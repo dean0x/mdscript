@@ -1,11 +1,14 @@
-use std::collections::HashSet;
-
 use crate::ast::*;
 use crate::error::MdsError;
 use crate::scope::Scope;
 
 /// Validate semantic correctness of a module AST.
 /// Checks variable references, function arity, and type constraints.
+///
+/// Note: Currently not wired into the compilation pipeline because the
+/// evaluator performs equivalent runtime checks. Static validation cannot
+/// fully handle block-scoped variables (e.g., @for loop vars) without
+/// simulating evaluation. Kept as a public API for tooling (LSP, linters).
 pub fn validate(nodes: &[Node], scope: &Scope) -> Result<(), MdsError> {
     for node in nodes {
         validate_node(node, scope)?;
@@ -18,8 +21,8 @@ fn validate_node(node: &Node, scope: &Scope) -> Result<(), MdsError> {
         Node::Text(_) | Node::EscapedBrace => Ok(()),
         Node::Interpolation(interp) => validate_expr(&interp.expr, scope),
         Node::If(block) => {
-            // Condition variable must exist
-            if !scope.has(&block.condition) {
+            // Condition must be a variable (truthiness check on a value)
+            if scope.get_var(&block.condition).is_none() {
                 return Err(MdsError::undefined_var(&block.condition));
             }
             for node in &block.then_body {
@@ -66,15 +69,7 @@ fn validate_expr(expr: &Expr, scope: &Scope) -> Result<(), MdsError> {
                     return Err(MdsError::arity(name, func.params.len(), args.len()));
                 }
             }
-            // Variable args must exist
-            for arg in args {
-                if let Arg::Var(var_name) = arg {
-                    if scope.get_var(var_name).is_none() {
-                        return Err(MdsError::undefined_var(var_name));
-                    }
-                }
-            }
-            Ok(())
+            validate_var_args(args, scope)
         }
         Expr::QualifiedCall {
             namespace,
@@ -89,26 +84,20 @@ fn validate_expr(expr: &Expr, scope: &Scope) -> Result<(), MdsError> {
                     }
                 }
             }
-            // Variable args must exist
-            for arg in args {
-                if let Arg::Var(var_name) = arg {
-                    if scope.get_var(var_name).is_none() {
-                        return Err(MdsError::undefined_var(var_name));
-                    }
-                }
-            }
-            Ok(())
+            validate_var_args(args, scope)
         }
     }
 }
 
-/// Collect all defined names in a module for export validation.
-pub fn collect_defined_names(nodes: &[Node]) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for node in nodes {
-        if let Node::Define(def) = node {
-            names.insert(def.name.clone());
+/// Check that all variable arguments reference defined variables.
+fn validate_var_args(args: &[Arg], scope: &Scope) -> Result<(), MdsError> {
+    for arg in args {
+        if let Arg::Var(var_name) = arg {
+            if scope.get_var(var_name).is_none() {
+                return Err(MdsError::undefined_var(var_name));
+            }
         }
     }
-    names
+    Ok(())
 }
+

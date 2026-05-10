@@ -25,9 +25,22 @@ pub enum Token {
 pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = source.chars().collect();
+    // Build a mapping from char index to byte offset for correct str slicing.
+    let byte_offsets: Vec<usize> = source
+        .char_indices()
+        .map(|(byte_idx, _)| byte_idx)
+        .collect();
     let mut pos = 0;
     let mut in_code_block = false;
-    let mut code_fence_prefix = String::new();
+
+    // Helper closure: get byte offset for a char position.
+    let byte_pos = |char_pos: usize| -> usize {
+        if char_pos >= byte_offsets.len() {
+            source.len()
+        } else {
+            byte_offsets[char_pos]
+        }
+    };
 
     // Check for frontmatter at the very start
     if source.starts_with("---\n") || source.starts_with("---\r\n") {
@@ -48,15 +61,18 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
         let mut found_close = false;
         while pos < chars.len() {
             // Check if current position starts a line with ---
-            if is_line_start(source, pos) && source[pos..].starts_with("---") {
+            if is_line_start_chars(&chars, pos)
+                && source[byte_pos(pos)..].starts_with("---")
+            {
                 let end_pos = pos + 3;
                 let at_end = end_pos >= chars.len()
                     || chars[end_pos] == '\n'
                     || chars[end_pos] == '\r';
                 if at_end {
                     let content: String = chars[fm_start..pos].iter().collect();
-                    tokens.push(Token::FrontmatterContent(content, fm_start));
-                    tokens.push(Token::FrontmatterFence(pos));
+                    let fm_byte_offset = byte_pos(fm_start);
+                    tokens.push(Token::FrontmatterContent(content, fm_byte_offset));
+                    tokens.push(Token::FrontmatterFence(byte_pos(pos)));
                     pos = end_pos;
                     // skip newline after closing ---
                     if pos < chars.len() && chars[pos] == '\n' {
@@ -86,9 +102,11 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
 
     // Process rest of the file
     while pos < chars.len() {
+        let bp = byte_pos(pos);
+
         // Check for code fences (```)
-        if is_line_start(source, pos) && source[pos..].starts_with("```") {
-            let fence_start = pos;
+        if is_line_start_chars(&chars, pos) && source[bp..].starts_with("```") {
+            let fence_start = byte_pos(pos);
             pos += 3;
             // consume any remaining backticks and language tag
             let mut fence = String::from("```");
@@ -104,25 +122,20 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
                 pos += 1;
             }
 
-            if !in_code_block {
-                in_code_block = true;
-                code_fence_prefix = fence.clone();
-                tokens.push(Token::CodeFence(fence, fence_start));
-            } else {
-                in_code_block = false;
-                tokens.push(Token::CodeFence(fence, fence_start));
-                code_fence_prefix.clear();
-            }
+            in_code_block = !in_code_block;
+            tokens.push(Token::CodeFence(fence, fence_start));
             continue;
         }
 
         if in_code_block {
             // Inside code block: no interpolation, just raw content
-            let start = pos;
+            let start = byte_pos(pos);
             let mut content = String::new();
             while pos < chars.len() {
                 // Check for closing code fence
-                if is_line_start(source, pos) && source[pos..].starts_with("```") {
+                if is_line_start_chars(&chars, pos)
+                    && source[byte_pos(pos)..].starts_with("```")
+                {
                     break;
                 }
                 content.push(chars[pos]);
@@ -135,8 +148,8 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
         }
 
         // Check for @ directives at line start
-        if is_line_start(source, pos) && pos < chars.len() && chars[pos] == '@' {
-            let start = pos;
+        if is_line_start_chars(&chars, pos) && chars[pos] == '@' {
+            let start = byte_pos(pos);
             let mut line = String::new();
             while pos < chars.len() && chars[pos] != '\n' {
                 line.push(chars[pos]);
@@ -152,14 +165,14 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
 
         // Check for escaped brace
         if pos + 1 < chars.len() && chars[pos] == '\\' && chars[pos + 1] == '{' {
-            tokens.push(Token::EscapedBrace(pos));
+            tokens.push(Token::EscapedBrace(byte_pos(pos)));
             pos += 2;
             continue;
         }
 
         // Check for interpolation
         if chars[pos] == '{' {
-            let start = pos;
+            let start = byte_pos(pos);
             pos += 1; // skip {
             let mut depth = 1;
             let mut content = String::new();
@@ -191,7 +204,7 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
         }
 
         // Regular text
-        let start = pos;
+        let start = byte_pos(pos);
         let mut text = String::new();
         while pos < chars.len() {
             // Stop at interpolation, escaped brace, directive start, or code fence
@@ -201,10 +214,12 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
             if pos + 1 < chars.len() && chars[pos] == '\\' && chars[pos + 1] == '{' {
                 break;
             }
-            if is_line_start(source, pos) && pos < chars.len() && chars[pos] == '@' {
+            if is_line_start_chars(&chars, pos) && chars[pos] == '@' {
                 break;
             }
-            if is_line_start(source, pos) && source[pos..].starts_with("```") {
+            if is_line_start_chars(&chars, pos)
+                && source[byte_pos(pos)..].starts_with("```")
+            {
                 break;
             }
             text.push(chars[pos]);
@@ -223,13 +238,13 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
     Ok(tokens)
 }
 
-/// Check if the given position is at the start of a line.
-fn is_line_start(source: &str, pos: usize) -> bool {
+/// Check if the given char position is at the start of a line,
+/// using the chars array for safe multi-byte character handling.
+fn is_line_start_chars(chars: &[char], pos: usize) -> bool {
     if pos == 0 {
         return true;
     }
-    let bytes = source.as_bytes();
-    pos <= bytes.len() && bytes[pos - 1] == b'\n'
+    chars[pos - 1] == '\n'
 }
 
 #[cfg(test)]

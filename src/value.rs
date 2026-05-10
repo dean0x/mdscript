@@ -82,6 +82,17 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Return a human-readable type name for error messages.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::String(_) => "string",
+            Value::Number(_) => "number",
+            Value::Boolean(_) => "boolean",
+            Value::Array(_) => "array",
+            Value::Null => "null",
+        }
+    }
 }
 
 impl fmt::Display for Value {

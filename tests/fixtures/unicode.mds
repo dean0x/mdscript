@@ -1,0 +1,12 @@
+---
+name: "Rene"
+emoji: "Hello"
+---
+
+Greetings {name}! {emoji}
+
+```python
+x = {not_interpolated}
+```
+
+Farewell {name}!

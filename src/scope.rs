@@ -45,6 +45,12 @@ pub struct NamespaceScope {
     pub prompt_body: Option<String>,
 }
 
+impl Default for Scope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Scope {
     pub fn new() -> Self {
         Scope {

@@ -28,6 +28,12 @@ pub struct ModuleCache {
     resolving: HashSet<PathBuf>,
 }
 
+impl Default for ModuleCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModuleCache {
     pub fn new() -> Self {
         ModuleCache {
@@ -122,24 +128,28 @@ impl ModuleCache {
                             explicit_exports.insert(name.clone());
                         }
                         ExportDirective::ReExport { name, path, .. } => {
-                            // Resolve the source module and bring in the function
+                            // Resolve the source module and bring in the function for
+                            // re-export only. Per spec: "@export from does not bring the
+                            // symbol into the current file's scope".
+                            validate_import_path(path)?;
                             let import_path = resolve_path(base_dir, path);
                             let source_module = self.resolve(&import_path, runtime_vars)?;
                             if let Some(func) = source_module.get_export(name) {
                                 functions.insert(name.clone(), func);
-                                scope.set_function(name, functions.get(name).unwrap().clone());
                             }
                             explicit_exports.insert(name.clone());
                         }
                         ExportDirective::Wildcard { path, .. } => {
+                            // Re-export all exports from the target module. These are
+                            // available to importers but NOT in the current file's scope.
+                            validate_import_path(path)?;
                             let import_path = resolve_path(base_dir, path);
                             let source_module = self.resolve(&import_path, runtime_vars)?;
                             for (name, func) in source_module.get_all_exports() {
                                 if functions.contains_key(&name) {
                                     return Err(MdsError::NameCollision { name });
                                 }
-                                functions.insert(name.clone(), func.clone());
-                                scope.set_function(&name, func);
+                                functions.insert(name.clone(), func);
                                 explicit_exports.insert(name);
                             }
                         }
@@ -183,12 +193,14 @@ impl ModuleCache {
     ) -> Result<(), MdsError> {
         match import {
             ImportDirective::Alias { path, alias, .. } => {
+                validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
                 let resolved = self.resolve(&import_path, runtime_vars)?;
                 let ns = module_to_namespace(&resolved);
                 scope.set_namespace(alias, ns);
             }
             ImportDirective::Merge { path, .. } => {
+                validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
                 let resolved = self.resolve(&import_path, runtime_vars)?;
                 // Merge exports into current scope
@@ -196,10 +208,11 @@ impl ModuleCache {
                     scope.set_function(&name, func);
                 }
                 for (name, value) in &resolved.vars {
-                    scope.set_var(&name, value.clone());
+                    scope.set_var(name, value.clone());
                 }
             }
             ImportDirective::Selective { names, path, .. } => {
+                validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
                 let resolved = self.resolve(&import_path, runtime_vars)?;
                 for name in names {
@@ -247,21 +260,29 @@ impl ResolvedModule {
 
 /// Create a NamespaceScope from a resolved module.
 fn module_to_namespace(module: &ResolvedModule) -> NamespaceScope {
-    let mut functions = HashMap::new();
-    for (name, func) in module.get_all_exports() {
-        functions.insert(name, func);
-    }
-
     NamespaceScope {
-        functions,
+        functions: module.get_all_exports().into_iter().collect(),
         vars: module.vars.clone(),
         prompt_body: module.prompt_body.clone(),
     }
 }
 
 /// Resolve a relative path against a base directory.
+/// Per spec: only relative paths are allowed (must start with "./" or "../").
 fn resolve_path(base_dir: &Path, relative: &str) -> PathBuf {
     base_dir.join(relative)
+}
+
+/// Validate that an import path is relative (starts with "./" or "../").
+fn validate_import_path(path: &str) -> Result<(), MdsError> {
+    if !path.starts_with("./") && !path.starts_with("../") {
+        return Err(MdsError::ImportError {
+            message: format!(
+                "import path must be relative (start with './' or '../'): \"{path}\""
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Validate that a file is a valid MDS file.
@@ -278,9 +299,9 @@ fn validate_file_type(path: &Path) -> Result<(), MdsError> {
             let source = std::fs::read_to_string(path).map_err(|e| MdsError::Io {
                 message: format!("cannot read {}: {e}", path.display()),
             })?;
-            if source.starts_with("---") {
-                if let Some(end) = source[3..].find("---") {
-                    let fm = &source[3..3 + end];
+            if let Some(after_prefix) = source.strip_prefix("---") {
+                if let Some(end) = after_prefix.find("---") {
+                    let fm = &after_prefix[..end];
                     if fm.contains("type: mds") || fm.contains("type: \"mds\"") {
                         return Ok(());
                     }

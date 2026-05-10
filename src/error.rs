@@ -1,28 +1,5 @@
 use miette::{Diagnostic, SourceSpan};
-use std::path::PathBuf;
 use thiserror::Error;
-
-/// Span information for error reporting.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Span {
-    pub file: PathBuf,
-    pub line: usize,
-    pub col: usize,
-    pub offset: usize,
-    pub len: usize,
-}
-
-impl Span {
-    pub fn new(file: PathBuf, line: usize, col: usize, offset: usize, len: usize) -> Self {
-        Self {
-            file,
-            line,
-            col,
-            offset,
-            len,
-        }
-    }
-}
 
 /// All errors produced by the MDS compiler.
 #[derive(Error, Debug, Diagnostic)]

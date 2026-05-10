@@ -3,20 +3,14 @@ use crate::error::MdsError;
 use crate::lexer::Token;
 
 /// Parse a stream of tokens into a Module AST.
-pub fn parse(tokens: &[Token], file: &str) -> Result<Module, MdsError> {
-    let mut parser = Parser {
-        tokens,
-        pos: 0,
-        file: file.to_string(),
-    };
+pub fn parse(tokens: &[Token], _file: &str) -> Result<Module, MdsError> {
+    let mut parser = Parser { tokens, pos: 0 };
     parser.parse_module()
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
-    #[allow(dead_code)]
-    file: String,
 }
 
 impl<'a> Parser<'a> {
@@ -26,37 +20,35 @@ impl<'a> Parser<'a> {
         Ok(Module { frontmatter, body })
     }
 
-    fn parse_frontmatter(&mut self) -> Result<Option<Frontmatter>, MdsError> {
-        if self.pos < self.tokens.len() {
-            if let Token::FrontmatterFence(_) = &self.tokens[self.pos] {
-                self.pos += 1; // skip opening fence
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
 
-                if self.pos < self.tokens.len() {
-                    if let Token::FrontmatterContent(content, offset) = &self.tokens[self.pos] {
-                        let fm = Frontmatter {
-                            raw: content.clone(),
-                            offset: *offset,
-                        };
-                        self.pos += 1; // skip content
-
-                        // skip closing fence
-                        if self.pos < self.tokens.len() {
-                            if let Token::FrontmatterFence(_) = &self.tokens[self.pos] {
-                                self.pos += 1;
-                            }
-                        }
-                        return Ok(Some(fm));
-                    }
-                }
-                // skip closing fence if no content
-                if self.pos < self.tokens.len() {
-                    if let Token::FrontmatterFence(_) = &self.tokens[self.pos] {
-                        self.pos += 1;
-                    }
-                }
-            }
+    fn skip_if_frontmatter_fence(&mut self) {
+        if matches!(self.peek(), Some(Token::FrontmatterFence(_))) {
+            self.pos += 1;
         }
-        Ok(None)
+    }
+
+    fn parse_frontmatter(&mut self) -> Result<Option<Frontmatter>, MdsError> {
+        if !matches!(self.peek(), Some(Token::FrontmatterFence(_))) {
+            return Ok(None);
+        }
+        self.pos += 1; // skip opening fence
+
+        let fm = if let Some(Token::FrontmatterContent(content, offset)) = self.peek() {
+            let fm = Frontmatter {
+                raw: content.clone(),
+                offset: *offset,
+            };
+            self.pos += 1; // skip content
+            Some(fm)
+        } else {
+            None
+        };
+
+        self.skip_if_frontmatter_fence();
+        Ok(fm)
     }
 
     /// Parse body nodes until we hit a terminator directive or end of tokens.
@@ -230,7 +222,14 @@ impl<'a> Parser<'a> {
             if let Token::Directive(d, _) = &self.tokens[self.pos] {
                 if d.trim() == "@end" {
                     self.pos += 1;
+                } else {
+                    return Err(MdsError::syntax(format!(
+                        "expected @end to close @for block, got '{}'",
+                        d.trim()
+                    )));
                 }
+            } else {
+                return Err(MdsError::syntax("expected @end to close @for block"));
             }
         } else {
             return Err(MdsError::syntax("unclosed @for block (missing @end)"));
@@ -282,7 +281,14 @@ impl<'a> Parser<'a> {
             if let Token::Directive(d, _) = &self.tokens[self.pos] {
                 if d.trim() == "@end" {
                     self.pos += 1;
+                } else {
+                    return Err(MdsError::syntax(format!(
+                        "expected @end to close @define block, got '{}'",
+                        d.trim()
+                    )));
                 }
+            } else {
+                return Err(MdsError::syntax("expected @end to close @define block"));
             }
         } else {
             return Err(MdsError::syntax("unclosed @define block (missing @end)"));
@@ -360,11 +366,10 @@ impl<'a> Parser<'a> {
 
         // Wildcard re-export: @export * from "path"
         if rest.starts_with("* from ") || rest.starts_with("*from ") {
-            let from_part = if rest.starts_with("* from ") {
-                &rest[7..]
-            } else {
-                &rest[6..]
-            };
+            let from_part = rest
+                .strip_prefix("* from ")
+                .or_else(|| rest.strip_prefix("*from "))
+                .unwrap();
             let path = parse_quoted_path(from_part.trim())?;
             return Ok(Node::Export(ExportDirective::Wildcard { path, offset }));
         }
@@ -474,11 +479,9 @@ fn parse_args(args_str: &str) -> Result<Vec<Arg>, MdsError> {
 
     for ch in args_str.chars() {
         if in_string {
+            current.push(ch);
             if ch == string_char {
                 in_string = false;
-                current.push(ch);
-            } else {
-                current.push(ch);
             }
         } else if ch == '"' || ch == '\'' {
             in_string = true;

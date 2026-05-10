@@ -1,5 +1,3 @@
-/// AST node types for MDS.
-
 /// A complete MDS source file.
 #[derive(Debug, Clone)]
 pub struct Module {

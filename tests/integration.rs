@@ -196,3 +196,65 @@ fn check_invalid_file() {
     let result = mds::check(&fixture("undefined_var.mds"), None);
     assert!(result.is_err());
 }
+
+#[test]
+fn function_calls_function() {
+    let result = mds::compile(&fixture("fn_calls_fn.mds"), None).unwrap();
+    assert!(result.contains("[Alice]"));
+}
+
+#[test]
+fn recursion_detected() {
+    let result = mds::compile(&fixture("recursive.mds"), None);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("recursion"));
+}
+
+#[test]
+fn nested_conditionals() {
+    let result = mds::compile(&fixture("nested_if.mds"), None).unwrap();
+    assert!(result.contains("outer true"));
+    assert!(result.contains("inner false"));
+    assert!(!result.contains("inner true"));
+    assert!(!result.contains("outer false"));
+}
+
+#[test]
+fn absolute_import_path_rejected() {
+    let result = mds::compile(&fixture("absolute_import.mds"), None);
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("relative") || err.contains("import"));
+}
+
+#[test]
+fn unicode_content() {
+    let result = mds::compile(&fixture("unicode.mds"), None).unwrap();
+    assert!(result.contains("Greetings Rene!"));
+    assert!(result.contains("Hello"));
+    // Code block content should not be interpolated
+    assert!(result.contains("{not_interpolated}"));
+    assert!(result.contains("Farewell Rene!"));
+}
+
+#[test]
+fn for_iterate_non_array_error() {
+    // Attempting to iterate over a non-array should produce a type error
+    let mut vars = HashMap::new();
+    vars.insert("items".to_string(), mds::value::Value::String("not_an_array".to_string()));
+    let result = mds::compile(&fixture("loop.mds"), Some(vars));
+    assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(err.contains("expected array") || err.contains("type error") || err.contains("string"));
+}
+
+#[test]
+fn empty_array_loop() {
+    // Iterating over an empty array should produce no output for the loop body
+    let mut vars = HashMap::new();
+    vars.insert("items".to_string(), mds::value::Value::Array(vec![]));
+    let result = mds::compile(&fixture("loop.mds"), Some(vars)).unwrap();
+    assert!(!result.contains("- apple"));
+    assert!(!result.contains("- banana"));
+}

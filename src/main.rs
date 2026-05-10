@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use std::path::PathBuf;
 use std::process;
 
@@ -44,17 +46,18 @@ fn main() {
     }
 }
 
+fn load_runtime_vars(
+    vars: Option<PathBuf>,
+) -> Result<Option<std::collections::HashMap<String, mds::value::Value>>, miette::Error> {
+    vars.map(|path| mds::load_vars_file(&path).map_err(|e| miette::miette!("{e}")))
+        .transpose()
+}
+
 fn run(cli: Cli) -> Result<(), miette::Error> {
     match cli.command {
         Commands::Build { input, o, vars } => {
-            let runtime_vars = if let Some(vars_path) = vars {
-                Some(mds::load_vars_file(&vars_path).map_err(|e| miette::miette!("{e}"))?)
-            } else {
-                None
-            };
-
-            let output =
-                mds::compile(&input, runtime_vars).map_err(|e| miette::Error::from(e))?;
+            let runtime_vars = load_runtime_vars(vars)?;
+            let output = mds::compile(&input, runtime_vars).map_err(miette::Error::from)?;
 
             if let Some(output_path) = o {
                 std::fs::write(&output_path, &output)
@@ -66,13 +69,8 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             Ok(())
         }
         Commands::Check { input, vars } => {
-            let runtime_vars = if let Some(vars_path) = vars {
-                Some(mds::load_vars_file(&vars_path).map_err(|e| miette::miette!("{e}"))?)
-            } else {
-                None
-            };
-
-            mds::check(&input, runtime_vars).map_err(|e| miette::Error::from(e))?;
+            let runtime_vars = load_runtime_vars(vars)?;
+            mds::check(&input, runtime_vars).map_err(miette::Error::from)?;
             eprintln!("OK: {}", input.display());
             Ok(())
         }

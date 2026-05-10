@@ -207,7 +207,7 @@ fn evaluate_for(
 
     let items = iterable
         .as_array()
-        .ok_or_else(|| MdsError::type_error(type_name(&iterable)))?;
+        .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
 
     let mut output = String::new();
 
@@ -227,20 +227,7 @@ fn evaluate_include(inc: &IncludeDirective, scope: &Scope) -> Result<String, Mds
         .get_namespace(&inc.alias)
         .ok_or_else(|| MdsError::undefined_var(&inc.alias))?;
 
-    match &ns.prompt_body {
-        Some(body) => Ok(body.clone()),
-        None => Ok(String::new()),
-    }
-}
-
-fn type_name(value: &Value) -> &'static str {
-    match value {
-        Value::String(_) => "string",
-        Value::Number(_) => "number",
-        Value::Boolean(_) => "boolean",
-        Value::Array(_) => "array",
-        Value::Null => "null",
-    }
+    Ok(ns.prompt_body.clone().unwrap_or_default())
 }
 
 #[cfg(test)]

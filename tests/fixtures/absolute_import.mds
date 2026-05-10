@@ -1,0 +1,3 @@
+@import "/etc/passwd" as x
+
+Hello!
