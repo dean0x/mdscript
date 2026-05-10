@@ -1,0 +1,10 @@
+@define greet(name):
+Hello {name}!
+@end
+
+@define farewell(name):
+Goodbye {name}!
+@end
+
+@export greet
+@export farewell

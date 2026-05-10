@@ -1,0 +1,9 @@
+---
+premium: false
+---
+
+@if premium:
+Thanks for being premium!
+@else:
+Upgrade for premium features.
+@end

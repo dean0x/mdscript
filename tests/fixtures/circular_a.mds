@@ -1,0 +1,3 @@
+@import "./circular_b.mds" as b
+
+Hello from A!

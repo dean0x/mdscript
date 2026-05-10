@@ -1,0 +1,12 @@
+---
+name: Alice
+---
+
+Hello {name}!
+
+```python
+x = {not_a_var}
+print(f"hello {world}")
+```
+
+Goodbye {name}!

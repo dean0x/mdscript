@@ -1,0 +1,9 @@
+---
+name: Alice
+---
+
+@import "./footer.mds" as footer
+
+Hello {name}!
+
+@include footer

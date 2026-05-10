@@ -1,0 +1,26 @@
+---
+name: Alice
+items: [apple, banana]
+premium: true
+---
+
+@import "./footer.mds" as footer
+
+@define list(items):
+@for item in items:
+- {item}
+@end
+@end
+
+Hello {name}!
+
+Your items:
+{list(items)}
+
+@if premium:
+Thanks for being premium!
+@else:
+Upgrade for premium features.
+@end
+
+@include footer

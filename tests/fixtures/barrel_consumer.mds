@@ -1,0 +1,11 @@
+---
+user: Alice
+tools: [search, code, browse]
+---
+
+@import "./index.mds" as prompts
+
+{prompts.hello(user)}
+
+You have access to:
+{prompts.bullet_list(tools)}

@@ -1,0 +1,10 @@
+@define hello(name):
+Hello {name}!
+@end
+
+@define welcome(name, role):
+Welcome {name}, you're joining as {role}.
+@end
+
+@export hello
+@export welcome

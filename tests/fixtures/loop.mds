@@ -1,0 +1,8 @@
+---
+items: [apple, banana, cherry]
+---
+
+Your items:
+@for item in items:
+- {item}
+@end
