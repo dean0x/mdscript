@@ -1,1 +1,27 @@
-{"version":1,"features":{}}
+{
+  "version": 1,
+  "features": {
+    "mds-compiler": {
+      "name": "MDS Compiler",
+      "description": "MDS (Markdown Script) compiler — lexer, parser, validator, resolver, evaluator pipeline compiling .mds files to Markdown",
+      "directories": [
+        "src/",
+        "tests/"
+      ],
+      "referencedFiles": [
+        "src/lib.rs",
+        "src/ast.rs",
+        "src/lexer.rs",
+        "src/parser.rs",
+        "src/validator.rs",
+        "src/resolver.rs",
+        "src/evaluator.rs",
+        "src/scope.rs",
+        "src/value.rs",
+        "src/error.rs"
+      ],
+      "lastUpdated": "2026-05-12T21:22:57.137Z",
+      "createdBy": "implement"
+    }
+  }
+}
