@@ -306,8 +306,15 @@ fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
     // Alias import: @import "path" as alias
     // Merge import: @import "path"
     let path = parse_quoted_path(rest)?;
-    let after_path_start = rest.find('"').unwrap();
-    let after_path_end = rest[after_path_start + 1..].find('"').unwrap() + after_path_start + 2;
+    // parse_quoted_path succeeded, so quotes must exist — but use safe fallback
+    let after_path_start = rest
+        .find('"')
+        .ok_or_else(|| MdsError::syntax("missing opening quote in import path"))?;
+    let after_path_end = rest[after_path_start + 1..]
+        .find('"')
+        .ok_or_else(|| MdsError::syntax("missing closing quote in import path"))?
+        + after_path_start
+        + 2;
     let after = rest[after_path_end..].trim();
 
     if let Some(alias) = after.strip_prefix("as ") {

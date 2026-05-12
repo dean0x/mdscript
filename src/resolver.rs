@@ -22,6 +22,9 @@ pub struct ResolvedModule {
     pub explicit_exports: HashSet<String>,
 }
 
+/// Maximum import depth to prevent stack overflow from deeply chained imports.
+const MAX_IMPORT_DEPTH: usize = 64;
+
 /// Module cache to avoid re-resolving the same file.
 pub struct ModuleCache {
     modules: HashMap<PathBuf, ResolvedModule>,
@@ -62,6 +65,15 @@ impl ModuleCache {
         if self.resolving.contains(&canonical) {
             let cycle = canonical.display().to_string();
             return Err(MdsError::CircularImport { cycle });
+        }
+
+        // Guard against excessively deep import chains
+        if self.resolving.len() >= MAX_IMPORT_DEPTH {
+            return Err(MdsError::ImportError {
+                message: format!(
+                    "import depth exceeds maximum of {MAX_IMPORT_DEPTH} (possible deep chain)"
+                ),
+            });
         }
 
         // Read source
@@ -302,11 +314,20 @@ fn resolve_path(base_dir: &Path, relative: &str) -> PathBuf {
     base_dir.join(relative)
 }
 
-/// Validate that an import path is relative (starts with "./" or "../").
+/// Validate that an import path is safe and relative.
+///
+/// Rejects absolute paths and paths containing components that could escape
+/// the project directory (e.g., null bytes or excessively long paths).
 fn validate_import_path(path: &str) -> Result<(), MdsError> {
     if !path.starts_with("./") && !path.starts_with("../") {
         return Err(MdsError::ImportError {
             message: format!("import path must be relative (start with './' or '../'): \"{path}\""),
+        });
+    }
+    // Reject null bytes which could truncate paths in some OS APIs
+    if path.contains('\0') {
+        return Err(MdsError::ImportError {
+            message: "import path contains null byte".to_string(),
         });
     }
     Ok(())

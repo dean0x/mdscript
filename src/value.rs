@@ -102,7 +102,9 @@ impl fmt::Display for Value {
         match self {
             Value::String(s) => write!(f, "{s}"),
             Value::Number(n) => {
-                if n.fract() == 0.0 {
+                // Display whole numbers without decimal point, but guard
+                // against values outside the i64 range to avoid overflow.
+                if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
                     write!(f, "{}", *n as i64)
                 } else {
                     write!(f, "{n}")
@@ -142,5 +144,26 @@ mod tests {
         assert_eq!(Value::Number(3.14).to_string(), "3.14");
         assert_eq!(Value::Boolean(true).to_string(), "true");
         assert_eq!(Value::Null.to_string(), "");
+    }
+
+    #[test]
+    fn display_large_number() {
+        // Numbers beyond i64 range should not panic during display
+        let large = Value::Number(1e20);
+        let result = large.to_string();
+        assert!(!result.is_empty());
+
+        let huge = Value::Number(f64::MAX);
+        let result = huge.to_string();
+        assert!(!result.is_empty());
+
+        // NaN and infinity should display without panic
+        let nan = Value::Number(f64::NAN);
+        let result = nan.to_string();
+        assert!(!result.is_empty());
+
+        let inf = Value::Number(f64::INFINITY);
+        let result = inf.to_string();
+        assert!(!result.is_empty());
     }
 }

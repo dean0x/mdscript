@@ -5,6 +5,9 @@ use crate::error::MdsError;
 use crate::scope::{FunctionDef, Scope};
 use crate::value::Value;
 
+/// Maximum call depth to prevent stack overflow from deeply nested calls.
+const MAX_CALL_DEPTH: usize = 128;
+
 /// Evaluate a module body into a final rendered string.
 pub fn evaluate(nodes: &[Node], scope: &mut Scope) -> Result<String, MdsError> {
     let mut call_stack: HashSet<String> = HashSet::new();
@@ -107,6 +110,12 @@ fn call_function(
             name: name.to_string(),
         });
     }
+    // Guard against excessive call depth (A -> B -> C -> ... )
+    if call_stack.len() >= MAX_CALL_DEPTH {
+        return Err(MdsError::Recursion {
+            name: format!("{name} (call depth exceeds {MAX_CALL_DEPTH})"),
+        });
+    }
 
     let func = scope
         .get_function(name)
@@ -145,6 +154,12 @@ fn call_qualified_function(
     if call_stack.contains(&qualified_name) {
         return Err(MdsError::Recursion {
             name: qualified_name,
+        });
+    }
+    // Guard against excessive call depth
+    if call_stack.len() >= MAX_CALL_DEPTH {
+        return Err(MdsError::Recursion {
+            name: format!("{qualified_name} (call depth exceeds {MAX_CALL_DEPTH})"),
         });
     }
 
