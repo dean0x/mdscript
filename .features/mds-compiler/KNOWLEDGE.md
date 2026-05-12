@@ -67,15 +67,21 @@ Lookup always walks from innermost to outermost frame, enabling block-scoped sha
 
 The `Value` enum has five variants: `String`, `Number(f64)`, `Boolean`, `Array(Vec<Value>)`, `Null`. Objects/maps are explicitly unsupported in v0.1. Truthiness rules match JavaScript-like semantics: `0`, `""`, `[]`, `null`, and `false` are falsy; everything else is truthy. `Value::Display` renders numbers as integers when the fractional part is zero, guarding against i64 overflow for very large floats.
 
-Both `from_yaml` and `from_json` converters exist, with identical rejection of object/map types.
+Both `from_yaml` and `from_json` converters exist, with identical rejection of object/map types. `from_yaml` also handles `serde_yml::Value::Tagged` by unwrapping the tag and recursing into `from_yaml`.
 
 ### Validator (`src/validator.rs`)
 
-Validates the AST against the current scope **before** evaluation. Catches: undefined variables in `{interpolation}` and `@if` conditions, undefined iterables in `@for`, undefined namespaces in `@include`, undefined functions and arity mismatches in calls, and undefined variable arguments to functions. The validator deliberately does **not** validate `@for` loop bodies — the loop variable only exists at evaluation time, so body validation is deferred.
+Validates the AST against the current scope **before** evaluation. Catches: undefined variables in `{interpolation}` and `@if` conditions, undefined iterables in `@for`, undefined namespaces in `@include`, undefined functions and arity mismatches in calls, and undefined variable arguments to functions.
+
+**`@for` body validation**: The validator does validate `@for` loop bodies. It clones the outer scope into an `inner` scope, injects the loop variable as `Value::Null`, then recurses into the body with that inner scope. This means undefined-variable references inside the loop body are caught at validate time, not evaluation time. The iterable variable must exist in the outer scope; the loop var itself does not need to pre-exist.
 
 ### Resolver (`src/resolver.rs`)
 
-The resolver is the orchestrator. `ModuleCache` drives the full pipeline for each file and caches `ResolvedModule` by canonical path, preventing repeated work and providing cycle detection via a `resolving: HashSet<PathBuf>`.
+The resolver is the orchestrator. `ModuleCache` drives the full pipeline for each file and caches `ResolvedModule` by canonical path, preventing repeated work and providing cycle detection.
+
+Cycle detection uses two parallel data structures:
+- `resolving: HashSet<PathBuf>` — O(1) membership test for "is this module currently resolving?"
+- `resolving_stack: Vec<PathBuf>` — insertion-ordered list of in-progress modules, used to reconstruct the cycle path string (e.g., `a.mds → b.mds → a.mds`)
 
 `process_module` is the inner workhorse: it tokenizes, parses, builds scope from frontmatter + runtime vars, walks the AST to register functions and resolve imports, validates, and evaluates. The result is a `ResolvedModule` with `functions`, `vars`, `prompt_body`, and export metadata.
 
@@ -90,7 +96,7 @@ Export semantics: without any `@export` directives, all `@define` functions are 
 
 The evaluator walks the AST and produces the final rendered string. It carries a `call_stack: HashSet<String>` for recursion detection (error on self or mutual recursion) and enforces `MAX_CALL_DEPTH = 128` for deep chains. Function calls create a new scope frame, bind parameters, evaluate the body, then restore the frame.
 
-`@include alias` looks up the aliased module's `prompt_body` from the namespace and injects it inline. If the included module has no body text, a warning is printed to stderr (no error — empty includes are permitted).
+`@include alias` looks up the aliased module's `prompt_body` from the namespace and injects it inline. If the included module has no body text, `evaluate_include` silently returns an empty string — no error, no warning.
 
 `@import` and `@export` nodes are no-ops in the evaluator (handled entirely by the resolver).
 
@@ -130,16 +136,27 @@ The `ModuleCache` is created per top-level compile call (not shared across calls
 All errors are `MdsError` variants (thiserror + miette). For errors with source location, use the `_at` constructor variants:
 
 ```rust
-// Use these builder methods — they attach span + NamedSource for miette rendering
+// Use _at variants to attach a miette SourceSpan — provides file + line in error output.
+// `file` = canonical path string, `source` = full source text, `offset`/`len` = byte range.
 MdsError::syntax_at(message, file, source, offset, len)
 MdsError::undefined_var_at(name, file, source, offset, len)
+MdsError::undefined_fn_at(name, file, source, offset, len)
+MdsError::name_collision_at(name, file, source, offset, len)
+MdsError::file_not_found_at(path, file, source, offset, len)
 
-// Use bare variants only when source context is unavailable (e.g., resolver-level errors)
+// Use bare variants only when source context is unavailable (e.g., resolver-level errors
+// that occur before or between file reads, where no single source span is meaningful).
 MdsError::syntax(message)
 MdsError::undefined_var(name)
+MdsError::undefined_fn(name)
+MdsError::name_collision(name)
+MdsError::file_not_found(path)
+MdsError::arity(name, expected, got)
+MdsError::type_error(got)
+MdsError::recursion(name)
 ```
 
-The `file` parameter is the canonical path string; `source` is the full source text (cloned into an `Arc<NamedSource>` for miette). The `offset` and `len` are byte offsets into the source.
+Bare variants produce no source-span; users see only the error message with no file/line context. Always prefer `_at` variants inside the validator and evaluator where source offsets are available from the AST nodes.
 
 ### Adding a New Value Type
 
@@ -165,13 +182,14 @@ Currently blocked by design: `Value::from_yaml` and `Value::from_json` both retu
 ## Gotchas
 
 - **`@define` body nodes have leading/trailing newlines stripped** — the parser calls `strip_leading_newline` and `strip_trailing_newline` on `@define` bodies so the function output doesn't include the newlines introduced by the block syntax. If you add a new block directive, apply the same stripping unless you want those newlines in output.
-- **`@for` loop variable validation is deferred** — the validator skips validating the `@for` body because the loop variable only exists at evaluation time. Errors in the body surface at runtime, not at validate time.
+- **`@for` body validation uses a Null-injected clone** — the validator validates `@for` bodies by cloning the outer scope and injecting the loop variable as `Value::Null`. This catches undefined references at validate time, but it means the loop variable appears as type `null` during validation — not its runtime type. Type errors in the body (e.g., using the loop var as an iterable) surface at evaluation time, not validate time.
 - **Runtime vars override frontmatter silently** — there is no warning when a runtime var shadows a frontmatter key. This is intentional but can cause confusion when debugging.
 - **`@export` changes all-implicit to explicit** — once a module has any `@export` directive, only explicitly exported names are visible to importers. Adding an `@export name` to a module that was previously exporting everything will break other modules that depended on the implicit-all behavior.
-- **`@include` emits a stderr warning for empty modules** — this is not an error; it prints to stderr and produces an empty string. Code that expects stderr to be clean will see these warnings.
+- **`@include` on an empty module produces an empty string** — `evaluate_include` silently returns `""` when the aliased module has no `prompt_body`. No error, no warning; the include just disappears from output.
 - **Merged imports check for name collisions; aliased imports do not** — `@import "path" as ns` never collides (it's under a namespace), but `@import "path"` (merge) raises `NameCollision` if a function name already exists in scope.
 - **`compile_str` uses a virtual path `<source>` in the module cache** — in-memory sources are never cached (the key is a virtual path that can't be canonicalized). Repeated calls to `compile_str` with the same source will re-parse every time.
 - **Qualified calls (`{ns.fn()}`) look up function definitions in the namespace at evaluation time** — if the namespace's scope diverges from what validation saw (shouldn't happen normally), evaluation can fail with a different error than validation predicted.
+- **Cycle detection reconstructs the path from `resolving_stack`** — when a circular import is detected, the error message is built by finding the repeated path in `resolving_stack` and joining the tail with `→`. The stack is in insertion order, so the cycle chain reflects the actual import sequence.
 
 ## Key Files
 
