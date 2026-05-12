@@ -104,7 +104,11 @@ impl fmt::Display for Value {
             Value::Number(n) => {
                 // Display whole numbers without decimal point, but guard
                 // against values outside the i64 range to avoid overflow.
-                if n.fract() == 0.0 && n.is_finite() && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                if n.fract() == 0.0
+                    && n.is_finite()
+                    && *n >= i64::MIN as f64
+                    && *n <= i64::MAX as f64
+                {
                     write!(f, "{}", *n as i64)
                 } else {
                     write!(f, "{n}")
