@@ -6,8 +6,6 @@ use crate::value::Value;
 /// A function definition stored in scope.
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
-    #[allow(dead_code)]
-    pub name: String,
     pub params: Vec<String>,
     pub body: Vec<crate::ast::Node>,
     /// Namespaces captured from the function's definition site (lexical scope).
@@ -21,7 +19,6 @@ pub struct FunctionDef {
 impl From<&DefineBlock> for FunctionDef {
     fn from(d: &DefineBlock) -> Self {
         FunctionDef {
-            name: d.name.clone(),
             params: d.params.clone(),
             body: d.body.clone(),
             captured_namespaces: HashMap::new(),
@@ -50,8 +47,6 @@ struct Frame {
 #[derive(Debug, Clone)]
 pub struct NamespaceScope {
     pub functions: HashMap<String, FunctionDef>,
-    #[allow(dead_code)]
-    pub vars: HashMap<String, Value>,
     /// The compiled prompt body of the imported module.
     pub prompt_body: Option<String>,
 }
@@ -84,9 +79,7 @@ impl Scope {
 
     /// Set a variable in the current (innermost) frame.
     pub fn set_var(&mut self, name: &str, value: Value) {
-        if let Some(frame) = self.frames.last_mut() {
-            frame.vars.insert(name.to_string(), value);
-        }
+        self.frames.last_mut().unwrap().vars.insert(name.to_string(), value);
     }
 
     /// Look up a variable by walking the scope chain (innermost first).
@@ -101,9 +94,7 @@ impl Scope {
 
     /// Define a function in the current frame.
     pub fn set_function(&mut self, name: &str, func: FunctionDef) {
-        if let Some(frame) = self.frames.last_mut() {
-            frame.functions.insert(name.to_string(), func);
-        }
+        self.frames.last_mut().unwrap().functions.insert(name.to_string(), func);
     }
 
     /// Look up a function by walking the scope chain.
@@ -118,9 +109,7 @@ impl Scope {
 
     /// Register a namespace (for aliased imports).
     pub fn set_namespace(&mut self, alias: &str, ns: NamespaceScope) {
-        if let Some(frame) = self.frames.last_mut() {
-            frame.namespaces.insert(alias.to_string(), ns);
-        }
+        self.frames.last_mut().unwrap().namespaces.insert(alias.to_string(), ns);
     }
 
     /// Look up a namespace by alias.
@@ -133,48 +122,31 @@ impl Scope {
         None
     }
 
-    /// Check if an identifier exists in any form (var, function, namespace).
-    #[allow(dead_code)]
-    pub fn has(&self, name: &str) -> bool {
-        self.get_var(name).is_some()
-            || self.get_function(name).is_some()
-            || self.get_namespace(name).is_some()
-    }
-
     /// Get all namespaces visible in the current scope (for closure capture).
-    /// Inner frames shadow outer frames — last write wins, matching shadowing semantics.
+    /// Outer-to-inner iteration: inner frames shadow outer frames.
     pub fn get_all_namespaces(&self) -> HashMap<String, NamespaceScope> {
-        let mut result = HashMap::new();
-        for frame in &self.frames {
-            for (name, ns) in &frame.namespaces {
-                result.insert(name.clone(), ns.clone());
-            }
-        }
-        result
+        self.frames
+            .iter()
+            .flat_map(|f| f.namespaces.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
     }
 
     /// Get all functions visible in the current scope (for closure capture).
-    /// Inner frames shadow outer frames — last write wins, matching shadowing semantics.
+    /// Outer-to-inner iteration: inner frames shadow outer frames.
     pub fn get_all_functions(&self) -> HashMap<String, FunctionDef> {
-        let mut result = HashMap::new();
-        for frame in &self.frames {
-            for (name, func) in &frame.functions {
-                result.insert(name.clone(), func.clone());
-            }
-        }
-        result
+        self.frames
+            .iter()
+            .flat_map(|f| f.functions.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
     }
 
     /// Get all variables visible in the current scope (for closure capture).
-    /// Inner frames shadow outer frames — last write wins, matching shadowing semantics.
+    /// Outer-to-inner iteration: inner frames shadow outer frames.
     pub fn get_all_vars(&self) -> HashMap<String, Value> {
-        let mut result = HashMap::new();
-        for frame in &self.frames {
-            for (name, val) in &frame.vars {
-                result.insert(name.clone(), val.clone());
-            }
-        }
-        result
+        self.frames
+            .iter()
+            .flat_map(|f| f.vars.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .collect()
     }
 }
 
@@ -199,7 +171,6 @@ mod tests {
         scope.set_function(
             "greet",
             FunctionDef {
-                name: "greet".into(),
                 params: vec!["name".into()],
                 body: vec![],
                 captured_namespaces: HashMap::new(),

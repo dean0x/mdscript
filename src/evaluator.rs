@@ -245,38 +245,31 @@ mod tests {
     use super::*;
     use crate::ast::TextNode;
 
+    fn text(s: &str) -> Node {
+        Node::Text(TextNode { text: s.to_string() })
+    }
+
     #[test]
     fn evaluate_text() {
-        let nodes = vec![Node::Text(TextNode {
-            text: "Hello world!".to_string(),
-            offset: 0,
-        })];
+        let nodes = vec![text("Hello world!")];
         let mut scope = Scope::new();
-        let result = evaluate(&nodes, &mut scope).unwrap();
-        assert_eq!(result, "Hello world!");
+        assert_eq!(evaluate(&nodes, &mut scope).unwrap(), "Hello world!");
     }
 
     #[test]
     fn evaluate_variable_interpolation() {
         let nodes = vec![
-            Node::Text(TextNode {
-                text: "Hello ".to_string(),
-                offset: 0,
-            }),
+            text("Hello "),
             Node::Interpolation(Interpolation {
                 expr: Expr::Var("name".to_string()),
                 offset: 6,
                 len: 4,
             }),
-            Node::Text(TextNode {
-                text: "!".to_string(),
-                offset: 12,
-            }),
+            text("!"),
         ];
         let mut scope = Scope::new();
         scope.set_var("name", Value::String("Alice".to_string()));
-        let result = evaluate(&nodes, &mut scope).unwrap();
-        assert_eq!(result, "Hello Alice!");
+        assert_eq!(evaluate(&nodes, &mut scope).unwrap(), "Hello Alice!");
     }
 
     #[test]
@@ -287,22 +280,15 @@ mod tests {
             len: 7,
         })];
         let mut scope = Scope::new();
-        let result = evaluate(&nodes, &mut scope);
-        assert!(result.is_err());
+        assert!(evaluate(&nodes, &mut scope).is_err());
     }
 
     #[test]
     fn evaluate_if_truthy() {
         let nodes = vec![Node::If(IfBlock {
             condition: "flag".to_string(),
-            then_body: vec![Node::Text(TextNode {
-                text: "yes".to_string(),
-                offset: 0,
-            })],
-            else_body: Some(vec![Node::Text(TextNode {
-                text: "no".to_string(),
-                offset: 0,
-            })]),
+            then_body: vec![text("yes")],
+            else_body: Some(vec![text("no")]),
             offset: 0,
         })];
         let mut scope = Scope::new();
@@ -314,14 +300,8 @@ mod tests {
     fn evaluate_if_falsy() {
         let nodes = vec![Node::If(IfBlock {
             condition: "flag".to_string(),
-            then_body: vec![Node::Text(TextNode {
-                text: "yes".to_string(),
-                offset: 0,
-            })],
-            else_body: Some(vec![Node::Text(TextNode {
-                text: "no".to_string(),
-                offset: 0,
-            })]),
+            then_body: vec![text("yes")],
+            else_body: Some(vec![text("no")]),
             offset: 0,
         })];
         let mut scope = Scope::new();
@@ -335,19 +315,13 @@ mod tests {
             var: "item".to_string(),
             iterable: "items".to_string(),
             body: vec![
-                Node::Text(TextNode {
-                    text: "- ".to_string(),
-                    offset: 0,
-                }),
+                text("- "),
                 Node::Interpolation(Interpolation {
                     expr: Expr::Var("item".to_string()),
                     offset: 2,
                     len: 4,
                 }),
-                Node::Text(TextNode {
-                    text: "\n".to_string(),
-                    offset: 8,
-                }),
+                text("\n"),
             ],
             offset: 0,
         })];
@@ -359,8 +333,7 @@ mod tests {
                 Value::String("banana".into()),
             ]),
         );
-        let result = evaluate(&nodes, &mut scope).unwrap();
-        assert_eq!(result, "- apple\n- banana\n");
+        assert_eq!(evaluate(&nodes, &mut scope).unwrap(), "- apple\n- banana\n");
     }
 
     #[test]
@@ -370,21 +343,14 @@ mod tests {
                 name: "greet".to_string(),
                 params: vec!["name".to_string()],
                 body: vec![
-                    Node::Text(TextNode {
-                        text: "Hello ".to_string(),
-                        offset: 0,
-                    }),
+                    text("Hello "),
                     Node::Interpolation(Interpolation {
                         expr: Expr::Var("name".to_string()),
                         offset: 6,
                         len: 4,
                     }),
-                    Node::Text(TextNode {
-                        text: "!".to_string(),
-                        offset: 12,
-                    }),
+                    text("!"),
                 ],
-                offset: 0,
             }),
             Node::Interpolation(Interpolation {
                 expr: Expr::Call {
@@ -396,25 +362,20 @@ mod tests {
             }),
         ];
         let mut scope = Scope::new();
-        let result = evaluate(&nodes, &mut scope).unwrap();
-        assert_eq!(result, "Hello Bob!");
+        assert_eq!(evaluate(&nodes, &mut scope).unwrap(), "Hello Bob!");
     }
 
     #[test]
     fn evaluate_escaped_brace() {
         let nodes = vec![
-            Node::Text(TextNode {
-                text: "Use ".to_string(),
-                offset: 0,
-            }),
+            text("Use "),
             Node::EscapedBrace,
-            Node::Text(TextNode {
-                text: "name} for interpolation".to_string(),
-                offset: 6,
-            }),
+            text("name} for interpolation"),
         ];
         let mut scope = Scope::new();
-        let result = evaluate(&nodes, &mut scope).unwrap();
-        assert_eq!(result, "Use {name} for interpolation");
+        assert_eq!(
+            evaluate(&nodes, &mut scope).unwrap(),
+            "Use {name} for interpolation"
+        );
     }
 }

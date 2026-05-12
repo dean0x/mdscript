@@ -189,13 +189,11 @@ mod tests {
         assert!(Value::Array(vec![Value::Number(1.0)]).is_truthy());
     }
 
-    // Fix 4: NaN must be falsy
     #[test]
     fn nan_is_falsy() {
         assert!(!Value::Number(f64::NAN).is_truthy(), "NaN must be falsy");
     }
 
-    // Fix 5: From impls
     #[test]
     fn from_impls() {
         assert_eq!(Value::from("hello"), Value::String("hello".to_owned()));

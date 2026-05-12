@@ -21,7 +21,7 @@ pub mod value;
 pub use value::Value;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use error::MdsError;
 use resolver::ModuleCache;
@@ -66,18 +66,9 @@ pub fn compile_str_with(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<String, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let cwd_buf;
-    let dir = match base_dir {
-        Some(d) => d,
-        None => {
-            cwd_buf = std::env::current_dir().map_err(|e| MdsError::Io {
-                message: format!("cannot determine current directory: {e}"),
-            })?;
-            cwd_buf.as_path()
-        }
-    };
+    let dir = resolve_base_dir(base_dir)?;
     let mut cache = ModuleCache::new();
-    let resolved = cache.resolve_source(source, dir, &vars)?;
+    let resolved = cache.resolve_source(source, &dir, &vars)?;
     Ok(resolved
         .prompt_body
         .as_deref()
@@ -103,6 +94,16 @@ pub fn check_str(source: &str) -> Result<(), MdsError> {
     check_str_with(source, None, None)
 }
 
+/// Resolve an optional base directory to a `PathBuf`, falling back to cwd.
+fn resolve_base_dir(base_dir: Option<&Path>) -> Result<PathBuf, MdsError> {
+    match base_dir {
+        Some(d) => Ok(d.to_path_buf()),
+        None => std::env::current_dir().map_err(|e| MdsError::Io {
+            message: format!("cannot determine current directory: {e}"),
+        }),
+    }
+}
+
 /// Check (validate) MDS source from a string with options.
 pub fn check_str_with(
     source: &str,
@@ -110,18 +111,9 @@ pub fn check_str_with(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<(), MdsError> {
     let vars = runtime_vars.unwrap_or_default();
-    let cwd_buf;
-    let dir = match base_dir {
-        Some(d) => d,
-        None => {
-            cwd_buf = std::env::current_dir().map_err(|e| MdsError::Io {
-                message: format!("cannot determine current directory: {e}"),
-            })?;
-            cwd_buf.as_path()
-        }
-    };
+    let dir = resolve_base_dir(base_dir)?;
     let mut cache = ModuleCache::new();
-    cache.resolve_source(source, dir, &vars)?;
+    cache.resolve_source(source, &dir, &vars)?;
     Ok(())
 }
 

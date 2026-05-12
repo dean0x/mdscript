@@ -1,6 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::ast::*;
+use crate::error::MdsError;
+use crate::evaluator::evaluate;
+use crate::lexer::tokenize;
+use crate::parser::parse;
+use crate::scope::{FunctionDef, NamespaceScope, Scope};
+use crate::validator;
+use crate::value::Value;
+
 /// Walk up from a directory to find the project root.
 /// Looks for `.git` or `.mdsroot` markers.
 /// Falls back to the given directory if no marker is found.
@@ -18,24 +27,10 @@ fn find_project_root(start: &Path) -> PathBuf {
     }
 }
 
-use crate::ast::*;
-use crate::error::MdsError;
-use crate::evaluator::evaluate;
-use crate::lexer::tokenize;
-use crate::parser::parse;
-use crate::scope::{FunctionDef, NamespaceScope, Scope};
-use crate::validator;
-use crate::value::Value;
-
 /// A resolved module with its AST, exports, and prompt body.
 #[derive(Debug, Clone)]
 pub struct ResolvedModule {
-    #[allow(dead_code)]
-    pub path: PathBuf,
-    #[allow(dead_code)]
-    pub module: Module,
     pub functions: HashMap<String, FunctionDef>,
-    pub vars: HashMap<String, Value>,
     pub prompt_body: Option<String>,
     pub has_explicit_exports: bool,
     pub explicit_exports: HashSet<String>,
@@ -143,18 +138,13 @@ impl ModuleCache {
 
         let file_str = canonical.display().to_string();
         let base_dir = canonical.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let is_md = canonical.extension().and_then(|e| e.to_str()) == Some("md");
 
         // Mark as resolving before recursing into process_module
         self.resolving.insert(canonical.clone());
         self.resolving_stack.push(canonical.clone());
 
-        let resolved = self.process_module(
-            &source,
-            &file_str,
-            &base_dir,
-            canonical.clone(),
-            runtime_vars,
-        );
+        let resolved = self.process_module(&source, &file_str, &base_dir, is_md, runtime_vars);
 
         // Unmark regardless of success or failure
         self.resolving.remove(&canonical);
@@ -180,8 +170,7 @@ impl ModuleCache {
         if self.root_dir.is_none() {
             self.root_dir = Some(base_dir.to_path_buf());
         }
-        let virtual_path = base_dir.join("<source>");
-        self.process_module(source, "<source>", base_dir, virtual_path, runtime_vars)
+        self.process_module(source, "<source>", base_dir, false, runtime_vars)
     }
 
     /// Common module processing: tokenize, parse, build scope, evaluate.
@@ -190,7 +179,7 @@ impl ModuleCache {
         source: &str,
         file_str: &str,
         base_dir: &Path,
-        path: PathBuf,
+        is_md: bool,
         runtime_vars: &HashMap<String, Value>,
     ) -> Result<ResolvedModule, MdsError> {
         // Tokenize and parse
@@ -199,25 +188,21 @@ impl ModuleCache {
 
         // Build scope from frontmatter
         let mut scope = Scope::new();
-        let mut vars = HashMap::new();
-
-        let is_md = path.extension().and_then(|e| e.to_str()) == Some("md");
 
         if let Some(ref fm) = module.frontmatter {
             let yaml_vars = parse_frontmatter(&fm.raw)?;
             for (key, value) in yaml_vars {
                 if key == "type" && is_md {
-                    continue; // Skip the 'type' meta-field only for .md files
+                    // Skip the 'type' meta-field for .md files (it's a file-type marker)
+                    continue;
                 }
-                scope.set_var(&key, value.clone());
-                vars.insert(key, value);
+                scope.set_var(&key, value);
             }
         }
 
         // Apply runtime vars (override frontmatter)
         for (key, value) in runtime_vars {
             scope.set_var(key, value.clone());
-            vars.insert(key.clone(), value.clone());
         }
 
         // Collect function definitions and process imports
@@ -245,13 +230,12 @@ impl ModuleCache {
                 Node::Export(export) => {
                     has_explicit_exports = true;
                     match export {
-                        ExportDirective::Named { name, .. } => {
+                        ExportDirective::Named { name } => {
                             explicit_exports.insert(name.clone());
                         }
                         ExportDirective::ReExport {
                             name,
                             path: import_path,
-                            ..
                         } => {
                             // Resolve the source module and bring in the function for
                             // re-export only. Per spec: "@export from does not bring the
@@ -264,9 +248,7 @@ impl ModuleCache {
                             }
                             explicit_exports.insert(name.clone());
                         }
-                        ExportDirective::Wildcard {
-                            path: import_path, ..
-                        } => {
+                        ExportDirective::Wildcard { path: import_path } => {
                             // Re-export all exports from the target module. These are
                             // available to importers but NOT in the current file's scope.
                             validate_import_path(import_path)?;
@@ -307,10 +289,7 @@ impl ModuleCache {
         };
 
         Ok(ResolvedModule {
-            path,
-            module,
             functions,
-            vars,
             prompt_body,
             has_explicit_exports,
             explicit_exports,
@@ -325,14 +304,14 @@ impl ModuleCache {
         scope: &mut Scope,
     ) -> Result<(), MdsError> {
         match import {
-            ImportDirective::Alias { path, alias, .. } => {
+            ImportDirective::Alias { path, alias } => {
                 validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
                 let resolved = self.resolve(&import_path, runtime_vars)?;
                 let ns = module_to_namespace(&resolved);
                 scope.set_namespace(alias, ns);
             }
-            ImportDirective::Merge { path, .. } => {
+            ImportDirective::Merge { path } => {
                 validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
                 let resolved = self.resolve(&import_path, runtime_vars)?;
@@ -348,7 +327,7 @@ impl ModuleCache {
                     scope.set_var("prompt", val);
                 }
             }
-            ImportDirective::Selective { names, path, .. } => {
+            ImportDirective::Selective { names, path } => {
                 validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
                 let resolved = self.resolve(&import_path, runtime_vars)?;
@@ -416,7 +395,6 @@ impl ResolvedModule {
 fn module_to_namespace(module: &ResolvedModule) -> NamespaceScope {
     NamespaceScope {
         functions: module.get_all_exports().into_iter().collect(),
-        vars: module.vars.clone(),
         prompt_body: module.prompt_body.clone(),
     }
 }

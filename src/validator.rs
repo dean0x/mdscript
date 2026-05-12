@@ -143,10 +143,9 @@ fn validate_expr(
 mod tests {
     use super::*;
 
-    // Fix 6: function bodies validated at definition time
     #[test]
     fn define_body_with_undefined_var_fails_at_validate_time() {
-        // Build a @define greet(name): {undefined_var} @end AST manually.
+        // @define greet(name): {undefined_var} @end — body references undefined var
         let body = vec![Node::Interpolation(crate::ast::Interpolation {
             expr: crate::ast::Expr::Var("undefined_var".to_string()),
             offset: 0,
@@ -156,9 +155,8 @@ mod tests {
             name: "greet".to_string(),
             params: vec!["name".to_string()],
             body,
-            offset: 0,
         });
-        let scope = Scope::new(); // empty scope
+        let scope = Scope::new();
         let result = validate(&[define], &scope, "test.mds", "");
         assert!(
             result.is_err(),
@@ -178,7 +176,6 @@ mod tests {
             name: "greet".to_string(),
             params: vec!["name".to_string()],
             body,
-            offset: 0,
         });
         let scope = Scope::new();
         let result = validate(&[define], &scope, "test.mds", "");

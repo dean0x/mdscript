@@ -67,10 +67,9 @@ impl Parser<'_> {
         }
         self.pos += 1; // skip opening fence
 
-        let fm = if let Some(Token::FrontmatterContent(content, offset)) = self.peek() {
+        let fm = if let Some(Token::FrontmatterContent(content, _offset)) = self.peek() {
             let fm = Frontmatter {
                 raw: content.clone(),
-                offset: *offset,
             };
             self.pos += 1; // skip content
             Some(fm)
@@ -102,11 +101,8 @@ impl Parser<'_> {
                     let node = self.parse_directive()?;
                     nodes.push(node);
                 }
-                Token::Text(text, offset) => {
-                    nodes.push(Node::Text(TextNode {
-                        text: text.clone(),
-                        offset: *offset,
-                    }));
+                Token::Text(text, _offset) => {
+                    nodes.push(Node::Text(TextNode { text: text.clone() }));
                     self.pos += 1;
                 }
                 Token::Interpolation(expr, offset) => {
@@ -118,20 +114,16 @@ impl Parser<'_> {
                     nodes.push(Node::EscapedBrace);
                     self.pos += 1;
                 }
-                Token::CodeFence(fence, offset) => {
+                Token::CodeFence(fence, _offset) => {
                     // Emit code fence as text
                     let mut code_text = fence.clone();
                     code_text.push('\n');
-                    nodes.push(Node::Text(TextNode {
-                        text: code_text,
-                        offset: *offset,
-                    }));
+                    nodes.push(Node::Text(TextNode { text: code_text }));
                     self.pos += 1;
                 }
-                Token::CodeContent(content, offset) => {
+                Token::CodeContent(content, _offset) => {
                     nodes.push(Node::Text(TextNode {
                         text: content.clone(),
-                        offset: *offset,
                     }));
                     self.pos += 1;
                 }
@@ -282,7 +274,7 @@ impl Parser<'_> {
         }))
     }
 
-    fn parse_define_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
+    fn parse_define_block(&mut self, rest: &str, _offset: usize) -> Result<Node, MdsError> {
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
             return Err(MdsError::syntax(format!(
@@ -343,17 +335,12 @@ impl Parser<'_> {
         self.consume_end("@define")?;
 
         self.depth -= 1;
-        Ok(Node::Define(DefineBlock {
-            name,
-            params,
-            body,
-            offset,
-        }))
+        Ok(Node::Define(DefineBlock { name, params, body }))
     }
 }
 
 /// Parse an `@import` directive into a Node.
-fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsError> {
+fn parse_import_directive(directive: &str, _offset: usize) -> Result<Node, MdsError> {
     let rest = directive.trim_start_matches("@import").trim();
 
     // Selective import: @import { name1, name2 } from "path"
@@ -381,26 +368,15 @@ fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
             .trim();
         let path = parse_quoted_path(path_part)?;
 
-        return Ok(Node::Import(ImportDirective::Selective {
-            names,
-            path,
-            offset,
-        }));
+        return Ok(Node::Import(ImportDirective::Selective { names, path }));
     }
 
     // Alias import: @import "path" as alias
     // Merge import: @import "path"
     let path = parse_quoted_path(rest)?;
-    // parse_quoted_path succeeded, so quotes must exist — but use safe fallback
-    let after_path_start = rest
-        .find('"')
-        .ok_or_else(|| MdsError::syntax("missing opening quote in import path"))?;
-    let after_path_end = rest[after_path_start + 1..]
-        .find('"')
-        .ok_or_else(|| MdsError::syntax("missing closing quote in import path"))?
-        + after_path_start
-        + 2;
-    let after = rest[after_path_end..].trim();
+    // Skip past the quoted path: opening `"` + content + closing `"`
+    let quoted_len = 2 + path.len();
+    let after = rest[quoted_len..].trim();
 
     if let Some(alias) = after.strip_prefix("as ") {
         let alias = alias.trim();
@@ -410,10 +386,9 @@ fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
         Ok(Node::Import(ImportDirective::Alias {
             path,
             alias: alias.to_string(),
-            offset,
         }))
     } else if after.is_empty() {
-        Ok(Node::Import(ImportDirective::Merge { path, offset }))
+        Ok(Node::Import(ImportDirective::Merge { path }))
     } else {
         Err(MdsError::syntax(format!(
             "unexpected text after import path: '{after}'"
@@ -422,7 +397,7 @@ fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
 }
 
 /// Parse an `@export` directive into a Node.
-fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsError> {
+fn parse_export_directive(directive: &str, _offset: usize) -> Result<Node, MdsError> {
     let rest = directive.trim_start_matches("@export").trim();
 
     // Wildcard re-export: @export * from "path"
@@ -432,7 +407,7 @@ fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
             .or_else(|| rest.strip_prefix("*from "))
             .unwrap_or("");
         let path = parse_quoted_path(from_part.trim())?;
-        return Ok(Node::Export(ExportDirective::Wildcard { path, offset }));
+        return Ok(Node::Export(ExportDirective::Wildcard { path }));
     }
 
     // Check for "name from" pattern: @export name from "path"
@@ -445,11 +420,7 @@ fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
             )));
         }
         let path = parse_quoted_path(parts[2])?;
-        return Ok(Node::Export(ExportDirective::ReExport {
-            name,
-            path,
-            offset,
-        }));
+        return Ok(Node::Export(ExportDirective::ReExport { name, path }));
     }
 
     // Named export: @export name
@@ -460,7 +431,7 @@ fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
     if !is_valid_identifier(&name) {
         return Err(MdsError::syntax(format!("invalid export name: '{name}'")));
     }
-    Ok(Node::Export(ExportDirective::Named { name, offset }))
+    Ok(Node::Export(ExportDirective::Named { name }))
 }
 
 /// Parse a quoted path like `"./utils.mds"` and return the inner string.
@@ -799,7 +770,6 @@ mod tests {
         }
     }
 
-    // Fix 1 & 2: parse_single_arg panic guard and escape handling
     #[test]
     fn parse_single_arg_lone_quote_returns_error() {
         // A lone `"` is not a valid string literal (len < 2) — must not panic
@@ -876,7 +846,6 @@ mod tests {
         );
     }
 
-    // Fix 3: ASCII-only identifier validation
     #[test]
     fn is_valid_identifier_rejects_unicode() {
         assert!(!is_valid_identifier("café"), "unicode must be rejected");

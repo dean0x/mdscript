@@ -9,8 +9,6 @@ pub struct Module {
 #[derive(Debug, Clone)]
 pub struct Frontmatter {
     pub raw: String,
-    #[allow(dead_code)]
-    pub offset: usize,
 }
 
 /// Top-level AST nodes.
@@ -39,8 +37,6 @@ pub enum Node {
 #[derive(Debug, Clone)]
 pub struct TextNode {
     pub text: String,
-    #[allow(dead_code)]
-    pub offset: usize,
 }
 
 /// An interpolation expression inside `{ }`.
@@ -94,55 +90,26 @@ pub struct DefineBlock {
     pub name: String,
     pub params: Vec<String>,
     pub body: Vec<Node>,
-    #[allow(dead_code)]
-    pub offset: usize,
 }
 
 #[derive(Debug, Clone)]
 pub enum ImportDirective {
     /// `@import "path" as alias`
-    Alias {
-        path: String,
-        alias: String,
-        #[allow(dead_code)]
-        offset: usize,
-    },
+    Alias { path: String, alias: String },
     /// `@import "path"` (merge)
-    Merge {
-        path: String,
-        #[allow(dead_code)]
-        offset: usize,
-    },
+    Merge { path: String },
     /// `@import { name1, name2 } from "path"`
-    Selective {
-        names: Vec<String>,
-        path: String,
-        #[allow(dead_code)]
-        offset: usize,
-    },
+    Selective { names: Vec<String>, path: String },
 }
 
 #[derive(Debug, Clone)]
 pub enum ExportDirective {
     /// `@export name`
-    Named {
-        name: String,
-        #[allow(dead_code)]
-        offset: usize,
-    },
+    Named { name: String },
     /// `@export name from "path"`
-    ReExport {
-        name: String,
-        path: String,
-        #[allow(dead_code)]
-        offset: usize,
-    },
+    ReExport { name: String, path: String },
     /// `@export * from "path"`
-    Wildcard {
-        path: String,
-        #[allow(dead_code)]
-        offset: usize,
-    },
+    Wildcard { path: String },
 }
 
 #[derive(Debug, Clone)]
