@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::error::MdsError;
+
 /// Runtime value type for MDS variables and expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -25,7 +27,7 @@ impl Value {
     }
 
     /// Convert a serde_yml::Value into our Value enum.
-    pub fn from_yaml(yaml: serde_yml::Value) -> Result<Value, String> {
+    pub fn from_yaml(yaml: serde_yml::Value) -> Result<Value, MdsError> {
         match yaml {
             serde_yml::Value::Null => Ok(Value::Null),
             serde_yml::Value::Bool(b) => Ok(Value::Boolean(b)),
@@ -35,24 +37,26 @@ impl Value {
                 } else if let Some(f) = n.as_f64() {
                     Ok(Value::Number(f))
                 } else {
-                    Err(format!("unsupported number: {n:?}"))
+                    Err(MdsError::YamlError {
+                        message: format!("unsupported number: {n:?}"),
+                    })
                 }
             }
             serde_yml::Value::String(s) => Ok(Value::String(s)),
             serde_yml::Value::Sequence(seq) => {
-                let items: Result<Vec<Value>, String> =
+                let items: Result<Vec<Value>, MdsError> =
                     seq.into_iter().map(Value::from_yaml).collect();
                 Ok(Value::Array(items?))
             }
-            serde_yml::Value::Mapping(_) => {
-                Err("object/map types are not supported in MDS v0.1".to_string())
-            }
+            serde_yml::Value::Mapping(_) => Err(MdsError::YamlError {
+                message: "object/map types are not supported in MDS v0.1".to_string(),
+            }),
             serde_yml::Value::Tagged(t) => Value::from_yaml(t.value),
         }
     }
 
     /// Convert a serde_json::Value into our Value enum.
-    pub fn from_json(json: serde_json::Value) -> Result<Value, String> {
+    pub fn from_json(json: serde_json::Value) -> Result<Value, MdsError> {
         match json {
             serde_json::Value::Null => Ok(Value::Null),
             serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
@@ -60,18 +64,20 @@ impl Value {
                 if let Some(f) = n.as_f64() {
                     Ok(Value::Number(f))
                 } else {
-                    Err(format!("unsupported number: {n:?}"))
+                    Err(MdsError::JsonError {
+                        message: format!("unsupported number: {n:?}"),
+                    })
                 }
             }
             serde_json::Value::String(s) => Ok(Value::String(s)),
             serde_json::Value::Array(arr) => {
-                let items: Result<Vec<Value>, String> =
+                let items: Result<Vec<Value>, MdsError> =
                     arr.into_iter().map(Value::from_json).collect();
                 Ok(Value::Array(items?))
             }
-            serde_json::Value::Object(_) => {
-                Err("object/map types are not supported in MDS v0.1".to_string())
-            }
+            serde_json::Value::Object(_) => Err(MdsError::JsonError {
+                message: "object/map types are not supported in MDS v0.1".to_string(),
+            }),
         }
     }
 

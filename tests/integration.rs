@@ -108,7 +108,14 @@ fn circular_import_error() {
     let result = mds::compile(&fixture("circular_a.mds"), None);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("circular import"));
+    assert!(
+        err.contains("circular import"),
+        "expected circular import error, got: {err}"
+    );
+    assert!(
+        err.contains('\u{2192}'),
+        "expected cycle chain with → arrow, got: {err}"
+    );
 }
 
 #[test]

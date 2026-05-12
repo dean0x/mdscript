@@ -98,47 +98,46 @@ fn resolve_args(args: &[Arg], scope: &Scope) -> Result<Vec<Value>, MdsError> {
         .collect()
 }
 
+fn invoke_function(
+    func: &FunctionDef,
+    call_key: &str,
+    args: &[Value],
+    scope: &mut Scope,
+    call_stack: &mut HashSet<String>,
+) -> Result<String, MdsError> {
+    if call_stack.contains(call_key) {
+        return Err(MdsError::recursion(call_key));
+    }
+    if call_stack.len() >= MAX_CALL_DEPTH {
+        return Err(MdsError::recursion(format!(
+            "{call_key} (call depth exceeds {MAX_CALL_DEPTH})"
+        )));
+    }
+    if args.len() != func.params.len() {
+        return Err(MdsError::arity(call_key, func.params.len(), args.len()));
+    }
+    scope.push();
+    for (param, value) in func.params.iter().zip(args.iter()) {
+        scope.set_var(param, value.clone());
+    }
+    call_stack.insert(call_key.to_string());
+    let result = evaluate_nodes(&func.body, scope, call_stack);
+    call_stack.remove(call_key);
+    scope.pop();
+    result
+}
+
 fn call_function(
     name: &str,
     args: &[Value],
     scope: &mut Scope,
     call_stack: &mut HashSet<String>,
 ) -> Result<String, MdsError> {
-    // Check for recursion
-    if call_stack.contains(name) {
-        return Err(MdsError::Recursion {
-            name: name.to_string(),
-        });
-    }
-    // Guard against excessive call depth (A -> B -> C -> ... )
-    if call_stack.len() >= MAX_CALL_DEPTH {
-        return Err(MdsError::Recursion {
-            name: format!("{name} (call depth exceeds {MAX_CALL_DEPTH})"),
-        });
-    }
-
     let func = scope
         .get_function(name)
         .ok_or_else(|| MdsError::undefined_fn(name))?
         .clone();
-
-    // Check arity
-    if args.len() != func.params.len() {
-        return Err(MdsError::arity(name, func.params.len(), args.len()));
-    }
-
-    // Create function scope
-    scope.push();
-    for (param, value) in func.params.iter().zip(args.iter()) {
-        scope.set_var(param, value.clone());
-    }
-
-    call_stack.insert(name.to_string());
-    let result = evaluate_nodes(&func.body, scope, call_stack);
-    call_stack.remove(name);
-
-    scope.pop();
-    result
+    invoke_function(&func, name, args, scope, call_stack)
 }
 
 fn call_qualified_function(
@@ -150,19 +149,6 @@ fn call_qualified_function(
 ) -> Result<String, MdsError> {
     let qualified_name = format!("{namespace}.{name}");
 
-    // Check for recursion
-    if call_stack.contains(&qualified_name) {
-        return Err(MdsError::Recursion {
-            name: qualified_name,
-        });
-    }
-    // Guard against excessive call depth
-    if call_stack.len() >= MAX_CALL_DEPTH {
-        return Err(MdsError::Recursion {
-            name: format!("{qualified_name} (call depth exceeds {MAX_CALL_DEPTH})"),
-        });
-    }
-
     let ns = scope
         .get_namespace(namespace)
         .ok_or_else(|| MdsError::undefined_var(namespace))?;
@@ -173,27 +159,7 @@ fn call_qualified_function(
         .ok_or_else(|| MdsError::undefined_fn(&qualified_name))?
         .clone();
 
-    // Check arity
-    if args.len() != func.params.len() {
-        return Err(MdsError::arity(
-            &qualified_name,
-            func.params.len(),
-            args.len(),
-        ));
-    }
-
-    // Create function scope with the namespace's scope visible
-    scope.push();
-    for (param, value) in func.params.iter().zip(args.iter()) {
-        scope.set_var(param, value.clone());
-    }
-
-    call_stack.insert(qualified_name.clone());
-    let result = evaluate_nodes(&func.body, scope, call_stack);
-    call_stack.remove(&qualified_name);
-
-    scope.pop();
-    result
+    invoke_function(&func, &qualified_name, args, scope, call_stack)
 }
 
 fn evaluate_if(

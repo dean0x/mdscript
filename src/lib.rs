@@ -120,7 +120,7 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
     let mut vars = HashMap::new();
     if let serde_json::Value::Object(map) = json {
         for (key, val) in map {
-            let value = Value::from_json(val).map_err(|e| MdsError::JsonError { message: e })?;
+            let value = Value::from_json(val)?;
             vars.insert(key, value);
         }
     } else {

@@ -70,7 +70,13 @@ pub enum MdsError {
 
     #[error("file not found: {path}")]
     #[diagnostic(code(mds::file_not_found))]
-    FileNotFound { path: String },
+    FileNotFound {
+        path: String,
+        #[label("imported here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
 
     #[error("import error: {message}")]
     #[diagnostic(code(mds::import))]
@@ -78,7 +84,13 @@ pub enum MdsError {
 
     #[error("name collision: '{name}' is already defined")]
     #[diagnostic(code(mds::name_collision))]
-    NameCollision { name: String },
+    NameCollision {
+        name: String,
+        #[label("collision here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
 
     #[error("not an MDS file: {path}")]
     #[diagnostic(
@@ -101,7 +113,13 @@ pub enum MdsError {
 
     #[error("recursion detected in function '{name}'")]
     #[diagnostic(code(mds::recursion))]
-    Recursion { name: String },
+    Recursion {
+        name: String,
+        #[label("recursive call here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
 
     #[error("export error: {message}")]
     #[diagnostic(code(mds::export))]
@@ -190,6 +208,58 @@ impl MdsError {
             got: got.into(),
             span: None,
             src: None,
+        }
+    }
+
+    pub fn name_collision(name: impl Into<String>) -> Self {
+        MdsError::NameCollision {
+            name: name.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    pub fn name_collision_at(
+        name: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        MdsError::NameCollision {
+            name: name.into(),
+            span: Some(SourceSpan::new(offset.into(), len)),
+            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
+        }
+    }
+
+    pub fn recursion(name: impl Into<String>) -> Self {
+        MdsError::Recursion {
+            name: name.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    pub fn file_not_found(path: impl Into<String>) -> Self {
+        MdsError::FileNotFound {
+            path: path.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    pub fn file_not_found_at(
+        path: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        MdsError::FileNotFound {
+            path: path.into(),
+            span: Some(SourceSpan::new(offset.into(), len)),
+            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
         }
     }
 }

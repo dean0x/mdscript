@@ -30,8 +30,10 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// Module cache to avoid re-resolving the same file.
 pub struct ModuleCache {
     modules: HashMap<PathBuf, ResolvedModule>,
-    /// Tracks modules currently being resolved (for cycle detection).
+    /// Tracks modules currently being resolved (for cycle detection), O(1) lookup.
     resolving: HashSet<PathBuf>,
+    /// Preserves insertion order of the resolving set for cycle path reconstruction.
+    resolving_stack: Vec<PathBuf>,
 }
 
 impl Default for ModuleCache {
@@ -45,6 +47,7 @@ impl ModuleCache {
         ModuleCache {
             modules: HashMap::new(),
             resolving: HashSet::new(),
+            resolving_stack: Vec::new(),
         }
     }
 
@@ -54,9 +57,9 @@ impl ModuleCache {
         path: &Path,
         runtime_vars: &HashMap<String, Value>,
     ) -> Result<ResolvedModule, MdsError> {
-        let canonical = path.canonicalize().map_err(|_| MdsError::FileNotFound {
-            path: path.display().to_string(),
-        })?;
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
 
         // Check cache
         if let Some(cached) = self.modules.get(&canonical) {
@@ -65,7 +68,7 @@ impl ModuleCache {
 
         // Check for circular imports
         if self.resolving.contains(&canonical) {
-            let cycle = canonical.display().to_string();
+            let cycle = build_cycle_string(&self.resolving_stack, &canonical);
             return Err(MdsError::CircularImport { cycle });
         }
 
@@ -91,6 +94,7 @@ impl ModuleCache {
 
         // Mark as resolving before recursing into process_module
         self.resolving.insert(canonical.clone());
+        self.resolving_stack.push(canonical.clone());
 
         let resolved = self.process_module(
             &source,
@@ -98,10 +102,15 @@ impl ModuleCache {
             &base_dir,
             canonical.clone(),
             runtime_vars,
-        )?;
+        );
 
-        // Cache and unmark
+        // Unmark regardless of success or failure
         self.resolving.remove(&canonical);
+        self.resolving_stack.pop();
+
+        let resolved = resolved?;
+
+        // Cache
         self.modules.insert(canonical, resolved.clone());
 
         Ok(resolved)
@@ -202,7 +211,7 @@ impl ModuleCache {
                             let source_module = self.resolve(&resolved_path, runtime_vars)?;
                             for (name, func) in source_module.get_all_exports() {
                                 if functions.contains_key(&name) {
-                                    return Err(MdsError::NameCollision { name });
+                                    return Err(MdsError::name_collision(name));
                                 }
                                 functions.insert(name.clone(), func);
                                 explicit_exports.insert(name);
@@ -257,13 +266,13 @@ impl ModuleCache {
                 let resolved = self.resolve(&import_path, runtime_vars)?;
                 for (name, func) in resolved.get_all_exports() {
                     if scope.get_function(&name).is_some() {
-                        return Err(MdsError::NameCollision { name });
+                        return Err(MdsError::name_collision(name));
                     }
                     scope.set_function(&name, func);
                 }
                 for (name, value) in &resolved.vars {
                     if scope.get_var(name).is_some() {
-                        return Err(MdsError::NameCollision { name: name.clone() });
+                        return Err(MdsError::name_collision(name.clone()));
                     }
                     scope.set_var(name, value.clone());
                 }
@@ -372,7 +381,31 @@ fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
     }
 }
 
-/// Parse YAML frontmatter into a map of values.
+/// Format a cycle chain like "a.mds → b.mds → a.mds" from the resolving stack.
+fn build_cycle_string(resolving_stack: &[PathBuf], repeated: &Path) -> String {
+    let start = resolving_stack
+        .iter()
+        .position(|p| p == repeated)
+        .unwrap_or(0);
+    let mut parts: Vec<String> = resolving_stack[start..]
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_else(|| p.to_str().unwrap_or("?"))
+                .to_string()
+        })
+        .collect();
+    parts.push(
+        repeated
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| repeated.to_str().unwrap_or("?"))
+            .to_string(),
+    );
+    parts.join(" \u{2192} ")
+}
+
 fn parse_frontmatter(raw: &str) -> Result<HashMap<String, Value>, MdsError> {
     let yaml: serde_yml::Value = serde_yml::from_str(raw).map_err(|e| MdsError::YamlError {
         message: e.to_string(),
@@ -384,7 +417,7 @@ fn parse_frontmatter(raw: &str) -> Result<HashMap<String, Value>, MdsError> {
             let serde_yml::Value::String(key_str) = key else {
                 continue;
             };
-            let value = Value::from_yaml(val).map_err(|e| MdsError::YamlError { message: e })?;
+            let value = Value::from_yaml(val)?;
             vars.insert(key_str, value);
         }
     }
