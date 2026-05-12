@@ -75,13 +75,45 @@ impl ModuleCache {
         })?;
 
         let file_str = canonical.display().to_string();
+        let base_dir = canonical.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-        // Tokenize and parse
-        let tokens = tokenize(&source, &file_str)?;
-        let module = parse(&tokens, &file_str)?;
-
-        // Mark as resolving
+        // Mark as resolving before recursing into process_module
         self.resolving.insert(canonical.clone());
+
+        let resolved =
+            self.process_module(&source, &file_str, &base_dir, canonical.clone(), runtime_vars)?;
+
+        // Cache and unmark
+        self.resolving.remove(&canonical);
+        self.modules.insert(canonical, resolved.clone());
+
+        Ok(resolved)
+    }
+
+    /// Resolve a module from an in-memory source string.
+    /// Imports within the source are resolved relative to `base_dir`.
+    pub fn resolve_source(
+        &mut self,
+        source: &str,
+        base_dir: &Path,
+        runtime_vars: &HashMap<String, Value>,
+    ) -> Result<ResolvedModule, MdsError> {
+        let virtual_path = base_dir.join("<source>");
+        self.process_module(source, "<source>", base_dir, virtual_path, runtime_vars)
+    }
+
+    /// Common module processing: tokenize, parse, build scope, evaluate.
+    fn process_module(
+        &mut self,
+        source: &str,
+        file_str: &str,
+        base_dir: &Path,
+        path: PathBuf,
+        runtime_vars: &HashMap<String, Value>,
+    ) -> Result<ResolvedModule, MdsError> {
+        // Tokenize and parse
+        let tokens = tokenize(source, file_str)?;
+        let module = parse(&tokens, file_str)?;
 
         // Build scope from frontmatter
         let mut scope = Scope::new();
@@ -109,9 +141,6 @@ impl ModuleCache {
         let mut has_explicit_exports = false;
         let mut explicit_exports = HashSet::new();
 
-        // First pass: resolve imports and collect definitions
-        let base_dir = canonical.parent().unwrap_or(Path::new("."));
-
         for node in &module.body {
             match node {
                 Node::Define(def) => {
@@ -128,24 +157,24 @@ impl ModuleCache {
                         ExportDirective::Named { name, .. } => {
                             explicit_exports.insert(name.clone());
                         }
-                        ExportDirective::ReExport { name, path, .. } => {
+                        ExportDirective::ReExport { name, path: import_path, .. } => {
                             // Resolve the source module and bring in the function for
                             // re-export only. Per spec: "@export from does not bring the
                             // symbol into the current file's scope".
-                            validate_import_path(path)?;
-                            let import_path = resolve_path(base_dir, path);
-                            let source_module = self.resolve(&import_path, runtime_vars)?;
+                            validate_import_path(import_path)?;
+                            let resolved_path = resolve_path(base_dir, import_path);
+                            let source_module = self.resolve(&resolved_path, runtime_vars)?;
                             if let Some(func) = source_module.get_export(name) {
                                 functions.insert(name.clone(), func);
                             }
                             explicit_exports.insert(name.clone());
                         }
-                        ExportDirective::Wildcard { path, .. } => {
+                        ExportDirective::Wildcard { path: import_path, .. } => {
                             // Re-export all exports from the target module. These are
                             // available to importers but NOT in the current file's scope.
-                            validate_import_path(path)?;
-                            let import_path = resolve_path(base_dir, path);
-                            let source_module = self.resolve(&import_path, runtime_vars)?;
+                            validate_import_path(import_path)?;
+                            let resolved_path = resolve_path(base_dir, import_path);
+                            let source_module = self.resolve(&resolved_path, runtime_vars)?;
                             for (name, func) in source_module.get_all_exports() {
                                 if functions.contains_key(&name) {
                                     return Err(MdsError::NameCollision { name });
@@ -171,21 +200,15 @@ impl ModuleCache {
             Some(prompt_body)
         };
 
-        let resolved = ResolvedModule {
-            path: canonical.clone(),
+        Ok(ResolvedModule {
+            path,
             module,
             functions,
             vars,
             prompt_body,
             has_explicit_exports,
             explicit_exports,
-        };
-
-        // Cache and unmark
-        self.resolving.remove(&canonical);
-        self.modules.insert(canonical, resolved.clone());
-
-        Ok(resolved)
+        })
     }
 
     fn resolve_import(

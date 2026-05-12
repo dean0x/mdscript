@@ -31,6 +31,37 @@ pub fn compile(path: &Path, runtime_vars: Option<HashMap<String, Value>>) -> Res
     }
 }
 
+/// Compile MDS source code from a string.
+///
+/// # Arguments
+/// * `source` — MDS source code
+/// * `base_dir` — Base directory for resolving imports (defaults to current dir)
+/// * `runtime_vars` — Optional runtime variable overrides
+pub fn compile_str(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<String, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let cwd;
+    let dir = match base_dir {
+        Some(d) => d,
+        None => {
+            cwd = std::env::current_dir().map_err(|e| MdsError::Io {
+                message: format!("cannot determine current directory: {e}"),
+            })?;
+            cwd.as_path()
+        }
+    };
+    let mut cache = ModuleCache::new();
+    let resolved = cache.resolve_source(source, dir, &vars)?;
+
+    match resolved.prompt_body {
+        Some(body) => Ok(clean_output(&body)),
+        None => Ok(String::new()),
+    }
+}
+
 /// Check (validate) an MDS file without rendering output.
 /// Returns Ok(()) if the file is valid, or an error describing the problem.
 pub fn check(path: &Path, runtime_vars: Option<HashMap<String, Value>>) -> Result<(), MdsError> {

@@ -258,3 +258,16 @@ fn empty_array_loop() {
     assert!(!result.contains("- apple"));
     assert!(!result.contains("- banana"));
 }
+
+#[test]
+fn compile_str_simple() {
+    let source = "---\nname: World\n---\nHello {name}!\n";
+    let result = mds::compile_str(source, None, None).unwrap();
+    assert!(result.contains("Hello World!"));
+}
+
+#[test]
+fn compile_str_no_frontmatter() {
+    let result = mds::compile_str("Just plain text.", None, None).unwrap();
+    assert!(result.contains("Just plain text."));
+}

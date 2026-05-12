@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -15,11 +15,11 @@ struct Cli {
 enum Commands {
     /// Compile an MDS file to Markdown
     Build {
-        /// Input .mds file
+        /// Input .mds file (use "-" to read from stdin)
         input: PathBuf,
         /// Output file (stdout if omitted)
-        #[arg(short, long)]
-        o: Option<PathBuf>,
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
@@ -31,6 +31,12 @@ enum Commands {
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
+    },
+    /// Create a starter MDS file
+    Init {
+        /// Output filename
+        #[arg(default_value = "hello.mds")]
+        filename: PathBuf,
     },
 }
 
@@ -53,16 +59,27 @@ fn load_runtime_vars(
 
 fn run(cli: Cli) -> Result<(), miette::Error> {
     match cli.command {
-        Commands::Build { input, o, vars } => {
+        Commands::Build { input, output, vars } => {
             let runtime_vars = load_runtime_vars(vars)?;
-            let output = mds::compile(&input, runtime_vars).map_err(miette::Error::from)?;
 
-            if let Some(output_path) = o {
-                std::fs::write(&output_path, &output)
+            let compiled = if input == Path::new("-") {
+                // Read from stdin
+                let source = std::io::read_to_string(std::io::stdin())
+                    .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
+                let cwd = std::env::current_dir()
+                    .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
+                mds::compile_str(&source, Some(&cwd), runtime_vars)
+                    .map_err(miette::Error::from)?
+            } else {
+                mds::compile(&input, runtime_vars).map_err(miette::Error::from)?
+            };
+
+            if let Some(output_path) = output {
+                std::fs::write(&output_path, &compiled)
                     .map_err(|e| miette::miette!("cannot write {}: {e}", output_path.display()))?;
                 eprintln!("Compiled to {}", output_path.display());
             } else {
-                print!("{output}");
+                print!("{compiled}");
             }
             Ok(())
         }
@@ -70,6 +87,25 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             let runtime_vars = load_runtime_vars(vars)?;
             mds::check(&input, runtime_vars).map_err(miette::Error::from)?;
             eprintln!("OK: {}", input.display());
+            Ok(())
+        }
+        Commands::Init { filename } => {
+            let starter = "\
+---
+name: World
+items: [one, two, three]
+---
+
+Hello {name}!
+
+Your items:
+@for item in items:
+- {item}
+@end
+";
+            std::fs::write(&filename, starter)
+                .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
+            eprintln!("Created {}", filename.display());
             Ok(())
         }
     }

@@ -3,12 +3,9 @@ use crate::error::MdsError;
 use crate::scope::Scope;
 
 /// Validate semantic correctness of a module AST.
-/// Checks variable references, function arity, and type constraints.
-///
-/// Note: Currently not wired into the compilation pipeline because the
-/// evaluator performs equivalent runtime checks. Static validation cannot
-/// fully handle block-scoped variables (e.g., @for loop vars) without
-/// simulating evaluation. Kept as a public API for tooling (LSP, linters).
+/// Checks variable references, function arity, and type constraints
+/// before evaluation. Block-scoped variables (e.g., @for loop vars)
+/// are verified at evaluation time.
 pub fn validate(nodes: &[Node], scope: &Scope) -> Result<(), MdsError> {
     for node in nodes {
         validate_node(node, scope)?;
