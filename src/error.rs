@@ -17,7 +17,10 @@ pub enum MdsError {
     },
 
     #[error("undefined variable '{name}'")]
-    #[diagnostic(code(mds::undefined_var), help("define '{name}' in frontmatter or imports"))]
+    #[diagnostic(
+        code(mds::undefined_var),
+        help("define '{name}' in frontmatter or imports")
+    )]
     UndefinedVariable {
         name: String,
         #[label("not defined")]

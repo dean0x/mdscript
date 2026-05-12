@@ -130,7 +130,10 @@ fn arity_mismatch_error() {
 #[test]
 fn runtime_vars_override() {
     let mut vars = HashMap::new();
-    vars.insert("name".to_string(), mds::value::Value::String("Override".to_string()));
+    vars.insert(
+        "name".to_string(),
+        mds::value::Value::String("Override".to_string()),
+    );
     let result = mds::compile(&fixture("simple.mds"), Some(vars)).unwrap();
     assert!(result.contains("Hello Override!"));
 }
@@ -176,10 +179,7 @@ fn vars_file_loading() {
         vars.get("name"),
         Some(&mds::value::Value::String("FromJSON".to_string()))
     );
-    assert_eq!(
-        vars.get("count"),
-        Some(&mds::value::Value::Number(99.0))
-    );
+    assert_eq!(vars.get("count"), Some(&mds::value::Value::Number(99.0)));
 
     // Clean up
     let _ = std::fs::remove_file(&vars_path);
@@ -242,7 +242,10 @@ fn unicode_content() {
 fn for_iterate_non_array_error() {
     // Attempting to iterate over a non-array should produce a type error
     let mut vars = HashMap::new();
-    vars.insert("items".to_string(), mds::value::Value::String("not_an_array".to_string()));
+    vars.insert(
+        "items".to_string(),
+        mds::value::Value::String("not_an_array".to_string()),
+    );
     let result = mds::compile(&fixture("loop.mds"), Some(vars));
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());

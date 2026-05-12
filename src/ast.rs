@@ -55,10 +55,7 @@ pub enum Expr {
     /// Simple variable reference: `{name}`
     Var(String),
     /// Function call: `{greet("Alice")}` or `{greet(name)}`
-    Call {
-        name: String,
-        args: Vec<Arg>,
-    },
+    Call { name: String, args: Vec<Arg> },
     /// Qualified call: `{utils.greet("Alice")}`
     QualifiedCall {
         namespace: String,
@@ -107,10 +104,7 @@ pub enum ImportDirective {
         offset: usize,
     },
     /// `@import "path"` (merge)
-    Merge {
-        path: String,
-        offset: usize,
-    },
+    Merge { path: String, offset: usize },
     /// `@import { name1, name2 } from "path"`
     Selective {
         names: Vec<String>,
@@ -122,10 +116,7 @@ pub enum ImportDirective {
 #[derive(Debug, Clone)]
 pub enum ExportDirective {
     /// `@export name`
-    Named {
-        name: String,
-        offset: usize,
-    },
+    Named { name: String, offset: usize },
     /// `@export name from "path"`
     ReExport {
         name: String,
@@ -133,10 +124,7 @@ pub enum ExportDirective {
         offset: usize,
     },
     /// `@export * from "path"`
-    Wildcard {
-        path: String,
-        offset: usize,
-    },
+    Wildcard { path: String, offset: usize },
 }
 
 #[derive(Debug, Clone)]

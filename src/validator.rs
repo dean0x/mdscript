@@ -123,4 +123,3 @@ fn validate_var_args(args: &[Arg], scope: &Scope) -> Result<(), MdsError> {
     }
     Ok(())
 }
-

@@ -61,13 +61,10 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
         let mut found_close = false;
         while pos < chars.len() {
             // Check if current position starts a line with ---
-            if is_line_start_chars(&chars, pos)
-                && source[byte_pos(pos)..].starts_with("---")
-            {
+            if is_line_start_chars(&chars, pos) && source[byte_pos(pos)..].starts_with("---") {
                 let end_pos = pos + 3;
-                let at_end = end_pos >= chars.len()
-                    || chars[end_pos] == '\n'
-                    || chars[end_pos] == '\r';
+                let at_end =
+                    end_pos >= chars.len() || chars[end_pos] == '\n' || chars[end_pos] == '\r';
                 if at_end {
                     let content: String = chars[fm_start..pos].iter().collect();
                     let fm_byte_offset = byte_pos(fm_start);
@@ -133,9 +130,7 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
             let mut content = String::new();
             while pos < chars.len() {
                 // Check for closing code fence
-                if is_line_start_chars(&chars, pos)
-                    && source[byte_pos(pos)..].starts_with("```")
-                {
+                if is_line_start_chars(&chars, pos) && source[byte_pos(pos)..].starts_with("```") {
                     break;
                 }
                 content.push(chars[pos]);
@@ -217,9 +212,7 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
             if is_line_start_chars(&chars, pos) && chars[pos] == '@' {
                 break;
             }
-            if is_line_start_chars(&chars, pos)
-                && source[byte_pos(pos)..].starts_with("```")
-            {
+            if is_line_start_chars(&chars, pos) && source[byte_pos(pos)..].starts_with("```") {
                 break;
             }
             text.push(chars[pos]);
@@ -275,7 +268,9 @@ mod tests {
     fn tokenize_frontmatter() {
         let src = "---\nname: Alice\n---\nHello!";
         let tokens = tokenize(src, "test.mds").unwrap();
-        assert!(tokens.iter().any(|t| matches!(t, Token::FrontmatterContent(_, _))));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, Token::FrontmatterContent(_, _))));
     }
 
     #[test]
@@ -290,15 +285,17 @@ mod tests {
         let tokens = tokenize(src, "test.mds").unwrap();
         // The {no_interp} should be CodeContent, not Interpolation
         assert!(tokens.iter().any(|t| matches!(t, Token::CodeContent(_, _))));
-        assert!(!tokens.iter().any(|t| {
-            matches!(t, Token::Interpolation(s, _) if s == "no_interp")
-        }));
+        assert!(!tokens
+            .iter()
+            .any(|t| { matches!(t, Token::Interpolation(s, _) if s == "no_interp") }));
     }
 
     #[test]
     fn tokenize_directive() {
         let src = "@if premium:\nContent\n@end\n";
         let tokens = tokenize(src, "test.mds").unwrap();
-        assert!(tokens.iter().any(|t| matches!(t, Token::Directive(d, _) if d.starts_with("@if"))));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, Token::Directive(d, _) if d.starts_with("@if"))));
     }
 }

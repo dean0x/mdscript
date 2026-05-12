@@ -160,7 +160,11 @@ fn call_qualified_function(
 
     // Check arity
     if args.len() != func.params.len() {
-        return Err(MdsError::arity(&qualified_name, func.params.len(), args.len()));
+        return Err(MdsError::arity(
+            &qualified_name,
+            func.params.len(),
+            args.len(),
+        ));
     }
 
     // Create function scope with the namespace's scope visible

@@ -59,7 +59,11 @@ fn load_runtime_vars(
 
 fn run(cli: Cli) -> Result<(), miette::Error> {
     match cli.command {
-        Commands::Build { input, output, vars } => {
+        Commands::Build {
+            input,
+            output,
+            vars,
+        } => {
             let runtime_vars = load_runtime_vars(vars)?;
 
             let compiled = if input == Path::new("-") {
@@ -68,8 +72,7 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
                     .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
                 let cwd = std::env::current_dir()
                     .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
-                mds::compile_str(&source, Some(&cwd), runtime_vars)
-                    .map_err(miette::Error::from)?
+                mds::compile_str(&source, Some(&cwd), runtime_vars).map_err(miette::Error::from)?
             } else {
                 mds::compile(&input, runtime_vars).map_err(miette::Error::from)?
             };

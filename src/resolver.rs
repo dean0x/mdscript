@@ -49,11 +49,9 @@ impl ModuleCache {
         path: &Path,
         runtime_vars: &HashMap<String, Value>,
     ) -> Result<ResolvedModule, MdsError> {
-        let canonical = path
-            .canonicalize()
-            .map_err(|_| MdsError::FileNotFound {
-                path: path.display().to_string(),
-            })?;
+        let canonical = path.canonicalize().map_err(|_| MdsError::FileNotFound {
+            path: path.display().to_string(),
+        })?;
 
         // Check cache
         if let Some(cached) = self.modules.get(&canonical) {
@@ -80,8 +78,13 @@ impl ModuleCache {
         // Mark as resolving before recursing into process_module
         self.resolving.insert(canonical.clone());
 
-        let resolved =
-            self.process_module(&source, &file_str, &base_dir, canonical.clone(), runtime_vars)?;
+        let resolved = self.process_module(
+            &source,
+            &file_str,
+            &base_dir,
+            canonical.clone(),
+            runtime_vars,
+        )?;
 
         // Cache and unmark
         self.resolving.remove(&canonical);
@@ -157,7 +160,11 @@ impl ModuleCache {
                         ExportDirective::Named { name, .. } => {
                             explicit_exports.insert(name.clone());
                         }
-                        ExportDirective::ReExport { name, path: import_path, .. } => {
+                        ExportDirective::ReExport {
+                            name,
+                            path: import_path,
+                            ..
+                        } => {
                             // Resolve the source module and bring in the function for
                             // re-export only. Per spec: "@export from does not bring the
                             // symbol into the current file's scope".
@@ -169,7 +176,9 @@ impl ModuleCache {
                             }
                             explicit_exports.insert(name.clone());
                         }
-                        ExportDirective::Wildcard { path: import_path, .. } => {
+                        ExportDirective::Wildcard {
+                            path: import_path, ..
+                        } => {
                             // Re-export all exports from the target module. These are
                             // available to importers but NOT in the current file's scope.
                             validate_import_path(import_path)?;
@@ -249,9 +258,7 @@ impl ModuleCache {
                         scope.set_function(name, func);
                     } else {
                         return Err(MdsError::ImportError {
-                            message: format!(
-                                "'{name}' is not exported from '{path}'"
-                            ),
+                            message: format!("'{name}' is not exported from '{path}'"),
                         });
                     }
                 }
@@ -306,9 +313,7 @@ fn resolve_path(base_dir: &Path, relative: &str) -> PathBuf {
 fn validate_import_path(path: &str) -> Result<(), MdsError> {
     if !path.starts_with("./") && !path.starts_with("../") {
         return Err(MdsError::ImportError {
-            message: format!(
-                "import path must be relative (start with './' or '../'): \"{path}\""
-            ),
+            message: format!("import path must be relative (start with './' or '../'): \"{path}\""),
         });
     }
     Ok(())
@@ -317,10 +322,7 @@ fn validate_import_path(path: &str) -> Result<(), MdsError> {
 /// Validate that a file is a valid MDS file.
 /// Accepts the already-read source content to avoid double-reading for `.md` files.
 fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
         "mds" => Ok(()),

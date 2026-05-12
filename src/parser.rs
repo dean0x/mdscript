@@ -251,9 +251,9 @@ impl<'a> Parser<'a> {
             .trim();
 
         // Parse "name(params)"
-        let paren_start = rest
-            .find('(')
-            .ok_or_else(|| MdsError::syntax("@define must have parameter list: @define name(params):"))?;
+        let paren_start = rest.find('(').ok_or_else(|| {
+            MdsError::syntax("@define must have parameter list: @define name(params):")
+        })?;
         let paren_end = rest
             .find(')')
             .ok_or_else(|| MdsError::syntax("@define: unclosed parenthesis"))?;
@@ -302,11 +302,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_import_directive(
-        &mut self,
-        directive: &str,
-        offset: usize,
-    ) -> Result<Node, MdsError> {
+    fn parse_import_directive(&mut self, directive: &str, offset: usize) -> Result<Node, MdsError> {
         let rest = directive.strip_prefix("@import").unwrap().trim();
 
         // Selective import: @import { name1, name2 } from "path"
@@ -357,11 +353,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_export_directive(
-        &mut self,
-        directive: &str,
-        offset: usize,
-    ) -> Result<Node, MdsError> {
+    fn parse_export_directive(&mut self, directive: &str, offset: usize) -> Result<Node, MdsError> {
         let rest = directive.strip_prefix("@export").unwrap().trim();
 
         // Wildcard re-export: @export * from "path"
@@ -399,9 +391,7 @@ impl<'a> Parser<'a> {
 fn parse_quoted_path(s: &str) -> Result<String, MdsError> {
     let s = s.trim();
     if !s.starts_with('"') {
-        return Err(MdsError::syntax(format!(
-            "expected quoted path, got: {s}"
-        )));
+        return Err(MdsError::syntax(format!("expected quoted path, got: {s}")));
     }
     let end = s[1..]
         .find('"')
@@ -624,7 +614,10 @@ mod tests {
         let src = "@import \"./utils.mds\" as utils\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let module = parse(&tokens, "test.mds").unwrap();
-        assert!(matches!(module.body[0], Node::Import(ImportDirective::Alias { .. })));
+        assert!(matches!(
+            module.body[0],
+            Node::Import(ImportDirective::Alias { .. })
+        ));
     }
 
     #[test]
@@ -632,7 +625,10 @@ mod tests {
         let src = "@import \"./base.mds\"\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let module = parse(&tokens, "test.mds").unwrap();
-        assert!(matches!(module.body[0], Node::Import(ImportDirective::Merge { .. })));
+        assert!(matches!(
+            module.body[0],
+            Node::Import(ImportDirective::Merge { .. })
+        ));
     }
 
     #[test]
@@ -652,7 +648,10 @@ mod tests {
         let src = "@export greet\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let module = parse(&tokens, "test.mds").unwrap();
-        assert!(matches!(module.body[0], Node::Export(ExportDirective::Named { .. })));
+        assert!(matches!(
+            module.body[0],
+            Node::Export(ExportDirective::Named { .. })
+        ));
     }
 
     #[test]
@@ -660,7 +659,10 @@ mod tests {
         let src = "@export greet from \"./greetings.mds\"\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let module = parse(&tokens, "test.mds").unwrap();
-        assert!(matches!(module.body[0], Node::Export(ExportDirective::ReExport { .. })));
+        assert!(matches!(
+            module.body[0],
+            Node::Export(ExportDirective::ReExport { .. })
+        ));
     }
 
     #[test]
@@ -668,7 +670,10 @@ mod tests {
         let src = "@export * from \"./formatting.mds\"\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let module = parse(&tokens, "test.mds").unwrap();
-        assert!(matches!(module.body[0], Node::Export(ExportDirective::Wildcard { .. })));
+        assert!(matches!(
+            module.body[0],
+            Node::Export(ExportDirective::Wildcard { .. })
+        ));
     }
 
     #[test]

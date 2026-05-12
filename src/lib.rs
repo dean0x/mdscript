@@ -20,11 +20,18 @@ use value::Value;
 /// # Arguments
 /// * `path` — Path to the .mds file
 /// * `runtime_vars` — Optional runtime variable overrides (from --vars JSON)
-pub fn compile(path: &Path, runtime_vars: Option<HashMap<String, Value>>) -> Result<String, MdsError> {
+pub fn compile(
+    path: &Path,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<String, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let resolved = cache.resolve(path, &vars)?;
-    Ok(resolved.prompt_body.as_deref().map(clean_output).unwrap_or_default())
+    Ok(resolved
+        .prompt_body
+        .as_deref()
+        .map(clean_output)
+        .unwrap_or_default())
 }
 
 /// Compile MDS source code from a string.
@@ -50,7 +57,11 @@ pub fn compile_str(
     };
     let mut cache = ModuleCache::new();
     let resolved = cache.resolve_source(source, dir, &vars)?;
-    Ok(resolved.prompt_body.as_deref().map(clean_output).unwrap_or_default())
+    Ok(resolved
+        .prompt_body
+        .as_deref()
+        .map(clean_output)
+        .unwrap_or_default())
 }
 
 /// Check (validate) an MDS file without rendering output.
