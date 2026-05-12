@@ -215,7 +215,12 @@ impl ModuleCache {
         for node in &module.body {
             match node {
                 Node::Define(def) => {
-                    let func = FunctionDef::from(def);
+                    let mut func = FunctionDef::from(def);
+                    // Capture definition-site scope for lexical closure semantics so the
+                    // function body can resolve alias imports from its defining module even
+                    // when called from a different module.
+                    func.captured_namespaces = scope.get_all_namespaces();
+                    func.captured_functions = scope.get_all_functions();
                     functions.insert(def.name.clone(), func.clone());
                     scope.set_function(&def.name, func);
                 }

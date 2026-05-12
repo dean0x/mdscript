@@ -10,6 +10,10 @@ pub struct FunctionDef {
     pub name: String,
     pub params: Vec<String>,
     pub body: Vec<crate::ast::Node>,
+    /// Namespaces captured from the function's definition site (lexical scope).
+    pub captured_namespaces: HashMap<String, NamespaceScope>,
+    /// Functions captured from the function's definition site (lexical scope).
+    pub captured_functions: HashMap<String, FunctionDef>,
 }
 
 impl From<&DefineBlock> for FunctionDef {
@@ -18,6 +22,8 @@ impl From<&DefineBlock> for FunctionDef {
             name: d.name.clone(),
             params: d.params.clone(),
             body: d.body.clone(),
+            captured_namespaces: HashMap::new(),
+            captured_functions: HashMap::new(),
         }
     }
 }
@@ -130,6 +136,30 @@ impl Scope {
             || self.get_function(name).is_some()
             || self.get_namespace(name).is_some()
     }
+
+    /// Get all namespaces visible in the current scope (for closure capture).
+    /// Inner frames shadow outer frames — last write wins, matching shadowing semantics.
+    pub fn get_all_namespaces(&self) -> HashMap<String, NamespaceScope> {
+        let mut result = HashMap::new();
+        for frame in &self.frames {
+            for (name, ns) in &frame.namespaces {
+                result.insert(name.clone(), ns.clone());
+            }
+        }
+        result
+    }
+
+    /// Get all functions visible in the current scope (for closure capture).
+    /// Inner frames shadow outer frames — last write wins, matching shadowing semantics.
+    pub fn get_all_functions(&self) -> HashMap<String, FunctionDef> {
+        let mut result = HashMap::new();
+        for frame in &self.frames {
+            for (name, func) in &frame.functions {
+                result.insert(name.clone(), func.clone());
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -156,6 +186,8 @@ mod tests {
                 name: "greet".into(),
                 params: vec!["name".into()],
                 body: vec![],
+                captured_namespaces: HashMap::new(),
+                captured_functions: HashMap::new(),
             },
         );
         assert!(scope.get_function("greet").is_some());

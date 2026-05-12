@@ -366,3 +366,19 @@ fn for_body_undefined_var_errors_at_validate_time() {
         "expected undefined variable error in for body, got: {err}"
     );
 }
+
+#[test]
+fn cross_module_function_preserves_lexical_scope() {
+    // A function defined in module A that uses an alias import (u -> utils.mds)
+    // must resolve that alias from its *definition* site (lexical scope) even when
+    // called from module B, which has no knowledge of 'u'.
+    let result = mds::compile(&fixture("lexical_scope_consumer.mds"), None).unwrap();
+    assert!(
+        result.contains("Hello Alice!"),
+        "expected 'Hello Alice!' in output (lexical scope), got: {result}"
+    );
+    assert!(
+        result.contains("Welcome"),
+        "expected 'Welcome' in output, got: {result}"
+    );
+}

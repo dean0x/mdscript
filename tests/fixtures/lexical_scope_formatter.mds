@@ -1,0 +1,7 @@
+@import "./utils.mds" as u
+
+@define formal_greet(name):
+{u.greet(name)} Welcome.
+@end
+
+@export formal_greet

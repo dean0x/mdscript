@@ -117,6 +117,14 @@ fn invoke_function(
         return Err(MdsError::arity(call_key, func.params.len(), args.len()));
     }
     scope.push();
+    // Restore captured lexical scope from definition site so the function body
+    // can resolve alias imports and sibling functions from its defining module.
+    for (alias, ns) in &func.captured_namespaces {
+        scope.set_namespace(alias, ns.clone());
+    }
+    for (name, f) in &func.captured_functions {
+        scope.set_function(name, f.clone());
+    }
     for (param, value) in func.params.iter().zip(args.iter()) {
         scope.set_var(param, value.clone());
     }
