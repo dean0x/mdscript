@@ -441,6 +441,11 @@ fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
     let parts: Vec<&str> = rest.splitn(3, ' ').collect();
     if parts.len() >= 3 && parts[1] == "from" {
         let name = parts[0].to_string();
+        if !is_valid_identifier(&name) {
+            return Err(MdsError::syntax(format!(
+                "invalid re-export name: '{name}'"
+            )));
+        }
         let path = parse_quoted_path(parts[2])?;
         return Ok(Node::Export(ExportDirective::ReExport {
             name,
