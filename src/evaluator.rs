@@ -246,7 +246,9 @@ mod tests {
     use crate::ast::TextNode;
 
     fn text(s: &str) -> Node {
-        Node::Text(TextNode { text: s.to_string() })
+        Node::Text(TextNode {
+            text: s.to_string(),
+        })
     }
 
     #[test]
