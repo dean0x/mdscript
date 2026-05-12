@@ -57,9 +57,12 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
             }
             Ok(())
         }
-        Node::Define(_) => {
-            // Function bodies are validated when called
-            Ok(())
+        Node::Define(def) => {
+            let mut inner = scope.clone();
+            for param in &def.params {
+                inner.set_var(param, crate::value::Value::Null);
+            }
+            validate(&def.body, &inner, file, source)
         }
         Node::Import(_) | Node::Export(_) => {
             // Handled by resolver
@@ -135,6 +138,53 @@ fn validate_expr(
             }
             validate_var_args(args, scope, file, source, offset)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fix 6: function bodies validated at definition time
+    #[test]
+    fn define_body_with_undefined_var_fails_at_validate_time() {
+        // Build a @define greet(name): {undefined_var} @end AST manually.
+        let body = vec![Node::Interpolation(crate::ast::Interpolation {
+            expr: crate::ast::Expr::Var("undefined_var".to_string()),
+            offset: 0,
+            len: 13,
+        })];
+        let define = Node::Define(crate::ast::DefineBlock {
+            name: "greet".to_string(),
+            params: vec!["name".to_string()],
+            body,
+            offset: 0,
+        });
+        let scope = Scope::new(); // empty scope
+        let result = validate(&[define], &scope, "test.mds", "");
+        assert!(
+            result.is_err(),
+            "undefined var inside @define body must fail at validate time"
+        );
+    }
+
+    #[test]
+    fn define_body_referencing_param_passes_validation() {
+        // @define greet(name): {name} @end — param is in scope, must pass.
+        let body = vec![Node::Interpolation(crate::ast::Interpolation {
+            expr: crate::ast::Expr::Var("name".to_string()),
+            offset: 0,
+            len: 4,
+        })];
+        let define = Node::Define(crate::ast::DefineBlock {
+            name: "greet".to_string(),
+            params: vec!["name".to_string()],
+            body,
+            offset: 0,
+        });
+        let scope = Scope::new();
+        let result = validate(&[define], &scope, "test.mds", "");
+        assert!(result.is_ok(), "param reference inside @define must pass: {result:?}");
     }
 }
 

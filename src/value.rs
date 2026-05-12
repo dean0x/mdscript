@@ -21,7 +21,7 @@ impl Value {
             Value::Boolean(b) => *b,
             Value::Null => false,
             Value::String(s) => !s.is_empty(),
-            Value::Number(n) => *n != 0.0,
+            Value::Number(n) => *n != 0.0 && !n.is_nan(),
             Value::Array(a) => !a.is_empty(),
         }
     }
@@ -103,6 +103,48 @@ impl Value {
     }
 }
 
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::String(s.to_owned())
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::String(s)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(n: f64) -> Self {
+        Value::Number(n)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(n: i64) -> Self {
+        Value::Number(n as f64)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(n: i32) -> Self {
+        Value::Number(n as f64)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self {
+        Value::Boolean(b)
+    }
+}
+
+impl<T: Into<Value>> From<Vec<T>> for Value {
+    fn from(v: Vec<T>) -> Self {
+        Value::Array(v.into_iter().map(Into::into).collect())
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -145,6 +187,26 @@ mod tests {
         assert!(Value::Number(1.0).is_truthy());
         assert!(!Value::Array(vec![]).is_truthy());
         assert!(Value::Array(vec![Value::Number(1.0)]).is_truthy());
+    }
+
+    // Fix 4: NaN must be falsy
+    #[test]
+    fn nan_is_falsy() {
+        assert!(!Value::Number(f64::NAN).is_truthy(), "NaN must be falsy");
+    }
+
+    // Fix 5: From impls
+    #[test]
+    fn from_impls() {
+        assert_eq!(Value::from("hello"), Value::String("hello".to_owned()));
+        assert_eq!(Value::from("hello".to_owned()), Value::String("hello".to_owned()));
+        assert_eq!(Value::from(3.14_f64), Value::Number(3.14));
+        assert_eq!(Value::from(42_i64), Value::Number(42.0));
+        assert_eq!(Value::from(7_i32), Value::Number(7.0));
+        assert_eq!(Value::from(true), Value::Boolean(true));
+        assert_eq!(Value::from(false), Value::Boolean(false));
+        let v: Value = vec![1_i32, 2, 3].into();
+        assert_eq!(v, Value::Array(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]));
     }
 
     #[test]

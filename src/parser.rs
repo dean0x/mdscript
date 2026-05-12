@@ -447,12 +447,21 @@ fn parse_args(args_str: &str) -> Result<Vec<Arg>, MdsError> {
     let mut current = String::new();
     let mut in_string = false;
     let mut string_char = '"';
+    let mut escaped = false;
 
     for ch in args_str.chars() {
-        if in_string {
+        if escaped {
             current.push(ch);
-            if ch == string_char {
+            escaped = false;
+        } else if in_string {
+            if ch == '\\' {
+                escaped = true;
+                current.push(ch);
+            } else if ch == string_char {
+                current.push(ch);
                 in_string = false;
+            } else {
+                current.push(ch);
             }
         } else if ch == '"' || ch == '\'' {
             in_string = true;
@@ -476,9 +485,15 @@ fn parse_args(args_str: &str) -> Result<Vec<Arg>, MdsError> {
 
 fn parse_single_arg(s: &str) -> Result<Arg, MdsError> {
     let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        // String literal
-        Ok(Arg::StringLiteral(s[1..s.len() - 1].to_string()))
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        let inner = &s[1..s.len() - 1];
+        let unescaped = inner
+            .replace("\\\"", "\"")
+            .replace("\\'", "'")
+            .replace("\\\\", "\\");
+        Ok(Arg::StringLiteral(unescaped))
     } else if is_valid_identifier(s) {
         // Variable reference
         Ok(Arg::Var(s.to_string()))
@@ -495,10 +510,10 @@ fn is_valid_identifier(s: &str) -> bool {
     }
     let mut chars = s.chars();
     let first = chars.next().unwrap();
-    if !first.is_alphabetic() && first != '_' {
+    if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
-    chars.all(|c| c.is_alphanumeric() || c == '_')
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Strip a leading newline from the body text nodes.
@@ -687,5 +702,46 @@ mod tests {
         } else {
             panic!("expected Interpolation node with QualifiedCall");
         }
+    }
+
+    // Fix 1 & 2: parse_single_arg panic guard and escape handling
+    #[test]
+    fn parse_single_arg_lone_quote_returns_error() {
+        // A lone `"` is not a valid string literal (len < 2) — must not panic
+        let result = parse_single_arg("\"");
+        assert!(result.is_err(), "lone quote should return Err, not panic");
+    }
+
+    #[test]
+    fn parse_single_arg_escaped_quote_in_string() {
+        // `"say \"hi\""` should parse to the string: say "hi"
+        let result = parse_single_arg(r#""say \"hi\"""#);
+        assert!(result.is_ok(), "escaped quote in string should parse ok");
+        if let Ok(Arg::StringLiteral(s)) = result {
+            assert_eq!(s, r#"say "hi""#);
+        } else {
+            panic!("expected StringLiteral");
+        }
+    }
+
+    #[test]
+    fn parse_args_escaped_comma_in_string() {
+        // A comma inside a string arg must not split the arg
+        let result = parse_args(r#""hello, world""#).unwrap();
+        assert_eq!(result.len(), 1);
+        if let Arg::StringLiteral(s) = &result[0] {
+            assert_eq!(s, "hello, world");
+        } else {
+            panic!("expected StringLiteral");
+        }
+    }
+
+    // Fix 3: ASCII-only identifier validation
+    #[test]
+    fn is_valid_identifier_rejects_unicode() {
+        assert!(!is_valid_identifier("café"), "unicode must be rejected");
+        assert!(!is_valid_identifier("αβγ"), "greek letters must be rejected");
+        assert!(is_valid_identifier("hello"), "ascii ident must be accepted");
+        assert!(is_valid_identifier("_foo_42"), "underscored ident ok");
     }
 }
