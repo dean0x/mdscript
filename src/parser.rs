@@ -167,6 +167,11 @@ impl Parser<'_> {
         }
         if let Some(rest) = trimmed.strip_prefix("@include ") {
             let alias = rest.trim().to_string();
+            if !is_valid_identifier(&alias) {
+                return Err(MdsError::syntax(format!(
+                    "invalid include alias: '{alias}'"
+                )));
+            }
             return Ok(Node::Include(IncludeDirective { alias, offset }));
         }
 
@@ -189,6 +194,12 @@ impl Parser<'_> {
             .ok_or_else(|| MdsError::syntax("@if directive must end with ':'"))?
             .trim()
             .to_string();
+
+        if !is_valid_identifier(&condition) {
+            return Err(MdsError::syntax(format!(
+                "invalid identifier in @if condition: '{condition}'"
+            )));
+        }
 
         let then_body = self.parse_body(&["@else:", "@end"])?;
 
@@ -243,6 +254,17 @@ impl Parser<'_> {
         let var = parts[0].to_string();
         let iterable = parts[2].trim().to_string();
 
+        if !is_valid_identifier(&var) {
+            return Err(MdsError::syntax(format!(
+                "invalid loop variable name: '{var}'"
+            )));
+        }
+        if !is_valid_identifier(&iterable) {
+            return Err(MdsError::syntax(format!(
+                "invalid iterable name: '{iterable}'"
+            )));
+        }
+
         let body = self.parse_body(&["@end"])?;
 
         self.consume_end("@for")?;
@@ -279,6 +301,13 @@ impl Parser<'_> {
             .ok_or_else(|| MdsError::syntax("@define: unclosed parenthesis"))?;
 
         let name = rest[..paren_start].trim().to_string();
+
+        if !is_valid_identifier(&name) {
+            return Err(MdsError::syntax(format!(
+                "invalid function name: '{name}'"
+            )));
+        }
+
         let params_str = &rest[paren_start + 1..paren_end];
         let params: Vec<String> = params_str
             .split(',')
@@ -286,6 +315,23 @@ impl Parser<'_> {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
+
+        for param in &params {
+            if !is_valid_identifier(param) {
+                return Err(MdsError::syntax(format!(
+                    "invalid parameter name: '{param}'"
+                )));
+            }
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for param in &params {
+            if !seen.insert(param.as_str()) {
+                return Err(MdsError::syntax(format!(
+                    "duplicate parameter name '{param}' in @define {name}"
+                )));
+            }
+        }
 
         let body = self.parse_body(&["@end"])?;
 
@@ -320,6 +366,14 @@ fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
             .filter(|n| !n.is_empty())
             .collect();
 
+        for name in &names {
+            if !is_valid_identifier(name) {
+                return Err(MdsError::syntax(format!(
+                    "invalid import name: '{name}'"
+                )));
+            }
+        }
+
         let after = rest[brace_end + 1..].trim();
         let path_part = after
             .strip_prefix("from")
@@ -349,9 +403,15 @@ fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
     let after = rest[after_path_end..].trim();
 
     if let Some(alias) = after.strip_prefix("as ") {
+        let alias = alias.trim();
+        if !is_valid_identifier(alias) {
+            return Err(MdsError::syntax(format!(
+                "invalid import alias: '{alias}'"
+            )));
+        }
         Ok(Node::Import(ImportDirective::Alias {
             path,
-            alias: alias.trim().to_string(),
+            alias: alias.to_string(),
             offset,
         }))
     } else if after.is_empty() {
@@ -393,6 +453,11 @@ fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsErr
     let name = rest.trim().to_string();
     if name.is_empty() {
         return Err(MdsError::syntax("@export requires a name"));
+    }
+    if !is_valid_identifier(&name) {
+        return Err(MdsError::syntax(format!(
+            "invalid export name: '{name}'"
+        )));
     }
     Ok(Node::Export(ExportDirective::Named { name, offset }))
 }
@@ -533,7 +598,7 @@ fn parse_single_arg(s: &str) -> Result<Arg, MdsError> {
     }
 }
 
-fn is_valid_identifier(s: &str) -> bool {
+pub(crate) fn is_valid_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -9,6 +10,9 @@ use miette::Result;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    /// Suppress status messages
+    #[arg(long, short = 'q', global = true)]
+    quiet: bool,
 }
 
 #[derive(Subcommand)]
@@ -23,6 +27,9 @@ enum Commands {
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
+        #[arg(long = "set", value_parser = parse_key_value)]
+        set_vars: Vec<(String, String)>,
     },
     /// Validate an MDS file without rendering
     Check {
@@ -31,6 +38,9 @@ enum Commands {
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
+        #[arg(long = "set", value_parser = parse_key_value)]
+        set_vars: Vec<(String, String)>,
     },
     /// Create a starter MDS file
     Init {
@@ -41,6 +51,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+}
+
+fn parse_key_value(s: &str) -> std::result::Result<(String, String), String> {
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("invalid KEY=VALUE: no '=' found in '{s}'"))?;
+    Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
 fn main() {
@@ -55,19 +72,26 @@ fn main() {
 
 fn load_runtime_vars(
     vars: Option<PathBuf>,
-) -> Result<Option<std::collections::HashMap<String, mds::value::Value>>, miette::Error> {
+) -> Result<Option<HashMap<String, mds::Value>>, miette::Error> {
     vars.map(|path| mds::load_vars_file(&path).map_err(|e| miette::miette!("{e}")))
         .transpose()
 }
 
 fn run(cli: Cli) -> Result<(), miette::Error> {
+    let quiet = cli.quiet;
     match cli.command {
         Commands::Build {
             input,
             output,
             vars,
+            set_vars,
         } => {
-            let runtime_vars = load_runtime_vars(vars)?;
+            let mut runtime_vars = load_runtime_vars(vars)?;
+            for (key, val) in set_vars {
+                runtime_vars
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, mds::Value::String(val));
+            }
 
             let compiled = if input == Path::new("-") {
                 // Read from stdin
@@ -84,14 +108,26 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             if let Some(output_path) = output {
                 std::fs::write(&output_path, &compiled)
                     .map_err(|e| miette::miette!("cannot write {}: {e}", output_path.display()))?;
-                eprintln!("Compiled to {}", output_path.display());
+                if !quiet {
+                    eprintln!("Compiled to {}", output_path.display());
+                }
             } else {
                 print!("{compiled}");
             }
             Ok(())
         }
-        Commands::Check { input, vars } => {
-            let runtime_vars = load_runtime_vars(vars)?;
+        Commands::Check {
+            input,
+            vars,
+            set_vars,
+        } => {
+            let mut runtime_vars = load_runtime_vars(vars)?;
+            for (key, val) in set_vars {
+                runtime_vars
+                    .get_or_insert_with(HashMap::new)
+                    .insert(key, mds::Value::String(val));
+            }
+
             if input == Path::new("-") {
                 let source = std::io::read_to_string(std::io::stdin())
                     .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
@@ -99,10 +135,14 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
                     .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
                 mds::check_str_with(&source, Some(&cwd), runtime_vars)
                     .map_err(miette::Error::from)?;
-                eprintln!("OK: <stdin>");
+                if !quiet {
+                    eprintln!("OK: <stdin>");
+                }
             } else {
                 mds::check(&input, runtime_vars).map_err(miette::Error::from)?;
-                eprintln!("OK: {}", input.display());
+                if !quiet {
+                    eprintln!("OK: {}", input.display());
+                }
             }
             Ok(())
         }
@@ -128,11 +168,13 @@ Your items:
 ";
             std::fs::write(&filename, starter)
                 .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
-            eprintln!(
-                "Created {}\n  Try: mds build {}",
-                filename.display(),
-                filename.display()
-            );
+            if !quiet {
+                eprintln!(
+                    "Created {}\n  Try: mds build {}",
+                    filename.display(),
+                    filename.display()
+                );
+            }
             Ok(())
         }
     }

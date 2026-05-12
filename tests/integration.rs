@@ -503,3 +503,59 @@ fn check_stdin_valid() {
         .unwrap();
     assert!(output.status.success(), "check stdin should succeed for valid input");
 }
+
+#[test]
+fn invalid_identifier_in_for_var() {
+    // @for x-y in items: — loop variable 'x-y' is not a valid identifier
+    let source = "---\nitems: [a, b]\n---\n@for x-y in items:\n- {item}\n@end\n";
+    let result = mds::compile_str_with(source, None, None);
+    assert!(result.is_err(), "invalid loop variable name must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("invalid") || err.contains("x-y"),
+        "expected syntax error about invalid identifier, got: {err}"
+    );
+}
+
+#[test]
+fn invalid_identifier_in_define_name() {
+    // @define my-func(): — function name 'my-func' is not a valid identifier
+    let source = "@define my-func():\nhello\n@end\n";
+    let result = mds::compile_str_with(source, None, None);
+    assert!(result.is_err(), "invalid function name must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("invalid") || err.contains("my-func"),
+        "expected syntax error about invalid function name, got: {err}"
+    );
+}
+
+#[test]
+fn duplicate_define_params_errors() {
+    // @define test(a, a): — duplicate parameter 'a' must be a compile error
+    let source = "@define test(a, a):\n{a}\n@end\n";
+    let result = mds::compile_str_with(source, None, None);
+    assert!(result.is_err(), "duplicate parameter name must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("duplicate") || err.contains("'a'"),
+        "expected duplicate parameter error, got: {err}"
+    );
+}
+
+#[test]
+fn set_flag_cli_overrides() {
+    // --set name=Test should override the frontmatter variable 'name'
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args(["build", fixture("simple.mds").to_str().unwrap(), "--set", "name=Test"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "build with --set should succeed");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Hello Test!"),
+        "expected '--set name=Test' to override frontmatter, got: {stdout}"
+    );
+}

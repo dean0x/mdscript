@@ -1,3 +1,13 @@
+//! # MDS — Markdown Script Compiler
+//!
+//! Compile composable LLM prompt templates from `.mds` files to Markdown.
+//!
+//! ```rust
+//! // Compile from a string
+//! let output = mds::compile_str("---\nname: World\n---\nHello {name}!\n").unwrap();
+//! assert_eq!(output, "Hello World!\n");
+//! ```
+
 pub(crate) mod ast;
 pub mod error;
 pub(crate) mod evaluator;
@@ -8,12 +18,13 @@ pub(crate) mod scope;
 pub(crate) mod validator;
 pub mod value;
 
+pub use value::Value;
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use error::MdsError;
 use resolver::ModuleCache;
-use value::Value;
 
 /// Compile an MDS file to a final Markdown string.
 ///
