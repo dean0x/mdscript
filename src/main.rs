@@ -199,8 +199,8 @@ fn reject_directory_input(input: &Path) -> Result<(), miette::Error> {
     Ok(())
 }
 
-/// Maximum stdin bytes accepted (mirrors the per-file limit in resolver.rs).
-const MAX_STDIN_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+/// Maximum stdin bytes accepted — shares the per-file limit from the library.
+use mds::MAX_FILE_SIZE as MAX_STDIN_SIZE;
 
 /// Read from stdin and return the source string along with the current working directory.
 ///
@@ -302,6 +302,14 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             Ok(())
         }
         Commands::Init { filename, force } => {
+            if filename
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                return Err(miette::miette!(
+                    "init filename must not contain '..' components"
+                ));
+            }
             if filename.exists() && !force {
                 return Err(miette::miette!(
                     "{} already exists (use --force to overwrite)",

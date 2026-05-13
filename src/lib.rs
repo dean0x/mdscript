@@ -50,6 +50,12 @@ pub mod value;
 pub use error::MdsError;
 pub use value::Value;
 
+/// Maximum file size accepted for compilation (10 MB).
+///
+/// This is the single source of truth shared by the file resolver and the
+/// stdin reader in the CLI binary.
+pub const MAX_FILE_SIZE: u64 = resolver::MAX_FILE_SIZE;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

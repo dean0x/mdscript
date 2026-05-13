@@ -164,6 +164,11 @@ fn complete_example_welcome() {
 fn file_not_found_error() {
     let result = mds::compile(PathBuf::from("nonexistent.mds"), None);
     assert!(result.is_err());
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("not found") || err.contains("nonexistent"),
+        "expected file not found error, got: {err}"
+    );
 }
 
 #[test]
