@@ -68,6 +68,44 @@ fn parse_key_value(s: &str) -> std::result::Result<(String, String), String> {
     Ok((s[..pos].to_string(), s[pos + 1..].to_string()))
 }
 
+/// Coerce a CLI `--set KEY=VALUE` string to the most specific typed Value.
+///
+/// Matches the ergonomics of YAML frontmatter parsing: `true`/`false` become
+/// booleans, integer and float literals become numbers, `null` becomes Null,
+/// and bracket-delimited lists become arrays.  Everything else stays a string.
+fn parse_cli_value(val: String) -> mds::Value {
+    match val.as_str() {
+        "true" => return mds::Value::Boolean(true),
+        "false" => return mds::Value::Boolean(false),
+        "null" => return mds::Value::Null,
+        _ => {}
+    }
+
+    // Integer — parse as i64 so we don't accept "1e3" (scientific notation) here;
+    // then widen to f64 for storage.
+    if let Ok(n) = val.parse::<i64>() {
+        return mds::Value::Number(n as f64);
+    }
+
+    // Float — accept decimal fractions like "3.14".
+    if let Ok(f) = val.parse::<f64>() {
+        return mds::Value::Number(f);
+    }
+
+    // Simple bracket-list: "[a, b, c]" → Array of strings.
+    // Only handles flat lists of unquoted tokens; does not recurse.
+    if val.starts_with('[') && val.ends_with(']') {
+        let inner = &val[1..val.len() - 1];
+        let items: Vec<mds::Value> = inner
+            .split(',')
+            .map(|s| mds::Value::String(s.trim().to_string()))
+            .collect();
+        return mds::Value::Array(items);
+    }
+
+    mds::Value::String(val)
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -95,7 +133,7 @@ fn build_runtime_vars(
     for (key, val) in set_vars {
         runtime_vars
             .get_or_insert_with(HashMap::new)
-            .insert(key, mds::Value::String(val));
+            .insert(key, parse_cli_value(val));
     }
     Ok(runtime_vars)
 }

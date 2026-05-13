@@ -598,6 +598,111 @@ fn set_flag_cli_overrides() {
     );
 }
 
+#[test]
+fn set_flag_boolean_coercion() {
+    // --set premium=false must coerce the string "false" to boolean false,
+    // so @if premium: evaluates as falsy and the @else branch is rendered.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args([
+            "build",
+            fixture("set_flag_false.mds").to_str().unwrap(),
+            "--set",
+            "premium=false",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build with --set premium=false should succeed"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Upgrade for premium features."),
+        "expected falsy branch when --set premium=false, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Thanks for being premium!"),
+        "truthy branch must not appear when --set premium=false, got: {stdout}"
+    );
+}
+
+#[test]
+fn set_flag_boolean_true_coercion() {
+    // --set premium=true must coerce to boolean true (truthy branch rendered).
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args([
+            "build",
+            fixture("set_flag_false.mds").to_str().unwrap(),
+            "--set",
+            "premium=true",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build with --set premium=true should succeed"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Thanks for being premium!"),
+        "expected truthy branch when --set premium=true, got: {stdout}"
+    );
+}
+
+#[test]
+fn set_flag_numeric_coercion() {
+    // --set count=3 must coerce the string "3" to a number so {count} renders as "3".
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args([
+            "build",
+            fixture("set_count.mds").to_str().unwrap(),
+            "--set",
+            "count=3",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build with --set count=3 should succeed"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Count is 3."),
+        "expected numeric value from --set count=3, got: {stdout}"
+    );
+}
+
+#[test]
+fn set_flag_null_coercion() {
+    // --set premium=null must coerce to Value::Null (falsy), so @else branch renders.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args([
+            "build",
+            fixture("set_flag_false.mds").to_str().unwrap(),
+            "--set",
+            "premium=null",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build with --set premium=null should succeed"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Upgrade for premium features."),
+        "expected falsy branch when --set premium=null, got: {stdout}"
+    );
+}
+
 // ── CLI Integration Tests ────────────────────────────────────────────────────
 
 #[test]
