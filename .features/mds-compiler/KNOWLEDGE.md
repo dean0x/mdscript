@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, or debugging output rendering. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, or debugging output rendering. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin."
 category: architecture
 directories: [src/, tests/]
 referencedFiles:
@@ -16,7 +16,7 @@ referencedFiles:
   - src/value.rs
   - src/error.rs
 created: 2026-05-12
-updated: 2026-05-12
+updated: 2026-05-13
 ---
 
 # MDS Compiler
@@ -33,15 +33,21 @@ The binary is a CLI tool (`mds build`, `mds check`, `mds init`) backed by a libr
 
 | Function | Purpose |
 |---|---|
-| `compile(path, runtime_vars)` | Compile a file to Markdown |
+| `compile(path, runtime_vars)` | Compile a file to Markdown, printing warnings to stderr |
 | `compile_str(source)` | Compile from string, no options |
 | `compile_str_with(source, base_dir, runtime_vars)` | Compile from string with options |
+| `compile_collecting_warnings(path, runtime_vars)` | Compile and return `(String, Vec<String>)` — caller controls warning output |
+| `compile_str_collecting_warnings(source, base_dir, runtime_vars)` | String variant of the above |
 | `check(path, runtime_vars)` | Validate a file without rendering |
 | `check_str(source)` | Validate from string, no options |
 | `check_str_with(source, base_dir, runtime_vars)` | Validate from string with options |
 | `load_vars_file(path)` | Load runtime vars from a JSON file |
 
 All compile/check functions funnel through `ModuleCache::resolve` / `ModuleCache::resolve_source`, which is the single entry point to the full pipeline. The CLI and any programmatic callers share exactly the same compilation behavior.
+
+**Warning collection pattern**: Warnings (e.g. empty `@include`) are passed as a `&mut Vec<String>` through the full pipeline — `process_module` → `evaluate` → `evaluate_nodes` → `evaluate_include`. Nothing in the evaluator or resolver calls `eprintln!` directly. The public `compile*` variants print warnings by calling `emit_warnings(&warnings)` on the collected `Vec`. The `compile_collecting_warnings` variants return warnings without printing — this is what the CLI build command uses so it can gate output on the `--quiet` flag.
+
+The CLI `build` and `check` commands both accept `-` as the input path to read from stdin, resolved against the current working directory for import paths.
 
 External dependencies are minimal: `clap` for CLI parsing, `serde_yml`/`serde_json` for frontmatter and runtime vars, `miette`/`thiserror` for rich diagnostic errors, `tempfile` in tests.
 
@@ -66,7 +72,7 @@ The `Module` struct holds an optional `Frontmatter` and a `Vec<Node>`. `Node` is
 
 `TextNode` is a struct (`{ text: String }`) with no offset field — offsets are not tracked for raw text. Expressions inside `{...}` are further typed as `Expr::Var`, `Expr::Call`, or `Expr::QualifiedCall`.
 
-**`Arg` enum** has three variants — this is the complete set as of the latest revision:
+**`Arg` enum** has three variants — this is the complete set:
 
 | Variant | Meaning |
 |---|---|
@@ -151,7 +157,7 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 - `resolving: HashSet<PathBuf>` — O(1) membership test
 - `resolving_stack: Vec<PathBuf>` — insertion-ordered list for cycle path reconstruction (e.g., `a.mds → b.mds → a.mds`)
 
-**`process_module`** is the inner workhorse: it tokenizes, parses, builds scope from frontmatter + runtime vars, walks the AST to register functions (capturing closure scope) and resolve imports, validates, and evaluates. The result is a `ResolvedModule`.
+**`process_module`** is the inner workhorse: it tokenizes, parses, builds scope from frontmatter + runtime vars, walks the AST to register functions (capturing closure scope) and resolve imports, validates, and evaluates. The result is a `ResolvedModule`. Warnings are threaded through as `&mut Vec<String>` from the public API all the way into `evaluate`.
 
 **`ResolvedModule`** fields:
 - `functions: HashMap<String, FunctionDef>` — all `@define`d functions (including re-exports)
@@ -176,17 +182,17 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 
 ### Evaluator (`src/evaluator.rs`)
 
-The evaluator walks the AST and produces the final rendered string. It carries a `call_stack: HashSet<String>` for recursion detection (error on self or mutual recursion) and enforces `MAX_CALL_DEPTH = 128` for deep chains.
+The evaluator walks the AST and produces the final rendered string. Its public entry point is `evaluate(nodes, scope, warnings)` — the `warnings: &mut Vec<String>` parameter is threaded through all internal helpers including `evaluate_include`. Nothing in the evaluator calls `eprintln!` directly; all diagnostics go into the warnings vec.
+
+The evaluator carries a `call_stack: HashSet<String>` for recursion detection (error on self or mutual recursion) and enforces `MAX_CALL_DEPTH = 128` for deep chains.
 
 `invoke_function` restores the function's captured closure scope (namespaces, functions, vars) before binding parameters, so params shadow captured vars correctly. After evaluation the pushed frame is popped.
 
-**`resolve_args` signature**: `resolve_args(args: &[Arg], scope: &mut Scope, call_stack: &mut HashSet<String>) -> Result<Vec<Value>, MdsError>`. The `call_stack` parameter was added so `Arg::Call` can invoke `call_function` during argument resolution, which itself may recurse. This is the key wiring that makes nested calls work at evaluation time.
+**`resolve_args` signature**: `resolve_args(args: &[Arg], scope: &mut Scope, call_stack: &mut HashSet<String>, warnings: &mut Vec<String>) -> Result<Vec<Value>, MdsError>`. The `call_stack` and `warnings` parameters are threaded so `Arg::Call` can invoke `call_function` during argument resolution, which itself may recurse. This is the key wiring that makes nested calls work at evaluation time.
 
 The `Arg::Call` arm in `resolve_args` recursively calls `resolve_args` for inner args, then `call_function` for the nested invocation, wrapping the `String` result in `Value::String`. This means the result of a nested call is always a `String` value regardless of what the inner function produces.
 
-Match arms in `evaluate_nodes` and `evaluate_expr` use direct expressions rather than intermediate `let` bindings — the simplification has no behavioral impact but reduces visual noise.
-
-`@include alias` looks up the aliased module's `prompt_body` from the namespace and injects it inline. If the included module has no body text, `evaluate_include` prints a warning to stderr and returns an empty string.
+`@include alias` looks up the aliased module's `prompt_body` from the namespace and injects it inline. If the included module has no body text, `evaluate_include` pushes a warning message to `warnings` (not `eprintln!`) and returns an empty string.
 
 `@import` and `@export` nodes are no-ops in the evaluator (handled entirely by the resolver).
 
@@ -202,9 +208,11 @@ source text
   → resolver: imports resolved recursively (ModuleCache)
     → closure scope captured into FunctionDef.captured_*
   → validator::validate()  (uses scope snapshot)
-  → evaluator::evaluate()  → String (raw prompt body)
+  → evaluator::evaluate(&mut warnings)  → String (raw prompt body)
   → lib::clean_output()    → final Markdown string
 ```
+
+**Warning propagation**: the `warnings: &mut Vec<String>` vector is allocated in the public API function and passed all the way through `ModuleCache::resolve` → `process_module` → `evaluate` → `evaluate_nodes` → `evaluate_include`. After the pipeline completes, the calling code decides whether to print them (via `emit_warnings`) or return them to the caller (via `compile_collecting_warnings`).
 
 Runtime variables override frontmatter: in `process_module`, frontmatter vars are loaded first, then runtime vars overwrite any key that appears in both. This means `--vars` JSON and `--set KEY=VAL` always win over template defaults.
 
@@ -219,7 +227,7 @@ The `ModuleCache` is created per top-level compile call (not shared across calls
 3. Parse: add a branch in `Parser::parse_directive()` matching the `@name` prefix; validate identifier names with `is_valid_identifier()`
 4. Validate: add a match arm in `validate_node()` — validate what the resolver can't catch
 5. Resolve: if the directive requires file I/O (import-like), handle it in `process_module`'s AST walk
-6. Evaluate: add a match arm in `evaluate_nodes()` — `Import`/`Export` stay as no-ops there
+6. Evaluate: add a match arm in `evaluate_nodes()` — if the directive can emit warnings, accept and forward `warnings: &mut Vec<String>`; `Import`/`Export` stay as no-ops there
 7. Add integration test fixture in `tests/fixtures/` and a test in `tests/integration.rs`
 
 ### Adding a New Arg Variant
@@ -230,6 +238,14 @@ If you add a fourth `Arg` variant, update all three sites that match on `Arg`:
 3. `validate_var_args` in `src/validator.rs` — pre-evaluation validity check
 
 Failing to update any one of these produces an incomplete `match` compilation error, which is intentional — `Arg` has no wildcard arm.
+
+### Warning-Emitting Code
+
+Any code that needs to emit a non-fatal diagnostic must accept `warnings: &mut Vec<String>` and push to it. Never call `eprintln!` from evaluator, resolver, or library code. The CLI controls whether to print warnings based on the `--quiet` flag.
+
+The two-tier API pattern in `lib.rs`:
+- `compile(path, vars)` — internal convenience that calls `compile_collecting_warnings` then `emit_warnings`
+- `compile_collecting_warnings(path, vars)` — returns `(String, Vec<String>)` — use this when the caller needs to gate warning output (e.g., the CLI's quiet mode)
 
 ### Error Reporting Pattern
 
@@ -279,6 +295,7 @@ Currently blocked by design: `Value::from_yaml` and `Value::from_json` both retu
 
 ## Anti-Patterns
 
+- **Calling `eprintln!` from evaluator or resolver code** — all non-fatal diagnostics must go through the `warnings: &mut Vec<String>` parameter. Direct stderr output bypasses the quiet flag and makes the warnings un-testable.
 - **Calling `evaluate` before `validate`** — the evaluator trusts that all references exist; skipping validation will produce misleading errors at evaluation rather than rich span-aware diagnostics.
 - **Resolving imports in the evaluator** — imports must be resolved before evaluation so scope is complete when `validate` runs. Adding import-like behavior in the evaluator breaks this order.
 - **Creating `ModuleCache` per-module instead of per-compile** — the cache is the only thing preventing re-parsing the same file dozens of times. Each `compile()` / `compile_str_with()` call creates exactly one cache.
@@ -287,7 +304,8 @@ Currently blocked by design: `Value::from_yaml` and `Value::from_json` both retu
 - **Forgetting to capture closure scope in new definition-like directives** — any directive that defines a callable entity should call `scope.get_all_namespaces()`, `get_all_functions()`, and `get_all_vars()` at definition time so the callable works correctly when invoked from other modules.
 - **Adding functions to `process_module`'s scope without also capturing current scope into the FunctionDef** — if you add a function to scope after other functions are already captured, the previously captured siblings won't see the new function.
 - **Adding a new `Arg` variant without updating all three match sites** — parser (`parse_single_arg_inner`), evaluator (`resolve_args`), and validator (`validate_var_args`) all pattern-match exhaustively on `Arg`. Adding a variant without updating all three will produce a compile error, which is by design.
-- **Passing `resolve_args` without `call_stack`** — nested `Arg::Call` evaluation requires the call stack for recursion detection. Any future refactor that removes `call_stack` from `resolve_args` will silently allow unbounded recursion through argument nesting.
+- **Passing `resolve_args` without `call_stack` or `warnings`** — nested `Arg::Call` evaluation requires the call stack for recursion detection and warnings for diagnostics. Any future refactor that removes these from `resolve_args` will silently allow unbounded recursion through argument nesting or lose warning context.
+- **Using `compile` instead of `compile_collecting_warnings` in CLI code** — the CLI must use the collecting variants to properly gate warning output on the `--quiet` flag.
 
 ## Gotchas
 
@@ -296,7 +314,7 @@ Currently blocked by design: `Value::from_yaml` and `Value::from_json` both retu
 - **Runtime vars override frontmatter silently** — there is no warning when a runtime var shadows a frontmatter key. Intentional but can cause confusion when debugging.
 - **`@export` changes all-implicit to explicit** — once any `@export` appears in a module, only explicitly listed names are exported. Adding an `@export name` to a previously-implicit-all module will break importers depending on other functions.
 - **`@export prompt` is valid** — the string `"prompt"` is a special case in export validation. It does not need a corresponding `@define prompt` — it refers to the module's rendered body.
-- **`@include` on an empty module prints a warning and returns empty** — `evaluate_include` calls `eprintln!()` and returns `""`. No error. The include disappears from output.
+- **`@include` on an empty module pushes a warning and returns empty** — `evaluate_include` calls `warnings.push(...)` (not `eprintln!`) and returns `""`. No error. The include disappears from output. The warning only reaches stderr if the caller chooses to print it.
 - **Merged imports bring in `prompt` body but not frontmatter vars** — `@import "path"` (merge) brings functions and the `prompt` body text into scope, but NOT the imported module's frontmatter variables. Two merge-imported modules that both define the same frontmatter variable do not cause a collision.
 - **Selective import of `prompt` binds as a variable, not a function** — `@import { prompt } from "path"` sets `prompt` as a `Value::String` via `scope.set_var`, not `scope.set_function`.
 - **`compile_str` takes no arguments** — the zero-argument form `compile_str(source)` is a convenience wrapper. Use `compile_str_with(source, base_dir, runtime_vars)` when you need import resolution relative to a specific directory or runtime variable overrides.
@@ -310,22 +328,23 @@ Currently blocked by design: `Value::from_yaml` and `Value::from_json` both retu
 
 ## Key Files
 
-- `src/lib.rs` — public API: `compile`, `compile_str`, `compile_str_with`, `check`, `check_str`, `check_str_with`, `load_vars_file`, `clean_output`
+- `src/lib.rs` — public API: `compile`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `load_vars_file`, `clean_output`
 - `src/ast.rs` — all AST types including `Arg::Call` for nested function call arguments; the contract between parser and everything downstream
 - `src/lexer.rs` — tokenizer; handles frontmatter, code fences, interpolation, directives
 - `src/parser.rs` — converts token stream to `Module` AST; `enter_block()` helper, `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion, identifier validation, duplicate param detection
-- `src/resolver.rs` — orchestrator: drives the full pipeline, module cache, import resolution, closure capture, security guards
-- `src/evaluator.rs` — AST walker that produces the rendered string; `resolve_args` handles `Arg::Call` via recursive evaluation with shared `call_stack`
+- `src/resolver.rs` — orchestrator: drives the full pipeline, module cache, import resolution, closure capture, security guards; threads `&mut Vec<String>` warnings through to evaluate
+- `src/evaluator.rs` — AST walker that produces the rendered string; `resolve_args` handles `Arg::Call` via recursive evaluation with shared `call_stack` and `warnings`; `evaluate_include` pushes to warnings vec, never calls `eprintln!`
 - `src/validator.rs` — pre-evaluation semantic checks; `validate_var_args` recursively validates nested `Arg::Call` arguments
 - `src/scope.rs` — scope chain with frames for variables, functions, and namespaces; closure capture helpers
 - `src/value.rs` — runtime value enum with YAML/JSON converters and display rules
 - `src/error.rs` — `MdsError` enum with miette diagnostics; builder methods for span-aware errors
-- `tests/integration.rs` — 71 end-to-end tests covering all features, error paths, CLI integration, edge cases, and error format verification
+- `tests/integration.rs` — end-to-end tests covering all features, error paths, CLI integration (stdin, file output, vars file, quiet flag), edge cases (nested loops, loop shadowing, falsy values, mutual recursion, escape sequences in blocks/functions), and error format verification
 
 ## Related
 
 - `src/resolver.rs` — canonical reference for the module system, import semantics, and security guards
-- `src/evaluator.rs` — canonical reference for directive execution order, closure restore, call-depth guards, and nested arg evaluation
+- `src/evaluator.rs` — canonical reference for directive execution order, closure restore, call-depth guards, nested arg evaluation, and warning collection
 - `src/scope.rs` — canonical reference for closure capture API (`get_all_*` methods)
 - `src/ast.rs` — canonical reference for `Arg` variants; any new argument form starts here
-- `tests/integration.rs` — covers all directive combinations including nested function calls; read before adding new directives to understand existing fixture patterns
+- `src/lib.rs` — canonical reference for the two-tier warning API (`compile` vs `compile_collecting_warnings`)
+- `tests/integration.rs` — covers all directive combinations including nested function calls, CLI stdin/quiet mode, and edge cases; read before adding new directives to understand existing fixture patterns
