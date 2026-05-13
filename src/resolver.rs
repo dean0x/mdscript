@@ -403,8 +403,16 @@ impl ResolvedModule {
 
 /// Create a NamespaceScope from a resolved module.
 fn module_to_namespace(module: &ResolvedModule) -> NamespaceScope {
+    let functions = module
+        .functions
+        .iter()
+        .filter(|(name, _)| {
+            !module.has_explicit_exports || module.explicit_exports.contains(*name)
+        })
+        .map(|(name, func)| (name.clone(), func.clone()))
+        .collect();
     NamespaceScope {
-        functions: module.get_all_exports().into_iter().collect(),
+        functions,
         prompt_body: module.prompt_body.clone(),
     }
 }

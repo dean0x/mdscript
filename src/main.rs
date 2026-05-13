@@ -78,11 +78,46 @@ fn main() {
     }
 }
 
-fn load_runtime_vars(
-    vars: Option<PathBuf>,
+/// Load vars from an optional file path, returning None if no file was given.
+fn load_vars_file(
+    path: Option<PathBuf>,
 ) -> Result<Option<HashMap<String, mds::Value>>, miette::Error> {
-    vars.map(|path| mds::load_vars_file(&path).map_err(|e| miette::miette!("{e}")))
+    path.map(|p| mds::load_vars_file(&p).map_err(|e| miette::miette!("{e}")))
         .transpose()
+}
+
+/// Merge a `--vars` file with any `--set key=value` overrides into a single map.
+fn build_runtime_vars(
+    vars: Option<PathBuf>,
+    set_vars: Vec<(String, String)>,
+) -> Result<Option<HashMap<String, mds::Value>>, miette::Error> {
+    let mut runtime_vars = load_vars_file(vars)?;
+    for (key, val) in set_vars {
+        runtime_vars
+            .get_or_insert_with(HashMap::new)
+            .insert(key, mds::Value::String(val));
+    }
+    Ok(runtime_vars)
+}
+
+/// Exit with an error if the input path is a directory (only file or stdin allowed).
+fn reject_directory_input(input: &Path) {
+    if input != Path::new("-") && input.is_dir() {
+        eprintln!(
+            "error: expected a file, got a directory: {}",
+            input.display()
+        );
+        process::exit(1);
+    }
+}
+
+/// Read from stdin and return the source string along with the current working directory.
+fn read_stdin() -> Result<(String, std::path::PathBuf), miette::Error> {
+    let source = std::io::read_to_string(std::io::stdin())
+        .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
+    Ok((source, cwd))
 }
 
 fn run(cli: Cli) -> Result<(), miette::Error> {
@@ -94,27 +129,11 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             vars,
             set_vars,
         } => {
-            let mut runtime_vars = load_runtime_vars(vars)?;
-            for (key, val) in set_vars {
-                runtime_vars
-                    .get_or_insert_with(HashMap::new)
-                    .insert(key, mds::Value::String(val));
-            }
-
-            if input != Path::new("-") && input.is_dir() {
-                eprintln!(
-                    "error: expected a file, got a directory: {}",
-                    input.display()
-                );
-                process::exit(1);
-            }
+            let runtime_vars = build_runtime_vars(vars, set_vars)?;
+            reject_directory_input(&input);
 
             let (compiled, warnings) = if input == Path::new("-") {
-                // Read from stdin
-                let source = std::io::read_to_string(std::io::stdin())
-                    .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
-                let cwd = std::env::current_dir()
-                    .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
+                let (source, cwd) = read_stdin()?;
                 mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
                     .map_err(miette::Error::from)?
             } else {
@@ -144,26 +163,11 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             vars,
             set_vars,
         } => {
-            let mut runtime_vars = load_runtime_vars(vars)?;
-            for (key, val) in set_vars {
-                runtime_vars
-                    .get_or_insert_with(HashMap::new)
-                    .insert(key, mds::Value::String(val));
-            }
-
-            if input != Path::new("-") && input.is_dir() {
-                eprintln!(
-                    "error: expected a file, got a directory: {}",
-                    input.display()
-                );
-                process::exit(1);
-            }
+            let runtime_vars = build_runtime_vars(vars, set_vars)?;
+            reject_directory_input(&input);
 
             if input == Path::new("-") {
-                let source = std::io::read_to_string(std::io::stdin())
-                    .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
-                let cwd = std::env::current_dir()
-                    .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
+                let (source, cwd) = read_stdin()?;
                 mds::check_str_with(&source, Some(&cwd), runtime_vars)
                     .map_err(miette::Error::from)?;
                 if !quiet {
