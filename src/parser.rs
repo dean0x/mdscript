@@ -54,22 +54,17 @@ impl Parser<'_> {
 
     /// Consume the closing `@end` token, returning an error if absent or wrong.
     fn consume_end(&mut self, block_name: &str) -> Result<(), MdsError> {
-        if self.pos >= self.tokens.len() {
-            return Err(MdsError::syntax(format!(
-                "unclosed {block_name} block (missing @end)"
-            )));
-        }
-        match &self.tokens[self.pos] {
-            Token::Directive(d, _) if d.trim() == "@end" => {
+        match self.tokens.get(self.pos) {
+            Some(Token::Directive(d, _)) if d.trim() == "@end" => {
                 self.pos += 1;
                 Ok(())
             }
-            Token::Directive(d, _) => Err(MdsError::syntax(format!(
+            Some(Token::Directive(d, _)) => Err(MdsError::syntax(format!(
                 "expected @end to close {block_name} block, got '{}'",
                 d.trim()
             ))),
             _ => Err(MdsError::syntax(format!(
-                "expected @end to close {block_name} block"
+                "unclosed {block_name} block (missing @end)"
             ))),
         }
     }

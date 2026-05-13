@@ -31,17 +31,14 @@ impl Value {
         match yaml {
             serde_yaml::Value::Null => Ok(Value::Null),
             serde_yaml::Value::Bool(b) => Ok(Value::Boolean(b)),
-            serde_yaml::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Ok(Value::Number(i as f64))
-                } else if let Some(f) = n.as_f64() {
-                    Ok(Value::Number(f))
-                } else {
-                    Err(MdsError::YamlError {
-                        message: format!("unsupported number: {n:?}"),
-                    })
-                }
-            }
+            serde_yaml::Value::Number(n) => n
+                .as_i64()
+                .map(|i| i as f64)
+                .or_else(|| n.as_f64())
+                .map(Value::Number)
+                .ok_or_else(|| MdsError::YamlError {
+                    message: format!("unsupported number: {n:?}"),
+                }),
             serde_yaml::Value::String(s) => Ok(Value::String(s)),
             serde_yaml::Value::Sequence(seq) => seq
                 .into_iter()

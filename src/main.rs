@@ -15,14 +15,10 @@ fn auto_detect_mds_file() -> std::result::Result<PathBuf, miette::Error> {
 
     let entries: Vec<PathBuf> = std::fs::read_dir(&cwd)
         .map_err(|e| miette::miette!("cannot read directory {}: {e}", cwd.display()))?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
-                Some(path)
-            } else {
-                None
-            }
+        .filter_map(|res| {
+            let path = res.ok()?.path();
+            (path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds"))
+                .then_some(path)
         })
         .collect();
 

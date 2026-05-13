@@ -307,11 +307,7 @@ impl ModuleCache {
 
         // Evaluate the body to get prompt text
         let prompt_body = evaluate(&module.body, &mut scope, warnings)?;
-        let prompt_body = if prompt_body.trim().is_empty() {
-            None
-        } else {
-            Some(prompt_body)
-        };
+        let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
         Ok(ResolvedModule {
             functions,
@@ -455,16 +451,23 @@ fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
 
     // For .md files, accept when frontmatter contains `type: mds`.
     if ext == "md" {
-        if let Some(after_prefix) = source
+        if let Some(after_fence) = source
             .strip_prefix("---\n")
             .or_else(|| source.strip_prefix("---\r\n"))
         {
-            if let Some(end) = after_prefix.find("\n---") {
-                let fm = &after_prefix[..end];
-                if let Ok(map) = serde_yaml::from_str::<HashMap<String, serde_yaml::Value>>(fm) {
-                    if map.get("type").and_then(|v| v.as_str()) == Some("mds") {
-                        return Ok(());
+            if let Some(end) = after_fence.find("\n---") {
+                let fm = &after_fence[..end];
+                // Check each line for `type: mds` without a full YAML parse.
+                let has_type_mds = fm.lines().any(|line| {
+                    let trimmed = line.trim();
+                    if let Some(val) = trimmed.strip_prefix("type:") {
+                        val.trim() == "mds"
+                    } else {
+                        false
                     }
+                });
+                if has_type_mds {
+                    return Ok(());
                 }
             }
         }
