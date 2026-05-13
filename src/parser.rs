@@ -456,6 +456,41 @@ fn parse_quoted_path(s: &str) -> Result<String, MdsError> {
     Ok(s[1..=end].to_string())
 }
 
+/// Build an actionable error for unsupported dot-notation variable access (e.g. `{alias.name}`).
+///
+/// Attaches source-location context when `file` and `source` are non-empty, falling back
+/// to a plain syntax error otherwise. `offset` marks the opening `{` and `content_len` is
+/// the length of the trimmed content between the braces (used to compute the interp span).
+fn dot_notation_error(
+    content: &str,
+    namespace: &str,
+    field: &str,
+    file: &str,
+    source: &str,
+    offset: usize,
+    content_len: usize,
+) -> MdsError {
+    let message = format!(
+        "dot notation for variables is not supported in v0.1: '{content}'. \
+         To call a function from an imported module use: {{{namespace}.{field}()}}",
+    );
+    // The interpolation token's offset points to the `{`; the span covers the
+    // entire interpolation including the surrounding braces (content_len + 2 for `{` and `}`).
+    let interp_len = if !source.is_empty() {
+        source[offset..]
+            .find('}')
+            .map(|end| end + 1)
+            .unwrap_or(content_len + 2)
+    } else {
+        content_len + 2
+    };
+    if !file.is_empty() && !source.is_empty() {
+        MdsError::syntax_at(message, file, source, offset, interp_len)
+    } else {
+        MdsError::syntax(message)
+    }
+}
+
 /// Parse the expression inside `{ }` into an Expr.
 fn parse_interpolation_expr(
     content: &str,
@@ -491,33 +526,7 @@ fn parse_interpolation_expr(
         // (e.g. {alias.name}), which is not supported. Give a clear, actionable error.
         let namespace = content[..dot_pos].trim();
         let field = rest_after_dot.trim();
-        // The interpolation token's offset points to the `{`; the span covers the
-        // entire interpolation including the surrounding braces (len + 2 for `{` and `}`).
-        let interp_len = if !source.is_empty() {
-            source[offset..]
-                .find('}')
-                .map(|end| end + 1)
-                .unwrap_or(len + 2)
-        } else {
-            len + 2
-        };
-        return if !file.is_empty() && !source.is_empty() {
-            Err(MdsError::syntax_at(
-                format!(
-                    "dot notation for variables is not supported in v0.1: '{content}'. \
-                     To call a function from an imported module use: {{{namespace}.{field}()}}",
-                ),
-                file,
-                source,
-                offset,
-                interp_len,
-            ))
-        } else {
-            Err(MdsError::syntax(format!(
-                "dot notation for variables is not supported in v0.1: '{content}'. \
-                 To call a function from an imported module use: {{{namespace}.{field}()}}",
-            )))
-        };
+        return Err(dot_notation_error(content, namespace, field, file, source, offset, len));
     }
 
     // Check for function call: name(args)
