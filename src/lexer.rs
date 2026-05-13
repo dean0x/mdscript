@@ -31,7 +31,7 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
         .map(|(byte_idx, _)| byte_idx)
         .collect();
     let mut pos = 0;
-    let mut in_code_block = false;
+    let mut code_fence_backticks: usize = 0;
 
     // Helper closure: get byte offset for a char position.
     let byte_pos = |char_pos: usize| -> usize {
@@ -57,7 +57,9 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
                 let at_end =
                     end_pos >= chars.len() || chars[end_pos] == '\n' || chars[end_pos] == '\r';
                 if at_end {
-                    let content: String = chars[fm_start..pos].iter().collect();
+                    // Strip \r for Windows line endings (\r\n) in frontmatter
+                    let content: String =
+                        chars[fm_start..pos].iter().filter(|&&c| c != '\r').collect();
                     let fm_byte_offset = byte_pos(fm_start);
                     tokens.push(Token::FrontmatterContent(content, fm_byte_offset));
                     tokens.push(Token::FrontmatterFence(byte_pos(pos)));
@@ -83,30 +85,81 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
     while pos < chars.len() {
         let bp = byte_pos(pos);
 
-        // Check for code fences (```)
+        // Check for code fences (``` or more backticks)
         if is_line_start_chars(&chars, pos) && source[bp..].starts_with("```") {
-            let fence_start = byte_pos(pos);
-            pos += 3;
-            // consume any remaining backticks and language tag
-            let mut fence = String::from("```");
-            while pos < chars.len() && chars[pos] != '\n' && chars[pos] != '\r' {
-                fence.push(chars[pos]);
-                pos += 1;
+            // Count the number of leading backticks on this line
+            let mut backtick_count = 0;
+            let mut scan = pos;
+            while scan < chars.len() && chars[scan] == '`' {
+                backtick_count += 1;
+                scan += 1;
             }
-            pos = skip_newline(&chars, pos);
-            in_code_block = !in_code_block;
-            tokens.push(Token::CodeFence(fence, fence_start));
-            continue;
+            // Determine whether what follows is only whitespace/newline (a closing fence candidate)
+            let rest_is_close = {
+                let mut s = scan;
+                while s < chars.len() && chars[s] != '\n' && chars[s] != '\r' {
+                    if chars[s] != ' ' && chars[s] != '\t' {
+                        break;
+                    }
+                    s += 1;
+                }
+                s >= chars.len() || chars[s] == '\n' || chars[s] == '\r'
+            };
+
+            if code_fence_backticks == 0 {
+                // Opening fence — record the backtick count
+                let fence_start = byte_pos(pos);
+                pos += backtick_count;
+                let mut fence = "`".repeat(backtick_count);
+                // consume any remaining language tag characters
+                while pos < chars.len() && chars[pos] != '\n' && chars[pos] != '\r' {
+                    fence.push(chars[pos]);
+                    pos += 1;
+                }
+                pos = skip_newline(&chars, pos);
+                code_fence_backticks = backtick_count;
+                tokens.push(Token::CodeFence(fence, fence_start));
+                continue;
+            } else if rest_is_close && backtick_count >= code_fence_backticks {
+                // Closing fence — must have >= the opening backtick count and no non-space suffix
+                let fence_start = byte_pos(pos);
+                pos += backtick_count;
+                let fence = "`".repeat(backtick_count);
+                pos = skip_newline(&chars, pos);
+                code_fence_backticks = 0;
+                tokens.push(Token::CodeFence(fence, fence_start));
+                continue;
+            }
+            // else: falls through to CodeContent handling below (fewer backticks inside block)
         }
 
-        if in_code_block {
+        if code_fence_backticks > 0 {
             // Inside code block: no interpolation, just raw content
             let start = byte_pos(pos);
             let mut content = String::new();
             while pos < chars.len() {
-                // Check for closing code fence
+                // Check for a potential closing code fence
                 if is_line_start_chars(&chars, pos) && source[byte_pos(pos)..].starts_with("```") {
-                    break;
+                    // Count backticks
+                    let mut bc = 0;
+                    let mut sc = pos;
+                    while sc < chars.len() && chars[sc] == '`' {
+                        bc += 1;
+                        sc += 1;
+                    }
+                    let is_close = {
+                        let mut s = sc;
+                        while s < chars.len() && chars[s] != '\n' && chars[s] != '\r' {
+                            if chars[s] != ' ' && chars[s] != '\t' {
+                                break;
+                            }
+                            s += 1;
+                        }
+                        s >= chars.len() || chars[s] == '\n' || chars[s] == '\r'
+                    };
+                    if is_close && bc >= code_fence_backticks {
+                        break;
+                    }
                 }
                 content.push(chars[pos]);
                 pos += 1;
@@ -129,6 +182,8 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
             if pos < chars.len() && chars[pos] == '\n' {
                 pos += 1;
             }
+            // Strip trailing \r for Windows line endings
+            let line = line.trim_end_matches('\r').to_string();
             tokens.push(Token::Directive(line, start));
             continue;
         }
@@ -199,7 +254,7 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
     }
 
     // Check for unclosed code block
-    if in_code_block {
+    if code_fence_backticks > 0 {
         return Err(MdsError::syntax("unclosed code fence"));
     }
 

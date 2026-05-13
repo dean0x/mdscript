@@ -892,6 +892,170 @@ fn multiple_escaped_braces() {
     );
 }
 
+// ── Falsy Values (Spec 4.3) ──────────────────────────────────────────────────
+
+#[test]
+fn if_falsy_zero() {
+    let result = mds::compile(&fixture("if_falsy_zero.mds"), None).unwrap();
+    assert!(
+        result.contains("falsy"),
+        "zero should be falsy, got: {result}"
+    );
+    assert!(
+        !result.contains("truthy"),
+        "zero should not be truthy, got: {result}"
+    );
+}
+
+#[test]
+fn if_falsy_null() {
+    let result = mds::compile(&fixture("if_falsy_null.mds"), None).unwrap();
+    assert!(
+        result.contains("falsy"),
+        "null should be falsy, got: {result}"
+    );
+}
+
+#[test]
+fn if_falsy_empty_string() {
+    let result = mds::compile(&fixture("if_falsy_empty_string.mds"), None).unwrap();
+    assert!(
+        result.contains("falsy"),
+        "empty string should be falsy, got: {result}"
+    );
+}
+
+#[test]
+fn if_falsy_empty_array() {
+    let result = mds::compile(&fixture("if_falsy_empty_array.mds"), None).unwrap();
+    assert!(
+        result.contains("falsy"),
+        "empty array should be falsy, got: {result}"
+    );
+}
+
+// ── Mutual Recursion (Spec 4.5) ──────────────────────────────────────────────
+
+#[test]
+fn mutual_recursion_detected() {
+    let result = mds::compile(&fixture("mutual_recursion.mds"), None);
+    assert!(result.is_err(), "mutual recursion should be detected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("recursion"),
+        "expected recursion error, got: {err}"
+    );
+}
+
+// ── Alias Prevents Unqualified Access (Spec 4.6) ─────────────────────────────
+
+#[test]
+fn alias_import_no_unqualified_access() {
+    // 'greet' was imported under alias 'g', so bare {greet(name)} must fail.
+    let result = mds::compile(&fixture("alias_no_unqualified.mds"), None);
+    assert!(
+        result.is_err(),
+        "unqualified access after alias import should fail"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("undefined") || err.contains("greet"),
+        "expected undefined function/variable error, got: {err}"
+    );
+}
+
+// ── @export from Does NOT Bring Symbol Into Local Scope (Spec 4.7) ───────────
+
+#[test]
+fn export_from_no_local_scope() {
+    // @export hello from "./greetings.mds" re-exports without local availability.
+    let result = mds::compile(&fixture("export_from_no_local.mds"), None);
+    assert!(
+        result.is_err(),
+        "@export from should not make symbol available locally"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("undefined"),
+        "expected undefined error, got: {err}"
+    );
+}
+
+// ── Escaped Braces in Function Body ─────────────────────────────────────────
+
+#[test]
+fn escaped_braces_in_function_body() {
+    // Per spec and existing tests (multiple_escaped_braces): only \{ is an escape
+    // sequence producing a literal '{'. The closing \} is plain text, rendered as \}.
+    // So \{curly braces\} → "{curly braces\}" in output.
+    let result = mds::compile(&fixture("escaped_brace_in_fn.mds"), None).unwrap();
+    assert!(
+        result.contains("{curly braces"),
+        "escaped brace in function body should produce literal brace, got: {result}"
+    );
+    assert!(
+        result.contains("Alice"),
+        "interpolation inside function body should still work, got: {result}"
+    );
+}
+
+// ── Escaped Braces in @if and @for Bodies ────────────────────────────────────
+
+#[test]
+fn escaped_braces_in_blocks() {
+    // Per spec and existing tests (multiple_escaped_braces): only \{ is an escape
+    // sequence producing a literal '{'. The closing \} is plain text, rendered as \}.
+    // So \{variable\} => "{variable\}" and \{item\} => "{item\}".
+    let result = mds::compile(&fixture("escaped_brace_in_blocks.mds"), None).unwrap();
+    assert!(
+        result.contains("{variable"),
+        "escaped brace in @if body should produce literal brace, got: {result}"
+    );
+    assert!(
+        result.contains("{item") && result.contains("= a"),
+        "escaped brace in @for body should produce literal brace for 'a', got: {result}"
+    );
+    assert!(
+        result.contains("{item") && result.contains("= b"),
+        "escaped brace in @for body should produce literal brace for 'b', got: {result}"
+    );
+}
+
+// ── Duplicate @define Should Error ───────────────────────────────────────────
+
+#[test]
+fn duplicate_define_errors() {
+    // NOTE: This test documents expected behavior (Spec: no duplicate function names).
+    // If the compiler does not yet enforce this, this test will fail until the fix lands.
+    let result = mds::compile(&fixture("duplicate_define.mds"), None);
+    assert!(
+        result.is_err(),
+        "duplicate @define for same function name should be an error"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("collision") || err.contains("duplicate") || err.contains("already defined"),
+        "expected collision/duplicate error, got: {err}"
+    );
+}
+
+// ── Empty Include Produces No Crash (Spec 4.8) ───────────────────────────────
+
+#[test]
+fn include_empty_body_no_crash() {
+    // @include of a module with only function definitions (no body text) should
+    // produce an empty string for the include, not crash.
+    let result = mds::compile(&fixture("include_empty_body.mds"), None).unwrap();
+    assert!(
+        result.contains("Before"),
+        "output should contain 'Before', got: {result}"
+    );
+    assert!(
+        result.contains("After"),
+        "output should contain 'After', got: {result}"
+    );
+}
+
 // ── Error Format Verification ────────────────────────────────────────────────
 
 #[test]

@@ -1,0 +1,12 @@
+---
+name: test
+---
+@define foo(x):
+{bar(x)}
+@end
+
+@define bar(x):
+{foo(x)}
+@end
+
+{foo(name)}

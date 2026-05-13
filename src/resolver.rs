@@ -213,6 +213,9 @@ impl ModuleCache {
         for node in &module.body {
             match node {
                 Node::Define(def) => {
+                    if functions.contains_key(&def.name) {
+                        return Err(MdsError::name_collision(&def.name));
+                    }
                     let mut func = FunctionDef::from(def);
                     // Capture definition-site scope for lexical closure semantics so the
                     // function body can resolve alias imports, sibling functions, and

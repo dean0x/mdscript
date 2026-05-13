@@ -6,7 +6,12 @@ use clap::{Parser, Subcommand};
 use miette::Result;
 
 #[derive(Parser)]
-#[command(name = "mds", version, about = "MDS (Markdown Script) compiler")]
+#[command(
+    name = "mds",
+    about = "MDS (Markdown Script) compiler",
+    long_about = "MDS (Markdown Script) compiler — composable LLM prompt templates\n\nCompile .mds template files into Markdown. Use variables, loops,\nconditionals, functions, and imports to build reusable prompts.\n\nQuick start:\n  mds init                       Create a starter template\n  mds build hello.mds            Compile to stdout\n  mds build hello.mds -o out.md  Compile to file",
+    version
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,6 +23,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Compile an MDS file to Markdown
+    #[command(
+        after_help = "Examples:\n  mds build template.mds                     Compile to stdout\n  mds build template.mds -o output.md        Compile to file\n  mds build template.mds --vars vars.json    With variable overrides\n  mds build template.mds --set name=Alice    Set a single variable\n  echo \"Hello {name}!\" | mds build -          Compile from stdin"
+    )]
     Build {
         /// Input .mds file (use "-" to read from stdin)
         input: PathBuf,
@@ -28,7 +36,7 @@ enum Commands {
         #[arg(long)]
         vars: Option<PathBuf>,
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
-        #[arg(long = "set", value_parser = parse_key_value)]
+        #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
     },
     /// Validate an MDS file without rendering
@@ -39,7 +47,7 @@ enum Commands {
         #[arg(long)]
         vars: Option<PathBuf>,
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
-        #[arg(long = "set", value_parser = parse_key_value)]
+        #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
     },
     /// Create a starter MDS file
@@ -93,6 +101,11 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
                     .insert(key, mds::Value::String(val));
             }
 
+            if input != Path::new("-") && input.is_dir() {
+                eprintln!("error: expected a file, got a directory: {}", input.display());
+                process::exit(1);
+            }
+
             let compiled = if input == Path::new("-") {
                 // Read from stdin
                 let source = std::io::read_to_string(std::io::stdin())
@@ -126,6 +139,11 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
                 runtime_vars
                     .get_or_insert_with(HashMap::new)
                     .insert(key, mds::Value::String(val));
+            }
+
+            if input != Path::new("-") && input.is_dir() {
+                eprintln!("error: expected a file, got a directory: {}", input.display());
+                process::exit(1);
             }
 
             if input == Path::new("-") {

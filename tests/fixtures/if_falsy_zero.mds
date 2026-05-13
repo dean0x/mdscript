@@ -1,0 +1,8 @@
+---
+val: 0
+---
+@if val:
+truthy
+@else:
+falsy
+@end

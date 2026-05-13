@@ -1,0 +1,10 @@
+---
+active: true
+items: [a, b]
+---
+@if active:
+Syntax: \{variable\}
+@end
+@for item in items:
+\{item\} = {item}
+@end

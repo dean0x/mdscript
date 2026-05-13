@@ -1,0 +1,5 @@
+@import "./fns_only.mds" as fns
+
+Before
+@include fns
+After

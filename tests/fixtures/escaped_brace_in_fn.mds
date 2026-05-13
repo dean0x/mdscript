@@ -1,0 +1,8 @@
+---
+name: Alice
+---
+@define show_syntax(x):
+Use \{curly braces\} for interpolation: {x}
+@end
+
+{show_syntax(name)}

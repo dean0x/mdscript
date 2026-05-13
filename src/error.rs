@@ -69,7 +69,10 @@ pub enum MdsError {
     CircularImport { cycle: String },
 
     #[error("file not found: {path}")]
-    #[diagnostic(code(mds::file_not_found))]
+    #[diagnostic(
+        code(mds::file_not_found),
+        help("check the file path and ensure the file exists")
+    )]
     FileNotFound {
         path: String,
         #[label("imported here")]
@@ -241,39 +244,11 @@ impl MdsError {
         }
     }
 
-    pub fn type_error_at(
-        got: impl Into<String>,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
-    ) -> Self {
-        MdsError::TypeError {
-            got: got.into(),
-            span: Some(SourceSpan::new(offset.into(), len)),
-            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
-        }
-    }
-
     pub fn name_collision(name: impl Into<String>) -> Self {
         MdsError::NameCollision {
             name: name.into(),
             span: None,
             src: None,
-        }
-    }
-
-    pub fn name_collision_at(
-        name: impl Into<String>,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
-    ) -> Self {
-        MdsError::NameCollision {
-            name: name.into(),
-            span: Some(SourceSpan::new(offset.into(), len)),
-            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
         }
     }
 
@@ -285,20 +260,6 @@ impl MdsError {
         }
     }
 
-    pub fn recursion_at(
-        name: impl Into<String>,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
-    ) -> Self {
-        MdsError::Recursion {
-            name: name.into(),
-            span: Some(SourceSpan::new(offset.into(), len)),
-            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
-        }
-    }
-
     pub fn file_not_found(path: impl Into<String>) -> Self {
         MdsError::FileNotFound {
             path: path.into(),
@@ -307,39 +268,11 @@ impl MdsError {
         }
     }
 
-    pub fn file_not_found_at(
-        path: impl Into<String>,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
-    ) -> Self {
-        MdsError::FileNotFound {
-            path: path.into(),
-            span: Some(SourceSpan::new(offset.into(), len)),
-            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
-        }
-    }
-
     pub fn import_error(message: impl Into<String>) -> Self {
         MdsError::ImportError {
             message: message.into(),
             span: None,
             src: None,
-        }
-    }
-
-    pub fn import_error_at(
-        message: impl Into<String>,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
-    ) -> Self {
-        MdsError::ImportError {
-            message: message.into(),
-            span: Some(SourceSpan::new(offset.into(), len)),
-            src: Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
         }
     }
 

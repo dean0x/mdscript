@@ -232,13 +232,7 @@ fn evaluate_include(inc: &IncludeDirective, scope: &Scope) -> Result<String, Mds
 
     match &ns.prompt_body {
         Some(body) => Ok(body.clone()),
-        None => {
-            eprintln!(
-                "warning: @include {} produces empty output (module has no body text)",
-                inc.alias
-            );
-            Ok(String::new())
-        }
+        None => Ok(String::new()),
     }
 }
 
