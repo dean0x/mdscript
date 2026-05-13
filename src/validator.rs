@@ -1,4 +1,4 @@
-use crate::ast::*;
+use crate::ast::{Arg, Expr, Node};
 use crate::error::MdsError;
 use crate::scope::Scope;
 

@@ -126,6 +126,7 @@ pub fn compile_str_with(
 /// Check (validate) an MDS file without rendering output.
 ///
 /// Returns `Ok(())` if the file is valid, or an error describing the problem.
+/// Warnings (e.g. empty `@include`) are printed to stderr.
 ///
 /// # Examples
 ///
@@ -149,6 +150,8 @@ pub fn check(
 }
 
 /// Check (validate) MDS source from a string without rendering output.
+///
+/// Warnings (e.g. empty `@include`) are printed to stderr.
 ///
 /// # Examples
 ///

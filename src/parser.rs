@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 
-use crate::ast::*;
+use crate::ast::{
+    Arg, DefineBlock, ExportDirective, Expr, ForBlock, Frontmatter, IfBlock, ImportDirective,
+    IncludeDirective, Interpolation, Module, Node, TextNode,
+};
 use crate::error::MdsError;
 use crate::lexer::Token;
 
@@ -609,12 +612,11 @@ fn unescape_string(s: &str) -> String {
             match chars.next() {
                 Some('"') => out.push('"'),
                 Some('\'') => out.push('\''),
-                Some('\\') => out.push('\\'),
+                Some('\\') | None => out.push('\\'),
                 Some(other) => {
                     out.push('\\');
                     out.push(other);
                 }
-                None => out.push('\\'),
             }
         } else {
             out.push(ch);

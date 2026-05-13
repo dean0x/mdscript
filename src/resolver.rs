@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::ast::*;
+use crate::ast::{ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::lexer::tokenize;
@@ -43,6 +43,7 @@ const MAX_IMPORT_DEPTH: usize = 64;
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Module cache to avoid re-resolving the same file.
+#[derive(Default)]
 pub struct ModuleCache {
     modules: HashMap<PathBuf, ResolvedModule>,
     /// Tracks modules currently being resolved (for cycle detection), O(1) lookup.
@@ -53,20 +54,9 @@ pub struct ModuleCache {
     root_dir: Option<PathBuf>,
 }
 
-impl Default for ModuleCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ModuleCache {
     pub fn new() -> Self {
-        ModuleCache {
-            modules: HashMap::new(),
-            resolving: HashSet::new(),
-            resolving_stack: Vec::new(),
-            root_dir: None,
-        }
+        Self::default()
     }
 
     /// Resolve a module from file path. Handles caching and cycle detection.
@@ -397,15 +387,11 @@ impl ResolvedModule {
             .collect()
     }
 
-    /// Check if `prompt` is an available export for this module.
-    pub fn has_prompt_export(&self) -> bool {
-        self.prompt_body.is_some()
-            && (!self.has_explicit_exports || self.explicit_exports.contains("prompt"))
-    }
-
-    /// Get the prompt body as a Value, if exportable.
+    /// Get the prompt body as a Value, if it is an available export.
     pub fn get_prompt_value(&self) -> Option<Value> {
-        if self.has_prompt_export() {
+        let prompt_is_exported =
+            !self.has_explicit_exports || self.explicit_exports.contains("prompt");
+        if prompt_is_exported {
             self.prompt_body.clone().map(Value::String)
         } else {
             None

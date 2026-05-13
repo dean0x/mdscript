@@ -117,14 +117,12 @@ fn parse_key_value(s: &str) -> std::result::Result<(String, String), String> {
 /// and bracket-delimited lists become arrays.  Everything else stays a string.
 fn parse_cli_value(val: String) -> mds::Value {
     match val.as_str() {
-        "true" => mds::Value::Boolean(true),
-        "false" => mds::Value::Boolean(false),
-        "null" => mds::Value::Null,
-        _ => parse_cli_value_unquoted(val),
+        "true" => return mds::Value::Boolean(true),
+        "false" => return mds::Value::Boolean(false),
+        "null" => return mds::Value::Null,
+        _ => {}
     }
-}
 
-fn parse_cli_value_unquoted(val: String) -> mds::Value {
     // Integer — parse as i64 so we don't accept "1e3" (scientific notation) here;
     // then widen to f64 for storage.
     if let Ok(n) = val.parse::<i64>() {

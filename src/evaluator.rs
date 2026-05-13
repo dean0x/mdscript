@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::ast::*;
+use crate::ast::{Arg, Expr, ForBlock, IfBlock, IncludeDirective, Node};
 use crate::error::MdsError;
 use crate::scope::{FunctionDef, Scope};
 use crate::value::Value;
@@ -259,7 +259,7 @@ fn evaluate_include(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::TextNode;
+    use crate::ast::{DefineBlock, Interpolation, TextNode};
 
     fn text(s: &str) -> Node {
         Node::Text(TextNode {
