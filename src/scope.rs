@@ -75,7 +75,7 @@ impl Scope {
     pub fn pop(&mut self) -> Result<(), crate::error::MdsError> {
         if self.frames.len() <= 1 {
             return Err(crate::error::MdsError::syntax(
-                "cannot pop the global scope frame",
+                "internal error: cannot pop the global scope frame — this is a compiler bug, please report it",
             ));
         }
         self.frames.pop();

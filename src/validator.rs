@@ -46,10 +46,7 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
                     block.iterable.len(),
                 )
             })?;
-            if !matches!(
-                iterable_val,
-                crate::value::Value::Array(_) | crate::value::Value::Null
-            ) {
+            if !matches!(iterable_val, crate::value::Value::Array(_)) {
                 return Err(MdsError::type_error_at(
                     iterable_val.type_name(),
                     file,
@@ -65,7 +62,10 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
         Node::Define(def) => {
             let mut inner = scope.clone();
             for param in &def.params {
-                inner.set_var(param, crate::value::Value::Null);
+                // Use an empty array as the placeholder for each parameter so
+                // that `@for item in param:` inside the body passes the type
+                // check. The actual type is enforced at call time by the evaluator.
+                inner.set_var(param, crate::value::Value::Array(vec![]));
             }
             validate(&def.body, &inner, file, source)
         }
@@ -73,12 +73,12 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
             // Handled by resolver
             Ok(())
         }
-        Node::Include(inc) => {
-            scope.get_namespace(&inc.alias).ok_or_else(|| {
+        Node::Include(inc) => scope
+            .get_namespace(&inc.alias)
+            .ok_or_else(|| {
                 MdsError::undefined_var_at(&inc.alias, file, source, inc.offset, inc.alias.len())
-            })?;
-            Ok(())
-        }
+            })
+            .map(|_| ()),
     }
 }
 
@@ -91,12 +91,10 @@ fn validate_expr(
     len: usize,
 ) -> Result<(), MdsError> {
     match expr {
-        Expr::Var(name) => {
-            scope.get_var(name).ok_or_else(|| {
-                MdsError::undefined_var_at(name, file, source, offset, name.len())
-            })?;
-            Ok(())
-        }
+        Expr::Var(name) => scope
+            .get_var(name)
+            .ok_or_else(|| MdsError::undefined_var_at(name, file, source, offset, name.len()))
+            .map(|_| ()),
         Expr::Call { name, args } => {
             let func = scope
                 .get_function(name)

@@ -1,0 +1,6 @@
+---
+null_var: null
+---
+@for item in null_var:
+- {item}
+@end

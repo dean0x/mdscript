@@ -75,7 +75,7 @@ impl Parser<'_> {
         }
         self.pos += 1; // skip opening fence
 
-        let fm = if let Some(Token::FrontmatterContent(content, _offset)) = self.peek() {
+        let fm = if let Some(Token::FrontmatterContent(content, _)) = self.peek() {
             let fm = Frontmatter {
                 raw: content.clone(),
             };
@@ -199,7 +199,7 @@ impl Parser<'_> {
 
         if !is_valid_identifier(&condition) {
             return Err(MdsError::syntax(format!(
-                "invalid identifier in @if condition: '{condition}'"
+                "@if condition must be a variable name, got '{condition}' — negation and expressions are not supported in v0.1"
             )));
         }
 

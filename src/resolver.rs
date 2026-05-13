@@ -405,10 +405,11 @@ impl ResolvedModule {
 
     /// Get the prompt body as a Value, if exportable.
     pub fn get_prompt_value(&self) -> Option<Value> {
-        if !self.has_prompt_export() {
-            return None;
+        if self.has_prompt_export() {
+            self.prompt_body.clone().map(Value::String)
+        } else {
+            None
         }
-        self.prompt_body.clone().map(Value::String)
     }
 }
 

@@ -219,11 +219,9 @@ fn evaluate_for(
         .get_var(&block.iterable)
         .ok_or_else(|| MdsError::undefined_var(&block.iterable))?;
 
-    // Validate it's an array before cloning the items.
-    let type_name = iterable.type_name();
     let items = iterable
         .as_array()
-        .ok_or_else(|| MdsError::type_error(type_name))?
+        .ok_or_else(|| MdsError::type_error(iterable.type_name()))?
         .clone();
 
     let mut output = String::new();
@@ -248,16 +246,14 @@ fn evaluate_include(
         .get_namespace(&inc.alias)
         .ok_or_else(|| MdsError::undefined_var(&inc.alias))?;
 
-    match &ns.prompt_body {
-        Some(body) => Ok(body.clone()),
-        None => {
-            warnings.push(format!(
-                "warning: @include of '{}' produced empty output — module has no body text",
-                inc.alias
-            ));
-            Ok(String::new())
-        }
+    if let Some(body) = &ns.prompt_body {
+        return Ok(body.clone());
     }
+    warnings.push(format!(
+        "warning: @include of '{}' produced empty output — module has no body text",
+        inc.alias
+    ));
+    Ok(String::new())
 }
 
 #[cfg(test)]

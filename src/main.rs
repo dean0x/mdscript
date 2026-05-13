@@ -132,8 +132,11 @@ fn parse_cli_value_unquoted(val: String) -> mds::Value {
     }
 
     // Float — accept decimal fractions like "3.14".
+    // Reject non-finite values (NaN, Infinity, -Infinity) — fall through to string.
     if let Ok(f) = val.parse::<f64>() {
-        return mds::Value::Number(f);
+        if f.is_finite() {
+            return mds::Value::Number(f);
+        }
     }
 
     // Simple bracket-list: "[a, b, c]" → Array of strings.
@@ -317,5 +320,49 @@ Your items:
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cli_value_nan_is_string() {
+        // "NaN".parse::<f64>() succeeds but is not finite — must fall through to string.
+        assert_eq!(
+            parse_cli_value("NaN".to_string()),
+            mds::Value::String("NaN".to_string()),
+            "--set val=NaN must produce Value::String, not Value::Number(NaN)"
+        );
+    }
+
+    #[test]
+    fn parse_cli_value_infinity_is_string() {
+        assert_eq!(
+            parse_cli_value("Infinity".to_string()),
+            mds::Value::String("Infinity".to_string()),
+            "--set val=Infinity must produce Value::String, not Value::Number(inf)"
+        );
+    }
+
+    #[test]
+    fn parse_cli_value_neg_infinity_is_string() {
+        assert_eq!(
+            parse_cli_value("-Infinity".to_string()),
+            mds::Value::String("-Infinity".to_string()),
+            "--set val=-Infinity must produce Value::String, not Value::Number(-inf)"
+        );
+    }
+
+    #[test]
+    fn parse_cli_value_finite_float_is_number() {
+        // Sanity check: legitimate floats still parse as numbers.
+        // Use 2.5 (exact in binary) to avoid clippy::approx_constant warning.
+        assert_eq!(
+            parse_cli_value("2.5".to_string()),
+            mds::Value::Number(2.5),
+            "finite float must still become Value::Number"
+        );
     }
 }
