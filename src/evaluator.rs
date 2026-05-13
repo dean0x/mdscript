@@ -8,6 +8,9 @@ use crate::value::Value;
 /// Maximum call depth to prevent stack overflow from deeply nested calls.
 const MAX_CALL_DEPTH: usize = 128;
 
+/// Maximum number of iterations allowed in a single @for loop.
+const MAX_LOOP_ITERATIONS: usize = 100_000;
+
 /// Evaluate a module body into a final rendered string.
 ///
 /// Warnings (e.g. empty `@include`) are appended to `warnings`.
@@ -223,6 +226,16 @@ fn evaluate_for(
         .as_array()
         .ok_or_else(|| MdsError::type_error(iterable.type_name()))?
         .clone();
+
+    if items.len() > MAX_LOOP_ITERATIONS {
+        return Err(MdsError::Io {
+            message: format!(
+                "array has {} elements, exceeding maximum loop iteration limit of {}",
+                items.len(),
+                MAX_LOOP_ITERATIONS
+            ),
+        });
+    }
 
     let mut output = String::new();
 

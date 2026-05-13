@@ -28,6 +28,16 @@ impl Value {
 
     /// Convert a serde_yaml::Value into our Value enum.
     pub fn from_yaml(yaml: serde_yaml::Value) -> Result<Value, MdsError> {
+        Self::from_yaml_inner(yaml, 0)
+    }
+
+    fn from_yaml_inner(yaml: serde_yaml::Value, depth: usize) -> Result<Value, MdsError> {
+        const MAX_DEPTH: usize = 64;
+        if depth > MAX_DEPTH {
+            return Err(MdsError::YamlError {
+                message: format!("value nesting exceeds maximum depth of {MAX_DEPTH}"),
+            });
+        }
         match yaml {
             serde_yaml::Value::Null => Ok(Value::Null),
             serde_yaml::Value::Bool(b) => Ok(Value::Boolean(b)),
@@ -42,18 +52,28 @@ impl Value {
             serde_yaml::Value::String(s) => Ok(Value::String(s)),
             serde_yaml::Value::Sequence(seq) => seq
                 .into_iter()
-                .map(Value::from_yaml)
+                .map(|v| Self::from_yaml_inner(v, depth + 1))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             serde_yaml::Value::Mapping(_) => Err(MdsError::YamlError {
                 message: "object/map types are not supported in MDS v0.1".to_string(),
             }),
-            serde_yaml::Value::Tagged(t) => Value::from_yaml(t.value),
+            serde_yaml::Value::Tagged(t) => Self::from_yaml_inner(t.value, depth + 1),
         }
     }
 
     /// Convert a serde_json::Value into our Value enum.
     pub fn from_json(json: serde_json::Value) -> Result<Value, MdsError> {
+        Self::from_json_inner(json, 0)
+    }
+
+    fn from_json_inner(json: serde_json::Value, depth: usize) -> Result<Value, MdsError> {
+        const MAX_DEPTH: usize = 64;
+        if depth > MAX_DEPTH {
+            return Err(MdsError::JsonError {
+                message: format!("value nesting exceeds maximum depth of {MAX_DEPTH}"),
+            });
+        }
         match json {
             serde_json::Value::Null => Ok(Value::Null),
             serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
@@ -67,7 +87,7 @@ impl Value {
             serde_json::Value::String(s) => Ok(Value::String(s)),
             serde_json::Value::Array(arr) => arr
                 .into_iter()
-                .map(Value::from_json)
+                .map(|v| Self::from_json_inner(v, depth + 1))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             serde_json::Value::Object(_) => Err(MdsError::JsonError {

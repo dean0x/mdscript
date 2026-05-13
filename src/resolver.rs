@@ -40,7 +40,7 @@ pub struct ResolvedModule {
 const MAX_IMPORT_DEPTH: usize = 64;
 
 /// Maximum file size (10 MB) to prevent runaway memory use.
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
 /// Module cache to avoid re-resolving the same file.
 #[derive(Default)]
@@ -66,6 +66,18 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
+        // Reject symlinks before canonicalize so we test the raw (pre-resolution) path.
+        // canonicalize() silently follows symlinks; we check the link itself here.
+        let sym_meta = std::fs::symlink_metadata(path);
+        if let Ok(meta) = sym_meta {
+            if meta.file_type().is_symlink() {
+                return Err(MdsError::import_error(format!(
+                    "symlinks are not allowed in imports: {}",
+                    path.display()
+                )));
+            }
+        }
+
         let canonical = path
             .canonicalize()
             .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
@@ -104,24 +116,23 @@ impl ModuleCache {
             }
         }
 
-        // Check file size before reading
-        let metadata = std::fs::metadata(&canonical).map_err(|e| MdsError::Io {
+        // Read the file as bytes first, then check size (avoids TOCTOU race between
+        // a separate metadata call and the actual read).
+        let bytes = std::fs::read(&canonical).map_err(|e| MdsError::Io {
             message: format!("cannot read {}: {e}", canonical.display()),
         })?;
-        if metadata.len() > MAX_FILE_SIZE {
+        if bytes.len() as u64 > MAX_FILE_SIZE {
             return Err(MdsError::Io {
                 message: format!(
                     "file too large ({} bytes, max {} bytes): {}",
-                    metadata.len(),
+                    bytes.len(),
                     MAX_FILE_SIZE,
                     canonical.display()
                 ),
             });
         }
-
-        // Read source
-        let source = std::fs::read_to_string(&canonical).map_err(|e| MdsError::Io {
-            message: format!("cannot read {}: {e}", canonical.display()),
+        let source = String::from_utf8(bytes).map_err(|e| MdsError::Io {
+            message: format!("invalid UTF-8 in {}: {e}", canonical.display()),
         })?;
 
         // Validate file type (uses already-read source for .md frontmatter check)
@@ -164,9 +175,12 @@ impl ModuleCache {
         // starts_with checks are consistent even when base_dir contains `.` or `..`.
         if self.root_dir.is_none() {
             self.root_dir = Some(
-                base_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| base_dir.to_path_buf()),
+                base_dir.canonicalize().map_err(|e| MdsError::Io {
+                    message: format!(
+                        "cannot resolve base directory {}: {e}",
+                        base_dir.display()
+                    ),
+                })?,
             );
         }
         self.process_module(source, "<source>", base_dir, false, runtime_vars, warnings)

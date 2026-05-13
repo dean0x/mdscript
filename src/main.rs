@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -201,10 +202,24 @@ fn reject_directory_input(input: &Path) -> Result<(), miette::Error> {
     Ok(())
 }
 
+/// Maximum stdin bytes accepted (mirrors the per-file limit in resolver.rs).
+const MAX_STDIN_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
 /// Read from stdin and return the source string along with the current working directory.
+///
+/// Reads at most `MAX_STDIN_SIZE + 1` bytes so we can detect over-sized input without
+/// buffering the entire stream first.
 fn read_stdin() -> Result<(String, std::path::PathBuf), miette::Error> {
-    let source = std::io::read_to_string(std::io::stdin())
+    let mut source = String::new();
+    std::io::stdin()
+        .take(MAX_STDIN_SIZE + 1)
+        .read_to_string(&mut source)
         .map_err(|e| miette::miette!("cannot read stdin: {e}"))?;
+    if source.len() as u64 > MAX_STDIN_SIZE {
+        return Err(miette::miette!(
+            "stdin input exceeds maximum size of 10 MB"
+        ));
+    }
     let cwd = std::env::current_dir()
         .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
     Ok((source, cwd))

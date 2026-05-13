@@ -1899,3 +1899,184 @@ fn if_negation_error_message_is_actionable() {
     );
 }
 
+// ── Security: stdin size limit ────────────────────────────────────────────────
+
+#[test]
+fn stdin_size_limit_rejects_oversized_input() {
+    // Feed more than 10 MB to stdin and verify the CLI returns a non-zero exit code
+    // with an appropriate error message.
+    use std::io::Write;
+
+    let oversized: Vec<u8> = vec![b'x'; 10 * 1024 * 1024 + 1];
+
+    let mut child = mds_bin()
+        .args(["build", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Write oversized data; ignore broken-pipe errors (process may exit early).
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&oversized);
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "build from oversized stdin must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("exceeds maximum") || stderr.contains("10 MB"),
+        "error should mention size limit, got: {stderr}"
+    );
+}
+
+// ── Security: vars file size limit ───────────────────────────────────────────
+
+#[test]
+fn vars_file_size_limit_rejects_oversized_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let huge_vars = dir.path().join("huge_vars.json");
+
+    // Create a JSON file just over 10 MB (fill a JSON object with long values)
+    let mut content = String::from("{\"key\": \"");
+    content.push_str(&"x".repeat(10 * 1024 * 1024));
+    content.push_str("\"}");
+    std::fs::write(&huge_vars, &content).unwrap();
+
+    let result = mds::load_vars_file(&huge_vars);
+    assert!(result.is_err(), "oversized vars file must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("exceeds maximum size") || err.contains("vars file"),
+        "error should mention vars file size limit, got: {err}"
+    );
+}
+
+// ── Security: @for loop iteration limit ──────────────────────────────────────
+
+#[test]
+fn for_loop_iteration_limit_rejects_huge_array() {
+    // Build a source that iterates over an array larger than MAX_LOOP_ITERATIONS (100_000).
+    // We construct the array via runtime vars to avoid a huge source string.
+    let huge_array: Vec<mds::Value> = (0..100_001)
+        .map(|i| mds::Value::String(format!("item{i}")))
+        .collect();
+    let mut vars = HashMap::new();
+    vars.insert("items".to_string(), mds::Value::Array(huge_array));
+
+    let result = mds::compile(fixture("loop.mds"), Some(vars));
+    assert!(result.is_err(), "loop over 100_001 items must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("exceeding maximum loop iteration limit")
+            || err.contains("100001")
+            || err.contains("100_001"),
+        "error should mention iteration limit, got: {err}"
+    );
+}
+
+// ── Security: YAML value depth limit ─────────────────────────────────────────
+
+#[test]
+fn yaml_value_depth_limit_rejects_deeply_nested_sequence() {
+    use serde_yaml::Value as YamlValue;
+
+    // Build a YAML sequence nested 65 levels deep (just past the limit of 64).
+    let mut nested = YamlValue::Null;
+    for _ in 0..65 {
+        nested = YamlValue::Sequence(vec![nested]);
+    }
+
+    let result = mds::value::Value::from_yaml(nested);
+    assert!(
+        result.is_err(),
+        "YAML value nested 65 levels deep must be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("nesting") || err.contains("depth") || err.contains("64"),
+        "error should mention depth limit, got: {err}"
+    );
+}
+
+// ── Security: JSON value depth limit ─────────────────────────────────────────
+
+#[test]
+fn json_value_depth_limit_rejects_deeply_nested_array() {
+    // Build a JSON array nested 65 levels deep (just past the limit of 64).
+    let mut nested = serde_json::Value::Null;
+    for _ in 0..65 {
+        nested = serde_json::Value::Array(vec![nested]);
+    }
+
+    let result = mds::value::Value::from_json(nested);
+    assert!(
+        result.is_err(),
+        "JSON value nested 65 levels deep must be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("nesting") || err.contains("depth") || err.contains("64"),
+        "error should mention depth limit, got: {err}"
+    );
+}
+
+// ── Security: symlink rejection in imports ────────────────────────────────────
+
+#[test]
+#[cfg(unix)]
+fn symlink_import_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create a real .mds file to be the symlink target
+    let real_file = dir.path().join("real.mds");
+    std::fs::write(&real_file, "@define greet(name):\nHello {name}!\n@end\n").unwrap();
+
+    // Create a symlink pointing to it
+    let link_file = dir.path().join("linked.mds");
+    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+    // Create a consumer that imports via the symlink
+    let consumer = dir.path().join("consumer.mds");
+    std::fs::write(
+        &consumer,
+        "@import { greet } from \"./linked.mds\"\n{greet(\"Alice\")}\n",
+    )
+    .unwrap();
+
+    let result = mds::compile(&consumer, None);
+    assert!(result.is_err(), "import via symlink must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("symlink") || err.contains("not allowed"),
+        "error should mention symlink restriction, got: {err}"
+    );
+}
+
+// ── Security: resolve_source base directory must be canonicalizable ──────────
+
+#[test]
+fn resolve_source_nonexistent_base_dir_errors() {
+    // Passing a non-existent base_dir to compile_str_with must now return an error
+    // (previously silently fell back to the raw path).
+    let nonexistent_dir = std::path::Path::new("/nonexistent/path/that/does/not/exist");
+    let result = mds::compile_str_with(
+        "---\nname: World\n---\nHello {name}!\n",
+        Some(nonexistent_dir),
+        None,
+    );
+    assert!(
+        result.is_err(),
+        "non-existent base_dir must now return an error"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("cannot resolve base directory") || err.contains("nonexistent"),
+        "error should describe the unresolvable base directory, got: {err}"
+    );
+}
+
