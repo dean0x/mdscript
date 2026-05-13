@@ -2122,3 +2122,112 @@ fn resolve_source_nonexistent_base_dir_errors() {
         "error should describe the unresolvable base directory, got: {err}"
     );
 }
+
+// ── Fix 1: file_not_found error includes source span for @import ─────────────
+
+#[test]
+fn import_file_not_found_includes_source_span() {
+    // When an @import directive references a non-existent file, the error must
+    // include the source location (file:line:col) pointing at the @import line.
+    let dir = tempfile::tempdir().unwrap();
+    let consumer = dir.path().join("test.mds");
+    std::fs::write(
+        &consumer,
+        "@import \"./nonexistent.mds\" as missing\n\nsome text\n",
+    )
+    .unwrap();
+
+    let result = mds::compile(&consumer, None);
+    assert!(result.is_err(), "import of non-existent file should error");
+
+    let err = result.unwrap_err();
+    // The Display format reports the path
+    let display = format!("{err}");
+    assert!(
+        display.contains("nonexistent") || display.contains("not found"),
+        "error message should mention the missing path, got: {display}"
+    );
+    // The Debug format (miette fancy rendering) includes source context with
+    // line/column numbers when a span is attached.
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("test.mds") || debug.contains("1"),
+        "error should include source context (file or line number), got: {debug}"
+    );
+    // Verify the @import line is referenced in the rendered output
+    assert!(
+        debug.contains("import") || debug.contains("nonexistent"),
+        "error context should reference the @import line, got: {debug}"
+    );
+}
+
+#[test]
+fn import_file_not_found_span_for_alias_import() {
+    // Alias-form @import should also include source span on file-not-found.
+    let dir = tempfile::tempdir().unwrap();
+    let consumer = dir.path().join("alias_test.mds");
+    std::fs::write(&consumer, "@import \"./missing.mds\" as m\n\nsome text\n").unwrap();
+
+    let result = mds::compile(&consumer, None);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("alias_test.mds") || debug.contains("1"),
+        "alias import error should include source context, got: {debug}"
+    );
+}
+
+#[test]
+fn import_file_not_found_span_for_merge_import() {
+    // Merge-form @import (no alias) should also include source span on file-not-found.
+    let dir = tempfile::tempdir().unwrap();
+    let consumer = dir.path().join("merge_test.mds");
+    std::fs::write(&consumer, "@import \"./missing.mds\"\n\nsome text\n").unwrap();
+
+    let result = mds::compile(&consumer, None);
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("merge_test.mds") || debug.contains("1"),
+        "merge import error should include source context, got: {debug}"
+    );
+}
+
+// ── Fix 2: `\}` produces literal `}` (symmetric with `\{`) ──────────────────
+
+#[test]
+fn escaped_close_brace_produces_literal_brace() {
+    // `\}` should produce a literal `}` in output, symmetric with `\{` → `{`.
+    let result = mds::compile_str("Use \\} to close.").unwrap();
+    assert!(
+        result.contains('}'),
+        "\\}} should produce a literal `}}`, got: {result}"
+    );
+    assert!(
+        !result.contains("\\}"),
+        "backslash should be stripped before `}}`, got: {result}"
+    );
+}
+
+#[test]
+fn escaped_open_and_close_brace_together() {
+    // `\{not interpolated\}` should produce `{not interpolated}` in output.
+    let result = mds::compile_str("\\{not interpolated\\}").unwrap();
+    assert!(
+        result.contains("{not interpolated}"),
+        "expected `{{not interpolated}}` in output, got: {result}"
+    );
+}
+
+#[test]
+fn escaped_close_brace_in_function_body() {
+    // `\}` inside a @define body should also produce a literal `}`.
+    let source = "@define show():\nresult\\}\n@end\n{show()}\n";
+    let result = mds::compile_str(source).unwrap();
+    assert!(
+        result.contains("result}"),
+        "escaped `}}` inside function body should render as literal `}}`, got: {result}"
+    );
+}

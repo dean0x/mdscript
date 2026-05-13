@@ -243,7 +243,14 @@ impl ModuleCache {
                     scope.set_function(&def.name, func);
                 }
                 Node::Import(import) => {
-                    self.resolve_import(import, base_dir, runtime_vars, &mut scope, warnings)?;
+                    self.resolve_import(
+                        import,
+                        base_dir,
+                        runtime_vars,
+                        &mut scope,
+                        warnings,
+                        (source, file_str),
+                    )?;
                 }
                 Node::Export(export) => {
                     has_explicit_exports = true;
@@ -323,19 +330,29 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         scope: &mut Scope,
         warnings: &mut Vec<String>,
+        source_ctx: (&str, &str),
     ) -> Result<(), MdsError> {
+        let (source, file_str) = source_ctx;
         match import {
-            ImportDirective::Alias { path, alias } => {
+            ImportDirective::Alias {
+                path,
+                alias,
+                offset,
+            } => {
                 validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
-                let resolved = self.resolve(&import_path, runtime_vars, warnings)?;
+                let resolved = self
+                    .resolve(&import_path, runtime_vars, warnings)
+                    .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
                 let ns = module_to_namespace(&resolved);
                 scope.set_namespace(alias, ns);
             }
-            ImportDirective::Merge { path } => {
+            ImportDirective::Merge { path, offset } => {
                 validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
-                let resolved = self.resolve(&import_path, runtime_vars, warnings)?;
+                let resolved = self
+                    .resolve(&import_path, runtime_vars, warnings)
+                    .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
                 // Per spec: only functions and the prompt body are imported via merge.
                 // Frontmatter variables from the imported module are NOT brought into scope.
                 for (name, func) in resolved.get_all_exports() {
@@ -348,10 +365,16 @@ impl ModuleCache {
                     scope.set_var("prompt", val);
                 }
             }
-            ImportDirective::Selective { names, path } => {
+            ImportDirective::Selective {
+                names,
+                path,
+                offset,
+            } => {
                 validate_import_path(path)?;
                 let import_path = resolve_path(base_dir, path);
-                let resolved = self.resolve(&import_path, runtime_vars, warnings)?;
+                let resolved = self
+                    .resolve(&import_path, runtime_vars, warnings)
+                    .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
                 let not_exported = |name: &str| {
                     MdsError::import_error(format!("'{name}' is not exported from '{path}'"))
                 };
@@ -495,6 +518,31 @@ fn path_display_name(p: &Path) -> String {
         .or_else(|| p.to_str())
         .unwrap_or("?")
         .to_string()
+}
+
+/// If `err` is a `FileNotFound` error with no source span, attach a span pointing
+/// to the `@import` directive in the parent file. Other error variants are returned
+/// unchanged so that cascading errors (e.g. circular imports inside the missing
+/// file) still report their own locations.
+fn attach_import_span(
+    err: MdsError,
+    path: &str,
+    file_str: &str,
+    source: &str,
+    offset: usize,
+) -> MdsError {
+    match err {
+        MdsError::FileNotFound { span: None, .. } => {
+            // Compute the span length as the number of bytes from `offset` to the
+            // end of the `@import` line (not including the newline character itself),
+            // so the whole directive is underlined.
+            let line_len = source[offset..]
+                .find('\n')
+                .unwrap_or(source[offset..].len());
+            MdsError::file_not_found_at(path, file_str, source, offset, line_len)
+        }
+        other => other,
+    }
 }
 
 fn parse_frontmatter(raw: &str) -> Result<HashMap<String, Value>, MdsError> {

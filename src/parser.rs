@@ -333,7 +333,7 @@ impl Parser<'_> {
 }
 
 /// Parse an `@import` directive into a Node.
-fn parse_import_directive(directive: &str, _offset: usize) -> Result<Node, MdsError> {
+fn parse_import_directive(directive: &str, offset: usize) -> Result<Node, MdsError> {
     let rest = directive.trim_start_matches("@import").trim();
 
     // Selective import: @import { name1, name2 } from "path"
@@ -362,7 +362,11 @@ fn parse_import_directive(directive: &str, _offset: usize) -> Result<Node, MdsEr
             .trim();
         let path = parse_quoted_path(path_part)?;
 
-        return Ok(Node::Import(ImportDirective::Selective { names, path }));
+        return Ok(Node::Import(ImportDirective::Selective {
+            names,
+            path,
+            offset,
+        }));
     }
 
     // Alias import: @import "path" as alias
@@ -380,9 +384,10 @@ fn parse_import_directive(directive: &str, _offset: usize) -> Result<Node, MdsEr
         Ok(Node::Import(ImportDirective::Alias {
             path,
             alias: alias.to_string(),
+            offset,
         }))
     } else if after.is_empty() {
-        Ok(Node::Import(ImportDirective::Merge { path }))
+        Ok(Node::Import(ImportDirective::Merge { path, offset }))
     } else {
         Err(MdsError::syntax(format!(
             "unexpected text after import path: '{after}'"

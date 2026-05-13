@@ -157,9 +157,16 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
             continue;
         }
 
-        // Check for escaped brace
+        // Check for escaped open brace: `\{` → literal `{`
         if pos + 1 < chars.len() && chars[pos] == '\\' && chars[pos + 1] == '{' {
             tokens.push(Token::EscapedBrace(byte_pos(pos)));
+            pos += 2;
+            continue;
+        }
+
+        // Check for escaped close brace: `\}` → literal `}` (symmetric with `\{`)
+        if pos + 1 < chars.len() && chars[pos] == '\\' && chars[pos + 1] == '}' {
+            tokens.push(Token::Text("}".to_string(), byte_pos(pos)));
             pos += 2;
             continue;
         }
@@ -201,11 +208,14 @@ pub fn tokenize(source: &str, file: &str) -> Result<Vec<Token>, MdsError> {
         let start = byte_pos(pos);
         let mut text = String::new();
         while pos < chars.len() {
-            // Stop at interpolation, escaped brace, directive start, or code fence
+            // Stop at interpolation, escaped braces, directive start, or code fence
             if chars[pos] == '{' {
                 break;
             }
             if pos + 1 < chars.len() && chars[pos] == '\\' && chars[pos + 1] == '{' {
+                break;
+            }
+            if pos + 1 < chars.len() && chars[pos] == '\\' && chars[pos + 1] == '}' {
                 break;
             }
             if is_line_start_chars(&chars, pos) && chars[pos] == '@' {

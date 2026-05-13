@@ -101,11 +101,19 @@ pub struct DefineBlock {
 #[derive(Debug, Clone)]
 pub enum ImportDirective {
     /// `@import "path" as alias`
-    Alias { path: String, alias: String },
+    Alias {
+        path: String,
+        alias: String,
+        offset: usize,
+    },
     /// `@import "path"` (merge)
-    Merge { path: String },
+    Merge { path: String, offset: usize },
     /// `@import { name1, name2 } from "path"`
-    Selective { names: Vec<String>, path: String },
+    Selective {
+        names: Vec<String>,
+        path: String,
+        offset: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
