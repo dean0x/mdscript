@@ -356,7 +356,8 @@ fn parse_import_directive(directive: &str, _offset: usize) -> Result<Node, MdsEr
 
         let after = rest[brace_end + 1..].trim();
         let path_part = after
-            .strip_prefix("from")
+            .strip_prefix("from ")
+            .or_else(|| after.strip_prefix("from\t"))
             .ok_or_else(|| MdsError::syntax("selective import requires 'from' keyword"))?
             .trim();
         let path = parse_quoted_path(path_part)?;
