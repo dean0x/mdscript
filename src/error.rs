@@ -68,7 +68,10 @@ pub enum MdsError {
     },
 
     #[error("type error: expected array for @for loop, got {got}")]
-    #[diagnostic(code(mds::type_error))]
+    #[diagnostic(
+        code(mds::type_error),
+        help("@for loops require an array value; valid types are arrays (e.g. [1, 2, 3])")
+    )]
     TypeError {
         got: String,
         #[label("not an array")]
@@ -78,7 +81,10 @@ pub enum MdsError {
     },
 
     #[error("circular import detected: {cycle}")]
-    #[diagnostic(code(mds::circular_import))]
+    #[diagnostic(
+        code(mds::circular_import),
+        help("check your import graph for cycles; A imports B imports A is not allowed")
+    )]
     CircularImport { cycle: String },
 
     #[error("file not found: {path}")]
@@ -134,7 +140,10 @@ pub enum MdsError {
     JsonError { message: String },
 
     #[error("recursion detected in function '{name}'")]
-    #[diagnostic(code(mds::recursion))]
+    #[diagnostic(
+        code(mds::recursion),
+        help("MDS does not support recursive functions; restructure using @for loops or multiple @define blocks")
+    )]
     Recursion {
         name: String,
         #[label("recursive call here")]

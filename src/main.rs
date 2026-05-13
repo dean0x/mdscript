@@ -5,6 +5,49 @@ use std::process;
 use clap::{Parser, Subcommand};
 use miette::Result;
 
+/// Scan the current directory for `.mds` files.
+///
+/// Returns `Ok(path)` if exactly one `.mds` file is found, or an `Err` describing
+/// why auto-detection failed (zero files, multiple files, or I/O error).
+fn auto_detect_mds_file() -> std::result::Result<PathBuf, miette::Error> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
+
+    let entries: Vec<PathBuf> = std::fs::read_dir(&cwd)
+        .map_err(|e| miette::miette!("cannot read directory {}: {e}", cwd.display()))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    match entries.len() {
+        0 => Err(miette::miette!(
+            "no .mds files found in current directory\n  \
+             hint: run 'mds init' to create a starter template"
+        )),
+        1 => Ok(entries.into_iter().next().unwrap()),
+        _ => {
+            let mut names: Vec<String> = entries
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+                .collect();
+            names.sort();
+            Err(miette::miette!(
+                "multiple .mds files found: {}\n  \
+                 hint: specify which file to compile, e.g. 'mds build {}'",
+                names.join(", "),
+                names[0],
+            ))
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "mds",
@@ -24,11 +67,11 @@ struct Cli {
 enum Commands {
     /// Compile an MDS file to Markdown
     #[command(
-        after_help = "Examples:\n  mds build template.mds                     Compile to stdout\n  mds build template.mds -o output.md        Compile to file\n  mds build template.mds --vars vars.json    With variable overrides\n  mds build template.mds --set name=Alice    Set a single variable\n  echo \"Hello {name}!\" | mds build -          Compile from stdin"
+        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to stdout\n  mds build template.mds -o output.md        Compile to file\n  mds build template.mds --vars vars.json    With variable overrides\n  mds build template.mds --set name=Alice    Set a single variable\n  echo \"Hello {name}!\" | mds build -          Compile from stdin"
     )]
     Build {
-        /// Input .mds file (use "-" to read from stdin)
-        input: PathBuf,
+        /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
+        input: Option<PathBuf>,
         /// Output file (stdout if omitted)
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
@@ -40,9 +83,12 @@ enum Commands {
         set_vars: Vec<(String, String)>,
     },
     /// Validate an MDS file without rendering
+    #[command(
+        after_help = "Examples:\n  mds check                                  Auto-detect the .mds file in current dir\n  mds check template.mds                     Validate a specific file\n  mds check template.mds --set name=Alice    Validate with variable overrides"
+    )]
     Check {
-        /// Input .mds file (use "-" to read from stdin)
-        input: PathBuf,
+        /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
+        input: Option<PathBuf>,
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
@@ -168,6 +214,19 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             set_vars,
         } => {
             let runtime_vars = build_runtime_vars(vars, set_vars)?;
+
+            // Resolve the input: explicit path/stdin, or auto-detect from cwd.
+            let input = match input {
+                Some(p) => p,
+                None => {
+                    let detected = auto_detect_mds_file()?;
+                    if !quiet {
+                        eprintln!("Building {}", detected.display());
+                    }
+                    detected
+                }
+            };
+
             reject_directory_input(&input);
 
             let (compiled, warnings) = if input == Path::new("-") {
@@ -202,6 +261,13 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             set_vars,
         } => {
             let runtime_vars = build_runtime_vars(vars, set_vars)?;
+
+            // Resolve the input: explicit path/stdin, or auto-detect from cwd.
+            let input = match input {
+                Some(p) => p,
+                None => auto_detect_mds_file()?,
+            };
+
             reject_directory_input(&input);
 
             if input == Path::new("-") {

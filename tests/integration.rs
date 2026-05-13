@@ -1223,3 +1223,160 @@ fn error_output_shows_line_numbers() {
         "error output should include line number context, got: {formatted}"
     );
 }
+
+// ── compile_file convenience function ────────────────────────────────────────
+
+#[test]
+fn compile_file_compiles_valid_mds() {
+    // compile_file is a thin wrapper over compile(); verify it produces correct output
+    let path = fixture("simple.mds");
+    let path_str = path.to_str().expect("fixture path is valid UTF-8");
+    let result = mds::compile_file(path_str);
+    assert!(
+        result.is_ok(),
+        "compile_file should succeed, got: {result:?}"
+    );
+    let output = result.unwrap();
+    assert!(
+        output.contains("Hello Alice!"),
+        "compile_file output should contain 'Hello Alice!', got: {output}"
+    );
+}
+
+#[test]
+fn compile_file_returns_error_for_nonexistent_path() {
+    let result = mds::compile_file("nonexistent_file_that_does_not_exist.mds");
+    assert!(
+        result.is_err(),
+        "compile_file should fail for nonexistent file"
+    );
+    let err = result.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("nonexistent") || msg.contains("not found") || msg.contains("No such"),
+        "error should describe the missing file, got: {msg}"
+    );
+}
+
+// ── Error help message verification ──────────────────────────────────────────
+
+#[test]
+fn circular_import_error_has_help_text() {
+    let result = mds::compile(&fixture("circular_a.mds"), None);
+    assert!(result.is_err(), "circular import should fail");
+    let err = result.unwrap_err();
+    let formatted = format!("{err:?}");
+    assert!(
+        formatted.contains("import") || formatted.contains("cycle"),
+        "circular import error should mention import/cycle, got: {formatted}"
+    );
+}
+
+#[test]
+fn type_error_for_non_array_in_for_loop() {
+    // Build a source that tries @for over a non-array variable
+    let source = "---\ncount: 42\n---\n@for item in count:\n- {item}\n@end\n";
+    let result = mds::compile_str(source);
+    assert!(result.is_err(), "type error should be returned");
+    let err = result.unwrap_err();
+    // Use Display (not Debug) to get the human-readable error message
+    let display = format!("{err}");
+    assert!(
+        display.contains("array") || display.contains("type error"),
+        "type error Display should mention 'array' or 'type error', got: {display}"
+    );
+}
+
+// ── CLI auto-detect .mds file ─────────────────────────────────────────────────
+
+#[test]
+fn build_auto_detects_single_mds_file_in_directory() {
+    // Create a temp directory with exactly one .mds file
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let mds_path = dir.path().join("auto.mds");
+    std::fs::write(&mds_path, "---\nname: World\n---\nHello {name}!\n").expect("write fixture");
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .arg("build")
+        .output()
+        .expect("run mds build");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "auto-detect should succeed with one .mds file; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Hello World!"),
+        "auto-detect output should contain 'Hello World!', got stdout: {stdout}"
+    );
+}
+
+#[test]
+fn build_errors_when_no_mds_files_in_directory() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .arg("build")
+        .output()
+        .expect("run mds build");
+
+    assert!(
+        !output.status.success(),
+        "build with no .mds files should fail"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("no .mds files") || stderr.contains("No .mds files"),
+        "error should mention missing .mds files, got: {stderr}"
+    );
+}
+
+#[test]
+fn build_errors_when_multiple_mds_files_in_directory() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    std::fs::write(dir.path().join("a.mds"), "---\n---\nhello\n").expect("write a.mds");
+    std::fs::write(dir.path().join("b.mds"), "---\n---\nworld\n").expect("write b.mds");
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .arg("build")
+        .output()
+        .expect("run mds build");
+
+    assert!(
+        !output.status.success(),
+        "build with multiple .mds files should fail"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("multiple") || stderr.contains("Multiple"),
+        "error should mention multiple .mds files, got: {stderr}"
+    );
+}
+
+#[test]
+fn check_auto_detects_single_mds_file_in_directory() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let mds_path = dir.path().join("valid.mds");
+    std::fs::write(&mds_path, "---\nname: World\n---\nHello {name}!\n").expect("write fixture");
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .arg("check")
+        .output()
+        .expect("run mds check");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "check auto-detect should succeed; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("OK"),
+        "check should print OK message, got stderr: {stderr}"
+    );
+}

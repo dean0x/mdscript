@@ -237,6 +237,26 @@ mod tests {
     }
 }
 
+/// Compile an MDS file by path string to a final Markdown string.
+///
+/// Convenience wrapper around [`compile`] for callers who have a path as `&str`
+/// and don't want to import [`std::path::Path`].
+///
+/// Warnings (e.g. empty `@include`) are printed to stderr.
+///
+/// # Arguments
+/// * `path` — Path string to the .mds file
+///
+/// # Example
+/// ```rust,no_run
+/// let output = mds::compile_file("template.mds").unwrap();
+/// println!("{output}");
+/// ```
+#[must_use = "the compiled Markdown output should be used"]
+pub fn compile_file(path: &str) -> Result<String, MdsError> {
+    compile(Path::new(path), None)
+}
+
 /// Load runtime variables from a JSON file.
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
