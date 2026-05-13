@@ -2164,8 +2164,10 @@ fn nested_loop_total_iteration_limit() {
 
 #[test]
 fn nested_loop_under_total_iteration_limit() {
-    // Two nested loops of 1000 × 1000 = 1,000,000 total iterations must succeed.
-    let outer: Vec<String> = (0..1000).map(|i| format!("o{i}")).collect();
+    // With unconditional iteration counting, every iteration across all loops counts.
+    // 999 outer × 1000 inner = 999,000 inner iterations + 999 outer = 999,999 total.
+    // This stays under MAX_TOTAL_ITERATIONS (1,000,000) and must succeed.
+    let outer: Vec<String> = (0..999).map(|i| format!("o{i}")).collect();
     let inner: Vec<String> = (0..1000).map(|i| format!("i{i}")).collect();
     let outer_yaml = outer.join(", ");
     let inner_yaml = inner.join(", ");
@@ -2175,7 +2177,7 @@ fn nested_loop_under_total_iteration_limit() {
     let result = mds::compile_str_with(&source, None, None);
     assert!(
         result.is_ok(),
-        "nested loops at exactly 1M total iterations must succeed, got: {:?}",
+        "nested loops under 1M total iterations must succeed, got: {:?}",
         result.unwrap_err()
     );
 }

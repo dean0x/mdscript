@@ -15,7 +15,7 @@ use crate::value::Value;
 /// Falls back to the given directory if no marker is found.
 fn find_project_root(start: &Path) -> PathBuf {
     let mut dir = start.to_path_buf();
-    loop {
+    for _ in 0..256 {
         for marker in [".git", ".mdsroot"] {
             if dir.join(marker).exists() {
                 return dir;
@@ -25,6 +25,7 @@ fn find_project_root(start: &Path) -> PathBuf {
             return start.to_path_buf();
         }
     }
+    start.to_path_buf()
 }
 
 /// A resolved module with its AST, exports, and prompt body.
@@ -96,11 +97,7 @@ impl ModuleCache {
         // Check for circular imports
         if self.resolving.contains(&canonical) {
             let cycle = build_cycle_string(&self.resolving_stack, &canonical);
-            return Err(MdsError::CircularImport {
-                cycle,
-                span: None,
-                src: None,
-            });
+            return Err(MdsError::circular_import(cycle));
         }
 
         // Guard against excessively deep import chains
@@ -126,14 +123,12 @@ impl ModuleCache {
             message: format!("cannot read {}: {e}", canonical.display()),
         })?;
         if bytes.len() as u64 > MAX_FILE_SIZE {
-            return Err(MdsError::Io {
-                message: format!(
-                    "file too large ({} bytes, max {} bytes): {}",
-                    bytes.len(),
-                    MAX_FILE_SIZE,
-                    canonical.display()
-                ),
-            });
+            return Err(MdsError::resource_limit(format!(
+                "file too large ({} bytes, max {} bytes): {}",
+                bytes.len(),
+                MAX_FILE_SIZE,
+                canonical.display()
+            )));
         }
         let source = String::from_utf8(bytes).map_err(|e| MdsError::Io {
             message: format!("invalid UTF-8 in {}: {e}", canonical.display()),

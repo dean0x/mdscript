@@ -137,6 +137,10 @@ pub enum MdsError {
     #[diagnostic(code(mds::io))]
     Io { message: String },
 
+    #[error("resource limit exceeded: {message}")]
+    #[diagnostic(code(mds::resource_limit))]
+    ResourceLimit { message: String },
+
     #[error("YAML parse error: {message}")]
     #[diagnostic(code(mds::yaml))]
     YamlError { message: String },
@@ -388,6 +392,50 @@ impl MdsError {
             message: message.into(),
             span: None,
             src: None,
+        }
+    }
+
+    pub fn resource_limit(message: impl Into<String>) -> Self {
+        MdsError::ResourceLimit {
+            message: message.into(),
+        }
+    }
+
+    pub fn circular_import(cycle: impl Into<String>) -> Self {
+        MdsError::CircularImport {
+            cycle: cycle.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    pub fn recursion_at(
+        name: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::Recursion {
+            name: name.into(),
+            span,
+            src,
+        }
+    }
+
+    pub fn export_error_at(
+        message: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::ExportError {
+            message: message.into(),
+            span,
+            src,
         }
     }
 }

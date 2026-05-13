@@ -77,8 +77,8 @@ fn evaluate_nodes(
                     warnings,
                 )?);
             }
-            Node::Define(block) => {
-                scope.set_function(&block.name, FunctionDef::from(block));
+            Node::Define(_) => {
+                // Handled by resolver with full lexical capture
             }
             Node::Import(_) | Node::Export(_) => {
                 // Handled by resolver, skip during evaluation
@@ -88,9 +88,10 @@ fn evaluate_nodes(
             }
         }
         if output.len() > MAX_OUTPUT_SIZE {
-            return Err(MdsError::Io {
-                message: format!("output exceeds maximum size of {} bytes", MAX_OUTPUT_SIZE),
-            });
+            return Err(MdsError::resource_limit(format!(
+                "output exceeds maximum size of {} bytes",
+                MAX_OUTPUT_SIZE
+            )));
         }
     }
 
@@ -318,34 +319,22 @@ fn evaluate_for(
         .clone();
 
     if items.len() > MAX_LOOP_ITERATIONS {
-        return Err(MdsError::Io {
-            message: format!(
-                "array has {} elements, exceeding maximum loop iteration limit of {}",
-                items.len(),
-                MAX_LOOP_ITERATIONS
-            ),
-        });
+        return Err(MdsError::resource_limit(format!(
+            "array has {} elements, exceeding maximum loop iteration limit of {}",
+            items.len(),
+            MAX_LOOP_ITERATIONS
+        )));
     }
-
-    // Only count this loop's iterations against the global total if the body does
-    // not contain nested @for loops. For nested loops, the inner loops own the
-    // accounting — otherwise a two-level 1000×1000 loop would count as 1,001,000
-    // instead of the intended 1,000,000 (the product of the loop sizes).
-    let is_leaf_loop = !block.body.iter().any(|n| matches!(n, Node::For(_)));
 
     let mut output = String::new();
 
     for item in items {
-        if is_leaf_loop {
-            *total_iterations += 1;
-            if *total_iterations > MAX_TOTAL_ITERATIONS {
-                return Err(MdsError::Io {
-                    message: format!(
-                        "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                        MAX_TOTAL_ITERATIONS
-                    ),
-                });
-            }
+        *total_iterations += 1;
+        if *total_iterations > MAX_TOTAL_ITERATIONS {
+            return Err(MdsError::resource_limit(format!(
+                "total loop iterations exceeded maximum of {} across all loops in this compilation",
+                MAX_TOTAL_ITERATIONS
+            )));
         }
         scope.push();
         scope.set_var(&block.var, item);
@@ -491,31 +480,33 @@ mod tests {
 
     #[test]
     fn evaluate_function_call() {
-        let nodes = vec![
-            Node::Define(DefineBlock {
-                name: "greet".to_string(),
-                params: vec!["name".to_string()],
-                body: vec![
-                    text("Hello "),
-                    Node::Interpolation(Interpolation {
-                        expr: Expr::Var("name".to_string()),
-                        offset: 6,
-                        len: 4,
-                    }),
-                    text("!"),
-                ],
-                offset: 0,
-            }),
-            Node::Interpolation(Interpolation {
-                expr: Expr::Call {
-                    name: "greet".to_string(),
-                    args: vec![Arg::StringLiteral("Bob".to_string())],
-                },
-                offset: 20,
-                len: 12,
-            }),
-        ];
+        // The resolver handles @define and populates scope before evaluate() is called.
+        // Simulate that here by pre-registering the function in scope.
+        let define = DefineBlock {
+            name: "greet".to_string(),
+            params: vec!["name".to_string()],
+            body: vec![
+                text("Hello "),
+                Node::Interpolation(Interpolation {
+                    expr: Expr::Var("name".to_string()),
+                    offset: 6,
+                    len: 4,
+                }),
+                text("!"),
+            ],
+            offset: 0,
+        };
         let mut scope = Scope::new();
+        scope.set_function("greet", FunctionDef::from(&define));
+
+        let nodes = vec![Node::Interpolation(Interpolation {
+            expr: Expr::Call {
+                name: "greet".to_string(),
+                args: vec![Arg::StringLiteral("Bob".to_string())],
+            },
+            offset: 20,
+            len: 12,
+        })];
         let mut warnings = vec![];
         assert_eq!(
             evaluate(&nodes, &mut scope, &mut warnings).unwrap(),
