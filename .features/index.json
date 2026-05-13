@@ -3,7 +3,7 @@
   "features": {
     "mds-compiler": {
       "name": "MDS Compiler",
-      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, or debugging output rendering. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport.",
+      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, or debugging output rendering. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport, resource limits, loop iterations, output size, value depth.",
       "directories": [
         "src/",
         "tests/"
@@ -20,7 +20,7 @@
         "src/value.rs",
         "src/error.rs"
       ],
-      "lastUpdated": "2026-05-13T06:14:12.004Z",
+      "lastUpdated": "2026-05-13T22:15:41.062Z",
       "createdBy": "devflow-knowledge"
     }
   }

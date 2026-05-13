@@ -16,7 +16,7 @@ referencedFiles:
   - src/value.rs
   - src/error.rs
 created: 2026-05-12
-updated: 2026-05-13
+updated: 2026-05-14
 ---
 
 # MDS Compiler
@@ -172,6 +172,8 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 
 `build_cycle_string` reconstructs the cycle path by finding the repeated path in `resolving_stack` using `.position(...).unwrap_or(0)`. The `.unwrap_or(0)` is a safe fallback: if for any reason the path is not found (which should not happen in normal operation), the cycle string starts from the beginning of the stack rather than panicking. A private `path_display_name` helper extracts the filename portion of each path for display in cycle strings, falling back to the full path or `"?"`.
 
+**`attach_import_span`**: When an import attempt fails, the private helper `attach_import_span` re-wraps certain span-less errors with the `@import` directive's source location. It handles two cases: `MdsError::FileNotFound { span: None, .. }` → `file_not_found_at(...)`, and `MdsError::CircularImport { cycle, span: None, .. }` → `circular_import_at(...)`. All other error variants pass through unchanged so cascading errors (e.g. a syntax error inside a circularly-imported file) still report their own source location.
+
 **`process_module`** is the inner workhorse: it tokenizes, parses, builds scope from frontmatter + runtime vars, walks the AST to register functions (capturing closure scope) and resolve imports, validates, and evaluates. The result is a `ResolvedModule`. Warnings are threaded through as `&mut Vec<String>` from the public API all the way into `evaluate`.
 
 **`ResolvedModule`** fields:
@@ -205,6 +207,14 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 The evaluator walks the AST and produces the final rendered string. Its public entry point is `evaluate(nodes, scope, warnings)` — the `warnings: &mut Vec<String>` parameter is threaded through all internal helpers including `evaluate_include`. Nothing in the evaluator calls `eprintln!` directly; all diagnostics go into the warnings vec.
 
 The evaluator carries a `call_stack: HashSet<String>` for recursion detection (error on self or mutual recursion) and enforces `MAX_CALL_DEPTH = 128` for deep chains.
+
+Four additional resource limits guard against runaway compilation:
+- `MAX_LOOP_ITERATIONS = 100,000` — enforced per `@for` loop; raising this by one over the limit triggers a `ResourceLimit` error at evaluation time
+- `MAX_TOTAL_ITERATIONS = 1,000,000` — cumulative across all loops in one compilation pass; nested loops that individually fit within the per-loop limit can still be rejected here
+- `MAX_OUTPUT_SIZE = 50 MB` — checked after each node renders; returning `ResourceLimit` the moment the buffer exceeds this size rather than at the end
+- `MAX_VALUE_DEPTH = 64` — enforced inside `Value::from_yaml` / `Value::from_json` via depth-tracking inner helpers, rejecting deeply nested YAML/JSON trees before they enter the pipeline
+
+All four limits return `MdsError::ResourceLimit` (no source span). If you add a warning-emitting path or a new iterable node, thread `total_iterations: &mut usize` through the call chain so the cumulative limit is respected.
 
 **`Node::Define` in the evaluator**: When the evaluator encounters a `Node::Define`, it calls `scope.set_function(&block.name, FunctionDef::from(block))`. This re-registers the function in the runtime scope with empty captures — the evaluator does not restore closure captures here. Closure restoration only happens inside `invoke_function` when the function is actually called. This means `@define` blocks must appear before any call sites in the source, and the resolver's pre-evaluation scope setup is what makes cross-module closure capture work.
 
@@ -287,6 +297,10 @@ MdsError::name_collision_at(name, file, source, offset, len)
 MdsError::file_not_found_at(path, file, source, offset, len)
 MdsError::arity_at(name, expected, got, file, source, offset, len)
 MdsError::type_error_at(got, file, source, offset, len)
+MdsError::recursion_at(name, file, source, offset, len)
+MdsError::import_error_at(message, file, source, offset, len)
+MdsError::export_error_at(message, file, source, offset, len)
+MdsError::circular_import_at(cycle, file, source, offset, len)
 
 // Use bare variants only when source context is unavailable.
 MdsError::syntax(message)
@@ -299,11 +313,10 @@ MdsError::type_error(got)
 MdsError::recursion(name)
 MdsError::import_error(message)
 MdsError::export_error(message)
+MdsError::circular_import(cycle)
 ```
 
-`Recursion`, `ImportError`, and `ExportError` carry optional `span` and `src` fields in their struct definition but do not yet have public `_at` constructor methods. They are currently always constructed without span info. If you need span-aware versions, add `_at` constructor methods following the pattern in `error.rs`.
-
-Always prefer `_at` variants inside the validator and evaluator where source offsets are available from the AST nodes. The validator currently uses `type_error_at` for `@for` iterable type errors.
+All major error variants now have `_at` constructor methods. Always prefer `_at` variants inside the validator and evaluator where source offsets are available from the AST nodes. The validator uses `type_error_at` for `@for` iterable type errors; the resolver uses `circular_import_at` and `file_not_found_at` via `attach_import_span`.
 
 ### Adding a New Value Type
 
@@ -326,6 +339,10 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **MAX_FILE_SIZE = 10MB** — checked before reading; prevents memory exhaustion from large inputs.
 - **MAX_CALL_DEPTH = 128** — prevents stack overflow from deeply nested function calls.
 - **MAX_NESTING_DEPTH = 256** — shared constant used for two distinct limits: parser-level block nesting (`@if`/`@for`/`@define`) via `enter_block()`, and argument-level nested call depth via `parse_args_inner`.
+- **MAX_LOOP_ITERATIONS = 100,000** — per-loop hard cap in the evaluator; `@for` over an array larger than this fails with `ResourceLimit`.
+- **MAX_TOTAL_ITERATIONS = 1,000,000** — cumulative cap across all loops in one compilation; nested loops can trigger this even when each is under the per-loop cap.
+- **MAX_OUTPUT_SIZE = 50 MB** — evaluator checks output buffer size after each node; exceeding it returns `ResourceLimit` immediately.
+- **MAX_VALUE_DEPTH = 64** — `Value::from_yaml` / `Value::from_json` reject YAML sequences or JSON arrays nested deeper than 64 levels.
 - **Object types unsupported** — YAML mappings and JSON objects are rejected at the value conversion layer.
 - **`.md` files require `type: mds`** in frontmatter to be compiled — `validate_file_type` enforces this.
 - **Recursion is detected at evaluation time** using the call stack set — the validator cannot catch recursive call chains because they depend on runtime scope.
@@ -373,11 +390,11 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **`help(...)` attributes are variant-level, not constructor-level** — `CircularImport`, `Recursion`, and `TypeError` now have `#[diagnostic(help(...))]` annotations that miette renders automatically. When adding new error variants, add the `help` attribute directly on the variant, not in the constructor method.
 - **Re-export errors are raised at the barrel module, not the consumer** — when `@export name from "path"` fails because `name` is not exported from the source module, the error surfaces when the barrel itself is compiled, not when the consumer imports from the barrel. This means `reexport_nonexistent.mds` fails at compile time regardless of whether any consumer uses it.
 - **`--set KEY=VAL` last-write wins for duplicate keys** — when `--set name=First --set name=Second` is passed, the second value wins because runtime vars are collected into a `HashMap` and later writes overwrite earlier ones.
-- **`type_error_at` is now available for `TypeError`** — unlike `Recursion`, `ImportError`, and `ExportError` (which still lack `_at` constructors), `TypeError` has a `type_error_at` constructor used by the validator for `@for` iterable type errors. When reporting type errors from the validator, always use `type_error_at`.
+- **All major `MdsError` variants now have `_at` constructors** — `recursion_at`, `import_error_at`, `export_error_at`, and `circular_import_at` were added alongside the existing span-aware constructors. When adding new error sites inside the validator or resolver where an AST offset is available, always use the `_at` form rather than the bare constructor so miette can annotate the source location.
 
 ## Key Files
 
-- `src/lib.rs` — public API: `compile`, `compile_file`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `load_vars_file`, `clean_output`; private `resolve_base_dir` helper shared by all string-based API variants
+- `src/lib.rs` — public API: `compile`, `compile_file`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `load_vars_file`, `clean_output`; public re-export `MAX_FILE_SIZE` (re-exported from `resolver::MAX_FILE_SIZE` as the single source of truth shared between the resolver and the CLI stdin reader); private `resolve_base_dir` helper shared by all string-based API variants
 - `src/main.rs` — CLI entry point: `auto_detect_mds_file`, `parse_cli_value`/`parse_cli_value_unquoted`, `build_runtime_vars`, `reject_directory_input`, `read_stdin`; `Build` and `Check` use `input: Option<PathBuf>`
 - `src/ast.rs` — all AST types including `Arg::Call` for nested function call arguments; the contract between parser and everything downstream
 - `src/lexer.rs` — tokenizer; handles frontmatter, code fences, interpolation, directives
@@ -387,7 +404,7 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - `src/validator.rs` — pre-evaluation semantic checks; `validate_var_args` recursively validates nested `Arg::Call` arguments; `@define` params injected as `Value::Array(vec![])` so param-as-iterable passes type check; `type_error_at` used for span-aware `@for` type errors
 - `src/scope.rs` — scope chain with frames for variables, functions, and namespaces; closure capture helpers; `get_all_*` iterate outer→inner for correct shadowing semantics
 - `src/value.rs` — runtime value enum with YAML/JSON converters and display rules; test numerics use `2.5` (not `3.14`) to satisfy clippy `approx_constant`
-- `src/error.rs` — `MdsError` enum with miette diagnostics; `CircularImport`, `Recursion`, `TypeError` carry `help(...)` diagnostic attributes; `type_error_at` constructor now available; builder methods for span-aware errors
+- `src/error.rs` — `MdsError` enum with miette diagnostics; `CircularImport`, `Recursion`, `TypeError` carry `help(...)` diagnostic attributes; all major variants now have `_at` constructors (`recursion_at`, `import_error_at`, `export_error_at`, `circular_import_at` added); `ResourceLimit` variant for evaluator/value depth guards
 - `tests/integration.rs` — end-to-end tests covering all features, error paths, CLI integration (stdin, file output, vars file, quiet flag, auto-detect), edge cases (nested loops, loop shadowing, falsy values, mutual recursion, escape sequences in blocks/functions, zero-param functions, empty function bodies, re-export errors), `compile_file` API, error help-text verification, and spec-compliance tests for scope visibility, export visibility, and `--set` coercion rules
 - `tests/fixtures/reexport_nonexistent.mds` — fixture for re-export error: `@export nonexistent_fn from "./greetings.mds"` where `nonexistent_fn` is not exported, verifying the error is raised at the barrel module
 
@@ -399,5 +416,5 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - `src/ast.rs` — canonical reference for `Arg` variants; any new argument form starts here
 - `src/lib.rs` — canonical reference for the two-tier warning API (`compile` vs `compile_collecting_warnings`), `compile_file` convenience entry point, and `resolve_base_dir` helper for optional base directory resolution
 - `src/main.rs` — canonical reference for CLI auto-detection logic and `parse_cli_value` coercion rules
-- `src/error.rs` — canonical reference for `help(...)` diagnostic attribute placement on `MdsError` variants and available `_at` constructors
+- `src/error.rs` — canonical reference for `help(...)` diagnostic attribute placement on `MdsError` variants and available `_at` constructors; all major variants (`Recursion`, `ImportError`, `ExportError`, `CircularImport`) now have span-aware constructors
 - `tests/integration.rs` — covers all directive combinations including nested function calls, CLI stdin/quiet mode, auto-detect, `compile_file`, error help-text, scope/export visibility rules, `--set` coercion and deduplication, and re-export error scenarios; read before adding new directives to understand existing fixture patterns
