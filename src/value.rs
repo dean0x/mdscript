@@ -58,13 +58,11 @@ impl Value {
             serde_json::Value::Null => Ok(Value::Null),
             serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
             serde_json::Value::Number(n) => {
-                if let Some(f) = n.as_f64() {
-                    Ok(Value::Number(f))
-                } else {
-                    Err(MdsError::JsonError {
+                n.as_f64()
+                    .map(Value::Number)
+                    .ok_or_else(|| MdsError::JsonError {
                         message: format!("unsupported number: {n:?}"),
                     })
-                }
             }
             serde_json::Value::String(s) => Ok(Value::String(s)),
             serde_json::Value::Array(arr) => arr

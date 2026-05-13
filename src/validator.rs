@@ -37,7 +37,7 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
             Ok(())
         }
         Node::For(block) => {
-            scope.get_var(&block.iterable).ok_or_else(|| {
+            let iterable_val = scope.get_var(&block.iterable).ok_or_else(|| {
                 MdsError::undefined_var_at(
                     &block.iterable,
                     file,
@@ -46,6 +46,18 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
                     block.iterable.len(),
                 )
             })?;
+            if !matches!(
+                iterable_val,
+                crate::value::Value::Array(_) | crate::value::Value::Null
+            ) {
+                return Err(MdsError::type_error_at(
+                    iterable_val.type_name(),
+                    file,
+                    source,
+                    block.offset,
+                    block.iterable.len(),
+                ));
+            }
             let mut inner = scope.clone();
             inner.set_var(&block.var, crate::value::Value::Null);
             validate(&block.body, &inner, file, source)
@@ -61,13 +73,12 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
             // Handled by resolver
             Ok(())
         }
-        Node::Include(inc) => {
-            // Verify the referenced namespace exists (must have been @import-ed)
-            scope.get_namespace(&inc.alias).ok_or_else(|| {
+        Node::Include(inc) => scope
+            .get_namespace(&inc.alias)
+            .ok_or_else(|| {
                 MdsError::undefined_var_at(&inc.alias, file, source, inc.offset, inc.alias.len())
-            })?;
-            Ok(())
-        }
+            })
+            .map(|_| ()),
     }
 }
 

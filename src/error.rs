@@ -270,6 +270,21 @@ impl MdsError {
         }
     }
 
+    pub fn type_error_at(
+        got: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::TypeError {
+            got: got.into(),
+            span,
+            src,
+        }
+    }
+
     pub fn name_collision(name: impl Into<String>) -> Self {
         MdsError::NameCollision {
             name: name.into(),

@@ -459,12 +459,9 @@ fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
                 let fm = &after_fence[..end];
                 // Check each line for `type: mds` without a full YAML parse.
                 let has_type_mds = fm.lines().any(|line| {
-                    let trimmed = line.trim();
-                    if let Some(val) = trimmed.strip_prefix("type:") {
-                        val.trim() == "mds"
-                    } else {
-                        false
-                    }
+                    line.trim()
+                        .strip_prefix("type:")
+                        .is_some_and(|v| v.trim() == "mds")
                 });
                 if has_type_mds {
                     return Ok(());
