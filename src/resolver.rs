@@ -5,7 +5,7 @@ use crate::ast::{ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::lexer::tokenize;
-use crate::parser::parse;
+use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
 use crate::validator;
 use crate::value::Value;
@@ -96,7 +96,11 @@ impl ModuleCache {
         // Check for circular imports
         if self.resolving.contains(&canonical) {
             let cycle = build_cycle_string(&self.resolving_stack, &canonical);
-            return Err(MdsError::CircularImport { cycle });
+            return Err(MdsError::CircularImport {
+                cycle,
+                span: None,
+                src: None,
+            });
         }
 
         // Guard against excessively deep import chains
@@ -193,7 +197,7 @@ impl ModuleCache {
     ) -> Result<ResolvedModule, MdsError> {
         // Tokenize and parse
         let tokens = tokenize(source, file_str)?;
-        let module = parse(&tokens)?;
+        let module = parse_with_ctx(&tokens, file_str, source)?;
 
         // Build scope from frontmatter
         let mut scope = Scope::new();
@@ -374,8 +378,17 @@ impl ModuleCache {
                 let resolved = self
                     .resolve(&import_path, runtime_vars, warnings)
                     .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
+                let line_len = source[*offset..]
+                    .find('\n')
+                    .unwrap_or(source[*offset..].len());
                 let not_exported = |name: &str| {
-                    MdsError::import_error(format!("'{name}' is not exported from '{path}'"))
+                    MdsError::import_error_at(
+                        format!("'{name}' is not exported from '{path}'"),
+                        file_str,
+                        source,
+                        *offset,
+                        line_len,
+                    )
                 };
                 for name in names {
                     if name == "prompt" {
@@ -529,15 +542,18 @@ fn attach_import_span(
     source: &str,
     offset: usize,
 ) -> MdsError {
+    // Compute the span length as the number of bytes from `offset` to the
+    // end of the `@import` line (not including the newline character itself),
+    // so the whole directive is underlined.
+    let line_len = source[offset..]
+        .find('\n')
+        .unwrap_or(source[offset..].len());
     match err {
         MdsError::FileNotFound { span: None, .. } => {
-            // Compute the span length as the number of bytes from `offset` to the
-            // end of the `@import` line (not including the newline character itself),
-            // so the whole directive is underlined.
-            let line_len = source[offset..]
-                .find('\n')
-                .unwrap_or(source[offset..].len());
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)
+        }
+        MdsError::CircularImport { cycle, span: None, .. } => {
+            MdsError::circular_import_at(cycle, file_str, source, offset, line_len)
         }
         other => other,
     }

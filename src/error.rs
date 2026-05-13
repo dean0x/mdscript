@@ -85,7 +85,13 @@ pub enum MdsError {
         code(mds::circular_import),
         help("check your import graph for cycles; A imports B imports A is not allowed")
     )]
-    CircularImport { cycle: String },
+    CircularImport {
+        cycle: String,
+        #[label("import creates cycle here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
 
     #[error("file not found: {path}")]
     #[diagnostic(
@@ -344,6 +350,36 @@ impl MdsError {
             message: message.into(),
             span: None,
             src: None,
+        }
+    }
+
+    pub fn import_error_at(
+        message: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::ImportError {
+            message: message.into(),
+            span,
+            src,
+        }
+    }
+
+    pub fn circular_import_at(
+        cycle: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::CircularImport {
+            cycle: cycle.into(),
+            span,
+            src,
         }
     }
 
