@@ -588,10 +588,7 @@ fn parse_single_arg_inner(s: &str, depth: usize) -> Result<Arg, MdsError> {
         && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
     {
         let inner = &s[1..s.len() - 1];
-        let unescaped = inner
-            .replace("\\\"", "\"")
-            .replace("\\'", "'")
-            .replace("\\\\", "\\");
+        let unescaped = unescape_string(inner);
         Ok(Arg::StringLiteral(unescaped))
     } else if let Some(paren_pos) = s.find('(') {
         // Nested function call: name(args)
@@ -617,6 +614,33 @@ fn parse_single_arg_inner(s: &str, depth: usize) -> Result<Arg, MdsError> {
             "invalid function argument: '{s}'"
         )))
     }
+}
+
+/// Single-pass unescape for string literals.
+///
+/// Recognises `\\`, `\"`, and `\'` escape sequences. A backslash followed
+/// by any other character is kept verbatim (both the backslash and the
+/// character), matching the least-surprise principle for a template language.
+fn unescape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\'') => out.push('\''),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Return true if `directive` is exactly `keyword` or starts with `keyword`
@@ -848,6 +872,45 @@ mod tests {
         assert!(result.is_ok(), "escaped quote in string should parse ok");
         if let Ok(Arg::StringLiteral(s)) = result {
             assert_eq!(s, r#"say "hi""#);
+        } else {
+            panic!("expected StringLiteral");
+        }
+    }
+
+    #[test]
+    fn unescape_backslash_then_quote() {
+        // `"a\\\"b"` inner content is `a\\\"b`:
+        // \\  -> single backslash
+        // \"  -> literal quote
+        // Result: `a\"b` (backslash, quote, b)
+        let result = parse_single_arg(r#""a\\\"b""#).unwrap();
+        if let Arg::StringLiteral(s) = result {
+            assert_eq!(s, "a\\\"b", "escaped backslash then escaped quote");
+        } else {
+            panic!("expected StringLiteral");
+        }
+    }
+
+    #[test]
+    fn unescape_double_backslash() {
+        // `"a\\\\b"` inner content is `a\\\\b`:
+        // \\  -> single backslash
+        // \\  -> single backslash
+        // Result: `a\\b`
+        let result = parse_single_arg(r#""a\\\\b""#).unwrap();
+        if let Arg::StringLiteral(s) = result {
+            assert_eq!(s, "a\\\\b", "double escaped backslash");
+        } else {
+            panic!("expected StringLiteral");
+        }
+    }
+
+    #[test]
+    fn unescape_unknown_sequence_preserved() {
+        // `"a\nb"` — `\n` is not a recognized escape, kept verbatim
+        let result = parse_single_arg(r#""a\nb""#).unwrap();
+        if let Arg::StringLiteral(s) = result {
+            assert_eq!(s, "a\\nb", "unknown escape sequence kept verbatim");
         } else {
             panic!("expected StringLiteral");
         }
