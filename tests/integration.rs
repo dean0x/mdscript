@@ -1380,3 +1380,258 @@ fn check_auto_detects_single_mds_file_in_directory() {
         "check should print OK message, got stderr: {stderr}"
     );
 }
+
+// ── Falsy: boolean false (Spec 4.3) ──────────────────────────────────────────
+
+#[test]
+fn if_falsy_boolean_false() {
+    // `false` is explicitly listed as a falsy value in Spec 4.3.
+    let result = mds::compile(fixture("if_falsy_false.mds"), None).unwrap();
+    assert!(
+        result.contains("falsy"),
+        "boolean false should be falsy, got: {result}"
+    );
+    assert!(
+        !result.contains("truthy"),
+        "boolean false should not be truthy, got: {result}"
+    );
+}
+
+// ── Multi-level imports: A imports B imports C (Spec 4.6) ────────────────────
+
+#[test]
+fn multilevel_imports() {
+    // A imports B (as b), B imports C (as c). A calls b.midfn which calls c.deepfn.
+    // Verifies that recursive import resolution works correctly.
+    let result = mds::compile(fixture("multilevel_a.mds"), None).unwrap();
+    assert!(
+        result.contains("Mid via Deep: Alice"),
+        "multi-level import should resolve A→B→C, got: {result}"
+    );
+}
+
+// ── Wildcard re-export collision (Spec 4.7) ───────────────────────────────────
+
+#[test]
+fn wildcard_reexport_collision_errors() {
+    // Two modules both export 'shared'. Barrel tries @export * from each.
+    // Per spec: name collisions across wildcard re-exports → compilation error.
+    let result = mds::compile(fixture("wildcard_collision_barrel.mds"), None);
+    assert!(
+        result.is_err(),
+        "wildcard re-export collision should be a compile error"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("collision") || err.contains("shared") || err.contains("already defined"),
+        "error should mention the colliding name, got: {err}"
+    );
+}
+
+// ── @include requires prior @import (Spec 4.8) ───────────────────────────────
+
+#[test]
+fn include_without_import_errors() {
+    // @include utils where utils has NOT been @import-ed must fail.
+    // Per spec: "Module must be imported first via @import."
+    let result = mds::compile(fixture("include_no_import.mds"), None);
+    assert!(
+        result.is_err(),
+        "@include of non-imported alias must fail"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("undefined") || err.contains("utils"),
+        "error should mention the missing alias, got: {err}"
+    );
+}
+
+// ── Frontmatter with only type: mds (Spec 9.2) ───────────────────────────────
+
+#[test]
+fn frontmatter_type_only_compiles() {
+    // A .md file with only `type: mds` in frontmatter (no other variables) should compile.
+    let result = mds::compile(fixture("frontmatter_type_only.md"), None).unwrap();
+    assert!(
+        result.contains("Hello from type-only frontmatter!"),
+        "frontmatter with only type:mds should compile, got: {result}"
+    );
+}
+
+// ── Error format includes file:line:col (Spec Section 5) ─────────────────────
+
+#[test]
+fn error_format_includes_file_line_col() {
+    // Per spec: errors include file path, line number, column, contextual explanation.
+    // Use the CLI to get the full diagnostic rendering.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("err_test.mds");
+    std::fs::write(&input, "---\nname: Alice\n---\nHello {undefined_var}!\n").unwrap();
+
+    let output = mds_bin()
+        .args(["build", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "should fail with undefined variable");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    // miette renders: ╭─[path:line:col]
+    assert!(
+        stderr.contains("undefined_var"),
+        "error should mention the undefined variable, got: {stderr}"
+    );
+    // Line number must be present (error is on line 4)
+    assert!(
+        stderr.contains(":4:") || stderr.contains("4 │"),
+        "error should include line number 4, got: {stderr}"
+    );
+    // Column must be present
+    assert!(
+        stderr.contains(':'),
+        "error should include column info, got: {stderr}"
+    );
+}
+
+// ── Compile from string: empty frontmatter (Spec 4.1 edge case) ──────────────
+
+#[test]
+fn compile_str_empty_frontmatter() {
+    // "---\n---\n" is valid: empty frontmatter with no variables.
+    let source = "---\n---\nHello World!\n";
+    let result = mds::compile_str(source).unwrap();
+    assert!(
+        result.contains("Hello World!"),
+        "empty frontmatter should compile cleanly, got: {result}"
+    );
+}
+
+// ── Compile from string: no frontmatter at all ───────────────────────────────
+
+#[test]
+fn compile_str_truly_no_frontmatter() {
+    // Source with no --- fences at all is valid per spec (frontmatter is optional).
+    let source = "@define greet(name):\nHi {name}!\n@end\n{greet(\"World\")}\n";
+    let result = mds::compile_str(source).unwrap();
+    assert!(
+        result.contains("Hi World!"),
+        "source with no frontmatter and @define should compile, got: {result}"
+    );
+}
+
+// ── YAML map type rejected (Spec 4.1) ────────────────────────────────────────
+
+#[test]
+fn yaml_map_type_rejected() {
+    // Per spec: "No object/map type in v0.1". A YAML map value must be a compile error.
+    let source = "---\nconfig:\n  key: value\n---\nHello!\n";
+    let result = mds::compile_str(source);
+    assert!(
+        result.is_err(),
+        "YAML map/object type should be rejected, got: {:?}",
+        result.unwrap()
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("object") || err.contains("map") || err.contains("not supported"),
+        "error should mention object/map not supported, got: {err}"
+    );
+}
+
+// ── Loop variable block scope (Spec 4.4) ─────────────────────────────────────
+
+#[test]
+fn loop_var_not_visible_after_loop() {
+    // The loop variable is scoped to the @for...@end block.
+    // After the loop, attempting to use it should fail.
+    let source = "---\nitems: [a, b]\n---\n@for item in items:\n- {item}\n@end\n{item}\n";
+    let result = mds::compile_str(source);
+    assert!(
+        result.is_err(),
+        "loop variable should not be visible after @end"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("item") || err.contains("undefined"),
+        "error should mention undefined 'item' after loop, got: {err}"
+    );
+}
+
+// ── Function scope: params not visible outside function (Spec 4.5) ───────────
+
+#[test]
+fn function_param_not_visible_outside_function() {
+    // Function parameters are scoped to the function body.
+    // After the call, the param name is not in scope.
+    let source = "@define greet(name):\nHello {name}!\n@end\n{greet(\"Alice\")}\n{name}\n";
+    let result = mds::compile_str(source);
+    assert!(
+        result.is_err(),
+        "function param should not be visible outside function body"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("name") || err.contains("undefined"),
+        "error should mention undefined 'name' outside function, got: {err}"
+    );
+}
+
+// ── Export visibility: explicit exports hide non-exported symbols (Spec 4.7) ──
+
+#[test]
+fn explicit_export_hides_non_exported() {
+    // When a module has any @export directive, only exported symbols are visible.
+    // collision_a.mds exports 'greet'. A non-exported function should NOT be importable.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = dir.path().join("provider.mds");
+    let consumer = dir.path().join("consumer.mds");
+
+    std::fs::write(
+        &provider,
+        "@define public_fn(name):\nPublic: {name}\n@end\n\n@define private_fn(name):\nPrivate: {name}\n@end\n\n@export public_fn\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer,
+        "@import { private_fn } from \"./provider.mds\"\n\n{private_fn(\"Alice\")}\n",
+    )
+    .unwrap();
+
+    let result = mds::compile(&consumer, None);
+    assert!(
+        result.is_err(),
+        "importing non-exported symbol should fail when module has explicit exports"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("private_fn") || err.contains("not exported"),
+        "error should mention the non-exported symbol, got: {err}"
+    );
+}
+
+// ── Default public when no exports (Spec 4.7) ────────────────────────────────
+
+#[test]
+fn default_public_when_no_exports() {
+    // If no @export directives exist, everything is exported (default-public).
+    let dir = tempfile::tempdir().unwrap();
+    let provider = dir.path().join("provider.mds");
+    let consumer = dir.path().join("consumer.mds");
+
+    std::fs::write(
+        &provider,
+        "@define hello(name):\nHello {name}!\n@end\n",
+    )
+    .unwrap();
+    // No @export directive — hello should still be importable.
+    std::fs::write(
+        &consumer,
+        "@import { hello } from \"./provider.mds\"\n\n{hello(\"World\")}\n",
+    )
+    .unwrap();
+
+    let result = mds::compile(&consumer, None).unwrap();
+    assert!(
+        result.contains("Hello World!"),
+        "default-public module should allow importing any symbol, got: {result}"
+    );
+}

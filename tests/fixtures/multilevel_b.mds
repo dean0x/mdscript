@@ -1,0 +1,7 @@
+@import "./multilevel_c.mds" as c
+
+@define midfn(name):
+Mid via {c.deepfn(name)}
+@end
+
+@export midfn

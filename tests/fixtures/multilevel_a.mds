@@ -1,0 +1,3 @@
+@import "./multilevel_b.mds" as b
+
+{b.midfn("Alice")}
