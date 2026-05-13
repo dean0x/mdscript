@@ -141,7 +141,9 @@ Validates the AST against the current scope **before** evaluation. Catches: unde
 
 **`@for` body validation**: The validator clones the outer scope, injects the loop variable as `Value::Null`, then recurses via top-level `validate()`. Undefined-variable references inside the loop body are caught at validate time.
 
-**`@define` body validation**: The validator clones the outer scope, injects all params as `Value::Null`, then recurses via top-level `validate()`. Both `@for` and `@define` body recursion delegate to the exported `validate()` function directly (no internal `validate_body` helper) — this ensures consistent error reporting.
+**`@define` body validation**: The validator clones the outer scope, injects all params as `Value::Array(vec![])` (an empty array placeholder), then recurses via top-level `validate()`. Using an empty array — rather than `Null` — allows `@for item in param:` inside the define body to pass the array type check at validation time. The actual runtime type of arguments is enforced by the evaluator at call time. Both `@for` and `@define` body recursion delegate to the exported `validate()` function directly (no internal `validate_body` helper) — this ensures consistent error reporting.
+
+**`@for` iterable type check**: The validator checks that the iterable is a `Value::Array` at validation time, using `type_error_at` to attach a source span. This is an early-exit check: non-array iterables fail at validate time with a precise source location, not at evaluation time.
 
 **`validate_var_args`** is extended to cover all three `Arg` variants:
 - `Arg::StringLiteral` — no validation needed
@@ -285,6 +287,7 @@ MdsError::undefined_fn_at(name, file, source, offset, len)
 MdsError::name_collision_at(name, file, source, offset, len)
 MdsError::file_not_found_at(path, file, source, offset, len)
 MdsError::arity_at(name, expected, got, file, source, offset, len)
+MdsError::type_error_at(got, file, source, offset, len)
 
 // Use bare variants only when source context is unavailable.
 MdsError::syntax(message)
@@ -299,9 +302,9 @@ MdsError::import_error(message)
 MdsError::export_error(message)
 ```
 
-`TypeError`, `Recursion`, `ImportError`, and `ExportError` carry optional `span` and `src` fields in their struct definition but do not yet have public `_at` constructor methods. They are currently always constructed without span info. If you need span-aware versions, add `_at` constructor methods following the pattern in `error.rs`.
+`Recursion`, `ImportError`, and `ExportError` carry optional `span` and `src` fields in their struct definition but do not yet have public `_at` constructor methods. They are currently always constructed without span info. If you need span-aware versions, add `_at` constructor methods following the pattern in `error.rs`.
 
-Always prefer `_at` variants inside the validator and evaluator where source offsets are available from the AST nodes.
+Always prefer `_at` variants inside the validator and evaluator where source offsets are available from the AST nodes. The validator currently uses `type_error_at` for `@for` iterable type errors.
 
 ### Adding a New Value Type
 
@@ -344,11 +347,12 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **Using `compile` instead of `compile_collecting_warnings` in CLI code** — the CLI must use the collecting variants to properly gate warning output on the `--quiet` flag.
 - **Duplicating `base_dir` fallback logic in new string-based API functions** — always call `resolve_base_dir(base_dir)` rather than inlining the `current_dir()` fallback. The function also maps the IO error to `MdsError::Io`, which inline code tends to omit.
 - **Calling `get_all_exports()` and expecting a `HashMap`** — `ResolvedModule::get_all_exports()` returns `Vec<(String, FunctionDef)>`, not a `HashMap`. Callers that need map-like access must collect explicitly.
+- **Injecting `Value::Null` as a placeholder for `@define` params in validation** — the validator uses `Value::Array(vec![])` so that `@for item in param:` inside a define body passes the array type check. Using `Null` would produce a spurious type error at validate time.
 
 ## Gotchas
 
 - **`@define` body nodes have leading/trailing newlines stripped** — the parser calls `strip_leading_newline` and `strip_trailing_newline` on `@define` bodies. If you add a new block directive, apply the same stripping unless you want those newlines in output.
-- **`@for` and `@define` body validation uses a Null-injected clone** — the validator validates both `@for` and `@define` bodies by cloning the outer scope and injecting variables (loop var or params) as `Value::Null`. Type errors that depend on runtime type surface at evaluation time, not validate time.
+- **`@for` body validation uses a Null-injected clone; `@define` body validation uses an Array-injected clone** — the validator uses `Value::Null` for the loop variable (type is unknown at define time) but `Value::Array(vec![])` for `@define` parameters. This asymmetry exists because `@define` params might be used as iterables (`@for item in param:`), which requires the placeholder to pass the array type check. The actual type is enforced by the evaluator at call time.
 - **Runtime vars override frontmatter silently** — there is no warning when a runtime var shadows a frontmatter key. Intentional but can cause confusion when debugging.
 - **`@export` changes all-implicit to explicit** — once any `@export` appears in a module, only explicitly listed names are exported. Adding an `@export name` to a previously-implicit-all module will break importers depending on other functions.
 - **`@export prompt` is valid** — the string `"prompt"` is a special case in export validation. It does not need a corresponding `@define prompt` — it refers to the module's rendered body.
@@ -369,6 +373,7 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **`help(...)` attributes are variant-level, not constructor-level** — `CircularImport`, `Recursion`, and `TypeError` now have `#[diagnostic(help(...))]` annotations that miette renders automatically. When adding new error variants, add the `help` attribute directly on the variant, not in the constructor method.
 - **Re-export errors are raised at the barrel module, not the consumer** — when `@export name from "path"` fails because `name` is not exported from the source module, the error surfaces when the barrel itself is compiled, not when the consumer imports from the barrel. This means `reexport_nonexistent.mds` fails at compile time regardless of whether any consumer uses it.
 - **`--set KEY=VAL` last-write wins for duplicate keys** — when `--set name=First --set name=Second` is passed, the second value wins because runtime vars are collected into a `HashMap` and later writes overwrite earlier ones.
+- **`type_error_at` is now available for `TypeError`** — unlike `Recursion`, `ImportError`, and `ExportError` (which still lack `_at` constructors), `TypeError` has a `type_error_at` constructor used by the validator for `@for` iterable type errors. When reporting type errors from the validator, always use `type_error_at`.
 
 ## Key Files
 
@@ -379,10 +384,10 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - `src/parser.rs` — converts token stream to `Module` AST; `enter_block()` helper, `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion, identifier validation, duplicate param detection
 - `src/resolver.rs` — orchestrator: drives the full pipeline, module cache, import resolution, closure capture, security guards; `build_cycle_string` uses `.unwrap_or(0)` as safe fallback for cycle start index; threads `&mut Vec<String>` warnings through to evaluate; `ResolvedModule::get_export` and `get_all_exports` for export visibility
 - `src/evaluator.rs` — AST walker that produces the rendered string; `resolve_args` handles `Arg::Call` via recursive evaluation with shared `call_stack` and `warnings`; `evaluate_include` pushes to warnings vec, never calls `eprintln!`
-- `src/validator.rs` — pre-evaluation semantic checks; `validate_var_args` recursively validates nested `Arg::Call` arguments
+- `src/validator.rs` — pre-evaluation semantic checks; `validate_var_args` recursively validates nested `Arg::Call` arguments; `@define` params injected as `Value::Array(vec![])` so param-as-iterable passes type check; `type_error_at` used for span-aware `@for` type errors
 - `src/scope.rs` — scope chain with frames for variables, functions, and namespaces; closure capture helpers; `get_all_*` iterate outer→inner for correct shadowing semantics
 - `src/value.rs` — runtime value enum with YAML/JSON converters and display rules; test numerics use `2.5` (not `3.14`) to satisfy clippy `approx_constant`
-- `src/error.rs` — `MdsError` enum with miette diagnostics; `CircularImport`, `Recursion`, `TypeError` carry `help(...)` diagnostic attributes; builder methods for span-aware errors
+- `src/error.rs` — `MdsError` enum with miette diagnostics; `CircularImport`, `Recursion`, `TypeError` carry `help(...)` diagnostic attributes; `type_error_at` constructor now available; builder methods for span-aware errors
 - `tests/integration.rs` — end-to-end tests covering all features, error paths, CLI integration (stdin, file output, vars file, quiet flag, auto-detect), edge cases (nested loops, loop shadowing, falsy values, mutual recursion, escape sequences in blocks/functions, zero-param functions, empty function bodies, re-export errors), `compile_file` API, error help-text verification, and spec-compliance tests for scope visibility, export visibility, and `--set` coercion rules
 - `tests/fixtures/reexport_nonexistent.mds` — fixture for re-export error: `@export nonexistent_fn from "./greetings.mds"` where `nonexistent_fn` is not exported, verifying the error is raised at the barrel module
 
@@ -394,5 +399,5 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - `src/ast.rs` — canonical reference for `Arg` variants; any new argument form starts here
 - `src/lib.rs` — canonical reference for the two-tier warning API (`compile` vs `compile_collecting_warnings`), `compile_file` convenience entry point, and `resolve_base_dir` helper for optional base directory resolution
 - `src/main.rs` — canonical reference for CLI auto-detection logic and `parse_cli_value` coercion rules
-- `src/error.rs` — canonical reference for `help(...)` diagnostic attribute placement on `MdsError` variants
+- `src/error.rs` — canonical reference for `help(...)` diagnostic attribute placement on `MdsError` variants and available `_at` constructors
 - `tests/integration.rs` — covers all directive combinations including nested function calls, CLI stdin/quiet mode, auto-detect, `compile_file`, error help-text, scope/export visibility rules, `--set` coercion and deduplication, and re-export error scenarios; read before adding new directives to understand existing fixture patterns
