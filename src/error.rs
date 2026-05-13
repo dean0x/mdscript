@@ -17,7 +17,8 @@ fn at(
 }
 
 /// All errors produced by the MDS compiler.
-#[derive(Error, Debug, Diagnostic)]
+#[must_use]
+#[derive(Error, Debug, Diagnostic, Clone)]
 pub enum MdsError {
     #[error("syntax error: {message}")]
     #[diagnostic(code(mds::syntax))]
@@ -437,5 +438,220 @@ impl MdsError {
         MdsError::ResourceLimit {
             message: message.into(),
         }
+    }
+
+    // TODO: migrate all raw `MdsError::Io { message: ... }` call sites in
+    // resolver.rs, value.rs, and lib.rs to use these constructors.
+
+    pub fn io(message: impl Into<String>) -> Self {
+        MdsError::Io {
+            message: message.into(),
+        }
+    }
+
+    pub fn yaml_error(message: impl Into<String>) -> Self {
+        MdsError::YamlError {
+            message: message.into(),
+        }
+    }
+
+    pub fn json_error(message: impl Into<String>) -> Self {
+        MdsError::JsonError {
+            message: message.into(),
+        }
+    }
+
+    pub fn not_mds_file(path: impl Into<String>) -> Self {
+        MdsError::NotMdsFile {
+            path: path.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Display output ────────────────────────────────────────────────────────
+
+    #[test]
+    fn syntax_display_contains_message() {
+        let e = MdsError::syntax("unexpected token '}'");
+        assert!(e.to_string().contains("unexpected token '}'"));
+    }
+
+    #[test]
+    fn undefined_var_display_contains_name() {
+        let e = MdsError::undefined_var("my_var");
+        assert!(e.to_string().contains("my_var"));
+    }
+
+    #[test]
+    fn undefined_fn_display_contains_name() {
+        let e = MdsError::undefined_fn("my_fn");
+        assert!(e.to_string().contains("my_fn"));
+    }
+
+    #[test]
+    fn arity_display_contains_name_and_counts() {
+        let e = MdsError::arity("greet", 1, 3);
+        let msg = e.to_string();
+        assert!(msg.contains("greet"));
+        assert!(msg.contains('1'));
+        assert!(msg.contains('3'));
+    }
+
+    #[test]
+    fn arity_display_singular_argument() {
+        let e = MdsError::arity("f", 1, 0);
+        assert!(e.to_string().contains("argument"), "should say 'argument' not 'arguments' for 1");
+    }
+
+    #[test]
+    fn arity_display_plural_arguments() {
+        let e = MdsError::arity("f", 2, 0);
+        assert!(e.to_string().contains("arguments"), "should say 'arguments' for 2");
+    }
+
+    #[test]
+    fn type_error_display_contains_got() {
+        let e = MdsError::type_error("string");
+        assert!(e.to_string().contains("string"));
+    }
+
+    #[test]
+    fn circular_import_display_contains_cycle() {
+        let e = MdsError::circular_import("a -> b -> a");
+        assert!(e.to_string().contains("a -> b -> a"));
+    }
+
+    #[test]
+    fn file_not_found_display_contains_path() {
+        let e = MdsError::file_not_found("foo/bar.mds");
+        assert!(e.to_string().contains("foo/bar.mds"));
+    }
+
+    #[test]
+    fn recursion_display_contains_name() {
+        let e = MdsError::recursion("fib");
+        assert!(e.to_string().contains("fib"));
+    }
+
+    #[test]
+    fn io_display_contains_message() {
+        let e = MdsError::io("permission denied");
+        assert!(e.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn yaml_error_display_contains_message() {
+        let e = MdsError::yaml_error("unexpected indent");
+        assert!(e.to_string().contains("unexpected indent"));
+    }
+
+    #[test]
+    fn json_error_display_contains_message() {
+        let e = MdsError::json_error("trailing comma");
+        assert!(e.to_string().contains("trailing comma"));
+    }
+
+    #[test]
+    fn not_mds_file_display_contains_path() {
+        let e = MdsError::not_mds_file("readme.txt");
+        assert!(e.to_string().contains("readme.txt"));
+    }
+
+    #[test]
+    fn resource_limit_display_contains_message() {
+        let e = MdsError::resource_limit("too many iterations");
+        assert!(e.to_string().contains("too many iterations"));
+    }
+
+    // ── Span propagation via _at constructors ─────────────────────────────────
+
+    #[test]
+    fn syntax_at_populates_span_and_src() {
+        let e = MdsError::syntax_at("bad token", "file.mds", "hello world", 0, 5);
+        match e {
+            MdsError::Syntax { span, src, .. } => {
+                assert!(span.is_some(), "span should be populated");
+                assert!(src.is_some(), "src should be populated");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn undefined_var_at_populates_span() {
+        let e = MdsError::undefined_var_at("x", "f.mds", "{{ x }}", 3, 1);
+        match e {
+            MdsError::UndefinedVariable { span, .. } => {
+                assert!(span.is_some());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn type_error_at_populates_span() {
+        let e = MdsError::type_error_at("string", "f.mds", "source", 0, 6);
+        match e {
+            MdsError::TypeError { span, .. } => {
+                assert!(span.is_some());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn recursion_at_populates_span() {
+        let e = MdsError::recursion_at("fib", "f.mds", "source", 0, 3);
+        match e {
+            MdsError::Recursion { span, .. } => {
+                assert!(span.is_some());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn circular_import_at_populates_span() {
+        let e = MdsError::circular_import_at("a->b->a", "f.mds", "source", 0, 1);
+        match e {
+            MdsError::CircularImport { span, .. } => {
+                assert!(span.is_some());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── No-span constructors leave span as None ───────────────────────────────
+
+    #[test]
+    fn syntax_without_at_has_no_span() {
+        let e = MdsError::syntax("msg");
+        match e {
+            MdsError::Syntax { span, src, .. } => {
+                assert!(span.is_none());
+                assert!(src.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // ── Clone derives correctly ───────────────────────────────────────────────
+
+    #[test]
+    fn mds_error_is_clone() {
+        let e = MdsError::syntax("cloneable");
+        let cloned = e.clone();
+        assert_eq!(e.to_string(), cloned.to_string());
+    }
+
+    #[test]
+    fn io_error_is_clone() {
+        let e = MdsError::io("disk full");
+        let cloned = e.clone();
+        assert_eq!(e.to_string(), cloned.to_string());
     }
 }

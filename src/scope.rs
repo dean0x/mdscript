@@ -87,7 +87,11 @@ impl Scope {
         // Scope::new() always pushes a frame, and pop() refuses to remove the last one,
         // so last_mut() is always Some.
         debug_assert!(!self.frames.is_empty(), "scope always has at least one frame");
-        self.frames.last_mut().unwrap().vars.insert(name.to_string(), value);
+        self.frames
+            .last_mut()
+            .expect("BUG: scope has no frames")
+            .vars
+            .insert(name.to_string(), value);
     }
 
     /// Look up a variable by walking the scope chain (innermost first).
@@ -98,7 +102,11 @@ impl Scope {
     /// Define a function in the current frame.
     pub fn set_function(&mut self, name: &str, func: FunctionDef) {
         debug_assert!(!self.frames.is_empty(), "scope always has at least one frame");
-        self.frames.last_mut().unwrap().functions.insert(name.to_string(), func);
+        self.frames
+            .last_mut()
+            .expect("BUG: scope has no frames")
+            .functions
+            .insert(name.to_string(), func);
     }
 
     /// Look up a function by walking the scope chain.
@@ -109,7 +117,11 @@ impl Scope {
     /// Register a namespace (for aliased imports).
     pub fn set_namespace(&mut self, alias: &str, ns: NamespaceScope) {
         debug_assert!(!self.frames.is_empty(), "scope always has at least one frame");
-        self.frames.last_mut().unwrap().namespaces.insert(alias.to_string(), ns);
+        self.frames
+            .last_mut()
+            .expect("BUG: scope has no frames")
+            .namespaces
+            .insert(alias.to_string(), ns);
     }
 
     /// Look up a namespace by alias.
@@ -184,5 +196,126 @@ mod tests {
         );
         assert!(scope.get_function("greet").is_some());
         assert!(scope.get_function("unknown").is_none());
+    }
+
+    // ── pop() on the last (global) frame returns an error ────────────────────
+
+    #[test]
+    fn scope_pop_last_frame_errors() {
+        let mut scope = Scope::new();
+        let result = scope.pop();
+        assert!(result.is_err(), "popping the global frame must return Err");
+    }
+
+    #[test]
+    fn scope_pop_nested_frame_succeeds() {
+        let mut scope = Scope::new();
+        scope.push();
+        assert!(scope.pop().is_ok(), "popping a non-global frame should succeed");
+        // Back to one frame — next pop must fail again.
+        assert!(scope.pop().is_err());
+    }
+
+    // ── Namespace set / get ──────────────────────────────────────────────────
+
+    fn make_ns() -> NamespaceScope {
+        NamespaceScope {
+            functions: HashMap::new(),
+            prompt_body: None,
+        }
+    }
+
+    #[test]
+    fn scope_namespace_set_and_get() {
+        let mut scope = Scope::new();
+        scope.set_namespace("utils", make_ns());
+        assert!(scope.get_namespace("utils").is_some());
+        assert!(scope.get_namespace("missing").is_none());
+    }
+
+    #[test]
+    fn scope_namespace_shadowing_across_frames() {
+        let mut scope = Scope::new();
+        scope.set_namespace(
+            "lib",
+            NamespaceScope {
+                functions: HashMap::new(),
+                prompt_body: Some("outer".into()),
+            },
+        );
+        scope.push();
+        scope.set_namespace(
+            "lib",
+            NamespaceScope {
+                functions: HashMap::new(),
+                prompt_body: Some("inner".into()),
+            },
+        );
+        // Inner frame shadows outer.
+        assert_eq!(
+            scope
+                .get_namespace("lib")
+                .and_then(|ns| ns.prompt_body.as_deref()),
+            Some("inner"),
+        );
+        scope.pop().unwrap();
+        // Outer restored.
+        assert_eq!(
+            scope
+                .get_namespace("lib")
+                .and_then(|ns| ns.prompt_body.as_deref()),
+            Some("outer"),
+        );
+    }
+
+    // ── collect_all / get_all_* correctness ──────────────────────────────────
+
+    #[test]
+    fn get_all_vars_collects_all_frames() {
+        let mut scope = Scope::new();
+        scope.set_var("a", Value::Number(1.0));
+        scope.push();
+        scope.set_var("b", Value::Number(2.0));
+        let all = scope.get_all_vars();
+        assert!(all.contains_key("a"), "outer var visible");
+        assert!(all.contains_key("b"), "inner var visible");
+    }
+
+    #[test]
+    fn get_all_vars_inner_shadows_outer() {
+        let mut scope = Scope::new();
+        scope.set_var("x", Value::Number(1.0));
+        scope.push();
+        scope.set_var("x", Value::Number(99.0));
+        let all = scope.get_all_vars();
+        assert_eq!(
+            all.get("x"),
+            Some(&Value::Number(99.0)),
+            "inner value should win",
+        );
+    }
+
+    #[test]
+    fn get_all_namespaces_collects_across_frames() {
+        let mut scope = Scope::new();
+        scope.set_namespace("a", make_ns());
+        scope.push();
+        scope.set_namespace("b", make_ns());
+        let all = scope.get_all_namespaces();
+        assert!(all.contains_key("a"));
+        assert!(all.contains_key("b"));
+    }
+
+    // ── Variable not visible after pop ───────────────────────────────────────
+
+    #[test]
+    fn scope_var_shadowing_restored_after_pop() {
+        let mut scope = Scope::new();
+        scope.set_var("val", Value::Number(10.0));
+        scope.push();
+        scope.set_var("val", Value::Number(20.0));
+        assert_eq!(scope.get_var("val"), Some(&Value::Number(20.0)));
+        scope.pop().unwrap();
+        assert_eq!(scope.get_var("val"), Some(&Value::Number(10.0)));
     }
 }
