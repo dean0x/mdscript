@@ -206,21 +206,9 @@ fn clean_output(s: &str) -> String {
     out
 }
 
-/// Compile an MDS file by path string to a final Markdown string.
-///
-/// Convenience wrapper around [`compile`] for callers who have a path as `&str`
-/// and don't want to import [`std::path::Path`].
+/// Convenience wrapper around [`compile`] for callers who have a path as `&str`.
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr.
-///
-/// # Arguments
-/// * `path` — Path string to the .mds file
-///
-/// # Example
-/// ```rust,no_run
-/// let output = mds::compile_file("template.mds").unwrap();
-/// println!("{output}");
-/// ```
 #[must_use = "the compiled Markdown output should be used"]
 pub fn compile_file(path: &str) -> Result<String, MdsError> {
     compile(Path::new(path), None)
