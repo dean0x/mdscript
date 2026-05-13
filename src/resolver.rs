@@ -263,9 +263,13 @@ impl ModuleCache {
                             let resolved_path = resolve_path(base_dir, import_path);
                             let source_module =
                                 self.resolve(&resolved_path, runtime_vars, warnings)?;
-                            if let Some(func) = source_module.get_export(name) {
-                                functions.insert(name.clone(), func);
-                            }
+                            let func =
+                                source_module.get_export(name).ok_or_else(|| {
+                                    MdsError::export_error(format!(
+                                        "cannot re-export '{name}': not exported from \"{import_path}\""
+                                    ))
+                                })?;
+                            functions.insert(name.clone(), func);
                             explicit_exports.insert(name.clone());
                         }
                         ExportDirective::Wildcard { path: import_path } => {

@@ -1797,6 +1797,23 @@ fn selective_import_of_non_exported_name() {
     );
 }
 
+// Re-export of a symbol that does not exist in the source module
+#[test]
+fn reexport_nonexistent_symbol_errors() {
+    // @export nonexistent_fn from "./greetings.mds" where greetings.mds does not export
+    // 'nonexistent_fn' must produce a clear error at the re-export site.
+    let result = mds::compile(fixture("reexport_nonexistent.mds"), None);
+    assert!(
+        result.is_err(),
+        "re-exporting a symbol not found in source module should fail"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("nonexistent_fn") || err.contains("not exported") || err.contains("re-export"),
+        "error should mention the missing symbol, got: {err}"
+    );
+}
+
 // 10. Variable interpolation in function argument
 #[test]
 fn variable_interpolation_in_function_argument() {
