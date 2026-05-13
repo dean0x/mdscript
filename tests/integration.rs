@@ -2068,7 +2068,7 @@ fn for_loop_iteration_limit_rejects_huge_array() {
 
 #[test]
 fn yaml_value_depth_limit_rejects_deeply_nested_sequence() {
-    use serde_yaml::Value as YamlValue;
+    use serde_yml::Value as YamlValue;
 
     // Build a YAML sequence nested 65 levels deep (just past the limit of 64).
     let mut nested = YamlValue::Null;

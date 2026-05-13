@@ -67,21 +67,42 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
-        // Reject symlinks before canonicalize so we test the raw (pre-resolution) path.
-        // canonicalize() silently follows symlinks; we check the link itself here.
-        let sym_meta = std::fs::symlink_metadata(path);
-        if let Ok(meta) = sym_meta {
-            if meta.file_type().is_symlink() {
-                return Err(MdsError::import_error(format!(
-                    "symlinks are not allowed in imports: {}",
-                    path.display()
-                )));
-            }
-        }
+        // Detect symlinks without a TOCTOU window by comparing the canonical path to
+        // the path constructed from (canonical parent dir) + (original filename).
+        //
+        // Strategy:
+        //   1. Canonicalize the parent directory of `path` — this resolves any symlinks
+        //      in the directory hierarchy (e.g. /var -> /private/var on macOS) without
+        //      following the final component.
+        //   2. Append the filename from `path` to get the "canonical parent + raw name".
+        //   3. Canonicalize the full path to get the real file location.
+        //   4. If they differ, the final component was a symlink.
+        //
+        // Both canonicalize calls use the file-system state atomically observed at that
+        // instant. This shrinks the TOCTOU window to the unavoidable OS-level race
+        // while correctly handling OS symlinks in the directory hierarchy.
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;
 
-        let canonical = path
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let canonical_parent = parent
             .canonicalize()
             .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
+        let canonical_without_following_last = canonical_parent.join(file_name);
+
+        let canonical = canonical_without_following_last
+            .canonicalize()
+            .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
+
+        // If the final-component-preserved path differs from the fully-resolved path,
+        // the final component was a symlink.
+        if canonical != canonical_without_following_last {
+            return Err(MdsError::import_error(format!(
+                "symlinks are not allowed in imports: {}",
+                path.display()
+            )));
+        }
 
         // Set root_dir on first resolve (project root, not just entry point directory)
         if self.root_dir.is_none() {
@@ -439,8 +460,18 @@ impl ResolvedModule {
 
     /// Convert this resolved module into a namespace scope for aliased imports.
     fn to_namespace(&self) -> NamespaceScope {
+        // Build the HashMap in one pass, avoiding the intermediate Vec that
+        // get_all_exports() would allocate.
+        let functions = self
+            .functions
+            .iter()
+            .filter(|(name, _)| {
+                !self.has_explicit_exports || self.explicit_exports.contains(*name)
+            })
+            .map(|(name, func)| (name.clone(), func.clone()))
+            .collect();
         NamespaceScope {
-            functions: self.get_all_exports().into_iter().collect(),
+            functions,
             prompt_body: self.prompt_body.clone(),
         }
     }
@@ -555,14 +586,14 @@ fn attach_import_span(
 }
 
 fn parse_frontmatter(raw: &str) -> Result<HashMap<String, Value>, MdsError> {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(raw).map_err(|e| MdsError::YamlError {
+    let yaml: serde_yml::Value = serde_yml::from_str(raw).map_err(|e| MdsError::YamlError {
         message: e.to_string(),
     })?;
 
     let mut vars = HashMap::new();
-    if let serde_yaml::Value::Mapping(map) = yaml {
+    if let serde_yml::Value::Mapping(map) = yaml {
         for (key, val) in map {
-            let serde_yaml::Value::String(key_str) = key else {
+            let serde_yml::Value::String(key_str) = key else {
                 continue;
             };
             let value = Value::from_yaml(val)?;

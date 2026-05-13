@@ -272,6 +272,62 @@ pub fn compile_str_collecting_warnings(
     Ok((output, warnings))
 }
 
+/// Check (validate) an MDS file and return any collected warnings without rendering output.
+///
+/// Unlike [`check`], this function does not print warnings to stderr. The caller
+/// is responsible for deciding whether to display them (e.g. based on a quiet flag).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+/// let ((), warnings) = mds::check_collecting_warnings(Path::new("template.mds"), None)?;
+/// for w in &warnings { eprintln!("warning: {w}"); }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "warnings should be used"]
+pub fn check_collecting_warnings(
+    path: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<((), Vec<String>), MdsError> {
+    let path = path.as_ref();
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    cache.resolve(path, &vars, &mut warnings)?;
+    Ok(((), warnings))
+}
+
+/// Check (validate) MDS source from a string and return any collected warnings without rendering output.
+///
+/// Unlike [`check_str_with`], this function does not print warnings to stderr. The caller
+/// is responsible for deciding whether to display them (e.g. based on a quiet flag).
+///
+/// # Examples
+///
+/// ```rust
+/// let ((), warnings) = mds::check_str_collecting_warnings(
+///     "---\nname: Test\n---\nHello {name}!\n",
+///     None,
+///     None,
+/// )?;
+/// assert!(warnings.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "warnings should be used"]
+pub fn check_str_collecting_warnings(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<((), Vec<String>), MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let dir = resolve_base_dir(base_dir)?;
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    cache.resolve_source(source, &dir, &vars, &mut warnings)?;
+    Ok(((), warnings))
+}
+
 /// Clean up output whitespace: collapse 3+ consecutive newlines to 2 (one blank line),
 /// and trim leading/trailing blank lines.
 fn clean_output(s: &str) -> String {
@@ -341,7 +397,7 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
         message: format!("cannot read vars file {}: {e}", path.display()),
     })?;
     if bytes.len() as u64 > resolver::MAX_FILE_SIZE {
-        return Err(MdsError::import_error(format!(
+        return Err(MdsError::resource_limit(format!(
             "vars file exceeds maximum size of {} bytes: {}",
             resolver::MAX_FILE_SIZE,
             path.display()

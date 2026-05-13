@@ -30,21 +30,21 @@ impl Value {
         }
     }
 
-    /// Convert a serde_yaml::Value into our Value enum.
-    pub fn from_yaml(yaml: serde_yaml::Value) -> Result<Value, MdsError> {
+    /// Convert a serde_yml::Value into our Value enum.
+    pub fn from_yaml(yaml: serde_yml::Value) -> Result<Value, MdsError> {
         Self::from_yaml_inner(yaml, 0)
     }
 
-    fn from_yaml_inner(yaml: serde_yaml::Value, depth: usize) -> Result<Value, MdsError> {
+    fn from_yaml_inner(yaml: serde_yml::Value, depth: usize) -> Result<Value, MdsError> {
         if depth > MAX_VALUE_DEPTH {
             return Err(MdsError::YamlError {
                 message: format!("value nesting exceeds maximum depth of {MAX_VALUE_DEPTH}"),
             });
         }
         match yaml {
-            serde_yaml::Value::Null => Ok(Value::Null),
-            serde_yaml::Value::Bool(b) => Ok(Value::Boolean(b)),
-            serde_yaml::Value::Number(n) => n
+            serde_yml::Value::Null => Ok(Value::Null),
+            serde_yml::Value::Bool(b) => Ok(Value::Boolean(b)),
+            serde_yml::Value::Number(n) => n
                 .as_i64()
                 .map(|i| i as f64)
                 .or_else(|| n.as_f64())
@@ -52,16 +52,16 @@ impl Value {
                 .ok_or_else(|| MdsError::YamlError {
                     message: format!("unsupported number: {n:?}"),
                 }),
-            serde_yaml::Value::String(s) => Ok(Value::String(s)),
-            serde_yaml::Value::Sequence(seq) => seq
+            serde_yml::Value::String(s) => Ok(Value::String(s)),
+            serde_yml::Value::Sequence(seq) => seq
                 .into_iter()
                 .map(|v| Self::from_yaml_inner(v, depth + 1))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
-            serde_yaml::Value::Mapping(_) => Err(MdsError::YamlError {
+            serde_yml::Value::Mapping(_) => Err(MdsError::YamlError {
                 message: "object/map types are not supported in MDS v0.1".to_string(),
             }),
-            serde_yaml::Value::Tagged(t) => Self::from_yaml_inner(t.value, depth + 1),
+            serde_yml::Value::Tagged(t) => Self::from_yaml_inner(t.value, depth + 1),
         }
     }
 
