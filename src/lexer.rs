@@ -242,22 +242,11 @@ fn is_line_start_chars(chars: &[char], pos: usize) -> bool {
 /// Returns `(count, is_close_candidate)` where `is_close_candidate` is true
 /// when nothing follows the backticks except spaces/tabs before EOL or EOF.
 fn scan_fence(chars: &[char], pos: usize) -> (usize, bool) {
-    let mut count = 0;
-    let mut scan = pos;
-    while scan < chars.len() && chars[scan] == '`' {
-        count += 1;
-        scan += 1;
-    }
-    // Check whether the remainder of the line is only whitespace
-    let is_close = loop {
-        if scan >= chars.len() || chars[scan] == '\n' || chars[scan] == '\r' {
-            break true;
-        }
-        if chars[scan] != ' ' && chars[scan] != '\t' {
-            break false;
-        }
-        scan += 1;
-    };
+    let count = chars[pos..].iter().take_while(|&&c| c == '`').count();
+    let is_close = chars[pos + count..]
+        .iter()
+        .take_while(|&&c| c != '\n' && c != '\r')
+        .all(|&c| c == ' ' || c == '\t');
     (count, is_close)
 }
 

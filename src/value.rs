@@ -43,13 +43,11 @@ impl Value {
                 }
             }
             serde_yaml::Value::String(s) => Ok(Value::String(s)),
-            serde_yaml::Value::Sequence(seq) => {
-                let items = seq
-                    .into_iter()
-                    .map(Value::from_yaml)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::Array(items))
-            }
+            serde_yaml::Value::Sequence(seq) => seq
+                .into_iter()
+                .map(Value::from_yaml)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
             serde_yaml::Value::Mapping(_) => Err(MdsError::YamlError {
                 message: "object/map types are not supported in MDS v0.1".to_string(),
             }),
@@ -72,13 +70,11 @@ impl Value {
                 }
             }
             serde_json::Value::String(s) => Ok(Value::String(s)),
-            serde_json::Value::Array(arr) => {
-                let items = arr
-                    .into_iter()
-                    .map(Value::from_json)
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::Array(items))
-            }
+            serde_json::Value::Array(arr) => arr
+                .into_iter()
+                .map(Value::from_json)
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
             serde_json::Value::Object(_) => Err(MdsError::JsonError {
                 message: "object/map types are not supported in MDS v0.1".to_string(),
             }),
@@ -168,8 +164,13 @@ impl fmt::Display for Value {
             }
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Array(items) => {
-                let parts: Vec<String> = items.iter().map(ToString::to_string).collect();
-                write!(f, "{}", parts.join(", "))
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                Ok(())
             }
             Value::Null => write!(f, ""),
         }

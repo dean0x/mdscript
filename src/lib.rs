@@ -231,12 +231,9 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
         });
     };
 
-    let mut vars = HashMap::new();
-    for (key, val) in map {
-        vars.insert(key, Value::from_json(val)?);
-    }
-
-    Ok(vars)
+    map.into_iter()
+        .map(|(key, val)| Value::from_json(val).map(|v| (key, v)))
+        .collect()
 }
 
 #[cfg(test)]

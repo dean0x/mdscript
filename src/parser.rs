@@ -105,11 +105,8 @@ impl Parser<'_> {
             match token {
                 Token::Directive(dir, _offset) => {
                     let trimmed = dir.trim();
-                    // Check if this is a terminator
-                    for term in terminators {
-                        if trimmed == *term {
-                            return Ok(nodes);
-                        }
+                    if terminators.contains(&trimmed) {
+                        return Ok(nodes);
                     }
                     let node = self.parse_directive()?;
                     nodes.push(node);
@@ -243,14 +240,14 @@ impl Parser<'_> {
             .trim();
 
         // Parse "item in items"
-        let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-        if parts.len() != 3 || parts[1] != "in" {
-            return Err(MdsError::syntax(
-                "@for must follow pattern: @for <var> in <iterable>:",
-            ));
-        }
-        let var = parts[0].to_string();
-        let iterable = parts[2].trim().to_string();
+        let (var, iterable) = match rest.splitn(3, ' ').collect::<Vec<_>>().as_slice() {
+            [v, "in", it] => (v.to_string(), it.trim().to_string()),
+            _ => {
+                return Err(MdsError::syntax(
+                    "@for must follow pattern: @for <var> in <iterable>:",
+                ))
+            }
+        };
 
         if !is_valid_identifier(&var) {
             return Err(MdsError::syntax(format!(
@@ -307,16 +304,13 @@ impl Parser<'_> {
             .map(str::to_owned)
             .collect();
 
+        let mut seen = HashSet::new();
         for param in &params {
             if !is_valid_identifier(param) {
                 return Err(MdsError::syntax(format!(
                     "invalid parameter name: '{param}'"
                 )));
             }
-        }
-
-        let mut seen = HashSet::new();
-        for param in &params {
             if !seen.insert(param.as_str()) {
                 return Err(MdsError::syntax(format!(
                     "duplicate parameter name '{param}' in @define {name}"

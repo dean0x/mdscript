@@ -89,12 +89,7 @@ impl Scope {
 
     /// Look up a variable by walking the scope chain (innermost first).
     pub fn get_var(&self, name: &str) -> Option<&Value> {
-        for frame in self.frames.iter().rev() {
-            if let Some(v) = frame.vars.get(name) {
-                return Some(v);
-            }
-        }
-        None
+        self.frames.iter().rev().find_map(|f| f.vars.get(name))
     }
 
     /// Define a function in the current frame.
@@ -108,12 +103,7 @@ impl Scope {
 
     /// Look up a function by walking the scope chain.
     pub fn get_function(&self, name: &str) -> Option<&FunctionDef> {
-        for frame in self.frames.iter().rev() {
-            if let Some(f) = frame.functions.get(name) {
-                return Some(f);
-            }
-        }
-        None
+        self.frames.iter().rev().find_map(|f| f.functions.get(name))
     }
 
     /// Register a namespace (for aliased imports).
@@ -127,12 +117,7 @@ impl Scope {
 
     /// Look up a namespace by alias.
     pub fn get_namespace(&self, alias: &str) -> Option<&NamespaceScope> {
-        for frame in self.frames.iter().rev() {
-            if let Some(ns) = frame.namespaces.get(alias) {
-                return Some(ns);
-            }
-        }
-        None
+        self.frames.iter().rev().find_map(|f| f.namespaces.get(alias))
     }
 
     /// Get all namespaces visible in the current scope (for closure capture).
