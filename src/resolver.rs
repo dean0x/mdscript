@@ -406,9 +406,7 @@ fn module_to_namespace(module: &ResolvedModule) -> NamespaceScope {
     let functions = module
         .functions
         .iter()
-        .filter(|(name, _)| {
-            !module.has_explicit_exports || module.explicit_exports.contains(*name)
-        })
+        .filter(|(name, _)| !module.has_explicit_exports || module.explicit_exports.contains(*name))
         .map(|(name, func)| (name.clone(), func.clone()))
         .collect();
     NamespaceScope {
