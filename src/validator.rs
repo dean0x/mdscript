@@ -63,18 +63,10 @@ fn validate_node(node: &Node, scope: &Scope, file: &str, source: &str) -> Result
         }
         Node::Include(inc) => {
             // Verify the referenced namespace exists (must have been @import-ed)
-            scope
-                .get_namespace(&inc.alias)
-                .ok_or_else(|| {
-                    MdsError::undefined_var_at(
-                        &inc.alias,
-                        file,
-                        source,
-                        inc.offset,
-                        inc.alias.len(),
-                    )
-                })
-                .map(|_| ())
+            scope.get_namespace(&inc.alias).ok_or_else(|| {
+                MdsError::undefined_var_at(&inc.alias, file, source, inc.offset, inc.alias.len())
+            })?;
+            Ok(())
         }
     }
 }

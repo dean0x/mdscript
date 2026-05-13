@@ -225,16 +225,15 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
             message: e.to_string(),
         })?;
 
-    let mut vars = HashMap::new();
-    if let serde_json::Value::Object(map) = json {
-        for (key, val) in map {
-            let value = Value::from_json(val)?;
-            vars.insert(key, value);
-        }
-    } else {
+    let serde_json::Value::Object(map) = json else {
         return Err(MdsError::JsonError {
             message: "vars file must contain a JSON object".to_string(),
         });
+    };
+
+    let mut vars = HashMap::new();
+    for (key, val) in map {
+        vars.insert(key, Value::from_json(val)?);
     }
 
     Ok(vars)

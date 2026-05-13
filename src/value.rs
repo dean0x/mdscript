@@ -44,9 +44,11 @@ impl Value {
             }
             serde_yaml::Value::String(s) => Ok(Value::String(s)),
             serde_yaml::Value::Sequence(seq) => {
-                let items: Result<Vec<Value>, MdsError> =
-                    seq.into_iter().map(Value::from_yaml).collect();
-                Ok(Value::Array(items?))
+                let items = seq
+                    .into_iter()
+                    .map(Value::from_yaml)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Array(items))
             }
             serde_yaml::Value::Mapping(_) => Err(MdsError::YamlError {
                 message: "object/map types are not supported in MDS v0.1".to_string(),
@@ -71,9 +73,11 @@ impl Value {
             }
             serde_json::Value::String(s) => Ok(Value::String(s)),
             serde_json::Value::Array(arr) => {
-                let items: Result<Vec<Value>, MdsError> =
-                    arr.into_iter().map(Value::from_json).collect();
-                Ok(Value::Array(items?))
+                let items = arr
+                    .into_iter()
+                    .map(Value::from_json)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Value::Array(items))
             }
             serde_json::Value::Object(_) => Err(MdsError::JsonError {
                 message: "object/map types are not supported in MDS v0.1".to_string(),

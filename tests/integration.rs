@@ -1435,10 +1435,7 @@ fn include_without_import_errors() {
     // @include utils where utils has NOT been @import-ed must fail.
     // Per spec: "Module must be imported first via @import."
     let result = mds::compile(fixture("include_no_import.mds"), None);
-    assert!(
-        result.is_err(),
-        "@include of non-imported alias must fail"
-    );
+    assert!(result.is_err(), "@include of non-imported alias must fail");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("undefined") || err.contains("utils"),
@@ -1473,7 +1470,10 @@ fn error_format_includes_file_line_col() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success(), "should fail with undefined variable");
+    assert!(
+        !output.status.success(),
+        "should fail with undefined variable"
+    );
     let stderr = String::from_utf8(output.stderr).unwrap();
     // miette renders: ╭─[path:line:col]
     assert!(
@@ -1520,10 +1520,7 @@ fn yaml_map_type_rejected() {
     // Per spec: "No object/map type in v0.1". A YAML map value must be a compile error.
     let source = "---\nconfig:\n  key: value\n---\nHello!\n";
     let result = mds::compile_str(source);
-    assert!(
-        result.is_err(),
-        "YAML map/object type should be rejected"
-    );
+    assert!(result.is_err(), "YAML map/object type should be rejected");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("object") || err.contains("map") || err.contains("not supported"),
@@ -1611,11 +1608,7 @@ fn default_public_when_no_exports() {
     let provider = dir.path().join("provider.mds");
     let consumer = dir.path().join("consumer.mds");
 
-    std::fs::write(
-        &provider,
-        "@define hello(name):\nHello {name}!\n@end\n",
-    )
-    .unwrap();
+    std::fs::write(&provider, "@define hello(name):\nHello {name}!\n@end\n").unwrap();
     // No @export directive — hello should still be importable.
     std::fs::write(
         &consumer,
