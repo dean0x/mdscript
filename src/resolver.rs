@@ -169,9 +169,15 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
-        // Set root_dir on first use so path-traversal checks work for imports
+        // Set root_dir on first use so path-traversal checks work for imports.
+        // Canonicalize to match the canonical paths used by resolve(), ensuring
+        // starts_with checks are consistent even when base_dir contains `.` or `..`.
         if self.root_dir.is_none() {
-            self.root_dir = Some(base_dir.to_path_buf());
+            self.root_dir = Some(
+                base_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| base_dir.to_path_buf()),
+            );
         }
         self.process_module(source, "<source>", base_dir, false, runtime_vars, warnings)
     }
