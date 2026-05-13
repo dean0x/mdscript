@@ -2057,6 +2057,49 @@ fn symlink_import_rejected() {
     );
 }
 
+// ── Resource Exhaustion: Total Iteration Limit ───────────────────────────────
+
+#[test]
+fn nested_loop_total_iteration_limit() {
+    // Two nested loops of 1001 × 1000 = 1,001,000 total iterations must be rejected.
+    // Build the source inline: outer array has 1001 elements, inner has 1000.
+    let outer: Vec<String> = (0..1001).map(|i| format!("o{i}")).collect();
+    let inner: Vec<String> = (0..1000).map(|i| format!("i{i}")).collect();
+    let outer_yaml = outer.join(", ");
+    let inner_yaml = inner.join(", ");
+    let source = format!(
+        "---\nouter: [{outer_yaml}]\ninner: [{inner_yaml}]\n---\n@for x in outer:\n@for y in inner:\n{{x}}-{{y}}\n@end\n@end\n"
+    );
+    let result = mds::compile_str_with(&source, None, None);
+    assert!(
+        result.is_err(),
+        "nested loops exceeding 1M total iterations must be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("total loop iterations") || err.contains("1000000"),
+        "error should mention total iteration limit, got: {err}"
+    );
+}
+
+#[test]
+fn nested_loop_under_total_iteration_limit() {
+    // Two nested loops of 1000 × 1000 = 1,000,000 total iterations must succeed.
+    let outer: Vec<String> = (0..1000).map(|i| format!("o{i}")).collect();
+    let inner: Vec<String> = (0..1000).map(|i| format!("i{i}")).collect();
+    let outer_yaml = outer.join(", ");
+    let inner_yaml = inner.join(", ");
+    let source = format!(
+        "---\nouter: [{outer_yaml}]\ninner: [{inner_yaml}]\n---\n@for x in outer:\n@for y in inner:\nx\n@end\n@end\n"
+    );
+    let result = mds::compile_str_with(&source, None, None);
+    assert!(
+        result.is_ok(),
+        "nested loops at exactly 1M total iterations must succeed, got: {:?}",
+        result.unwrap_err()
+    );
+}
+
 // ── Security: resolve_source base directory must be canonicalizable ──────────
 
 #[test]
@@ -2079,4 +2122,3 @@ fn resolve_source_nonexistent_base_dir_errors() {
         "error should describe the unresolvable base directory, got: {err}"
     );
 }
-
