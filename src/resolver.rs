@@ -344,8 +344,7 @@ impl ModuleCache {
                 let resolved = self
                     .resolve(&import_path, runtime_vars, warnings)
                     .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
-                let ns = module_to_namespace(&resolved);
-                scope.set_namespace(alias, ns);
+                scope.set_namespace(alias, resolved.to_namespace());
             }
             ImportDirective::Merge { path, offset } => {
                 validate_import_path(path)?;
@@ -429,13 +428,13 @@ impl ResolvedModule {
             None
         }
     }
-}
 
-/// Create a NamespaceScope from a resolved module.
-fn module_to_namespace(module: &ResolvedModule) -> NamespaceScope {
-    NamespaceScope {
-        functions: module.get_all_exports().into_iter().collect(),
-        prompt_body: module.prompt_body.clone(),
+    /// Convert this resolved module into a namespace scope for aliased imports.
+    fn to_namespace(&self) -> NamespaceScope {
+        NamespaceScope {
+            functions: self.get_all_exports().into_iter().collect(),
+            prompt_body: self.prompt_body.clone(),
+        }
     }
 }
 
@@ -473,22 +472,20 @@ fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
 
     // For .md files, accept when frontmatter contains `type: mds`.
     if ext == "md" {
-        if let Some(after_fence) = source
+        let found = source
             .strip_prefix("---\n")
             .or_else(|| source.strip_prefix("---\r\n"))
-        {
-            if let Some(end) = after_fence.find("\n---") {
-                let fm = &after_fence[..end];
+            .and_then(|after_fence| after_fence.find("\n---").map(|end| &after_fence[..end]))
+            .is_some_and(|fm| {
                 // Check each line for `type: mds` without a full YAML parse.
-                let has_type_mds = fm.lines().any(|line| {
+                fm.lines().any(|line| {
                     line.trim()
                         .strip_prefix("type:")
                         .is_some_and(|v| v.trim() == "mds")
-                });
-                if has_type_mds {
-                    return Ok(());
-                }
-            }
+                })
+            });
+        if found {
+            return Ok(());
         }
     }
 
@@ -503,12 +500,13 @@ fn build_cycle_string(resolving_stack: &[PathBuf], repeated: &Path) -> String {
         .iter()
         .position(|p| p == repeated)
         .unwrap_or(0);
-    let mut parts: Vec<String> = resolving_stack[start..]
+    resolving_stack[start..]
         .iter()
-        .map(|p| path_display_name(p))
-        .collect();
-    parts.push(path_display_name(repeated));
-    parts.join(" \u{2192} ")
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(repeated))
+        .map(path_display_name)
+        .collect::<Vec<_>>()
+        .join(" \u{2192} ")
 }
 
 /// Return a short display name for a path (filename, falling back to full path, then "?").

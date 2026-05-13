@@ -131,29 +131,32 @@ impl Scope {
     /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
     /// preserving correct shadowing semantics.
     pub fn get_all_namespaces(&self) -> HashMap<String, NamespaceScope> {
-        self.frames
-            .iter()
-            .flat_map(|f| f.namespaces.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .collect()
+        self.collect_all(|f| &f.namespaces)
     }
 
     /// Get all functions visible in the current scope (for closure capture).
     /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
     /// preserving correct shadowing semantics.
     pub fn get_all_functions(&self) -> HashMap<String, FunctionDef> {
-        self.frames
-            .iter()
-            .flat_map(|f| f.functions.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .collect()
+        self.collect_all(|f| &f.functions)
     }
 
     /// Get all variables visible in the current scope (for closure capture).
     /// Iterates outer→inner so duplicate keys are overwritten by inner frames,
     /// preserving correct shadowing semantics.
     pub fn get_all_vars(&self) -> HashMap<String, Value> {
+        self.collect_all(|f| &f.vars)
+    }
+
+    /// Flatten all scope frames outer→inner into a single map.
+    /// Duplicate keys are overwritten by inner frames, preserving shadowing semantics.
+    fn collect_all<T: Clone>(
+        &self,
+        get: impl Fn(&Frame) -> &HashMap<String, T>,
+    ) -> HashMap<String, T> {
         self.frames
             .iter()
-            .flat_map(|f| f.vars.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .flat_map(|f| get(f).iter().map(|(k, v)| (k.clone(), v.clone())))
             .collect()
     }
 }
