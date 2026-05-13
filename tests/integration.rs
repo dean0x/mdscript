@@ -703,6 +703,32 @@ fn set_flag_null_coercion() {
     );
 }
 
+#[test]
+fn set_flag_empty_array() {
+    // --set items=[] must produce Value::Array(vec![]) — not [String("")].
+    // The empty array is falsy, so the @else branch should render.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args([
+            "build",
+            fixture("set_items_empty.mds").to_str().unwrap(),
+            "--set",
+            "items=[]",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build with --set items=[] should succeed"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("empty"),
+        "expected falsy branch when --set items=[], got: {stdout}"
+    );
+}
+
 // ── CLI Integration Tests ────────────────────────────────────────────────────
 
 #[test]

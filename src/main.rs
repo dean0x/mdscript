@@ -140,6 +140,9 @@ fn parse_cli_value_unquoted(val: String) -> mds::Value {
     // Only handles flat lists of unquoted tokens; does not recurse.
     if val.starts_with('[') && val.ends_with(']') {
         let inner = &val[1..val.len() - 1];
+        if inner.trim().is_empty() {
+            return mds::Value::Array(vec![]);
+        }
         let items: Vec<mds::Value> = inner
             .split(',')
             .map(|s| mds::Value::String(s.trim().to_string()))
