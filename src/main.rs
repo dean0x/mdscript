@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -6,6 +7,161 @@ use std::process;
 use clap::{Parser, Subcommand};
 use miette::Result;
 use mds::MdsError;
+use serde::Deserialize;
+
+// ── Project config (mds.json) ─────────────────────────────────────────────────
+
+#[derive(Debug, Default, Deserialize)]
+struct MdsConfig {
+    #[serde(default)]
+    build: BuildConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BuildConfig {
+    output_dir: Option<String>,
+}
+
+/// Walk up from `start` looking for `mds.json`.
+///
+/// Returns `Ok(Some((config, config_dir)))` when found, `Ok(None)` when no
+/// `mds.json` exists in the hierarchy, or `Err(...)` when a file is found but
+/// contains invalid JSON.
+///
+/// The `config_dir` is the directory that *contains* `mds.json` — used to
+/// resolve relative `output_dir` values.
+fn load_config(
+    start: &Path,
+) -> std::result::Result<Option<(MdsConfig, PathBuf)>, miette::Error> {
+    // Walk upward from `start` (which may be a file; begin at its parent).
+    let start_dir = if start.is_dir() {
+        start.to_path_buf()
+    } else {
+        start
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+
+    let mut current = start_dir;
+    // 256-iteration cap prevents unbounded traversal on unusual filesystems.
+    for _ in 0..256 {
+        let candidate = current.join("mds.json");
+        if candidate.is_file() {
+            let raw = std::fs::read_to_string(&candidate).map_err(|e| {
+                miette::miette!(
+                    "cannot read {}: {e}",
+                    candidate.display()
+                )
+            })?;
+            let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
+                miette::miette!(
+                    "invalid mds.json at {}: {e}",
+                    candidate.display()
+                )
+            })?;
+            return Ok(Some((config, current)));
+        }
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    Ok(None)
+}
+
+// ── Output path resolution ────────────────────────────────────────────────────
+
+/// Derive the output filename by replacing the extension with `.md`.
+///
+/// Examples:
+/// - `foo.mds`     → `foo.md`
+/// - `foo.bar.mds` → `foo.bar.md`
+/// - `README`      → `README.md`
+/// - `foo.txt`     → `foo.md`
+fn derive_output_filename(input: &Path) -> OsString {
+    let stem = input.file_stem().unwrap_or(input.as_os_str());
+    let mut name = OsString::from(stem);
+    name.push(".md");
+    name
+}
+
+/// Resolve the output path according to the precedence chain:
+///
+/// 1. `-o -`            → stdout (returns `None`)
+/// 2. `-o <path>`       → that exact path
+/// 3. Stdin with no -o  → stdout (returns `None`)
+/// 4. `--out-dir <dir>` → `<dir>/<name>.md` (directory created if needed)
+/// 5. `mds.json`        → `<config_dir>/<output_dir>/<name>.md` (dir created)
+/// 6. Default           → source dir + `<name>.md`
+fn resolve_output_path(
+    input: &Option<PathBuf>,
+    output: &Option<String>,
+    out_dir: &Option<PathBuf>,
+    config: &Option<(MdsConfig, PathBuf)>,
+) -> std::result::Result<Option<PathBuf>, miette::Error> {
+    // 1. `-o -` → stdout
+    if let Some(o) = output {
+        if o == "-" {
+            return Ok(None);
+        }
+    }
+
+    // 2. `-o <path>` → exact path
+    if let Some(o) = output {
+        return Ok(Some(PathBuf::from(o)));
+    }
+
+    // 3. Stdin input with no -o → stdout
+    let is_stdin = match input {
+        Some(p) => p == Path::new("-"),
+        None => false,
+    };
+    if is_stdin {
+        return Ok(None);
+    }
+
+    // Derive the output filename from the input path (needed for steps 4-6).
+    let input_path: Option<&Path> = input.as_deref();
+
+    // 4. `--out-dir <dir>`
+    if let Some(dir) = out_dir {
+        let filename = input_path
+            .map(derive_output_filename)
+            .unwrap_or_else(|| OsString::from("output.md"));
+        std::fs::create_dir_all(dir).map_err(|e| {
+            miette::miette!("cannot create output directory {}: {e}", dir.display())
+        })?;
+        return Ok(Some(dir.join(filename)));
+    }
+
+    // 5. `mds.json` output_dir
+    if let Some((cfg, config_dir)) = config {
+        if let Some(ref output_dir) = cfg.build.output_dir {
+            let dir = config_dir.join(output_dir);
+            let filename = input_path
+                .map(derive_output_filename)
+                .unwrap_or_else(|| OsString::from("output.md"));
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                miette::miette!("cannot create output directory {}: {e}", dir.display())
+            })?;
+            return Ok(Some(dir.join(filename)));
+        }
+    }
+
+    // 6. Default: file next to source
+    match input_path {
+        Some(p) => {
+            let filename = derive_output_filename(p.file_name().map(Path::new).unwrap_or(p));
+            let dir = p.parent().unwrap_or(Path::new("."));
+            Ok(Some(dir.join(filename)))
+        }
+        // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
+        None => Ok(None),
+    }
+}
+
+// ── CLI entry point ───────────────────────────────────────────────────────────
 
 /// Scan the current directory for `.mds` files.
 ///
@@ -50,7 +206,7 @@ fn auto_detect_mds_file() -> std::result::Result<PathBuf, miette::Error> {
 #[command(
     name = "mds",
     about = "MDS (Markdown Script) compiler",
-    long_about = "MDS (Markdown Script) compiler — composable LLM prompt templates\n\nCompile .mds template files into Markdown. Use variables, loops,\nconditionals, functions, and imports to build reusable prompts.\n\nQuick start:\n  mds init                       Create a starter template\n  mds build hello.mds            Compile to stdout\n  mds build hello.mds -o out.md  Compile to file",
+    long_about = "MDS (Markdown Script) compiler — composable LLM prompt templates\n\nCompile .mds template files into Markdown. Use variables, loops,\nconditionals, functions, and imports to build reusable prompts.\n\nQuick start:\n  mds init                       Create a starter template\n  mds build hello.mds            Compile to hello.md\n  mds build hello.mds -o -       Compile to stdout\n  mds build hello.mds -o out.md  Compile to a specific file",
     version
 )]
 struct Cli {
@@ -65,14 +221,21 @@ struct Cli {
 enum Commands {
     /// Compile an MDS file to Markdown
     #[command(
-        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to stdout\n  mds build template.mds -o output.md        Compile to file\n  mds build template.mds --vars vars.json    With variable overrides\n  mds build template.mds --set name=Alice    Set a single variable\n  echo \"Hello {name}!\" | mds build -          Compile from stdin"
+        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  echo \"Hello {name}!\" | mds build -         Compile from stdin (writes to stdout)"
     )]
     Build {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
         input: Option<PathBuf>,
-        /// Output file (stdout if omitted)
-        #[arg(short = 'o', long = "output")]
-        output: Option<PathBuf>,
+        /// Output destination: a file path, or "-" for stdout.
+        /// Defaults to <name>.md next to the source file.
+        /// Mutually exclusive with --out-dir.
+        #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
+        output: Option<String>,
+        /// Output directory. The output file is named <input-stem>.md inside this directory.
+        /// Directory is created if it does not exist.
+        /// Mutually exclusive with -o/--output.
+        #[arg(long = "out-dir", conflicts_with = "output")]
+        out_dir: Option<PathBuf>,
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
@@ -250,6 +413,7 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
         Commands::Build {
             input,
             output,
+            out_dir,
             vars,
             set_vars,
         } => {
@@ -269,6 +433,12 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
 
             reject_directory_input(&input)?;
 
+            // Load project config (mds.json), walking up from the input file.
+            let config = load_config(&input)?;
+
+            // Resolve output destination before compiling (config discovery happens once).
+            let output_path = resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
+
             let (compiled, warnings) = if input == Path::new("-") {
                 let (source, cwd) = read_stdin()?;
                 mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
@@ -284,14 +454,28 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
                 }
             }
 
-            if let Some(output_path) = output {
-                std::fs::write(&output_path, &compiled)
-                    .map_err(|e| miette::miette!("cannot write {}: {e}", output_path.display()))?;
-                if !quiet {
-                    eprintln!("Compiled to {}", output_path.display());
+            match output_path {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                miette::miette!(
+                                    "cannot create output directory {}: {e}",
+                                    parent.display()
+                                )
+                            })?;
+                        }
+                    }
+                    std::fs::write(&path, &compiled).map_err(|e| {
+                        miette::miette!("cannot write {}: {e}", path.display())
+                    })?;
+                    if !quiet {
+                        eprintln!("Compiled to {}", path.display());
+                    }
                 }
-            } else {
-                print!("{compiled}");
+                None => {
+                    print!("{compiled}");
+                }
             }
             Ok(())
         }
@@ -415,6 +599,102 @@ mod tests {
             parse_cli_value("2.5".to_string()),
             mds::Value::Number(2.5),
             "finite float must still become Value::Number"
+        );
+    }
+
+    #[test]
+    fn derive_output_filename_swaps_mds_extension() {
+        assert_eq!(
+            derive_output_filename(Path::new("foo.mds")),
+            OsString::from("foo.md")
+        );
+    }
+
+    #[test]
+    fn derive_output_filename_preserves_compound_extension() {
+        assert_eq!(
+            derive_output_filename(Path::new("foo.bar.mds")),
+            OsString::from("foo.bar.md")
+        );
+    }
+
+    #[test]
+    fn derive_output_filename_no_extension() {
+        assert_eq!(
+            derive_output_filename(Path::new("README")),
+            OsString::from("README.md")
+        );
+    }
+
+    #[test]
+    fn derive_output_filename_other_extension() {
+        assert_eq!(
+            derive_output_filename(Path::new("foo.txt")),
+            OsString::from("foo.md")
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_dash_o_dash_is_stdout() {
+        let result = resolve_output_path(
+            &Some(PathBuf::from("foo.mds")),
+            &Some("-".to_string()),
+            &None,
+            &None,
+        )
+        .unwrap();
+        assert_eq!(result, None, "-o - should resolve to stdout (None)");
+    }
+
+    #[test]
+    fn resolve_output_path_stdin_no_o_is_stdout() {
+        let result = resolve_output_path(
+            &Some(PathBuf::from("-")),
+            &None,
+            &None,
+            &None,
+        )
+        .unwrap();
+        assert_eq!(result, None, "stdin input with no -o should resolve to stdout");
+    }
+
+    #[test]
+    fn resolve_output_path_default_file_next_to_source() {
+        let result = resolve_output_path(
+            &Some(PathBuf::from("/some/dir/hello.mds")),
+            &None,
+            &None,
+            &None,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(PathBuf::from("/some/dir/hello.md")),
+            "default should produce .md next to source"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_explicit_o_wins_over_config() {
+        let config = Some((
+            MdsConfig {
+                build: BuildConfig {
+                    output_dir: Some("build".to_string()),
+                },
+            },
+            PathBuf::from("/project"),
+        ));
+        let result = resolve_output_path(
+            &Some(PathBuf::from("/project/hello.mds")),
+            &Some("out.md".to_string()),
+            &None,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(PathBuf::from("out.md")),
+            "-o should win over mds.json config"
         );
     }
 }
