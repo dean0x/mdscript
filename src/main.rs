@@ -5,6 +5,7 @@ use std::process;
 
 use clap::{Parser, Subcommand};
 use miette::Result;
+use mds::MdsError;
 
 /// Scan the current directory for `.mds` files.
 ///
@@ -156,13 +157,36 @@ fn parse_cli_value(val: String) -> mds::Value {
     mds::Value::String(val)
 }
 
+/// Map an error to a categorized exit code.
+///
+/// Exit codes:
+/// - 0: success (never returned here — handled by happy path)
+/// - 1: logical/syntax error (undefined variable, arity mismatch, recursion, etc.)
+/// - 2: I/O or file-system error (file not found, not an MDS file, I/O failure)
+/// - 3: resource limit exceeded (output too large, too many iterations)
+///
+/// Errors created via `miette::miette!()` in main.rs do NOT downcast to `MdsError`
+/// and correctly fall through to exit code 1. Only `MdsError` values converted via
+/// `.map_err(miette::Error::from)` are categorized.
+fn exit_code(err: &miette::Error) -> i32 {
+    if let Some(mds_err) = err.downcast_ref::<MdsError>() {
+        match mds_err {
+            MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
+            MdsError::ResourceLimit { .. } => 3,
+            _ => 1,
+        }
+    } else {
+        1
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let result = run(cli);
     if let Err(e) = result {
         eprintln!("{e:?}");
-        process::exit(1);
+        process::exit(exit_code(&e));
     }
 }
 

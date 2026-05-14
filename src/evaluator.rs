@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use crate::ast::{Arg, Expr, ForBlock, IfBlock, IncludeDirective, Node};
 use crate::error::MdsError;
 use crate::scope::{FunctionDef, Scope};
@@ -21,6 +19,20 @@ const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
 
+/// Transient state threaded through the evaluator for a single compilation.
+///
+/// Bundles the three mutable parameters that were previously threaded individually
+/// through every function signature, reducing arity and making call sites clearer.
+pub(crate) struct EvalContext<'a> {
+    /// LIFO stack of active function call keys, used to detect direct recursion.
+    /// Vec is used for O(n) contains at MAX_CALL_DEPTH=128 — acceptable.
+    call_stack: Vec<String>,
+    /// Cumulative loop iterations across all @for loops in one compilation.
+    total_iterations: usize,
+    /// Accumulated warnings (e.g. empty @include).
+    warnings: &'a mut Vec<String>,
+}
+
 /// Evaluate a module body into a final rendered string.
 ///
 /// Warnings (e.g. empty `@include`) are appended to `warnings`.
@@ -29,23 +41,18 @@ pub fn evaluate(
     scope: &mut Scope,
     warnings: &mut Vec<String>,
 ) -> Result<String, MdsError> {
-    let mut call_stack: HashSet<String> = HashSet::new();
-    let mut total_iterations: usize = 0;
-    evaluate_nodes(
-        nodes,
-        scope,
-        &mut call_stack,
-        &mut total_iterations,
+    let mut ctx = EvalContext {
+        call_stack: Vec::new(),
+        total_iterations: 0,
         warnings,
-    )
+    };
+    evaluate_nodes(nodes, scope, &mut ctx)
 }
 
 fn evaluate_nodes(
     nodes: &[Node],
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let mut output = String::new();
 
@@ -54,31 +61,13 @@ fn evaluate_nodes(
             Node::Text(t) => output.push_str(&t.text),
             Node::EscapedBrace => output.push('{'),
             Node::Interpolation(interp) => {
-                output.push_str(&evaluate_expr(
-                    &interp.expr,
-                    scope,
-                    call_stack,
-                    total_iterations,
-                    warnings,
-                )?);
+                output.push_str(&evaluate_expr(&interp.expr, scope, ctx)?);
             }
             Node::If(block) => {
-                output.push_str(&evaluate_if(
-                    block,
-                    scope,
-                    call_stack,
-                    total_iterations,
-                    warnings,
-                )?);
+                output.push_str(&evaluate_if(block, scope, ctx)?);
             }
             Node::For(block) => {
-                output.push_str(&evaluate_for(
-                    block,
-                    scope,
-                    call_stack,
-                    total_iterations,
-                    warnings,
-                )?);
+                output.push_str(&evaluate_for(block, scope, ctx)?);
             }
             Node::Define(_) => {
                 // Handled by resolver with full lexical capture
@@ -87,7 +76,7 @@ fn evaluate_nodes(
                 // Handled by resolver, skip during evaluation
             }
             Node::Include(inc) => {
-                output.push_str(&evaluate_include(inc, scope, warnings)?);
+                output.push_str(&evaluate_include(inc, scope, ctx)?);
             }
         }
         if output.len() > MAX_OUTPUT_SIZE {
@@ -104,9 +93,7 @@ fn evaluate_nodes(
 fn evaluate_expr(
     expr: &Expr,
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     match expr {
         Expr::Var(name) => {
@@ -116,33 +103,16 @@ fn evaluate_expr(
             Ok(value.to_string())
         }
         Expr::Call { name, args } => {
-            let resolved_args =
-                resolve_args(args, scope, call_stack, total_iterations, warnings, 0)?;
-            call_function(
-                name,
-                &resolved_args,
-                scope,
-                call_stack,
-                total_iterations,
-                warnings,
-            )
+            let resolved_args = resolve_args(args, scope, ctx, 0)?;
+            call_function(name, &resolved_args, scope, ctx)
         }
         Expr::QualifiedCall {
             namespace,
             name,
             args,
         } => {
-            let resolved_args =
-                resolve_args(args, scope, call_stack, total_iterations, warnings, 0)?;
-            call_qualified_function(
-                namespace,
-                name,
-                &resolved_args,
-                scope,
-                call_stack,
-                total_iterations,
-                warnings,
-            )
+            let resolved_args = resolve_args(args, scope, ctx, 0)?;
+            call_qualified_function(namespace, name, &resolved_args, scope, ctx)
         }
     }
 }
@@ -150,9 +120,7 @@ fn evaluate_expr(
 fn resolve_args(
     args: &[Arg],
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
     depth: usize,
 ) -> Result<Vec<Value>, MdsError> {
     if depth > MAX_CALL_DEPTH {
@@ -171,22 +139,8 @@ fn resolve_args(
                 name,
                 args: inner_args,
             } => {
-                let resolved = resolve_args(
-                    inner_args,
-                    scope,
-                    call_stack,
-                    total_iterations,
-                    warnings,
-                    depth + 1,
-                )?;
-                let result = call_function(
-                    name,
-                    &resolved,
-                    scope,
-                    call_stack,
-                    total_iterations,
-                    warnings,
-                )?;
+                let resolved = resolve_args(inner_args, scope, ctx, depth + 1)?;
+                let result = call_function(name, &resolved, scope, ctx)?;
                 Ok(Value::String(result))
             }
         })
@@ -198,14 +152,12 @@ fn invoke_function(
     call_key: &str,
     args: &[Value],
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    if call_stack.contains(call_key) {
+    if ctx.call_stack.iter().any(|s| s == call_key) {
         return Err(MdsError::recursion(call_key));
     }
-    if call_stack.len() >= MAX_CALL_DEPTH {
+    if ctx.call_stack.len() >= MAX_CALL_DEPTH {
         return Err(MdsError::recursion(format!(
             "{call_key} (call depth exceeds {MAX_CALL_DEPTH})"
         )));
@@ -231,9 +183,13 @@ fn invoke_function(
     for (param, value) in func.params.iter().zip(args.iter()) {
         scope.set_var(param, value.clone());
     }
-    call_stack.insert(call_key.to_string());
-    let result = evaluate_nodes(&func.body, scope, call_stack, total_iterations, warnings);
-    call_stack.remove(call_key);
+    ctx.call_stack.push(call_key.to_string());
+    let result = evaluate_nodes(&func.body, scope, ctx);
+    debug_assert!(
+        ctx.call_stack.last().is_some_and(|s| s == call_key),
+        "call_stack LIFO invariant violated: expected '{call_key}' on top"
+    );
+    ctx.call_stack.pop();
     scope.pop()?;
     result
 }
@@ -242,23 +198,13 @@ fn call_function(
     name: &str,
     args: &[Value],
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let func = scope
         .get_function(name)
         .ok_or_else(|| MdsError::undefined_fn(name))?
         .clone();
-    invoke_function(
-        &func,
-        name,
-        args,
-        scope,
-        call_stack,
-        total_iterations,
-        warnings,
-    )
+    invoke_function(&func, name, args, scope, ctx)
 }
 
 fn call_qualified_function(
@@ -266,9 +212,7 @@ fn call_qualified_function(
     name: &str,
     args: &[Value],
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let qualified_name = format!("{namespace}.{name}");
 
@@ -282,38 +226,22 @@ fn call_qualified_function(
         .ok_or_else(|| MdsError::undefined_fn(&qualified_name))?
         .clone();
 
-    invoke_function(
-        &func,
-        &qualified_name,
-        args,
-        scope,
-        call_stack,
-        total_iterations,
-        warnings,
-    )
+    invoke_function(&func, &qualified_name, args, scope, ctx)
 }
 
 fn evaluate_if(
     block: &IfBlock,
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let value = scope
         .get_var(&block.condition)
         .ok_or_else(|| MdsError::undefined_var(&block.condition))?;
 
     if value.is_truthy() {
-        evaluate_nodes(
-            &block.then_body,
-            scope,
-            call_stack,
-            total_iterations,
-            warnings,
-        )
+        evaluate_nodes(&block.then_body, scope, ctx)
     } else if let Some(else_body) = &block.else_body {
-        evaluate_nodes(else_body, scope, call_stack, total_iterations, warnings)
+        evaluate_nodes(else_body, scope, ctx)
     } else {
         Ok(String::new())
     }
@@ -322,9 +250,7 @@ fn evaluate_if(
 fn evaluate_for(
     block: &ForBlock,
     scope: &mut Scope,
-    call_stack: &mut HashSet<String>,
-    total_iterations: &mut usize,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let iterable = scope
         .get_var(&block.iterable)
@@ -346,8 +272,8 @@ fn evaluate_for(
     let mut output = String::new();
 
     for item in items {
-        *total_iterations += 1;
-        if *total_iterations > MAX_TOTAL_ITERATIONS {
+        ctx.total_iterations += 1;
+        if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
                 "total loop iterations exceeded maximum of {} across all loops in this compilation",
                 MAX_TOTAL_ITERATIONS
@@ -355,7 +281,7 @@ fn evaluate_for(
         }
         scope.push();
         scope.set_var(&block.var, item);
-        let rendered = evaluate_nodes(&block.body, scope, call_stack, total_iterations, warnings);
+        let rendered = evaluate_nodes(&block.body, scope, ctx);
         scope.pop()?;
         output.push_str(&rendered?);
     }
@@ -366,7 +292,7 @@ fn evaluate_for(
 fn evaluate_include(
     inc: &IncludeDirective,
     scope: &Scope,
-    warnings: &mut Vec<String>,
+    ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     let ns = scope
         .get_namespace(&inc.alias)
@@ -375,8 +301,8 @@ fn evaluate_include(
     if let Some(body) = &ns.prompt_body {
         return Ok(body.clone());
     }
-    if warnings.len() < MAX_WARNINGS {
-        warnings.push(format!(
+    if ctx.warnings.len() < MAX_WARNINGS {
+        ctx.warnings.push(format!(
             "warning: @include of '{}' produced empty output — module has no body text",
             inc.alias
         ));

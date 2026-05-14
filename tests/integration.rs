@@ -2318,3 +2318,51 @@ fn escaped_close_brace_in_function_body() {
         "escaped `}}` inside function body should render as literal `}}`, got: {result}"
     );
 }
+
+// ── CLI exit codes ────────────────────────────────────────────────────────────
+
+#[test]
+fn exit_code_success() {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args(["build", "tests/fixtures/simple.mds"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert!(status.success(), "expected exit code 0 for successful build");
+}
+
+#[test]
+fn exit_code_file_not_found() {
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args(["build", "/tmp/no_such_file_12345.mds"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "expected exit code 2 for file-not-found"
+    );
+}
+
+#[test]
+fn exit_code_syntax_error() {
+    // A file with an undefined variable produces a logical/syntax error → exit code 1.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.mds");
+    std::fs::write(&path, "{undefined_var}").unwrap();
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+        .args(["build"])
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected exit code 1 for undefined-variable error"
+    );
+}
