@@ -3020,3 +3020,87 @@ fn build_auto_detect_writes_file() {
         "auto-detect default output should contain 'Hello World!', got: {content}"
     );
 }
+
+// ── Exit code 3 (ResourceLimit) ───────────────────────────────────────────────
+
+#[test]
+fn exit_code_resource_limit() {
+    // Trigger MAX_TOTAL_ITERATIONS (1,000,000) via two nested @for loops.
+    // Outer array: 1,001 items × inner array: 1,001 items = 1,002,001 iterations.
+    // Each individual loop stays well under MAX_LOOP_ITERATIONS (100,000), so
+    // only MAX_TOTAL_ITERATIONS fires, producing MdsError::ResourceLimit → exit code 3.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("resource_limit.mds");
+
+    // Build a YAML frontmatter array of 1,001 string items and a nested @for loop.
+    let mut source = String::from("---\n");
+    source.push_str("outer:\n");
+    for i in 0..1001 {
+        source.push_str(&format!("  - item{i}\n"));
+    }
+    source.push_str("inner:\n");
+    for i in 0..1001 {
+        source.push_str(&format!("  - sub{i}\n"));
+    }
+    source.push_str("---\n");
+    source.push_str("@for x in outer:\n");
+    source.push_str("@for y in inner:\n");
+    source.push_str("{x}-{y}\n");
+    source.push_str("@end\n");
+    source.push_str("@end\n");
+
+    std::fs::write(&src, &source).unwrap();
+
+    let status = mds_bin()
+        .args(["build"])
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "expected exit code 3 for resource-limit error"
+    );
+}
+
+// ── check_collecting_warnings / check_str_collecting_warnings direct API ──────
+
+#[test]
+fn check_collecting_warnings_returns_warnings_for_empty_include() {
+    // check_collecting_warnings should succeed (Ok) and surface the empty-@include
+    // warning in the returned Vec<String> without printing to stderr.
+    let path = fixture("include_empty_body.mds");
+    let ((), warnings) = mds::check_collecting_warnings(&path, None)
+        .expect("check_collecting_warnings should succeed on a valid file");
+    assert!(
+        warnings.iter().any(|w| w.contains("empty output") || w.contains("fns")),
+        "expected at least one warning about empty @include, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn check_str_collecting_warnings_no_warnings_for_clean_source() {
+    // A well-formed source with no warnings should return an empty warnings vec.
+    let source = "---\nname: Test\n---\nHello {name}!\n";
+    let ((), warnings) = mds::check_str_collecting_warnings(source, None, None)
+        .expect("check_str_collecting_warnings should succeed on clean source");
+    assert!(
+        warnings.is_empty(),
+        "clean source should produce no warnings, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn check_str_collecting_warnings_errors_on_invalid_source() {
+    // check_str_collecting_warnings should return Err for sources with compile errors,
+    // independently of CLI argument parsing.
+    let source = "{undefined_variable}";
+    let result = mds::check_str_collecting_warnings(source, None, None);
+    assert!(
+        result.is_err(),
+        "check_str_collecting_warnings should return Err for undefined variable"
+    );
+}
