@@ -88,41 +88,36 @@ fn derive_output_filename(input: &Path) -> OsString {
 
 /// Resolve the output path according to the precedence chain:
 ///
-/// 1. `-o -`            → stdout (returns `None`)
-/// 2. `-o <path>`       → that exact path
-/// 3. Stdin with no -o  → stdout (returns `None`)
-/// 4. `--out-dir <dir>` → `<dir>/<name>.md` (directory created if needed)
-/// 5. `mds.json`        → `<config_dir>/<output_dir>/<name>.md` (dir created)
-/// 6. Default           → source dir + `<name>.md`
+/// 1. `-o -`                         → stdout (returns `None`)
+/// 2. `-o <path>`                    → that exact path
+/// 3. Stdin with no -o / --out-dir   → stdout (returns `None`)
+/// 4. `--out-dir <dir>`              → `<dir>/<name>.md` (directory created if needed)
+/// 5. `mds.json`                     → `<config_dir>/<output_dir>/<name>.md` (dir created)
+/// 6. Default                        → source dir + `<name>.md`
 fn resolve_output_path(
     input: &Option<PathBuf>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
 ) -> std::result::Result<Option<PathBuf>, miette::Error> {
-    // 1. `-o -` → stdout
-    if let Some(o) = output {
-        if o == "-" {
-            return Ok(None);
-        }
+    // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
+    match output.as_deref() {
+        Some("-") => return Ok(None),
+        Some(o) => return Ok(Some(PathBuf::from(o))),
+        None => {}
     }
 
-    // 2. `-o <path>` → exact path
-    if let Some(o) = output {
-        return Ok(Some(PathBuf::from(o)));
-    }
-
-    // 3. Stdin input with no -o → stdout
-    let is_stdin = match input {
-        Some(p) => p == Path::new("-"),
-        None => false,
-    };
-    if is_stdin {
+    // 3. Stdin input with no explicit output destination → stdout.
+    //    But if --out-dir is set, fall through so the user's explicit CLI flag
+    //    is honored (using "output.md" as the derived filename).
+    let is_stdin = matches!(input.as_deref(), Some(p) if p == Path::new("-"));
+    if is_stdin && out_dir.is_none() {
         return Ok(None);
     }
 
     // Derive the output filename from the input path (needed for steps 4-6).
-    let input_path: Option<&Path> = input.as_deref();
+    // Treat stdin ("-") as None so we fall back to "output.md" instead of "-.md".
+    let input_path = input.as_deref().filter(|p| *p != Path::new("-"));
 
     // 4. `--out-dir <dir>`
     if let Some(dir) = out_dir {
@@ -152,7 +147,7 @@ fn resolve_output_path(
     // 6. Default: file next to source
     match input_path {
         Some(p) => {
-            let filename = derive_output_filename(p.file_name().map(Path::new).unwrap_or(p));
+            let filename = derive_output_filename(p);
             let dir = p.parent().unwrap_or(Path::new("."));
             Ok(Some(dir.join(filename)))
         }
@@ -671,6 +666,24 @@ mod tests {
             result,
             Some(PathBuf::from("/some/dir/hello.md")),
             "default should produce .md next to source"
+        );
+    }
+
+    #[test]
+    fn resolve_output_path_stdin_with_out_dir_uses_out_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_dir = dir.path().join("out");
+        let result = resolve_output_path(
+            &Some(PathBuf::from("-")),
+            &None,
+            &Some(out_dir.clone()),
+            &None,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(out_dir.join("output.md")),
+            "stdin with --out-dir should produce output.md inside the out dir"
         );
     }
 

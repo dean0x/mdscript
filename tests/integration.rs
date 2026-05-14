@@ -501,23 +501,23 @@ fn export_nonexistent_symbol_errors() {
 
 #[test]
 fn check_stdin_valid() {
-    let output = mds_bin()
+    let mut child = mds_bin()
         .args(["check", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"---\nname: World\n---\nHello {name}!\n")
-                .unwrap();
-            child.wait_with_output()
-        })
         .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "check stdin should succeed for valid input"
@@ -2604,6 +2604,52 @@ fn build_stdin_with_output_writes_file() {
     assert!(
         stdout.is_empty(),
         "stdout should be empty when -o writes to file, got: {stdout}"
+    );
+}
+
+#[test]
+fn build_stdin_with_out_dir_writes_to_directory() {
+    // `echo "..." | mds build - --out-dir dist` should write `dist/output.md`.
+    let dir = tempfile::tempdir().unwrap();
+    let dist = dir.path().join("dist");
+
+    let mut child = mds_bin()
+        .args(["build", "-", "--out-dir", dist.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdin + --out-dir should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let md_path = dist.join("output.md");
+    assert!(
+        md_path.exists(),
+        "output.md should be written inside dist/ for stdin + --out-dir"
+    );
+    let content = std::fs::read_to_string(&md_path).unwrap();
+    assert!(
+        content.contains("Hello World!"),
+        "output file should contain compiled content, got: {content}"
+    );
+    // stdout should be empty (output went to file)
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.is_empty(),
+        "stdout should be empty when --out-dir writes to file, got: {stdout}"
     );
 }
 
