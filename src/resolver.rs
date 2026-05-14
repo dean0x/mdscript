@@ -312,14 +312,7 @@ impl ModuleCache {
                     scope.set_function(&def.name, arc);
                 }
                 Node::Import(import) => {
-                    self.resolve_import(
-                        import,
-                        ctx.base_dir,
-                        ctx.runtime_vars,
-                        scope,
-                        warnings,
-                        (ctx.source, ctx.file_str),
-                    )?;
+                    self.resolve_import(import, scope, ctx, warnings)?;
                 }
                 Node::Export(export) => {
                     has_explicit_exports = true;
@@ -374,13 +367,10 @@ impl ModuleCache {
     fn resolve_import(
         &mut self,
         import: &ImportDirective,
-        base_dir: &Path,
-        runtime_vars: &HashMap<String, Value>,
         scope: &mut Scope,
+        ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
-        source_ctx: (&str, &str),
     ) -> Result<(), MdsError> {
-        let (source, file_str) = source_ctx;
         match import {
             ImportDirective::Alias {
                 path,
@@ -388,18 +378,18 @@ impl ModuleCache {
                 offset,
             } => {
                 validate_import_path(path)?;
-                let import_path = resolve_path(base_dir, path);
+                let import_path = resolve_path(ctx.base_dir, path);
                 let resolved = self
-                    .resolve(&import_path, runtime_vars, warnings)
-                    .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
+                    .resolve(&import_path, ctx.runtime_vars, warnings)
+                    .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, *offset))?;
                 scope.set_namespace(alias, resolved.to_namespace());
             }
             ImportDirective::Merge { path, offset } => {
                 validate_import_path(path)?;
-                let import_path = resolve_path(base_dir, path);
+                let import_path = resolve_path(ctx.base_dir, path);
                 let resolved = self
-                    .resolve(&import_path, runtime_vars, warnings)
-                    .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
+                    .resolve(&import_path, ctx.runtime_vars, warnings)
+                    .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, *offset))?;
                 // Per spec: only functions and the prompt body are imported via merge.
                 // Frontmatter variables from the imported module are NOT brought into scope.
                 for (name, func) in resolved.get_all_exports() {
@@ -418,18 +408,18 @@ impl ModuleCache {
                 offset,
             } => {
                 validate_import_path(path)?;
-                let import_path = resolve_path(base_dir, path);
+                let import_path = resolve_path(ctx.base_dir, path);
                 let resolved = self
-                    .resolve(&import_path, runtime_vars, warnings)
-                    .map_err(|e| attach_import_span(e, path, file_str, source, *offset))?;
-                let line_len = source[*offset..]
+                    .resolve(&import_path, ctx.runtime_vars, warnings)
+                    .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, *offset))?;
+                let line_len = ctx.source[*offset..]
                     .find('\n')
-                    .unwrap_or(source[*offset..].len());
+                    .unwrap_or(ctx.source[*offset..].len());
                 let not_exported = |name: &str| {
                     MdsError::import_error_at(
                         format!("'{name}' is not exported from '{path}'"),
-                        file_str,
-                        source,
+                        ctx.file_str,
+                        ctx.source,
                         *offset,
                         line_len,
                     )
@@ -465,7 +455,7 @@ impl ResolvedModule {
         if self.has_explicit_exports && !self.explicit_exports.contains(name) {
             return None;
         }
-        self.functions.get(name).cloned()  // cloned() on &Arc = Arc::clone (cheap)
+        self.functions.get(name).cloned()
     }
 
     /// Get all exported functions.
@@ -502,9 +492,18 @@ impl ResolvedModule {
             })
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect();
+        // Respect export visibility: prompt_body is only included in the namespace
+        // when "prompt" is an available export (same rule as get_prompt_value).
+        let prompt_is_exported =
+            !self.has_explicit_exports || self.explicit_exports.contains("prompt");
+        let prompt_body = if prompt_is_exported {
+            self.prompt_body.clone()
+        } else {
+            None
+        };
         NamespaceScope {
             functions,
-            prompt_body: self.prompt_body.clone(),
+            prompt_body,
         }
     }
 }

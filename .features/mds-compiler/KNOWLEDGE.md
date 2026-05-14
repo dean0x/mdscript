@@ -42,6 +42,8 @@ The binary is a CLI tool (`mds build`, `mds check`, `mds init`) backed by a libr
 | `check(path, runtime_vars)` | Validate a file without rendering |
 | `check_str(source)` | Validate from string, no options |
 | `check_str_with(source, base_dir, runtime_vars)` | Validate from string with options |
+| `check_collecting_warnings(path, runtime_vars)` | Validate and return `((), Vec<String>)` — caller controls warning output |
+| `check_str_collecting_warnings(source, base_dir, runtime_vars)` | String variant of the above |
 | `load_vars_file(path)` | Load runtime vars from a JSON file |
 
 `compile_file` is the simplest entry point for embedding MDS in tools that already have a path as `&str`. It does not accept runtime vars; use `compile` directly when runtime overrides are needed.
@@ -96,7 +98,7 @@ All non-text AST nodes carry a byte `offset` into the original source. This is t
 - `functions: HashMap<String, FunctionDef>` — `@define` functions
 - `namespaces: HashMap<String, NamespaceScope>` — aliased imports (`@import "x" as ns`)
 
-Lookup always walks from innermost to outermost frame, enabling block-scoped shadowing. `push()`/`pop()` are called around `@for` iterations and function calls.
+Lookup always walks from innermost to outermost frame, enabling block-scoped shadowing. `push()`/`pop()` are called around `@for` iterations and function calls. `pop()` returns `Result<(), MdsError>` — it returns an error if called when only the global scope frame remains, surfacing mismatched push/pop as a compiler-bug diagnostic rather than a panic. All callers use `scope.pop()?`.
 
 `FunctionDef` carries three closure capture fields populated at definition time:
 - `captured_namespaces: HashMap<String, NamespaceScope>` — alias imports visible at definition site
@@ -160,11 +162,12 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 
 **Project root detection**: `find_project_root` walks up from the entry file's directory looking for `.git` or `.mdsroot` markers. The found root is stored in `ModuleCache::root_dir` on first resolve. All subsequently resolved paths must `starts_with(root_dir)` — this is the path traversal boundary.
 
-**Security guards** (all checked before reading the file):
-1. `validate_import_path` — rejects non-relative paths and null bytes
-2. `root_dir` check — rejects paths that escape the project directory
-3. `MAX_IMPORT_DEPTH = 64` — rejects chains deeper than 64 levels
-4. `MAX_FILE_SIZE = 10MB` — rejects files over 10MB
+**Security guards** (checked in order, before reading the file):
+1. Symlink detection — rejects imports where the final path component is a symlink; detects via two-step canonicalize: `canonical_parent.join(raw_filename)` vs `full_canonicalize()`; if they differ, returns `ImportError`
+2. `validate_import_path` — rejects non-relative paths and null bytes
+3. `root_dir` check — rejects paths that escape the project directory
+4. `MAX_IMPORT_DEPTH = 64` — rejects chains deeper than 64 levels
+5. `MAX_FILE_SIZE = 10MB` — rejects files over 10MB
 
 **Cycle detection** uses two parallel data structures:
 - `resolving: HashSet<PathBuf>` — O(1) membership test
@@ -208,19 +211,20 @@ The evaluator walks the AST and produces the final rendered string. Its public e
 
 The evaluator carries a `call_stack: HashSet<String>` for recursion detection (error on self or mutual recursion) and enforces `MAX_CALL_DEPTH = 128` for deep chains.
 
-Four additional resource limits guard against runaway compilation:
+Five additional resource limits guard against runaway compilation:
 - `MAX_LOOP_ITERATIONS = 100,000` — enforced per `@for` loop; raising this by one over the limit triggers a `ResourceLimit` error at evaluation time
 - `MAX_TOTAL_ITERATIONS = 1,000,000` — cumulative across all loops in one compilation pass; nested loops that individually fit within the per-loop limit can still be rejected here
 - `MAX_OUTPUT_SIZE = 50 MB` — checked after each node renders; returning `ResourceLimit` the moment the buffer exceeds this size rather than at the end
 - `MAX_VALUE_DEPTH = 64` — enforced inside `Value::from_yaml` / `Value::from_json` via depth-tracking inner helpers, rejecting deeply nested YAML/JSON trees before they enter the pipeline
+- `MAX_WARNINGS = 1,000` — once the warnings vec reaches this size, `evaluate_include` silently skips further pushes; prevents unbounded vec growth from templates with many empty `@include` directives
 
 All four limits return `MdsError::ResourceLimit` (no source span). If you add a warning-emitting path or a new iterable node, thread `total_iterations: &mut usize` through the call chain so the cumulative limit is respected.
 
-**`Node::Define` in the evaluator**: When the evaluator encounters a `Node::Define`, it calls `scope.set_function(&block.name, FunctionDef::from(block))`. This re-registers the function in the runtime scope with empty captures — the evaluator does not restore closure captures here. Closure restoration only happens inside `invoke_function` when the function is actually called. This means `@define` blocks must appear before any call sites in the source, and the resolver's pre-evaluation scope setup is what makes cross-module closure capture work.
+**`Node::Define` in the evaluator**: The evaluator's `Node::Define` arm is a deliberate no-op — the implementation contains only `// Handled by resolver with full lexical capture`. All function registration (including closure capture into `captured_namespaces`, `captured_functions`, `captured_vars`) happens in the resolver's pre-evaluation AST walk. The evaluator skips `@define` nodes entirely, relying on the scope the resolver built. The resolver's pre-evaluation pass is therefore load-bearing for all function calls, including cross-module ones.
 
 `invoke_function` restores the function's captured closure scope (namespaces, functions, vars) before binding parameters, so params shadow captured vars correctly. After evaluation the pushed frame is popped.
 
-**`resolve_args` signature**: `resolve_args(args: &[Arg], scope: &mut Scope, call_stack: &mut HashSet<String>, warnings: &mut Vec<String>) -> Result<Vec<Value>, MdsError>`. The `call_stack` and `warnings` parameters are threaded so `Arg::Call` can invoke `call_function` during argument resolution, which itself may recurse. This is the key wiring that makes nested calls work at evaluation time.
+**`resolve_args` signature**: `resolve_args(args: &[Arg], scope: &mut Scope, call_stack: &mut HashSet<String>, total_iterations: &mut usize, warnings: &mut Vec<String>, depth: usize) -> Result<Vec<Value>, MdsError>`. The `call_stack` and `warnings` parameters are threaded so `Arg::Call` can invoke `call_function` during argument resolution. `depth` tracks argument expression nesting and is checked against `MAX_CALL_DEPTH` to prevent unbounded recursion through argument nesting alone. `total_iterations` is passed so any `@for` loops that execute inside argument-evaluated functions contribute to the cumulative iteration limit. This is the key wiring that makes nested calls work at evaluation time.
 
 The `Arg::Call` arm in `resolve_args` recursively calls `resolve_args` for inner args, then `call_function` for the nested invocation, wrapping the `String` result in `Value::String`. This means the result of a nested call is always a `String` value regardless of what the inner function produces.
 
@@ -334,6 +338,7 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 ## Constraints
 
 - **Import paths must be relative** — `validate_import_path` rejects non-relative paths (must start with `./` or `../`) and null bytes. Runs before any filesystem access.
+- **Symlinks rejected** — `ModuleCache::resolve` detects symlinks in the final path component by comparing `canonical_parent.join(raw_filename)` vs the fully-resolved path. If they differ, returns `ImportError` before reading the file. Runs before the `root_dir` and file-read steps.
 - **Path traversal prevention** — resolved import paths must remain within the project root (detected via `.git`/`.mdsroot` walk-up from entry file directory).
 - **MAX_IMPORT_DEPTH = 64** — prevents stack overflow from deep chains (separate from circular import detection).
 - **MAX_FILE_SIZE = 10MB** — checked before reading; prevents memory exhaustion from large inputs.
@@ -360,10 +365,11 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **Adding functions to `process_module`'s scope without also capturing current scope into the FunctionDef** — if you add a function to scope after other functions are already captured, the previously captured siblings won't see the new function.
 - **Adding a new `Arg` variant without updating all three match sites** — parser (`parse_single_arg_inner`), evaluator (`resolve_args`), and validator (`validate_var_args`) all pattern-match exhaustively on `Arg`. Adding a variant without updating all three will produce a compile error, which is by design.
 - **Passing `resolve_args` without `call_stack` or `warnings`** — nested `Arg::Call` evaluation requires the call stack for recursion detection and warnings for diagnostics. Any future refactor that removes these from `resolve_args` will silently allow unbounded recursion through argument nesting or lose warning context.
-- **Using `compile` instead of `compile_collecting_warnings` in CLI code** — the CLI must use the collecting variants to properly gate warning output on the `--quiet` flag.
+- **Using `compile` instead of `compile_collecting_warnings` in CLI code** — the CLI must use the collecting variants to properly gate warning output on the `--quiet` flag. The same applies to validation: use `check_collecting_warnings` / `check_str_collecting_warnings` rather than `check` / `check_str` when the caller needs to control warning output.
 - **Duplicating `base_dir` fallback logic in new string-based API functions** — always call `resolve_base_dir(base_dir)` rather than inlining the `current_dir()` fallback. The function also maps the IO error to `MdsError::Io`, which inline code tends to omit.
 - **Calling `get_all_exports()` and expecting a `HashMap`** — `ResolvedModule::get_all_exports()` returns `Vec<(String, FunctionDef)>`, not a `HashMap`. Callers that need map-like access must collect explicitly.
 - **Injecting `Value::Null` as a placeholder for `@define` params in validation** — the validator uses `Value::Array(vec![])` so that `@for item in param:` inside a define body passes the array type check. Using `Null` would produce a spurious type error at validate time.
+- **Ignoring the `Result` from `scope.pop()`** — `pop()` returns `Result<(), MdsError>` and errors when called on the global scope frame. Always use `scope.pop()?` to propagate the error. A mismatched push/pop is a compiler bug that should surface as a diagnostic error, not a panic or silent failure.
 
 ## Gotchas
 
@@ -372,7 +378,7 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **Runtime vars override frontmatter silently** — there is no warning when a runtime var shadows a frontmatter key. Intentional but can cause confusion when debugging.
 - **`@export` changes all-implicit to explicit** — once any `@export` appears in a module, only explicitly listed names are exported. Adding an `@export name` to a previously-implicit-all module will break importers depending on other functions.
 - **`@export prompt` is valid** — the string `"prompt"` is a special case in export validation. It does not need a corresponding `@define prompt` — it refers to the module's rendered body.
-- **`@include` on an empty module pushes a warning and returns empty** — `evaluate_include` calls `warnings.push(...)` (not `eprintln!`) and returns `""`. No error. The include disappears from output. The warning only reaches stderr if the caller chooses to print it.
+- **`@include` on an empty module pushes a warning and returns empty** — `evaluate_include` calls `warnings.push(...)` (not `eprintln!`) and returns `""`. No error. The include disappears from output. The warning only reaches stderr if the caller chooses to print it. Warnings are silently dropped once `warnings.len() >= MAX_WARNINGS (1,000)` — a template with thousands of empty `@include` directives will compile correctly but emit at most 1,000 warnings.
 - **Merged imports bring in `prompt` body but not frontmatter vars** — `@import "path"` (merge) brings functions and the `prompt` body text into scope, but NOT the imported module's frontmatter variables. Two merge-imported modules that both define the same frontmatter variable do not cause a collision.
 - **Selective import of `prompt` binds as a variable, not a function** — `@import { prompt } from "path"` sets `prompt` as a `Value::String` via `scope.set_var`, not `scope.set_function`.
 - **`compile_str` takes no arguments** — the zero-argument form `compile_str(source)` is a convenience wrapper. Use `compile_str_with(source, base_dir, runtime_vars)` when you need import resolution relative to a specific directory or runtime variable overrides.
@@ -380,13 +386,14 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - **Closure capture is eager and shallow** — `get_all_vars()` / `get_all_functions()` / `get_all_namespaces()` snapshot the scope at definition time. Functions defined after the closure capture are not visible to the captured function. Within `process_module`, `@define` nodes are processed in top-to-bottom AST order, so later-defined functions are not visible to earlier ones.
 - **`get_all_*` iteration order matters for shadowing** — all three `get_all_*` methods iterate outer→inner frames, so when a key exists in multiple frames the inner frame wins. The resulting `HashMap` thus correctly reflects inner-scope shadowing. This is the correct behavior for snapshot captures.
 - **`compile_str` / `resolve_source` uses a virtual path `<source>`** — in-memory sources cannot be canonicalized. Repeated calls to `compile_str` re-parse every time; there is no caching for in-memory sources.
-- **Project root is set on first resolve** — `root_dir` is set lazily. If `resolve_source` is called first (e.g., via `compile_str_with`), `root_dir` is set to the _canonicalized_ `base_dir` via `canonicalize().unwrap_or_else(|_| base_dir.to_path_buf())`, not a git-root-discovered path. Canonicalization ensures `starts_with` comparisons are consistent even when `base_dir` contains `.` or `..` components — without it, path traversal checks could be bypassed via relative segments. The `unwrap_or_else` fallback to the raw path handles non-existent or unmounted directories gracefully.
+- **Project root is set on first resolve** — `root_dir` is set lazily. If `resolve_source` is called first (e.g., via `compile_str_with`), `root_dir` is set to the _canonicalized_ `base_dir` via `base_dir.canonicalize().map_err(|e| MdsError::io(...))` — if the directory cannot be resolved, `resolve_source` returns `Err` immediately (no silent fallback). Canonicalization ensures `starts_with` comparisons work even when `base_dir` contains `.` or `..` components. File-based `resolve()` always finds the project root via git walk-up; `resolve_source` does not walk up.
 - **Cycle detection reconstructs the path from `resolving_stack`** — when circular import is detected, `build_cycle_string` uses `.position(...).unwrap_or(0)` to find the start of the cycle. If `position` returns `None` (which should not happen at runtime), the cycle string starts from index 0 as a safe fallback rather than panicking.
+- **Symlink detection uses two sequential canonicalize calls** — `resolve()` first canonicalizes the parent directory (resolving any symlinks in directory components, e.g. `/var → /private/var` on macOS), then appends the raw filename, then fully canonicalizes. Comparing the two results detects a symlink in the final component without a TOCTOU-prone `lstat`. Cost: two filesystem calls per import, but both happen atomically at the OS level.
 - **`TextNode` has no offset** — raw text nodes (`Node::Text(TextNode)`) do not carry a byte offset. Only structured nodes (`Interpolation`, `IfBlock`, `ForBlock`, `IncludeDirective`) have offsets for error reporting. `EscapedBrace` is also a unit variant with no offset.
 - **`enter_block()` must be paired with `self.depth -= 1`** — the helper only increments; callers are responsible for decrementing after the block body is parsed. Failing to decrement will cause subsequent blocks to see an inflated depth and may reject valid inputs.
 - **Selective import `from` keyword requires a whitespace separator** — `parse_import_directive` accepts `from ` (space) or `from\t` (tab) but rejects `from"path"` with no gap. Both the missing-`from` and missing-whitespace cases produce the same error `"selective import requires 'from' keyword"`. This means a typo like `@import { fn } from"./path"` fails with that message rather than a path error.
 - **String literal escapes are not full Rust/JSON escapes** — `unescape_string` in the parser only recognizes `\\`, `\"`, and `\'`. A backslash followed by any other character (e.g., `\n`, `\t`) is kept verbatim as both backslash and the following character — it is NOT converted to a control character. Template authors writing `{greet("say \nhello")}` will get the literal two-character sequence `\n`, not a newline. This matches the least-surprise principle for a template language where `\n` in a string argument is rarely intended.
-- **Evaluator's `Node::Define` arm does not restore closures** — the evaluator re-registers a function via `FunctionDef::from(block)` with empty captures. Closure capture only happens in the resolver and is only restored inside `invoke_function`. This design means the resolver's pre-evaluation scope pass is load-bearing for cross-module function calls.
+- **Evaluator's `Node::Define` arm is a no-op** — the evaluator skips `Node::Define` nodes entirely (`// Handled by resolver with full lexical capture`). All function registration and closure capture happen in the resolver's pre-evaluation AST walk. Closure restoration only occurs inside `invoke_function` when the function is called. The resolver's pre-evaluation scope pass is therefore the sole mechanism for cross-module function calls.
 - **`help(...)` attributes are variant-level, not constructor-level** — `CircularImport`, `Recursion`, and `TypeError` now have `#[diagnostic(help(...))]` annotations that miette renders automatically. When adding new error variants, add the `help` attribute directly on the variant, not in the constructor method.
 - **Re-export errors are raised at the barrel module, not the consumer** — when `@export name from "path"` fails because `name` is not exported from the source module, the error surfaces when the barrel itself is compiled, not when the consumer imports from the barrel. This means `reexport_nonexistent.mds` fails at compile time regardless of whether any consumer uses it.
 - **`--set KEY=VAL` last-write wins for duplicate keys** — when `--set name=First --set name=Second` is passed, the second value wins because runtime vars are collected into a `HashMap` and later writes overwrite earlier ones.
@@ -394,7 +401,7 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 
 ## Key Files
 
-- `src/lib.rs` — public API: `compile`, `compile_file`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `load_vars_file`, `clean_output`; public re-export `MAX_FILE_SIZE` (re-exported from `resolver::MAX_FILE_SIZE` as the single source of truth shared between the resolver and the CLI stdin reader); private `resolve_base_dir` helper shared by all string-based API variants
+- `src/lib.rs` — public API: `compile`, `compile_file`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `check_collecting_warnings`, `check_str_collecting_warnings`, `load_vars_file`, `clean_output`; public re-export `MAX_FILE_SIZE` (re-exported from `resolver::MAX_FILE_SIZE` as the single source of truth shared between the resolver and the CLI stdin reader); private `resolve_base_dir` helper shared by all string-based API variants
 - `src/main.rs` — CLI entry point: `auto_detect_mds_file`, `parse_cli_value`/`parse_cli_value_unquoted`, `build_runtime_vars`, `reject_directory_input`, `read_stdin`; `Build` and `Check` use `input: Option<PathBuf>`
 - `src/ast.rs` — all AST types including `Arg::Call` for nested function call arguments; the contract between parser and everything downstream
 - `src/lexer.rs` — tokenizer; handles frontmatter, code fences, interpolation, directives
@@ -414,7 +421,7 @@ Both `Build` and `Check` commands use `input: Option<PathBuf>`. When `None`, the
 - `src/evaluator.rs` — canonical reference for directive execution order, closure restore, call-depth guards, nested arg evaluation, and warning collection
 - `src/scope.rs` — canonical reference for closure capture API (`get_all_*` methods) and shadowing semantics
 - `src/ast.rs` — canonical reference for `Arg` variants; any new argument form starts here
-- `src/lib.rs` — canonical reference for the two-tier warning API (`compile` vs `compile_collecting_warnings`), `compile_file` convenience entry point, and `resolve_base_dir` helper for optional base directory resolution
+- `src/lib.rs` — canonical reference for the two-tier warning API (`compile` vs `compile_collecting_warnings`, `check` vs `check_collecting_warnings`), `compile_file` convenience entry point, and `resolve_base_dir` helper for optional base directory resolution
 - `src/main.rs` — canonical reference for CLI auto-detection logic and `parse_cli_value` coercion rules
 - `src/error.rs` — canonical reference for `help(...)` diagnostic attribute placement on `MdsError` variants and available `_at` constructors; all major variants (`Recursion`, `ImportError`, `ExportError`, `CircularImport`) now have span-aware constructors
 - `tests/integration.rs` — covers all directive combinations including nested function calls, CLI stdin/quiet mode, auto-detect, `compile_file`, error help-text, scope/export visibility rules, `--set` coercion and deduplication, and re-export error scenarios; read before adding new directives to understand existing fixture patterns

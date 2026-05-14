@@ -312,14 +312,22 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
 
             if input == Path::new("-") {
                 let (source, cwd) = read_stdin()?;
-                mds::check_str_with(&source, Some(&cwd), runtime_vars)
-                    .map_err(miette::Error::from)?;
+                let ((), warnings) =
+                    mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
+                        .map_err(miette::Error::from)?;
                 if !quiet {
+                    for w in &warnings {
+                        eprintln!("{w}");
+                    }
                     eprintln!("OK: <stdin>");
                 }
             } else {
-                mds::check(&input, runtime_vars).map_err(miette::Error::from)?;
+                let ((), warnings) = mds::check_collecting_warnings(&input, runtime_vars)
+                    .map_err(miette::Error::from)?;
                 if !quiet {
+                    for w in &warnings {
+                        eprintln!("{w}");
+                    }
                     eprintln!("OK: {}", input.display());
                 }
             }

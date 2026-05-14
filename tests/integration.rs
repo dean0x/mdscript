@@ -458,7 +458,7 @@ fn init_does_not_overwrite_existing_file() {
     std::fs::write(&existing, "original content").unwrap();
 
     // Try to init over existing file - should fail
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args(["init", existing.to_str().unwrap()])
         .output()
         .unwrap();
@@ -501,7 +501,7 @@ fn export_nonexistent_symbol_errors() {
 
 #[test]
 fn check_stdin_valid() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args(["check", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -578,7 +578,7 @@ fn selective_import_prompt_body() {
 #[test]
 fn set_flag_cli_overrides() {
     // --set name=Test should override the frontmatter variable 'name'
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args([
             "build",
             fixture("simple.mds").to_str().unwrap(),
@@ -601,7 +601,7 @@ fn set_flag_cli_overrides() {
 fn set_flag_boolean_coercion() {
     // --set premium=false must coerce the string "false" to boolean false,
     // so @if premium: evaluates as falsy and the @else branch is rendered.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args([
             "build",
             fixture("set_flag_false.mds").to_str().unwrap(),
@@ -630,7 +630,7 @@ fn set_flag_boolean_coercion() {
 #[test]
 fn set_flag_boolean_true_coercion() {
     // --set premium=true must coerce to boolean true (truthy branch rendered).
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args([
             "build",
             fixture("set_flag_false.mds").to_str().unwrap(),
@@ -655,7 +655,7 @@ fn set_flag_boolean_true_coercion() {
 #[test]
 fn set_flag_numeric_coercion() {
     // --set count=3 must coerce the string "3" to a number so {count} renders as "3".
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args([
             "build",
             fixture("set_count.mds").to_str().unwrap(),
@@ -680,7 +680,7 @@ fn set_flag_numeric_coercion() {
 #[test]
 fn set_flag_null_coercion() {
     // --set premium=null must coerce to Value::Null (falsy), so @else branch renders.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args([
             "build",
             fixture("set_flag_false.mds").to_str().unwrap(),
@@ -706,7 +706,7 @@ fn set_flag_null_coercion() {
 fn set_flag_empty_array() {
     // --set items=[] must produce Value::Array(vec![]) — not [String("")].
     // The empty array is falsy, so the @else branch should render.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let output = mds_bin()
         .args([
             "build",
             fixture("set_items_empty.mds").to_str().unwrap(),
@@ -1111,6 +1111,40 @@ fn export_from_no_local_scope() {
     );
 }
 
+// ── @include respects export visibility for prompt_body ─────────────────────
+
+#[test]
+fn include_respects_export_visibility_for_prompt() {
+    // A module with explicit exports that does NOT list "prompt" should not
+    // expose its body text via @include, even through an aliased import.
+    let dir = tempfile::tempdir().unwrap();
+    let provider = dir.path().join("provider.mds");
+    let consumer = dir.path().join("consumer.mds");
+
+    std::fs::write(
+        &provider,
+        "@define greet(name):\nHello {name}!\n@end\n\n@export greet\n\nThis body should be hidden.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &consumer,
+        "@import \"./provider.mds\" as p\n\n@include p\n",
+    )
+    .unwrap();
+
+    let (result, warnings) = mds::compile_collecting_warnings(&consumer, None).unwrap();
+    // The provider has explicit exports without "prompt", so @include should
+    // produce empty output and a warning — not the provider's body text.
+    assert!(
+        !result.contains("This body should be hidden"),
+        "explicit exports without 'prompt' should hide module body from @include, got: {result}"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("empty output")),
+        "expected warning about empty @include, got warnings: {warnings:?}"
+    );
+}
+
 // ── Escaped Braces in Function Body ─────────────────────────────────────────
 
 #[test]
@@ -1221,6 +1255,26 @@ fn include_empty_body_no_warning_in_quiet_mode() {
     assert!(
         stderr.is_empty(),
         "quiet flag should suppress the empty-include warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn check_empty_body_no_warning_in_quiet_mode() {
+    // When -q/--quiet is set, the warning from @include of an empty module
+    // should be suppressed for `mds check` too (not just `mds build`).
+    let output = mds_bin()
+        .args([
+            "check",
+            fixture("include_empty_body.mds").to_str().unwrap(),
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "quiet check should succeed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.is_empty(),
+        "quiet flag should suppress warnings for check command, got: {stderr}"
     );
 }
 
@@ -2323,7 +2377,7 @@ fn escaped_close_brace_in_function_body() {
 
 #[test]
 fn exit_code_success() {
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let status = mds_bin()
         .args(["build", "tests/fixtures/simple.mds"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2334,7 +2388,7 @@ fn exit_code_success() {
 
 #[test]
 fn exit_code_file_not_found() {
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let status = mds_bin()
         .args(["build", "/tmp/no_such_file_12345.mds"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2353,7 +2407,7 @@ fn exit_code_syntax_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.mds");
     std::fs::write(&path, "{undefined_var}").unwrap();
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_mds"))
+    let status = mds_bin()
         .args(["build"])
         .arg(&path)
         .stdout(std::process::Stdio::null())

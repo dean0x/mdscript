@@ -203,12 +203,10 @@ fn call_function(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    // Arc::clone is O(1); the deref coercion &Arc<FunctionDef> → &FunctionDef
-    // is applied automatically when passing to invoke_function.
     let func = scope
         .get_function(name)
         .ok_or_else(|| MdsError::undefined_fn(name))?
-        .clone();  // Arc::clone — cheap
+        .clone();
     invoke_function(&func, name, args, scope, ctx)
 }
 
@@ -229,7 +227,7 @@ fn call_qualified_function(
         .functions
         .get(name)
         .ok_or_else(|| MdsError::undefined_fn(&qualified_name))?
-        .clone();  // Arc::clone — cheap
+        .clone();
 
     invoke_function(&func, &qualified_name, args, scope, ctx)
 }
