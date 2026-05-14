@@ -1,0 +1,4 @@
+@import "./utils.mds" as utils
+
+{utils.greet("Alice")}
+{utils.farewell("Alice")}

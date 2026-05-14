@@ -1,0 +1,11 @@
+---
+name: Dean
+---
+
+@import "./lib/footer.mds" as footer
+
+Hello {name}!
+
+This is the main content of the prompt.
+
+@include footer

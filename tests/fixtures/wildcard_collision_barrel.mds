@@ -1,0 +1,2 @@
+@export * from "./wildcard_collision_x.mds"
+@export * from "./wildcard_collision_y.mds"

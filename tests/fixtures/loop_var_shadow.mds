@@ -1,0 +1,10 @@
+---
+item: outer_value
+items: [inner1, inner2]
+---
+
+Before: {item}
+@for item in items:
+- {item}
+@end
+After: {item}

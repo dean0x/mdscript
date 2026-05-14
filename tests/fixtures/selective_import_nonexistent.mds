@@ -1,0 +1,3 @@
+@import { nonexistent } from "./utils.mds"
+
+{nonexistent("test")}

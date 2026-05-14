@@ -1,0 +1,6 @@
+---
+items: [one, two, three]
+---
+@for item in items:
+{undefined_var_in_body}
+@end

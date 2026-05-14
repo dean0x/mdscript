@@ -1,0 +1,9 @@
+@define outer(x):
+[{x}]
+@end
+
+@define inner(x):
+{x}!
+@end
+
+{outer(inner("arg"))}

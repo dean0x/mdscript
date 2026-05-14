@@ -1,0 +1,11 @@
+---
+name: World
+items: [one, two, three]
+---
+
+Hello {name}!
+
+Your items:
+@for item in items:
+- {item}
+@end

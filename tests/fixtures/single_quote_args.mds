@@ -1,0 +1,6 @@
+@define greet(name):
+Hello {name}!
+@end
+
+{greet('Alice')}
+{greet('Bob')}

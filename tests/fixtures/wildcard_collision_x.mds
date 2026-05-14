@@ -1,0 +1,5 @@
+@define shared(name):
+From X: {name}
+@end
+
+@export shared

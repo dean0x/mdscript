@@ -1,0 +1,6 @@
+---
+a: hello
+b: world
+---
+
+\{a\} and \{b\}

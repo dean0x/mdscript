@@ -1,0 +1,6 @@
+@define welcome(name, role):
+Hello {name}! You are logged in as {role}.
+@end
+
+{welcome("Alice", "admin")}
+{welcome("Bob", "editor")}

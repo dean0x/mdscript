@@ -1,0 +1,9 @@
+@define greet(name):
+Hello {name}!
+@end
+
+@define greet(name):
+Goodbye {name}!
+@end
+
+{greet("Alice")}

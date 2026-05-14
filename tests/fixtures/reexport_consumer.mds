@@ -1,0 +1,3 @@
+@import "./reexport.mds" as r
+
+{r.greet("Dave")}

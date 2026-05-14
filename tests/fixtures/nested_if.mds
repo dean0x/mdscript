@@ -1,0 +1,15 @@
+---
+a: true
+b: false
+---
+
+@if a:
+outer true
+@if b:
+inner true
+@else:
+inner false
+@end
+@else:
+outer false
+@end

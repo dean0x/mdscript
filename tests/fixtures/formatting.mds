@@ -1,0 +1,14 @@
+@define bullet_list(items):
+@for item in items:
+- {item}
+@end
+@end
+
+@define numbered_list(items):
+@for item in items:
+1. {item}
+@end
+@end
+
+@export bullet_list
+@export numbered_list

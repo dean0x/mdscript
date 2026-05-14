@@ -1,0 +1,9 @@
+@define wrap(text):
+[{text}]
+@end
+
+@define greet(name):
+{wrap(name)}
+@end
+
+{greet("Alice")}

@@ -1,0 +1,4 @@
+---
+type: assistant
+---
+My type is {type}.

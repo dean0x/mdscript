@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "features": {
+    "mds-compiler": {
+      "name": "MDS Compiler",
+      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, or changing CLI output behavior. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport, EvalContext, CapturedScope, IndexSet, Arc, exit_code, mds.json, output_dir, resolve_output_path, derive_output_filename, load_config.",
+      "directories": [
+        "src/",
+        "tests/"
+      ],
+      "referencedFiles": [
+        "src/lib.rs",
+        "src/ast.rs",
+        "src/lexer.rs",
+        "src/parser.rs",
+        "src/validator.rs",
+        "src/resolver.rs",
+        "src/evaluator.rs",
+        "src/scope.rs",
+        "src/value.rs",
+        "src/error.rs",
+        "src/main.rs"
+      ],
+      "lastUpdated": "2026-05-14T15:56:40.505Z",
+      "createdBy": "devflow-knowledge"
+    }
+  }
+}

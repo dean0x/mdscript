@@ -1,0 +1,10 @@
+---
+rows: [row1, row2]
+cols: [col1, col2]
+---
+
+@for row in rows:
+@for col in cols:
+{row}-{col}
+@end
+@end

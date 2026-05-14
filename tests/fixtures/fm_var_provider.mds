@@ -1,0 +1,9 @@
+---
+greeting: Hello from module A
+---
+
+@define greet_with_fm():
+{greeting}
+@end
+
+@export greet_with_fm

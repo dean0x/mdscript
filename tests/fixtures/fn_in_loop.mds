@@ -1,0 +1,11 @@
+---
+names: [Alice, Bob, Charlie]
+---
+
+@define greet(person):
+Hello {person}!
+@end
+
+@for item in names:
+{greet(item)}
+@end

@@ -1,0 +1,11 @@
+---
+name: outer
+---
+
+@define greet(name):
+Hello {name}!
+@end
+
+Before: {name}
+{greet("inner")}
+After: {name}

@@ -1,0 +1,3 @@
+@import "./fm_var_provider.mds" as provider
+
+{provider.greet_with_fm()}
