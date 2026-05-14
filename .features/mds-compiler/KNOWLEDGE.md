@@ -180,12 +180,17 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 
 **Project root detection**: `find_project_root` walks up from the entry file's directory looking for `.git` or `.mdsroot` markers. The found root is stored in `ModuleCache::root_dir` on first resolve. All subsequently resolved paths must `starts_with(root_dir)` — this is the path traversal boundary.
 
-**Security guards** (checked in order, before reading the file):
-1. Symlink detection — rejects imports where the final path component is a symlink; detects via two-step canonicalize: `canonical_parent.join(raw_filename)` vs `full_canonicalize()`; if they differ, returns `ImportError`
-2. `validate_import_path` — rejects non-relative paths and null bytes
-3. `root_dir` check — rejects paths that escape the project directory
-4. `MAX_IMPORT_DEPTH = 64` — rejects chains deeper than 64 levels
-5. `MAX_FILE_SIZE = 10MB` — rejects files over 10MB
+**Security guards** — split across two methods to separate the "check" phase (runs always, even on cache hits) from the "read" phase (cache misses only):
+
+`canonicalize_and_check` (always):
+1. `validate_import_path` — rejects non-relative paths and null bytes (called by `resolve_import` before `resolve()`)
+2. Symlink detection — rejects imports where the final path component is a symlink; detects via two-step canonicalize: `canonical_parent.join(raw_filename)` vs `full_canonicalize()`; if they differ, returns `ImportError`
+3. `root_dir` initialization — set on first resolve by walking up to `.git`/`.mdsroot` from the entry file's directory
+4. `MAX_IMPORT_DEPTH = 64` — rejects chains deeper than 64 levels; checked via `resolving.len()`
+5. Path-traversal prevention — resolved canonical path must `starts_with(root_dir)`
+
+`read_validated_file` (cache misses only):
+6. `MAX_FILE_SIZE = 10MB` — checked after reading bytes (avoids TOCTOU race with metadata-then-read pattern); rejects files over 10MB
 
 **Cycle detection** uses `IndexSet<PathBuf>` (`indexmap` crate) — this single data structure replaces the previous `HashSet<PathBuf> + Vec<PathBuf>` pair (`resolving` + `resolving_stack`). `IndexSet` provides O(1) membership test (like `HashSet`) plus insertion-ordered iteration (like `Vec`), so it serves both purposes. `shift_remove` preserves insertion order of remaining elements when unmarking.
 
@@ -195,14 +200,15 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 - `build_scope_from_frontmatter(frontmatter, is_md, runtime_vars)` — free function; parses YAML, populates scope, applies runtime var overrides; skips `type` key for `.md` files
 - `collect_definitions_and_imports(body, scope, ctx, warnings)` — `ModuleCache` method; walks AST to register `@define` functions with closure capture, process `@import` and `@export` directives; returns `CollectedDefs`
 - `validate_exports(explicit_exports, functions)` — free function; checks every named export refers to a defined function or `"prompt"`
-- `validate_and_read_file(path)` — `ModuleCache` method; performs all security checks and reads file content
+- `canonicalize_and_check(path)` — `ModuleCache` method; performs all security checks WITHOUT reading the file: symlink detection, `root_dir` initialization (first call only), `MAX_IMPORT_DEPTH` guard, path-traversal prevention; called on every resolve including cache hits, so cache hits pay only the cost of two `canonicalize` syscalls and no I/O
+- `read_validated_file(canonical)` — `ModuleCache` method (free function taking `&Path`); reads the file as bytes then checks size against `MAX_FILE_SIZE` — reading first avoids a TOCTOU race between a separate metadata call and the actual read; called only on cache misses
 - `attach_import_span(err, path, file_str, source, offset)` — free function; re-annotates `FileNotFound` and `CircularImport` errors (with no existing span) from recursive `resolve()` calls to point to the `@import` directive in the parent file; all other error variants are returned unchanged, preserving their own source locations so cascading errors (e.g. a circular import discovered inside the imported file) still report their correct origin
 
 `process_module` itself is now a ~25-line orchestrator that calls these helpers in sequence.
 
 **`ModuleCtx` struct** bundles the borrowed per-module context threaded through AST walk helpers (`file_str`, `source`, `base_dir`, `runtime_vars`), reducing parameter lists.
 
-**`CollectedDefs` type alias**: `type CollectedDefs = (HashMap<String, Arc<FunctionDef>>, bool, HashSet<String>)` — the return type of `collect_definitions_and_imports`.
+**`CollectedDefs` struct**: A named struct (not a type alias) returned by `collect_definitions_and_imports`. Fields: `functions: HashMap<String, Arc<FunctionDef>>`, `has_explicit_exports: bool`, `explicit_exports: HashSet<String>`. Destructured with named field syntax in `process_module` (`let CollectedDefs { functions, has_explicit_exports, explicit_exports } = ...`). Named fields improve readability over the previous tuple alias.
 
 **`Arc<ResolvedModule>`**: `ModuleCache::modules` stores `Arc<ResolvedModule>`. Both `resolve()` and `resolve_source()` return `Arc<ResolvedModule>`. Cache hits clone the `Arc` (O(1)); misses wrap the new `ResolvedModule` in `Arc::new(resolved)` then insert and return a clone.
 
@@ -249,7 +255,7 @@ pub(crate) struct EvalContext<'a> {
 
 `evaluate()` allocates an `EvalContext` and passes `&mut ctx` to `evaluate_nodes`. All internal functions that previously took `call_stack`, `total_iterations`, and `warnings` as separate parameters now take `ctx: &mut EvalContext`. The `warnings` field in `EvalContext` is the same `&mut Vec<String>` passed by the public `evaluate()` entry point — not a copy.
 
-`call_stack` is now `Vec<String>` (not `HashSet<String>`). Recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` — O(n) scan at MAX_CALL_DEPTH=128, which is acceptable. The LIFO property is verified with `debug_assert!` after each call returns.
+`call_stack` is now `Vec<String>` (not `HashSet<String>`). Recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` — O(n) scan at MAX_CALL_DEPTH=128, which is acceptable. The LIFO property is verified with `assert!` (not `debug_assert!`) after each call returns — this assertion is safety-critical and runs in release mode; a mismatched pop would silently corrupt recursion state, so the cost (negligible at MAX_CALL_DEPTH = 128) is justified.
 
 Five resource limits guard against runaway compilation:
 - `MAX_CALL_DEPTH = 128` — prevents stack overflow from deeply nested function calls
@@ -262,7 +268,7 @@ All limits return `MdsError::ResourceLimit` (no source span). If you add a warni
 
 **`Node::Define` in the evaluator**: The evaluator's `Node::Define` arm is a deliberate no-op — the implementation contains only `// Handled by resolver with full lexical capture`. All function registration (including closure capture into `captured.namespaces`, `captured.functions`, `captured.vars`) happens in the resolver's pre-evaluation AST walk. The evaluator skips `@define` nodes entirely, relying on the scope the resolver built. The resolver's pre-evaluation pass is therefore load-bearing for all function calls, including cross-module ones.
 
-`invoke_function` restores the function's captured closure scope from `func.captured` before binding parameters, so params shadow captured vars correctly. It accesses `func.captured.namespaces`, `func.captured.functions` (wrapped in `Arc::new(f.clone())` for scope insertion), and `func.captured.vars`. After evaluation the pushed frame is popped.
+`invoke_function` restores the function's captured closure scope from `func.captured` before binding parameters, so params shadow captured vars correctly. It accesses `func.captured.namespaces`, `func.captured.functions` (wrapped in `Arc::new(f.clone())` for scope insertion), and `func.captured.vars`. After evaluation the pushed frame is popped using the double-fault error-preservation pattern: on a render error, the render error is returned immediately (pop error discarded); on render success + pop error, the pop error is returned; on both success, the rendered string is returned. This matches the same pattern used in `evaluate_for`.
 
 **`resolve_args` signature**: `resolve_args(args: &[Arg], scope: &mut Scope, ctx: &mut EvalContext, depth: usize) -> Result<Vec<Value>, MdsError>`. The `ctx` parameter carries `call_stack` and `warnings` so `Arg::Call` can invoke `call_function` during argument resolution. `depth` tracks argument expression nesting and is checked against `MAX_CALL_DEPTH` to prevent unbounded recursion through argument nesting alone.
 
@@ -482,7 +488,7 @@ Key behaviors:
 - **`compile_file` takes no runtime vars** — `compile_file(path)` calls `compile(Path::new(path), None)`. If runtime vars are needed, call `compile` directly.
 - **Closure capture is eager and shallow** — `get_all_vars()` / `get_all_functions()` / `get_all_namespaces()` snapshot the scope at definition time. Functions defined after the closure capture are not visible to the captured function.
 - **`get_all_functions()` returns `Arc<FunctionDef>`; captured.functions stores owned `FunctionDef`** — the resolver converts `Arc<FunctionDef>` → owned `FunctionDef` when populating captures (via `(*v).clone()`). `invoke_function` then wraps each captured function back in `Arc::new(f.clone())` when restoring closure scope. This round-trip is intentional to break reference cycles.
-- **`call_stack` is `Vec`, not `HashSet`** — recursion detection in the evaluator now uses `ctx.call_stack.iter().any(|s| s == call_key)` (O(n) scan). At `MAX_CALL_DEPTH = 128`, this is negligible. The Vec is also the stack that `invoke_function` pushes to and pops from; a `debug_assert!` verifies the LIFO invariant after each return.
+- **`call_stack` is `Vec`, not `HashSet`** — recursion detection in the evaluator uses `ctx.call_stack.iter().any(|s| s == call_key)` (O(n) scan). At `MAX_CALL_DEPTH = 128`, this is negligible. The Vec is also the stack that `invoke_function` pushes to and pops from; an `assert!` (not `debug_assert!`) verifies the LIFO invariant after each return — this runs in release mode because a mismatched pop would silently corrupt recursion state and allow stack overflows.
 - **`IndexSet` replaces two resolver fields** — if you need to check "is this path currently being resolved?", use `self.resolving.contains(&canonical)`. If you need to reconstruct the cycle path, use `self.resolving.iter()` to get an ordered sequence. There is no separate `resolving_stack` field.
 - **`compile_str` / `resolve_source` uses a virtual path `<source>`** — in-memory sources cannot be canonicalized. Repeated calls to `compile_str` re-parse every time; there is no caching for in-memory sources.
 - **Project root is set on first resolve** — `root_dir` is set lazily. If `resolve_source` is called first, `root_dir` is set to the _canonicalized_ `base_dir` — if the directory cannot be resolved, `resolve_source` returns `Err` immediately.
@@ -506,7 +512,7 @@ Key behaviors:
 - `src/ast.rs` — all AST types including `Arg::Call` for nested function call arguments; the contract between parser and everything downstream
 - `src/lexer.rs` — `Lexer<'a>` struct with `scan_*` methods; public API is `tokenize(source, file)` only
 - `src/parser.rs` — converts token stream to `Module` AST; `enter_block()` helper, `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion, identifier validation, duplicate param detection
-- `src/resolver.rs` — orchestrator: `ModuleCache` with `Arc<ResolvedModule>` cache, `IndexSet<PathBuf>` for cycle detection; `process_module` delegates to `build_scope_from_frontmatter`, `collect_definitions_and_imports`, `validate_exports`, `validate_and_read_file`; `ModuleCtx` and `CollectedDefs` type alias; `to_namespace()` now respects export visibility for `prompt_body`
+- `src/resolver.rs` — orchestrator: `ModuleCache` with `Arc<ResolvedModule>` cache, `IndexSet<PathBuf>` for cycle detection; `process_module` delegates to `build_scope_from_frontmatter`, `collect_definitions_and_imports`, `validate_exports`; security checks split into `canonicalize_and_check` (runs always, no I/O) and `read_validated_file` (cache misses only); `ModuleCtx` struct and `CollectedDefs` struct (named fields, not type alias); `to_namespace()` respects export visibility for `prompt_body`
 - `src/evaluator.rs` — AST walker; `EvalContext<'a>` bundles `call_stack: Vec<String>`, `total_iterations`, `warnings`; `resolve_args` takes `ctx: &mut EvalContext`; `evaluate_include` pushes to `ctx.warnings`
 - `src/validator.rs` — pre-evaluation semantic checks; `validate_var_args` recursively validates nested `Arg::Call` arguments; `@define` params injected as `Value::Array(vec![])` so param-as-iterable passes type check
 - `src/scope.rs` — `CapturedScope` struct bundling three closure capture maps; `FunctionDef.captured: CapturedScope`; `Frame::functions` and `NamespaceScope::functions` store `Arc<FunctionDef>`; `set_function` takes `Arc<FunctionDef>`; `get_function` returns `Option<&Arc<FunctionDef>>`

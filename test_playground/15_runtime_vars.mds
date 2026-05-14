@@ -1,0 +1,10 @@
+---
+name: default_name
+role: default_role
+---
+
+Hello {name}! Your role is {role}.
+
+@for item in items:
+- {item}
+@end
