@@ -154,7 +154,6 @@ fn resolve_args(
 /// Used for double-fault scenarios (render error AND an internal pop/LIFO error):
 /// the render error carries the actionable source-span diagnostic for the user,
 /// while pop/LIFO failures are compiler bugs that surface as secondary errors.
-#[inline]
 fn prefer_first_error<T>(first: Result<T, MdsError>, second: Result<(), MdsError>) -> Result<T, MdsError> {
     match (first, second) {
         (Err(first_err), _) => Err(first_err),
@@ -207,7 +206,7 @@ fn invoke_function(
     // stack overflows. Return a structured error rather than panicking so
     // callers get a proper diagnostic instead of an opaque abort.
     let popped = ctx.call_stack.pop();
-    let lifo_result: Result<(), MdsError> = if popped.as_deref() == Some(call_key) {
+    let lifo_result = if popped.as_deref() == Some(call_key) {
         Ok(())
     } else {
         Err(MdsError::syntax(format!(
