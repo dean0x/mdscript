@@ -48,6 +48,18 @@ fn load_config(
     for _ in 0..256 {
         let candidate = current.join("mds.json");
         if candidate.is_file() {
+            // Guard against maliciously large mds.json files (1 MB cap).
+            const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
+            let file_size = std::fs::metadata(&candidate)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if file_size > MAX_CONFIG_SIZE {
+                return Err(miette::miette!(
+                    "mds.json at {} is too large ({} bytes; maximum is 1 MB)",
+                    candidate.display(),
+                    file_size
+                ));
+            }
             let raw = std::fs::read_to_string(&candidate).map_err(|e| {
                 miette::miette!(
                     "cannot read {}: {e}",
@@ -133,6 +145,18 @@ fn resolve_output_path(
     // 5. `mds.json` output_dir
     if let Some((cfg, config_dir)) = config {
         if let Some(ref output_dir) = cfg.build.output_dir {
+            // Reject path traversal: `output_dir` must not contain `..` components.
+            // We check raw path components rather than canonicalizing because the
+            // directory may not exist yet (it gets created by create_dir_all below).
+            let traversal = Path::new(output_dir)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir);
+            if traversal {
+                return Err(miette::miette!(
+                    "mds.json output_dir '{}' must not contain '..' components",
+                    output_dir
+                ));
+            }
             let dir = config_dir.join(output_dir);
             let filename = input_path
                 .map(derive_output_filename)

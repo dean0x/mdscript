@@ -57,7 +57,7 @@ impl Value {
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             serde_yml::Value::Mapping(_) => {
-                Err(MdsError::yaml_error("object/map types are not supported"))
+                Err(MdsError::yaml_error("object/map types are not supported in MDS v0.1"))
             }
             serde_yml::Value::Tagged(t) => Self::from_yaml_inner(t.value, depth + 1),
         }
@@ -89,7 +89,7 @@ impl Value {
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::Array),
             serde_json::Value::Object(_) => {
-                Err(MdsError::json_error("object/map types are not supported"))
+                Err(MdsError::json_error("object/map types are not supported in MDS v0.1"))
             }
         }
     }

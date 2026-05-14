@@ -63,15 +63,17 @@ impl ModuleCache {
         Self::default()
     }
 
-    /// Validate the path, read the file, and return `(source, canonical_path, is_md)`.
+    /// Canonicalize `path` and run all security checks, returning `(canonical, is_md)`.
     ///
-    /// Performs all security checks (symlink, depth, root_dir, size) and reads
-    /// the file content. `&mut self` is required to initialise `self.root_dir` on
-    /// the first call and to check `self.resolving`.
-    fn validate_and_read_file(
+    /// This is the first half of the old `validate_and_read_file`.  It performs every
+    /// check that does NOT require reading the file — symlink detection, root_dir
+    /// initialisation, import-depth guard, and path-traversal prevention.  The caller
+    /// must check the cache before calling `read_validated_file`; that way cache hits
+    /// pay only the cost of two `canonicalize` syscalls and no I/O.
+    fn canonicalize_and_check(
         &mut self,
         path: &Path,
-    ) -> Result<(String, PathBuf, bool), MdsError> {
+    ) -> Result<(PathBuf, bool), MdsError> {
         // Detect symlinks without a TOCTOU window by comparing the canonical path to
         // the path constructed from (canonical parent dir) + (original filename).
         //
@@ -132,9 +134,18 @@ impl ModuleCache {
             }
         }
 
+        let is_md = canonical.extension().and_then(|e| e.to_str()) == Some("md");
+        Ok((canonical, is_md))
+    }
+
+    /// Read and decode the file at `canonical` (already security-checked).
+    ///
+    /// This is the second half of the old `validate_and_read_file`.  It is called only
+    /// on cache misses, so the expensive I/O never runs for files that are already cached.
+    fn read_validated_file(canonical: &Path) -> Result<String, MdsError> {
         // Read the file as bytes first, then check size (avoids TOCTOU race between
         // a separate metadata call and the actual read).
-        let bytes = std::fs::read(&canonical)
+        let bytes = std::fs::read(canonical)
             .map_err(|e| MdsError::io(format!("cannot read {}: {e}", canonical.display())))?;
         if bytes.len() as u64 > MAX_FILE_SIZE {
             return Err(MdsError::resource_limit(format!(
@@ -144,12 +155,9 @@ impl ModuleCache {
                 canonical.display()
             )));
         }
-        let source = String::from_utf8(bytes).map_err(|e| {
+        String::from_utf8(bytes).map_err(|e| {
             MdsError::io(format!("invalid UTF-8 in {}: {e}", canonical.display()))
-        })?;
-
-        let is_md = canonical.extension().and_then(|e| e.to_str()) == Some("md");
-        Ok((source, canonical, is_md))
+        })
     }
 
     /// Resolve a module from file path. Handles caching and cycle detection.
@@ -159,18 +167,22 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        let (source, canonical, is_md) = self.validate_and_read_file(path)?;
+        // Step 1: canonicalize + security checks (no file read yet).
+        let (canonical, is_md) = self.canonicalize_and_check(path)?;
 
-        // Check cache (after canonicalization, before cycle/depth checks that need &mut self)
+        // Step 2: cache hit — return immediately without reading the file.
         if let Some(cached) = self.modules.get(&canonical) {
             return Ok(Arc::clone(cached));
         }
 
-        // Check for circular imports
+        // Step 3: cycle detection — must happen before we push to `resolving`.
         if self.resolving.contains(&canonical) {
             let cycle = build_cycle_string(&self.resolving, &canonical);
             return Err(MdsError::circular_import(cycle));
         }
+
+        // Step 4: read the file only on a cache miss.
+        let source = Self::read_validated_file(&canonical)?;
 
         // Validate file type (uses already-read source for .md frontmatter check)
         validate_file_type(&canonical, &source)?;
@@ -186,9 +198,10 @@ impl ModuleCache {
         let resolved =
             self.process_module(&source, &file_str, &base_dir, is_md, runtime_vars, warnings);
 
-        // Unmark regardless of success or failure.
-        // shift_remove preserves insertion order of remaining elements.
-        self.resolving.shift_remove(&canonical);
+        // Unmark regardless of success or failure. resolve/unmark is strictly LIFO
+        // (we always remove the last element we inserted), so pop() is O(1).
+        let popped = self.resolving.pop();
+        debug_assert_eq!(popped.as_ref(), Some(&canonical), "resolving unmark must be LIFO");
 
         let resolved = resolved?;
 
@@ -244,7 +257,7 @@ impl ModuleCache {
 
         // Walk the AST: collect @define functions (with closure capture), process imports/exports
         let ctx = ModuleCtx { file_str, source, base_dir, runtime_vars };
-        let (functions, has_explicit_exports, explicit_exports) = self
+        let CollectedDefs { functions, has_explicit_exports, explicit_exports } = self
             .collect_definitions_and_imports(&module.body, &mut scope, &ctx, warnings)?;
 
         // Validate that all named exports refer to defined functions or "prompt"
@@ -268,7 +281,7 @@ impl ModuleCache {
     /// Walk the AST body and collect `@define` functions (with closure capture),
     /// process `@import` directives, and record `@export` / `@export...from` entries.
     ///
-    /// Returns `(functions, has_explicit_exports, explicit_exports)`.
+    /// Returns a `CollectedDefs` struct with self-documenting field names.
     fn collect_definitions_and_imports(
         &mut self,
         body: &[Node],
@@ -361,7 +374,7 @@ impl ModuleCache {
             }
         }
 
-        Ok((functions, has_explicit_exports, explicit_exports))
+        Ok(CollectedDefs { functions, has_explicit_exports, explicit_exports })
     }
 
     fn resolve_import(
@@ -509,10 +522,15 @@ impl ResolvedModule {
 }
 
 /// Collected output of the AST definition/import walk in `collect_definitions_and_imports`.
-type CollectedDefs = (HashMap<String, Arc<FunctionDef>>, bool, HashSet<String>);
+struct CollectedDefs {
+    functions: HashMap<String, Arc<FunctionDef>>,
+    has_explicit_exports: bool,
+    explicit_exports: HashSet<String>,
+}
 
 /// Bundle of borrowed per-module context threaded through the AST walk helpers.
 struct ModuleCtx<'a> {
+    /// Canonical display path of the source file (e.g. the path shown in error messages).
     file_str: &'a str,
     source: &'a str,
     base_dir: &'a Path,
