@@ -188,11 +188,15 @@ fn invoke_function(
     }
     ctx.call_stack.push(call_key.to_string());
     let result = evaluate_nodes(&func.body, scope, ctx);
-    debug_assert!(
-        ctx.call_stack.last().is_some_and(|s| s == call_key),
-        "call_stack LIFO invariant violated: expected '{call_key}' on top"
+    // Safety-critical LIFO invariant: call_stack tracks recursion detection.
+    // A mismatched pop would silently corrupt recursion state and allow
+    // stack overflows. Enforce in release mode — cost is negligible at
+    // MAX_CALL_DEPTH = 128.
+    let popped = ctx.call_stack.pop();
+    assert!(
+        popped.as_deref() == Some(call_key),
+        "call_stack LIFO invariant violated: expected '{call_key}' on top, got {popped:?}"
     );
-    ctx.call_stack.pop();
     scope.pop()?;
     result
 }
@@ -285,8 +289,15 @@ fn evaluate_for(
         scope.push();
         scope.set_var(&block.var, item);
         let rendered = evaluate_nodes(&block.body, scope, ctx);
-        scope.pop()?;
-        output.push_str(&rendered?);
+        let pop_result = scope.pop();
+        // On double-fault (render error AND pop error), preserve the render
+        // error — pop failures are compiler bugs, but the render error carries
+        // the actionable source-span diagnostic for the user.
+        match (rendered, pop_result) {
+            (Err(render_err), _) => return Err(render_err),
+            (Ok(_), Err(pop_err)) => return Err(pop_err),
+            (Ok(s), Ok(())) => output.push_str(&s),
+        }
     }
 
     Ok(output)

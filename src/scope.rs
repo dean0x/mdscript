@@ -96,8 +96,10 @@ impl Scope {
 
     /// Set a variable in the current (innermost) frame.
     ///
-    /// `Scope::new()` always pushes a frame and `pop()` refuses to remove the last one,
-    /// so `last_mut()` is always `Some`.
+    /// The `expect` here is sound: `Scope::new()` always pushes one frame (the global
+    /// frame) and `pop()` refuses to remove the last remaining frame, so `frames` is
+    /// never empty. Converting to `Result` would add unwrap noise at every call site
+    /// for an invariant that is structurally guaranteed by private fields.
     pub fn set_var(&mut self, name: &str, value: Value) {
         self.frames
             .last_mut()
