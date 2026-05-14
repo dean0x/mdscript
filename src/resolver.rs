@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use indexmap::IndexSet;
 
-use crate::ast::{ExportDirective, ImportDirective, Node};
+use crate::ast::{DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::lexer::tokenize;
@@ -200,8 +200,11 @@ impl ModuleCache {
 
         // Unmark regardless of success or failure. resolve/unmark is strictly LIFO
         // (we always remove the last element we inserted), so pop() is O(1).
+        // Safety-critical LIFO invariant: a mismatched pop would silently corrupt
+        // cycle-detection state and allow unbounded recursion. Enforce in release
+        // mode — cost is negligible at MAX_IMPORT_DEPTH = 64.
         let popped = self.resolving.pop();
-        debug_assert_eq!(popped.as_ref(), Some(&canonical), "resolving unmark must be LIFO");
+        assert_eq!(popped.as_ref(), Some(&canonical), "resolving unmark must be LIFO");
 
         let resolved = resolved?;
 
@@ -289,92 +292,74 @@ impl ModuleCache {
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<CollectedDefs, MdsError> {
-        let mut functions: HashMap<String, Arc<FunctionDef>> = HashMap::new();
-        let mut has_explicit_exports = false;
-        let mut explicit_exports: HashSet<String> = HashSet::new();
+        let mut defs = CollectedDefs {
+            functions: HashMap::new(),
+            has_explicit_exports: false,
+            explicit_exports: HashSet::new(),
+        };
 
         for node in body {
             match node {
-                Node::Define(def) => {
-                    if functions.contains_key(&def.name) {
-                        return Err(MdsError::name_collision_at(
-                            &def.name,
-                            ctx.file_str,
-                            ctx.source,
-                            def.offset,
-                            def.name.len(),
-                        ));
-                    }
-                    let mut func = FunctionDef::from(def);
-                    // Capture definition-site scope for lexical closure semantics so the
-                    // function body can resolve alias imports, sibling functions, and
-                    // frontmatter variables from its defining module even when called from
-                    // a different module.
-                    func.captured.namespaces = scope.get_all_namespaces();
-                    // Convert Arc<FunctionDef> → owned FunctionDef for captured.functions.
-                    // Owned captures break potential reference cycles (A captures B captures A).
-                    func.captured.functions = scope
-                        .get_all_functions()
-                        .into_iter()
-                        .map(|(k, v)| (k, (*v).clone()))
-                        .collect();
-                    func.captured.vars = scope.get_all_vars();
-                    // Wrap in Arc for cheap storage and O(1) scope insertion.
-                    let arc = Arc::new(func);
-                    functions.insert(def.name.clone(), Arc::clone(&arc));
-                    scope.set_function(&def.name, arc);
-                }
-                Node::Import(import) => {
-                    self.resolve_import(import, scope, ctx, warnings)?;
-                }
-                Node::Export(export) => {
-                    has_explicit_exports = true;
-                    match export {
-                        ExportDirective::Named { name } => {
-                            explicit_exports.insert(name.clone());
-                        }
-                        ExportDirective::ReExport {
-                            name,
-                            path: import_path,
-                        } => {
-                            // Resolve the source module and bring in the function for
-                            // re-export only. Per spec: "@export from does not bring the
-                            // symbol into the current file's scope".
-                            validate_import_path(import_path)?;
-                            let resolved_path = resolve_path(ctx.base_dir, import_path);
-                            let source_module =
-                                self.resolve(&resolved_path, ctx.runtime_vars, warnings)?;
-                            let func =
-                                source_module.get_export(name).ok_or_else(|| {
-                                    MdsError::export_error(format!(
-                                        "cannot re-export '{name}': not exported from \"{import_path}\""
-                                    ))
-                                })?;
-                            functions.insert(name.clone(), func);
-                            explicit_exports.insert(name.clone());
-                        }
-                        ExportDirective::Wildcard { path: import_path } => {
-                            // Re-export all exports from the target module. These are
-                            // available to importers but NOT in the current file's scope.
-                            validate_import_path(import_path)?;
-                            let resolved_path = resolve_path(ctx.base_dir, import_path);
-                            let source_module =
-                                self.resolve(&resolved_path, ctx.runtime_vars, warnings)?;
-                            for (name, func) in source_module.get_all_exports() {
-                                if functions.contains_key(&name) {
-                                    return Err(MdsError::name_collision(name));
-                                }
-                                functions.insert(name.clone(), func);
-                                explicit_exports.insert(name);
-                            }
-                        }
-                    }
-                }
+                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
+                Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
+                Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 _ => {}
             }
         }
 
-        Ok(CollectedDefs { functions, has_explicit_exports, explicit_exports })
+        Ok(defs)
+    }
+
+    /// Process a single `@export` directive, updating `defs` in place.
+    ///
+    /// Handles the three export forms: named (`@export foo`), re-export
+    /// (`@export foo from "./bar"`), and wildcard (`@export * from "./bar"`).
+    fn collect_export(
+        &mut self,
+        export: &ExportDirective,
+        defs: &mut CollectedDefs,
+        ctx: &ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), MdsError> {
+        defs.has_explicit_exports = true;
+        match export {
+            ExportDirective::Named { name } => {
+                defs.explicit_exports.insert(name.clone());
+            }
+            ExportDirective::ReExport {
+                name,
+                path: import_path,
+            } => {
+                // Resolve the source module and bring in the function for
+                // re-export only. Per spec: "@export from does not bring the
+                // symbol into the current file's scope".
+                validate_import_path(import_path)?;
+                let resolved_path = resolve_path(ctx.base_dir, import_path);
+                let source_module = self.resolve(&resolved_path, ctx.runtime_vars, warnings)?;
+                let func = source_module.get_export(name).ok_or_else(|| {
+                    MdsError::export_error(format!(
+                        "cannot re-export '{name}': not exported from \"{import_path}\""
+                    ))
+                })?;
+                defs.functions.insert(name.clone(), func);
+                defs.explicit_exports.insert(name.clone());
+            }
+            ExportDirective::Wildcard { path: import_path } => {
+                // Re-export all exports from the target module. These are
+                // available to importers but NOT in the current file's scope.
+                validate_import_path(import_path)?;
+                let resolved_path = resolve_path(ctx.base_dir, import_path);
+                let source_module = self.resolve(&resolved_path, ctx.runtime_vars, warnings)?;
+                for (name, func) in source_module.get_all_exports() {
+                    if defs.functions.contains_key(&name) {
+                        return Err(MdsError::name_collision(name));
+                    }
+                    defs.functions.insert(name.clone(), func);
+                    defs.explicit_exports.insert(name);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn resolve_import(
@@ -461,11 +446,19 @@ impl ModuleCache {
 }
 
 impl ResolvedModule {
+    /// Return `true` if `name` is an available export of this module.
+    ///
+    /// When no explicit `@export` list is present every name is visible.
+    /// When an explicit list exists only the listed names are visible.
+    fn is_exported(&self, name: &str) -> bool {
+        !self.has_explicit_exports || self.explicit_exports.contains(name)
+    }
+
     /// Get a single export by name.
     ///
     /// Returns `Arc<FunctionDef>` — cloning is O(1).
     pub fn get_export(&self, name: &str) -> Option<Arc<FunctionDef>> {
-        if self.has_explicit_exports && !self.explicit_exports.contains(name) {
+        if !self.is_exported(name) {
             return None;
         }
         self.functions.get(name).cloned()
@@ -477,16 +470,14 @@ impl ResolvedModule {
     pub fn get_all_exports(&self) -> Vec<(String, Arc<FunctionDef>)> {
         self.functions
             .iter()
-            .filter(|(name, _)| !self.has_explicit_exports || self.explicit_exports.contains(*name))
+            .filter(|(name, _)| self.is_exported(name))
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect()
     }
 
     /// Get the prompt body as a Value, if it is an available export.
     pub fn get_prompt_value(&self) -> Option<Value> {
-        let prompt_is_exported =
-            !self.has_explicit_exports || self.explicit_exports.contains("prompt");
-        if prompt_is_exported {
+        if self.is_exported("prompt") {
             self.prompt_body.clone().map(Value::String)
         } else {
             None
@@ -500,16 +491,12 @@ impl ResolvedModule {
         let functions = self
             .functions
             .iter()
-            .filter(|(name, _)| {
-                !self.has_explicit_exports || self.explicit_exports.contains(*name)
-            })
+            .filter(|(name, _)| self.is_exported(name))
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect();
         // Respect export visibility: prompt_body is only included in the namespace
         // when "prompt" is an available export (same rule as get_prompt_value).
-        let prompt_is_exported =
-            !self.has_explicit_exports || self.explicit_exports.contains("prompt");
-        let prompt_body = if prompt_is_exported {
+        let prompt_body = if self.is_exported("prompt") {
             self.prompt_body.clone()
         } else {
             None
@@ -535,6 +522,44 @@ struct ModuleCtx<'a> {
     source: &'a str,
     base_dir: &'a Path,
     runtime_vars: &'a HashMap<String, Value>,
+}
+
+/// Process a single `@define` directive, updating `defs` and `scope` in place.
+///
+/// Captures the definition-site scope for lexical closure semantics so the
+/// function body can resolve alias imports, sibling functions, and frontmatter
+/// variables from its defining module even when called from a different module.
+fn collect_define(
+    def: &DefineBlock,
+    defs: &mut CollectedDefs,
+    scope: &mut Scope,
+    ctx: &ModuleCtx<'_>,
+) -> Result<(), MdsError> {
+    if defs.functions.contains_key(&def.name) {
+        return Err(MdsError::name_collision_at(
+            &def.name,
+            ctx.file_str,
+            ctx.source,
+            def.offset,
+            def.name.len(),
+        ));
+    }
+    let mut func = FunctionDef::from(def);
+    // Capture definition-site scope for lexical closure semantics.
+    func.captured.namespaces = scope.get_all_namespaces();
+    // Convert Arc<FunctionDef> → owned FunctionDef for captured.functions.
+    // Owned captures break potential reference cycles (A captures B captures A).
+    func.captured.functions = scope
+        .get_all_functions()
+        .into_iter()
+        .map(|(k, v)| (k, (*v).clone()))
+        .collect();
+    func.captured.vars = scope.get_all_vars();
+    // Wrap in Arc for cheap storage and O(1) scope insertion.
+    let arc = Arc::new(func);
+    defs.functions.insert(def.name.clone(), Arc::clone(&arc));
+    scope.set_function(&def.name, arc);
+    Ok(())
 }
 
 /// Build a scope from optional frontmatter and runtime variable overrides.
