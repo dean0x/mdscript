@@ -51,22 +51,20 @@ fn load_config(
     for _ in 0..256 {
         let candidate = current.join("mds.json");
         if candidate.is_file() {
-            // Guard against maliciously large mds.json files.
-            let file_size = std::fs::metadata(&candidate)
-                .map(|m| m.len())
-                .unwrap_or(0);
-            if file_size > MAX_CONFIG_SIZE {
+            // Read the file first, then check size — avoids a TOCTOU race between
+            // a separate metadata() call and the actual read().
+            let bytes = std::fs::read(&candidate).map_err(|e| {
+                miette::miette!("cannot read {}: {e}", candidate.display())
+            })?;
+            if bytes.len() as u64 > MAX_CONFIG_SIZE {
                 return Err(miette::miette!(
                     "mds.json at {} is too large ({} bytes; maximum is 1 MB)",
                     candidate.display(),
-                    file_size
+                    bytes.len()
                 ));
             }
-            let raw = std::fs::read_to_string(&candidate).map_err(|e| {
-                miette::miette!(
-                    "cannot read {}: {e}",
-                    candidate.display()
-                )
+            let raw = String::from_utf8(bytes).map_err(|e| {
+                miette::miette!("invalid UTF-8 in {}: {e}", candidate.display())
             })?;
             let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
                 miette::miette!(
@@ -221,7 +219,7 @@ fn auto_detect_mds_file() -> std::result::Result<PathBuf, miette::Error> {
                 "multiple .mds files found: {}\n  \
                  hint: specify which file to compile, e.g. 'mds build {}'",
                 names.join(", "),
-                names[0],
+                names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
             ))
         }
     }

@@ -201,12 +201,24 @@ impl ModuleCache {
         // Unmark regardless of success or failure. resolve/unmark is strictly LIFO
         // (we always remove the last element we inserted), so pop() is O(1).
         // Safety-critical LIFO invariant: a mismatched pop would silently corrupt
-        // cycle-detection state and allow unbounded recursion. Enforce in release
-        // mode — cost is negligible at MAX_IMPORT_DEPTH = 64.
+        // cycle-detection state and allow unbounded recursion. Return an error
+        // rather than panicking — prefer the user-facing module error if both fail.
         let popped = self.resolving.pop();
-        assert_eq!(popped.as_ref(), Some(&canonical), "resolving unmark must be LIFO");
+        let lifo_check = if popped.as_ref() != Some(&canonical) {
+            Err(MdsError::syntax(
+                "internal error: resolving stack LIFO invariant violated — this is a compiler bug, please report it",
+            ))
+        } else {
+            Ok(())
+        };
 
-        let resolved = resolved?;
+        // Prefer the module processing error over the LIFO invariant violation
+        // so the user sees the root cause rather than an internal compiler message.
+        let resolved = match (resolved, lifo_check) {
+            (Ok(r), Ok(())) => r,
+            (Err(e), _) => return Err(e),
+            (Ok(_), Err(e)) => return Err(e),
+        };
 
         // Wrap in Arc, store in cache, and return a clone of the Arc (O(1)).
         let arc = Arc::new(resolved);
