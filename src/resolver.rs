@@ -18,7 +18,7 @@ use crate::value::Value;
 /// Falls back to the given directory if no marker is found.
 fn find_project_root(start: &Path) -> PathBuf {
     let mut dir = start.to_path_buf();
-    for _ in 0..256 {
+    for _ in 0..MAX_TRAVERSAL_DEPTH {
         for marker in [".git", ".mdsroot"] {
             if dir.join(marker).exists() {
                 return dir;
@@ -42,6 +42,9 @@ pub struct ResolvedModule {
 
 /// Maximum import depth to prevent stack overflow from deeply chained imports.
 const MAX_IMPORT_DEPTH: usize = 64;
+
+/// Maximum directory traversal depth when searching for project root markers.
+const MAX_TRAVERSAL_DEPTH: usize = 256;
 
 /// Maximum file size (10 MB) to prevent runaway memory use.
 pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;

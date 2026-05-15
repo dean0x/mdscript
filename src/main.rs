@@ -25,6 +25,9 @@ struct BuildConfig {
 /// Maximum allowed size for `mds.json` (1 MB) to prevent runaway memory use.
 const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
+/// Maximum directory traversal depth when searching for `mds.json`.
+const MAX_TRAVERSAL_DEPTH: usize = 256;
+
 /// Walk up from `start` looking for `mds.json`.
 ///
 /// Returns `Ok(Some((config, config_dir)))` when found, `Ok(None)` when no
@@ -47,8 +50,8 @@ fn load_config(
     };
 
     let mut current = start_dir;
-    // 256-iteration cap prevents unbounded traversal on unusual filesystems.
-    for _ in 0..256 {
+    // Cap prevents unbounded traversal on unusual filesystems.
+    for _ in 0..MAX_TRAVERSAL_DEPTH {
         let candidate = current.join("mds.json");
         if candidate.is_file() {
             // Read the file first, then check size — avoids a TOCTOU race between

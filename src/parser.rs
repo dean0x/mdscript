@@ -9,7 +9,7 @@ use crate::lexer::Token;
 
 /// Maximum nesting depth for @if/@for/@define blocks.
 /// Prevents stack overflow from crafted inputs with thousands of nested blocks.
-const MAX_NESTING_DEPTH: usize = 256;
+pub(crate) const MAX_NESTING_DEPTH: usize = 256;
 
 /// Parse a stream of tokens into a Module AST with optional source context for error spans.
 ///
