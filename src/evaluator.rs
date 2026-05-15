@@ -556,4 +556,79 @@ mod tests {
             "secondary error should be returned when first is Ok; got: {msg}"
         );
     }
+
+    // ── Resource limit: MAX_CALL_DEPTH ───────────────────────────────────────
+
+    #[test]
+    fn call_depth_limit_rejects_deep_call_stack() {
+        // Build a call chain of MAX_CALL_DEPTH + 2 functions (f0 calls f1, f1 calls f2, ...).
+        // Uses direct AST construction to avoid the resolver's O(n^3) closure-capture overhead.
+        //
+        // Each FunctionDef has a simple body: [Interpolation(Call { "f{i+1}", [] })].
+        // The last function in the chain calls f0 to close the cycle (preventing
+        // the direct-recursion short-circuit which only catches same-key re-entry).
+        let n = MAX_CALL_DEPTH + 2;
+        let mut scope = Scope::new();
+
+        // Register n functions: fi calls f(i+1 % n)
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let next_name = format!("f{next}");
+            let body = vec![Node::Interpolation(Interpolation {
+                expr: Expr::Call {
+                    name: next_name,
+                    args: vec![],
+                },
+                offset: 0,
+                len: 3,
+            })];
+            let func = FunctionDef {
+                params: vec![],
+                body,
+                captured: crate::scope::CapturedScope::default(),
+            };
+            scope.set_function(&format!("f{i}"), Arc::new(func));
+        }
+
+        // Invoke f0 — should fail with a call depth error
+        let call_node = vec![Node::Interpolation(Interpolation {
+            expr: Expr::Call {
+                name: "f0".to_string(),
+                args: vec![],
+            },
+            offset: 0,
+            len: 4,
+        })];
+        let mut warnings = vec![];
+        let result = evaluate(&call_node, &mut scope, &mut warnings);
+        assert!(result.is_err(), "call chain of {n} must be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("call depth") || err.contains("recursion") || err.contains("128"),
+            "error should mention call depth or recursion, got: {err}"
+        );
+    }
+
+    // ── Resource limit: MAX_OUTPUT_SIZE ──────────────────────────────────────
+
+    #[test]
+    fn output_size_limit_rejects_oversized_output() {
+        // Build a node list that immediately produces text exceeding MAX_OUTPUT_SIZE (50 MB).
+        // We use a pre-sized string just over the limit to avoid allocating 50 MB of actual text.
+        // Instead, test that the check fires when the accumulated output exceeds the limit.
+        //
+        // Strategy: create a Text node whose content is (MAX_OUTPUT_SIZE + 1) bytes.
+        // evaluate_nodes checks output.len() > MAX_OUTPUT_SIZE after each node.
+        let big_text = "x".repeat(MAX_OUTPUT_SIZE + 1);
+        let nodes = vec![text(&big_text)];
+        let mut scope = Scope::new();
+        let mut warnings = vec![];
+        let result = evaluate(&nodes, &mut scope, &mut warnings);
+        assert!(result.is_err(), "output exceeding MAX_OUTPUT_SIZE must be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("output") || err.contains("maximum size") || err.contains("50"),
+            "error should mention output size limit, got: {err}"
+        );
+    }
 }

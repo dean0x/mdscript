@@ -3126,3 +3126,118 @@ fn config_size_limit_rejects_oversized_mds_json() {
         "error should mention config size limit, got: {stderr}"
     );
 }
+
+// ── Resource limit: MAX_CALL_DEPTH (128) — unit test in evaluator.rs ─────────
+// The call_depth_limit test lives in src/evaluator.rs to avoid the O(n^3)
+// closure-capture overhead that a 130-function integration template would cause.
+
+// ── Resource limit: MAX_NESTING_DEPTH (256) ───────────────────────────────────
+
+#[test]
+fn parser_nesting_depth_limit_rejects_deep_nesting() {
+    // Build a template with 257 nested @if blocks (just past MAX_NESTING_DEPTH=256).
+    let mut source = String::new();
+    source.push_str("---\nflag: true\n---\n");
+    for _ in 0..257 {
+        source.push_str("@if flag:\n");
+    }
+    source.push_str("deep\n");
+    for _ in 0..257 {
+        source.push_str("@end\n");
+    }
+
+    let result = mds::compile_str(&source);
+    assert!(result.is_err(), "257 nested @if blocks must be rejected");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("nesting") || err.contains("depth") || err.contains("256"),
+        "error should mention nesting depth limit, got: {err}"
+    );
+}
+
+// ── Resource limit: MAX_WARNINGS (1000) ──────────────────────────────────────
+
+#[test]
+fn warning_cap_at_max_warnings() {
+    // Build a template with many @include of modules with no body.
+    // Each @include of an empty module produces one warning.
+    // We use a subdirectory with a shared empty library module.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create a shared empty module (no body — just a @define with no body text)
+    let lib_path = dir.path().join("empty_lib.mds");
+    std::fs::write(
+        &lib_path,
+        "@define noop():\n@end\n",
+    )
+    .unwrap();
+
+    // Build main template: import empty_lib as 'lib' and @include it 1010 times.
+    let mut src = String::from("@import \"./empty_lib.mds\" as lib\n");
+    for _ in 0..1010 {
+        src.push_str("@include lib\n");
+    }
+    let main_path = dir.path().join("main.mds");
+    std::fs::write(&main_path, &src).unwrap();
+
+    let (_, warnings) = mds::compile_collecting_warnings(&main_path, None)
+        .expect("template should compile successfully");
+
+    assert!(
+        warnings.len() <= 1000,
+        "warnings must be capped at 1000, got {}",
+        warnings.len()
+    );
+    assert!(
+        warnings.len() >= 1,
+        "at least some warnings should have been collected"
+    );
+}
+
+// ── CLI: reject_directory_input ───────────────────────────────────────────────
+
+#[test]
+fn cli_build_rejects_directory_input() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "build with directory input must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("expected a file") || stderr.contains("directory"),
+        "error should mention expected-a-file or directory, got: {stderr}"
+    );
+}
+
+// ── CLI: init path traversal ─────────────────────────────────────────────────
+
+#[test]
+fn cli_init_rejects_path_traversal() {
+    let output = mds_bin()
+        .arg("init")
+        .arg("../escaped.mds")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "init with path traversal must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("..") || stderr.contains("traversal") || stderr.contains("components"),
+        "error should mention path traversal, got: {stderr}"
+    );
+}
