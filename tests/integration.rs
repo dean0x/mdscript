@@ -2156,52 +2156,6 @@ fn for_loop_iteration_limit_rejects_huge_array() {
     );
 }
 
-// ── Security: YAML value depth limit ─────────────────────────────────────────
-
-#[test]
-fn yaml_value_depth_limit_rejects_deeply_nested_sequence() {
-    use serde_yml::Value as YamlValue;
-
-    // Build a YAML sequence nested 65 levels deep (just past the limit of 64).
-    let mut nested = YamlValue::Null;
-    for _ in 0..65 {
-        nested = YamlValue::Sequence(vec![nested]);
-    }
-
-    let result = mds::Value::from_yaml(nested);
-    assert!(
-        result.is_err(),
-        "YAML value nested 65 levels deep must be rejected"
-    );
-    let err = format!("{}", result.unwrap_err());
-    assert!(
-        err.contains("nesting") || err.contains("depth") || err.contains("64"),
-        "error should mention depth limit, got: {err}"
-    );
-}
-
-// ── Security: JSON value depth limit ─────────────────────────────────────────
-
-#[test]
-fn json_value_depth_limit_rejects_deeply_nested_array() {
-    // Build a JSON array nested 65 levels deep (just past the limit of 64).
-    let mut nested = serde_json::Value::Null;
-    for _ in 0..65 {
-        nested = serde_json::Value::Array(vec![nested]);
-    }
-
-    let result = mds::Value::from_json(nested);
-    assert!(
-        result.is_err(),
-        "JSON value nested 65 levels deep must be rejected"
-    );
-    let err = format!("{}", result.unwrap_err());
-    assert!(
-        err.contains("nesting") || err.contains("depth") || err.contains("64"),
-        "error should mention depth limit, got: {err}"
-    );
-}
-
 // ── Security: symlink rejection in imports ────────────────────────────────────
 
 #[test]

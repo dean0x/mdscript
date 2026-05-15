@@ -18,6 +18,7 @@ fn at(
 
 /// All errors produced by the MDS compiler.
 #[must_use]
+#[non_exhaustive]
 #[derive(Error, Debug, Diagnostic, Clone)]
 pub enum MdsError {
     #[error("syntax error: {message}")]
@@ -175,7 +176,7 @@ pub enum MdsError {
 }
 
 impl MdsError {
-    pub fn syntax(message: impl Into<String>) -> Self {
+    pub(crate) fn syntax(message: impl Into<String>) -> Self {
         MdsError::Syntax {
             message: message.into(),
             span: None,
@@ -183,7 +184,7 @@ impl MdsError {
         }
     }
 
-    pub fn syntax_at(
+    pub(crate) fn syntax_at(
         message: impl Into<String>,
         file: &str,
         source: &str,
@@ -198,7 +199,7 @@ impl MdsError {
         }
     }
 
-    pub fn undefined_var(name: impl Into<String>) -> Self {
+    pub(crate) fn undefined_var(name: impl Into<String>) -> Self {
         MdsError::UndefinedVariable {
             name: name.into(),
             span: None,
@@ -206,7 +207,7 @@ impl MdsError {
         }
     }
 
-    pub fn undefined_var_at(
+    pub(crate) fn undefined_var_at(
         name: impl Into<String>,
         file: &str,
         source: &str,
@@ -221,7 +222,7 @@ impl MdsError {
         }
     }
 
-    pub fn undefined_fn(name: impl Into<String>) -> Self {
+    pub(crate) fn undefined_fn(name: impl Into<String>) -> Self {
         MdsError::UndefinedFunction {
             name: name.into(),
             span: None,
@@ -229,7 +230,7 @@ impl MdsError {
         }
     }
 
-    pub fn undefined_fn_at(
+    pub(crate) fn undefined_fn_at(
         name: impl Into<String>,
         file: &str,
         source: &str,
@@ -244,7 +245,7 @@ impl MdsError {
         }
     }
 
-    pub fn arity(name: impl Into<String>, expected: usize, got: usize) -> Self {
+    pub(crate) fn arity(name: impl Into<String>, expected: usize, got: usize) -> Self {
         MdsError::ArityMismatch {
             name: name.into(),
             expected,
@@ -254,7 +255,7 @@ impl MdsError {
         }
     }
 
-    pub fn arity_at(
+    pub(crate) fn arity_at(
         name: impl Into<String>,
         expected: usize,
         got: usize,
@@ -273,7 +274,7 @@ impl MdsError {
         }
     }
 
-    pub fn type_error(got: impl Into<String>) -> Self {
+    pub(crate) fn type_error(got: impl Into<String>) -> Self {
         MdsError::TypeError {
             got: got.into(),
             span: None,
@@ -281,7 +282,7 @@ impl MdsError {
         }
     }
 
-    pub fn type_error_at(
+    pub(crate) fn type_error_at(
         got: impl Into<String>,
         file: &str,
         source: &str,
@@ -296,7 +297,7 @@ impl MdsError {
         }
     }
 
-    pub fn name_collision(name: impl Into<String>) -> Self {
+    pub(crate) fn name_collision(name: impl Into<String>) -> Self {
         MdsError::NameCollision {
             name: name.into(),
             span: None,
@@ -304,7 +305,7 @@ impl MdsError {
         }
     }
 
-    pub fn name_collision_at(
+    pub(crate) fn name_collision_at(
         name: impl Into<String>,
         file: &str,
         source: &str,
@@ -319,7 +320,7 @@ impl MdsError {
         }
     }
 
-    pub fn recursion(name: impl Into<String>) -> Self {
+    pub(crate) fn recursion(name: impl Into<String>) -> Self {
         MdsError::Recursion {
             name: name.into(),
             span: None,
@@ -327,7 +328,8 @@ impl MdsError {
         }
     }
 
-    pub fn recursion_at(
+    #[allow(dead_code)]
+    pub(crate) fn recursion_at(
         name: impl Into<String>,
         file: &str,
         source: &str,
@@ -342,7 +344,7 @@ impl MdsError {
         }
     }
 
-    pub fn file_not_found(path: impl Into<String>) -> Self {
+    pub(crate) fn file_not_found(path: impl Into<String>) -> Self {
         MdsError::FileNotFound {
             path: path.into(),
             span: None,
@@ -350,7 +352,7 @@ impl MdsError {
         }
     }
 
-    pub fn file_not_found_at(
+    pub(crate) fn file_not_found_at(
         path: impl Into<String>,
         file: &str,
         source: &str,
@@ -365,7 +367,7 @@ impl MdsError {
         }
     }
 
-    pub fn import_error(message: impl Into<String>) -> Self {
+    pub(crate) fn import_error(message: impl Into<String>) -> Self {
         MdsError::ImportError {
             message: message.into(),
             span: None,
@@ -373,7 +375,7 @@ impl MdsError {
         }
     }
 
-    pub fn import_error_at(
+    pub(crate) fn import_error_at(
         message: impl Into<String>,
         file: &str,
         source: &str,
@@ -388,7 +390,7 @@ impl MdsError {
         }
     }
 
-    pub fn circular_import(cycle: impl Into<String>) -> Self {
+    pub(crate) fn circular_import(cycle: impl Into<String>) -> Self {
         MdsError::CircularImport {
             cycle: cycle.into(),
             span: None,
@@ -396,7 +398,7 @@ impl MdsError {
         }
     }
 
-    pub fn circular_import_at(
+    pub(crate) fn circular_import_at(
         cycle: impl Into<String>,
         file: &str,
         source: &str,
@@ -411,7 +413,7 @@ impl MdsError {
         }
     }
 
-    pub fn export_error(message: impl Into<String>) -> Self {
+    pub(crate) fn export_error(message: impl Into<String>) -> Self {
         MdsError::ExportError {
             message: message.into(),
             span: None,
@@ -419,7 +421,8 @@ impl MdsError {
         }
     }
 
-    pub fn export_error_at(
+    #[allow(dead_code)]
+    pub(crate) fn export_error_at(
         message: impl Into<String>,
         file: &str,
         source: &str,
@@ -434,31 +437,31 @@ impl MdsError {
         }
     }
 
-    pub fn resource_limit(message: impl Into<String>) -> Self {
+    pub(crate) fn resource_limit(message: impl Into<String>) -> Self {
         MdsError::ResourceLimit {
             message: message.into(),
         }
     }
 
-    pub fn io(message: impl Into<String>) -> Self {
+    pub(crate) fn io(message: impl Into<String>) -> Self {
         MdsError::Io {
             message: message.into(),
         }
     }
 
-    pub fn yaml_error(message: impl Into<String>) -> Self {
+    pub(crate) fn yaml_error(message: impl Into<String>) -> Self {
         MdsError::YamlError {
             message: message.into(),
         }
     }
 
-    pub fn json_error(message: impl Into<String>) -> Self {
+    pub(crate) fn json_error(message: impl Into<String>) -> Self {
         MdsError::JsonError {
             message: message.into(),
         }
     }
 
-    pub fn not_mds_file(path: impl Into<String>) -> Self {
+    pub(crate) fn not_mds_file(path: impl Into<String>) -> Self {
         MdsError::NotMdsFile {
             path: path.into(),
         }

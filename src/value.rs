@@ -6,6 +6,7 @@ use crate::error::MdsError;
 const MAX_VALUE_DEPTH: usize = 64;
 
 /// Runtime value type for MDS variables and expressions.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     String(String),
@@ -31,7 +32,7 @@ impl Value {
     }
 
     /// Convert a serde_yml::Value into our Value enum.
-    pub fn from_yaml(yaml: serde_yml::Value) -> Result<Value, MdsError> {
+    pub(crate) fn from_yaml(yaml: serde_yml::Value) -> Result<Value, MdsError> {
         Self::from_yaml_inner(yaml, 0)
     }
 
@@ -64,7 +65,7 @@ impl Value {
     }
 
     /// Convert a serde_json::Value into our Value enum.
-    pub fn from_json(json: serde_json::Value) -> Result<Value, MdsError> {
+    pub(crate) fn from_json(json: serde_json::Value) -> Result<Value, MdsError> {
         Self::from_json_inner(json, 0)
     }
 
@@ -253,5 +254,51 @@ mod tests {
         assert_eq!(Value::Number(f64::NAN).to_string(), "NaN");
         assert_eq!(Value::Number(f64::INFINITY).to_string(), "inf");
         assert_eq!(Value::Number(f64::NEG_INFINITY).to_string(), "-inf");
+    }
+
+    // ── Security: YAML value depth limit ─────────────────────────────────────
+
+    #[test]
+    fn yaml_value_depth_limit_rejects_deeply_nested_sequence() {
+        use serde_yml::Value as YamlValue;
+
+        // Build a YAML sequence nested 65 levels deep (just past the limit of 64).
+        let mut nested = YamlValue::Null;
+        for _ in 0..65 {
+            nested = YamlValue::Sequence(vec![nested]);
+        }
+
+        let result = Value::from_yaml(nested);
+        assert!(
+            result.is_err(),
+            "YAML value nested 65 levels deep must be rejected"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("nesting") || err.contains("depth") || err.contains("64"),
+            "error should mention depth limit, got: {err}"
+        );
+    }
+
+    // ── Security: JSON value depth limit ─────────────────────────────────────
+
+    #[test]
+    fn json_value_depth_limit_rejects_deeply_nested_array() {
+        // Build a JSON array nested 65 levels deep (just past the limit of 64).
+        let mut nested = serde_json::Value::Null;
+        for _ in 0..65 {
+            nested = serde_json::Value::Array(vec![nested]);
+        }
+
+        let result = Value::from_json(nested);
+        assert!(
+            result.is_err(),
+            "JSON value nested 65 levels deep must be rejected"
+        );
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("nesting") || err.contains("depth") || err.contains("64"),
+            "error should mention depth limit, got: {err}"
+        );
     }
 }
