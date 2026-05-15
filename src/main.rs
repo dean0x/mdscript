@@ -433,132 +433,141 @@ fn read_stdin() -> Result<(String, std::path::PathBuf), miette::Error> {
     Ok((source, cwd))
 }
 
-fn run(cli: Cli) -> Result<(), miette::Error> {
-    let quiet = cli.quiet;
-    match cli.command {
-        Commands::Build {
-            input,
-            output,
-            out_dir,
-            vars,
-            set_vars,
-        } => {
-            let runtime_vars = build_runtime_vars(vars, set_vars)?;
+/// Resolve the input path: use the explicit value, or auto-detect from cwd.
+///
+/// Returns the resolved path. Does not check for directory or validate the file;
+/// callers perform those checks after resolution.
+fn resolve_input(input: Option<PathBuf>) -> std::result::Result<PathBuf, miette::Error> {
+    match input {
+        Some(p) => Ok(p),
+        None => auto_detect_mds_file(),
+    }
+}
 
-            // Resolve the input: explicit path/stdin, or auto-detect from cwd.
-            let input = match input {
-                Some(p) => p,
-                None => {
-                    let detected = auto_detect_mds_file()?;
-                    if !quiet {
-                        eprintln!("Building {}", detected.display());
-                    }
-                    detected
-                }
-            };
+fn run_build(
+    input: Option<PathBuf>,
+    output: Option<String>,
+    out_dir: Option<PathBuf>,
+    vars: Option<PathBuf>,
+    set_vars: Vec<(String, String)>,
+    quiet: bool,
+) -> Result<(), miette::Error> {
+    let runtime_vars = build_runtime_vars(vars, set_vars)?;
 
-            reject_directory_input(&input)?;
-
-            // Load project config (mds.json), walking up from the input file.
-            let config = load_config(&input)?;
-
-            // Resolve output destination before compiling (config discovery happens once).
-            let output_path = resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
-
-            let (compiled, warnings) = if input == Path::new("-") {
-                let (source, cwd) = read_stdin()?;
-                mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-                    .map_err(miette::Error::from)?
-            } else {
-                mds::compile_collecting_warnings(&input, runtime_vars)
-                    .map_err(miette::Error::from)?
-            };
-
+    // Resolve the input: explicit path/stdin, or auto-detect from cwd.
+    let input = match input {
+        Some(p) => p,
+        None => {
+            let detected = auto_detect_mds_file()?;
             if !quiet {
-                for w in &warnings {
-                    eprintln!("{w}");
-                }
+                eprintln!("Building {}", detected.display());
             }
+            detected
+        }
+    };
 
-            match output_path {
-                Some(path) => {
-                    if let Some(parent) = path.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                miette::miette!(
-                                    "cannot create output directory {}: {e}",
-                                    parent.display()
-                                )
-                            })?;
-                        }
-                    }
-                    std::fs::write(&path, &compiled).map_err(|e| {
-                        miette::miette!("cannot write {}: {e}", path.display())
+    reject_directory_input(&input)?;
+
+    // Load project config (mds.json), walking up from the input file.
+    let config = load_config(&input)?;
+
+    // Resolve output destination before compiling (config discovery happens once).
+    let output_path = resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
+
+    let (compiled, warnings) = if input == Path::new("-") {
+        let (source, cwd) = read_stdin()?;
+        mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
+            .map_err(miette::Error::from)?
+    } else {
+        mds::compile_collecting_warnings(&input, runtime_vars)
+            .map_err(miette::Error::from)?
+    };
+
+    if !quiet {
+        for w in &warnings {
+            eprintln!("{w}");
+        }
+    }
+
+    match output_path {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        miette::miette!(
+                            "cannot create output directory {}: {e}",
+                            parent.display()
+                        )
                     })?;
-                    if !quiet {
-                        eprintln!("Compiled to {}", path.display());
-                    }
-                }
-                None => {
-                    print!("{compiled}");
                 }
             }
-            Ok(())
+            std::fs::write(&path, &compiled).map_err(|e| {
+                miette::miette!("cannot write {}: {e}", path.display())
+            })?;
+            if !quiet {
+                eprintln!("Compiled to {}", path.display());
+            }
         }
-        Commands::Check {
-            input,
-            vars,
-            set_vars,
-        } => {
-            let runtime_vars = build_runtime_vars(vars, set_vars)?;
-
-            // Resolve the input: explicit path/stdin, or auto-detect from cwd.
-            let input = match input {
-                Some(p) => p,
-                None => auto_detect_mds_file()?,
-            };
-
-            reject_directory_input(&input)?;
-
-            if input == Path::new("-") {
-                let (source, cwd) = read_stdin()?;
-                let ((), warnings) =
-                    mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-                        .map_err(miette::Error::from)?;
-                if !quiet {
-                    for w in &warnings {
-                        eprintln!("{w}");
-                    }
-                    eprintln!("OK: <stdin>");
-                }
-            } else {
-                let ((), warnings) = mds::check_collecting_warnings(&input, runtime_vars)
-                    .map_err(miette::Error::from)?;
-                if !quiet {
-                    for w in &warnings {
-                        eprintln!("{w}");
-                    }
-                    eprintln!("OK: {}", input.display());
-                }
-            }
-            Ok(())
+        None => {
+            print!("{compiled}");
         }
-        Commands::Init { filename, force } => {
-            if filename
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-            {
-                return Err(miette::miette!(
-                    "init filename must not contain '..' components"
-                ));
+    }
+    Ok(())
+}
+
+fn run_check(
+    input: Option<PathBuf>,
+    vars: Option<PathBuf>,
+    set_vars: Vec<(String, String)>,
+    quiet: bool,
+) -> Result<(), miette::Error> {
+    let runtime_vars = build_runtime_vars(vars, set_vars)?;
+
+    // Resolve the input: explicit path/stdin, or auto-detect from cwd.
+    let input = resolve_input(input)?;
+
+    reject_directory_input(&input)?;
+
+    if input == Path::new("-") {
+        let (source, cwd) = read_stdin()?;
+        let ((), warnings) =
+            mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
+                .map_err(miette::Error::from)?;
+        if !quiet {
+            for w in &warnings {
+                eprintln!("{w}");
             }
-            if filename.exists() && !force {
-                return Err(miette::miette!(
-                    "{} already exists (use --force to overwrite)",
-                    filename.display()
-                ));
+            eprintln!("OK: <stdin>");
+        }
+    } else {
+        let ((), warnings) = mds::check_collecting_warnings(&input, runtime_vars)
+            .map_err(miette::Error::from)?;
+        if !quiet {
+            for w in &warnings {
+                eprintln!("{w}");
             }
-            let starter = "\
+            eprintln!("OK: {}", input.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<(), miette::Error> {
+    if filename
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(miette::miette!(
+            "init filename must not contain '..' components"
+        ));
+    }
+    if filename.exists() && !force {
+        return Err(miette::miette!(
+            "{} already exists (use --force to overwrite)",
+            filename.display()
+        ));
+    }
+    let starter = "\
 ---
 name: World
 items: [one, two, three]
@@ -571,17 +580,34 @@ Your items:
 - {item}
 @end
 ";
-            std::fs::write(&filename, starter)
-                .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
-            if !quiet {
-                eprintln!(
-                    "Created {}\n  Try: mds build {}",
-                    filename.display(),
-                    filename.display()
-                );
-            }
-            Ok(())
-        }
+    std::fs::write(&filename, starter)
+        .map_err(|e| miette::miette!("cannot write {}: {e}", filename.display()))?;
+    if !quiet {
+        eprintln!(
+            "Created {}\n  Try: mds build {}",
+            filename.display(),
+            filename.display()
+        );
+    }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<(), miette::Error> {
+    let quiet = cli.quiet;
+    match cli.command {
+        Commands::Build {
+            input,
+            output,
+            out_dir,
+            vars,
+            set_vars,
+        } => run_build(input, output, out_dir, vars, set_vars, quiet),
+        Commands::Check {
+            input,
+            vars,
+            set_vars,
+        } => run_check(input, vars, set_vars, quiet),
+        Commands::Init { filename, force } => run_init(filename, force, quiet),
     }
 }
 
