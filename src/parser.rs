@@ -11,6 +11,10 @@ use crate::lexer::Token;
 /// Prevents stack overflow from crafted inputs with thousands of nested blocks.
 pub(crate) const MAX_NESTING_DEPTH: usize = 256;
 
+/// Maximum number of segments in a dot-separated path (e.g. `a.b.c` = 3 segments).
+/// Defense-in-depth limit independent of MAX_FILE_SIZE; half of the value nesting cap.
+pub(crate) const MAX_DOT_SEGMENTS: usize = 32;
+
 /// Parse a stream of tokens into a Module AST with optional source context for error spans.
 ///
 /// Pass non-empty `file` and `source` to enable source-location labels on parse errors.
@@ -217,6 +221,11 @@ impl Parser<'_> {
             .split('.')
             .map(|s| s.trim().to_string())
             .collect();
+        if condition.len() > MAX_DOT_SEGMENTS {
+            return Err(MdsError::syntax(format!(
+                "@if condition dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
+            )));
+        }
         for part in &condition {
             if !is_valid_identifier(part) {
                 return Err(MdsError::syntax(format!(
@@ -272,6 +281,11 @@ impl Parser<'_> {
             .split('.')
             .map(|s| s.trim().to_string())
             .collect();
+        if iterable.len() > MAX_DOT_SEGMENTS {
+            return Err(MdsError::syntax(format!(
+                "@for iterable dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
+            )));
+        }
         for part in &iterable {
             if !is_valid_identifier(part) {
                 return Err(MdsError::syntax(format!(
@@ -497,7 +511,72 @@ fn parse_for_vars(var_part: &str) -> Result<(Option<String>, String), MdsError> 
     }
 }
 
+/// Resolve a dot-leading expression into a QualifiedCall or MemberAccess interpolation.
+///
+/// Called when a dot appears before any `(` in interpolation content, i.e.:
+///   `{obj.key}`       → MemberAccess
+///   `{ns.func(args)}` → QualifiedCall
+///
+/// `dot_pos` is the byte index of the first `.` in `content`.
+fn parse_dot_expr(
+    content: &str,
+    dot_pos: usize,
+    offset: usize,
+    len: usize,
+    file: &str,
+    source: &str,
+) -> Result<Interpolation, MdsError> {
+    let rest_after_dot = &content[dot_pos + 1..];
+
+    if let Some(paren_pos) = rest_after_dot.find('(') {
+        // namespace.func(args) — QualifiedCall
+        let namespace = content[..dot_pos].trim().to_string();
+        let name = rest_after_dot[..paren_pos].trim().to_string();
+        let args_str = rest_after_dot[paren_pos + 1..]
+            .trim()
+            .strip_suffix(')')
+            .ok_or_else(|| MdsError::syntax_at("unclosed parenthesis in function call", file, source, offset, len))?;
+        let args = parse_args(args_str)?;
+        return Ok(Interpolation {
+            expr: Expr::QualifiedCall { namespace, name, args },
+            offset,
+            len,
+        });
+    }
+
+    // No '(' anywhere — obj.field or obj.field1.field2 (MemberAccess)
+    let parts: Vec<&str> = content.split('.').collect();
+    if parts.len() > MAX_DOT_SEGMENTS {
+        return Err(MdsError::syntax_at(
+            format!("dot path in interpolation exceeds maximum segment count of {MAX_DOT_SEGMENTS}"),
+            file, source, offset, len,
+        ));
+    }
+    for part in &parts {
+        let part = part.trim();
+        if !is_valid_identifier(part) {
+            return Err(MdsError::syntax_at(
+                format!("invalid dot-path in interpolation: '{content}' — each segment must be a valid identifier"),
+                file, source, offset, len,
+            ));
+        }
+    }
+    let object = parts[0].trim().to_string();
+    let fields: Vec<String> = parts[1..].iter().map(|s| s.trim().to_string()).collect();
+    Ok(Interpolation {
+        expr: Expr::MemberAccess { object, fields },
+        offset,
+        len,
+    })
+}
+
 /// Parse the expression inside `{ }` into an Expr.
+///
+/// Dispatches across four expression types by examining the positions of the
+/// first `.` and first `(`:
+///   dot before `(`  → [`parse_dot_expr`] (QualifiedCall or MemberAccess)
+///   `(` without dot → Call
+///   neither         → Var
 fn parse_interpolation_expr(
     content: &str,
     offset: usize,
@@ -507,63 +586,17 @@ fn parse_interpolation_expr(
     let content = content.trim();
     let len = content.len();
 
-    // Determine if content has a dot before the first '(' (if any).
-    // This distinguishes:
-    //   {obj.key}            → MemberAccess (dot before any paren)
-    //   {ns.func(args)}      → QualifiedCall (dot then paren)
-    //   {greet(obj.field)}   → Call with MemberAccess arg (paren before dot)
+    // Dot before any `(`: QualifiedCall or MemberAccess.
     let first_dot = content.find('.');
     let first_paren = content.find('(');
-
-    match (first_dot, first_paren) {
-        (Some(dot_pos), paren_opt) if paren_opt.map_or(true, |p| dot_pos < p) => {
-            // Dot appears before any '(' — either QualifiedCall or MemberAccess
-            let rest_after_dot = &content[dot_pos + 1..];
-
-            if let Some(paren_pos) = rest_after_dot.find('(') {
-                // namespace.func(args) — QualifiedCall
-                let namespace = content[..dot_pos].trim().to_string();
-                let name = rest_after_dot[..paren_pos].trim().to_string();
-                let args_str = rest_after_dot[paren_pos + 1..]
-                    .trim()
-                    .strip_suffix(')')
-                    .ok_or_else(|| MdsError::syntax_at("unclosed parenthesis in function call", file, source, offset, len))?;
-                let args = parse_args(args_str)?;
-                return Ok(Interpolation {
-                    expr: Expr::QualifiedCall {
-                        namespace,
-                        name,
-                        args,
-                    },
-                    offset,
-                    len,
-                });
-            }
-
-            // No '(' anywhere — obj.field or obj.field1.field2 (MemberAccess)
-            let parts: Vec<&str> = content.split('.').collect();
-            for part in &parts {
-                let part = part.trim();
-                if !is_valid_identifier(part) {
-                    return Err(MdsError::syntax_at(
-                        format!("invalid dot-path in interpolation: '{content}' — each segment must be a valid identifier"),
-                        file, source, offset, len,
-                    ));
-                }
-            }
-            let object = parts[0].trim().to_string();
-            let fields: Vec<String> = parts[1..].iter().map(|s| s.trim().to_string()).collect();
-            return Ok(Interpolation {
-                expr: Expr::MemberAccess { object, fields },
-                offset,
-                len,
-            });
+    if let (Some(dot_pos), paren_opt) = (first_dot, first_paren) {
+        if paren_opt.map_or(true, |p| dot_pos < p) {
+            return parse_dot_expr(content, dot_pos, offset, len, file, source);
         }
-        _ => {}
     }
 
-    // Check for function call: name(args)
-    if let Some(paren_pos) = content.find('(') {
+    // Paren without prior dot: simple Call.
+    if let Some(paren_pos) = first_paren {
         let name = content[..paren_pos].trim().to_string();
         let args_str = content[paren_pos + 1..]
             .trim()
@@ -577,7 +610,7 @@ fn parse_interpolation_expr(
         });
     }
 
-    // Simple variable reference
+    // Simple variable reference.
     if !is_valid_identifier(content) {
         return Err(MdsError::syntax_at(
             format!(
@@ -691,6 +724,11 @@ fn parse_single_arg_inner(s: &str, depth: usize) -> Result<Arg, MdsError> {
     } else if s.contains('.') && !s.contains('(') {
         // Object member access as argument: config.name or a.b.c
         let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() > MAX_DOT_SEGMENTS {
+            return Err(MdsError::syntax(format!(
+                "dot path in argument exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
+            )));
+        }
         for part in &parts {
             let part = part.trim();
             if !is_valid_identifier(part) {
@@ -1110,6 +1148,96 @@ mod tests {
         assert!(
             err_msg.contains("invalid dot-path"),
             "error should mention 'invalid dot-path', got: {err_msg}"
+        );
+    }
+
+    // --- Tests for MAX_DOT_SEGMENTS limit ---
+
+    #[test]
+    fn parse_dot_path_at_limit_accepted() {
+        // MAX_DOT_SEGMENTS segments (e.g. a.b.c...32 parts) must be accepted.
+        let segments: Vec<&str> = std::iter::repeat("x").take(MAX_DOT_SEGMENTS).collect();
+        let path = segments.join(".");
+        let src = format!("{{{path}}}");
+        let tokens = tokenize(&src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(
+            result.is_ok(),
+            "exactly MAX_DOT_SEGMENTS segments must be accepted: {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_interpolation_dot_path_exceeds_limit_rejected() {
+        // MAX_DOT_SEGMENTS + 1 segments in an interpolation must be rejected.
+        let segments: Vec<&str> = std::iter::repeat("x").take(MAX_DOT_SEGMENTS + 1).collect();
+        let path = segments.join(".");
+        let src = format!("{{{path}}}");
+        let tokens = tokenize(&src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "test.mds", &src);
+        assert!(
+            result.is_err(),
+            "dot path exceeding MAX_DOT_SEGMENTS must be rejected"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("segment count"),
+            "error must mention segment count, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn parse_if_condition_dot_path_exceeds_limit_rejected() {
+        // @if with too many dot segments must be rejected.
+        let segments: Vec<&str> = std::iter::repeat("x").take(MAX_DOT_SEGMENTS + 1).collect();
+        let path = segments.join(".");
+        let src = format!("@if {path}:\ncontent\n@end\n");
+        let tokens = tokenize(&src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(
+            result.is_err(),
+            "@if dot path exceeding MAX_DOT_SEGMENTS must be rejected"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("segment count"),
+            "error must mention segment count, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn parse_for_iterable_dot_path_exceeds_limit_rejected() {
+        // @for with too many dot segments in iterable must be rejected.
+        let segments: Vec<&str> = std::iter::repeat("x").take(MAX_DOT_SEGMENTS + 1).collect();
+        let path = segments.join(".");
+        let src = format!("@for item in {path}:\n- {{item}}\n@end\n");
+        let tokens = tokenize(&src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(
+            result.is_err(),
+            "@for iterable dot path exceeding MAX_DOT_SEGMENTS must be rejected"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("segment count"),
+            "error must mention segment count, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn parse_arg_dot_path_exceeds_limit_rejected() {
+        // Function arg with too many dot segments must be rejected.
+        let segments: Vec<&str> = std::iter::repeat("x").take(MAX_DOT_SEGMENTS + 1).collect();
+        let path = segments.join(".");
+        let result = parse_args(&path);
+        assert!(
+            result.is_err(),
+            "arg dot path exceeding MAX_DOT_SEGMENTS must be rejected"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("segment count"),
+            "error must mention segment count, got: {err_msg}"
         );
     }
 
