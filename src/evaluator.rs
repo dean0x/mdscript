@@ -94,16 +94,15 @@ fn evaluate_nodes(
 
 /// Resolve a dot-separated path against the current scope.
 ///
-/// `path[0]` is the root variable name; `path[1..]` are the field names to traverse.
+/// `root` is the root variable name; `fields` are the field names to traverse into the
+/// resolved root value. Passing an empty `fields` slice returns the root variable itself.
 /// Returns `Ok(Value)` with the resolved value, or an error if the path is invalid.
-fn resolve_dot_path(path: &[String], scope: &Scope) -> Result<Value, MdsError> {
-    debug_assert!(!path.is_empty(), "resolve_dot_path called with empty path");
-    let root = &path[0];
+fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError> {
     let mut current = scope
         .get_var(root)
         .cloned()
         .ok_or_else(|| MdsError::undefined_var(root))?;
-    for field in &path[1..] {
+    for field in fields {
         match current {
             Value::Object(ref map) => {
                 current = map.get(field).cloned().ok_or_else(|| {
@@ -161,10 +160,7 @@ fn evaluate_expr(
                     "'{object}' is an imported module, not a variable — to call a function use {{{object}.func()}}"
                 )));
             }
-            let path: Vec<String> = std::iter::once(object.clone())
-                .chain(fields.iter().cloned())
-                .collect();
-            let value = resolve_dot_path(&path, scope)?;
+            let value = resolve_dot_path(object, fields, scope)?;
             // Objects cannot be directly interpolated — user must access a specific field
             match value {
                 Value::Object(_) => Err(MdsError::syntax(format!(
@@ -204,10 +200,7 @@ fn resolve_args(
                 Ok(Value::String(result))
             }
             Arg::MemberAccess { object, fields } => {
-                let path: Vec<String> = std::iter::once(object.clone())
-                    .chain(fields.iter().cloned())
-                    .collect();
-                resolve_dot_path(&path, scope)
+                resolve_dot_path(object, fields, scope)
             }
         })
         .collect()
@@ -324,7 +317,9 @@ fn evaluate_if(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    let value = resolve_dot_path(&block.condition, scope)?;
+    // Parser invariant: condition is always non-empty (validated at parse time).
+    assert!(!block.condition.is_empty(), "IfBlock.condition must be non-empty");
+    let value = resolve_dot_path(&block.condition[0], &block.condition[1..], scope)?;
 
     if value.is_truthy() {
         evaluate_nodes(&block.then_body, scope, ctx)
@@ -340,7 +335,9 @@ fn evaluate_for(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    let iterable = resolve_dot_path(&block.iterable, scope)?;
+    // Parser invariant: iterable is always non-empty (validated at parse time).
+    assert!(!block.iterable.is_empty(), "ForBlock.iterable must be non-empty");
+    let iterable = resolve_dot_path(&block.iterable[0], &block.iterable[1..], scope)?;
 
     if let Some(ref key_var) = block.key_var {
         // Key-value iteration: @for key, value in obj:
