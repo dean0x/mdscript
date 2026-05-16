@@ -21,9 +21,12 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
             validate_expr(&interp.expr, scope, file, source, interp.offset, interp.len)
         }
         Node::If(block) => {
-            // Condition root must be a defined variable (truthiness is checked at evaluation time)
-            debug_assert!(!block.condition.is_empty(), "IfBlock.condition must be non-empty (parser invariant)");
-            let root = &block.condition[0];
+            // Condition root must be a defined variable (truthiness is checked at evaluation time).
+            // Parser invariant: condition is always non-empty. Use .first() with an error return
+            // rather than a debug_assert!+index so this holds in release builds too.
+            let root = block.condition.first().ok_or_else(|| {
+                MdsError::syntax("internal error: @if block has empty condition path")
+            })?;
             scope.get_var(root).ok_or_else(|| {
                 MdsError::undefined_var_at(
                     root,
@@ -46,8 +49,11 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
             Ok(())
         }
         Node::For(block) => {
-            debug_assert!(!block.iterable.is_empty(), "ForBlock.iterable must be non-empty (parser invariant)");
-            let root = &block.iterable[0];
+            // Parser invariant: iterable is always non-empty. Use .first() with an error return
+            // rather than a debug_assert!+index so this holds in release builds too.
+            let root = block.iterable.first().ok_or_else(|| {
+                MdsError::syntax("internal error: @for block has empty iterable path")
+            })?;
             let iterable_val = scope.get_var(root).ok_or_else(|| {
                 MdsError::undefined_var_at(
                     root,
@@ -60,6 +66,15 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
             // Only perform static type checks when:
             // 1. No key_var (single-var iteration should be an array)
             // 2. The iterable is a simple identifier (no dot path — can't statically resolve type)
+            //
+            // ACCEPTED LIMITATION: when the iterable is a dot-path (block.iterable.len() > 1,
+            // e.g. `@for item in data.list:`), we skip the static array-type check here because
+            // `data.list` is a field on a runtime Value::Object whose type cannot be determined
+            // statically from the scope's root variable. Any type mismatch (e.g., `data.list`
+            // resolves to a non-array) surfaces as a MdsError::TypeError at evaluation time via
+            // `resolve_dot_path`, with less precise span information than a validator diagnostic.
+            // Resolving object fields statically would require a full type-system pass that is
+            // out of scope for v0.1.
             if block.key_var.is_none() && block.iterable.len() == 1 && !matches!(iterable_val, Value::Array(_)) {
                 if matches!(iterable_val, Value::Object(_)) {
                     return Err(MdsError::syntax_at(
