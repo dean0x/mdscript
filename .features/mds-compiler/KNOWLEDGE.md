@@ -153,7 +153,7 @@ The `Value` enum has six variants: `String`, `Number(f64)`, `Boolean`, `Array(Ve
 
 **`Value::Object`**: YAML mappings and JSON objects are converted to `Value::Object(HashMap<String, Value>)` by `from_yaml` and `from_json`. Key behaviors:
 - Empty objects are falsy; non-empty objects are truthy
-- Non-string YAML keys are silently skipped (YAML allows non-string keys; MDS does not)
+- Non-string YAML keys are **rejected with `MdsError::yaml_error`** — a diagnostic directs users to use a quoted string key. This replaces the previous silent-skip behavior; callers now get a clear error rather than confusing "field not found" failures downstream
 - `Display` renders as alphabetically-sorted `key: val1, key2: val2` pairs
 - Objects cannot be directly interpolated — `{obj}` where obj is an `Object` produces a runtime `TypeError` directing users to access a specific field via `{obj.field}`
 - `type_name()` returns `"object"`
@@ -179,7 +179,7 @@ The parser converts a token stream to a `Module` AST. Key hardening:
 - Duplicate `@define` parameter names are rejected at parse time
 - `@else` without colon gives a targeted error message ("use '@else:' with trailing colon")
 
-**Dot-path parsing**: `@if` conditions and `@for` iterables are both parsed as `Vec<String>` by splitting on `.`. Each segment is validated with `is_valid_identifier`. Parser invariant: the resulting `Vec` is always non-empty (the `debug_assert!` in the validator depends on this). `@if config.debug:` → `condition: vec!["config", "debug"]`. `@for item in data.list:` → `iterable: vec!["data", "list"]`.
+**Dot-path parsing**: `@if` conditions and `@for` iterables are both parsed as `Vec<String>` by splitting on `.`. Each segment is validated with `is_valid_identifier`. Parser invariant: the resulting `Vec` is always non-empty (the validator uses `.first().ok_or_else(...)` on these paths rather than index access, returning `MdsError::syntax` in release builds instead of panicking). `@if config.debug:` → `condition: vec!["config", "debug"]`. `@for item in data.list:` → `iterable: vec!["data", "list"]`.
 
 **Key-value `@for` parsing**: `@for key, value in obj:` is parsed by looking for a comma in the `var_part` (before `in`). Both the key and value identifiers are validated with `is_valid_identifier`. The parser produces `ForBlock { key_var: Some("key"), var: "value", iterable: vec!["obj"], ... }`.
 
@@ -295,7 +295,7 @@ pub(crate) struct EvalContext<'a> {
 }
 ```
 
-**`resolve_dot_path(path: &[String], scope: &Scope) -> Result<Value, MdsError>`**: Private function that walks a dot-separated path starting from `path[0]` as the root scope variable, then traversing `Value::Object` fields for `path[1..]`. Returns a `MdsError::undefined_var` if the root is missing, or `MdsError::syntax` if a field is missing or an intermediate value is not an object.
+**`resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError>`**: Private function that walks a dot-separated path. `root` is the name of the top-level scope variable; `fields` is the remaining path segments after the dot. Looks up `root` in `scope`, then traverses `Value::Object` fields for each element of `fields`. Returns a `MdsError::undefined_var` if the root is missing, or `MdsError::syntax` if a field is missing or an intermediate value is not an object.
 
 `resolve_dot_path` is the single implementation shared across four use sites:
 - `evaluate_expr(Expr::MemberAccess)` — `{config.key}` interpolation
@@ -307,7 +307,7 @@ pub(crate) struct EvalContext<'a> {
 
 **Key-value `@for` iteration**: When `block.key_var` is `Some`, the evaluator matches the iterable against `Value::Object`, sorts keys alphabetically for deterministic output, and iterates over `(key, val)` pairs. Each iteration pushes a scope frame with `key_var → Value::String(key)` and `var → val`. When `key_var` is `None` and the iterable resolves to an object, the evaluator returns an error with a hint to use key-value syntax.
 
-`call_stack` is `Vec<String>` (not `HashSet<String>`). Recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` — O(n) scan at MAX_CALL_DEPTH=128, acceptable. The LIFO property is verified with `assert!` (not `debug_assert!`) after each call returns — safety-critical, runs in release mode.
+`call_stack` is `Vec<String>` (not `HashSet<String>`). Recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` — O(n) scan at MAX_CALL_DEPTH=128, acceptable. The LIFO property is verified with a **structured error return** (not `assert!`) — a mismatch produces `MdsError::syntax`; `prefer_first_error` ensures the render error wins over the LIFO error in double-fault scenarios.
 
 Five resource limits guard against runaway compilation:
 - `MAX_CALL_DEPTH = 128` — prevents stack overflow from deeply nested function calls
@@ -574,7 +574,7 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 - **`compile_file` takes no runtime vars** — call `compile` directly if runtime vars are needed.
 - **Closure capture is eager and shallow** — `get_all_vars()` / `get_all_functions()` / `get_all_namespaces()` snapshot the scope at definition time. Functions defined after the closure capture are not visible to the captured function.
 - **`get_all_functions()` returns `Arc<FunctionDef>`; captured.functions stores owned `FunctionDef`** — the resolver converts `Arc<FunctionDef>` → owned `FunctionDef` when populating captures. `invoke_function` then wraps each captured function back in `Arc::new(f.clone())` when restoring closure scope. This round-trip is intentional to break reference cycles.
-- **`call_stack` is `Vec`, not `HashSet`** — recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` (O(n) scan). At `MAX_CALL_DEPTH = 128`, this is negligible. An `assert!` (not `debug_assert!`) verifies the LIFO invariant after each return — runs in release mode.
+- **`call_stack` is `Vec`, not `HashSet`** — recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` (O(n) scan). At `MAX_CALL_DEPTH = 128`, this is negligible. The LIFO invariant is verified with a **structured error return** (not `assert!`) — a mismatch surfaces as `MdsError::syntax`; `prefer_first_error` ensures the render error takes precedence when both fail simultaneously. Same pattern applies to the `resolving` IndexSet in the resolver.
 - **`IndexSet` replaces two resolver fields** — if you need to check "is this path currently being resolved?", use `self.resolving.contains(&canonical)`. If you need to reconstruct the cycle path, use `self.resolving.iter()`. There is no separate `resolving_stack` field.
 - **`compile_str` / `resolve_source` uses a virtual path `<source>`** — repeated calls to `compile_str` re-parse every time; there is no caching for in-memory sources.
 - **Project root is set on first resolve** — `root_dir` is set lazily. If `resolve_source` is called first, `root_dir` is set to the canonicalized `base_dir`.

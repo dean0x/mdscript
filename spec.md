@@ -39,6 +39,9 @@ name: Alice
 items: [apple, banana]
 premium: true
 count: 3
+config:
+  debug: false
+  greeting: Hello
 ---
 ```
 
@@ -89,7 +92,7 @@ Free tier content here.
 **Rules:**
 
 - Condition is a variable name or dot path (truthy/falsy check): `@if premium:` or `@if config.debug:`
-- Falsy values: `false`, `null`, empty string `""`, empty array `[]`, empty object `{}`, `0`
+- Falsy values: `false`, `null`, empty string `""`, empty array `[]`, empty object `{}`, `0`, `NaN`
 - Everything else is truthy
 - Nesting: plain `@end`, resolved by innermost matching
 - No `@elseif` in v0.1 (use nested `@if` or restructure)
