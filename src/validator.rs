@@ -61,6 +61,18 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
             // 1. No key_var (single-var iteration should be an array)
             // 2. The iterable is a simple identifier (no dot path — can't statically resolve type)
             if block.key_var.is_none() && block.iterable.len() == 1 && !matches!(iterable_val, Value::Array(_)) {
+                if matches!(iterable_val, Value::Object(_)) {
+                    return Err(MdsError::syntax_at(
+                        format!(
+                            "cannot iterate over object '{root}' with a single variable — \
+                             use @for key, value in {root}: to iterate over an object's entries"
+                        ),
+                        file,
+                        source,
+                        block.offset,
+                        root.len(),
+                    ));
+                }
                 return Err(MdsError::type_error_at(
                     iterable_val.type_name(),
                     file,
