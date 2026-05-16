@@ -474,8 +474,7 @@ fn parse_quoted_path(s: &str) -> Result<String, MdsError> {
 /// (`key, value`). Returns `(key_var, loop_var)` where `key_var` is `Some`
 /// only for key-value iteration.
 fn parse_for_vars(var_part: &str) -> Result<(Option<String>, String), MdsError> {
-    if var_part.contains(',') {
-        let comma_idx = var_part.find(',').expect("comma check already passed");
+    if let Some(comma_idx) = var_part.find(',') {
         let key = var_part[..comma_idx].trim().to_string();
         let val = var_part[comma_idx + 1..].trim().to_string();
         if !is_valid_identifier(&key) {
@@ -489,12 +488,11 @@ fn parse_for_vars(var_part: &str) -> Result<(Option<String>, String), MdsError> 
             )));
         }
         Ok((Some(key), val))
+    } else if !is_valid_identifier(var_part) {
+        Err(MdsError::syntax(format!(
+            "invalid loop variable name: '{var_part}'"
+        )))
     } else {
-        if !is_valid_identifier(var_part) {
-            return Err(MdsError::syntax(format!(
-                "invalid loop variable name: '{var_part}'"
-            )));
-        }
         Ok((None, var_part.to_string()))
     }
 }

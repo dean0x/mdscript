@@ -374,64 +374,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_yaml_non_string_key_integer_returns_error() {
-        use serde_yml::Value as YamlValue;
+    /// Assert that `from_yaml` rejects a mapping whose sole key is `key_value`.
+    fn assert_non_string_yaml_key_rejected(key_value: serde_yml::Value) {
         let mut mapping = serde_yml::Mapping::new();
-        mapping.insert(
-            YamlValue::Number(42.into()),
-            YamlValue::String("answer".to_string()),
-        );
-        let yaml = YamlValue::Mapping(mapping);
-        let result = Value::from_yaml(yaml);
-        assert!(
-            result.is_err(),
-            "YAML mapping with integer key must return an error"
-        );
+        mapping.insert(key_value, serde_yml::Value::String("value".to_string()));
+        let result = Value::from_yaml(serde_yml::Value::Mapping(mapping));
+        assert!(result.is_err(), "non-string YAML key must return an error");
         let err = format!("{}", result.unwrap_err());
         assert!(
             err.contains("string") || err.contains("key"),
             "error should mention string keys, got: {err}"
         );
+    }
+
+    #[test]
+    fn from_yaml_non_string_key_integer_returns_error() {
+        assert_non_string_yaml_key_rejected(serde_yml::Value::Number(42.into()));
     }
 
     #[test]
     fn from_yaml_non_string_key_boolean_returns_error() {
-        use serde_yml::Value as YamlValue;
-        let mut mapping = serde_yml::Mapping::new();
-        mapping.insert(
-            YamlValue::Bool(true),
-            YamlValue::String("value".to_string()),
-        );
-        let yaml = YamlValue::Mapping(mapping);
-        let result = Value::from_yaml(yaml);
-        assert!(
-            result.is_err(),
-            "YAML mapping with boolean key must return an error"
-        );
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("string") || err.contains("key"),
-            "error should mention string keys, got: {err}"
-        );
+        assert_non_string_yaml_key_rejected(serde_yml::Value::Bool(true));
     }
 
     #[test]
     fn from_yaml_non_string_key_null_returns_error() {
-        use serde_yml::Value as YamlValue;
-        let mut mapping = serde_yml::Mapping::new();
-        mapping.insert(YamlValue::Null, YamlValue::String("value".to_string()));
-        let yaml = YamlValue::Mapping(mapping);
-        let result = Value::from_yaml(yaml);
-        assert!(
-            result.is_err(),
-            "YAML mapping with null key must return an error"
-        );
-        let err = format!("{}", result.unwrap_err());
-        assert!(
-            err.contains("string") || err.contains("key"),
-            "error should mention string keys, got: {err}"
-        );
+        assert_non_string_yaml_key_rejected(serde_yml::Value::Null);
     }
 
     #[test]
