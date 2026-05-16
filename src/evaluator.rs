@@ -98,22 +98,30 @@ fn evaluate_nodes(
 /// resolved root value. Passing an empty `fields` slice returns the root variable itself.
 /// Returns `Ok(Value)` with the resolved value, or an error if the path is invalid.
 fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError> {
+    if fields.len() > MAX_CALL_DEPTH {
+        return Err(MdsError::syntax(format!(
+            "dot path depth exceeds maximum of {MAX_CALL_DEPTH} segments"
+        )));
+    }
     let mut current = scope
         .get_var(root)
         .cloned()
         .ok_or_else(|| MdsError::undefined_var(root))?;
+    let mut path_so_far = root.to_string();
     for field in fields {
         match current {
             Value::Object(ref map) => {
                 current = map.get(field).cloned().ok_or_else(|| {
                     MdsError::syntax(format!(
-                        "field '{field}' not found on object '{root}'"
+                        "field '{field}' not found on '{path_so_far}'"
                     ))
                 })?;
+                path_so_far.push('.');
+                path_so_far.push_str(field);
             }
             _ => {
                 return Err(MdsError::syntax(format!(
-                    "cannot access field '{field}' on {}",
+                    "cannot access field '{field}' on {} '{path_so_far}'",
                     current.type_name()
                 )));
             }
@@ -317,9 +325,11 @@ fn evaluate_if(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    // Parser invariant: condition is always non-empty (validated at parse time).
-    assert!(!block.condition.is_empty(), "IfBlock.condition must be non-empty");
-    let value = resolve_dot_path(&block.condition[0], &block.condition[1..], scope)?;
+    let root = block
+        .condition
+        .first()
+        .ok_or_else(|| MdsError::syntax("internal error: @if block has empty condition path"))?;
+    let value = resolve_dot_path(root, &block.condition[1..], scope)?;
 
     if value.is_truthy() {
         evaluate_nodes(&block.then_body, scope, ctx)
@@ -330,14 +340,76 @@ fn evaluate_if(
     }
 }
 
+/// Execute one loop body iteration: push a scope frame, bind variables, render, pop.
+///
+/// `bindings` is a slice of `(name, value)` pairs to set in the pushed scope frame.
+/// On double-fault (render error + pop error), the render error is preferred.
+fn run_loop_body(
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    body: &[Node],
+    bindings: &[(&str, Value)],
+) -> Result<String, MdsError> {
+    scope.push();
+    for (name, val) in bindings {
+        scope.set_var(name, val.clone());
+    }
+    let rendered = evaluate_nodes(body, scope, ctx);
+    let pop_result = scope.pop();
+    prefer_first_error(rendered, pop_result)
+}
+
+/// Key-value iteration path for `@for key, value in obj:`.
+fn evaluate_for_key_value(
+    key_var: &str,
+    val_var: &str,
+    map: std::collections::HashMap<String, Value>,
+    body: &[Node],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<String, MdsError> {
+    if map.len() > MAX_LOOP_ITERATIONS {
+        return Err(MdsError::resource_limit(format!(
+            "object has {} entries, exceeding maximum loop iteration limit of {}",
+            map.len(),
+            MAX_LOOP_ITERATIONS
+        )));
+    }
+
+    // Sort keys alphabetically for deterministic output
+    let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut output = String::new();
+    for (key, val) in entries {
+        ctx.total_iterations += 1;
+        if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
+            return Err(MdsError::resource_limit(format!(
+                "total loop iterations exceeded maximum of {} across all loops in this compilation",
+                MAX_TOTAL_ITERATIONS
+            )));
+        }
+        let rendered = run_loop_body(
+            scope,
+            ctx,
+            body,
+            &[(key_var, Value::String(key)), (val_var, val)],
+        )?;
+        output.push_str(&rendered);
+    }
+    Ok(output)
+}
+
 fn evaluate_for(
     block: &ForBlock,
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    // Parser invariant: iterable is always non-empty (validated at parse time).
-    assert!(!block.iterable.is_empty(), "ForBlock.iterable must be non-empty");
-    let iterable = resolve_dot_path(&block.iterable[0], &block.iterable[1..], scope)?;
+    let root = block
+        .iterable
+        .first()
+        .ok_or_else(|| MdsError::syntax("internal error: @for block has empty iterable path"))?;
+    let iterable = resolve_dot_path(root, &block.iterable[1..], scope)?;
 
     if let Some(ref key_var) = block.key_var {
         // Key-value iteration: @for key, value in obj:
@@ -350,36 +422,7 @@ fn evaluate_for(
                 )));
             }
         };
-
-        if map.len() > MAX_LOOP_ITERATIONS {
-            return Err(MdsError::resource_limit(format!(
-                "object has {} entries, exceeding maximum loop iteration limit of {}",
-                map.len(),
-                MAX_LOOP_ITERATIONS
-            )));
-        }
-
-        // Sort keys alphabetically for deterministic output
-        let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        let mut output = String::new();
-        for (key, val) in entries {
-            ctx.total_iterations += 1;
-            if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
-                return Err(MdsError::resource_limit(format!(
-                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                    MAX_TOTAL_ITERATIONS
-                )));
-            }
-            scope.push();
-            scope.set_var(key_var, Value::String(key));
-            scope.set_var(&block.var, val);
-            let rendered = evaluate_nodes(&block.body, scope, ctx);
-            let pop_result = scope.pop();
-            output.push_str(&prefer_first_error(rendered, pop_result)?);
-        }
-        return Ok(output);
+        return evaluate_for_key_value(key_var, &block.var, map, &block.body, scope, ctx);
     }
 
     // Standard array iteration: @for item in iterable:
@@ -408,7 +451,6 @@ fn evaluate_for(
     let items = array.to_vec();
 
     let mut output = String::new();
-
     for item in items {
         ctx.total_iterations += 1;
         if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
@@ -417,11 +459,7 @@ fn evaluate_for(
                 MAX_TOTAL_ITERATIONS
             )));
         }
-        scope.push();
-        scope.set_var(&block.var, item);
-        let rendered = evaluate_nodes(&block.body, scope, ctx);
-        let pop_result = scope.pop();
-        output.push_str(&prefer_first_error(rendered, pop_result)?);
+        output.push_str(&run_loop_body(scope, ctx, &block.body, &[(&block.var, item)])?);
     }
 
     Ok(output)
