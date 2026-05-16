@@ -41,6 +41,7 @@ pub(crate) mod ast;
 pub mod error;
 pub(crate) mod evaluator;
 pub(crate) mod lexer;
+pub(crate) mod limits;
 pub(crate) mod parser;
 pub(crate) mod resolver;
 pub(crate) mod scope;

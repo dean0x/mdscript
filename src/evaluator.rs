@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::ast::{Arg, Expr, ForBlock, IfBlock, IncludeDirective, Node};
 use crate::error::MdsError;
-use crate::parser::MAX_DOT_SEGMENTS;
+use crate::limits::MAX_DOT_SEGMENTS;
 use crate::scope::{FunctionDef, Scope};
 use crate::value::Value;
 
@@ -102,28 +102,31 @@ fn evaluate_nodes(
 fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError> {
     if fields.len() > MAX_DOT_SEGMENTS {
         return Err(MdsError::syntax(format!(
-            "dot path depth exceeds maximum of {MAX_DOT_SEGMENTS} segments"
+            "dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
         )));
     }
     let mut current = scope
         .get_var(root)
         .cloned()
         .ok_or_else(|| MdsError::undefined_var(root))?;
-    let mut path_so_far = root.to_string();
-    for field in fields {
+    for (i, field) in fields.iter().enumerate() {
         match current {
             Value::Object(ref map) => {
                 current = map.get(field).cloned().ok_or_else(|| {
-                    MdsError::syntax(format!(
-                        "field '{field}' not found on '{path_so_far}'"
-                    ))
+                    let path = std::iter::once(root)
+                        .chain(fields[..i].iter().map(|s| s.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    MdsError::syntax(format!("field '{field}' not found on '{path}'"))
                 })?;
-                path_so_far.push('.');
-                path_so_far.push_str(field);
             }
             _ => {
+                let path = std::iter::once(root)
+                    .chain(fields[..i].iter().map(|s| s.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(".");
                 return Err(MdsError::syntax(format!(
-                    "cannot access field '{field}' on {} '{path_so_far}'",
+                    "cannot access field '{field}' on {} '{path}'",
                     current.type_name()
                 )));
             }
@@ -344,17 +347,18 @@ fn evaluate_if(
 
 /// Execute one loop body iteration: push a scope frame, bind variables, render, pop.
 ///
-/// `bindings` is a slice of `(name, value)` pairs to set in the pushed scope frame.
+/// `bindings` is a `Vec` of `(name, value)` pairs to set in the pushed scope frame.
+/// Values are moved into scope directly, avoiding a clone per iteration.
 /// On double-fault (render error + pop error), the render error is preferred.
 fn run_loop_body(
     scope: &mut Scope,
     ctx: &mut EvalContext,
     body: &[Node],
-    bindings: &[(&str, Value)],
+    bindings: Vec<(&str, Value)>,
 ) -> Result<String, MdsError> {
     scope.push();
     for (name, val) in bindings {
-        scope.set_var(name, val.clone());
+        scope.set_var(name, val);
     }
     let rendered = evaluate_nodes(body, scope, ctx);
     let pop_result = scope.pop();
@@ -395,39 +399,21 @@ fn evaluate_for_key_value(
             scope,
             ctx,
             body,
-            &[(key_var, Value::String(key)), (val_var, val)],
+            vec![(key_var, Value::String(key)), (val_var, val)],
         )?;
         output.push_str(&rendered);
     }
     Ok(output)
 }
 
-fn evaluate_for(
-    block: &ForBlock,
+/// Array iteration path for `@for item in array:`.
+fn evaluate_for_array(
+    loop_var: &str,
+    iterable: Value,
+    body: &[Node],
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    let root = block
-        .iterable
-        .first()
-        .ok_or_else(|| MdsError::syntax("internal error: @for block has empty iterable path"))?;
-    let iterable = resolve_dot_path(root, &block.iterable[1..], scope)?;
-
-    if let Some(ref key_var) = block.key_var {
-        // Key-value iteration: @for key, value in obj:
-        let map = match iterable {
-            Value::Object(m) => m,
-            _ => {
-                return Err(MdsError::syntax(format!(
-                    "key-value iteration requires an object, but got {}",
-                    iterable.type_name()
-                )));
-            }
-        };
-        return evaluate_for_key_value(key_var, &block.var, map, &block.body, scope, ctx);
-    }
-
-    // Standard array iteration: @for item in iterable:
     if let Value::Object(_) = &iterable {
         return Err(MdsError::syntax(
             "to iterate over an object's entries, use `@for key, value in obj:` syntax".to_string(),
@@ -461,10 +447,39 @@ fn evaluate_for(
                 MAX_TOTAL_ITERATIONS
             )));
         }
-        output.push_str(&run_loop_body(scope, ctx, &block.body, &[(&block.var, item)])?);
+        output.push_str(&run_loop_body(scope, ctx, body, vec![(loop_var, item)])?);
     }
 
     Ok(output)
+}
+
+fn evaluate_for(
+    block: &ForBlock,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<String, MdsError> {
+    let root = block
+        .iterable
+        .first()
+        .ok_or_else(|| MdsError::syntax("internal error: @for block has empty iterable path"))?;
+    let iterable = resolve_dot_path(root, &block.iterable[1..], scope)?;
+
+    if let Some(ref key_var) = block.key_var {
+        // Key-value iteration: @for key, value in obj:
+        let map = match iterable {
+            Value::Object(m) => m,
+            _ => {
+                return Err(MdsError::syntax(format!(
+                    "key-value iteration requires an object, but got {}",
+                    iterable.type_name()
+                )));
+            }
+        };
+        return evaluate_for_key_value(key_var, &block.var, map, &block.body, scope, ctx);
+    }
+
+    // Standard array iteration: @for item in iterable:
+    evaluate_for_array(&block.var, iterable, &block.body, scope, ctx)
 }
 
 fn evaluate_include(

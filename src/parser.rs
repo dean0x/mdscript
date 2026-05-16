@@ -6,14 +6,11 @@ use crate::ast::{
 };
 use crate::error::MdsError;
 use crate::lexer::Token;
+use crate::limits::MAX_DOT_SEGMENTS;
 
 /// Maximum nesting depth for @if/@for/@define blocks.
 /// Prevents stack overflow from crafted inputs with thousands of nested blocks.
 pub(crate) const MAX_NESTING_DEPTH: usize = 256;
-
-/// Maximum number of segments in a dot-separated path (e.g. `a.b.c` = 3 segments).
-/// Defense-in-depth limit independent of MAX_FILE_SIZE; half of the value nesting cap.
-pub(crate) const MAX_DOT_SEGMENTS: usize = 32;
 
 /// Parse a stream of tokens into a Module AST with optional source context for error spans.
 ///
