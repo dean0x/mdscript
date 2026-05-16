@@ -318,7 +318,7 @@ mod tests {
     // ── Object/Map type tests ─────────────────────────────────────────────────
 
     #[test]
-    fn test_object_truthiness_empty() {
+    fn object_truthiness_empty() {
         assert!(
             !Value::Object(HashMap::new()).is_truthy(),
             "empty object should be falsy"
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_object_truthiness_non_empty() {
+    fn object_truthiness_non_empty() {
         let mut m = HashMap::new();
         m.insert("key".to_string(), Value::String("val".to_string()));
         assert!(
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_yaml_mapping() {
+    fn from_yaml_mapping() {
         use serde_yml::Value as YamlValue;
         let mut mapping = serde_yml::Mapping::new();
         mapping.insert(
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_json_object() {
+    fn from_json_object() {
         let json = serde_json::json!({"key": "val"});
         let result = Value::from_json(json).unwrap();
         if let Value::Object(map) = result {
@@ -364,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_yaml_nested_object_depth_limit() {
+    fn yaml_nested_object_depth_limit() {
         use serde_yml::Value as YamlValue;
 
         // Build a YAML mapping nested 65 levels deep (just past the limit of 64).
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_nested_object_depth_limit() {
+    fn json_nested_object_depth_limit() {
         // Build a JSON object nested 65 levels deep (just past the limit of 64).
         let mut nested = serde_json::Value::Null;
         for _ in 0..65 {
@@ -410,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn test_object_display() {
+    fn object_display() {
         let mut m = HashMap::new();
         m.insert("key1".to_string(), Value::String("val1".to_string()));
         m.insert("key2".to_string(), Value::String("val2".to_string()));
@@ -419,13 +419,13 @@ mod tests {
     }
 
     #[test]
-    fn test_object_type_name() {
+    fn object_type_name() {
         let obj = Value::Object(HashMap::new());
         assert_eq!(obj.type_name(), "object");
     }
 
     #[test]
-    fn test_from_hashmap() {
+    fn from_hashmap() {
         let mut m = HashMap::new();
         m.insert("a".to_string(), Value::Number(1.0));
         let v: Value = m.clone().into();

@@ -306,10 +306,7 @@ The CLI logic has been extracted from `run()` into three dedicated functions:
 
 `run()` in `main.rs` dispatches to one of these three functions. This decomposition means each function has a single responsibility and is independently testable.
 
-**Named constants**: Two named constants control bounded traversal:
-- `MAX_TRAVERSAL_DEPTH: usize = 256` in `src/main.rs` — caps the upward directory walk in `load_config`
-- `MAX_TRAVERSAL_DEPTH: usize = 256` in `src/resolver.rs` — caps the upward directory walk in `find_project_root`
-- Both have the same value and purpose; they are separate named constants in their respective modules
+**Named constant — single source of truth**: `MAX_TRAVERSAL_DEPTH: usize = 256` is defined once in `src/resolver.rs` as `pub(crate)`, re-exported from `src/lib.rs` as `pub const MAX_TRAVERSAL_DEPTH`, and imported in `src/main.rs` via `use mds::MAX_TRAVERSAL_DEPTH`. There is no second definition in `main.rs`. Both the `load_config` upward walk and the `find_project_root` upward walk share this single value via the public library re-export.
 
 **Safety fix in `auto_detect_mds_file`**: The multiple-files branch uses `names.first().map(|s| s.as_str()).unwrap_or("<file>.mds")` instead of `names[0]` to avoid a panic on an empty sorted list.
 
@@ -493,7 +490,7 @@ Key behaviors:
 - **`.md` files require `type: mds`** in frontmatter to be compiled — `validate_file_type` enforces this.
 - **Recursion is detected at evaluation time** using `ctx.call_stack` — the validator cannot catch recursive call chains because they depend on runtime scope.
 - **Nested call result is always a String** — `Arg::Call` evaluation wraps the inner function's output in `Value::String`. Functions that return non-string values (e.g., future numeric functions) will still produce a string when used as a nested argument.
-- **MAX_TRAVERSAL_DEPTH = 256** — caps upward directory walks in both `load_config` (main.rs) and `find_project_root` (resolver.rs); prevents unbounded traversal on unusual filesystems.
+- **MAX_TRAVERSAL_DEPTH = 256** — single definition in `src/resolver.rs`, re-exported as `pub const` via `src/lib.rs`; caps upward directory walks in both `load_config` (main.rs) and `find_project_root` (resolver.rs); prevents unbounded traversal on unusual filesystems.
 - **MAX_CONFIG_SIZE = 1MB** — `mds.json` files larger than 1MB are rejected by `load_config` before parsing; TOCTOU-safe (read first, then check size).
 - **Directory input rejected** — `reject_directory_input()` in main.rs returns an error immediately if the input path is a directory (not a file or stdin); prevents confusing errors deeper in the pipeline.
 - **`mds init` filename traversal rejected** — `run_init` rejects filenames containing `..` components before writing.
@@ -550,6 +547,7 @@ Key behaviors:
 - **`enter_block()` must be paired with `self.depth -= 1`** — the helper only increments; callers are responsible for decrementing after the block body is parsed.
 - **Selective import `from` keyword requires a whitespace separator** — `parse_import_directive` accepts `from ` (space) or `from\t` (tab) but rejects `from"path"` with no gap.
 - **String literal escapes are not full Rust/JSON escapes** — `unescape_string` in the parser only recognizes `\\`, `\"`, and `\'`. A backslash followed by any other character (e.g., `\n`, `\t`) is kept verbatim as both backslash and the following character.
+- **`MdsError` itself is `#[must_use]` at the type level** — in addition to `#[must_use]` on individual constructor methods, the `MdsError` enum has `#[must_use]` applied to the type declaration. This means constructing a `MdsError` value without returning or using it produces a compiler warning. This guards against accidentally constructing an error in a branch and then silently discarding it.
 - **`help(...)` attributes are variant-level, not constructor-level** — `CircularImport`, `Recursion`, and `TypeError` have `#[diagnostic(help(...))]` annotations that miette renders automatically. When adding new error variants, add the `help` attribute directly on the variant, not in the constructor method.
 - **Exit code 2 covers three error types** — `MdsError::Io`, `MdsError::FileNotFound`, and `MdsError::NotMdsFile` all map to exit code 2. Other `MdsError` variants map to exit code 1. Non-`MdsError` miette errors (from `miette::miette!()`) also map to exit code 1.
 - **`mds build` default is file output, not stdout** — before this change the build command always wrote to stdout. Now it writes `<stem>.md` next to the source by default. Existing scripts that pipe `mds build foo.mds` and expect stdout output must be updated to add `-o -`.
@@ -558,7 +556,7 @@ Key behaviors:
 
 ## Key Files
 
-- `src/lib.rs` — public API: `compile`, `compile_file`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `check_collecting_warnings`, `check_str_collecting_warnings`, `load_vars_file`, `clean_output`; re-exports `MAX_FILE_SIZE`; private `resolve_base_dir` helper
+- `src/lib.rs` — public API: `compile`, `compile_file`, `compile_str`, `compile_str_with`, `compile_collecting_warnings`, `compile_str_collecting_warnings`, `check`, `check_str`, `check_str_with`, `check_collecting_warnings`, `check_str_collecting_warnings`, `load_vars_file`, `clean_output`; re-exports `MAX_FILE_SIZE` and `MAX_TRAVERSAL_DEPTH` (both sourced from `resolver.rs`); private `resolve_base_dir` helper
 - `src/main.rs` — CLI entry point: `MdsConfig`/`BuildConfig` structs, `load_config` (TOCTOU-safe, bounded by `MAX_TRAVERSAL_DEPTH`), `resolve_output_path` (6-step precedence), `derive_output_filename`, `auto_detect_mds_file`, `parse_cli_value`, `build_runtime_vars`, `reject_directory_input`, `read_stdin`, `exit_code`; logic split into `run_build`/`run_check`/`run_init`
 - `src/ast.rs` — all AST types including `Arg::Call` for nested function call arguments; the contract between parser and everything downstream
 - `src/lexer.rs` — `Lexer<'a>` struct with `scan_*` methods; public API is `tokenize(source, file)` only

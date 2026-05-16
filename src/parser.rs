@@ -516,9 +516,8 @@ fn parse_interpolation_expr(
             // Dot appears before any '(' — either QualifiedCall or MemberAccess
             let rest_after_dot = &content[dot_pos + 1..];
 
-            if rest_after_dot.contains('(') {
+            if let Some(paren_pos) = rest_after_dot.find('(') {
                 // namespace.func(args) — QualifiedCall
-                let paren_pos = rest_after_dot.find('(').expect("contains('(') checked above");
                 let namespace = content[..dot_pos].trim().to_string();
                 let name = rest_after_dot[..paren_pos].trim().to_string();
                 let args_str = rest_after_dot[paren_pos + 1..]

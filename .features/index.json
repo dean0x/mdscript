@@ -10,19 +10,18 @@
       ],
       "referencedFiles": [
         "src/lib.rs",
-        "src/ast.rs",
-        "src/lexer.rs",
-        "src/parser.rs",
-        "src/validator.rs",
+        "src/main.rs",
         "src/resolver.rs",
         "src/evaluator.rs",
-        "src/scope.rs",
-        "src/value.rs",
+        "src/validator.rs",
+        "src/parser.rs",
         "src/error.rs",
-        "src/main.rs"
+        "src/value.rs",
+        "src/scope.rs",
+        "src/ast.rs"
       ],
-      "lastUpdated": "2026-05-15T15:18:21.672Z",
-      "createdBy": "implement"
+      "lastUpdated": "2026-05-15T20:18:48.664Z",
+      "createdBy": "devflow-knowledge"
     }
   }
 }
