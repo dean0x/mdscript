@@ -11,6 +11,13 @@ use std::sync::OnceLock;
 use crate::error::MdsError;
 use crate::resolver::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
 
+/// Maximum number of path segments allowed in a single import path.
+///
+/// Defense-in-depth against adversarial inputs that could create unbounded
+/// allocations in the segment-accumulation loop. 256 segments is far more
+/// than any realistic import path would contain.
+const MAX_PATH_SEGMENTS: usize = 256;
+
 /// Filesystem abstraction for module resolution.
 ///
 /// Implementations provide path normalization, file reading, and file-type
@@ -61,6 +68,7 @@ pub trait FileSystem: Send + Sync {
 ///
 /// Keys use `/` as separator regardless of host OS.
 /// Designed for WASM environments and testing.
+#[derive(Debug)]
 pub struct VirtualFs {
     modules: HashMap<String, String>,
 }
@@ -86,7 +94,13 @@ impl FileSystem for VirtualFs {
         }
 
         if base.is_empty() {
-            // Root entry point — use key as-is.
+            // Root entry point — use key as-is, but still enforce the segment limit.
+            let segment_count = relative.split('/').filter(|s| !s.is_empty() && *s != ".").count();
+            if segment_count > MAX_PATH_SEGMENTS {
+                return Err(MdsError::resource_limit(format!(
+                    "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{relative}\""
+                )));
+            }
             return Ok(relative.to_string());
         }
 
@@ -113,6 +127,11 @@ impl FileSystem for VirtualFs {
                     segments.pop();
                 }
                 seg => {
+                    if segments.len() >= MAX_PATH_SEGMENTS {
+                        return Err(MdsError::resource_limit(format!(
+                            "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{relative}\""
+                        )));
+                    }
                     segments.push(seg);
                 }
             }
@@ -156,6 +175,7 @@ impl FileSystem for VirtualFs {
 ///
 /// Enforces symlink rejection, path traversal prevention,
 /// file size limits, and UTF-8 validation.
+#[derive(Debug)]
 pub struct NativeFs {
     root_dir: OnceLock<PathBuf>,
 }
@@ -251,6 +271,9 @@ impl Default for NativeFs {
 
 impl FileSystem for NativeFs {
     fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
+        if relative.is_empty() {
+            return Err(MdsError::import_error("import path is empty"));
+        }
         if relative.contains('\0') {
             return Err(MdsError::import_error("import path contains null byte"));
         }
@@ -279,17 +302,9 @@ impl FileSystem for NativeFs {
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
         let path = Path::new(normalized);
-        // Pre-check size via metadata to avoid allocating memory for files that
-        // will be rejected anyway. The post-read check remains as defense-in-depth.
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| MdsError::io(format!("cannot read {normalized}: {e}")))?;
-        if metadata.len() > MAX_FILE_SIZE {
-            return Err(MdsError::resource_limit(format!(
-                "file too large ({} bytes, max {} bytes): {normalized}",
-                metadata.len(),
-                MAX_FILE_SIZE,
-            )));
-        }
+        // Read bytes first, then check size — this is the TOCTOU-safe pattern.
+        // A metadata() pre-check would introduce a race window between the size
+        // check and the actual read. Read first, reject after.
         let bytes = std::fs::read(path)
             .map_err(|e| MdsError::io(format!("cannot read {normalized}: {e}")))?;
         if bytes.len() as u64 > MAX_FILE_SIZE {
@@ -688,10 +703,10 @@ mod tests {
         }
     }
 
-    // ── NativeFs::read size pre-check ─────────────────────────────────────────
+    // ── NativeFs::read size check (TOCTOU-safe post-read) ────────────────────
 
     #[test]
-    fn native_read_size_precheck_rejects_large_file() {
+    fn native_read_rejects_large_file() {
         let dir = TempDir::new().unwrap();
         // Write a file just over the limit.
         let big_content = "x".repeat((MAX_FILE_SIZE + 1) as usize);
@@ -705,5 +720,84 @@ mod tests {
             matches!(err, MdsError::ResourceLimit { .. }),
             "expected ResourceLimit for oversized file, got {err:?}"
         );
+    }
+
+    // ── NativeFs::normalize empty-path guard ─────────────────────────────────
+
+    #[test]
+    fn native_normalize_empty_path_errors() {
+        let fs = NativeFs::new();
+        let result = fs.normalize("", "");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty"),
+            "expected 'empty' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_empty_import_path_errors() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        let base_key = fs
+            .normalize("", &file.display().to_string())
+            .expect("entry normalize");
+        let result = fs.normalize(&base_key, "");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty"),
+            "expected 'empty' in error for empty import, got: {msg}"
+        );
+    }
+
+    // ── VirtualFs segment limit ───────────────────────────────────────────────
+
+    #[test]
+    fn vfs_normalize_too_many_segments_errors() {
+        // Build a path with MAX_PATH_SEGMENTS + 1 normal (non-dot) segments.
+        let long_path = "a/".repeat(MAX_PATH_SEGMENTS + 1) + "file.mds";
+        let result = vfs().normalize("", &long_path);
+        assert!(
+            result.is_err(),
+            "expected Err for path with too many segments, got {result:?}"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit variant, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_normalize_exactly_at_segment_limit_ok() {
+        // Exactly MAX_PATH_SEGMENTS normal segments must succeed.
+        // Each segment is 1 char ("a"), separated by "/".
+        // The path is built so that all segments are new (no base dir context).
+        let exactly = (0..MAX_PATH_SEGMENTS)
+            .map(|i| format!("seg{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let result = vfs().normalize("", &exactly);
+        assert!(
+            result.is_ok(),
+            "expected Ok for path at segment limit, got {result:?}"
+        );
+    }
+
+    // ── Debug derive ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn virtual_fs_implements_debug() {
+        let fs = vfs();
+        let _ = format!("{fs:?}");
+    }
+
+    #[test]
+    fn native_fs_implements_debug() {
+        let fs = NativeFs::new();
+        let _ = format!("{fs:?}");
     }
 }

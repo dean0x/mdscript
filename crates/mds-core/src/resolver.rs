@@ -52,6 +52,15 @@ pub struct ModuleCache {
     resolving: IndexSet<String>,
 }
 
+impl std::fmt::Debug for ModuleCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleCache")
+            .field("modules_count", &self.modules.len())
+            .field("resolving_count", &self.resolving.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ModuleCache {
     /// Create a new `ModuleCache` backed by the native OS filesystem.
     ///
@@ -154,7 +163,7 @@ impl ModuleCache {
         self.resolving.insert(key.to_string());
 
         let ctx = ModuleCtx {
-            file_str: key_display_name(key),
+            file_str: key,
             source: &source,
             base_key: key,
             runtime_vars,
@@ -255,13 +264,39 @@ impl ModuleCache {
         // the canonical directory so imports resolve relative to that directory
         // (not its parent).
         let base_key = format!("{canonical_str}/<source>");
+
+        // Guard against re-entrant or cyclic calls that could form a cycle
+        // back through this root module. Mirrors the resolving bookkeeping in
+        // resolve_by_key so that cycle detection and depth checks apply to the
+        // root module as well.
+        self.check_import_depth()?;
+        self.resolving.insert(base_key.clone());
+
         let ctx = ModuleCtx {
             file_str: "<source>",
             source,
             base_key: &base_key,
             runtime_vars,
         };
-        self.process_module(&ctx, false, warnings).map(Arc::new)
+        let resolved = self.process_module(&ctx, false, warnings);
+
+        let popped = self.resolving.pop();
+        let lifo_result = if popped.as_deref() == Some(&base_key) {
+            Ok(())
+        } else {
+            Err(MdsError::syntax(format!(
+                "internal error: resolving stack LIFO invariant violated \
+                 (expected {expected}, got {got}) — this is a compiler bug, please report it",
+                expected = base_key,
+                got = popped.as_deref().unwrap_or("<empty>"),
+            )))
+        };
+
+        match (resolved, lifo_result) {
+            (Err(module_err), _) => Err(module_err),
+            (Ok(_), Err(lifo_err)) => Err(lifo_err),
+            (Ok(resolved), Ok(())) => Ok(Arc::new(resolved)),
+        }
     }
 
     /// Common module processing: tokenize, parse, build scope, evaluate.
@@ -709,7 +744,14 @@ fn validate_import_path(path: &str) -> Result<(), MdsError> {
 fn validate_file_type(key: &str, source: &str) -> Result<(), MdsError> {
     // Extract extension from the key string (split on '/' and '\\' for portability).
     let filename = key.rsplit(['/', '\\']).next().unwrap_or(key);
-    let ext = filename.rsplit('.').next().filter(|e| *e != filename);
+    // Guard against dotfiles: a filename that starts with '.' and contains no
+    // further '.' (e.g. ".mds") has no extension — reject it the same way
+    // Path::extension() would return None for such files.
+    let ext = if filename.starts_with('.') && !filename[1..].contains('.') {
+        None
+    } else {
+        filename.rsplit('.').next().filter(|e| *e != filename)
+    };
 
     if ext == Some("mds") {
         return Ok(());
