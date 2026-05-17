@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mds::{MdsError, Value, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use mds::{FileSystem, MdsError, ModuleCache, NativeFs, Value, VirtualFs, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
 
 #[test]
 fn public_functions_exist() {
@@ -197,4 +197,55 @@ fn cli_import_pattern_works() {
     let _: fn(&str) -> Result<String, MdsError> = |s| mds::compile_str(s);
     assert!(MAX_FILE_SIZE > 0);
     assert!(MAX_TRAVERSAL_DEPTH > 0);
+}
+
+// ── New public types from Phase 2 ─────────────────────────────────────────────
+
+#[test]
+fn filesystem_trait_importable() {
+    // FileSystem trait is part of the public API.
+    fn _accepts_fs(_fs: &dyn FileSystem) {}
+    let fs = NativeFs::new();
+    _accepts_fs(&fs);
+}
+
+#[test]
+fn native_fs_new_exists() {
+    let _fs = NativeFs::new();
+}
+
+#[test]
+fn virtual_fs_new_exists() {
+    let _fs = VirtualFs::new(HashMap::new());
+}
+
+#[test]
+fn module_cache_native_constructor() {
+    let _cache = ModuleCache::native();
+}
+
+#[test]
+fn module_cache_virtual_fs_constructor() {
+    let _cache = ModuleCache::virtual_fs(HashMap::new());
+}
+
+#[test]
+fn module_cache_with_fs_constructor() {
+    let fs: Box<dyn FileSystem> = Box::new(NativeFs::new());
+    let _cache = ModuleCache::with_fs(fs);
+}
+
+#[test]
+fn module_cache_new_still_works() {
+    let _cache = ModuleCache::new();
+}
+
+#[test]
+fn compile_virtual_exists() {
+    // compile_virtual is callable with a trivial module.
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+    let result = mds::compile_virtual(modules, "main.mds", None);
+    assert!(result.is_ok(), "compile_virtual should succeed: {result:?}");
+    assert_eq!(result.unwrap(), "Hello!\n");
 }
