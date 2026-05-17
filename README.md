@@ -7,7 +7,7 @@ MDS is a template language for composable LLM prompt engineering. Write prompts 
 **Install** (from source):
 
 ```bash
-cargo install --path .
+cargo install --path crates/mds-cli
 ```
 
 **Create your first template** (`hello.mds`):

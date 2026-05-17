@@ -120,7 +120,10 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Valu
         match current {
             Value::Object(ref map) => {
                 current = map.get(field).cloned().ok_or_else(|| {
-                    MdsError::syntax(format!("field '{field}' not found on '{}'", traversed_path()))
+                    MdsError::syntax(format!(
+                        "field '{field}' not found on '{}'",
+                        traversed_path()
+                    ))
                 })?;
             }
             _ => {
@@ -212,9 +215,7 @@ fn resolve_args(
                 let result = call_function(name, &resolved, scope, ctx)?;
                 Ok(Value::String(result))
             }
-            Arg::MemberAccess { object, fields } => {
-                resolve_dot_path(object, fields, scope)
-            }
+            Arg::MemberAccess { object, fields } => resolve_dot_path(object, fields, scope),
         })
         .collect()
 }
@@ -224,7 +225,10 @@ fn resolve_args(
 /// Used when a render error AND an internal pop/LIFO error occur simultaneously:
 /// the render error carries the actionable source-span diagnostic for the user,
 /// while pop/LIFO failures are compiler bugs that surface as secondary errors.
-fn prefer_first_error<T>(first: Result<T, MdsError>, second: Result<(), MdsError>) -> Result<T, MdsError> {
+fn prefer_first_error<T>(
+    first: Result<T, MdsError>,
+    second: Result<(), MdsError>,
+) -> Result<T, MdsError> {
     match (first, second) {
         (Err(first_err), _) => Err(first_err),
         (Ok(_), Err(second_err)) => Err(second_err),
@@ -506,8 +510,8 @@ fn evaluate_include(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::ast::{DefineBlock, Interpolation, TextNode};
+    use std::sync::Arc;
 
     fn text(s: &str) -> Node {
         Node::Text(TextNode {
@@ -702,10 +706,8 @@ mod tests {
     fn prefer_first_error_first_err_wins_over_second_err() {
         // Double-fault: both render and secondary fail. Render error takes precedence
         // because it carries the actionable source-span diagnostic for the user.
-        let result: Result<&str, MdsError> = prefer_first_error(
-            Err(make_err("render error")),
-            Err(make_err("lifo error")),
-        );
+        let result: Result<&str, MdsError> =
+            prefer_first_error(Err(make_err("render error")), Err(make_err("lifo error")));
         let msg = format!("{}", result.unwrap_err());
         assert!(
             msg.contains("render error"),
@@ -795,7 +797,10 @@ mod tests {
         let mut scope = Scope::new();
         let mut warnings = vec![];
         let result = evaluate(&nodes, &mut scope, &mut warnings);
-        assert!(result.is_err(), "output exceeding MAX_OUTPUT_SIZE must be rejected");
+        assert!(
+            result.is_err(),
+            "output exceeding MAX_OUTPUT_SIZE must be rejected"
+        );
         let err = format!("{}", result.unwrap_err());
         assert!(
             err.contains("output") || err.contains("maximum size") || err.contains("50"),

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
+use mds::{MdsError, MAX_FILE_SIZE as MAX_STDIN_SIZE, MAX_TRAVERSAL_DEPTH};
 use miette::Result;
-use mds::MdsError;
 use serde::Deserialize;
 
 // ── Project config (mds.json) ─────────────────────────────────────────────────
@@ -25,12 +25,6 @@ struct BuildConfig {
 /// Maximum allowed size for `mds.json` (1 MB) to prevent runaway memory use.
 const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
-/// Maximum directory traversal depth when searching for `mds.json`.
-///
-/// Imported from the library crate — single source of truth with `find_project_root`
-/// in `resolver.rs`.
-use mds::MAX_TRAVERSAL_DEPTH;
-
 /// Walk up from `start` looking for `mds.json`.
 ///
 /// Returns `Ok(Some((config, config_dir)))` when found, `Ok(None)` when no
@@ -39,9 +33,7 @@ use mds::MAX_TRAVERSAL_DEPTH;
 ///
 /// The `config_dir` is the directory that *contains* `mds.json` — used to
 /// resolve relative `output_dir` values.
-fn load_config(
-    start: &Path,
-) -> std::result::Result<Option<(MdsConfig, PathBuf)>, miette::Error> {
+fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> {
     // Walk upward from `start` (which may be a file; begin at its parent).
     let start_dir = if start.is_dir() {
         start.to_path_buf()
@@ -59,9 +51,8 @@ fn load_config(
         if candidate.is_file() {
             // Read the file first, then check size — avoids a TOCTOU race between
             // a separate metadata() call and the actual read().
-            let bytes = std::fs::read(&candidate).map_err(|e| {
-                miette::miette!("cannot read {}: {e}", candidate.display())
-            })?;
+            let bytes = std::fs::read(&candidate)
+                .map_err(|e| miette::miette!("cannot read {}: {e}", candidate.display()))?;
             if bytes.len() as u64 > MAX_CONFIG_SIZE {
                 return Err(miette::miette!(
                     "mds.json at {} is too large ({} bytes; maximum is 1 MB)",
@@ -69,15 +60,10 @@ fn load_config(
                     bytes.len()
                 ));
             }
-            let raw = String::from_utf8(bytes).map_err(|e| {
-                miette::miette!("invalid UTF-8 in {}: {e}", candidate.display())
-            })?;
-            let config: MdsConfig = serde_json::from_str(&raw).map_err(|e| {
-                miette::miette!(
-                    "invalid mds.json at {}: {e}",
-                    candidate.display()
-                )
-            })?;
+            let raw = String::from_utf8(bytes)
+                .map_err(|e| miette::miette!("invalid UTF-8 in {}: {e}", candidate.display()))?;
+            let config: MdsConfig = serde_json::from_str(&raw)
+                .map_err(|e| miette::miette!("invalid mds.json at {}: {e}", candidate.display()))?;
             return Ok(Some((config, current)));
         }
         match current.parent() {
@@ -108,16 +94,12 @@ fn derive_output_filename(input: &Path) -> OsString {
 ///
 /// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
 /// if `None` (stdin), the fallback name `output.md` is used.
-fn prepare_output_dir(
-    dir: &Path,
-    input_path: Option<&Path>,
-) -> std::result::Result<PathBuf, miette::Error> {
+fn prepare_output_dir(dir: &Path, input_path: Option<&Path>) -> Result<PathBuf> {
     let filename = input_path
         .map(derive_output_filename)
         .unwrap_or_else(|| OsString::from("output.md"));
-    std::fs::create_dir_all(dir).map_err(|e| {
-        miette::miette!("cannot create output directory {}: {e}", dir.display())
-    })?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| miette::miette!("cannot create output directory {}: {e}", dir.display()))?;
     Ok(dir.join(filename))
 }
 
@@ -134,7 +116,7 @@ fn resolve_output_path(
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
-) -> std::result::Result<Option<PathBuf>, miette::Error> {
+) -> Result<Option<PathBuf>> {
     // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
     match output.as_deref() {
         Some("-") => return Ok(None),
@@ -196,7 +178,7 @@ fn resolve_output_path(
 ///
 /// Returns `Ok(path)` if exactly one `.mds` file is found, or an `Err` describing
 /// why auto-detection failed (zero files, multiple files, or I/O error).
-fn auto_detect_mds_file() -> std::result::Result<PathBuf, miette::Error> {
+fn auto_detect_mds_file() -> Result<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
 
@@ -256,11 +238,11 @@ enum Commands {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
         input: Option<PathBuf>,
         /// Output destination: a file path, or "-" for stdout.
-        /// Defaults to <name>.md next to the source file.
+        /// Defaults to `<name>.md` next to the source file.
         /// Mutually exclusive with --out-dir.
         #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
         output: Option<String>,
-        /// Output directory. The output file is named <input-stem>.md inside this directory.
+        /// Output directory. The output file is named `<input-stem>.md` inside this directory.
         /// Directory is created if it does not exist.
         /// Mutually exclusive with -o/--output.
         #[arg(long = "out-dir", conflicts_with = "output")]
@@ -383,9 +365,7 @@ fn main() {
 }
 
 /// Load vars from an optional file path, returning None if no file was given.
-fn load_vars_file(
-    path: Option<PathBuf>,
-) -> Result<Option<HashMap<String, mds::Value>>, miette::Error> {
+fn load_optional_vars_file(path: Option<PathBuf>) -> Result<Option<HashMap<String, mds::Value>>> {
     path.map(|p| mds::load_vars_file(&p).map_err(|e| miette::miette!("{e}")))
         .transpose()
 }
@@ -394,8 +374,8 @@ fn load_vars_file(
 fn build_runtime_vars(
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
-) -> Result<Option<HashMap<String, mds::Value>>, miette::Error> {
-    let mut runtime_vars = load_vars_file(vars)?;
+) -> Result<Option<HashMap<String, mds::Value>>> {
+    let mut runtime_vars = load_optional_vars_file(vars)?;
     for (key, val) in set_vars {
         runtime_vars
             .get_or_insert_with(HashMap::new)
@@ -405,7 +385,7 @@ fn build_runtime_vars(
 }
 
 /// Return an error if the input path is a directory (only file or stdin allowed).
-fn reject_directory_input(input: &Path) -> Result<(), miette::Error> {
+fn reject_directory_input(input: &Path) -> Result<()> {
     if input != Path::new("-") && input.is_dir() {
         return Err(miette::miette!(
             "expected a file, got a directory: {}",
@@ -415,14 +395,11 @@ fn reject_directory_input(input: &Path) -> Result<(), miette::Error> {
     Ok(())
 }
 
-/// Maximum stdin bytes accepted — shares the per-file limit from the library.
-use mds::MAX_FILE_SIZE as MAX_STDIN_SIZE;
-
 /// Read from stdin and return the source string along with the current working directory.
 ///
 /// Reads at most `MAX_STDIN_SIZE + 1` bytes so we can detect over-sized input without
 /// buffering the entire stream first.
-fn read_stdin() -> Result<(String, std::path::PathBuf), miette::Error> {
+fn read_stdin() -> Result<(String, PathBuf)> {
     let mut source = String::new();
     std::io::stdin()
         .take(MAX_STDIN_SIZE + 1)
@@ -443,9 +420,7 @@ fn read_stdin() -> Result<(String, std::path::PathBuf), miette::Error> {
 /// Callers can use the flag to decide whether to print a banner (e.g. `run_build`).
 ///
 /// Does not check for directory or validate the file; callers perform those checks after resolution.
-fn resolve_input(
-    input: Option<PathBuf>,
-) -> std::result::Result<(PathBuf, bool), miette::Error> {
+fn resolve_input(input: Option<PathBuf>) -> Result<(PathBuf, bool)> {
     match input {
         Some(p) => Ok((p, false)),
         None => auto_detect_mds_file().map(|p| (p, true)),
@@ -458,26 +433,18 @@ fn resolve_input(
 /// writes the compiled string, and prints `"Compiled to {path}"` to stderr
 /// unless `quiet` is set.  When `output_path` is `None`, prints the compiled
 /// string to stdout with no trailing newline.
-fn write_output(
-    output_path: Option<PathBuf>,
-    compiled: &str,
-    quiet: bool,
-) -> std::result::Result<(), miette::Error> {
+fn write_output(output_path: Option<PathBuf>, compiled: &str, quiet: bool) -> Result<()> {
     match output_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        miette::miette!(
-                            "cannot create output directory {}: {e}",
-                            parent.display()
-                        )
+                        miette::miette!("cannot create output directory {}: {e}", parent.display())
                     })?;
                 }
             }
-            std::fs::write(&path, compiled).map_err(|e| {
-                miette::miette!("cannot write {}: {e}", path.display())
-            })?;
+            std::fs::write(&path, compiled)
+                .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
             if !quiet {
                 eprintln!("Compiled to {}", path.display());
             }
@@ -489,14 +456,24 @@ fn write_output(
     Ok(())
 }
 
-fn run_build(
+struct BuildArgs {
     input: Option<PathBuf>,
     output: Option<String>,
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
     quiet: bool,
-) -> Result<(), miette::Error> {
+}
+
+fn run_build(args: BuildArgs) -> Result<()> {
+    let BuildArgs {
+        input,
+        output,
+        out_dir,
+        vars,
+        set_vars,
+        quiet,
+    } = args;
     let runtime_vars = build_runtime_vars(vars, set_vars)?;
 
     // Resolve the input: explicit path, or auto-detect from cwd.
@@ -519,8 +496,7 @@ fn run_build(
         mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
             .map_err(miette::Error::from)?
     } else {
-        mds::compile_collecting_warnings(&input, runtime_vars)
-            .map_err(miette::Error::from)?
+        mds::compile_collecting_warnings(&input, runtime_vars).map_err(miette::Error::from)?
     };
 
     if !quiet {
@@ -537,20 +513,19 @@ fn run_check(
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
     quiet: bool,
-) -> Result<(), miette::Error> {
+) -> Result<()> {
     let runtime_vars = build_runtime_vars(vars, set_vars)?;
 
     // Resolve the input: explicit path/stdin, or auto-detect from cwd.
     // run_check does not print a banner on auto-detect — check is a silent validation.
-    let (input, _auto_detected) = resolve_input(input)?;
+    let (input, _) = resolve_input(input)?;
 
     reject_directory_input(&input)?;
 
     if input == Path::new("-") {
         let (source, cwd) = read_stdin()?;
-        let ((), warnings) =
-            mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-                .map_err(miette::Error::from)?;
+        let ((), warnings) = mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
+            .map_err(miette::Error::from)?;
         if !quiet {
             for w in &warnings {
                 eprintln!("{w}");
@@ -558,8 +533,8 @@ fn run_check(
             eprintln!("OK: <stdin>");
         }
     } else {
-        let ((), warnings) = mds::check_collecting_warnings(&input, runtime_vars)
-            .map_err(miette::Error::from)?;
+        let ((), warnings) =
+            mds::check_collecting_warnings(&input, runtime_vars).map_err(miette::Error::from)?;
         if !quiet {
             for w in &warnings {
                 eprintln!("{w}");
@@ -570,7 +545,7 @@ fn run_check(
     Ok(())
 }
 
-fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<(), miette::Error> {
+fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
     if filename
         .components()
         .any(|c| c == std::path::Component::ParentDir)
@@ -610,7 +585,7 @@ Your items:
     Ok(())
 }
 
-fn run(cli: Cli) -> Result<(), miette::Error> {
+fn run(cli: Cli) -> Result<()> {
     let quiet = cli.quiet;
     match cli.command {
         Commands::Build {
@@ -619,7 +594,14 @@ fn run(cli: Cli) -> Result<(), miette::Error> {
             out_dir,
             vars,
             set_vars,
-        } => run_build(input, output, out_dir, vars, set_vars, quiet),
+        } => run_build(BuildArgs {
+            input,
+            output,
+            out_dir,
+            vars,
+            set_vars,
+            quiet,
+        }),
         Commands::Check {
             input,
             vars,
@@ -718,14 +700,11 @@ mod tests {
 
     #[test]
     fn resolve_output_path_stdin_no_o_is_stdout() {
-        let result = resolve_output_path(
-            &Some(PathBuf::from("-")),
-            &None,
-            &None,
-            &None,
-        )
-        .unwrap();
-        assert_eq!(result, None, "stdin input with no -o should resolve to stdout");
+        let result = resolve_output_path(&Some(PathBuf::from("-")), &None, &None, &None).unwrap();
+        assert_eq!(
+            result, None,
+            "stdin input with no -o should resolve to stdout"
+        );
     }
 
     #[test]

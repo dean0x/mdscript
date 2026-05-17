@@ -462,9 +462,7 @@ impl MdsError {
     }
 
     pub(crate) fn not_mds_file(path: impl Into<String>) -> Self {
-        MdsError::NotMdsFile {
-            path: path.into(),
-        }
+        MdsError::NotMdsFile { path: path.into() }
     }
 }
 
@@ -504,13 +502,19 @@ mod tests {
     #[test]
     fn arity_display_singular_argument() {
         let e = MdsError::arity("f", 1, 0);
-        assert!(e.to_string().contains("argument"), "should say 'argument' not 'arguments' for 1");
+        assert!(
+            e.to_string().contains("argument"),
+            "should say 'argument' not 'arguments' for 1"
+        );
     }
 
     #[test]
     fn arity_display_plural_arguments() {
         let e = MdsError::arity("f", 2, 0);
-        assert!(e.to_string().contains("arguments"), "should say 'arguments' for 2");
+        assert!(
+            e.to_string().contains("arguments"),
+            "should say 'arguments' for 2"
+        );
     }
 
     #[test]
@@ -638,5 +642,4 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
-
 }

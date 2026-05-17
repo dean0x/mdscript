@@ -231,7 +231,10 @@ mod tests {
     fn scope_pop_nested_frame_succeeds() {
         let mut scope = Scope::new();
         scope.push();
-        assert!(scope.pop().is_ok(), "popping a non-global frame should succeed");
+        assert!(
+            scope.pop().is_ok(),
+            "popping a non-global frame should succeed"
+        );
         // Back to one frame — next pop must fail again.
         assert!(scope.pop().is_err());
     }

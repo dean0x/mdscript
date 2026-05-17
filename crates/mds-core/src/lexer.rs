@@ -87,9 +87,7 @@ impl<'a> Lexer<'a> {
 
         while self.pos < self.chars.len() {
             let bp = self.byte_pos(self.pos);
-            if is_line_start_chars(&self.chars, self.pos)
-                && self.source[bp..].starts_with("---")
-            {
+            if is_line_start_chars(&self.chars, self.pos) && self.source[bp..].starts_with("---") {
                 let end_pos = self.pos + 3;
                 let at_end = end_pos >= self.chars.len()
                     || self.chars[end_pos] == '\n'
@@ -176,9 +174,7 @@ impl<'a> Lexer<'a> {
         let mut content = String::new();
         while self.pos < self.chars.len() {
             let bp = self.byte_pos(self.pos);
-            if is_line_start_chars(&self.chars, self.pos)
-                && self.source[bp..].starts_with("```")
-            {
+            if is_line_start_chars(&self.chars, self.pos) && self.source[bp..].starts_with("```") {
                 let (bc, is_close) = scan_fence(&self.chars, self.pos);
                 if is_close && bc >= self.code_fence_backticks {
                     break;
@@ -222,7 +218,8 @@ impl<'a> Lexer<'a> {
         }
         let next = self.chars[self.pos + 1];
         if next == '{' {
-            self.tokens.push(Token::EscapedBrace(self.byte_pos(self.pos)));
+            self.tokens
+                .push(Token::EscapedBrace(self.byte_pos(self.pos)));
             self.pos += 2;
             true
         } else if next == '}' {

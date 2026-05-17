@@ -111,11 +111,10 @@ impl Value {
         match json {
             serde_json::Value::Null => Ok(Value::Null),
             serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
-            serde_json::Value::Number(n) => {
-                n.as_f64()
-                    .map(Value::Number)
-                    .ok_or_else(|| MdsError::json_error(format!("unsupported number: {n:?}")))
-            }
+            serde_json::Value::Number(n) => n
+                .as_f64()
+                .map(Value::Number)
+                .ok_or_else(|| MdsError::json_error(format!("unsupported number: {n:?}"))),
             serde_json::Value::String(s) => Ok(Value::String(s)),
             serde_json::Value::Array(arr) => arr
                 .into_iter()
@@ -465,7 +464,10 @@ mod tests {
         m.insert("key1".to_string(), Value::String("val1".to_string()));
         m.insert("key2".to_string(), Value::String("val2".to_string()));
         let s = Value::Object(m).to_string();
-        assert_eq!(s, "key1: val1, key2: val2", "object display should be sorted key: val pairs");
+        assert_eq!(
+            s, "key1: val1, key2: val2",
+            "object display should be sorted key: val pairs"
+        );
     }
 
     #[test]

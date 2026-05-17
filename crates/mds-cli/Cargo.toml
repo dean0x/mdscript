@@ -1,0 +1,25 @@
+[package]
+name = "mds-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "MDS (Markdown Script) compiler — command-line interface"
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "mds"
+path = "src/main.rs"
+
+[dependencies]
+mds = { package = "mds-core", path = "../mds-core" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+miette = { workspace = true, features = ["fancy"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -133,10 +133,7 @@ impl ModuleCache {
     /// initialisation, import-depth guard, and path-traversal prevention.  The caller
     /// must check the cache before calling `read_validated_file`; that way cache hits
     /// pay only the cost of two `canonicalize` syscalls and no I/O.
-    fn canonicalize_and_check(
-        &mut self,
-        path: &Path,
-    ) -> Result<(PathBuf, bool), MdsError> {
+    fn canonicalize_and_check(&mut self, path: &Path) -> Result<(PathBuf, bool), MdsError> {
         let canonical = Self::check_symlink(path)?;
 
         // Set root_dir on first resolve (project root, not just entry point directory)
@@ -169,9 +166,8 @@ impl ModuleCache {
                 canonical.display()
             )));
         }
-        String::from_utf8(bytes).map_err(|e| {
-            MdsError::io(format!("invalid UTF-8 in {}: {e}", canonical.display()))
-        })
+        String::from_utf8(bytes)
+            .map_err(|e| MdsError::io(format!("invalid UTF-8 in {}: {e}", canonical.display())))
     }
 
     /// Resolve a module from file path. Handles caching and cycle detection.
@@ -229,7 +225,10 @@ impl ModuleCache {
                 "internal error: resolving stack LIFO invariant violated \
                  (expected {expected}, got {got}) — this is a compiler bug, please report it",
                 expected = canonical.display(),
-                got = popped.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<empty>".to_string()),
+                got = popped
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<empty>".to_string()),
             )))
         };
 
@@ -290,12 +289,21 @@ impl ModuleCache {
         let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
 
         // Build scope from frontmatter + runtime vars
-        let mut scope = build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, runtime_vars)?;
+        let mut scope =
+            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, runtime_vars)?;
 
         // Walk the AST: collect @define functions (with closure capture), process imports/exports
-        let ctx = ModuleCtx { file_str, source, base_dir, runtime_vars };
-        let CollectedDefs { functions, has_explicit_exports, explicit_exports } = self
-            .collect_definitions_and_imports(&module.body, &mut scope, &ctx, warnings)?;
+        let ctx = ModuleCtx {
+            file_str,
+            source,
+            base_dir,
+            runtime_vars,
+        };
+        let CollectedDefs {
+            functions,
+            has_explicit_exports,
+            explicit_exports,
+        } = self.collect_definitions_and_imports(&module.body, &mut scope, &ctx, warnings)?;
 
         // Validate that all named exports refer to defined functions or "prompt"
         validate_exports(&explicit_exports, &functions)?;
@@ -496,15 +504,19 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         match import {
-            ImportDirective::Alias { path, alias, offset } => {
-                self.resolve_alias_import(path, alias, *offset, scope, ctx, warnings)
-            }
+            ImportDirective::Alias {
+                path,
+                alias,
+                offset,
+            } => self.resolve_alias_import(path, alias, *offset, scope, ctx, warnings),
             ImportDirective::Merge { path, offset } => {
                 self.resolve_merge_import(path, *offset, scope, ctx, warnings)
             }
-            ImportDirective::Selective { names, path, offset } => {
-                self.resolve_selective_import(names, path, *offset, scope, ctx, warnings)
-            }
+            ImportDirective::Selective {
+                names,
+                path,
+                offset,
+            } => self.resolve_selective_import(names, path, *offset, scope, ctx, warnings),
         }
     }
 }
@@ -716,13 +728,11 @@ fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
             .is_some_and(|fm| {
                 // Check each line for `type: mds` without a full YAML parse.
                 fm.lines().any(|line| {
-                    line.trim()
-                        .strip_prefix("type:")
-                        .is_some_and(|v| {
-                            let v = v.trim();
-                            // Match all three YAML quoting styles, mirroring strip_type_mds.
-                            v == "mds" || v == "\"mds\"" || v == "'mds'"
-                        })
+                    line.trim().strip_prefix("type:").is_some_and(|v| {
+                        let v = v.trim();
+                        // Match all three YAML quoting styles, mirroring strip_type_mds.
+                        v == "mds" || v == "\"mds\"" || v == "'mds'"
+                    })
                 })
             });
         if found {
@@ -738,10 +748,7 @@ fn validate_file_type(path: &Path, source: &str) -> Result<(), MdsError> {
 /// `IndexSet` preserves insertion order, so we can use it as both the set
 /// and the ordered stack for cycle path reconstruction.
 fn build_cycle_string(resolving: &IndexSet<PathBuf>, repeated: &Path) -> String {
-    let start = resolving
-        .iter()
-        .position(|p| p == repeated)
-        .unwrap_or(0);
+    let start = resolving.iter().position(|p| p == repeated).unwrap_or(0);
     resolving.as_slice()[start..]
         .iter()
         .map(PathBuf::as_path)
@@ -781,9 +788,9 @@ fn attach_import_span(
         MdsError::FileNotFound { span: None, .. } => {
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)
         }
-        MdsError::CircularImport { cycle, span: None, .. } => {
-            MdsError::circular_import_at(cycle, file_str, source, offset, line_len)
-        }
+        MdsError::CircularImport {
+            cycle, span: None, ..
+        } => MdsError::circular_import_at(cycle, file_str, source, offset, line_len),
         other => other,
     }
 }

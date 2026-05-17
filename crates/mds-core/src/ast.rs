@@ -61,10 +61,7 @@ pub enum Expr {
         args: Vec<Arg>,
     },
     /// Object field access: `{config.key}` or `{a.b.c}`
-    MemberAccess {
-        object: String,
-        fields: Vec<String>,
-    },
+    MemberAccess { object: String, fields: Vec<String> },
 }
 
 /// A function argument — a string literal, variable reference, or nested call.

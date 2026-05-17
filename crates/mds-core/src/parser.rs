@@ -126,8 +126,7 @@ impl Parser<'_> {
                     self.pos += 1;
                 }
                 Token::Interpolation(expr, offset) => {
-                    let interp =
-                        parse_interpolation_expr(expr, *offset, self.file, self.source)?;
+                    let interp = parse_interpolation_expr(expr, *offset, self.file, self.source)?;
                     nodes.push(Node::Interpolation(interp));
                     self.pos += 1;
                 }
@@ -265,9 +264,9 @@ impl Parser<'_> {
         // Supports both:
         //   @for item in iterable:
         //   @for key, value in iterable:
-        let in_idx = rest
-            .find(" in ")
-            .ok_or_else(|| MdsError::syntax("@for must follow pattern: @for <var> in <iterable>:"))?;
+        let in_idx = rest.find(" in ").ok_or_else(|| {
+            MdsError::syntax("@for must follow pattern: @for <var> in <iterable>:")
+        })?;
         let var_part = rest[..in_idx].trim();
         let iterable_str = rest[in_idx + 4..].trim();
 
@@ -565,10 +564,22 @@ fn parse_dot_expr(
         let args_str = rest_after_dot[paren_pos + 1..]
             .trim()
             .strip_suffix(')')
-            .ok_or_else(|| MdsError::syntax_at("unclosed parenthesis in function call", file, source, offset, len))?;
+            .ok_or_else(|| {
+                MdsError::syntax_at(
+                    "unclosed parenthesis in function call",
+                    file,
+                    source,
+                    offset,
+                    len,
+                )
+            })?;
         let args = parse_args(args_str)?;
         return Ok(Interpolation {
-            expr: Expr::QualifiedCall { namespace, name, args },
+            expr: Expr::QualifiedCall {
+                namespace,
+                name,
+                args,
+            },
             offset,
             len,
         });
@@ -579,7 +590,10 @@ fn parse_dot_expr(
     validate_dot_path_parts(&parts).map_err(|reason| {
         MdsError::syntax_at(
             format!("invalid dot-path in interpolation: '{content}' — {reason}"),
-            file, source, offset, len,
+            file,
+            source,
+            offset,
+            len,
         )
     })?;
     let object = parts[0].trim().to_string();
@@ -622,7 +636,15 @@ fn parse_interpolation_expr(
         let args_str = content[paren_pos + 1..]
             .trim()
             .strip_suffix(')')
-            .ok_or_else(|| MdsError::syntax_at("unclosed parenthesis in function call", file, source, offset, len))?;
+            .ok_or_else(|| {
+                MdsError::syntax_at(
+                    "unclosed parenthesis in function call",
+                    file,
+                    source,
+                    offset,
+                    len,
+                )
+            })?;
         let args = parse_args(args_str)?;
         return Ok(Interpolation {
             expr: Expr::Call { name, args },
