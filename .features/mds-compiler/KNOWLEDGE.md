@@ -3,20 +3,20 @@ feature: mds-compiler
 name: MDS Compiler
 description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, or modifying CLI output behavior (file output, project config). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport, EvalContext, CapturedScope, IndexSet, Arc, exit_code, mds.json, output_dir, out_dir, default output, file output, MdsConfig, BuildConfig, load_config, resolve_output_path, derive_output_filename, non_exhaustive, pub(crate), run_build, run_check, run_init, MAX_TRAVERSAL_DEPTH, MAX_NESTING_DEPTH, MAX_DOT_SEGMENTS, object, map, Value::Object, dot notation, member access, MemberAccess, key-value iteration, resolve_dot_path, dot path, config.field, raw_frontmatter, strip_type_mds, prepend_frontmatter, frontmatter preservation, limits, dot segments, run_loop_body, evaluate_for_array, evaluate_for_key_value, validate_dot_path_parts."
 category: architecture
-directories: [src/, tests/]
+directories: [crates/mds-core/src/, crates/mds-cli/src/, crates/mds-cli/tests/]
 referencedFiles:
-  - src/lib.rs
-  - src/ast.rs
-  - src/lexer.rs
-  - src/parser.rs
-  - src/validator.rs
-  - src/resolver.rs
-  - src/evaluator.rs
-  - src/scope.rs
-  - src/value.rs
-  - src/error.rs
-  - src/limits.rs
-  - src/main.rs
+  - crates/mds-core/src/lib.rs
+  - crates/mds-core/src/ast.rs
+  - crates/mds-core/src/lexer.rs
+  - crates/mds-core/src/parser.rs
+  - crates/mds-core/src/validator.rs
+  - crates/mds-core/src/resolver.rs
+  - crates/mds-core/src/evaluator.rs
+  - crates/mds-core/src/scope.rs
+  - crates/mds-core/src/value.rs
+  - crates/mds-core/src/error.rs
+  - crates/mds-core/src/limits.rs
+  - crates/mds-cli/src/main.rs
 created: 2026-05-12
 updated: 2026-05-17
 ---
@@ -62,7 +62,7 @@ External dependencies are minimal: `clap` for CLI parsing, `serde_json` and `ser
 
 ## Component Architecture
 
-### Limits Module (`src/limits.rs`)
+### Limits Module (`crates/mds-core/src/limits.rs`)
 
 A single-file module that centralizes defense-in-depth resource limits that are shared across multiple pipeline stages. Currently holds one constant:
 
@@ -70,7 +70,7 @@ A single-file module that centralizes defense-in-depth resource limits that are 
 
 When adding a new limit that spans more than one pipeline stage, add it here rather than duplicating the constant.
 
-### Token Model (`src/lexer.rs`)
+### Token Model (`crates/mds-core/src/lexer.rs`)
 
 The lexer converts raw source text into a flat `Vec<Token>` via the public `tokenize(source, file)` function. Internally, this creates a `Lexer<'a>` struct and calls `.run()`. The `Lexer` struct encapsulates all mutable scanning state (`pos`, `tokens`, `code_fence_backticks`) and the pre-computed `chars: Vec<char>` and `byte_offsets: Vec<usize>` arrays. The monolithic loop has been decomposed into focused `scan_*` methods: `scan_frontmatter`, `scan_code_fence`, `scan_code_content`, `scan_directive`, `scan_escape`, `scan_interpolation`, `scan_text`. The public API (`tokenize`) is unchanged.
 
@@ -85,7 +85,7 @@ Token variants cover the complete surface syntax:
 
 Code blocks are tokenized as opaque `CodeContent` — no interpolation or directive parsing occurs inside triple-backtick regions. This is enforced at the lexer level; the rest of the pipeline never needs to check for this case.
 
-### AST (`src/ast.rs`)
+### AST (`crates/mds-core/src/ast.rs`)
 
 The `Module` struct holds an optional `Frontmatter` and a `Vec<Node>`. `Node` is an enum with variants for every construct: `Text(TextNode)`, `Interpolation`, `EscapedBrace`, `If`, `For`, `Define`, `Import`, `Export`, `Include`.
 
@@ -121,7 +121,7 @@ The `Module` struct holds an optional `Frontmatter` and a `Vec<Node>`. `Node` is
 
 All non-text AST nodes carry a byte `offset` into the original source. This is threaded through to `MdsError` variants to produce precise source-span diagnostics via `miette`.
 
-### Scope (`src/scope.rs`)
+### Scope (`crates/mds-core/src/scope.rs`)
 
 `Scope` is a stack of `Frame` structs (innermost last). Each frame holds:
 - `vars: HashMap<String, Value>` — variable bindings
@@ -156,7 +156,7 @@ Key consequence: code that previously wrote `func.captured_namespaces = ...` now
 
 Helper methods `get_all_namespaces()`, `get_all_functions()`, `get_all_vars()` snapshot the current scope for closure capture at definition time. All three iterate **outer frame to inner frame**, so when the same key appears in multiple frames, the inner (more recently defined) value wins. `get_all_functions()` returns `HashMap<String, Arc<FunctionDef>>` — callers that need owned captures must convert via `.map(|(k, v)| (k, (*v).clone()))`. All three delegate to the private `collect_all<T: Clone>(get: impl Fn(&Frame) -> &HashMap<String, T>)` method — to add a new `get_all_X()` for a new `Frame` field, add the field to `Frame` and call `self.collect_all(|f| &f.x)`.
 
-### Value System (`src/value.rs`)
+### Value System (`crates/mds-core/src/value.rs`)
 
 The `Value` enum has six variants: `String`, `Number(f64)`, `Boolean`, `Array(Vec<Value>)`, `Object(HashMap<String, Value>)`, `Null`. Truthiness rules match JavaScript-like semantics: `0`, `""`, `[]`, `{}`, `null`, `false`, and `NaN` are falsy; everything else is truthy.
 
@@ -178,11 +178,11 @@ Both converters enforce `MAX_VALUE_DEPTH = 64` to reject YAML/JSON nested deeper
 
 The `Value` enum implements `From` for common Rust types: `&str`, `String`, `f64`, `i64`, `i32`, `bool`, `Vec<T: Into<Value>>`, and `HashMap<String, Value>`. Use these conversions in test setup and programmatic API code rather than constructing enum variants directly.
 
-### Parser (`src/parser.rs`)
+### Parser (`crates/mds-core/src/parser.rs`)
 
 The parser converts a token stream to a `Module` AST. Key hardening:
 
-- `pub(crate) const MAX_NESTING_DEPTH: usize = 256` — `pub(crate)` (not private) so `src/validator.rs` can import it for `validate_var_args`'s depth guard; enforced via a `depth` counter on the parser struct; shared between two independent limits: (1) `@if`/`@for`/`@define` block nesting via `enter_block()`, and (2) nested function call argument depth via `parse_args_inner`
+- `pub(crate) const MAX_NESTING_DEPTH: usize = 256` — `pub(crate)` (not private) so `crates/mds-core/src/validator.rs` can import it for `validate_var_args`'s depth guard; enforced via a `depth` counter on the parser struct; shared between two independent limits: (1) `@if`/`@for`/`@define` block nesting via `enter_block()`, and (2) nested function call argument depth via `parse_args_inner`
 - `enter_block()` — extracted helper that increments `self.depth` and returns `Err` if the limit is exceeded; called at the start of `parse_if_block`, `parse_for_block`, and `parse_define_block`, with matching `self.depth -= 1` on exit
 - `is_valid_identifier(s)` — all directive names (function names, loop vars, aliases, export names) are validated: must start with ASCII letter or `_`, contain only ASCII alphanumeric or `_`
 - Duplicate `@define` parameter names are rejected at parse time
@@ -190,7 +190,7 @@ The parser converts a token stream to a `Module` AST. Key hardening:
 
 **Dot-path helpers** — three private functions handle all dot-path validation and construction in one consistent place:
 
-- `validate_dot_path_parts(parts: &[&str]) -> Result<(), String>` — validates every segment is a valid identifier AND `parts.len() <= MAX_DOT_SEGMENTS` (from `src/limits.rs`). Returns `Ok` or an error reason string. Called from `parse_if_block`, `parse_for_block`, `parse_dot_expr`, and `parse_single_arg_inner`. Any new directive or argument type that parses dot paths must call this rather than duplicating the validation.
+- `validate_dot_path_parts(parts: &[&str]) -> Result<(), String>` — validates every segment is a valid identifier AND `parts.len() <= MAX_DOT_SEGMENTS` (from `crates/mds-core/src/limits.rs`). Returns `Ok` or an error reason string. Called from `parse_if_block`, `parse_for_block`, `parse_dot_expr`, and `parse_single_arg_inner`. Any new directive or argument type that parses dot paths must call this rather than duplicating the validation.
 - `parse_dot_expr(content, dot_pos, offset, len, file, source)` — resolves the dot-before-paren ambiguity: `{ns.func(args)}` → `Expr::QualifiedCall`, `{obj.field}` → `Expr::MemberAccess`. Extracted from `parse_interpolation_expr` to keep the dispatch function readable.
 - `parse_for_vars(var_part)` — splits `"key, value"` or `"item"` into `(Option<String>, String)`; validates both identifiers with `is_valid_identifier`.
 
@@ -211,7 +211,7 @@ The parser converts a token stream to a `Module` AST. Key hardening:
 
 Note: `parse_single_arg` (without `_inner` suffix) exists only under `#[cfg(test)]` as a test shim.
 
-### Validator (`src/validator.rs`)
+### Validator (`crates/mds-core/src/validator.rs`)
 
 Validates the AST against the current scope **before** evaluation. Catches: undefined variables in `{interpolation}` and `@if` conditions, undefined iterables in `@for`, undefined namespaces in `@include`, undefined functions and arity mismatches in calls, and undefined variable arguments to functions.
 
@@ -231,7 +231,7 @@ Validates the AST against the current scope **before** evaluation. Catches: unde
 
 The `arity_at` constructor provides source-span-aware arity errors from the validator.
 
-### Resolver (`src/resolver.rs`)
+### Resolver (`crates/mds-core/src/resolver.rs`)
 
 The resolver is the orchestrator. `ModuleCache` drives the full pipeline for each file and caches `Arc<ResolvedModule>` by canonical path, preventing repeated work and providing cycle detection.
 
@@ -297,7 +297,7 @@ The resolver is the orchestrator. `ModuleCache` drives the full pipeline for eac
 
 **Closure capture**: When a `@define` node is processed, the resolver calls `FunctionDef::from(def)` (which creates empty captures), then fills `func.captured.namespaces`, `func.captured.functions`, and `func.captured.vars` from the current scope state. `captured.functions` is populated by converting `Arc<FunctionDef>` → owned `FunctionDef` (via `(*v).clone()`) to avoid reference cycles.
 
-### Evaluator (`src/evaluator.rs`)
+### Evaluator (`crates/mds-core/src/evaluator.rs`)
 
 The evaluator walks the AST and produces the final rendered string. Its public entry point is `evaluate(nodes, scope, warnings)` — the `warnings: &mut Vec<String>` parameter is threaded through all internal helpers including `evaluate_include`. Nothing in the evaluator calls `eprintln!` directly.
 
@@ -311,7 +311,7 @@ pub(crate) struct EvalContext<'a> {
 }
 ```
 
-**`resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError>`**: Private function that walks a dot-separated path. `root` is the name of the top-level scope variable; `fields` is the remaining path segments after the dot. First guards against `fields.len() > MAX_DOT_SEGMENTS` (from `src/limits.rs`), then looks up `root` in `scope` and traverses `Value::Object` fields for each element of `fields`. Returns `MdsError::undefined_var` if the root is missing, or `MdsError::syntax` if the path is too long, a field is missing, or an intermediate value is not an object.
+**`resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError>`**: Private function that walks a dot-separated path. `root` is the name of the top-level scope variable; `fields` is the remaining path segments after the dot. First guards against `fields.len() > MAX_DOT_SEGMENTS` (from `crates/mds-core/src/limits.rs`), then looks up `root` in `scope` and traverses `Value::Object` fields for each element of `fields`. Returns `MdsError::undefined_var` if the root is missing, or `MdsError::syntax` if the path is too long, a field is missing, or an intermediate value is not an object.
 
 `resolve_dot_path` is the single implementation shared across four use sites:
 - `evaluate_expr(Expr::MemberAccess)` — `{config.key}` interpolation
@@ -350,7 +350,7 @@ All limits return `MdsError::ResourceLimit` (no source span). If you add a warni
 
 `@import` and `@export` nodes are no-ops in the evaluator (handled entirely by the resolver).
 
-### Frontmatter Preservation (`src/lib.rs`)
+### Frontmatter Preservation (`crates/mds-core/src/lib.rs`)
 
 Compiled output preserves the source file's YAML frontmatter. The pipeline steps for this are in `lib.rs`:
 
@@ -360,7 +360,7 @@ Compiled output preserves the source file's YAML frontmatter. The pipeline steps
 
 Both `compile_collecting_warnings` and `compile_str_collecting_warnings` call `prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body)` as the final step before returning. This means output from a source with only `type: mds` in frontmatter (and nothing else useful) will have no frontmatter block in the output.
 
-### Error System (`src/error.rs`)
+### Error System (`crates/mds-core/src/error.rs`)
 
 **`#[non_exhaustive]`**: `MdsError` is marked `#[non_exhaustive]`. External crates cannot exhaustively match on it without a wildcard arm, allowing new variants to be added without a semver break. Within the crate, all match arms are exhaustive and do not need `_`.
 
@@ -368,7 +368,7 @@ Both `compile_collecting_warnings` and `compile_str_collecting_warnings` call `p
 
 **`_at` constructors**: Every major `MdsError` variant has a corresponding `_at` constructor that accepts `(file: &str, source: &str, offset: usize, len: usize)` and populates the `span` and `src` fields for miette rich diagnostics. Always prefer `_at` variants inside the validator and evaluator where source offsets are available from the AST nodes.
 
-### CLI (`src/main.rs`)
+### CLI (`crates/mds-cli/src/main.rs`)
 
 The CLI logic has been extracted from `run()` into three dedicated functions:
 
@@ -376,7 +376,7 @@ The CLI logic has been extracted from `run()` into three dedicated functions:
 - `run_check(input, vars, set_vars, quiet)` — handles the complete check flow
 - `run_init(filename, force, quiet)` — creates a starter `.mds` file; rejects `..` components in the filename before writing
 
-**Named constant — single source of truth**: `MAX_TRAVERSAL_DEPTH: usize = 256` is defined once in `src/resolver.rs` as `pub(crate)`, re-exported from `src/lib.rs` as `pub const MAX_TRAVERSAL_DEPTH`, and imported in `src/main.rs` via `use mds::MAX_TRAVERSAL_DEPTH`.
+**Named constant — single source of truth**: `MAX_TRAVERSAL_DEPTH: usize = 256` is defined once in `crates/mds-core/src/resolver.rs` as `pub(crate)`, re-exported from `crates/mds-core/src/lib.rs` as `pub const MAX_TRAVERSAL_DEPTH`, and imported in `crates/mds-cli/src/main.rs` via `use mds::MAX_TRAVERSAL_DEPTH`.
 
 **`load_config` TOCTOU fix**: `load_config` reads the file bytes first via `fs::read`, then checks `bytes.len() as u64 > MAX_CONFIG_SIZE`. This avoids the TOCTOU race that a `metadata().len()` check before `read()` would introduce.
 
@@ -410,7 +410,7 @@ The `ModuleCache` is created per top-level compile call (not shared across calls
 
 ### Adding a New Directive
 
-1. Add a new variant to `Node` in `src/ast.rs` (and any needed sub-structs)
+1. Add a new variant to `Node` in `crates/mds-core/src/ast.rs` (and any needed sub-structs)
 2. Lex: directives are already captured as `Token::Directive` — no lexer change required unless new syntax
 3. Parse: add a branch in `Parser::parse_directive()` matching the `@name` prefix; validate identifier names with `is_valid_identifier()`
 4. Validate: add a match arm in `validate_node()` — validate what the resolver can't catch
@@ -421,9 +421,9 @@ The `ModuleCache` is created per top-level compile call (not shared across calls
 ### Adding a New Arg Variant
 
 If you add a fifth `Arg` variant, update all three sites that match on `Arg`:
-1. `parse_single_arg_inner` in `src/parser.rs` — construct the new variant
-2. `resolve_args` in `src/evaluator.rs` — evaluate to a `Value`
-3. `validate_var_args` in `src/validator.rs` — pre-evaluation validity check
+1. `parse_single_arg_inner` in `crates/mds-core/src/parser.rs` — construct the new variant
+2. `resolve_args` in `crates/mds-core/src/evaluator.rs` — evaluate to a `Value`
+3. `validate_var_args` in `crates/mds-core/src/validator.rs` — pre-evaluation validity check
 
 Failing to update any one of these produces an incomplete `match` compilation error, which is intentional — `Arg` has no wildcard arm.
 
@@ -492,7 +492,7 @@ Always prefer `_at` variants inside the validator and evaluator where source off
 
 ### CLI Exit Codes
 
-The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps errors to structured exit codes:
+The `exit_code(err: &miette::Error) -> i32` function in `crates/mds-cli/src/main.rs` maps errors to structured exit codes:
 
 | Code | Meaning |
 |---|---|
@@ -530,8 +530,8 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 - **MAX_IMPORT_DEPTH = 64** — prevents stack overflow from deep chains; tracked via `IndexSet::len()` on the single `resolving` field.
 - **MAX_FILE_SIZE = 10MB** — checked by reading bytes first, then comparing size (TOCTOU-safe).
 - **MAX_CALL_DEPTH = 128** — prevents stack overflow from deeply nested function calls; tracked via `ctx.call_stack.len()`.
-- **MAX_NESTING_DEPTH = 256** — `pub(crate)` constant in `src/parser.rs`; shared between: (1) parser-level block nesting (`@if`/`@for`/`@define`) via `enter_block()`, and (2) argument-level nested call depth validation in `validate_var_args`.
-- **MAX_DOT_SEGMENTS = 32** — `pub(crate)` constant in `src/limits.rs`; caps the number of segments in any dot-separated path (e.g. `a.b.c` = 3). Enforced in four independent places: parser `@if` condition, parser `@for` iterable, parser interpolation/argument via `validate_dot_path_parts`, and evaluator `resolve_dot_path`. This is intentionally a width limit independent of `MAX_NESTING_DEPTH`.
+- **MAX_NESTING_DEPTH = 256** — `pub(crate)` constant in `crates/mds-core/src/parser.rs`; shared between: (1) parser-level block nesting (`@if`/`@for`/`@define`) via `enter_block()`, and (2) argument-level nested call depth validation in `validate_var_args`.
+- **MAX_DOT_SEGMENTS = 32** — `pub(crate)` constant in `crates/mds-core/src/limits.rs`; caps the number of segments in any dot-separated path (e.g. `a.b.c` = 3). Enforced in four independent places: parser `@if` condition, parser `@for` iterable, parser interpolation/argument via `validate_dot_path_parts`, and evaluator `resolve_dot_path`. This is intentionally a width limit independent of `MAX_NESTING_DEPTH`.
 - **MAX_LOOP_ITERATIONS = 100,000** — per-loop hard cap in the evaluator; applies to both array and key-value object iteration.
 - **MAX_TOTAL_ITERATIONS = 1,000,000** — cumulative cap across all loops in one compilation; tracked via `ctx.total_iterations`.
 - **MAX_OUTPUT_SIZE = 50 MB** — evaluator checks output buffer size after each node.
@@ -540,7 +540,7 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 - **`.md` files require `type: mds`** in frontmatter to be compiled — `validate_file_type` enforces this.
 - **Recursion is detected at evaluation time** using `ctx.call_stack` — the validator cannot catch recursive call chains because they depend on runtime scope.
 - **`Arg::Call` result is always String; `Arg::MemberAccess` result is the raw Value** — functions receiving a nested call argument always receive `Value::String`. Functions receiving a member access argument receive the field's actual runtime type.
-- **MAX_TRAVERSAL_DEPTH = 256** — single definition in `src/resolver.rs`, re-exported as `pub const` via `src/lib.rs`; caps upward directory walks in both `load_config` (main.rs) and `find_project_root` (resolver.rs).
+- **MAX_TRAVERSAL_DEPTH = 256** — single definition in `crates/mds-core/src/resolver.rs`, re-exported as `pub const` via `crates/mds-core/src/lib.rs`; caps upward directory walks in both `load_config` (mds-cli/src/main.rs) and `find_project_root` (mds-core/src/resolver.rs).
 - **MAX_CONFIG_SIZE = 1MB** — `mds.json` files larger than 1MB are rejected by `load_config` before parsing; TOCTOU-safe (read first, then check size).
 - **Directory input rejected** — `reject_directory_input()` in main.rs returns an error immediately if the input path is a directory.
 - **`mds init` filename traversal rejected** — `run_init` rejects filenames containing `..` components before writing.
@@ -603,7 +603,7 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 - **Project root is set on first resolve** — `root_dir` is set lazily. If `resolve_source` is called first, `root_dir` is set to the canonicalized `base_dir`.
 - **Re-export errors are raised at the barrel module, not the consumer** — when `@export name from "path"` fails, the error surfaces when the barrel itself is compiled.
 - **`--set KEY=VAL` last-write wins for duplicate keys** — later `--set` values overwrite earlier ones (HashMap semantics).
-- **`MAX_NESTING_DEPTH` is `pub(crate)`, not `pub`** — elevated to `pub(crate)` so `src/validator.rs` can import it for its argument-depth guard.
+- **`MAX_NESTING_DEPTH` is `pub(crate)`, not `pub`** — elevated to `pub(crate)` so `crates/mds-core/src/validator.rs` can import it for its argument-depth guard.
 - **`TextNode` has no offset** — raw text nodes do not carry a byte offset. Only structured nodes have offsets for error reporting.
 - **`enter_block()` must be paired with `self.depth -= 1`** — the helper only increments; callers are responsible for decrementing after the block body is parsed.
 - **Selective import `from` keyword requires a whitespace separator** — `parse_import_directive` accepts `from ` (space) or `from\t` (tab) but rejects `from"path"` with no gap.
@@ -617,28 +617,28 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 
 ## Key Files
 
-- `src/limits.rs` — single-file module for cross-pipeline resource limits; currently holds `MAX_DOT_SEGMENTS = 32`; add new shared limits here instead of duplicating constants across modules
-- `src/lib.rs` — public API; `strip_type_mds` and `prepend_frontmatter` private helpers for frontmatter preservation; re-exports `MAX_FILE_SIZE` and `MAX_TRAVERSAL_DEPTH`; private `resolve_base_dir` helper; `compile_collecting_warnings` / `compile_str_collecting_warnings` are the canonical output assembly points
-- `src/main.rs` — CLI entry point: `MdsConfig`/`BuildConfig` structs, `load_config` (TOCTOU-safe, bounded by `MAX_TRAVERSAL_DEPTH`), `resolve_output_path` (6-step precedence), `derive_output_filename`, `auto_detect_mds_file`, `parse_cli_value`, `build_runtime_vars`, `reject_directory_input`, `read_stdin`, `exit_code`; logic split into `run_build`/`run_check`/`run_init`
-- `src/ast.rs` — all AST types: `Expr::MemberAccess` and `Arg::MemberAccess` for dot-notation; `IfBlock.condition: Vec<String>` and `ForBlock.iterable: Vec<String>` as dot-separated paths; `ForBlock.key_var: Option<String>` for key-value iteration; `Arg::Call` for nested function call arguments
-- `src/lexer.rs` — `Lexer<'a>` struct with `scan_*` methods; public API is `tokenize(source, file)` only
-- `src/parser.rs` — converts token stream to `Module` AST; `pub(crate) MAX_NESTING_DEPTH`; `enter_block()` helper; `validate_dot_path_parts` for all dot-path validation (uses `MAX_DOT_SEGMENTS`); `parse_dot_expr` for interpolation disambiguation; `parse_for_vars` for loop variable splitting; `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion
-- `src/resolver.rs` — orchestrator: `ModuleCache` with `Arc<ResolvedModule>` cache; `raw_frontmatter: Option<String>` field on `ResolvedModule`; `IndexSet<PathBuf>` for cycle detection; security checks; import dispatch split into dedicated helpers
-- `src/evaluator.rs` — AST walker; `EvalContext<'a>` bundles `call_stack: Vec<String>`, `total_iterations`, `warnings`; `resolve_dot_path` private function for dot-path traversal; `Expr::MemberAccess` and `Arg::MemberAccess` evaluation; key-value `@for` iteration; `evaluate_include` pushes to `ctx.warnings`
-- `src/validator.rs` — pre-evaluation semantic checks; `validate()` takes `&mut Scope`; `Arg::MemberAccess` validation (root only); key-value `@for` validation with `key_var` injection; static type check bypass for dot-path iterables; uses `crate::parser::MAX_NESTING_DEPTH` for depth guard
-- `src/scope.rs` — `CapturedScope` struct bundling three closure capture maps; `FunctionDef.captured: CapturedScope`; `Frame::functions` and `NamespaceScope::functions` store `Arc<FunctionDef>`; `set_function` takes `Arc<FunctionDef>`; `get_function` returns `Option<&Arc<FunctionDef>>`
-- `src/value.rs` — runtime value enum (`#[non_exhaustive]`); `Value::Object(HashMap<String, Value>)` variant with alphabetical-sort `Display`; `from_yaml`/`from_json` are `pub(crate)` and convert YAML mappings/JSON objects to `Value::Object`; `From<HashMap<String, Value>>` impl
-- `src/error.rs` — `MdsError` enum (`#[non_exhaustive]`); all constructor methods are `pub(crate)`; all major variants have `_at` constructors; `ResourceLimit` variant for evaluator/value depth guards
-- `tests/integration.rs` — end-to-end tests covering all features, error paths, CLI integration, and spec-compliance tests; includes object/map access, key-value iteration, dot-path conditions, frontmatter preservation, resource limit tests, directory rejection, path traversal rejection, and `mds.json` config tests
+- `crates/mds-core/src/limits.rs` — single-file module for cross-pipeline resource limits; currently holds `MAX_DOT_SEGMENTS = 32`; add new shared limits here instead of duplicating constants across modules
+- `crates/mds-core/src/lib.rs` — public API; `strip_type_mds` and `prepend_frontmatter` private helpers for frontmatter preservation; re-exports `MAX_FILE_SIZE` and `MAX_TRAVERSAL_DEPTH`; private `resolve_base_dir` helper; `compile_collecting_warnings` / `compile_str_collecting_warnings` are the canonical output assembly points
+- `crates/mds-cli/src/main.rs` — CLI entry point: `MdsConfig`/`BuildConfig` structs, `load_config` (TOCTOU-safe, bounded by `MAX_TRAVERSAL_DEPTH`), `resolve_output_path` (6-step precedence), `derive_output_filename`, `auto_detect_mds_file`, `parse_cli_value`, `build_runtime_vars`, `reject_directory_input`, `read_stdin`, `exit_code`; logic split into `run_build`/`run_check`/`run_init`
+- `crates/mds-core/src/ast.rs` — all AST types: `Expr::MemberAccess` and `Arg::MemberAccess` for dot-notation; `IfBlock.condition: Vec<String>` and `ForBlock.iterable: Vec<String>` as dot-separated paths; `ForBlock.key_var: Option<String>` for key-value iteration; `Arg::Call` for nested function call arguments
+- `crates/mds-core/src/lexer.rs` — `Lexer<'a>` struct with `scan_*` methods; public API is `tokenize(source, file)` only
+- `crates/mds-core/src/parser.rs` — converts token stream to `Module` AST; `pub(crate) MAX_NESTING_DEPTH`; `enter_block()` helper; `validate_dot_path_parts` for all dot-path validation (uses `MAX_DOT_SEGMENTS`); `parse_dot_expr` for interpolation disambiguation; `parse_for_vars` for loop variable splitting; `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion
+- `crates/mds-core/src/resolver.rs` — orchestrator: `ModuleCache` with `Arc<ResolvedModule>` cache; `raw_frontmatter: Option<String>` field on `ResolvedModule`; `IndexSet<PathBuf>` for cycle detection; security checks; import dispatch split into dedicated helpers
+- `crates/mds-core/src/evaluator.rs` — AST walker; `EvalContext<'a>` bundles `call_stack: Vec<String>`, `total_iterations`, `warnings`; `resolve_dot_path` private function for dot-path traversal; `Expr::MemberAccess` and `Arg::MemberAccess` evaluation; key-value `@for` iteration; `evaluate_include` pushes to `ctx.warnings`
+- `crates/mds-core/src/validator.rs` — pre-evaluation semantic checks; `validate()` takes `&mut Scope`; `Arg::MemberAccess` validation (root only); key-value `@for` validation with `key_var` injection; static type check bypass for dot-path iterables; uses `crate::parser::MAX_NESTING_DEPTH` for depth guard
+- `crates/mds-core/src/scope.rs` — `CapturedScope` struct bundling three closure capture maps; `FunctionDef.captured: CapturedScope`; `Frame::functions` and `NamespaceScope::functions` store `Arc<FunctionDef>`; `set_function` takes `Arc<FunctionDef>`; `get_function` returns `Option<&Arc<FunctionDef>>`
+- `crates/mds-core/src/value.rs` — runtime value enum (`#[non_exhaustive]`); `Value::Object(HashMap<String, Value>)` variant with alphabetical-sort `Display`; `from_yaml`/`from_json` are `pub(crate)` and convert YAML mappings/JSON objects to `Value::Object`; `From<HashMap<String, Value>>` impl
+- `crates/mds-core/src/error.rs` — `MdsError` enum (`#[non_exhaustive]`); all constructor methods are `pub(crate)`; all major variants have `_at` constructors; `ResourceLimit` variant for evaluator/value depth guards
+- `crates/mds-cli/tests/integration.rs` — end-to-end tests covering all features, error paths, CLI integration, and spec-compliance tests; includes object/map access, key-value iteration, dot-path conditions, frontmatter preservation, resource limit tests, directory rejection, path traversal rejection, and `mds.json` config tests
 
 ## Related
 
-- `src/resolver.rs` — canonical reference for the module system, import semantics, security guards, `Arc<ResolvedModule>` cache, `raw_frontmatter` field, `IndexSet` cycle detection, and `ResolvedModule` export API
-- `src/evaluator.rs` — canonical reference for `EvalContext` usage, `resolve_dot_path` implementation, directive execution order, closure restore, call-depth guards, key-value for-loop implementation, nested arg evaluation, and warning collection
-- `src/scope.rs` — canonical reference for `CapturedScope` struct, `Arc<FunctionDef>` in frames, closure capture API (`get_all_*` methods), and shadowing semantics
-- `src/ast.rs` — canonical reference for `Arg` variants, `Expr` variants, and dot-path representations in `IfBlock`/`ForBlock`; any new argument or expression form starts here
-- `src/lib.rs` — canonical reference for the two-tier warning API, `compile_file` entry point, `resolve_base_dir` helper, `strip_type_mds`/`prepend_frontmatter` for frontmatter preservation, and `clean_output`
-- `src/main.rs` — canonical reference for CLI auto-detection logic, `parse_cli_value` coercion rules, `exit_code` categorization, output destination resolution (`resolve_output_path`), project config loading (`load_config`), and run_build/run_check/run_init decomposition
-- `src/error.rs` — canonical reference for `#[non_exhaustive]` on `MdsError`, `pub(crate)` constructor pattern, `help(...)` diagnostic attribute placement, and available `_at` constructors
-- `src/value.rs` — canonical reference for `#[non_exhaustive]` on `Value`, `pub(crate)` converters, `Value::Object` semantics, and the JSON/YAML parsing boundary
-- `tests/integration.rs` — covers all directive combinations including object access, key-value iteration, dot-path conditions, frontmatter preservation, nested function calls, CLI stdin/quiet mode, auto-detect, error help-text, scope/export visibility rules, re-export error scenarios, default file output, `--out-dir`, `mds.json` config behavior, and all resource limit scenarios
+- `crates/mds-core/src/resolver.rs` — canonical reference for the module system, import semantics, security guards, `Arc<ResolvedModule>` cache, `raw_frontmatter` field, `IndexSet` cycle detection, and `ResolvedModule` export API
+- `crates/mds-core/src/evaluator.rs` — canonical reference for `EvalContext` usage, `resolve_dot_path` implementation, directive execution order, closure restore, call-depth guards, key-value for-loop implementation, nested arg evaluation, and warning collection
+- `crates/mds-core/src/scope.rs` — canonical reference for `CapturedScope` struct, `Arc<FunctionDef>` in frames, closure capture API (`get_all_*` methods), and shadowing semantics
+- `crates/mds-core/src/ast.rs` — canonical reference for `Arg` variants, `Expr` variants, and dot-path representations in `IfBlock`/`ForBlock`; any new argument or expression form starts here
+- `crates/mds-core/src/lib.rs` — canonical reference for the two-tier warning API, `compile_file` entry point, `resolve_base_dir` helper, `strip_type_mds`/`prepend_frontmatter` for frontmatter preservation, and `clean_output`
+- `crates/mds-cli/src/main.rs` — canonical reference for CLI auto-detection logic, `parse_cli_value` coercion rules, `exit_code` categorization, output destination resolution (`resolve_output_path`), project config loading (`load_config`), and run_build/run_check/run_init decomposition
+- `crates/mds-core/src/error.rs` — canonical reference for `#[non_exhaustive]` on `MdsError`, `pub(crate)` constructor pattern, `help(...)` diagnostic attribute placement, and available `_at` constructors
+- `crates/mds-core/src/value.rs` — canonical reference for `#[non_exhaustive]` on `Value`, `pub(crate)` converters, `Value::Object` semantics, and the JSON/YAML parsing boundary
+- `crates/mds-cli/tests/integration.rs` — covers all directive combinations including object access, key-value iteration, dot-path conditions, frontmatter preservation, nested function calls, CLI stdin/quiet mode, auto-detect, error help-text, scope/export visibility rules, re-export error scenarios, default file output, `--out-dir`, `mds.json` config behavior, and all resource limit scenarios
