@@ -494,7 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn native_normalize_path_traversal_rejected() {
+    fn native_normalize_absolute_path_injection_rejected() {
+        // Security boundary: an absolute path outside the established project root
+        // must be rejected with "escapes project directory".
         let project_dir = TempDir::new().unwrap();
         let outside_dir = TempDir::new().unwrap();
 
@@ -505,27 +507,79 @@ mod tests {
         // Establish root via entry point.
         let base_key = fs
             .normalize("", &entry.display().to_string())
-            .expect("entry point");
-        // Absolute path injection — may or may not error depending on platform path depth;
-        // the real traversal check is exercised via the relative escape below.
-        let _ = fs.normalize(&base_key, &outside.display().to_string());
+            .expect("entry point normalize should succeed");
 
-        // Use relative traversal to escape the project dir.
-        // Construct a relative path that would escape: ../../secret.mds relative to project.
-        // Since we don't control the temp path depth, we'll try many ".." segments.
-        let escape = "../".repeat(20) + &outside.display().to_string().trim_start_matches('/');
-        let result2 = fs.normalize(&base_key, &escape);
+        // Absolute path pointing outside the project root.
+        let result = fs.normalize(&base_key, &outside.display().to_string());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
         assert!(
-            result2.is_err(),
-            "expected traversal error, got {result2:?}"
+            msg.contains("escapes project"),
+            "expected 'escapes project' in error, got: {msg}"
         );
-        if let Err(e) = result2 {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("escapes project") || msg.contains("symlinks") || msg.contains("not found"),
-                "unexpected error: {msg}"
-            );
-        }
+    }
+
+    #[test]
+    fn native_normalize_relative_traversal_rejected() {
+        // Security boundary: a relative `../` sequence that escapes the project
+        // root must be rejected with "escapes project directory".
+        let project_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+
+        let entry = make_temp_file(&project_dir, "main.mds", "hello");
+        // Place a real file outside so canonicalization has a target to resolve.
+        let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
+
+        let fs = NativeFs::new();
+        // Establish root via entry point.
+        let base_key = fs
+            .normalize("", &entry.display().to_string())
+            .expect("entry point normalize should succeed");
+
+        // Build a relative path using many ".." segments to escape the project
+        // dir, then re-root into the outside directory.
+        let outside_str = outside.display().to_string();
+        let escape = "../".repeat(20) + outside_str.trim_start_matches('/');
+        let result = fs.normalize(&base_key, &escape);
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes project"),
+            "expected 'escapes project' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_set_root_rejects_paths_outside_root() {
+        // set_root should initialize the root directory so that subsequent
+        // normalize calls reject paths outside that root.
+        let project_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+
+        let entry = make_temp_file(&project_dir, "main.mds", "hello");
+        let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
+
+        let fs = NativeFs::new();
+        // Initialize root explicitly via set_root, not via normalize.
+        fs.set_root(&project_dir.path().display().to_string())
+            .expect("set_root should succeed for a real directory");
+
+        // normalize uses "" base for entry points, which would re-init root;
+        // test the already-set root by normalizing a non-entry import instead.
+        // First establish a valid base key by normalizing the entry point
+        // (set_root already won the OnceLock race, so root stays as project_dir).
+        let base_key = fs
+            .normalize("", &entry.display().to_string())
+            .expect("entry point normalize should succeed");
+
+        // A path outside the root must be rejected.
+        let result = fs.normalize(&base_key, &outside.display().to_string());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes project"),
+            "expected 'escapes project' after set_root, got: {msg}"
+        );
     }
 
     #[test]
