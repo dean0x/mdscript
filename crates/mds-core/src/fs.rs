@@ -17,6 +17,22 @@ use crate::resolver::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
 /// detection. Security properties (symlink rejection, traversal prevention)
 /// are implementation-specific: [`NativeFs`] enforces them for OS access,
 /// while [`VirtualFs`] relies on its closed key-space.
+///
+/// # Security Contract
+///
+/// Custom implementations provided via [`crate::resolver::ModuleResolver::with_fs`]
+/// MUST uphold the following minimum obligations:
+///
+/// - **Path traversal prevention**: `normalize` must reject paths that escape
+///   the intended root (e.g., `../../../etc/passwd`).
+/// - **Null-byte rejection**: `normalize` must reject paths containing `\0`.
+/// - **File size limits**: `read` must refuse content larger than
+///   [`crate::resolver::MAX_FILE_SIZE`] bytes (10 MB) to prevent resource exhaustion.
+/// - **Input sanitization**: `normalize` must reject empty paths.
+///
+/// Failing to implement these controls silently bypasses the security enforced
+/// by [`NativeFs`] and may expose the host system to arbitrary file reads or
+/// denial-of-service attacks.
 pub trait FileSystem: Send + Sync {
     /// Normalize a path relative to a base key.
     ///
@@ -112,14 +128,25 @@ impl FileSystem for VirtualFs {
     }
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
-        self.modules
+        let content = self
+            .modules
             .get(normalized)
-            .cloned()
-            .ok_or_else(|| MdsError::file_not_found(normalized.to_string()))
+            .ok_or_else(|| MdsError::file_not_found(normalized.to_string()))?;
+        if content.len() as u64 > MAX_FILE_SIZE {
+            return Err(MdsError::resource_limit(format!(
+                "file too large ({} bytes, max {} bytes): {normalized}",
+                content.len(),
+                MAX_FILE_SIZE,
+            )));
+        }
+        Ok(content.clone())
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {
-        normalized.ends_with(".md")
+        Path::new(normalized)
+            .extension()
+            .and_then(|e| e.to_str())
+            == Some("md")
     }
 }
 
@@ -206,7 +233,11 @@ impl NativeFs {
 
     /// Initialize root_dir from a canonical entry-point directory.
     fn init_root(&self, canonical_dir: &Path) {
-        // OnceLock: set() silently no-ops if already initialized.
+        // Skip the up-to-256 exists() calls if the root is already established.
+        if self.root_dir.get().is_some() {
+            return;
+        }
+        // OnceLock: set() silently no-ops if another thread raced here.
         let root = Self::find_project_root(canonical_dir);
         let _ = self.root_dir.set(root);
     }
@@ -220,6 +251,9 @@ impl Default for NativeFs {
 
 impl FileSystem for NativeFs {
     fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
+        if relative.contains('\0') {
+            return Err(MdsError::import_error("import path contains null byte"));
+        }
         let path = if base.is_empty() {
             // Root entry point: treat `relative` as a filesystem path.
             Path::new(relative).to_path_buf()
@@ -245,6 +279,17 @@ impl FileSystem for NativeFs {
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
         let path = Path::new(normalized);
+        // Pre-check size via metadata to avoid allocating memory for files that
+        // will be rejected anyway. The post-read check remains as defense-in-depth.
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| MdsError::io(format!("cannot read {normalized}: {e}")))?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(MdsError::resource_limit(format!(
+                "file too large ({} bytes, max {} bytes): {normalized}",
+                metadata.len(),
+                MAX_FILE_SIZE,
+            )));
+        }
         let bytes = std::fs::read(path)
             .map_err(|e| MdsError::io(format!("cannot read {normalized}: {e}")))?;
         if bytes.len() as u64 > MAX_FILE_SIZE {
@@ -512,5 +557,100 @@ mod tests {
     fn native_is_markdown_mds() {
         let fs = NativeFs::new();
         assert!(!fs.is_markdown("file.mds"));
+    }
+
+    // ── VirtualFs size limit ──────────────────────────────────────────────────
+
+    #[test]
+    fn vfs_read_over_size_limit_errors() {
+        // Content slightly over 10 MB.
+        let big = "x".repeat((MAX_FILE_SIZE + 1) as usize);
+        let fs = VirtualFs::new(HashMap::from([("big.mds".to_string(), big)]));
+        let err = fs.read("big.mds").unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_read_at_size_limit_ok() {
+        // Content exactly at 10 MB should be allowed.
+        let exact = "x".repeat(MAX_FILE_SIZE as usize);
+        let fs = VirtualFs::new(HashMap::from([("exact.mds".to_string(), exact.clone())]));
+        let content = fs.read("exact.mds").unwrap();
+        assert_eq!(content.len(), MAX_FILE_SIZE as usize);
+    }
+
+    // ── NativeFs null-byte rejection ──────────────────────────────────────────
+
+    #[test]
+    fn native_normalize_null_byte_errors() {
+        let fs = NativeFs::new();
+        let result = fs.normalize("", "./\0evil.mds");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null byte"),
+            "expected null byte in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_null_byte_in_import_errors() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        let base_key = fs
+            .normalize("", &file.display().to_string())
+            .expect("entry normalize");
+        let result = fs.normalize(&base_key, "./\0evil.mds");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null byte"),
+            "expected null byte in error, got: {msg}"
+        );
+    }
+
+    // ── is_markdown consistency ───────────────────────────────────────────────
+
+    #[test]
+    fn vfs_is_markdown_path_extension_precision() {
+        // "foo.cmd" ends with "md" but extension is "cmd" — must not match.
+        assert!(!vfs().is_markdown("script.cmd"));
+    }
+
+    #[test]
+    fn vfs_is_markdown_matches_native_behavior() {
+        // Both implementations should agree on the same key.
+        let native = NativeFs::new();
+        let virt = vfs();
+        for key in ["readme.md", "main.mds", "no_ext", "script.cmd", "a/b/c.md"] {
+            assert_eq!(
+                virt.is_markdown(key),
+                native.is_markdown(key),
+                "is_markdown disagreement on key: {key}"
+            );
+        }
+    }
+
+    // ── NativeFs::read size pre-check ─────────────────────────────────────────
+
+    #[test]
+    fn native_read_size_precheck_rejects_large_file() {
+        let dir = TempDir::new().unwrap();
+        // Write a file just over the limit.
+        let big_content = "x".repeat((MAX_FILE_SIZE + 1) as usize);
+        let path = dir.path().join("big.mds");
+        std::fs::write(&path, big_content.as_bytes()).unwrap();
+
+        let fs = NativeFs::new();
+        let key = path.display().to_string();
+        let err = fs.read(&key).unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit for oversized file, got {err:?}"
+        );
     }
 }
