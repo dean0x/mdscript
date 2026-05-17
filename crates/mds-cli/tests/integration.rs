@@ -174,7 +174,7 @@ fn file_not_found_error() {
 #[test]
 fn not_mds_file_error() {
     // Try to compile a .md file without type: mds
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec.md");
+    let path = fixture("not_mds.md");
     let result = mds::compile(&path, None);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());

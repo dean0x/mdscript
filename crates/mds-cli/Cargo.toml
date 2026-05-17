@@ -1,0 +1,25 @@
+[package]
+name = "mds-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "MDS (Markdown Script) compiler — command-line interface"
+license = "MIT"
+readme = "../../README.md"
+repository = "https://github.com/deanshrn/mdl"
+keywords = ["markdown", "template", "llm", "prompt", "compiler"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "mds"
+path = "src/main.rs"
+
+[dependencies]
+mds = { package = "mds-core", path = "../mds-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+miette = { version = "7", features = ["fancy"] }
+
+[dev-dependencies]
+tempfile = "3"
