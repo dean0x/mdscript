@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, or modifying CLI output behavior (file output, project config). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport, EvalContext, CapturedScope, IndexSet, Arc, exit_code, mds.json, output_dir, out_dir, default output, file output, MdsConfig, BuildConfig, load_config, resolve_output_path, derive_output_filename, non_exhaustive, pub(crate), run_build, run_check, run_init, MAX_TRAVERSAL_DEPTH, MAX_NESTING_DEPTH, object, map, Value::Object, dot notation, member access, MemberAccess, key-value iteration, resolve_dot_path, dot path, config.field, raw_frontmatter, strip_type_mds, prepend_frontmatter, frontmatter preservation."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, or modifying CLI output behavior (file output, project config). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport, EvalContext, CapturedScope, IndexSet, Arc, exit_code, mds.json, output_dir, out_dir, default output, file output, MdsConfig, BuildConfig, load_config, resolve_output_path, derive_output_filename, non_exhaustive, pub(crate), run_build, run_check, run_init, MAX_TRAVERSAL_DEPTH, MAX_NESTING_DEPTH, MAX_DOT_SEGMENTS, object, map, Value::Object, dot notation, member access, MemberAccess, key-value iteration, resolve_dot_path, dot path, config.field, raw_frontmatter, strip_type_mds, prepend_frontmatter, frontmatter preservation, limits, dot segments, run_loop_body, evaluate_for_array, evaluate_for_key_value, validate_dot_path_parts."
 category: architecture
 directories: [src/, tests/]
 referencedFiles:
@@ -15,9 +15,10 @@ referencedFiles:
   - src/scope.rs
   - src/value.rs
   - src/error.rs
+  - src/limits.rs
   - src/main.rs
 created: 2026-05-12
-updated: 2026-05-16
+updated: 2026-05-17
 ---
 
 # MDS Compiler
@@ -60,6 +61,14 @@ The CLI `build` and `check` commands both accept `-` as the input path to read f
 External dependencies are minimal: `clap` for CLI parsing, `serde_json` and `serde_yaml` for frontmatter and runtime vars, `miette`/`thiserror` for rich diagnostic errors, `indexmap` for the cycle-detection `IndexSet`, `tempfile` in tests.
 
 ## Component Architecture
+
+### Limits Module (`src/limits.rs`)
+
+A single-file module that centralizes defense-in-depth resource limits that are shared across multiple pipeline stages. Currently holds one constant:
+
+- `pub(crate) const MAX_DOT_SEGMENTS: usize = 32` — maximum number of segments allowed in any dot-separated path expression (e.g. `a.b.c` = 3 segments). Enforced in four independent places: parser (`@if` condition, `@for` iterable, interpolation via `validate_dot_path_parts`), and evaluator (`resolve_dot_path`). This is intentionally independent of `MAX_NESTING_DEPTH` — it caps path width, not block depth.
+
+When adding a new limit that spans more than one pipeline stage, add it here rather than duplicating the constant.
 
 ### Token Model (`src/lexer.rs`)
 
@@ -179,17 +188,24 @@ The parser converts a token stream to a `Module` AST. Key hardening:
 - Duplicate `@define` parameter names are rejected at parse time
 - `@else` without colon gives a targeted error message ("use '@else:' with trailing colon")
 
-**Dot-path parsing**: `@if` conditions and `@for` iterables are both parsed as `Vec<String>` by splitting on `.`. Each segment is validated with `is_valid_identifier`. Parser invariant: the resulting `Vec` is always non-empty (the validator uses `.first().ok_or_else(...)` on these paths rather than index access, returning `MdsError::syntax` in release builds instead of panicking). `@if config.debug:` → `condition: vec!["config", "debug"]`. `@for item in data.list:` → `iterable: vec!["data", "list"]`.
+**Dot-path helpers** — three private functions handle all dot-path validation and construction in one consistent place:
 
-**Key-value `@for` parsing**: `@for key, value in obj:` is parsed by looking for a comma in the `var_part` (before `in`). Both the key and value identifiers are validated with `is_valid_identifier`. The parser produces `ForBlock { key_var: Some("key"), var: "value", iterable: vec!["obj"], ... }`.
+- `validate_dot_path_parts(parts: &[&str]) -> Result<(), String>` — validates every segment is a valid identifier AND `parts.len() <= MAX_DOT_SEGMENTS` (from `src/limits.rs`). Returns `Ok` or an error reason string. Called from `parse_if_block`, `parse_for_block`, `parse_dot_expr`, and `parse_single_arg_inner`. Any new directive or argument type that parses dot paths must call this rather than duplicating the validation.
+- `parse_dot_expr(content, dot_pos, offset, len, file, source)` — resolves the dot-before-paren ambiguity: `{ns.func(args)}` → `Expr::QualifiedCall`, `{obj.field}` → `Expr::MemberAccess`. Extracted from `parse_interpolation_expr` to keep the dispatch function readable.
+- `parse_for_vars(var_part)` — splits `"key, value"` or `"item"` into `(Option<String>, String)`; validates both identifiers with `is_valid_identifier`.
 
-**Interpolation disambiguation** — the parser inspects raw content to choose among `Expr::Var`, `Expr::Call`, `Expr::QualifiedCall`, and `Expr::MemberAccess`:
-1. Dot before any `(` → either `QualifiedCall` or `MemberAccess`
-2. Dot before `(` with args → `QualifiedCall`
-3. Dot with no `(` anywhere → `MemberAccess`; all dot-path segments validated with `is_valid_identifier`
-4. No dot before `(` → `Var` (no parens) or `Call` (with parens)
+**Dot-path parsing**: `@if` conditions and `@for` iterables are both parsed as `Vec<String>` by splitting on `.`. Each segment is validated with `validate_dot_path_parts` (which calls `is_valid_identifier` on each segment AND checks `MAX_DOT_SEGMENTS`). Parser invariant: the resulting `Vec` is always non-empty (the validator uses `.first().ok_or_else(...)` on these paths rather than index access, returning `MdsError::syntax` in release builds instead of panicking). `@if config.debug:` → `condition: vec!["config", "debug"]`. `@for item in data.list:` → `iterable: vec!["data", "list"]`.
 
-**Argument parsing internals**: `parse_args` and `parse_single_arg` are thin public wrappers that delegate to `parse_args_inner(s, depth)` and `parse_single_arg_inner(s, depth)`. The `_inner` variants carry the recursion depth. When `parse_single_arg_inner` encounters `name(...)` syntax, it produces `Arg::Call`. When it encounters `name.field` syntax (a dot with no following `(`), it produces `Arg::MemberAccess`.
+**Key-value `@for` parsing**: `@for key, value in obj:` delegates to `parse_for_vars(var_part)` which detects the comma and validates both identifiers. The parser produces `ForBlock { key_var: Some("key"), var: "value", iterable: vec!["obj"], ... }`.
+
+**Interpolation disambiguation** — `parse_interpolation_expr` examines the first `.` and first `(` positions and dispatches:
+1. Dot before any `(` → `parse_dot_expr` (returns `QualifiedCall` or `MemberAccess`)
+2. `(` without prior dot → `Expr::Call`
+3. Neither → `Expr::Var`
+
+`parse_dot_expr` then uses `validate_dot_path_parts` for `MemberAccess` paths and validates namespace/name identifiers individually for `QualifiedCall`.
+
+**Argument parsing internals**: `parse_args` and `parse_single_arg` are thin public wrappers that delegate to `parse_args_inner(s, depth)` and `parse_single_arg_inner(s, depth)`. The `_inner` variants carry the recursion depth. When `parse_single_arg_inner` encounters `name(...)` syntax, it produces `Arg::Call`. When it encounters `name.field` syntax (a dot with no following `(`), it calls `validate_dot_path_parts` and produces `Arg::MemberAccess`.
 
 `parse_args_inner` tracks open parentheses (`paren_depth`) so that commas inside nested calls are not treated as argument separators at the outer level. Quote-escaped commas inside string arguments are similarly skipped.
 
@@ -295,7 +311,7 @@ pub(crate) struct EvalContext<'a> {
 }
 ```
 
-**`resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError>`**: Private function that walks a dot-separated path. `root` is the name of the top-level scope variable; `fields` is the remaining path segments after the dot. Looks up `root` in `scope`, then traverses `Value::Object` fields for each element of `fields`. Returns a `MdsError::undefined_var` if the root is missing, or `MdsError::syntax` if a field is missing or an intermediate value is not an object.
+**`resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Value, MdsError>`**: Private function that walks a dot-separated path. `root` is the name of the top-level scope variable; `fields` is the remaining path segments after the dot. First guards against `fields.len() > MAX_DOT_SEGMENTS` (from `src/limits.rs`), then looks up `root` in `scope` and traverses `Value::Object` fields for each element of `fields`. Returns `MdsError::undefined_var` if the root is missing, or `MdsError::syntax` if the path is too long, a field is missing, or an intermediate value is not an object.
 
 `resolve_dot_path` is the single implementation shared across four use sites:
 - `evaluate_expr(Expr::MemberAccess)` — `{config.key}` interpolation
@@ -305,7 +321,13 @@ pub(crate) struct EvalContext<'a> {
 
 **Object interpolation guard**: `Expr::Var` and `Expr::MemberAccess` both check for `Value::Object` and return a `MdsError::syntax` with a hint to access a specific field.
 
-**Key-value `@for` iteration**: When `block.key_var` is `Some`, the evaluator matches the iterable against `Value::Object`, sorts keys alphabetically for deterministic output, and iterates over `(key, val)` pairs. Each iteration pushes a scope frame with `key_var → Value::String(key)` and `var → val`. When `key_var` is `None` and the iterable resolves to an object, the evaluator returns an error with a hint to use key-value syntax.
+**`@for` iteration helpers** — `evaluate_for` dispatches to two dedicated private functions rather than inlining both paths:
+
+- `evaluate_for_key_value(key_var, val_var, map, body, scope, ctx)` — handles `@for key, value in obj:`. Checks `map.len() <= MAX_LOOP_ITERATIONS`, sorts keys alphabetically, then calls `run_loop_body` per entry.
+- `evaluate_for_array(loop_var, iterable, body, scope, ctx)` — handles `@for item in array:`. Rejects `Value::Object` with a hint, checks array length, clones items to release the borrow, then calls `run_loop_body` per item.
+- `run_loop_body(scope, ctx, body, bindings)` — pushes a frame, sets `(name, value)` bindings, evaluates body, pops; uses `prefer_first_error` so render errors take precedence over pop failures.
+
+When `block.key_var` is `None` and the iterable resolves to an object, `evaluate_for_array` returns an error with a hint to use key-value syntax.
 
 `call_stack` is `Vec<String>` (not `HashSet<String>`). Recursion detection uses `ctx.call_stack.iter().any(|s| s == call_key)` — O(n) scan at MAX_CALL_DEPTH=128, acceptable. The LIFO property is verified with a **structured error return** (not `assert!`) — a mismatch produces `MdsError::syntax`; `prefer_first_error` ensures the render error wins over the LIFO error in double-fault scenarios.
 
@@ -509,6 +531,7 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 - **MAX_FILE_SIZE = 10MB** — checked by reading bytes first, then comparing size (TOCTOU-safe).
 - **MAX_CALL_DEPTH = 128** — prevents stack overflow from deeply nested function calls; tracked via `ctx.call_stack.len()`.
 - **MAX_NESTING_DEPTH = 256** — `pub(crate)` constant in `src/parser.rs`; shared between: (1) parser-level block nesting (`@if`/`@for`/`@define`) via `enter_block()`, and (2) argument-level nested call depth validation in `validate_var_args`.
+- **MAX_DOT_SEGMENTS = 32** — `pub(crate)` constant in `src/limits.rs`; caps the number of segments in any dot-separated path (e.g. `a.b.c` = 3). Enforced in four independent places: parser `@if` condition, parser `@for` iterable, parser interpolation/argument via `validate_dot_path_parts`, and evaluator `resolve_dot_path`. This is intentionally a width limit independent of `MAX_NESTING_DEPTH`.
 - **MAX_LOOP_ITERATIONS = 100,000** — per-loop hard cap in the evaluator; applies to both array and key-value object iteration.
 - **MAX_TOTAL_ITERATIONS = 1,000,000** — cumulative cap across all loops in one compilation; tracked via `ctx.total_iterations`.
 - **MAX_OUTPUT_SIZE = 50 MB** — evaluator checks output buffer size after each node.
@@ -594,11 +617,12 @@ The `exit_code(err: &miette::Error) -> i32` function in `src/main.rs` maps error
 
 ## Key Files
 
+- `src/limits.rs` — single-file module for cross-pipeline resource limits; currently holds `MAX_DOT_SEGMENTS = 32`; add new shared limits here instead of duplicating constants across modules
 - `src/lib.rs` — public API; `strip_type_mds` and `prepend_frontmatter` private helpers for frontmatter preservation; re-exports `MAX_FILE_SIZE` and `MAX_TRAVERSAL_DEPTH`; private `resolve_base_dir` helper; `compile_collecting_warnings` / `compile_str_collecting_warnings` are the canonical output assembly points
 - `src/main.rs` — CLI entry point: `MdsConfig`/`BuildConfig` structs, `load_config` (TOCTOU-safe, bounded by `MAX_TRAVERSAL_DEPTH`), `resolve_output_path` (6-step precedence), `derive_output_filename`, `auto_detect_mds_file`, `parse_cli_value`, `build_runtime_vars`, `reject_directory_input`, `read_stdin`, `exit_code`; logic split into `run_build`/`run_check`/`run_init`
 - `src/ast.rs` — all AST types: `Expr::MemberAccess` and `Arg::MemberAccess` for dot-notation; `IfBlock.condition: Vec<String>` and `ForBlock.iterable: Vec<String>` as dot-separated paths; `ForBlock.key_var: Option<String>` for key-value iteration; `Arg::Call` for nested function call arguments
 - `src/lexer.rs` — `Lexer<'a>` struct with `scan_*` methods; public API is `tokenize(source, file)` only
-- `src/parser.rs` — converts token stream to `Module` AST; `pub(crate) MAX_NESTING_DEPTH`; `enter_block()` helper; dot-path parsing for `@if`/`@for`; key-value `@for` parsing; `MemberAccess` interpolation disambiguation; `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion
+- `src/parser.rs` — converts token stream to `Module` AST; `pub(crate) MAX_NESTING_DEPTH`; `enter_block()` helper; `validate_dot_path_parts` for all dot-path validation (uses `MAX_DOT_SEGMENTS`); `parse_dot_expr` for interpolation disambiguation; `parse_for_vars` for loop variable splitting; `parse_args_inner`/`parse_single_arg_inner` depth-bounded recursion
 - `src/resolver.rs` — orchestrator: `ModuleCache` with `Arc<ResolvedModule>` cache; `raw_frontmatter: Option<String>` field on `ResolvedModule`; `IndexSet<PathBuf>` for cycle detection; security checks; import dispatch split into dedicated helpers
 - `src/evaluator.rs` — AST walker; `EvalContext<'a>` bundles `call_stack: Vec<String>`, `total_iterations`, `warnings`; `resolve_dot_path` private function for dot-path traversal; `Expr::MemberAccess` and `Arg::MemberAccess` evaluation; key-value `@for` iteration; `evaluate_include` pushes to `ctx.warnings`
 - `src/validator.rs` — pre-evaluation semantic checks; `validate()` takes `&mut Scope`; `Arg::MemberAccess` validation (root only); key-value `@for` validation with `key_var` injection; static type check bypass for dot-path iterables; uses `crate::parser::MAX_NESTING_DEPTH` for depth guard
