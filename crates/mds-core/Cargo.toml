@@ -1,26 +1,26 @@
 [package]
 name = "mds-core"
-version = "0.1.0"
-edition = "2021"
-rust-version = "1.80"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "MDS (Markdown Script) compiler — composable LLM prompt templates (library)"
-license = "MIT"
-readme = "../../README.md"
-repository = "https://github.com/deanshrn/mdl"
-keywords = ["markdown", "template", "llm", "prompt", "compiler"]
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+keywords.workspace = true
 categories = ["template-engine", "text-processing"]
 
 [lib]
 name = "mds"
 
 [dependencies]
-indexmap = "2.2"
-serde = { version = "1", features = ["derive"] }
+indexmap = { workspace = true }
+serde = { workspace = true }
 # Pre-release (0.0.x); track for 0.1.x stability milestone
-serde_yml = "0.0.12"
-serde_json = "1"
-miette = { version = "7" }
-thiserror = "2"
+serde_yml = { workspace = true }
+serde_json = { workspace = true }
+miette = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
