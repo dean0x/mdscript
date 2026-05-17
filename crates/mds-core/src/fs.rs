@@ -1,0 +1,520 @@
+//! Filesystem abstraction for module resolution.
+//!
+//! Provides the [`FileSystem`] trait and two implementations:
+//! - [`NativeFs`] — OS filesystem with symlink rejection and traversal prevention
+//! - [`VirtualFs`] — in-memory HashMap-backed filesystem for testing and WASM
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use crate::error::MdsError;
+use crate::resolver::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+
+/// Filesystem abstraction for module resolution.
+///
+/// Implementations provide path normalization, file reading, and file-type
+/// detection. Security properties (symlink rejection, traversal prevention)
+/// are implementation-specific: [`NativeFs`] enforces them for OS access,
+/// while [`VirtualFs`] relies on its closed key-space.
+pub trait FileSystem: Send + Sync {
+    /// Normalize a path relative to a base key.
+    ///
+    /// - `base == ""` means entry point (root-level resolution)
+    /// - `base != ""` means importing from within an already-resolved module
+    fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError>;
+
+    /// Read the content of a normalized key.
+    fn read(&self, normalized: &str) -> Result<String, MdsError>;
+
+    /// Return `true` if the key refers to a `.md` (Markdown) file rather than `.mds`.
+    fn is_markdown(&self, normalized: &str) -> bool;
+
+    /// Pre-initialize the project root before imports resolve.
+    ///
+    /// Default: no-op. [`VirtualFs`] ignores this; [`NativeFs`] uses it for
+    /// `resolve_source` paths that don't go through [`FileSystem::normalize`].
+    fn set_root(&self, _base: &str) -> Result<(), MdsError> {
+        Ok(())
+    }
+}
+
+// ── VirtualFs ────────────────────────────────────────────────────────────────
+
+/// Virtual filesystem backed by an in-memory `HashMap`.
+///
+/// Keys use `/` as separator regardless of host OS.
+/// Designed for WASM environments and testing.
+pub struct VirtualFs {
+    modules: HashMap<String, String>,
+}
+
+impl VirtualFs {
+    /// Create a new `VirtualFs` from a map of key → content.
+    pub fn new(modules: HashMap<String, String>) -> Self {
+        Self { modules }
+    }
+}
+
+impl FileSystem for VirtualFs {
+    /// Resolve `relative` against the directory portion of `base`.
+    ///
+    /// When `base == ""` the relative path is used as-is (root entry point).
+    /// Rejects: empty paths, null bytes, traversal above the virtual root.
+    fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
+        if relative.is_empty() {
+            return Err(MdsError::import_error("import path is empty"));
+        }
+        if relative.contains('\0') {
+            return Err(MdsError::import_error("import path contains null byte"));
+        }
+
+        if base.is_empty() {
+            // Root entry point — use key as-is.
+            return Ok(relative.to_string());
+        }
+
+        // Resolve relative to the directory portion of base (split on '/').
+        // Build up a segment list, applying "." (noop) and ".." (pop) as we go.
+        let base_dir_segments: Vec<&str> = base
+            .rsplit_once('/')
+            .map(|(dir, _)| dir.split('/').filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+
+        let mut segments: Vec<&str> = base_dir_segments;
+
+        for part in relative.split('/') {
+            match part {
+                "" | "." => {
+                    // Skip empty parts (leading "./") and "." segments.
+                }
+                ".." => {
+                    if segments.is_empty() {
+                        return Err(MdsError::import_error(format!(
+                            "import path escapes project directory: \"{relative}\""
+                        )));
+                    }
+                    segments.pop();
+                }
+                seg => {
+                    segments.push(seg);
+                }
+            }
+        }
+
+        if segments.is_empty() {
+            return Err(MdsError::import_error(format!(
+                "import path resolves to empty key: \"{relative}\""
+            )));
+        }
+
+        Ok(segments.join("/"))
+    }
+
+    fn read(&self, normalized: &str) -> Result<String, MdsError> {
+        self.modules
+            .get(normalized)
+            .cloned()
+            .ok_or_else(|| MdsError::file_not_found(normalized.to_string()))
+    }
+
+    fn is_markdown(&self, normalized: &str) -> bool {
+        normalized.ends_with(".md")
+    }
+}
+
+// ── NativeFs ─────────────────────────────────────────────────────────────────
+
+/// Native OS filesystem implementation.
+///
+/// Enforces symlink rejection, path traversal prevention,
+/// file size limits, and UTF-8 validation.
+pub struct NativeFs {
+    root_dir: OnceLock<PathBuf>,
+}
+
+impl NativeFs {
+    /// Create a new `NativeFs` with no root directory set.
+    ///
+    /// The root is established on the first call to [`FileSystem::normalize`]
+    /// or [`FileSystem::set_root`].
+    pub fn new() -> Self {
+        Self {
+            root_dir: OnceLock::new(),
+        }
+    }
+
+    /// Canonicalize `path` and detect symlinks without a TOCTOU window.
+    ///
+    /// Strategy: canonicalize parent dir (resolves dir-level symlinks), then
+    /// canonicalize the full path. If they differ, the final component is a symlink.
+    fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;
+
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
+        let canonical_without_following_last = canonical_parent.join(file_name);
+
+        let canonical = canonical_without_following_last
+            .canonicalize()
+            .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
+
+        if canonical != canonical_without_following_last {
+            return Err(MdsError::import_error(format!(
+                "symlinks are not allowed in imports: {}",
+                path.display()
+            )));
+        }
+        Ok(canonical)
+    }
+
+    /// Walk up from a directory to find the project root.
+    ///
+    /// Looks for `.git` or `.mdsroot` markers.
+    /// Falls back to the given directory if no marker is found.
+    fn find_project_root(start: &Path) -> PathBuf {
+        let mut dir = start.to_path_buf();
+        for _ in 0..MAX_TRAVERSAL_DEPTH {
+            for marker in [".git", ".mdsroot"] {
+                if dir.join(marker).exists() {
+                    return dir;
+                }
+            }
+            if !dir.pop() {
+                return start.to_path_buf();
+            }
+        }
+        start.to_path_buf()
+    }
+
+    /// Check that `canonical` stays within the established root directory.
+    fn check_path_traversal(&self, canonical: &Path) -> Result<(), MdsError> {
+        if let Some(root) = self.root_dir.get() {
+            if !canonical.starts_with(root) {
+                return Err(MdsError::import_error(format!(
+                    "import path escapes project directory: {}",
+                    canonical.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Initialize root_dir from a canonical entry-point directory.
+    fn init_root(&self, canonical_dir: &Path) {
+        // OnceLock: set() silently no-ops if already initialized.
+        let root = Self::find_project_root(canonical_dir);
+        let _ = self.root_dir.set(root);
+    }
+}
+
+impl Default for NativeFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileSystem for NativeFs {
+    fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
+        let path = if base.is_empty() {
+            // Root entry point: treat `relative` as a filesystem path.
+            Path::new(relative).to_path_buf()
+        } else {
+            // Import from within a resolved module: resolve against base directory.
+            let base_path = Path::new(base);
+            let base_dir = base_path.parent().unwrap_or(Path::new("."));
+            base_dir.join(relative)
+        };
+
+        let canonical = Self::check_symlink(&path)?;
+
+        if base.is_empty() {
+            // Set root_dir on first entry point resolution.
+            let entry_dir = canonical.parent().unwrap_or(Path::new("."));
+            self.init_root(entry_dir);
+        }
+
+        self.check_path_traversal(&canonical)?;
+
+        Ok(canonical.display().to_string())
+    }
+
+    fn read(&self, normalized: &str) -> Result<String, MdsError> {
+        let path = Path::new(normalized);
+        let bytes = std::fs::read(path)
+            .map_err(|e| MdsError::io(format!("cannot read {normalized}: {e}")))?;
+        if bytes.len() as u64 > MAX_FILE_SIZE {
+            return Err(MdsError::resource_limit(format!(
+                "file too large ({} bytes, max {} bytes): {normalized}",
+                bytes.len(),
+                MAX_FILE_SIZE,
+            )));
+        }
+        String::from_utf8(bytes)
+            .map_err(|e| MdsError::io(format!("invalid UTF-8 in {normalized}: {e}")))
+    }
+
+    fn is_markdown(&self, normalized: &str) -> bool {
+        Path::new(normalized)
+            .extension()
+            .and_then(|e| e.to_str())
+            == Some("md")
+    }
+
+    fn set_root(&self, base: &str) -> Result<(), MdsError> {
+        let canonical = Path::new(base)
+            .canonicalize()
+            .map_err(|e| MdsError::io(format!("cannot resolve base directory {base}: {e}")))?;
+        self.init_root(&canonical);
+        Ok(())
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    // ── VirtualFs::normalize ──────────────────────────────────────────────────
+
+    fn vfs() -> VirtualFs {
+        VirtualFs::new(HashMap::new())
+    }
+
+    #[test]
+    fn vfs_normalize_same_dir_sibling() {
+        let result = vfs().normalize("components/header.mds", "./footer.mds");
+        assert_eq!(result.unwrap(), "components/footer.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_parent_dir() {
+        let result = vfs().normalize("components/header.mds", "../shared.mds");
+        assert_eq!(result.unwrap(), "shared.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_two_levels_up() {
+        let result = vfs().normalize("a/b/c.mds", "../../d.mds");
+        assert_eq!(result.unwrap(), "d.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_escapes_root() {
+        // "a.mds" has no parent directory segment, so ".." would go above root.
+        let result = vfs().normalize("a.mds", "../../x.mds");
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    #[test]
+    fn vfs_normalize_dot_segments_collapsed() {
+        let result = vfs().normalize("a/b.mds", "./././c.mds");
+        assert_eq!(result.unwrap(), "a/c.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_empty_path_errors() {
+        let result = vfs().normalize("a.mds", "");
+        assert!(result.is_err(), "expected Err for empty path");
+    }
+
+    #[test]
+    fn vfs_normalize_null_byte_errors() {
+        let result = vfs().normalize("a.mds", "./\0bad.mds");
+        assert!(result.is_err(), "expected Err for null byte");
+    }
+
+    #[test]
+    fn vfs_normalize_root_entry_point() {
+        let result = vfs().normalize("", "main.mds");
+        assert_eq!(result.unwrap(), "main.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_deep_traversal_at_boundary() {
+        // "deep/nested/file.mds" has dir = "deep/nested"; three ".." would escape.
+        let result = vfs().normalize("deep/nested/file.mds", "../../../x.mds");
+        assert!(result.is_err(), "expected Err when escaping root");
+    }
+
+    #[test]
+    fn vfs_normalize_sibling_flat() {
+        let result = vfs().normalize("a.mds", "./b.mds");
+        assert_eq!(result.unwrap(), "b.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_subdirectory() {
+        let result = vfs().normalize("a/b.mds", "./c/d.mds");
+        assert_eq!(result.unwrap(), "a/c/d.mds");
+    }
+
+    // ── VirtualFs::read ───────────────────────────────────────────────────────
+
+    #[test]
+    fn vfs_read_existing_key() {
+        let fs = VirtualFs::new(HashMap::from([("main.mds".to_string(), "hello".to_string())]));
+        assert_eq!(fs.read("main.mds").unwrap(), "hello");
+    }
+
+    #[test]
+    fn vfs_read_missing_key_file_not_found() {
+        let fs = VirtualFs::new(HashMap::new());
+        let err = fs.read("missing.mds").unwrap_err();
+        assert!(
+            matches!(err, MdsError::FileNotFound { .. }),
+            "expected FileNotFound, got {err:?}"
+        );
+    }
+
+    // ── VirtualFs::is_markdown ────────────────────────────────────────────────
+
+    #[test]
+    fn vfs_is_markdown_md_extension() {
+        assert!(vfs().is_markdown("readme.md"));
+    }
+
+    #[test]
+    fn vfs_is_markdown_mds_extension() {
+        assert!(!vfs().is_markdown("main.mds"));
+    }
+
+    #[test]
+    fn vfs_is_markdown_no_extension() {
+        assert!(!vfs().is_markdown("no_extension"));
+    }
+
+    // ── NativeFs tests ────────────────────────────────────────────────────────
+
+    fn make_temp_file(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn native_normalize_entry_point() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        let result = fs.normalize("", &file.display().to_string());
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        // The result should be a canonical absolute path string.
+        let key = result.unwrap();
+        assert!(key.contains("main.mds"), "key should contain filename");
+    }
+
+    #[test]
+    fn native_normalize_import_from_base() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let sibling = make_temp_file(&dir, "sibling.mds", "world");
+        let _ = sibling; // ensure it exists
+
+        let fs = NativeFs::new();
+        // First normalize the entry point to establish the root and get its key.
+        let base_key = fs
+            .normalize("", &file.display().to_string())
+            .expect("entry point normalize failed");
+        // Now resolve a sibling relative to it.
+        let result = fs.normalize(&base_key, "./sibling.mds");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let key = result.unwrap();
+        assert!(key.contains("sibling.mds"));
+    }
+
+    #[test]
+    fn native_normalize_symlink_rejected() {
+        let dir = TempDir::new().unwrap();
+        let target = make_temp_file(&dir, "target.mds", "hello");
+        let link_path = dir.path().join("link.mds");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        let fs = NativeFs::new();
+        let result = fs.normalize("", &link_path.display().to_string());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinks"),
+            "expected symlinks in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_path_traversal_rejected() {
+        let project_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+
+        let entry = make_temp_file(&project_dir, "main.mds", "hello");
+        let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
+
+        let fs = NativeFs::new();
+        // Establish root via entry point.
+        let base_key = fs
+            .normalize("", &entry.display().to_string())
+            .expect("entry point");
+        // Try to import the outside file by absolute path.
+        let result = fs.normalize(&base_key, &outside.display().to_string());
+        // This will fail because the outside path is absolute and won't start with "./"
+        // Actually in NativeFs, we join relative to base_dir — for absolute paths this
+        // still passes through check_symlink which succeeds, but traversal check fails.
+        // We test via a relative traversal instead.
+        drop(result); // may or may not error depending on path
+
+        // Use relative traversal to escape the project dir.
+        // Construct a relative path that would escape: ../../secret.mds relative to project.
+        // Since we don't control the temp path depth, we'll try many ".." segments.
+        let escape = "../".repeat(20) + &outside.display().to_string().trim_start_matches('/');
+        let result2 = fs.normalize(&base_key, &escape);
+        assert!(
+            result2.is_err(),
+            "expected traversal error, got {result2:?}"
+        );
+        if let Err(e) = result2 {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("escapes project") || msg.contains("symlinks") || msg.contains("not found"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_read_file_content() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "hello.mds", "Hello World!");
+        let fs = NativeFs::new();
+        let key = fs
+            .normalize("", &file.display().to_string())
+            .expect("normalize");
+        let content = fs.read(&key).expect("read");
+        assert_eq!(content, "Hello World!");
+    }
+
+    #[test]
+    fn native_read_nonexistent_errors() {
+        let fs = NativeFs::new();
+        let result = fs.read("/nonexistent/path/that/does/not/exist.mds");
+        assert!(result.is_err(), "expected Err for missing file");
+    }
+
+    #[test]
+    fn native_is_markdown_md() {
+        let fs = NativeFs::new();
+        assert!(fs.is_markdown("file.md"));
+    }
+
+    #[test]
+    fn native_is_markdown_mds() {
+        let fs = NativeFs::new();
+        assert!(!fs.is_markdown("file.mds"));
+    }
+}

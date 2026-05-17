@@ -40,6 +40,7 @@
 pub(crate) mod ast;
 pub(crate) mod error;
 pub(crate) mod evaluator;
+pub mod fs;
 pub(crate) mod lexer;
 pub(crate) mod limits;
 pub(crate) mod parser;
@@ -48,10 +49,11 @@ pub(crate) mod scope;
 pub(crate) mod validator;
 pub(crate) mod value;
 
+pub use fs::{FileSystem, NativeFs, VirtualFs};
+pub use resolver::ModuleCache;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-use resolver::ModuleCache;
 
 pub use error::MdsError;
 pub use value::Value;
