@@ -480,14 +480,17 @@ fn write_output(
     Ok(())
 }
 
-fn run_build(
+struct BuildArgs {
     input: Option<PathBuf>,
     output: Option<String>,
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
     quiet: bool,
-) -> Result<()> {
+}
+
+fn run_build(args: BuildArgs) -> Result<()> {
+    let BuildArgs { input, output, out_dir, vars, set_vars, quiet } = args;
     let runtime_vars = build_runtime_vars(vars, set_vars)?;
 
     // Resolve the input: explicit path, or auto-detect from cwd.
@@ -610,7 +613,7 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
-        } => run_build(input, output, out_dir, vars, set_vars, quiet),
+        } => run_build(BuildArgs { input, output, out_dir, vars, set_vars, quiet }),
         Commands::Check {
             input,
             vars,
