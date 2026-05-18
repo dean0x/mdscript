@@ -55,8 +55,25 @@ pub use resolver::ModuleCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub use error::MdsError;
+pub use error::{MdsError, SerializedError, SerializedSpan};
 pub use value::Value;
+
+/// The result of compiling an MDS template with full dependency tracking.
+///
+/// Returned by `compile_with_deps`, `compile_str_with_deps`, and
+/// `compile_virtual_with_deps`. The `dependencies` list is in depth-first
+/// resolution order and excludes the entry module itself — it contains only
+/// the files imported (transitively) by the entry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CompileOutput {
+    /// The rendered Markdown output.
+    pub output: String,
+    /// Warnings emitted during compilation (e.g. empty `@include`).
+    pub warnings: Vec<String>,
+    /// Normalized keys of all modules imported during compilation, in
+    /// first-resolution (depth-first) order. Excludes the entry module.
+    pub dependencies: Vec<String>,
+}
 
 /// Maximum file size accepted for compilation (10 MB).
 ///
@@ -226,6 +243,14 @@ fn emit_warnings(warnings: &[String]) {
     }
 }
 
+/// Build the final output string from a resolved module.
+///
+/// Cleans the prompt body and prepends YAML frontmatter when present.
+fn build_output(resolved: &resolver::ResolvedModule) -> String {
+    let body = resolved.prompt_body.as_deref().map(clean_output).unwrap_or_default();
+    prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body)
+}
+
 /// Compile an MDS file and return the output along with any collected warnings.
 ///
 /// Unlike [`compile`], this function does not print warnings to stderr. The caller
@@ -249,13 +274,7 @@ pub fn compile_collecting_warnings(
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
     let resolved = cache.resolve_path(path, &vars, &mut warnings)?;
-    let body = resolved
-        .prompt_body
-        .as_deref()
-        .map(clean_output)
-        .unwrap_or_default();
-    let output = prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body);
-    Ok((output, warnings))
+    Ok((build_output(&resolved), warnings))
 }
 
 /// Compile MDS source from a string and return the output along with any collected warnings.
@@ -273,13 +292,7 @@ pub fn compile_str_collecting_warnings(
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
     let resolved = cache.resolve_source(source, &dir, &vars, &mut warnings)?;
-    let body = resolved
-        .prompt_body
-        .as_deref()
-        .map(clean_output)
-        .unwrap_or_default();
-    let output = prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body);
-    Ok((output, warnings))
+    Ok((build_output(&resolved), warnings))
 }
 
 /// Check (validate) an MDS file and return any collected warnings without rendering output.
@@ -479,13 +492,123 @@ pub fn compile_virtual_collecting_warnings(
     let mut cache = ModuleCache::virtual_fs(modules);
     let mut warnings = vec![];
     let resolved = cache.resolve_key(entry, &vars, &mut warnings)?;
-    let body = resolved
-        .prompt_body
-        .as_deref()
-        .map(clean_output)
-        .unwrap_or_default();
-    let output = prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body);
-    Ok((output, warnings))
+    Ok((build_output(&resolved), warnings))
+}
+
+/// Compile an MDS file and return a [`CompileOutput`] with dependency tracking.
+///
+/// Like [`compile_collecting_warnings`] but also returns the list of imported
+/// modules (direct and transitive) in depth-first resolution order. The entry
+/// file itself is excluded from `dependencies`.
+///
+/// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+///
+/// let result = mds::compile_with_deps(Path::new("template.mds"), None)?;
+/// println!("{}", result.output);
+/// for dep in &result.dependencies { println!("dep: {dep}"); }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_with_deps(
+    path: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileOutput, MdsError> {
+    let path = path.as_ref();
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    let resolved = cache.resolve_path(path, &vars, &mut warnings)?;
+    let output = build_output(&resolved);
+    // Post-order DFS guarantees the entry module is last in the cache.
+    // Filter by value rather than position for explicitness.
+    let deps = cache.dependencies();
+    let entry_key = deps.last().cloned();
+    let dependencies = deps
+        .into_iter()
+        .filter(|k| Some(k) != entry_key.as_ref())
+        .collect();
+    Ok(CompileOutput { output, warnings, dependencies })
+}
+
+/// Compile MDS source code from a string and return a [`CompileOutput`] with
+/// dependency tracking.
+///
+/// Like [`compile_str_collecting_warnings`] but also returns the list of imported
+/// modules in depth-first resolution order. Because the source is not a file,
+/// there is no entry key to exclude — all resolved imports appear in `dependencies`.
+///
+/// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::compile_str_with_deps(
+///     "---\ngreeting: Hi\n---\n{greeting} there!\n",
+///     None,
+///     None,
+/// )?;
+/// assert_eq!(result.output, "---\ngreeting: Hi\n---\nHi there!\n");
+/// assert!(result.dependencies.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_str_with_deps(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileOutput, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let dir = resolve_base_dir(base_dir)?;
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    let resolved = cache.resolve_source(source, &dir, &vars, &mut warnings)?;
+    let output = build_output(&resolved);
+    // resolve_source does not insert the inline source into the modules cache,
+    // so cache.dependencies() contains only imported files — no filtering needed.
+    let dependencies = cache.dependencies();
+    Ok(CompileOutput { output, warnings, dependencies })
+}
+
+/// Compile a module from an in-memory virtual filesystem and return a
+/// [`CompileOutput`] with dependency tracking.
+///
+/// Like [`compile_virtual_collecting_warnings`] but also returns the list of
+/// imported modules in depth-first resolution order. The entry module itself is
+/// excluded from `dependencies`.
+///
+/// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// let mut modules = HashMap::new();
+/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
+///
+/// let result = mds::compile_virtual_with_deps(modules, "main.mds", None)?;
+/// assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
+/// assert!(result.dependencies.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_virtual_with_deps(
+    modules: HashMap<String, String>,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileOutput, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut warnings = vec![];
+    let resolved = cache.resolve_key(entry, &vars, &mut warnings)?;
+    let output = build_output(&resolved);
+    let dependencies = cache.dependencies().into_iter().filter(|k| k != entry).collect();
+    Ok(CompileOutput { output, warnings, dependencies })
 }
 
 /// Check (validate) a module from an in-memory virtual filesystem without rendering output.

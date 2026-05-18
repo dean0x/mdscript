@@ -1,11 +1,12 @@
 ---
 feature: mds-compiler
 name: MDS Compiler
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, or modifying CLI output behavior (file output, project config). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, reexport, EvalContext, CapturedScope, IndexSet, Arc, exit_code, mds.json, output_dir, out_dir, default output, file output, MdsConfig, BuildConfig, load_config, resolve_output_path, derive_output_filename, non_exhaustive, pub(crate), run_build, run_check, run_init, MAX_TRAVERSAL_DEPTH, MAX_NESTING_DEPTH, MAX_DOT_SEGMENTS, object, map, Value::Object, dot notation, member access, MemberAccess, key-value iteration, resolve_dot_path, dot path, config.field, raw_frontmatter, strip_type_mds, prepend_frontmatter, frontmatter preservation, limits, dot segments, run_loop_body, evaluate_for_array, evaluate_for_key_value, validate_dot_path_parts."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, or using the virtual filesystem / dependency tracking API. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, closure, lexical scope, prompt export, nested function calls, arg parsing, warnings, quiet mode, stdin, auto-detect, compile_file, compile_virtual, compile_with_deps, compile_str_with_deps, CompileOutput, dependency graph, FileSystem, NativeFs, VirtualFs, ModuleCache, resolve_path, resolve_key, resolve_source, dependencies, virtual filesystem, WASM, reexport, EvalContext, CapturedScope, IndexSet, Arc, exit_code, mds.json, output_dir, out_dir, default output, file output, MdsConfig, BuildConfig, load_config, resolve_output_path, derive_output_filename, non_exhaustive, pub(crate), run_build, run_check, run_init, MAX_TRAVERSAL_DEPTH, MAX_NESTING_DEPTH, MAX_DOT_SEGMENTS, object, map, Value::Object, dot notation, member access, MemberAccess, key-value iteration, resolve_dot_path, dot path, config.field, raw_frontmatter, strip_type_mds, prepend_frontmatter, frontmatter preservation, limits, dot segments, run_loop_body, evaluate_for_array, evaluate_for_key_value, validate_dot_path_parts, SerializedError, SerializedSpan, serialize, error serialization."
 category: architecture
 directories: [crates/mds-core/src/, crates/mds-cli/src/, crates/mds-cli/tests/]
 referencedFiles:
   - crates/mds-core/src/lib.rs
+  - crates/mds-core/src/fs.rs
   - crates/mds-core/src/ast.rs
   - crates/mds-core/src/lexer.rs
   - crates/mds-core/src/parser.rs
@@ -19,7 +20,7 @@ referencedFiles:
   - crates/mds-cli/src/main.rs
   - crates/mds-core/tests/api_surface.rs
 created: 2026-05-12
-updated: 2026-05-17
+updated: 2026-05-19
 ---
 
 # MDS Compiler
@@ -44,12 +45,26 @@ The binary is a CLI tool (`mds build`, `mds check`, `mds init`) backed by a libr
 | `compile_str_with(source, base_dir, runtime_vars)` | Compile from string with options |
 | `compile_collecting_warnings(path, runtime_vars)` | Compile and return `(String, Vec<String>)` — caller controls warning output |
 | `compile_str_collecting_warnings(source, base_dir, runtime_vars)` | String variant of the above |
+| `compile_virtual(modules, entry, runtime_vars)` | Compile from in-memory `HashMap<String, String>` — for WASM/testing |
+| `compile_virtual_collecting_warnings(modules, entry, runtime_vars)` | Virtual FS variant with warning collection |
+| `compile_with_deps(path, runtime_vars)` | Compile with dependency graph — returns `CompileOutput` |
+| `compile_str_with_deps(source, base_dir, runtime_vars)` | String variant with dependency graph |
+| `compile_virtual_with_deps(modules, entry, runtime_vars)` | Virtual FS variant with dependency graph |
 | `check(path, runtime_vars)` | Validate a file without rendering |
 | `check_str(source)` | Validate from string, no options |
 | `check_str_with(source, base_dir, runtime_vars)` | Validate from string with options |
 | `check_collecting_warnings(path, runtime_vars)` | Validate and return `((), Vec<String>)` — caller controls warning output |
 | `check_str_collecting_warnings(source, base_dir, runtime_vars)` | String variant of the above |
+| `check_virtual(modules, entry, runtime_vars)` | Validate from in-memory `HashMap` — for WASM/testing |
+| `check_virtual_collecting_warnings(modules, entry, runtime_vars)` | Virtual FS variant with warning collection |
 | `load_vars_file(path)` | Load runtime vars from a JSON file |
+
+The library also exports these public types: `FileSystem` (trait), `NativeFs`, `VirtualFs`, `ModuleCache`, `Value`, `MdsError`, `SerializedError`, `SerializedSpan`, `CompileOutput`, and constants `MAX_FILE_SIZE` / `MAX_TRAVERSAL_DEPTH`.
+
+**`CompileOutput` struct** — returned by `compile_with_deps`, `compile_str_with_deps`, and `compile_virtual_with_deps`. Derives `Debug`, `Clone`, `PartialEq`, `serde::Serialize`:
+- `output: String` — rendered Markdown
+- `warnings: Vec<String>` — non-fatal diagnostics
+- `dependencies: Vec<String>` — normalized keys of imported modules in depth-first order, **excluding** the entry module
 
 `compile_file` is the simplest entry point for embedding MDS in tools that already have a path as `&str`. It does not accept runtime vars; use `compile` directly when runtime overrides are needed.
 
@@ -72,6 +87,35 @@ A single-file module that centralizes defense-in-depth resource limits that are 
 - `pub(crate) const MAX_DOT_SEGMENTS: usize = 32` — maximum number of segments allowed in any dot-separated path expression (e.g. `a.b.c` = 3 segments). Enforced in four independent places: parser (`@if` condition, `@for` iterable, interpolation via `validate_dot_path_parts`), and evaluator (`resolve_dot_path`). This is intentionally independent of `MAX_NESTING_DEPTH` — it caps path width, not block depth.
 
 When adding a new limit that spans more than one pipeline stage, add it here rather than duplicating the constant.
+
+### FileSystem Abstraction (`crates/mds-core/src/fs.rs`)
+
+The `FileSystem` trait decouples module resolution from the OS filesystem. Two implementations ship with the library:
+
+- **`NativeFs`** — OS filesystem with symlink rejection, traversal prevention, and TOCTOU-safe size checks. Stores `root_dir: OnceLock<PathBuf>` — thread-safe without a mutex. First call to `normalize("", path)` initializes the root via `find_project_root`. `canonicalize()` delegates to `check_symlink()` rather than `std::fs::canonicalize()` so that symlinked directories cannot re-anchor the security root (fixes issue #21).
+- **`VirtualFs`** — in-memory `HashMap<String, String>` keyed by `/`-separated path. Designed for WASM environments and unit tests. Normalization resolves `.`/`..` segment-by-segment and rejects traversal above the virtual root. `canonicalize()` is identity (default implementation).
+
+**`FileSystem` trait contract** (`Send + Sync`):
+- `normalize(base, relative) → Result<String, MdsError>` — convert a relative import path to a normalized key. `base = ""` means entry point (root-level). `base != ""` means import from within an already-resolved module.
+- `read(normalized) → Result<String, MdsError>` — read content by key; must enforce `MAX_FILE_SIZE`.
+- `is_markdown(normalized) → bool` — returns `true` for `.md` extension.
+- `set_root(base) → Result<(), MdsError>` — pre-initialize root; used by `resolve_source` for NativeFs.
+- `canonicalize(path) → Result<String, MdsError>` — default is identity; NativeFs overrides.
+
+`MAX_PATH_SEGMENTS = 256` (private to `fs.rs`) bounds segment accumulation in `VirtualFs::normalize` and the entry-point path in root-level normalization.
+
+**`ModuleCache` is now public API** — `pub use resolver::ModuleCache` in `lib.rs`. Constructors:
+- `ModuleCache::new()` / `ModuleCache::native()` — native FS
+- `ModuleCache::virtual_fs(modules: HashMap<String, String>)` — virtual FS
+- `ModuleCache::with_fs(fs: Box<dyn FileSystem>)` — custom FS
+
+Public resolution methods:
+- `resolve_path(path: &Path, runtime_vars, warnings)` — OS path; calls `fs.normalize("", path)`
+- `resolve_key(key: &str, runtime_vars, warnings)` — virtual FS or pre-normalized key
+- `resolve_source(source: &str, base_dir: &Path, runtime_vars, warnings)` — in-memory source (NativeFs only)
+- `dependencies() → Vec<String>` — all resolved module keys in depth-first insertion order, **including** the entry
+
+`modules` is now `IndexMap<String, Arc<ResolvedModule>>` (was `HashMap`) to preserve insertion order for deterministic dependency extraction. The entry module is always the **last** key inserted (post-order DFS), so `split_last()` isolates it in `compile_with_deps`.
 
 ### Token Model (`crates/mds-core/src/lexer.rs`)
 
@@ -236,27 +280,24 @@ The `arity_at` constructor provides source-span-aware arity errors from the vali
 
 ### Resolver (`crates/mds-core/src/resolver.rs`)
 
-The resolver is the orchestrator. `ModuleCache` drives the full pipeline for each file and caches `Arc<ResolvedModule>` by canonical path, preventing repeated work and providing cycle detection.
+The resolver is the orchestrator. `ModuleCache` drives the full pipeline for each file/key and caches `Arc<ResolvedModule>`, preventing repeated work and providing cycle detection. Security enforcement (symlinks, traversal, size limits) has moved entirely into the `FileSystem` trait implementations in `fs.rs`.
 
-**Project root detection**: `find_project_root` walks up from the entry file's directory looking for `.git` or `.mdsroot` markers. The found root is stored in `ModuleCache::root_dir` on first resolve. All subsequently resolved paths must `starts_with(root_dir)` — this is the path traversal boundary. The walk is bounded by `MAX_TRAVERSAL_DEPTH = 256`.
-
-**Security guards** — split across focused private methods:
-
-`canonicalize_and_check` (always):
-1. `check_symlink(path)` — detects symlinks by comparing `canonical_parent.join(filename)` vs `full_canonicalize()`; if they differ, returns `ImportError`
-2. `root_dir` initialization — set on first resolve by calling `find_project_root` from the entry file's directory
-3. `check_import_depth(&self)` — rejects chains deeper than `MAX_IMPORT_DEPTH = 64`; checked via `resolving.len()`
-4. `check_path_traversal(&self, canonical)` — resolved canonical path must `starts_with(root_dir)`
-
-`read_validated_file` (cache misses only):
-5. Reads bytes first, then checks size against `MAX_FILE_SIZE = 10MB` — reading first avoids a TOCTOU race
+**Resolution flow** in `resolve_by_key`:
+1. Cache hit → return `Arc::clone` (O(1))
+2. Cycle detection via `self.resolving.contains(key)` — produces `CircularImport`
+3. Depth guard via `check_import_depth()` — rejects chains > `MAX_IMPORT_DEPTH = 64`
+4. File read via `self.fs.read(key)` — security enforced by the `FileSystem` impl
+5. File type validation
+6. Push key to `resolving`, recurse into `process_module`
+7. Pop key from `resolving` (strict LIFO, verified with `check_lifo_pop`)
+8. Wrap result in `Arc`, insert into `modules` IndexMap, return clone
 
 **Import helpers** — each `ImportDirective` variant dispatches to a dedicated private method:
 - `resolve_alias_import` — calls `validate_import_path`, resolves, calls `scope.set_namespace`
 - `resolve_merge_import` — brings all exports + `prompt` body into scope; frontmatter vars not imported
 - `resolve_selective_import` — imports only named exports; `prompt` binds as a variable via `scope.set_var`
 
-**Cycle detection** uses `IndexSet<PathBuf>` (`indexmap` crate) — provides O(1) membership test plus insertion-ordered iteration. `shift_remove` preserves insertion order when unmarking.
+**Cycle detection** uses `IndexSet<String>` (keys, not `PathBuf`) — provides O(1) membership test plus insertion-ordered iteration. `pop()` is used for strict LIFO unmarking (O(1)).
 
 **`process_module` decomposition**: split into focused helpers:
 - `build_scope_from_frontmatter(frontmatter, is_md, runtime_vars)` — parses YAML, populates scope, applies runtime var overrides; skips `type` key for `.md` files

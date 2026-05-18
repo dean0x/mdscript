@@ -3,6 +3,57 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
+// ── Serializable error types ──────────────────────────────────────────────────
+
+/// A serializable representation of a source span.
+///
+/// Offsets and lengths are in bytes from the start of the source string,
+/// matching `miette::SourceSpan`. Line and column are 1-indexed byte offsets
+/// from the start of the respective line (NOT UTF-16 code units).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SerializedSpan {
+    pub offset: usize,
+    pub length: usize,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+}
+
+/// A serializable, `serde`-friendly representation of an [`MdsError`].
+///
+/// Suitable for embedding in JSON API responses or structured log output.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SerializedError {
+    pub code: String,
+    pub message: String,
+    pub help: Option<String>,
+    pub span: Option<SerializedSpan>,
+}
+
+/// Compute the 1-indexed line and column (byte-based) for a byte offset in source.
+///
+/// Returns `None` if `offset` exceeds `source.len()`. Both line and column are
+/// 1-indexed: the very first byte is (1, 1).
+///
+/// Column counts bytes from the start of the current line (NOT UTF-16 code units
+/// and NOT Unicode scalar values). This matches the convention used by most
+/// command-line tools and language servers when operating in byte mode.
+fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
+    if offset > source.len() {
+        return None;
+    }
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for byte in source[..offset].bytes() {
+        if byte == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    Some((line, col))
+}
+
 /// Build the `(span, src)` pair shared by all `_at` constructors.
 fn at(
     file: &str,
@@ -464,182 +515,71 @@ impl MdsError {
     pub(crate) fn not_mds_file(path: impl Into<String>) -> Self {
         MdsError::NotMdsFile { path: path.into() }
     }
+
+    /// Serialize this error into a [`SerializedError`] suitable for JSON output.
+    ///
+    /// - `code` is extracted via [`miette::Diagnostic::code`] (drift-proof).
+    /// - `message` is the `Display` representation of the error.
+    /// - `help` is extracted via [`miette::Diagnostic::help`] (drift-proof).
+    /// - `span` is populated for variants that carry `(span, src)` fields.
+    ///   If `span` is `Some` but `src` is `None`, or if the offset exceeds the
+    ///   source length, `line` and `column` are `None` but `offset`/`length`
+    ///   still reflect the raw `SourceSpan` values.
+    pub fn serialize(&self) -> SerializedError {
+        let code = Diagnostic::code(self)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        let message = self.to_string();
+        let help = Diagnostic::help(self).map(|h| h.to_string());
+
+        // Extract (span, src) from each span-bearing variant; no-span variants
+        // use the wildcard arm and produce span: None.
+        let serialized_span: Option<SerializedSpan> = match self {
+            MdsError::Syntax { span, src, .. }
+            | MdsError::UndefinedVariable { span, src, .. }
+            | MdsError::UndefinedFunction { span, src, .. }
+            | MdsError::ArityMismatch { span, src, .. }
+            | MdsError::TypeError { span, src, .. }
+            | MdsError::CircularImport { span, src, .. }
+            | MdsError::FileNotFound { span, src, .. }
+            | MdsError::ImportError { span, src, .. }
+            | MdsError::NameCollision { span, src, .. }
+            | MdsError::Recursion { span, src, .. }
+            | MdsError::ExportError { span, src, .. } => {
+                span.as_ref().map(|ss| {
+                    let offset = ss.offset();
+                    let length = ss.len();
+                    let (line, column) = src
+                        .as_ref()
+                        .and_then(|named_src| {
+                            // NamedSource<String> implements SourceCode; inner() gives &String.
+                            compute_line_column(named_src.inner(), offset)
+                        })
+                        .map_or((None, None), |(l, c)| (Some(l), Some(c)));
+                    SerializedSpan {
+                        offset,
+                        length,
+                        line,
+                        column,
+                    }
+                })
+            }
+            MdsError::NotMdsFile { .. }
+            | MdsError::Io { .. }
+            | MdsError::ResourceLimit { .. }
+            | MdsError::YamlError { .. }
+            | MdsError::JsonError { .. } => None,
+        };
+
+        SerializedError {
+            code,
+            message,
+            help,
+            span: serialized_span,
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── Display output ────────────────────────────────────────────────────────
-
-    #[test]
-    fn syntax_display_contains_message() {
-        let e = MdsError::syntax("unexpected token '}'");
-        assert!(e.to_string().contains("unexpected token '}'"));
-    }
-
-    #[test]
-    fn undefined_var_display_contains_name() {
-        let e = MdsError::undefined_var("my_var");
-        assert!(e.to_string().contains("my_var"));
-    }
-
-    #[test]
-    fn undefined_fn_display_contains_name() {
-        let e = MdsError::undefined_fn("my_fn");
-        assert!(e.to_string().contains("my_fn"));
-    }
-
-    #[test]
-    fn arity_display_contains_name_and_counts() {
-        let e = MdsError::arity("greet", 1, 3);
-        let msg = e.to_string();
-        assert!(msg.contains("greet"));
-        assert!(msg.contains('1'));
-        assert!(msg.contains('3'));
-    }
-
-    #[test]
-    fn arity_display_singular_argument() {
-        let e = MdsError::arity("f", 1, 0);
-        assert!(
-            e.to_string().contains("argument"),
-            "should say 'argument' not 'arguments' for 1"
-        );
-    }
-
-    #[test]
-    fn arity_display_plural_arguments() {
-        let e = MdsError::arity("f", 2, 0);
-        assert!(
-            e.to_string().contains("arguments"),
-            "should say 'arguments' for 2"
-        );
-    }
-
-    #[test]
-    fn type_error_display_contains_got() {
-        let e = MdsError::type_error("string");
-        assert!(e.to_string().contains("string"));
-    }
-
-    #[test]
-    fn circular_import_display_contains_cycle() {
-        let e = MdsError::circular_import("a -> b -> a");
-        assert!(e.to_string().contains("a -> b -> a"));
-    }
-
-    #[test]
-    fn file_not_found_display_contains_path() {
-        let e = MdsError::file_not_found("foo/bar.mds");
-        assert!(e.to_string().contains("foo/bar.mds"));
-    }
-
-    #[test]
-    fn recursion_display_contains_name() {
-        let e = MdsError::recursion("fib");
-        assert!(e.to_string().contains("fib"));
-    }
-
-    #[test]
-    fn io_display_contains_message() {
-        let e = MdsError::io("permission denied");
-        assert!(e.to_string().contains("permission denied"));
-    }
-
-    #[test]
-    fn yaml_error_display_contains_message() {
-        let e = MdsError::yaml_error("unexpected indent");
-        assert!(e.to_string().contains("unexpected indent"));
-    }
-
-    #[test]
-    fn json_error_display_contains_message() {
-        let e = MdsError::json_error("trailing comma");
-        assert!(e.to_string().contains("trailing comma"));
-    }
-
-    #[test]
-    fn not_mds_file_display_contains_path() {
-        let e = MdsError::not_mds_file("readme.txt");
-        assert!(e.to_string().contains("readme.txt"));
-    }
-
-    #[test]
-    fn resource_limit_display_contains_message() {
-        let e = MdsError::resource_limit("too many iterations");
-        assert!(e.to_string().contains("too many iterations"));
-    }
-
-    // ── Span propagation via _at constructors ─────────────────────────────────
-
-    #[test]
-    fn syntax_at_populates_span_and_src() {
-        let e = MdsError::syntax_at("bad token", "file.mds", "hello world", 0, 5);
-        match e {
-            MdsError::Syntax { span, src, .. } => {
-                assert!(span.is_some(), "span should be populated");
-                assert!(src.is_some(), "src should be populated");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn undefined_var_at_populates_span() {
-        let e = MdsError::undefined_var_at("x", "f.mds", "{{ x }}", 3, 1);
-        match e {
-            MdsError::UndefinedVariable { span, .. } => {
-                assert!(span.is_some());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn type_error_at_populates_span() {
-        let e = MdsError::type_error_at("string", "f.mds", "source", 0, 6);
-        match e {
-            MdsError::TypeError { span, .. } => {
-                assert!(span.is_some());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn recursion_at_populates_span() {
-        let e = MdsError::recursion_at("fib", "f.mds", "source", 0, 3);
-        match e {
-            MdsError::Recursion { span, .. } => {
-                assert!(span.is_some());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn circular_import_at_populates_span() {
-        let e = MdsError::circular_import_at("a->b->a", "f.mds", "source", 0, 1);
-        match e {
-            MdsError::CircularImport { span, .. } => {
-                assert!(span.is_some());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    // ── No-span constructors leave span as None ───────────────────────────────
-
-    #[test]
-    fn syntax_without_at_has_no_span() {
-        let e = MdsError::syntax("msg");
-        match e {
-            MdsError::Syntax { span, src, .. } => {
-                assert!(span.is_none());
-                assert!(src.is_none());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-}
+#[path = "error_tests.rs"]
+mod tests;

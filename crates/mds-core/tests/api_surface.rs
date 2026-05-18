@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mds::{
-    FileSystem, MdsError, ModuleCache, NativeFs, Value, VirtualFs, MAX_FILE_SIZE,
+    CompileOutput, FileSystem, MdsError, ModuleCache, NativeFs, Value, VirtualFs, MAX_FILE_SIZE,
     MAX_TRAVERSAL_DEPTH,
 };
 
@@ -243,6 +243,114 @@ fn module_cache_new_still_works() {
     let _cache = ModuleCache::new();
 }
 
+// ── CompileOutput / dependency graph API (Stage 2) ────────────────────────────
+
+#[test]
+fn compile_output_type_importable() {
+    // CompileOutput must be constructible and implement Debug + Clone + PartialEq.
+    let co = CompileOutput {
+        output: "hello\n".to_string(),
+        warnings: vec!["warn".to_string()],
+        dependencies: vec!["lib.mds".to_string()],
+    };
+    let cloned = co.clone();
+    assert_eq!(co, cloned);
+    let _ = format!("{co:?}");
+}
+
+#[test]
+fn compile_output_to_json() {
+    // CompileOutput must serialize to JSON with "output", "warnings", "dependencies" keys.
+    let co = CompileOutput {
+        output: "hello\n".to_string(),
+        warnings: vec![],
+        dependencies: vec!["dep.mds".to_string()],
+    };
+    let json = serde_json::to_string(&co).expect("should serialize");
+    assert!(json.contains("\"output\""), "missing output key: {json}");
+    assert!(
+        json.contains("\"warnings\""),
+        "missing warnings key: {json}"
+    );
+    assert!(
+        json.contains("\"dependencies\""),
+        "missing dependencies key: {json}"
+    );
+    assert!(json.contains("\"dep.mds\""), "missing dep value: {json}");
+}
+
+#[test]
+fn compile_with_deps_exists() {
+    // compile_with_deps is callable (will error on nonexistent file, which is fine).
+    let _ = mds::compile_with_deps(Path::new("nonexistent.mds"), None);
+}
+
+#[test]
+fn compile_str_with_deps_exists() {
+    // compile_str_with_deps compiles successfully.
+    let result = mds::compile_str_with_deps("---\nname: World\n---\nHello {name}!\n", None, None)
+        .expect("should compile");
+    assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
+    assert_eq!(result.dependencies, Vec::<String>::new());
+}
+
+#[test]
+fn compile_virtual_with_deps_exists() {
+    // compile_virtual_with_deps compiles successfully.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "main.mds".to_string(),
+        "---\nname: World\n---\nHello {name}!\n".to_string(),
+    );
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
+    assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
+    assert_eq!(result.dependencies, Vec::<String>::new());
+}
+
+#[test]
+fn module_cache_dependencies_exists() {
+    // ModuleCache::dependencies() is callable.
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut warnings = vec![];
+    let _ = cache
+        .resolve_key("main.mds", &HashMap::new(), &mut warnings)
+        .expect("should resolve");
+    let deps = cache.dependencies();
+    assert!(deps.contains(&"main.mds".to_string()));
+}
+
+#[test]
+fn compile_with_deps_output_matches_compile() {
+    // Same input → same output string as compile_virtual.
+    let modules = HashMap::from([(
+        "main.mds".to_string(),
+        "---\nname: World\n---\nHello {name}!\n".to_string(),
+    )]);
+    let baseline = mds::compile_virtual(modules.clone(), "main.mds", None).expect("baseline");
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("with deps");
+    assert_eq!(result.output, baseline);
+}
+
+// ── Regression: existing functions unchanged ──────────────────────────────────
+
+#[test]
+fn compile_virtual_unchanged() {
+    // compile_virtual still returns Result<String, MdsError>, not CompileOutput.
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+    let result: Result<String, MdsError> = mds::compile_virtual(modules, "main.mds", None);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn compile_str_unchanged() {
+    // compile_str still returns Result<String, MdsError>, not CompileOutput.
+    let result: Result<String, MdsError> = mds::compile_str("Hello!\n");
+    assert!(result.is_ok());
+}
+
 #[test]
 fn compile_virtual_exists() {
     // compile_virtual is callable with a trivial module.
@@ -320,6 +428,98 @@ fn check_virtual_rejects_invalid_module() {
     assert!(
         result.is_err(),
         "check_virtual should fail for undefined variable"
+    );
+}
+
+/// Integration test for `compile_with_deps` using NativeFs with real on-disk files.
+///
+/// Creates two .mds files in a tempdir: an entry that imports a library.
+/// Verifies that:
+/// - Compilation succeeds and output is correct
+/// - The imported library appears in dependencies
+/// - The entry file itself is excluded from dependencies
+#[test]
+fn compile_with_deps_native_fs_integration() {
+    use std::io::Write;
+
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let lib_path = dir.path().join("lib.mds");
+    let mut f = std::fs::File::create(&lib_path).unwrap();
+    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n")
+        .unwrap();
+
+    let entry_path = dir.path().join("main.mds");
+    let mut f = std::fs::File::create(&entry_path).unwrap();
+    f.write_all(b"@import \"./lib.mds\"\n{greet(\"World\")}\n")
+        .unwrap();
+
+    let result = mds::compile_with_deps(&entry_path, None)
+        .expect("compile_with_deps should succeed with real files");
+
+    assert!(
+        result.output.contains("Hello World!"),
+        "expected rendered output, got: {}",
+        result.output
+    );
+    // The imported lib must appear in deps.
+    assert_eq!(
+        result.dependencies.len(),
+        1,
+        "expected 1 dep, got: {:?}",
+        result.dependencies
+    );
+    let dep = &result.dependencies[0];
+    assert!(
+        dep.ends_with("lib.mds"),
+        "expected dep ending in lib.mds, got: {dep}"
+    );
+    // The entry file must NOT appear in deps (entry-key exclusion by value filter).
+    assert!(
+        !result.dependencies.iter().any(|d| d.ends_with("main.mds")),
+        "entry file must be excluded from deps, got: {:?}",
+        result.dependencies
+    );
+}
+
+/// Test that compiler-emitted warnings surface in `CompileOutput::warnings`.
+///
+/// The evaluator emits a warning when `@include` is used against a module that
+/// has no body text (only macro definitions). This test verifies that the warning
+/// makes it into `result.warnings` rather than being silently dropped or sent to
+/// stderr.
+#[test]
+fn compile_output_warnings_emitted_for_empty_include() {
+    // A definition-only module: has @define but no top-level body text.
+    // @include of this module will produce no output, triggering the warning.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert(
+        "defs.mds".to_string(),
+        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./defs.mds\" as defs\n@include defs\n{defs.greet(\"World\")}\n".to_string(),
+    );
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
+
+    assert!(
+        result.output.contains("Hello World!"),
+        "expected rendered output, got: {}",
+        result.output
+    );
+    assert!(
+        !result.warnings.is_empty(),
+        "expected at least one warning for @include of empty module, got none"
+    );
+    let has_include_warning = result
+        .warnings
+        .iter()
+        .any(|w| w.contains("@include") && w.contains("empty output"));
+    assert!(
+        has_include_warning,
+        "expected warning about empty @include, got: {:?}",
+        result.warnings
     );
 }
 

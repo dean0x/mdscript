@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
@@ -45,7 +45,10 @@ pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.
 pub struct ModuleCache {
     fs: Box<dyn FileSystem>,
-    modules: HashMap<String, Arc<ResolvedModule>>,
+    /// Stores resolved modules in first-resolution (depth-first) order.
+    /// IndexMap preserves insertion order while providing O(1) get/insert/contains_key,
+    /// enabling efficient dependency-graph extraction via `dependencies()`.
+    modules: IndexMap<String, Arc<ResolvedModule>>,
     /// Tracks modules currently being resolved. IndexSet provides both O(1)
     /// membership test (like HashSet) and insertion-ordered iteration (like Vec),
     /// so a separate `resolving_stack` is no longer needed.
@@ -73,7 +76,7 @@ impl ModuleCache {
     pub fn native() -> Self {
         Self {
             fs: Box::new(NativeFs::new()),
-            modules: HashMap::new(),
+            modules: IndexMap::new(),
             resolving: IndexSet::new(),
         }
     }
@@ -85,7 +88,7 @@ impl ModuleCache {
     pub fn virtual_fs(modules: HashMap<String, String>) -> Self {
         Self {
             fs: Box::new(VirtualFs::new(modules)),
-            modules: HashMap::new(),
+            modules: IndexMap::new(),
             resolving: IndexSet::new(),
         }
     }
@@ -94,9 +97,20 @@ impl ModuleCache {
     pub fn with_fs(fs: Box<dyn FileSystem>) -> Self {
         Self {
             fs,
-            modules: HashMap::new(),
+            modules: IndexMap::new(),
             resolving: IndexSet::new(),
         }
+    }
+
+    /// Returns normalized keys of all modules resolved during compilation,
+    /// in first-resolution order (depth-first traversal).
+    ///
+    /// This includes the entry module itself. Use this after a successful
+    /// `resolve_path` / `resolve_key` / `resolve_source` call to obtain the
+    /// dependency graph. Callers that want to exclude the entry point should
+    /// filter it out themselves (see `compile_virtual_with_deps`).
+    pub fn dependencies(&self) -> Vec<String> {
+        self.modules.keys().cloned().collect()
     }
 
     /// Guard against excessively deep import chains.
@@ -228,15 +242,10 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        // Canonicalize base_dir and set the filesystem root so import traversal
-        // checks work correctly even when base_dir contains '.' or '..' components.
-        let canonical = base_dir.canonicalize().map_err(|e| {
-            MdsError::io(format!(
-                "cannot resolve base directory {}: {e}",
-                base_dir.display()
-            ))
-        })?;
-        let canonical_str = canonical.display().to_string();
+        // Canonicalize base_dir via the FileSystem abstraction so that custom
+        // or virtual backends can override this behaviour (fixes issue #21).
+        let base_dir_str = base_dir.display().to_string();
+        let canonical_str = self.fs.canonicalize(&base_dir_str)?;
         self.fs.set_root(&canonical_str)?;
 
         // The base_key must look like a file path so that normalize() can call

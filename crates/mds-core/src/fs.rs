@@ -60,6 +60,16 @@ pub trait FileSystem: Send + Sync {
     fn set_root(&self, _base: &str) -> Result<(), MdsError> {
         Ok(())
     }
+
+    /// Resolve a path to its canonical (absolute, symlink-free) form.
+    ///
+    /// The default implementation is an identity function — suitable for
+    /// virtual or in-memory filesystems where canonicalization is a no-op.
+    ///
+    /// [`NativeFs`] overrides this to call [`std::fs::canonicalize`].
+    fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
+        Ok(path.to_string())
+    }
 }
 
 // ── VirtualFs ────────────────────────────────────────────────────────────────
@@ -328,6 +338,26 @@ impl FileSystem for NativeFs {
             .map_err(|e| MdsError::io(format!("cannot resolve base directory {base}: {e}")))?;
         self.init_root(&canonical);
         Ok(())
+    }
+
+    fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
+        // Use check_symlink() rather than std::fs::canonicalize() directly so that
+        // symlinked directories are rejected before they can re-anchor the security
+        // root to an attacker-controlled location (issue #21).
+        //
+        // check_symlink() returns ImportError (symlink detected) or FileNotFound
+        // (path does not exist). ImportError passes through; FileNotFound is
+        // re-wrapped as Io because canonicalize is a resolution operation, not
+        // an import step.
+        Self::check_symlink(Path::new(path))
+            .map(|p| p.display().to_string())
+            .map_err(|e| match e {
+                MdsError::ImportError { .. } => e,
+                MdsError::FileNotFound { .. } => {
+                    MdsError::io(format!("cannot resolve path {path}: {e}"))
+                }
+                other => other,
+            })
     }
 }
 
@@ -750,6 +780,67 @@ mod tests {
         assert!(
             msg.contains("empty"),
             "expected 'empty' in error for empty import, got: {msg}"
+        );
+    }
+
+    // ── FileSystem::canonicalize ──────────────────────────────────────────────
+
+    #[test]
+    fn vfs_canonicalize_returns_identity() {
+        // VirtualFs inherits the default implementation — returns path unchanged.
+        let key = "some/virtual/path.mds";
+        let result = vfs().canonicalize(key);
+        assert_eq!(result.unwrap(), key, "VirtualFs canonicalize should be identity");
+    }
+
+    #[test]
+    fn native_canonicalize_resolves_real_path() {
+        // NativeFs should resolve a real file to its canonical absolute path.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "real.mds", "content");
+        let fs = NativeFs::new();
+        let result = fs.canonicalize(&file.display().to_string());
+        let canonical = result.expect("canonicalize should succeed for real file");
+        // The canonical path must be absolute and contain the filename.
+        assert!(
+            canonical.contains("real.mds"),
+            "canonical path should contain filename, got: {canonical}"
+        );
+        // Must be an absolute path.
+        assert!(
+            Path::new(&canonical).is_absolute(),
+            "canonical path should be absolute, got: {canonical}"
+        );
+    }
+
+    #[test]
+    fn native_canonicalize_nonexistent_errors() {
+        // NativeFs should return an Io error for a nonexistent path.
+        let fs = NativeFs::new();
+        let result = fs.canonicalize("/nonexistent/path/does/not/exist.mds");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MdsError::Io { .. }),
+            "expected Io error for nonexistent path, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn native_canonicalize_symlink_rejected() {
+        // Security boundary: canonicalize() must reject symlinked directories so that
+        // a symlinked base_dir cannot re-anchor the security root to an arbitrary location.
+        let real_dir = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link_path = link_parent.path().join("link_to_dir");
+        std::os::unix::fs::symlink(real_dir.path(), &link_path).unwrap();
+
+        let fs = NativeFs::new();
+        let result = fs.canonicalize(&link_path.display().to_string());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinks"),
+            "expected 'symlinks' in error when canonicalizing a symlink, got: {msg}"
         );
     }
 
