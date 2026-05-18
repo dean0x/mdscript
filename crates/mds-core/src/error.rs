@@ -980,4 +980,98 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    // ── I3: serialize() tests for UndefinedFunction, ImportError, NameCollision ─
+
+    #[test]
+    fn serialize_undefined_fn_with_span() {
+        // "{{ greet() }}" — 'g' of "greet" is at offset 3, length 5.
+        let e = MdsError::undefined_fn_at("greet", "f.mds", "{{ greet() }}", 3, 5);
+        let s = e.serialize();
+        assert_eq!(s.code, "mds::undefined_fn");
+        let help = s.help.expect("UndefinedFunction should have help text");
+        assert!(
+            help.contains("define"),
+            "help should mention 'define', got: {help}"
+        );
+        let span = s.span.expect("span should be Some");
+        assert_eq!(span.offset, 3);
+        assert_eq!(span.length, 5);
+        assert_eq!(span.line, Some(1));
+        assert_eq!(span.column, Some(4)); // bytes 0,1,2 → col 4
+    }
+
+    #[test]
+    fn serialize_import_error_with_span() {
+        // "import x" — 'x' at offset 7, length 1.
+        let e = MdsError::import_error_at("could not resolve", "f.mds", "import x", 7, 1);
+        let s = e.serialize();
+        assert_eq!(s.code, "mds::import");
+        assert_eq!(s.help, None, "ImportError has no help text");
+        let span = s.span.expect("span should be Some");
+        assert_eq!(span.offset, 7);
+        assert_eq!(span.length, 1);
+        assert_eq!(span.line, Some(1));
+        assert_eq!(span.column, Some(8)); // bytes 0..6 → col 8
+    }
+
+    #[test]
+    fn serialize_name_collision_with_span() {
+        // "foo" redefined at offset 0, length 3.
+        let e = MdsError::name_collision_at("foo", "f.mds", "foo = 1", 0, 3);
+        let s = e.serialize();
+        assert_eq!(s.code, "mds::name_collision");
+        assert_eq!(s.help, None, "NameCollision has no help text");
+        let span = s.span.expect("span should be Some");
+        assert_eq!(span.offset, 0);
+        assert_eq!(span.length, 3);
+        assert_eq!(span.line, Some(1));
+        assert_eq!(span.column, Some(1));
+    }
+
+    // ── I4: serialize() test for ExportError ──────────────────────────────────
+
+    #[test]
+    fn serialize_export_error_with_span() {
+        // Export statement at offset 0, length 6.
+        let e = MdsError::export_error_at("invalid export target", "f.mds", "export foo", 0, 6);
+        let s = e.serialize();
+        assert_eq!(s.code, "mds::export");
+        assert_eq!(s.help, None, "ExportError has no help text");
+        let span = s.span.expect("span should be Some");
+        assert_eq!(span.offset, 0);
+        assert_eq!(span.length, 6);
+        assert_eq!(span.line, Some(1));
+        assert_eq!(span.column, Some(1));
+    }
+
+    // ── I5: span=Some but src=None produces offset/length but not line/column ──
+
+    #[test]
+    fn serialize_span_some_src_none_omits_line_column() {
+        // Construct Syntax directly with span set but src intentionally None,
+        // matching the documented behavior in serialize()'s doc comment.
+        let e = MdsError::Syntax {
+            message: "bad token".to_string(),
+            span: Some(miette::SourceSpan::new(10.into(), 3)),
+            src: None,
+        };
+        let s = e.serialize();
+        assert_eq!(s.code, "mds::syntax");
+        let span = s.span.expect("span should be Some when SourceSpan is set");
+        assert_eq!(span.offset, 10);
+        assert_eq!(span.length, 3);
+        // Without src there is no source text to compute line/column from.
+        assert_eq!(span.line, None, "line should be None when src is None");
+        assert_eq!(span.column, None, "column should be None when src is None");
+    }
+
+    // ── I6: compute_line_column at offset == source.len() (boundary) ──────────
+
+    #[test]
+    fn line_col_at_end_of_source() {
+        // "abc" has len 3. Offset 3 is one past the last byte — still valid
+        // (offset == len is the exclusive-end sentinel, not out-of-bounds).
+        assert_eq!(compute_line_column("abc", 3), Some((1, 4)));
+    }
 }
