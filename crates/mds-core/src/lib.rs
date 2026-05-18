@@ -55,7 +55,7 @@ pub use resolver::ModuleCache;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub use error::MdsError;
+pub use error::{MdsError, SerializedError, SerializedSpan};
 pub use value::Value;
 
 /// Maximum file size accepted for compilation (10 MB).
