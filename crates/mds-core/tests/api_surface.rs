@@ -268,8 +268,14 @@ fn compile_output_to_json() {
     };
     let json = serde_json::to_string(&co).expect("should serialize");
     assert!(json.contains("\"output\""), "missing output key: {json}");
-    assert!(json.contains("\"warnings\""), "missing warnings key: {json}");
-    assert!(json.contains("\"dependencies\""), "missing dependencies key: {json}");
+    assert!(
+        json.contains("\"warnings\""),
+        "missing warnings key: {json}"
+    );
+    assert!(
+        json.contains("\"dependencies\""),
+        "missing dependencies key: {json}"
+    );
     assert!(json.contains("\"dep.mds\""), "missing dep value: {json}");
 }
 
@@ -282,11 +288,8 @@ fn compile_with_deps_exists() {
 #[test]
 fn compile_str_with_deps_exists() {
     // compile_str_with_deps compiles successfully.
-    let result = mds::compile_str_with_deps(
-        "---\nname: World\n---\nHello {name}!\n",
-        None,
-        None,
-    ).expect("should compile");
+    let result = mds::compile_str_with_deps("---\nname: World\n---\nHello {name}!\n", None, None)
+        .expect("should compile");
     assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
     assert_eq!(result.dependencies, Vec::<String>::new());
 }
@@ -299,8 +302,7 @@ fn compile_virtual_with_deps_exists() {
         "main.mds".to_string(),
         "---\nname: World\n---\nHello {name}!\n".to_string(),
     );
-    let result = mds::compile_virtual_with_deps(modules, "main.mds", None)
-        .expect("should compile");
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
     assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
     assert_eq!(result.dependencies, Vec::<String>::new());
 }
@@ -312,7 +314,9 @@ fn module_cache_dependencies_exists() {
     modules.insert("main.mds".to_string(), "Hello!\n".to_string());
     let mut cache = ModuleCache::virtual_fs(modules);
     let mut warnings = vec![];
-    let _ = cache.resolve_key("main.mds", &HashMap::new(), &mut warnings).expect("should resolve");
+    let _ = cache
+        .resolve_key("main.mds", &HashMap::new(), &mut warnings)
+        .expect("should resolve");
     let deps = cache.dependencies();
     assert!(deps.contains(&"main.mds".to_string()));
 }
@@ -335,10 +339,7 @@ fn compile_with_deps_output_matches_compile() {
 fn compile_virtual_unchanged() {
     // compile_virtual still returns Result<String, MdsError>, not CompileOutput.
     let mut modules = HashMap::new();
-    modules.insert(
-        "main.mds".to_string(),
-        "Hello!\n".to_string(),
-    );
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
     let result: Result<String, MdsError> = mds::compile_virtual(modules, "main.mds", None);
     assert!(result.is_ok());
 }
@@ -445,11 +446,13 @@ fn compile_with_deps_native_fs_integration() {
 
     let lib_path = dir.path().join("lib.mds");
     let mut f = std::fs::File::create(&lib_path).unwrap();
-    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n").unwrap();
+    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n")
+        .unwrap();
 
     let entry_path = dir.path().join("main.mds");
     let mut f = std::fs::File::create(&entry_path).unwrap();
-    f.write_all(b"@import \"./lib.mds\"\n{greet(\"World\")}\n").unwrap();
+    f.write_all(b"@import \"./lib.mds\"\n{greet(\"World\")}\n")
+        .unwrap();
 
     let result = mds::compile_with_deps(&entry_path, None)
         .expect("compile_with_deps should succeed with real files");
@@ -460,7 +463,12 @@ fn compile_with_deps_native_fs_integration() {
         result.output
     );
     // The imported lib must appear in deps.
-    assert_eq!(result.dependencies.len(), 1, "expected 1 dep, got: {:?}", result.dependencies);
+    assert_eq!(
+        result.dependencies.len(),
+        1,
+        "expected 1 dep, got: {:?}",
+        result.dependencies
+    );
     let dep = &result.dependencies[0];
     assert!(
         dep.ends_with("lib.mds"),
@@ -493,8 +501,7 @@ fn compile_output_warnings_emitted_for_empty_include() {
         "main.mds".to_string(),
         "@import \"./defs.mds\" as defs\n@include defs\n{defs.greet(\"World\")}\n".to_string(),
     );
-    let result = mds::compile_virtual_with_deps(modules, "main.mds", None)
-        .expect("should compile");
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
 
     assert!(
         result.output.contains("Hello World!"),

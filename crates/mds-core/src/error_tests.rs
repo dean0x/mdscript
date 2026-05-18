@@ -100,7 +100,10 @@ fn serialize_arity_code() {
     let e = MdsError::arity_at("greet", 1, 3, "f.mds", "source text", 0, 6);
     let s = e.serialize();
     assert_eq!(s.code, "mds::arity");
-    assert!(s.span.is_some(), "ArityMismatch with span should produce Some(span)");
+    assert!(
+        s.span.is_some(),
+        "ArityMismatch with span should produce Some(span)"
+    );
 }
 
 #[test]
@@ -108,10 +111,7 @@ fn serialize_type_error_with_help() {
     let e = MdsError::type_error_at("string", "f.mds", "source", 0, 6);
     let s = e.serialize();
     assert_eq!(s.code, "mds::type_error");
-    assert!(
-        s.help.is_some(),
-        "TypeError should have help text"
-    );
+    assert!(s.help.is_some(), "TypeError should have help text");
     assert!(s.span.is_some());
 }
 
@@ -120,10 +120,7 @@ fn serialize_circular_import() {
     let e = MdsError::circular_import_at("a->b->a", "f.mds", "source", 0, 1);
     let s = e.serialize();
     assert_eq!(s.code, "mds::circular_import");
-    assert!(
-        s.help.is_some(),
-        "CircularImport should have help text"
-    );
+    assert!(s.help.is_some(), "CircularImport should have help text");
     assert!(s.span.is_some());
 }
 
@@ -132,10 +129,7 @@ fn serialize_file_not_found() {
     let e = MdsError::file_not_found_at("missing.mds", "f.mds", "source", 0, 1);
     let s = e.serialize();
     assert_eq!(s.code, "mds::file_not_found");
-    assert!(
-        s.help.is_some(),
-        "FileNotFound should have help text"
-    );
+    assert!(s.help.is_some(), "FileNotFound should have help text");
     assert!(s.span.is_some());
 }
 
@@ -144,10 +138,7 @@ fn serialize_recursion() {
     let e = MdsError::recursion_at("fib", "f.mds", "source text", 0, 3);
     let s = e.serialize();
     assert_eq!(s.code, "mds::recursion");
-    assert!(
-        s.help.is_some(),
-        "Recursion should have help text"
-    );
+    assert!(s.help.is_some(), "Recursion should have help text");
     assert!(s.span.is_some());
 }
 
@@ -156,10 +147,7 @@ fn serialize_not_mds_no_span() {
     let e = MdsError::not_mds_file("readme.txt");
     let s = e.serialize();
     assert_eq!(s.code, "mds::not_mds");
-    assert!(
-        s.help.is_some(),
-        "NotMdsFile should have help text"
-    );
+    assert!(s.help.is_some(), "NotMdsFile should have help text");
     assert_eq!(s.span, None);
 }
 
@@ -208,15 +196,26 @@ fn serialized_error_to_json_with_span() {
     let json = serde_json::to_string(&s).expect("serialization should succeed");
     // Verify JSON structure contains expected keys.
     assert!(json.contains("\"code\""), "JSON should contain 'code' key");
-    assert!(json.contains("\"message\""), "JSON should contain 'message' key");
+    assert!(
+        json.contains("\"message\""),
+        "JSON should contain 'message' key"
+    );
     assert!(json.contains("\"span\""), "JSON should contain 'span' key");
-    assert!(json.contains("\"offset\""), "JSON should contain 'offset' key");
-    assert!(json.contains("\"length\""), "JSON should contain 'length' key");
+    assert!(
+        json.contains("\"offset\""),
+        "JSON should contain 'offset' key"
+    );
+    assert!(
+        json.contains("\"length\""),
+        "JSON should contain 'length' key"
+    );
     assert!(json.contains("\"line\""), "JSON should contain 'line' key");
-    assert!(json.contains("\"column\""), "JSON should contain 'column' key");
+    assert!(
+        json.contains("\"column\""),
+        "JSON should contain 'column' key"
+    );
     // Verify values are correct.
-    let v: serde_json::Value =
-        serde_json::from_str(&json).expect("JSON should parse back");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("JSON should parse back");
     assert_eq!(v["code"], "mds::syntax");
     assert_eq!(v["span"]["offset"], 6);
     assert_eq!(v["span"]["length"], 5);
@@ -229,8 +228,7 @@ fn serialized_error_to_json_null_span() {
     let e = MdsError::io("disk full");
     let s = e.serialize();
     let json = serde_json::to_string(&s).expect("serialization should succeed");
-    let v: serde_json::Value =
-        serde_json::from_str(&json).expect("JSON should parse back");
+    let v: serde_json::Value = serde_json::from_str(&json).expect("JSON should parse back");
     assert!(v["span"].is_null(), "span should be null in JSON when None");
 }
 

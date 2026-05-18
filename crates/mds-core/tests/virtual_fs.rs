@@ -319,7 +319,11 @@ fn deps_two_files() {
         "@import \"./lib.mds\"\n{greet(\"Alice\")}\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
-    assert!(result.output.contains("Hello Alice!"), "got: {}", result.output);
+    assert!(
+        result.output.contains("Hello Alice!"),
+        "got: {}",
+        result.output
+    );
     assert_eq!(result.dependencies, vec!["lib.mds".to_string()]);
 }
 
@@ -342,7 +346,10 @@ fn deps_three_file_chain() {
     let result = mds::compile_virtual_with_deps(modules, "a.mds", None).expect("should compile");
     assert!(result.output.contains("World!!!"), "got: {}", result.output);
     // Resolution is post-order DFS: c is inserted first (leaf), then b, then a (entry, excluded).
-    assert_eq!(result.dependencies, vec!["c.mds".to_string(), "b.mds".to_string()]);
+    assert_eq!(
+        result.dependencies,
+        vec!["c.mds".to_string(), "b.mds".to_string()]
+    );
 }
 
 #[test]
@@ -374,14 +381,39 @@ fn deps_diamond_no_duplicates() {
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
     assert!(result.output.contains("hello"), "got: {}", result.output);
     // shared must appear exactly once
-    let shared_count = result.dependencies.iter().filter(|d| *d == "shared.mds").count();
-    assert_eq!(shared_count, 1, "shared appeared {shared_count} times: {:?}", result.dependencies);
+    let shared_count = result
+        .dependencies
+        .iter()
+        .filter(|d| *d == "shared.mds")
+        .count();
+    assert_eq!(
+        shared_count, 1,
+        "shared appeared {shared_count} times: {:?}",
+        result.dependencies
+    );
     // All three deps present
-    assert!(result.dependencies.contains(&"a.mds".to_string()), "missing a.mds: {:?}", result.dependencies);
-    assert!(result.dependencies.contains(&"b.mds".to_string()), "missing b.mds: {:?}", result.dependencies);
-    assert!(result.dependencies.contains(&"shared.mds".to_string()), "missing shared.mds: {:?}", result.dependencies);
+    assert!(
+        result.dependencies.contains(&"a.mds".to_string()),
+        "missing a.mds: {:?}",
+        result.dependencies
+    );
+    assert!(
+        result.dependencies.contains(&"b.mds".to_string()),
+        "missing b.mds: {:?}",
+        result.dependencies
+    );
+    assert!(
+        result.dependencies.contains(&"shared.mds".to_string()),
+        "missing shared.mds: {:?}",
+        result.dependencies
+    );
     // 3 deps total, no duplicates
-    assert_eq!(result.dependencies.len(), 3, "expected 3 deps, got: {:?}", result.dependencies);
+    assert_eq!(
+        result.dependencies.len(),
+        3,
+        "expected 3 deps, got: {:?}",
+        result.dependencies
+    );
 }
 
 #[test]
@@ -390,12 +422,13 @@ fn deps_str_with_deps_basic() {
     // Use a base_dir so the import resolution works; but with NativeFs that
     // would look for real files. Skip this variant here — covered in api_surface.rs.
     // Instead test the no-import case:
-    let result = mds::compile_str_with_deps(
-        "---\nname: Alice\n---\nHi {name}!\n",
-        None,
-        None,
-    ).expect("should compile");
-    assert!(result.output.contains("Hi Alice!"), "got: {}", result.output);
+    let result = mds::compile_str_with_deps("---\nname: Alice\n---\nHi {name}!\n", None, None)
+        .expect("should compile");
+    assert!(
+        result.output.contains("Hi Alice!"),
+        "got: {}",
+        result.output
+    );
     // No imports → no deps
     assert_eq!(result.dependencies, Vec::<String>::new());
 }
@@ -408,7 +441,8 @@ fn deps_str_with_deps_file_import() {
     let dir = tempfile::TempDir::new().unwrap();
     let lib_path = dir.path().join("lib.mds");
     let mut f = std::fs::File::create(&lib_path).unwrap();
-    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n").unwrap();
+    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n")
+        .unwrap();
 
     let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
     let result = mds::compile_str_with_deps(source, Some(dir.path()), None)
@@ -421,7 +455,12 @@ fn deps_str_with_deps_file_import() {
     );
     // The lib file is an imported dependency; source string is not a file, so
     // only the imported lib appears in dependencies.
-    assert_eq!(result.dependencies.len(), 1, "expected 1 dep, got: {:?}", result.dependencies);
+    assert_eq!(
+        result.dependencies.len(),
+        1,
+        "expected 1 dep, got: {:?}",
+        result.dependencies
+    );
     let dep = &result.dependencies[0];
     assert!(
         dep.ends_with("lib.mds"),

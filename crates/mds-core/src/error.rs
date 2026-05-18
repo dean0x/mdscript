@@ -556,7 +556,12 @@ impl MdsError {
                             compute_line_column(named_src.inner(), offset)
                         })
                         .map_or((None, None), |(l, c)| (Some(l), Some(c)));
-                    SerializedSpan { offset, length, line, column }
+                    SerializedSpan {
+                        offset,
+                        length,
+                        line,
+                        column,
+                    }
                 })
             }
             MdsError::NotMdsFile { .. }
@@ -566,7 +571,12 @@ impl MdsError {
             | MdsError::JsonError { .. } => None,
         };
 
-        SerializedError { code, message, help, span: serialized_span }
+        SerializedError {
+            code,
+            message,
+            help,
+            span: serialized_span,
+        }
     }
 }
 
