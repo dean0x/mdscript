@@ -43,10 +43,7 @@ fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
     }
     let mut line = 1usize;
     let mut col = 1usize;
-    for (i, byte) in source.bytes().enumerate() {
-        if i == offset {
-            break;
-        }
+    for byte in source[..offset].bytes() {
         if byte == b'\n' {
             line += 1;
             col = 1;
@@ -562,8 +559,11 @@ impl MdsError {
                     SerializedSpan { offset, length, line, column }
                 })
             }
-            // No-span variants: NotMdsFile, Io, ResourceLimit, YamlError, JsonError.
-            _ => None,
+            MdsError::NotMdsFile { .. }
+            | MdsError::Io { .. }
+            | MdsError::ResourceLimit { .. }
+            | MdsError::YamlError { .. }
+            | MdsError::JsonError { .. } => None,
         };
 
         SerializedError { code, message, help, span: serialized_span }
