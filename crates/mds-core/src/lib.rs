@@ -502,7 +502,18 @@ pub fn compile_virtual_collecting_warnings(
 /// file itself is excluded from `dependencies`.
 ///
 /// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
-#[must_use = "the CompileOutput should be used"]
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+///
+/// let result = mds::compile_with_deps(Path::new("template.mds"), None)?;
+/// println!("{}", result.output);
+/// for dep in &result.dependencies { println!("dep: {dep}"); }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
 pub fn compile_with_deps(
     path: impl AsRef<Path>,
     runtime_vars: Option<HashMap<String, Value>>,
@@ -513,16 +524,17 @@ pub fn compile_with_deps(
     let mut warnings = vec![];
     let resolved = cache.resolve_path(path, &vars, &mut warnings)?;
     let output = build_output(&resolved);
-    // The NativeFs normalizer calls canonicalize() to build the cache key.
-    // Replicate the same transformation here so the entry key comparison is exact.
-    // If canonicalize fails we fall back to the raw display string, which may
-    // result in the entry being included in deps — an acceptable degradation for
-    // paths that don't exist (they would have already errored during resolve_path).
-    let entry_key = path
-        .canonicalize()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| path.display().to_string());
-    let dependencies = cache.dependencies().into_iter().filter(|k| k != &entry_key).collect();
+    // The entry module is inserted into the cache last (post-order DFS: all imports
+    // are resolved and cached before the entry itself is stored). Use the last key
+    // from cache.dependencies() as the canonical entry key — this delegates to the
+    // FileSystem abstraction (NativeFs calls canonicalize()) and avoids duplicating
+    // that logic here.
+    let deps = cache.dependencies();
+    let entry_key = deps.last().cloned();
+    let dependencies = deps
+        .into_iter()
+        .filter(|k| Some(k) != entry_key.as_ref())
+        .collect();
     Ok(CompileOutput { output, warnings, dependencies })
 }
 
@@ -534,7 +546,20 @@ pub fn compile_with_deps(
 /// there is no entry key to exclude — all resolved imports appear in `dependencies`.
 ///
 /// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
-#[must_use = "the CompileOutput should be used"]
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::compile_str_with_deps(
+///     "---\ngreeting: Hi\n---\n{greeting} there!\n",
+///     None,
+///     None,
+/// )?;
+/// assert_eq!(result.output, "---\ngreeting: Hi\n---\nHi there!\n");
+/// assert!(result.dependencies.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
 pub fn compile_str_with_deps(
     source: &str,
     base_dir: Option<&Path>,
@@ -560,7 +585,21 @@ pub fn compile_str_with_deps(
 /// excluded from `dependencies`.
 ///
 /// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
-#[must_use = "the CompileOutput should be used"]
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// let mut modules = HashMap::new();
+/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
+///
+/// let result = mds::compile_virtual_with_deps(modules, "main.mds", None)?;
+/// assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
+/// assert!(result.dependencies.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
 pub fn compile_virtual_with_deps(
     modules: HashMap<String, String>,
     entry: &str,
