@@ -466,7 +466,7 @@ fn compile_with_deps_native_fs_integration() {
         dep.ends_with("lib.mds"),
         "expected dep ending in lib.mds, got: {dep}"
     );
-    // The entry file must NOT appear in deps (entry-key exclusion via split_last).
+    // The entry file must NOT appear in deps (entry-key exclusion by value filter).
     assert!(
         !result.dependencies.iter().any(|d| d.ends_with("main.mds")),
         "entry file must be excluded from deps, got: {:?}",
@@ -505,7 +505,10 @@ fn compile_output_warnings_emitted_for_empty_include() {
         !result.warnings.is_empty(),
         "expected at least one warning for @include of empty module, got none"
     );
-    let has_include_warning = result.warnings.iter().any(|w| w.contains("empty output") || w.contains("no body text") || w.contains("include"));
+    let has_include_warning = result
+        .warnings
+        .iter()
+        .any(|w| w.contains("@include") && w.contains("empty output"));
     assert!(
         has_include_warning,
         "expected warning about empty @include, got: {:?}",
