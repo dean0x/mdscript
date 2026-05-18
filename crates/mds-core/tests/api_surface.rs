@@ -430,6 +430,89 @@ fn check_virtual_rejects_invalid_module() {
     );
 }
 
+/// Integration test for `compile_with_deps` using NativeFs with real on-disk files.
+///
+/// Creates two .mds files in a tempdir: an entry that imports a library.
+/// Verifies that:
+/// - Compilation succeeds and output is correct
+/// - The imported library appears in dependencies
+/// - The entry file itself is excluded from dependencies
+#[test]
+fn compile_with_deps_native_fs_integration() {
+    use std::io::Write;
+
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let lib_path = dir.path().join("lib.mds");
+    let mut f = std::fs::File::create(&lib_path).unwrap();
+    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n").unwrap();
+
+    let entry_path = dir.path().join("main.mds");
+    let mut f = std::fs::File::create(&entry_path).unwrap();
+    f.write_all(b"@import \"./lib.mds\"\n{greet(\"World\")}\n").unwrap();
+
+    let result = mds::compile_with_deps(&entry_path, None)
+        .expect("compile_with_deps should succeed with real files");
+
+    assert!(
+        result.output.contains("Hello World!"),
+        "expected rendered output, got: {}",
+        result.output
+    );
+    // The imported lib must appear in deps.
+    assert_eq!(result.dependencies.len(), 1, "expected 1 dep, got: {:?}", result.dependencies);
+    let dep = &result.dependencies[0];
+    assert!(
+        dep.ends_with("lib.mds"),
+        "expected dep ending in lib.mds, got: {dep}"
+    );
+    // The entry file must NOT appear in deps (entry-key exclusion via split_last).
+    assert!(
+        !result.dependencies.iter().any(|d| d.ends_with("main.mds")),
+        "entry file must be excluded from deps, got: {:?}",
+        result.dependencies
+    );
+}
+
+/// Test that compiler-emitted warnings surface in `CompileOutput::warnings`.
+///
+/// The evaluator emits a warning when `@include` is used against a module that
+/// has no body text (only macro definitions). This test verifies that the warning
+/// makes it into `result.warnings` rather than being silently dropped or sent to
+/// stderr.
+#[test]
+fn compile_output_warnings_emitted_for_empty_include() {
+    // A definition-only module: has @define but no top-level body text.
+    // @include of this module will produce no output, triggering the warning.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert(
+        "defs.mds".to_string(),
+        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./defs.mds\" as defs\n@include defs\n{defs.greet(\"World\")}\n".to_string(),
+    );
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None)
+        .expect("should compile");
+
+    assert!(
+        result.output.contains("Hello World!"),
+        "expected rendered output, got: {}",
+        result.output
+    );
+    assert!(
+        !result.warnings.is_empty(),
+        "expected at least one warning for @include of empty module, got none"
+    );
+    let has_include_warning = result.warnings.iter().any(|w| w.contains("empty output") || w.contains("no body text") || w.contains("include"));
+    assert!(
+        has_include_warning,
+        "expected warning about empty @include, got: {:?}",
+        result.warnings
+    );
+}
+
 /// Verify that `compile_str_with` resolves `@import` paths relative to the
 /// supplied `base_dir`, not its parent. Regression test for the base_key
 /// sentinel fix in `resolve_source`.

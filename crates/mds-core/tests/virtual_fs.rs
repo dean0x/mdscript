@@ -325,7 +325,7 @@ fn deps_two_files() {
 
 #[test]
 fn deps_three_file_chain() {
-    // a → b → c: deps of a = ["b.mds", "c.mds"] in DFS order
+    // a → b → c: deps of a = ["c.mds", "b.mds"] in post-order DFS (leaves first)
     let mut modules = HashMap::new();
     modules.insert(
         "c.mds".to_string(),
@@ -398,6 +398,35 @@ fn deps_str_with_deps_basic() {
     assert!(result.output.contains("Hi Alice!"), "got: {}", result.output);
     // No imports → no deps
     assert_eq!(result.dependencies, Vec::<String>::new());
+}
+
+#[test]
+fn deps_str_with_deps_file_import() {
+    // compile_str_with_deps resolves @import relative to base_dir on disk.
+    use std::io::Write;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let lib_path = dir.path().join("lib.mds");
+    let mut f = std::fs::File::create(&lib_path).unwrap();
+    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n").unwrap();
+
+    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let result = mds::compile_str_with_deps(source, Some(dir.path()), None)
+        .expect("should compile with file import");
+
+    assert!(
+        result.output.contains("Hello World!"),
+        "expected rendered output, got: {}",
+        result.output
+    );
+    // The lib file is an imported dependency; source string is not a file, so
+    // only the imported lib appears in dependencies.
+    assert_eq!(result.dependencies.len(), 1, "expected 1 dep, got: {:?}", result.dependencies);
+    let dep = &result.dependencies[0];
+    assert!(
+        dep.ends_with("lib.mds"),
+        "expected dep ending in lib.mds, got: {dep}"
+    );
 }
 
 #[test]
