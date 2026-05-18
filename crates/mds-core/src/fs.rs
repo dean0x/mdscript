@@ -60,6 +60,16 @@ pub trait FileSystem: Send + Sync {
     fn set_root(&self, _base: &str) -> Result<(), MdsError> {
         Ok(())
     }
+
+    /// Resolve a path to its canonical (absolute, symlink-free) form.
+    ///
+    /// The default implementation is an identity function — suitable for
+    /// virtual or in-memory filesystems where canonicalization is a no-op.
+    ///
+    /// [`NativeFs`] overrides this to call [`std::fs::canonicalize`].
+    fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
+        Ok(path.to_string())
+    }
 }
 
 // ── VirtualFs ────────────────────────────────────────────────────────────────
@@ -328,6 +338,13 @@ impl FileSystem for NativeFs {
             .map_err(|e| MdsError::io(format!("cannot resolve base directory {base}: {e}")))?;
         self.init_root(&canonical);
         Ok(())
+    }
+
+    fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
+        Path::new(path)
+            .canonicalize()
+            .map(|p| p.display().to_string())
+            .map_err(|e| MdsError::io(format!("cannot resolve path {path}: {e}")))
     }
 }
 
@@ -750,6 +767,48 @@ mod tests {
         assert!(
             msg.contains("empty"),
             "expected 'empty' in error for empty import, got: {msg}"
+        );
+    }
+
+    // ── FileSystem::canonicalize ──────────────────────────────────────────────
+
+    #[test]
+    fn vfs_canonicalize_returns_identity() {
+        // VirtualFs inherits the default implementation — returns path unchanged.
+        let key = "some/virtual/path.mds";
+        let result = vfs().canonicalize(key);
+        assert_eq!(result.unwrap(), key, "VirtualFs canonicalize should be identity");
+    }
+
+    #[test]
+    fn native_canonicalize_resolves_real_path() {
+        // NativeFs should resolve a real file to its canonical absolute path.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "real.mds", "content");
+        let fs = NativeFs::new();
+        let result = fs.canonicalize(&file.display().to_string());
+        let canonical = result.expect("canonicalize should succeed for real file");
+        // The canonical path must be absolute and contain the filename.
+        assert!(
+            canonical.contains("real.mds"),
+            "canonical path should contain filename, got: {canonical}"
+        );
+        // Must be an absolute path.
+        assert!(
+            Path::new(&canonical).is_absolute(),
+            "canonical path should be absolute, got: {canonical}"
+        );
+    }
+
+    #[test]
+    fn native_canonicalize_nonexistent_errors() {
+        // NativeFs should return an Io error for a nonexistent path.
+        let fs = NativeFs::new();
+        let result = fs.canonicalize("/nonexistent/path/does/not/exist.mds");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MdsError::Io { .. }),
+            "expected Io error for nonexistent path, got: {err:?}"
         );
     }
 

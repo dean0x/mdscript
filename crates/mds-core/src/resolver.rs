@@ -228,15 +228,10 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
-        // Canonicalize base_dir and set the filesystem root so import traversal
-        // checks work correctly even when base_dir contains '.' or '..' components.
-        let canonical = base_dir.canonicalize().map_err(|e| {
-            MdsError::io(format!(
-                "cannot resolve base directory {}: {e}",
-                base_dir.display()
-            ))
-        })?;
-        let canonical_str = canonical.display().to_string();
+        // Canonicalize base_dir via the FileSystem abstraction so that custom
+        // or virtual backends can override this behaviour (fixes issue #21).
+        let base_dir_str = base_dir.display().to_string();
+        let canonical_str = self.fs.canonicalize(&base_dir_str)?;
         self.fs.set_root(&canonical_str)?;
 
         // The base_key must look like a file path so that normalize() can call
