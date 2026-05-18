@@ -341,10 +341,15 @@ impl FileSystem for NativeFs {
     }
 
     fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
-        Path::new(path)
-            .canonicalize()
+        // Use check_symlink() rather than std::fs::canonicalize() directly so that
+        // symlinked directories are rejected before they can re-anchor the security
+        // root to an attacker-controlled location (issue #21).
+        Self::check_symlink(Path::new(path))
             .map(|p| p.display().to_string())
-            .map_err(|e| MdsError::io(format!("cannot resolve path {path}: {e}")))
+            .map_err(|e| match e {
+                MdsError::ImportError { .. } => e,
+                _ => MdsError::io(format!("cannot resolve path {path}: {e}")),
+            })
     }
 }
 
@@ -809,6 +814,25 @@ mod tests {
         assert!(
             matches!(err, MdsError::Io { .. }),
             "expected Io error for nonexistent path, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn native_canonicalize_symlink_rejected() {
+        // Security boundary: canonicalize() must reject symlinked directories so that
+        // a symlinked base_dir cannot re-anchor the security root to an arbitrary location.
+        let real_dir = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link_path = link_parent.path().join("link_to_dir");
+        std::os::unix::fs::symlink(real_dir.path(), &link_path).unwrap();
+
+        let fs = NativeFs::new();
+        let result = fs.canonicalize(&link_path.display().to_string());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinks"),
+            "expected 'symlinks' in error when canonicalizing a symlink, got: {msg}"
         );
     }
 
