@@ -28,6 +28,7 @@ serde_json = { workspace = true }
 js-sys = { workspace = true }
 
 [dev-dependencies]
+mds = { package = "mds-core", path = "../mds-core" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]

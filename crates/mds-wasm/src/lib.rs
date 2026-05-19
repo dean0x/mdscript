@@ -333,6 +333,14 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
     let extra_modules = parse_modules(&mut map)?;
     let vars = parse_vars(&mut map)?;
 
+    // Reject unrecognised keys so callers catch typos (e.g. `varss` instead of
+    // `vars`) early rather than silently producing unexpected output.
+    if let Some(unknown_key) = map.keys().next() {
+        return Err(options_error(&format!(
+            "unknown option key \"{unknown_key}\"; recognised keys are: filename, modules, vars"
+        )));
+    }
+
     Ok(ParsedOptions { filename, extra_modules, vars })
 }
 

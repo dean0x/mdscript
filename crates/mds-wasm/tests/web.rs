@@ -134,16 +134,27 @@ fn compile_runtime_vars_override_frontmatter() {
 
 // ── compile error tests ───────────────────────────────────────────────────────
 
+/// Source string shared by all error-path tests.
+///
+/// The variable reference `{undefined_var}` starts at byte offset 6 and has
+/// byte length 15. Tests that assert exact span values rely on these positions.
+const UNDEFINED_VAR_SOURCE: &str = "Hello {undefined_var}!\n";
+
+/// Compile `UNDEFINED_VAR_SOURCE` and return the resulting JS error.
+fn compile_undefined_var_err() -> JsValue {
+    mds_wasm::compile(UNDEFINED_VAR_SOURCE, JsValue::NULL).unwrap_err()
+}
+
 #[wasm_bindgen_test]
 fn compile_undefined_variable_returns_error() {
-    let err = mds_wasm::compile("Hello {undefined_var}!\n", JsValue::NULL).unwrap_err();
+    let err = compile_undefined_var_err();
     let msg = get_str(&err, "message");
     assert!(!msg.is_empty(), "error message should not be empty");
 }
 
 #[wasm_bindgen_test]
 fn compile_error_has_code_property() {
-    let err = mds_wasm::compile("Hello {undefined_var}!\n", JsValue::NULL).unwrap_err();
+    let err = compile_undefined_var_err();
     let code = get_str(&err, "code");
     assert!(!code.is_empty(), "error.code must be set");
     assert!(code.starts_with("mds::"), "code must start with 'mds::': {code}");
@@ -151,8 +162,8 @@ fn compile_error_has_code_property() {
 
 #[wasm_bindgen_test]
 fn compile_error_is_js_error() {
-    // Verify the thrown value is an instanceof Error by checking it has a message property
-    let err = mds_wasm::compile("{undefined}\n", JsValue::NULL).unwrap_err();
+    // Verify the thrown value is an instanceof Error by checking it has a message property.
+    let err = compile_undefined_var_err();
     let msg = get_prop(&err, "message");
     assert!(
         msg.as_string().is_some(),
@@ -163,8 +174,11 @@ fn compile_error_is_js_error() {
 #[wasm_bindgen_test]
 fn compile_error_has_span_with_offset_and_length() {
     // UndefinedVariable is emitted with a source span pointing at the variable reference.
-    // The source "Hello {undefined_var}!\n" has "{undefined_var}" starting at byte 6.
-    let err = mds_wasm::compile("Hello {undefined_var}!\n", JsValue::NULL).unwrap_err();
+    // In UNDEFINED_VAR_SOURCE ("Hello {undefined_var}!\n"):
+    //   - "{undefined_var}" starts at byte offset 6 (after "Hello ")
+    //   - The span covers "undefined_var" (13 bytes) — the inner identifier,
+    //     not the surrounding braces which are syntactic delimiters.
+    let err = compile_undefined_var_err();
     let span = get_prop(&err, "span");
     assert!(
         !span.is_undefined() && !span.is_null(),
@@ -180,15 +194,17 @@ fn compile_error_has_span_with_offset_and_length() {
         length.as_f64().is_some(),
         "span.length must be a number, got: {length:?}"
     );
-    // Both values must be non-negative (f64 >= 0.0).
-    assert!(
-        offset.as_f64().unwrap() >= 0.0,
-        "span.offset must be >= 0, got: {}",
+    // Assert exact byte positions so regressions in span calculation are caught.
+    assert_eq!(
+        offset.as_f64().unwrap() as usize,
+        6,
+        "span.offset must be 6 (start of '{{undefined_var}}' in source), got: {}",
         offset.as_f64().unwrap()
     );
-    assert!(
-        length.as_f64().unwrap() > 0.0,
-        "span.length must be > 0, got: {}",
+    assert_eq!(
+        length.as_f64().unwrap() as usize,
+        13,
+        "span.length must be 13 (byte length of 'undefined_var' identifier), got: {}",
         length.as_f64().unwrap()
     );
 }
@@ -196,7 +212,7 @@ fn compile_error_has_span_with_offset_and_length() {
 #[wasm_bindgen_test]
 fn compile_error_span_has_line_and_column() {
     // When a source span is present and src is available, line and column are resolved.
-    let err = mds_wasm::compile("Hello {undefined_var}!\n", JsValue::NULL).unwrap_err();
+    let err = compile_undefined_var_err();
     let span = get_prop(&err, "span");
     assert!(!span.is_undefined(), "span must be present");
     let line = get_prop(&span, "line");
@@ -224,7 +240,7 @@ fn compile_error_span_has_line_and_column() {
 #[wasm_bindgen_test]
 fn compile_error_has_help_for_undefined_variable() {
     // UndefinedVariable carries a static help hint from the diagnostic attribute.
-    let err = mds_wasm::compile("Hello {undefined_var}!\n", JsValue::NULL).unwrap_err();
+    let err = compile_undefined_var_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::undefined_var", "expected undefined_var error: {code}");
     let help = get_prop(&err, "help");
@@ -237,6 +253,25 @@ fn compile_error_has_help_for_undefined_variable() {
         !help_str.is_empty(),
         "error.help must not be empty"
     );
+}
+
+#[wasm_bindgen_test]
+fn compile_source_too_large_returns_resource_limit() {
+    // MAX_SOURCE_SIZE mirrors mds::MAX_FILE_SIZE (10 MiB). A source one byte
+    // over the limit must be rejected before compilation begins.
+    let big = "x".repeat(mds::MAX_FILE_SIZE as usize + 1);
+    let err = mds_wasm::compile(&big, JsValue::NULL).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::resource_limit", "got: {code}");
+}
+
+#[wasm_bindgen_test]
+fn check_source_too_large_returns_resource_limit() {
+    // Same guard is enforced on the check() path.
+    let big = "x".repeat(mds::MAX_FILE_SIZE as usize + 1);
+    let err = mds_wasm::check(&big, JsValue::NULL).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::resource_limit", "got: {code}");
 }
 
 // ── check tests ───────────────────────────────────────────────────────────────
@@ -258,14 +293,14 @@ fn check_with_frontmatter_vars() {
 
 #[wasm_bindgen_test]
 fn check_invalid_template_returns_error() {
-    let err = mds_wasm::check("Hello {undefined_var}!\n", JsValue::NULL).unwrap_err();
+    let err = mds_wasm::check(UNDEFINED_VAR_SOURCE, JsValue::NULL).unwrap_err();
     let code = get_str(&err, "code");
     assert!(!code.is_empty(), "error.code must be set");
 }
 
 #[wasm_bindgen_test]
 fn check_error_has_code_property() {
-    let err = mds_wasm::check("{undefined}\n", JsValue::NULL).unwrap_err();
+    let err = mds_wasm::check(UNDEFINED_VAR_SOURCE, JsValue::NULL).unwrap_err();
     let code = get_str(&err, "code");
     assert!(code.starts_with("mds::"), "code must start with 'mds::': {code}");
 }
@@ -355,4 +390,26 @@ fn check_empty_filename_returns_error() {
     let err = mds_wasm::check("Hello!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options");
+}
+
+#[wasm_bindgen_test]
+fn compile_unknown_option_key_returns_error() {
+    // A typo like `varss` must be caught rather than silently ignored.
+    let opts_val = serde_json::json!({ "varss": { "name": "World" } });
+    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let err = mds_wasm::compile("Hello {name}!\n", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::invalid_options", "got: {code}");
+    let message = get_str(&err, "message");
+    assert!(message.contains("varss"), "error message should name the unknown key, got: {message}");
+}
+
+#[wasm_bindgen_test]
+fn check_unknown_option_key_returns_error() {
+    // Verifies the same unknown-key guard is exercised via check().
+    let opts_val = serde_json::json!({ "moduless": {} });
+    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let err = mds_wasm::check("Hello!\n", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::invalid_options", "got: {code}");
 }
