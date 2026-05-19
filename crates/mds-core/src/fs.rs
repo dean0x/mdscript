@@ -790,7 +790,11 @@ mod tests {
         // VirtualFs inherits the default implementation — returns path unchanged.
         let key = "some/virtual/path.mds";
         let result = vfs().canonicalize(key);
-        assert_eq!(result.unwrap(), key, "VirtualFs canonicalize should be identity");
+        assert_eq!(
+            result.unwrap(),
+            key,
+            "VirtualFs canonicalize should be identity"
+        );
     }
 
     #[test]

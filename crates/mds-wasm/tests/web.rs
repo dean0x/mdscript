@@ -86,14 +86,20 @@ fn compile_with_modules_import() {
 fn compile_has_warnings_field() {
     let result = mds_wasm::compile("Hello!\n", JsValue::NULL).unwrap();
     let warnings = get_prop(&result, "warnings");
-    assert!(js_sys::Array::is_array(&warnings), "warnings must be an array");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "warnings must be an array"
+    );
 }
 
 #[wasm_bindgen_test]
 fn compile_has_dependencies_field() {
     let result = mds_wasm::compile("Hello!\n", JsValue::NULL).unwrap();
     let deps = get_prop(&result, "dependencies");
-    assert!(js_sys::Array::is_array(&deps), "dependencies must be an array");
+    assert!(
+        js_sys::Array::is_array(&deps),
+        "dependencies must be an array"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -159,7 +165,10 @@ fn compile_error_has_code_property() {
     let err = compile_undefined_var_err();
     let code = get_str(&err, "code");
     assert!(!code.is_empty(), "error.code must be set");
-    assert!(code.starts_with("mds::"), "code must start with 'mds::': {code}");
+    assert!(
+        code.starts_with("mds::"),
+        "code must start with 'mds::': {code}"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -194,8 +203,14 @@ fn compile_error_has_span_with_offset_and_length() {
         .as_f64()
         .expect("span.length must be a number") as usize;
     // Assert exact byte positions so regressions in span calculation are caught.
-    assert_eq!(offset, 6, "span.offset must be 6 (start of '{{undefined_var}}' in source)");
-    assert_eq!(length, 13, "span.length must be 13 (byte length of 'undefined_var' identifier)");
+    assert_eq!(
+        offset, 6,
+        "span.offset must be 6 (start of '{{undefined_var}}' in source)"
+    );
+    assert_eq!(
+        length, 13,
+        "span.length must be 13 (byte length of 'undefined_var' identifier)"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -220,7 +235,10 @@ fn compile_error_has_help_for_undefined_variable() {
     // UndefinedVariable carries a static help hint from the diagnostic attribute.
     let err = compile_undefined_var_err();
     let code = get_str(&err, "code");
-    assert_eq!(code, "mds::undefined_var", "expected undefined_var error: {code}");
+    assert_eq!(
+        code, "mds::undefined_var",
+        "expected undefined_var error: {code}"
+    );
     let help = get_prop(&err, "help")
         .as_string()
         .expect("error.help must be a string for UndefinedVariable");
@@ -252,7 +270,10 @@ fn check_source_too_large_returns_resource_limit() {
 fn check_valid_template() {
     let result = mds_wasm::check("Hello!\n", JsValue::NULL).unwrap();
     let warnings = get_prop(&result, "warnings");
-    assert!(js_sys::Array::is_array(&warnings), "warnings must be an array");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "warnings must be an array"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -274,7 +295,10 @@ fn check_invalid_template_returns_error() {
 fn check_error_has_code_property() {
     let err = mds_wasm::check(UNDEFINED_VAR_SOURCE, JsValue::NULL).unwrap_err();
     let code = get_str(&err, "code");
-    assert!(code.starts_with("mds::"), "code must start with 'mds::': {code}");
+    assert!(
+        code.starts_with("mds::"),
+        "code must start with 'mds::': {code}"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -345,14 +369,20 @@ fn compile_invalid_vars_type_returns_error() {
 fn check_null_options() {
     let result = mds_wasm::check("Hello!\n", JsValue::NULL).unwrap();
     let warnings = get_prop(&result, "warnings");
-    assert!(js_sys::Array::is_array(&warnings), "warnings must be an array");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "warnings must be an array"
+    );
 }
 
 #[wasm_bindgen_test]
 fn check_undefined_options() {
     let result = mds_wasm::check("Hello!\n", JsValue::UNDEFINED).unwrap();
     let warnings = get_prop(&result, "warnings");
-    assert!(js_sys::Array::is_array(&warnings), "warnings must be an array");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "warnings must be an array"
+    );
 }
 
 #[wasm_bindgen_test]
@@ -373,7 +403,10 @@ fn compile_unknown_option_key_returns_error() {
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options", "got: {code}");
     let message = get_str(&err, "message");
-    assert!(message.contains("varss"), "error message should name the unknown key, got: {message}");
+    assert!(
+        message.contains("varss"),
+        "error message should name the unknown key, got: {message}"
+    );
 }
 
 #[wasm_bindgen_test]

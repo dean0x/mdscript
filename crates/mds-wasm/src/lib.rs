@@ -72,8 +72,7 @@ const DEFAULT_FILENAME: &str = "input.mds";
 /// pass those, so failure is a programming error. The debug assertion catches
 /// it during development without adding overhead in release.
 fn set_prop(target: &JsValue, key: &str, value: &JsValue) {
-    let ok = Reflect::set(target, &JsValue::from_str(key), value)
-        .unwrap_or(false);
+    let ok = Reflect::set(target, &JsValue::from_str(key), value).unwrap_or(false);
     debug_assert!(ok, "Reflect::set failed for key {key:?}");
 }
 
@@ -343,7 +342,11 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
         )));
     }
 
-    Ok(ParsedOptions { filename, extra_modules, vars })
+    Ok(ParsedOptions {
+        filename,
+        extra_modules,
+        vars,
+    })
 }
 
 /// Return a human-readable JSON value type name for error diagnostics.
@@ -451,9 +454,8 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     catch_panic(AssertUnwindSafe(move || {
         let opts = parse_options(options)?;
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
-        let result =
-            mds::compile_virtual_with_deps(modules, &opts.filename, opts.vars)
-                .map_err(mds_error_to_js)?;
+        let result = mds::compile_virtual_with_deps(modules, &opts.filename, opts.vars)
+            .map_err(mds_error_to_js)?;
 
         to_js(&result)
     }))

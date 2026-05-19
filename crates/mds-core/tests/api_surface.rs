@@ -179,8 +179,8 @@ fn mds_error_trait_impls() {
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
-    assert!(MAX_TRAVERSAL_DEPTH > 0);
-    assert!(MAX_TRAVERSAL_DEPTH <= 1000);
+    const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
+    const _: () = assert!(MAX_TRAVERSAL_DEPTH <= 1000);
 }
 
 #[test]
@@ -199,8 +199,8 @@ fn value_methods() {
 #[test]
 fn cli_import_pattern_works() {
     let _: fn(&str) -> Result<String, MdsError> = |s| mds::compile_str(s);
-    assert!(MAX_FILE_SIZE > 0);
-    assert!(MAX_TRAVERSAL_DEPTH > 0);
+    const _: () = assert!(MAX_FILE_SIZE > 0);
+    const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
 }
 
 // ── New public types from Phase 2 ─────────────────────────────────────────────

@@ -247,7 +247,11 @@ fn emit_warnings(warnings: &[String]) {
 ///
 /// Cleans the prompt body and prepends YAML frontmatter when present.
 fn build_output(resolved: &resolver::ResolvedModule) -> String {
-    let body = resolved.prompt_body.as_deref().map(clean_output).unwrap_or_default();
+    let body = resolved
+        .prompt_body
+        .as_deref()
+        .map(clean_output)
+        .unwrap_or_default();
     prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body)
 }
 
@@ -532,7 +536,11 @@ pub fn compile_with_deps(
         .into_iter()
         .filter(|k| Some(k) != entry_key.as_ref())
         .collect();
-    Ok(CompileOutput { output, warnings, dependencies })
+    Ok(CompileOutput {
+        output,
+        warnings,
+        dependencies,
+    })
 }
 
 /// Compile MDS source code from a string and return a [`CompileOutput`] with
@@ -571,7 +579,11 @@ pub fn compile_str_with_deps(
     // resolve_source does not insert the inline source into the modules cache,
     // so cache.dependencies() contains only imported files — no filtering needed.
     let dependencies = cache.dependencies();
-    Ok(CompileOutput { output, warnings, dependencies })
+    Ok(CompileOutput {
+        output,
+        warnings,
+        dependencies,
+    })
 }
 
 /// Compile a module from an in-memory virtual filesystem and return a
@@ -607,8 +619,16 @@ pub fn compile_virtual_with_deps(
     let mut warnings = vec![];
     let resolved = cache.resolve_key(entry, &vars, &mut warnings)?;
     let output = build_output(&resolved);
-    let dependencies = cache.dependencies().into_iter().filter(|k| k != entry).collect();
-    Ok(CompileOutput { output, warnings, dependencies })
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != entry)
+        .collect();
+    Ok(CompileOutput {
+        output,
+        warnings,
+        dependencies,
+    })
 }
 
 /// Check (validate) a module from an in-memory virtual filesystem without rendering output.
