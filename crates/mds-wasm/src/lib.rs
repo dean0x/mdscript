@@ -343,13 +343,12 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 /// ```
 #[wasm_bindgen]
 pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
-    // Clone into owned values so the closure is UnwindSafe.
-    let source_owned = source.to_string();
-    let options_owned = options;
+    // source must be cloned into an owned String so the closure is UnwindSafe.
+    let source = source.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
-        let opts = parse_options(options_owned)?;
-        let modules = build_modules(source_owned, &opts.filename, opts.extra_modules)?;
+        let opts = parse_options(options)?;
+        let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let result =
             mds::compile_virtual_with_deps(modules, &opts.filename, opts.vars)
                 .map_err(mds_error_to_js)?;
@@ -379,13 +378,12 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// ```
 #[wasm_bindgen]
 pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
-    // Clone into owned values so the closure is UnwindSafe.
-    let source_owned = source.to_string();
-    let options_owned = options;
+    // source must be cloned into an owned String so the closure is UnwindSafe.
+    let source = source.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
-        let opts = parse_options(options_owned)?;
-        let modules = build_modules(source_owned, &opts.filename, opts.extra_modules)?;
+        let opts = parse_options(options)?;
+        let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let ((), warnings) =
             mds::check_virtual_collecting_warnings(modules, &opts.filename, opts.vars)
                 .map_err(mds_error_to_js)?;

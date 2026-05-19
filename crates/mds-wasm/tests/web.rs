@@ -74,12 +74,9 @@ fn compile_with_modules_import() {
     // VirtualFs normalizes "./lib.mds" from "input.mds" to "lib.mds",
     // so the module key must be "lib.mds".
     let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
-    let opts_val = serde_json::json!({
-        "modules": {
-            "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
-        }
-    });
-    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let opts = modules_opts(&serde_json::json!({
+        "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
+    }));
     let result = mds_wasm::compile(source, opts).unwrap();
     let output = get_str(&result, "output");
     assert!(output.contains("Hello World!"), "got: {output}");
