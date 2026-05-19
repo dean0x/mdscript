@@ -757,6 +757,12 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 /// ```
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError> {
+    if json.len() as u64 > MAX_FILE_SIZE {
+        return Err(MdsError::resource_limit(format!(
+            "vars string exceeds maximum size of {} bytes",
+            MAX_FILE_SIZE,
+        )));
+    }
     let parsed: serde_json::Value =
         serde_json::from_str(json).map_err(|e| MdsError::json_error(e.to_string()))?;
     let serde_json::Value::Object(map) = parsed else {
@@ -869,5 +875,28 @@ mod tests {
             Some("config:\n  type: \"mds\"\n  theme: dark\n".to_string()),
             "indented quoted type:mds should be preserved, got: {result:?}"
         );
+    }
+
+    // ── load_vars_str: size limit ─────────────────────────────────────────────
+
+    #[test]
+    fn load_vars_str_rejects_oversized_input() {
+        // Construct a string that exceeds MAX_FILE_SIZE (10 MB).
+        let oversized = "x".repeat((MAX_FILE_SIZE as usize) + 1);
+        let result = load_vars_str(&oversized);
+        assert!(result.is_err(), "expected error for oversized input");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds maximum size"),
+            "error message should mention size limit, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_vars_str_accepts_valid_json_within_limit() {
+        let json = r#"{"name": "World", "count": 42}"#;
+        let vars = load_vars_str(json).expect("valid JSON within size limit should succeed");
+        assert_eq!(vars.len(), 2);
     }
 }
