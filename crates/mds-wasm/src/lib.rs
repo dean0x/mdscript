@@ -44,34 +44,29 @@ use wasm_bindgen::prelude::*;
 
 // ── Resource limits ───────────────────────────────────────────────────────────
 
-/// Maximum source string size accepted at the WASM boundary.
+/// Maximum source string size accepted at the WASM boundary (10 MiB).
 ///
-/// Matches `MAX_FILE_SIZE` in `mds-core` (10 MiB). The WASM boundary bypasses
-/// the file layer, so we enforce the limit here to prevent memory exhaustion
-/// from callers passing arbitrarily large strings.
-const MAX_SOURCE_SIZE: usize = 10 * 1024 * 1024; // 10 MiB
+/// Mirrors `mds::MAX_FILE_SIZE`. The WASM boundary bypasses the file layer,
+/// so the limit must be re-enforced here to prevent memory exhaustion.
+const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
 // ── JS interop primitives ─────────────────────────────────────────────────────
 
 /// Set a property on a JS object, asserting success in debug builds.
 ///
-/// `Reflect::set` can only fail when the target is a non-extensible or
-/// frozen object. We never set properties on such objects, so failure is a
-/// programming error rather than a runtime condition. Silent discard is wrong
-/// because it would produce incomplete error objects with no diagnostic trace;
-/// a debug assertion surfaces the bug immediately during development.
-#[inline]
+/// `Reflect::set` only fails on non-extensible or frozen objects; we never
+/// pass those, so failure is a programming error. The debug assertion catches
+/// it during development without adding overhead in release.
 fn set_prop(target: &JsValue, key: &str, value: &JsValue) {
     let ok = Reflect::set(target, &JsValue::from_str(key), value)
         .unwrap_or(false);
     debug_assert!(ok, "Reflect::set failed for key {key:?}");
 }
 
-/// Build a JS `Error` with a `code` property attached.
+/// Build a JS `Error` with a `code` property.
 ///
-/// Every error thrown at the WASM boundary must carry `code` so callers can
+/// Every error thrown at the WASM boundary carries `code` so callers can
 /// branch programmatically (e.g. `if (err.code === "mds::syntax") …`).
-#[inline]
 fn js_error(message: &str, code: &str) -> JsValue {
     let err = js_sys::Error::new(message);
     set_prop(&err, "code", &JsValue::from_str(code));
@@ -79,7 +74,6 @@ fn js_error(message: &str, code: &str) -> JsValue {
 }
 
 /// Shorthand for a `js_error` with `code = "mds::invalid_options"`.
-#[inline]
 fn options_error(message: &str) -> JsValue {
     js_error(message, "mds::invalid_options")
 }
@@ -311,6 +305,21 @@ fn build_modules(
     Ok(modules)
 }
 
+/// Guard against oversized source inputs before entering the compilation path.
+fn check_source_size(source: &str) -> Result<(), JsValue> {
+    if source.len() > MAX_SOURCE_SIZE {
+        return Err(js_error(
+            &format!(
+                "source exceeds maximum size of {} bytes ({} bytes provided)",
+                MAX_SOURCE_SIZE,
+                source.len()
+            ),
+            "mds::resource_limit",
+        ));
+    }
+    Ok(())
+}
+
 // ── Output types ──────────────────────────────────────────────────────────────
 
 /// Serializable output for the `check` function.
@@ -358,18 +367,9 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 /// ```
 #[wasm_bindgen]
 pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
-    if source.len() > MAX_SOURCE_SIZE {
-        return Err(js_error(
-            &format!(
-                "source exceeds maximum size of {} bytes ({} bytes provided)",
-                MAX_SOURCE_SIZE,
-                source.len()
-            ),
-            "mds::resource_limit",
-        ));
-    }
+    check_source_size(source)?;
 
-    // source must be cloned into an owned String so the closure is UnwindSafe.
+    // Owned String required so the closure satisfies UnwindSafe.
     let source = source.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
@@ -404,18 +404,9 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// ```
 #[wasm_bindgen]
 pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
-    if source.len() > MAX_SOURCE_SIZE {
-        return Err(js_error(
-            &format!(
-                "source exceeds maximum size of {} bytes ({} bytes provided)",
-                MAX_SOURCE_SIZE,
-                source.len()
-            ),
-            "mds::resource_limit",
-        ));
-    }
+    check_source_size(source)?;
 
-    // source must be cloned into an owned String so the closure is UnwindSafe.
+    // Owned String required so the closure satisfies UnwindSafe.
     let source = source.to_string();
 
     catch_panic(AssertUnwindSafe(move || {

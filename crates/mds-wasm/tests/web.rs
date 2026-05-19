@@ -98,7 +98,6 @@ fn compile_has_dependencies_field() {
 
 #[wasm_bindgen_test]
 fn compile_dependencies_contains_imported_module() {
-    // When a module is imported, its resolved path must appear in the dependencies array.
     let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
     let opts = modules_opts(&serde_json::json!({
         "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
@@ -106,20 +105,12 @@ fn compile_dependencies_contains_imported_module() {
     let result = mds_wasm::compile(source, opts).unwrap();
     let deps_val = get_prop(&result, "dependencies");
     let deps = js_sys::Array::from(&deps_val);
-    assert!(deps.length() > 0, "dependencies must contain the imported module");
-    // Verify that "lib.mds" (the resolved path) appears somewhere in the array.
-    let found = (0..deps.length()).any(|i| {
-        deps.get(i)
-            .as_string()
-            .map(|s| s.contains("lib.mds"))
-            .unwrap_or(false)
-    });
+    let dep_strings: Vec<String> = (0..deps.length())
+        .map(|i| deps.get(i).as_string().unwrap_or_default())
+        .collect();
     assert!(
-        found,
-        "dependencies must contain 'lib.mds'; got: {:?}",
-        (0..deps.length())
-            .map(|i| deps.get(i).as_string().unwrap_or_default())
-            .collect::<Vec<_>>()
+        dep_strings.iter().any(|s| s.contains("lib.mds")),
+        "dependencies must contain 'lib.mds'; got: {dep_strings:?}"
     );
 }
 
@@ -359,13 +350,9 @@ fn check_undefined_options() {
 
 #[wasm_bindgen_test]
 fn check_empty_filename_returns_error() {
-    // Validates that the same options validation path is exercised via check().
-    // Empty filename is rejected before any compilation attempt.
+    // Verifies that the shared options-validation path is exercised via check().
     let opts = filename_opts("");
     let err = mds_wasm::check("Hello!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
-    assert_eq!(
-        code, "mds::invalid_options",
-        "check() empty filename must return mds::invalid_options, got: {code}"
-    );
+    assert_eq!(code, "mds::invalid_options");
 }
