@@ -136,8 +136,10 @@ fn compile_runtime_vars_override_frontmatter() {
 
 /// Source string shared by all error-path tests.
 ///
-/// The variable reference `{undefined_var}` starts at byte offset 6 and has
-/// byte length 15. Tests that assert exact span values rely on these positions.
+/// The variable reference `{undefined_var}` starts at byte offset 6 (after
+/// `"Hello "`). The compiler reports a span of offset=6, length=13, covering
+/// the opening brace and identifier name (`{undefined_var` without the closing
+/// `}`). Tests that assert exact span values rely on these positions.
 const UNDEFINED_VAR_SOURCE: &str = "Hello {undefined_var}!\n";
 
 /// Compile `UNDEFINED_VAR_SOURCE` and return the resulting JS error.
@@ -175,9 +177,10 @@ fn compile_error_is_js_error() {
 fn compile_error_has_span_with_offset_and_length() {
     // UndefinedVariable is emitted with a source span pointing at the variable reference.
     // In UNDEFINED_VAR_SOURCE ("Hello {undefined_var}!\n"):
-    //   - "{undefined_var}" starts at byte offset 6 (after "Hello ")
-    //   - The span covers "undefined_var" (13 bytes) — the inner identifier,
-    //     not the surrounding braces which are syntactic delimiters.
+    //   - The interpolation "{undefined_var}" starts at byte offset 6 (after "Hello ").
+    //   - The compiler emits a span with offset=6 and length=13, covering the
+    //     opening brace plus the identifier name ("undefined_var" is 13 bytes).
+    //     The closing "}" is not included in the span length.
     let err = compile_undefined_var_err();
     let span = get_prop(&err, "span");
     assert!(
