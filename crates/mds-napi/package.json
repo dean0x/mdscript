@@ -1,0 +1,15 @@
+{
+  "name": "mds-napi",
+  "version": "0.1.0",
+  "description": "MDS compiler native Node.js bindings",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "mds-napi",
+    "triples": {}
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  }
+}

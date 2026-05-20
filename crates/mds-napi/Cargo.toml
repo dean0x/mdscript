@@ -1,0 +1,26 @@
+[package]
+name = "mds-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "MDS compiler native Node.js bindings via napi-rs"
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Expose the raw Rust panic payload as `err.detail` on mds::internal errors.
+# Enable during local development to diagnose unexpected panics. NEVER enable
+# in production builds — panic messages contain absolute filesystem paths.
+debug-panics = []
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mds = { package = "mds-core", path = "../mds-core" }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+napi-build = { workspace = true }

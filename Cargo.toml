@@ -1,11 +1,11 @@
 [workspace]
-members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm"]
+members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-napi"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.88"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/deanshrn/mdl"
@@ -25,10 +25,13 @@ wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen-test = "0.3"
 js-sys = "0.3"
+napi = { version = "3.9.0", default-features = false, features = ["napi3", "serde-json"] }
+napi-derive = "3.5.6"
+napi-build = "2"
 
-# panic = "unwind" is required workspace-wide because mds-wasm uses catch_unwind
-# at the WASM boundary to convert panics into structured JS errors. Cargo does
-# not support per-package panic strategy overrides for workspace profiles.
+# panic = "unwind" is required workspace-wide because mds-wasm and mds-napi use
+# catch_unwind at the JS boundary to convert panics into structured JS errors.
+# Cargo does not support per-package panic strategy overrides for workspace profiles.
 # Note: "unwind" is already Rust's default for dev, so the dev setting is
 # explicit documentation only.
 [profile.dev]
@@ -42,3 +45,7 @@ panic = "unwind" # required by mds-wasm catch_unwind; see comment above
 opt-level = "z"
 strip = true
 codegen-units = 1
+
+[profile.release.package.mds-napi]
+opt-level = 3
+strip = true

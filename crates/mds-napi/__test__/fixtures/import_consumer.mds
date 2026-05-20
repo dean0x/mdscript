@@ -1,0 +1,3 @@
+@import { greet } from "./import_provider.mds"
+
+{greet("World")}
