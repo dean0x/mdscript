@@ -74,17 +74,7 @@ describe('compile', () => {
     assert.ok(result.output.includes('Hello Test!'), `got: ${result.output}`);
   });
 
-  test('F-C9: warnings field is an array', () => {
-    const result = compile('Hello World!\n');
-    assert.ok(Array.isArray(result.warnings), 'warnings should be an array');
-  });
-
-  test('F-C10: dependencies field is an array', () => {
-    const result = compile('Hello World!\n');
-    assert.ok(Array.isArray(result.dependencies), 'dependencies should be an array');
-  });
-
-  test('F-C11: empty source compiles successfully', () => {
+  test('F-C9: empty source compiles successfully', () => {
     const result = compile('');
     assert.equal(result.output, '');
     assert.deepEqual(result.warnings, []);
@@ -407,18 +397,15 @@ describe('resource limits', () => {
     );
   });
 
-  test('R-3: source at exactly max size compiles successfully', () => {
-    // A source at exactly max size: all safe characters (spaces).
-    // This may produce a large but valid empty result.
+  test('R-3: source at exactly max size is accepted (not rejected by size guard)', () => {
+    // Exactly at the limit must not trigger the resource_limit guard — only
+    // sources strictly larger than MAX_SOURCE_SIZE are rejected.
     const atLimit = ' '.repeat(MAX_SOURCE_SIZE);
-    // Should not throw — just produce empty output.
     try {
       const result = compile(atLimit);
       assert.ok(typeof result.output === 'string', 'output should be a string');
     } catch (e) {
-      // Some internal limit may cause a resource_limit error — that's acceptable too.
-      // What's NOT acceptable is a crash or non-Error throw.
-      assert.ok(e instanceof Error, 'if thrown, should be an Error');
+      assert.notEqual(e.code, 'mds::resource_limit', 'size guard must not fire at exactly the limit');
     }
   });
 });

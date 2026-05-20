@@ -34,8 +34,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::panic::catch_unwind;
-use std::panic::AssertUnwindSafe;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 
@@ -217,17 +216,19 @@ where
         Ok(Ok(val)) => Ok(val),
         Ok(Err(mds_err)) => Err(throw_mds_error(env, mds_err)),
         Err(payload) => {
-            #[allow(unused_variables)]
-            let detail = if let Some(s) = payload.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic payload".to_string()
-            };
-
             #[cfg(feature = "debug-panics")]
-            let msg = format!("internal compiler error (panic): {detail}");
+            let msg = {
+                let detail = if let Some(s) = payload.downcast_ref::<&str>() {
+                    *s
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.as_str()
+                } else {
+                    "unknown panic payload"
+                };
+                format!("internal compiler error (panic): {detail}")
+            };
+            #[cfg(not(feature = "debug-panics"))]
+            let _ = payload;
             #[cfg(not(feature = "debug-panics"))]
             let msg = "internal compiler error".to_string();
 
