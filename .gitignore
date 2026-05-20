@@ -1,5 +1,6 @@
 /target
 crates/mds-wasm/pkg/
 *.node
+node_modules/
 crates/mds-napi/index.js
 crates/mds-napi/index.d.ts
