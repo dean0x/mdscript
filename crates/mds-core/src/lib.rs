@@ -43,6 +43,7 @@ pub(crate) mod evaluator;
 pub(crate) mod fs;
 pub(crate) mod lexer;
 pub(crate) mod limits;
+pub mod options;
 pub(crate) mod parser;
 pub(crate) mod resolver;
 pub(crate) mod scope;
@@ -50,6 +51,7 @@ pub(crate) mod validator;
 pub(crate) mod value;
 
 pub use fs::{FileSystem, NativeFs, VirtualFs};
+pub use options::{json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError};
 pub use resolver::ModuleCache;
 
 use std::collections::HashMap;
