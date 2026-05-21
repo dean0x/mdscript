@@ -1,3 +1,4 @@
+use serde::Serialize;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
@@ -18,22 +19,28 @@ fn get_str(obj: &JsValue, key: &str) -> String {
         .unwrap_or_else(|| format!("<not a string: {key}>"))
 }
 
+/// Serialize to a plain JS object (not a `Map`).
+///
+/// `serde_wasm_bindgen::to_value` defaults to `Map` for JSON objects.
+/// Real JS callers pass plain object literals, so tests must match that.
+fn to_js_object(v: &impl Serialize) -> JsValue {
+    v.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap()
+}
+
 /// Build a simple JS options object from a vars record.
 fn vars_opts(vars: &serde_json::Value) -> JsValue {
-    let opts = serde_json::json!({ "vars": vars });
-    serde_wasm_bindgen::to_value(&opts).unwrap()
+    to_js_object(&serde_json::json!({ "vars": vars }))
 }
 
 /// Build an options object with extra modules.
 fn modules_opts(modules: &serde_json::Value) -> JsValue {
-    let opts = serde_json::json!({ "modules": modules });
-    serde_wasm_bindgen::to_value(&opts).unwrap()
+    to_js_object(&serde_json::json!({ "modules": modules }))
 }
 
 /// Build an options object with filename.
 fn filename_opts(filename: &str) -> JsValue {
-    let opts = serde_json::json!({ "filename": filename });
-    serde_wasm_bindgen::to_value(&opts).unwrap()
+    to_js_object(&serde_json::json!({ "filename": filename }))
 }
 
 // ── compile tests ─────────────────────────────────────────────────────────────
@@ -349,7 +356,7 @@ fn compile_filename_collision_returns_error() {
             "input.mds": "Some other module\n"
         }
     });
-    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let opts = to_js_object(&opts_val);
     let err = mds_wasm::compile("Hello!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::filename_collision", "got: {code}");
@@ -359,7 +366,7 @@ fn compile_filename_collision_returns_error() {
 fn compile_invalid_vars_type_returns_error() {
     // vars must be an object, not a string
     let opts_val = serde_json::json!({ "vars": "not an object" });
-    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let opts = to_js_object(&opts_val);
     let err = mds_wasm::compile("Hello!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options", "got: {code}");
@@ -398,7 +405,7 @@ fn check_empty_filename_returns_error() {
 fn compile_unknown_option_key_returns_error() {
     // A typo like `varss` must be caught rather than silently ignored.
     let opts_val = serde_json::json!({ "varss": { "name": "World" } });
-    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let opts = to_js_object(&opts_val);
     let err = mds_wasm::compile("Hello {name}!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options", "got: {code}");
@@ -413,7 +420,7 @@ fn compile_unknown_option_key_returns_error() {
 fn check_unknown_option_key_returns_error() {
     // Verifies the same unknown-key guard is exercised via check().
     let opts_val = serde_json::json!({ "moduless": {} });
-    let opts = serde_wasm_bindgen::to_value(&opts_val).unwrap();
+    let opts = to_js_object(&opts_val);
     let err = mds_wasm::check("Hello!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options", "got: {code}");
