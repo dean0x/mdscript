@@ -5,7 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 description = "MDS compiler native Node.js bindings via napi-rs"
 license.workspace = true
+readme.workspace = true
 repository.workspace = true
+keywords.workspace = true
+categories = ["api-bindings"]
 
 [features]
 # Expose the raw Rust panic payload as `err.detail` on mds::internal errors.

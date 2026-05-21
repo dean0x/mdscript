@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.88" # napi 3.9.0 sets rust-version = "1.88" in its published Cargo.toml
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/deanshrn/mdl"
@@ -49,3 +49,4 @@ codegen-units = 1
 [profile.release.package.mds-napi]
 opt-level = 3
 strip = true
+codegen-units = 1
