@@ -38,7 +38,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 
-use mds::Value;
+use mds::{Value, parse_json_vars, VarsError};
 use napi::bindgen_prelude::*;
 use napi::sys;
 use napi::Env;
@@ -318,73 +318,139 @@ fn check_source_size(env: &Env, source: &str) -> napi::Result<()> {
     Ok(())
 }
 
-// ── JSON type name helper ─────────────────────────────────────────────────────
+// ── Options parsing ───────────────────────────────────────────────────────────
 
-fn json_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "boolean",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
+/// Map a napi `ValueType` to a human-readable name for error messages.
+fn napi_type_name(vt: ValueType) -> &'static str {
+    match vt {
+        ValueType::Undefined => "undefined",
+        ValueType::Null => "null",
+        ValueType::Boolean => "boolean",
+        ValueType::Number => "number",
+        ValueType::String => "string",
+        ValueType::Symbol => "symbol",
+        ValueType::Object => "object",
+        ValueType::Function => "function",
+        ValueType::External => "external",
+        ValueType::Unknown => "unknown",
     }
 }
 
-// ── Options parsing ───────────────────────────────────────────────────────────
-
-/// Extract and validate `vars` from a serde_json options map.
-fn parse_vars_field(
+/// Collect all unknown option keys from an Object and return an error if any exist.
+///
+/// Uses `get_property_names` to enumerate all keys, deserializes the resulting
+/// Array as a `serde_json` array of strings, then filters out recognised keys.
+/// Reports ALL unknown keys at once so users can fix multiple typos in one go.
+fn reject_unknown_napi_keys(
     env: &Env,
-    map: &mut serde_json::Map<String, serde_json::Value>,
-) -> napi::Result<Option<HashMap<String, Value>>> {
-    match map.remove("vars") {
-        Some(serde_json::Value::Object(vars_map)) => {
-            let mut result = HashMap::with_capacity(vars_map.len());
-            for (key, val) in vars_map {
-                let mds_val = Value::from_json(val)
-                    .map_err(|e| throw_mds_error(env, e))?;
-                result.insert(key, mds_val);
+    obj: &Object,
+    known: &[&str],
+) -> napi::Result<()> {
+    let names_obj: Object = obj.get_property_names()?;
+    // Deserialize the property-names Array into a JSON array of strings.
+    let names_json: serde_json::Value = env.from_js_value(names_obj)?;
+    let keys: Vec<String> = match names_json {
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => return Ok(()),
+    };
+
+    let unknowns: Vec<&str> = keys
+        .iter()
+        .filter(|k| !known.contains(&k.as_str()))
+        .map(String::as_str)
+        .collect();
+
+    if unknowns.is_empty() {
+        return Ok(());
+    }
+
+    let recognised = known.join(", ");
+    let msg = if unknowns.len() == 1 {
+        format!(
+            "unknown option key \"{}\"; recognised keys are: {}",
+            unknowns[0], recognised
+        )
+    } else {
+        let listed: Vec<String> = unknowns.iter().map(|k| format!("\"{k}\"")).collect();
+        format!(
+            "unknown option keys: {}; recognised keys are: {}",
+            listed.join(", "),
+            recognised
+        )
+    };
+
+    Err(throw_options_error(env, &msg))
+}
+
+/// Extract and validate the `basePath` option using direct property access.
+///
+/// Returns `None` for absent, `undefined`, or `null`; errors on empty strings
+/// or non-string types; returns `Some(PathBuf)` for valid non-empty strings.
+fn extract_base_path_direct(env: &Env, obj: &Object) -> napi::Result<Option<PathBuf>> {
+    if !obj.has_named_property("basePath")? {
+        return Ok(None);
+    }
+    let val: Unknown = obj.get_named_property_unchecked("basePath")?;
+    let vt = val.get_type()?;
+    match vt {
+        ValueType::Undefined | ValueType::Null => Ok(None),
+        ValueType::String => {
+            // SAFETY: we checked get_type() == String above before casting.
+            let s: String = unsafe { val.cast()? };
+            if s.is_empty() {
+                Err(throw_options_error(
+                    env,
+                    "options.basePath must be a non-empty string",
+                ))
+            } else {
+                Ok(Some(PathBuf::from(s)))
             }
-            Ok(Some(result))
         }
-        None => Ok(None),
-        Some(other) => Err(throw_options_error(
+        other => Err(throw_options_error(
             env,
             &format!(
-                "options.vars must be a plain object, got {}",
-                json_type_name(&other)
+                "options.basePath must be a string, got {}",
+                napi_type_name(other)
             ),
         )),
     }
 }
 
-/// Extract and validate the `basePath` entry from a deserialized options map.
+/// Extract and validate the `vars` option using direct property access.
 ///
-/// Removes the key from `map` so the caller can detect unknown keys afterward.
-/// Returns `None` for absent or `null` values; errors on empty strings or
-/// non-string types.
-fn extract_base_path(
+/// Returns `None` for absent, `undefined`, or `null`; delegates to the shared
+/// `parse_json_vars` for object validation and conversion; errors on non-object
+/// types (including arrays).
+fn extract_vars_direct(
     env: &Env,
-    map: &mut serde_json::Map<String, serde_json::Value>,
-) -> napi::Result<Option<PathBuf>> {
-    match map.remove("basePath") {
-        Some(serde_json::Value::String(s)) => {
-            if s.is_empty() {
-                return Err(throw_options_error(
-                    env,
-                    "options.basePath must be a non-empty string",
-                ));
-            }
-            Ok(Some(PathBuf::from(s)))
+    obj: &Object,
+) -> napi::Result<Option<HashMap<String, Value>>> {
+    if !obj.has_named_property("vars")? {
+        return Ok(None);
+    }
+    let val: Unknown = obj.get_named_property_unchecked("vars")?;
+    let vt = val.get_type()?;
+    match vt {
+        ValueType::Undefined | ValueType::Null => Ok(None),
+        ValueType::Object => {
+            // Deserialize only the vars sub-value.
+            let vars_json: serde_json::Value = env.from_js_value(val)?;
+            // Note: ValueType::Object includes JS arrays, which serde deserializes
+            // as Value::Array. The `let Value::Object(map) else` guard inside
+            // parse_json_vars rejects arrays and non-objects.
+            parse_json_vars(vars_json).map(Some).map_err(|e| match e {
+                VarsError::InvalidType(msg) => throw_options_error(env, &msg),
+                VarsError::Conversion(mds_err) => throw_mds_error(env, mds_err),
+            })
         }
-        // null/undefined treated as absent (omitted).
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(other) => Err(throw_options_error(
+        other => Err(throw_options_error(
             env,
             &format!(
-                "options.basePath must be a string, got {}",
-                json_type_name(&other)
+                "options.vars must be a plain object, got {}",
+                napi_type_name(other)
             ),
         )),
     }
@@ -401,25 +467,9 @@ fn parse_compile_opts(env: &Env, opts: Option<Object>) -> napi::Result<CompileOp
         return Ok((None, None));
     };
 
-    // Use the `serde-json` feature to deserialize the options Object.
-    let opts_val: serde_json::Value = env.from_js_value(opts_obj)?;
-
-    let serde_json::Value::Object(mut map) = opts_val else {
-        return Err(throw_options_error(env, "options must be a plain object"));
-    };
-
-    let base_path = extract_base_path(env, &mut map)?;
-    let vars = parse_vars_field(env, &mut map)?;
-
-    // Reject unknown keys so callers catch typos early.
-    if let Some(unknown_key) = map.keys().next() {
-        return Err(throw_options_error(
-            env,
-            &format!(
-                "unknown option key \"{unknown_key}\"; recognised keys are: basePath, vars"
-            ),
-        ));
-    }
+    reject_unknown_napi_keys(env, &opts_obj, &["basePath", "vars"])?;
+    let base_path = extract_base_path_direct(env, &opts_obj)?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
 
     Ok((base_path, vars))
 }
@@ -435,14 +485,8 @@ fn parse_file_opts(
         return Ok(None);
     };
 
-    let opts_val: serde_json::Value = env.from_js_value(opts_obj)?;
-
-    let serde_json::Value::Object(mut map) = opts_val else {
-        return Err(throw_options_error(env, "options must be a plain object"));
-    };
-
     // basePath is not valid for file operations.
-    if map.contains_key("basePath") {
+    if opts_obj.has_named_property("basePath")? {
         return Err(throw_options_error(
             env,
             "option \"basePath\" is not valid for compileFile/checkFile; \
@@ -450,17 +494,8 @@ fn parse_file_opts(
         ));
     }
 
-    let vars = parse_vars_field(env, &mut map)?;
-
-    // Reject all other unknown keys.
-    if let Some(unknown_key) = map.keys().next() {
-        return Err(throw_options_error(
-            env,
-            &format!(
-                "unknown option key \"{unknown_key}\"; recognised keys are: vars"
-            ),
-        ));
-    }
+    reject_unknown_napi_keys(env, &opts_obj, &["vars"])?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
 
     Ok(vars)
 }
