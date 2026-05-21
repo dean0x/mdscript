@@ -391,6 +391,47 @@ describe('options validation', () => {
       },
     );
   });
+
+  test('V-7: basePath as number throws mds::invalid_options', () => {
+    assert.throws(
+      () => compile('Hello!\n', { basePath: 42 }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  test('V-8: vars as array throws mds::invalid_options', () => {
+    assert.throws(
+      () => compile('Hello!\n', { vars: ['not', 'an', 'object'] }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        assert.ok(err.message.includes('array'), `expected "array" in message: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test('V-9: unknown key on check throws mds::invalid_options', () => {
+    assert.throws(
+      () => check('Hello!\n', { unknownKey: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  test('V-10: unknown key on checkFile throws mds::invalid_options', () => {
+    assert.throws(
+      () => checkFile(SIMPLE_MDS, { unknownKey: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
 });
 
 // ── Resource limit tests ──────────────────────────────────────────────────────
