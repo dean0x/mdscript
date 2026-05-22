@@ -1,7 +1,6 @@
 /**
  * Shared test helpers for @mds/mds tests.
  */
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -14,9 +13,3 @@ export const ENTRY_MDS = path.join(FIXTURES, 'imports', 'entry.mds');
 export const EMPTY_MDS = path.join(FIXTURES, 'edge', 'empty.mds');
 export const FRONTMATTER_ONLY_MDS = path.join(FIXTURES, 'edge', 'frontmatter_only.mds');
 export const MD_EXTENSION = path.join(FIXTURES, 'edge', 'md_extension.md');
-
-/**
- * Load the napi addon directly (bypasses the workspace-linked mds-napi resolution).
- */
-const require = createRequire(import.meta.url);
-export const napiAddon = require(path.join(__dirname, '../../..', 'crates/mds-napi/mds-napi.node'));

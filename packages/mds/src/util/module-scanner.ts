@@ -46,11 +46,9 @@ export function normalizeVirtualKey(base: string, relative: string): string {
   // Resolve relative to the directory portion of base (split on '/').
   const lastSlash = base.lastIndexOf('/');
   const baseDir = lastSlash >= 0 ? base.slice(0, lastSlash) : '';
-  const baseDirSegments: string[] = baseDir.length > 0
+  const segments: string[] = baseDir.length > 0
     ? baseDir.split('/').filter((s) => s.length > 0)
     : [];
-
-  const segments: string[] = [...baseDirSegments];
 
   for (const part of relative.split('/')) {
     if (part === '' || part === '.') {

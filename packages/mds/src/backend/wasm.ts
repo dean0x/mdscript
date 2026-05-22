@@ -9,8 +9,6 @@ import type {
 } from '../types.js';
 import {
   buildModulesMap,
-  DEFAULT_MAX_MODULES,
-  DEFAULT_MAX_AGGREGATE_SIZE,
   type BuildModulesMapResult,
 } from '../util/module-scanner.js';
 import { varsOpt } from '../util/options.js';
@@ -108,11 +106,7 @@ function assertInitialized(): WasmModule {
 }
 
 async function buildFileModules(wasm: WasmModule, path: string): Promise<BuildModulesMapResult> {
-  return buildModulesMap(
-    path,
-    (source) => wasm.scanImports(source),
-    { maxModules: DEFAULT_MAX_MODULES, maxAggregateSize: DEFAULT_MAX_AGGREGATE_SIZE },
-  );
+  return buildModulesMap(path, (source) => wasm.scanImports(source));
 }
 
 /**
