@@ -7,10 +7,7 @@ import type {
   InitOptions,
   MdsBackend,
 } from '../types.js';
-import {
-  buildModulesMap,
-  type BuildModulesMapResult,
-} from '../util/module-scanner.js';
+import { buildModulesMap } from '../util/module-scanner.js';
 import { varsOpt } from '../util/options.js';
 
 /**
@@ -105,10 +102,6 @@ function assertInitialized(): WasmModule {
   return wasmModule;
 }
 
-async function buildFileModules(wasm: WasmModule, path: string): Promise<BuildModulesMapResult> {
-  return buildModulesMap(path, (source) => wasm.scanImports(source));
-}
-
 /** Default compile/check options for the common no-vars path — avoids per-call allocation. */
 const DEFAULT_COMPILE_OPTS = Object.freeze({ filename: 'input.mds', modules: {} as Record<string, string> });
 
@@ -132,7 +125,7 @@ export async function createWasmBackend(options?: InitOptions): Promise<MdsBacke
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
       const wasm = assertInitialized();
-      const { entryFilename, modules } = await buildFileModules(wasm, path);
+      const { entryFilename, modules } = await buildModulesMap(path, (src) => wasm.scanImports(src));
       return wasm.compile(modules[entryFilename] ?? '', {
         filename: entryFilename,
         modules,
@@ -142,7 +135,7 @@ export async function createWasmBackend(options?: InitOptions): Promise<MdsBacke
 
     async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
       const wasm = assertInitialized();
-      const { entryFilename, modules } = await buildFileModules(wasm, path);
+      const { entryFilename, modules } = await buildModulesMap(path, (src) => wasm.scanImports(src));
       return wasm.check(modules[entryFilename] ?? '', {
         filename: entryFilename,
         modules,

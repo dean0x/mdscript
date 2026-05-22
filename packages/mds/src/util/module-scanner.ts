@@ -17,23 +17,6 @@ export interface BuildModulesMapResult {
 }
 
 /**
- * Normalize the root entry-point key (base is empty).
- *
- * The path is used as-is; only the segment count is validated.
- * Extracted from normalizeVirtualKey to reduce its cyclomatic complexity.
- */
-function normalizeRootKey(relative: string): string {
-  const segmentCount = relative
-    .split('/')
-    .filter((s) => s.length > 0 && s !== '.')
-    .length;
-  if (segmentCount > MAX_PATH_SEGMENTS) {
-    throw new Error(`import path exceeds maximum segment count of ${MAX_PATH_SEGMENTS}`);
-  }
-  return relative;
-}
-
-/**
  * Normalize a virtual module key the same way VirtualFs::normalize() does in Rust.
  *
  * Given a base key (the key of the importing module) and a relative import path,
@@ -51,7 +34,11 @@ export function normalizeVirtualKey(base: string, relative: string): string {
 
   if (base.length === 0) {
     // Root entry point — use key as-is, but still enforce the segment limit.
-    return normalizeRootKey(relative);
+    const segmentCount = relative.split('/').filter((s) => s.length > 0 && s !== '.').length;
+    if (segmentCount > MAX_PATH_SEGMENTS) {
+      throw new Error(`import path exceeds maximum segment count of ${MAX_PATH_SEGMENTS}`);
+    }
+    return relative;
   }
 
   // Resolve relative to the directory portion of base (split on '/').
