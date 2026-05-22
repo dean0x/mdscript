@@ -31,7 +31,7 @@
     "mds-napi": "file:../../crates/mds-napi"
   },
   "devDependencies": {
-    "@types/node": "^25.9.1",
+    "@types/node": "^22.0.0",
     "typescript": "^5.4.0"
   }
 }
