@@ -522,3 +522,38 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         to_js(&CheckOutput { warnings })
     }))
 }
+
+/// Extract all import and re-export paths from an MDS source string.
+///
+/// Returns an array of path strings (`string[]`) in insertion order, deduplicated.
+/// Does not resolve paths to the filesystem — returns them as-is from the source.
+///
+/// ## Arguments
+///
+/// - `source`: MDS template source text.
+///
+/// ## Returns
+///
+/// On success, a JS array of strings (e.g. `["./foo.mds", "./bar.mds"]`).
+///
+/// On failure, throws a JS `Error` with the same structure as [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const paths = scanImports('@import "./foo.mds"\n@import { bar } from "./bar.mds"\n');
+/// console.log(paths); // ["./foo.mds", "./bar.mds"]
+/// ```
+#[wasm_bindgen(js_name = "scanImports")]
+pub fn scan_imports(source: &str) -> Result<JsValue, JsValue> {
+    check_source_size(source)?;
+
+    // Owned String required so the closure satisfies UnwindSafe.
+    let source = source.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let paths = mds::scan_imports(&source).map_err(mds_error_to_js)?;
+        serde_wasm_bindgen::to_value(&paths)
+            .map_err(|e| js_error(&format!("failed to serialize result: {e}"), "mds::internal"))
+    }))
+}

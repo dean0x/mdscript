@@ -425,3 +425,69 @@ fn check_unknown_option_key_returns_error() {
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options", "got: {code}");
 }
+
+// ── scan_imports tests ────────────────────────────────────────────────────────
+
+/// Helper: get the JS array length.
+fn js_array_len(val: &JsValue) -> u32 {
+    js_sys::Array::from(val).length()
+}
+
+/// Helper: get string element at index from a JS array.
+fn js_array_str(val: &JsValue, idx: u32) -> String {
+    js_sys::Array::from(val).get(idx).as_string().unwrap_or_default()
+}
+
+#[wasm_bindgen_test]
+fn scan_imports_returns_array_for_source_with_imports() {
+    let source = "@import \"./foo.mds\"\n@import \"./bar.mds\"\n";
+    let result = mds_wasm::scan_imports(source).unwrap();
+    assert_eq!(js_array_len(&result), 2);
+    assert_eq!(js_array_str(&result, 0), "./foo.mds");
+    assert_eq!(js_array_str(&result, 1), "./bar.mds");
+}
+
+#[wasm_bindgen_test]
+fn scan_imports_returns_empty_array_for_importless_source() {
+    let result = mds_wasm::scan_imports("Hello World!\n").unwrap();
+    assert_eq!(js_array_len(&result), 0);
+}
+
+#[wasm_bindgen_test]
+fn scan_imports_returns_error_for_malformed_source() {
+    // Unclosed interpolation — should produce an error.
+    let err = mds_wasm::scan_imports("Hello {name\n").unwrap_err();
+    let code = get_str(&err, "code");
+    assert!(
+        !code.is_empty(),
+        "error should have a code, got empty string"
+    );
+}
+
+#[wasm_bindgen_test]
+fn scan_imports_returns_error_for_oversized_source() {
+    // Build a source that exceeds MAX_SOURCE_SIZE (10 MiB).
+    let oversized = "x".repeat(10 * 1024 * 1024 + 1);
+    let err = mds_wasm::scan_imports(&oversized).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::resource_limit");
+}
+
+#[wasm_bindgen_test]
+fn scan_imports_handles_all_directive_forms() {
+    let source = concat!(
+        "@import \"./a.mds\" as a\n",
+        "@import { foo } from \"./b.mds\"\n",
+        "@import \"./c.mds\"\n",
+        "@export bar from \"./d.mds\"\n",
+        "@export * from \"./e.mds\"\n",
+        "@export localFn\n",
+    );
+    let result = mds_wasm::scan_imports(source).unwrap();
+    assert_eq!(js_array_len(&result), 5);
+    assert_eq!(js_array_str(&result, 0), "./a.mds");
+    assert_eq!(js_array_str(&result, 1), "./b.mds");
+    assert_eq!(js_array_str(&result, 2), "./c.mds");
+    assert_eq!(js_array_str(&result, 3), "./d.mds");
+    assert_eq!(js_array_str(&result, 4), "./e.mds");
+}
