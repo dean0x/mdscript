@@ -1,0 +1,48 @@
+'use strict';
+
+const { platform, arch } = process;
+
+function isMusl() {
+  const { readFileSync } = require('fs');
+  try { return readFileSync('/usr/bin/ldd', 'utf-8').includes('musl'); }
+  catch { return false; }
+}
+
+function loadBinding() {
+  const errors = [];
+  const triples = {
+    'darwin-arm64': ['mds-napi.darwin-arm64.node', '@mds/mds-darwin-arm64'],
+    'darwin-x64':   ['mds-napi.darwin-x64.node',   '@mds/mds-darwin-x64'],
+    'linux-x64-gnu':  ['mds-napi.linux-x64-gnu.node',  '@mds/mds-linux-x64-gnu'],
+    'linux-x64-musl': ['mds-napi.linux-x64-musl.node', '@mds/mds-linux-x64-musl'],
+    'linux-arm64-gnu':  ['mds-napi.linux-arm64-gnu.node',  '@mds/mds-linux-arm64-gnu'],
+    'linux-arm64-musl': ['mds-napi.linux-arm64-musl.node', '@mds/mds-linux-arm64-musl'],
+    'win32-x64':    ['mds-napi.win32-x64-msvc.node', '@mds/mds-win32-x64-msvc'],
+  };
+
+  let key;
+  if (platform === 'linux') {
+    const libc = isMusl() ? 'musl' : 'gnu';
+    key = `${platform}-${arch}-${libc}`;
+  } else {
+    key = `${platform}-${arch}`;
+  }
+
+  const candidates = triples[key]
+    ? ['mds-napi.node', ...triples[key]]
+    : ['mds-napi.node'];
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate.endsWith('.node')) {
+        return require(require('path').join(__dirname, candidate));
+      }
+      return require(candidate);
+    } catch (e) { errors.push({ candidate, error: e.message }); }
+  }
+
+  const details = errors.map(e => `  ${e.candidate}: ${e.error}`).join('\n');
+  throw new Error(`Failed to load mds-napi native binding for ${platform}-${arch}:\n${details}`);
+}
+
+module.exports = loadBinding();

@@ -1,0 +1,25 @@
+{
+  "name": "@mds/mds",
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=22.0.0" },
+  "exports": {
+    ".": {
+      "node": { "types": "./dist/node.d.ts", "import": "./dist/node.js" },
+      "default": { "types": "./dist/browser.d.ts", "import": "./dist/browser.js" }
+    }
+  },
+  "files": ["dist/", "wasm/"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test __test__/*.spec.mjs",
+    "test:parity": "node --test __test__/parity.spec.mjs",
+    "test:perf": "node --test __test__/perf.spec.mjs"
+  },
+  "dependencies": {
+    "mds-napi": "file:../../crates/mds-napi"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

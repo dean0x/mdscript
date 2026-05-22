@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "workspaces": ["packages/*", "crates/mds-napi"],
+  "engines": { "node": ">=22.0.0" }
+}
