@@ -44,22 +44,27 @@ if (forceBackend === 'wasm') {
   }
 }
 
+/** Compile an MDS source string to Markdown. */
 export function compile(source: string, options?: CompileOptions): CompileResult {
   return backend.compile(source, options);
 }
 
+/** Validate an MDS source string without rendering. */
 export function check(source: string, options?: CompileOptions): CheckResult {
   return backend.check(source, options);
 }
 
+/** Compile an MDS file to Markdown, resolving `@import` directives relative to the file. */
 export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
   return backend.compileFile(path, options);
 }
 
+/** Validate an MDS file without rendering, resolving `@import` directives relative to the file. */
 export function checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
   return backend.checkFile(path, options);
 }
 
+/** Returns which backend is currently active: `'native'` or `'wasm'`. */
 export function getBackend(): BackendType {
   return backend.getBackend();
 }

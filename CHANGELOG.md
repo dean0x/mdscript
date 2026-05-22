@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`@mds/mds` npm package** — universal JavaScript/TypeScript bindings for the MDS compiler
+  - Node.js entry auto-selects the native addon with WASM fallback
+  - Browser entry via WASM; requires `init()` before use
+  - API: `compile`, `check`, `compileFile`, `checkFile`, `getBackend`, `init`, `isMdsError`
+  - `MDS_BACKEND` environment variable to force `native` or `wasm` backend
+  - Full TypeScript types with JSDoc
+
 ## [0.1.0] — 2026-05-15
 
 Initial release of the MDS (Markdown Script) compiler.
