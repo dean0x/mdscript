@@ -32,7 +32,6 @@ export interface MdsError extends Error {
 export type BackendType = 'native' | 'wasm';
 
 export interface InitOptions {
-  backend?: BackendType;
   wasmUrl?: string | URL | Response | BufferSource;
 }
 

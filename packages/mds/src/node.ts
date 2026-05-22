@@ -59,6 +59,18 @@ export function getBackend(): BackendType {
   return backend.getBackend();
 }
 
+/**
+ * Pre-initialize the WASM module with a custom URL (browser-target WASM only).
+ *
+ * Backend selection in Node.js happens at import time via the `MDS_BACKEND`
+ * environment variable — before user code can call `init()`. In Node.js, the
+ * backend is already selected and loaded by the time this module is imported,
+ * so `init()` is a no-op unless the WASM backend was chosen and you need to
+ * supply a custom `wasmUrl` before the first compile call.
+ *
+ * The only meaningful option is `wasmUrl`, which is forwarded to the WASM
+ * module initializer. Passing any other options has no effect.
+ */
 export { init } from './backend/wasm.js';
 export { isMdsError } from './types.js';
 export type {
