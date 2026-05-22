@@ -8,5 +8,5 @@ import type { CompileOptions, FileOptions } from '../types.js';
  * object creation and keeps the options shape minimal.
  */
 export function varsOpt(options?: CompileOptions | FileOptions): { vars: Record<string, unknown> } | undefined {
-  return options?.vars !== undefined ? { vars: options.vars } : undefined;
+  return options?.vars != null ? { vars: options.vars } : undefined;
 }

@@ -109,20 +109,25 @@ async function buildFileModules(wasm: WasmModule, path: string): Promise<BuildMo
   return buildModulesMap(path, (source) => wasm.scanImports(source));
 }
 
+/** Default compile/check options for the common no-vars path — avoids per-call allocation. */
+const DEFAULT_COMPILE_OPTS = Object.freeze({ filename: 'input.mds', modules: {} as Record<string, string> });
+
 /**
  * Create a WASM backend instance. Calls init() internally.
  */
-export async function createWasmBackend(): Promise<MdsBackend> {
-  await init();
+export async function createWasmBackend(options?: InitOptions): Promise<MdsBackend> {
+  await init(options);
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
       const wasm = assertInitialized();
-      return wasm.compile(source, { filename: 'input.mds', modules: {}, ...varsOpt(options) });
+      const vars = varsOpt(options);
+      return wasm.compile(source, vars !== undefined ? { ...DEFAULT_COMPILE_OPTS, ...vars } : DEFAULT_COMPILE_OPTS);
     },
 
     check(source: string, options?: CompileOptions): CheckResult {
       const wasm = assertInitialized();
-      return wasm.check(source, { filename: 'input.mds', modules: {}, ...varsOpt(options) });
+      const vars = varsOpt(options);
+      return wasm.check(source, vars !== undefined ? { ...DEFAULT_COMPILE_OPTS, ...vars } : DEFAULT_COMPILE_OPTS);
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {

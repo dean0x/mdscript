@@ -7,7 +7,7 @@ import type {
   InitOptions,
   MdsBackend,
 } from './types.js';
-import { init as wasmInit } from './backend/wasm.js';
+import { createWasmBackend } from './backend/wasm.js';
 
 export { isMdsError } from './types.js';
 export type {
@@ -21,54 +21,69 @@ export type {
   InitOptions,
 } from './types.js';
 
-let backend: MdsBackend | undefined;
-// Promise cached synchronously to prevent double-init race when
-// multiple callers invoke init() concurrently.
-let initPromise: Promise<void> | null = null;
+let resolvedBackend: MdsBackend | undefined;
+// Cached as the same Promise<void> object so concurrent init() calls return
+// reference-equal promises. Reset on rejection so callers can retry;
+// wasm.ts's MAX_INIT_RETRIES enforces a permanent failure bound.
+let initVoidPromise: Promise<void> | null = null;
 
 /**
  * Initialize the WASM backend. Must be called before compile/check in browser environments.
- * Idempotent — safe to call multiple times. Concurrent calls share the same init promise.
+ *
+ * Idempotent — safe to call multiple times. Concurrent calls receive the same
+ * promise object (reference-equal), preventing double-init races. Delegates all
+ * retry and race logic to the WASM adapter (MAX_INIT_RETRIES=3 in wasm.ts).
  */
-export async function init(options?: InitOptions): Promise<void> {
-  if (backend !== undefined) return;
-  if (initPromise !== null) return initPromise;
-  initPromise = doInit(options);
-  return initPromise;
-}
-
-async function doInit(options?: InitOptions): Promise<void> {
-  try {
-    // wasmInit populates the singleton with options (e.g. wasmUrl) before createWasmBackend reads it.
-    await wasmInit(options);
-    const { createWasmBackend } = await import('./backend/wasm.js');
-    backend = await createWasmBackend();
-  } catch (err) {
-    // Reset so a subsequent call can retry after a transient failure.
-    initPromise = null;
-    throw err;
-  }
+export function init(options?: InitOptions): Promise<void> {
+  if (resolvedBackend !== undefined) return Promise.resolve();
+  if (initVoidPromise !== null) return initVoidPromise;
+  initVoidPromise = createWasmBackend(options)
+    .then((b) => {
+      resolvedBackend = b;
+    })
+    .catch((err) => {
+      // Reset so a subsequent call can retry after a transient failure.
+      // wasm.ts's MAX_INIT_RETRIES ensures eventual permanent failure.
+      initVoidPromise = null;
+      throw err;
+    });
+  return initVoidPromise;
 }
 
 function assertInitialized(): MdsBackend {
-  if (backend === undefined) {
+  if (resolvedBackend === undefined) {
     throw new Error('@mds/mds: call init() before using compile/check in a browser environment');
   }
-  return backend;
+  return resolvedBackend;
 }
 
+/**
+ * Compile an MDS source string to Markdown.
+ * Requires init() to have been called and awaited first.
+ */
 export function compile(source: string, options?: CompileOptions): CompileResult {
   return assertInitialized().compile(source, options);
 }
 
+/**
+ * Validate an MDS source string without rendering.
+ * Requires init() to have been called and awaited first.
+ */
 export function check(source: string, options?: CompileOptions): CheckResult {
   return assertInitialized().check(source, options);
 }
 
+/**
+ * Returns the active backend type. Always `'wasm'` in browser environments.
+ */
 export function getBackend(): BackendType {
   return 'wasm';
 }
 
+/**
+ * Not available in browser environments.
+ * @throws Always throws — use compile() with a pre-loaded source string instead.
+ */
 export function compileFile(_path: string, _options?: FileOptions): Promise<CompileResult> {
   return Promise.reject(
     new Error(
@@ -78,6 +93,10 @@ export function compileFile(_path: string, _options?: FileOptions): Promise<Comp
   );
 }
 
+/**
+ * Not available in browser environments.
+ * @throws Always throws — use check() with a pre-loaded source string instead.
+ */
 export function checkFile(_path: string, _options?: FileOptions): Promise<CheckResult> {
   return Promise.reject(
     new Error(
