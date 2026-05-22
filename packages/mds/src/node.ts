@@ -7,7 +7,12 @@ import type {
   FileOptions,
 } from './types.js';
 
-const forceBackend = process.env['MDS_BACKEND'] as BackendType | undefined;
+const rawBackend = process.env['MDS_BACKEND'];
+const forceBackend: BackendType | undefined =
+  rawBackend === 'native' || rawBackend === 'wasm' ? rawBackend : undefined;
+if (rawBackend !== undefined && forceBackend === undefined) {
+  console.warn(`@mds/mds: ignoring unknown MDS_BACKEND value "${rawBackend}"; expected "native" or "wasm"`);
+}
 
 let backend: MdsBackend;
 
@@ -78,8 +83,8 @@ export type {
   CheckResult,
   CompileOptions,
   FileOptions,
-  MdsError,
   MdsErrorSpan,
+  MdsError,
   BackendType,
   InitOptions,
 } from './types.js';

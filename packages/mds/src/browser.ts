@@ -15,46 +15,46 @@ export type {
   CheckResult,
   CompileOptions,
   FileOptions,
-  MdsError,
   MdsErrorSpan,
+  MdsError,
   BackendType,
   InitOptions,
 } from './types.js';
 
-let _backend: MdsBackend | undefined;
+let backend: MdsBackend | undefined;
 // Promise cached synchronously to prevent double-init race when
 // multiple callers invoke init() concurrently.
-let _initPromise: Promise<void> | null = null;
+let initPromise: Promise<void> | null = null;
 
 /**
  * Initialize the WASM backend. Must be called before compile/check in browser environments.
  * Idempotent — safe to call multiple times. Concurrent calls share the same init promise.
  */
 export async function init(options?: InitOptions): Promise<void> {
-  if (_backend !== undefined) return;
-  if (_initPromise !== null) return _initPromise;
-  _initPromise = _doInit(options);
-  return _initPromise;
+  if (backend !== undefined) return;
+  if (initPromise !== null) return initPromise;
+  initPromise = doInit(options);
+  return initPromise;
 }
 
-async function _doInit(options?: InitOptions): Promise<void> {
+async function doInit(options?: InitOptions): Promise<void> {
   try {
     // wasmInit populates the singleton with options (e.g. wasmUrl) before createWasmBackend reads it.
     await wasmInit(options);
     const { createWasmBackend } = await import('./backend/wasm.js');
-    _backend = await createWasmBackend();
+    backend = await createWasmBackend();
   } catch (err) {
     // Reset so a subsequent call can retry after a transient failure.
-    _initPromise = null;
+    initPromise = null;
     throw err;
   }
 }
 
 function assertInitialized(): MdsBackend {
-  if (_backend === undefined) {
+  if (backend === undefined) {
     throw new Error('@mds/mds: call init() before using compile/check in a browser environment');
   }
-  return _backend;
+  return backend;
 }
 
 export function compile(source: string, options?: CompileOptions): CompileResult {
