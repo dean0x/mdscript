@@ -1,9 +1,9 @@
-import { readFile, lstat } from 'node:fs/promises';
+import { readFile, lstat, realpath } from 'node:fs/promises';
 import { resolve, dirname, basename } from 'node:path';
 
 const MAX_PATH_SEGMENTS = 256;
-const DEFAULT_MAX_MODULES = 256;
-const DEFAULT_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
+export const DEFAULT_MAX_MODULES = 256;
+export const DEFAULT_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
 
 export interface ModuleScannerOptions {
   maxModules?: number;
@@ -97,9 +97,42 @@ export async function buildModulesMap(
   const projectRoot = dirname(absoluteEntry);
   const entryFilename = basename(absoluteEntry);
 
+  // Security: entry file must not be at filesystem root — that would disable the
+  // path traversal guard (projectRoot === '/' makes startsWith checks meaningless).
+  if (projectRoot === '/' || projectRoot === '') {
+    throw new Error('security: project root cannot be filesystem root');
+  }
+
   const modules: Record<string, string> = {};
   const visited = new Set<string>();
   let aggregateSize = 0;
+
+  /**
+   * Validate a child import path string and resolve it to an absolute filesystem
+   * path within the project root. Returns the resolved absolute path.
+   *
+   * Extracted to reduce nesting in the scan closure (scanner-6).
+   */
+  function validateImportPath(importPath: string, absoluteDir: string): string {
+    // Security: reject null bytes and empty paths.
+    if (importPath.includes('\0')) {
+      throw new Error('security: import path contains null byte');
+    }
+    if (importPath.trim().length === 0) {
+      throw new Error('security: import path is empty');
+    }
+
+    const childAbsolute = resolve(absoluteDir, importPath);
+
+    // Security: verify child is within project root.
+    if (!childAbsolute.startsWith(projectRoot + '/') && childAbsolute !== projectRoot) {
+      throw new Error(
+        `security: import path escapes project root: ${childAbsolute} is outside ${projectRoot}`,
+      );
+    }
+
+    return childAbsolute;
+  }
 
   async function scan(absolutePath: string, virtualKey: string): Promise<void> {
     if (visited.has(absolutePath)) {
@@ -107,10 +140,28 @@ export async function buildModulesMap(
     }
     visited.add(absolutePath);
 
-    // Security: reject symlinks.
+    // Resource limit: check module count immediately after marking visited so
+    // the count is O(1) and there is no off-by-one from checking after the write.
+    if (visited.size > maxModules) {
+      throw new Error(
+        `resource limit: module count exceeds maximum of ${maxModules}`,
+      );
+    }
+
+    // Security: reject symlinks. Use lstat so we inspect the path itself, not
+    // its target. Then compare the real path to detect TOCTOU swaps.
     const stats = await lstat(absolutePath);
     if (stats.isSymbolicLink()) {
       throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
+    }
+
+    // Security: TOCTOU — verify the path was not swapped for a symlink between
+    // lstat and readFile by comparing the real path to the expected path.
+    const resolved = await realpath(absolutePath);
+    if (resolved !== absolutePath) {
+      throw new Error(
+        `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink swap`,
+      );
     }
 
     // Security: verify resolved path is within project root.
@@ -120,20 +171,18 @@ export async function buildModulesMap(
       );
     }
 
-    const content = await readFile(absolutePath, 'utf-8');
-
-    aggregateSize += content.length;
+    // Resource limit: pre-reserve file size (in bytes, from OS metadata) before
+    // reading content so that parallel scan calls cannot each pass the check
+    // independently and collectively overshoot the limit (scanner-2 / scanner-3).
+    // stats.size is byte-accurate unlike content.length which counts UTF-16 units.
+    aggregateSize += stats.size;
     if (aggregateSize > maxAggregateSize) {
       throw new Error(
         `resource limit: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
       );
     }
 
-    if (Object.keys(modules).length >= maxModules) {
-      throw new Error(
-        `resource limit: module count exceeds maximum of ${maxModules}`,
-      );
-    }
+    const content = await readFile(absolutePath, 'utf-8');
 
     modules[virtualKey] = content;
 
@@ -143,22 +192,7 @@ export async function buildModulesMap(
     // Parallelize child reads at each level.
     await Promise.all(
       importPaths.map(async (importPath) => {
-        // Security: reject null bytes and empty paths.
-        if (importPath.includes('\0')) {
-          throw new Error('security: import path contains null byte');
-        }
-        if (importPath.trim().length === 0) {
-          throw new Error('security: import path is empty');
-        }
-
-        const childAbsolute = resolve(absoluteDir, importPath);
-
-        // Security: verify child is within project root.
-        if (!childAbsolute.startsWith(projectRoot + '/') && childAbsolute !== projectRoot) {
-          throw new Error(
-            `security: import path escapes project root: ${childAbsolute} is outside ${projectRoot}`,
-          );
-        }
+        const childAbsolute = validateImportPath(importPath, absoluteDir);
 
         // Compute virtual key using normalizeVirtualKey to mirror Rust's VirtualFs::normalize().
         const childVirtualKey = normalizeVirtualKey(virtualKey, importPath);

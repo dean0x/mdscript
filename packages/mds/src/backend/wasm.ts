@@ -7,10 +7,12 @@ import type {
   InitOptions,
   MdsBackend,
 } from '../types.js';
-
-// Must match DEFAULT_MAX_MODULES and DEFAULT_MAX_AGGREGATE_SIZE in module-scanner.ts.
-const WASM_MAX_MODULES = 256;
-const WASM_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
+import {
+  buildModulesMap,
+  DEFAULT_MAX_MODULES,
+  DEFAULT_MAX_AGGREGATE_SIZE,
+  type BuildModulesMapResult,
+} from '../util/module-scanner.js';
 
 /**
  * Shape of the WASM module exports (built with --target nodejs).
@@ -27,6 +29,8 @@ interface WasmModule {
 let wasmModule: WasmModule | undefined;
 // Promise cached BEFORE async work starts — prevents double-init race.
 let initPromise: Promise<void> | null = null;
+const MAX_INIT_RETRIES = 3;
+let initFailures = 0;
 
 /**
  * Initialize the WASM backend (idempotent singleton).
@@ -35,14 +39,21 @@ let initPromise: Promise<void> | null = null;
  * In Node.js environments loaded via node.ts, this is called automatically.
  *
  * Concurrent calls share the same init promise. If init fails, the cached
- * promise is cleared so subsequent calls can retry.
+ * promise is cleared so subsequent calls can retry, up to MAX_INIT_RETRIES
+ * times. After that, every call throws immediately without re-attempting.
  */
 export async function init(options?: InitOptions): Promise<void> {
   if (initPromise !== null) {
     return initPromise;
   }
+  if (initFailures >= MAX_INIT_RETRIES) {
+    throw new Error(
+      `@mds/mds: WASM backend failed to initialize after ${MAX_INIT_RETRIES} attempts. Check that the WASM module is built and accessible.`,
+    );
+  }
   initPromise = _init(options).catch((err) => {
     // Reset so a subsequent call can retry after a transient failure.
+    initFailures += 1;
     initPromise = null;
     throw err;
   });
@@ -99,12 +110,11 @@ function varsOpt(options?: CompileOptions | FileOptions): { vars: Record<string,
   return options?.vars !== undefined ? { vars: options.vars } : undefined;
 }
 
-async function buildFileModules(wasm: WasmModule, path: string) {
-  const { buildModulesMap } = await import('../util/module-scanner.js');
+async function buildFileModules(wasm: WasmModule, path: string): Promise<BuildModulesMapResult> {
   return buildModulesMap(
     path,
     (source) => wasm.scanImports(source),
-    { maxModules: WASM_MAX_MODULES, maxAggregateSize: WASM_MAX_AGGREGATE_SIZE },
+    { maxModules: DEFAULT_MAX_MODULES, maxAggregateSize: DEFAULT_MAX_AGGREGATE_SIZE },
   );
 }
 
