@@ -22,27 +22,47 @@ export type {
 } from './types.js';
 
 let resolvedBackend: MdsBackend | undefined;
-// Cached as the same Promise<void> object so concurrent init() calls return
-// reference-equal promises. Not reset on rejection — wasm.ts owns all retry
-// and failure-bound logic (MAX_INIT_RETRIES). A permanently-failed init
-// produces a permanently-rejected promise here, consistent with wasm.ts's
-// exhaustion semantics.
+// Cached while the init attempt is in-flight so concurrent init() calls share
+// the same promise and don't trigger double-initialization. Reset to null on
+// rejection, so that subsequent calls re-enter createWasmBackend() and reach
+// wasm.ts's retry logic (MAX_INIT_RETRIES=3). Cleared to null permanently once
+// resolvedBackend is set (resolvedBackend guard short-circuits first).
 let initVoidPromise: Promise<void> | null = null;
+
+/**
+ * Reset singleton state for testing.
+ *
+ * FOR TESTING ONLY — allows tests to drive the retry path by clearing cached
+ * state between calls.
+ *
+ * @internal
+ */
+export function _resetForTesting(): void {
+  resolvedBackend = undefined;
+  initVoidPromise = null;
+}
 
 /**
  * Initialize the WASM backend. Must be called before compile/check in browser environments.
  *
- * Idempotent — safe to call multiple times. Concurrent calls receive the same
- * promise object (reference-equal), preventing double-init races. Delegates all
- * retry and failure-bound logic to the WASM adapter (MAX_INIT_RETRIES=3 in
- * wasm.ts). Once init permanently fails, all subsequent calls receive the same
- * rejected promise.
+ * Idempotent — safe to call multiple times. Concurrent calls in flight share
+ * the same promise, preventing double-init races. On transient failure the
+ * cached promise is cleared so the next call can retry, delegating retry
+ * counting and exhaustion to the WASM adapter (MAX_INIT_RETRIES=3 in wasm.ts).
+ * Once the adapter permanently exhausts its retries, every subsequent call will
+ * reject immediately (driven by wasm.ts, not by this layer).
  */
 export function init(options?: InitOptions): Promise<void> {
   if (resolvedBackend !== undefined) return Promise.resolve();
   if (initVoidPromise !== null) return initVoidPromise;
   initVoidPromise = createWasmBackend(options).then((b) => {
     resolvedBackend = b;
+  }).catch((err: unknown) => {
+    // Clear so the next init() call re-enters createWasmBackend() and reaches
+    // wasm.ts's retry / exhaustion logic rather than returning this stale
+    // rejected promise.
+    initVoidPromise = null;
+    throw err;
   });
   return initVoidPromise;
 }

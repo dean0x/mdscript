@@ -1,13 +1,13 @@
 /**
  * Browser entry point behavioral tests for @mds/mds.
- * Tests: U-BR1 through U-BR10
+ * Tests: U-BR1 through U-BR11
  *
  * Imports dist/browser.js directly. Node.js ESM module state is shared within
  * the process. Node.js test runner executes top-level describe blocks
  * sequentially, so pre-init tests complete before the post-init suite starts.
  * init() is called in a before() hook inside the post-init describe block.
  */
-import { test, describe, before } from 'node:test';
+import { test, describe, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   compile,
@@ -17,7 +17,9 @@ import {
   getBackend,
   init,
   isMdsError,
+  _resetForTesting as browserReset,
 } from '../dist/browser.js';
+import { init as wasmInit, _resetForTesting as wasmReset } from '../dist/backend/wasm.js';
 
 // ---------------------------------------------------------------------------
 // Pre-init behavior (describe ensures these complete before post-init suite)
@@ -133,5 +135,60 @@ describe('browser entry — post-init', () => {
     // Backend must still be functional after repeated init.
     const result = compile('Idempotent!\n');
     assert.ok(result.output.includes('Idempotent!'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retry / rejection reset behavior
+// ---------------------------------------------------------------------------
+
+describe('browser entry — init() retry after transient failure', () => {
+  // Restore both module singletons after each test so other suites are unaffected.
+  // wasmReset(0) clears wasmModule so we must re-warm it with wasmInit() to
+  // avoid leaving wasm state blank for other spec files in the same process.
+  afterEach(async () => {
+    browserReset();
+    wasmReset(0);
+    await wasmInit();
+  });
+
+  test('U-BR11: init() clears cached promise on rejection so next call can retry', async () => {
+    // Exhaust wasm.ts retries so createWasmBackend() rejects immediately.
+    wasmReset(3); // MAX_INIT_RETRIES = 3
+    browserReset();
+
+    // First call: should reject because wasm is exhausted.
+    await assert.rejects(
+      () => init(),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('failed to initialize after'),
+          `expected exhaustion message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+
+    // Second call: wasm is still exhausted, but the key invariant is that
+    // browser's cached initVoidPromise was cleared on the first rejection,
+    // so a new promise is created and the rejection is a fresh attempt, not
+    // the stale one returned unchanged.
+    await assert.rejects(
+      () => init(),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('failed to initialize after'),
+          `expected exhaustion message on second call, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+
+    // Restore wasm to good state and verify a fresh init() now succeeds,
+    // confirming the browser module did not cache the stale rejection.
+    wasmReset(0);
+    await assert.doesNotReject(() => init());
   });
 });
