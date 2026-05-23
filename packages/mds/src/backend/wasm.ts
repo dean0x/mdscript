@@ -8,7 +8,6 @@ import type {
   MdsBackend,
 } from '../types.js';
 import { buildModulesMap } from '../util/module-scanner.js';
-import { varsOpt } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with --target nodejs).
@@ -138,7 +137,10 @@ async function _init(options?: InitOptions): Promise<void> {
   const candidates: readonly string[] = [
     // Workspace: pkg is built next to mds-wasm crate
     new URL('../../../../crates/mds-wasm/pkg/mds_wasm.js', import.meta.url).pathname,
-    // npm install scenario: mds-wasm might be a separate package
+    // Future npm package path: 'mds-wasm' is not yet published to npm and is
+    // not listed in package.json dependencies. This candidate is forward-looking
+    // — when the package is published, it will be resolvable here without code
+    // changes. Until then, it is skipped silently (MODULE_NOT_FOUND).
     'mds-wasm',
   ];
 
@@ -185,8 +187,22 @@ const DEFAULT_COMPILE_OPTS = Object.freeze({
 
 /** Build the options object for compile/check, merging vars when present. */
 function compileOpts(options?: CompileOptions) {
-  const vars = varsOpt(options);
-  return vars !== undefined ? { ...DEFAULT_COMPILE_OPTS, ...vars } : DEFAULT_COMPILE_OPTS;
+  const vars = options?.vars;
+  return vars != null
+    ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, vars }
+    : DEFAULT_COMPILE_OPTS;
+}
+
+/** Build the options object for compileFile/checkFile, merging vars when present. */
+function fileOpts(
+  entryFilename: string,
+  modules: Record<string, string>,
+  options?: FileOptions,
+) {
+  const vars = options?.vars;
+  return vars != null
+    ? { filename: entryFilename, modules, vars }
+    : { filename: entryFilename, modules };
 }
 
 /**
@@ -208,21 +224,13 @@ export async function createWasmBackend(options?: InitOptions): Promise<MdsBacke
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
       const wasm = assertInitialized();
       const { entryFilename, modules } = await buildModulesMap(path, (src) => wasm.scanImports(src));
-      return wasm.compile(modules[entryFilename] ?? '', {
-        filename: entryFilename,
-        modules,
-        ...varsOpt(options),
-      });
+      return wasm.compile(modules[entryFilename] ?? '', fileOpts(entryFilename, modules, options));
     },
 
     async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
       const wasm = assertInitialized();
       const { entryFilename, modules } = await buildModulesMap(path, (src) => wasm.scanImports(src));
-      return wasm.check(modules[entryFilename] ?? '', {
-        filename: entryFilename,
-        modules,
-        ...varsOpt(options),
-      });
+      return wasm.check(modules[entryFilename] ?? '', fileOpts(entryFilename, modules, options));
     },
 
     getBackend(): BackendType {
