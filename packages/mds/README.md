@@ -97,7 +97,7 @@ try {
 | `checkFile(path, options?)` | Validate an MDS file, resolving imports |
 | `getBackend()` | Returns the active backend: `'native'` or `'wasm'` |
 | `init(options?)` | Initialize the WASM backend (browser/explicit WASM only) |
-| `isMdsError(err)` | Type guard for MDS compiler errors |
+| `isMdsError(err)` | Type guard for MDS compiler errors (requires `code` starting with `"mds::"`) |
 
 ### Options
 

@@ -48,6 +48,7 @@ export interface MdsError extends Error {
   span?: MdsErrorSpan;
 }
 
+/** Discriminant for the active compiler backend. */
 export type BackendType = 'native' | 'wasm';
 
 /** Options for explicit WASM backend initialization. */
@@ -70,6 +71,11 @@ export interface MdsBackend {
   getBackend(): BackendType;
 }
 
+/**
+ * Type guard that identifies errors thrown by the MDS compiler.
+ * Returns `true` when `err` is an `Error` with a string `code` property
+ * starting with `'mds::'`.
+ */
 export function isMdsError(err: unknown): err is MdsError {
   return (
     err instanceof Error &&
