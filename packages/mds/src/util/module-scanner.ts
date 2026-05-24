@@ -1,4 +1,4 @@
-import { open, lstat, realpath } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
 
@@ -12,6 +12,26 @@ const MAX_PATH_SEGMENTS = 256;
 const MAX_IMPORT_DEPTH = 64;
 export const DEFAULT_MAX_MODULES = 256;
 export const DEFAULT_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
+
+/**
+ * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP /
+ * ENOTDIR errors that the kernel emits when the path is a symlink into a clear
+ * security error. All other OS errors are re-thrown unchanged.
+ *
+ * Module-level helper (not a closure) so that openAndValidateModule's own
+ * try/catch only handles post-open validation, keeping nesting shallow.
+ */
+async function openNoFollow(absolutePath: string): Promise<Awaited<ReturnType<typeof open>>> {
+  try {
+    return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ELOOP' || code === 'ENOTDIR') {
+      throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
+    }
+    throw err;
+  }
+}
 
 export interface ModuleScannerOptions {
   maxModules?: number;
@@ -83,7 +103,7 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * suitable for passing to the WASM compile/check functions.
  *
  * Security checks performed:
- * - Rejects symlinks (lstat check)
+ * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)
  * - Rejects paths that escape the project root (entry file's directory)
  * - Rejects paths with null bytes or empty segments
  * - Enforces module count and aggregate size limits
@@ -136,18 +156,22 @@ export async function buildModulesMap(
   }
 
   /**
-   * Validate a module at absolutePath (symlink check, TOCTOU-safe read) and
-   * return its content and byte size.
+   * Open a file with O_NOFOLLOW and validate its security properties (symlink check,
+   * path confinement, regular-file check). Returns the open file handle and the
+   * file's byte size from fstat.
    *
-   * Uses O_NOFOLLOW to open the file descriptor before stat/read, eliminating the
-   * TOCTOU race window between validation and content access. If the path is a
-   * symlink, O_NOFOLLOW causes open() to fail with ELOOP, which we surface as a
-   * security error. On Windows (where O_NOFOLLOW=0), a post-open lstat check is
-   * performed instead.
+   * The caller is responsible for closing the handle (use try/finally).
+   * Separating open+validate from read allows the aggregate size check to happen
+   * before file content is loaded into memory, bounding worst-case memory use.
    *
-   * Separated from scan() to isolate filesystem-security logic from orchestration.
+   * Uses O_NOFOLLOW to eliminate the TOCTOU race window between validation and
+   * content access. If the path is a symlink, O_NOFOLLOW causes open() to fail
+   * with ELOOP, which we surface as a security error. On Windows (where O_NOFOLLOW=0),
+   * a post-open realpath check is performed instead.
    */
-  async function openAndValidateModule(absolutePath: string): Promise<{ size: number; content: string }> {
+  async function openAndValidateModule(
+    absolutePath: string,
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number }> {
     // Security: verify path is within project root before opening.
     if (!absolutePath.startsWith(projectRoot + '/') && absolutePath !== projectRoot) {
       throw new Error(
@@ -155,18 +179,9 @@ export async function buildModulesMap(
       );
     }
 
-    let handle: Awaited<ReturnType<typeof open>>;
-    try {
-      // O_NOFOLLOW | O_RDONLY: if absolutePath is a symlink the kernel rejects it
-      // with ELOOP before our code reads a single byte — no TOCTOU window.
-      handle = await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'ELOOP' || code === 'ENOTDIR') {
-        throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
-      }
-      throw err;
-    }
+    // O_NOFOLLOW | O_RDONLY: if absolutePath is a symlink the kernel rejects it
+    // with ELOOP before our code reads a single byte — no TOCTOU window.
+    const handle = await openNoFollow(absolutePath);
 
     try {
       const [stats, resolved] = await Promise.all([
@@ -191,10 +206,10 @@ export async function buildModulesMap(
         );
       }
 
-      const content = await handle.readFile({ encoding: 'utf-8' });
-      return { size: stats.size, content };
-    } finally {
+      return { handle, size: stats.size };
+    } catch (err) {
       await handle.close();
+      throw err;
     }
   }
 
@@ -221,18 +236,26 @@ export async function buildModulesMap(
       );
     }
 
-    const { size: fileSize, content } = await openAndValidateModule(absolutePath);
+    const { handle, size: fileSize } = await openAndValidateModule(absolutePath);
 
-    // Resource limit: pre-reserve file size (in bytes, from OS metadata) before
-    // reading content so that parallel scan calls cannot each pass the check
-    // independently and collectively overshoot the limit.
+    // Resource limit: check aggregate size using fstat metadata BEFORE reading
+    // content into memory, so that a malicious file cannot force allocation of
+    // content it knows will be rejected.
     // JS is single-threaded: the increment and guard below execute atomically
     // (no await between them), so concurrent scan() calls cannot interleave here.
     aggregateSize += fileSize;
     if (aggregateSize > maxAggregateSize) {
+      await handle.close();
       throw new Error(
         `resource limit: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
       );
+    }
+
+    let content: string;
+    try {
+      content = await handle.readFile({ encoding: 'utf-8' });
+    } finally {
+      await handle.close();
     }
 
     modules[virtualKey] = content;
