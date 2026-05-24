@@ -113,12 +113,7 @@ describe('wasm backend — circuit breaker', () => {
 
   test('U-WB9: createWasmBackend(mod) is synchronous and returns MdsBaseBackend', async () => {
     const mod = await initWasmNode();
-    // createWasmBackend is synchronous — no await needed.
-    let backend;
-    assert.doesNotThrow(() => {
-      backend = createWasmBackend(mod);
-    });
-    assert.ok(backend !== undefined, 'createWasmBackend must return a backend');
+    const backend = createWasmBackend(mod);
     assert.equal(typeof backend.compile, 'function', 'must have compile');
     assert.equal(typeof backend.check, 'function', 'must have check');
     assert.equal(typeof backend.getBackend, 'function', 'must have getBackend');

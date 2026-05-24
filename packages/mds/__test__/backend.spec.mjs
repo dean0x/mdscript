@@ -95,7 +95,7 @@ catch (e) { console.log(e.message.includes('init()') ? 'correct' : 'wrong: ' + e
     // Both concurrent calls must resolve without error and the backend must
     // only be initialized once (shared promise deduplication).
     _resetForTesting();
-    const [, ] = await Promise.all([init(), init()]);
+    await Promise.all([init(), init()]);
     // Both resolved — verify backend is functional.
     const result = compile('Concurrent!\n');
     assert.ok(result.output.includes('Concurrent'));

@@ -89,17 +89,10 @@ async function tryLoadCandidate(
     throw err;
   }
 
-  // Validate the module shape at the boundary before trusting it as WasmModule.
-  // compile, check, and scanImports are all required — scanImports is needed for
-  // file-based operations in node.ts, and its absence would cause a silent runtime
-  // error instead of a clear initialization failure.
-  if (
-    typeof (mod as Record<string, unknown>).compile !== 'function' ||
-    typeof (mod as Record<string, unknown>).check !== 'function' ||
-    typeof (mod as Record<string, unknown>).scanImports !== 'function'
-  ) {
-    return null;
-  }
+  // Validate the module shape before trusting it as WasmModule.
+  // validateWasmShape throws with an actionable message naming the missing member,
+  // which the caller captures as lastError for the final diagnostic.
+  validateWasmShape(mod);
 
   const wasmMod = mod as WasmModule;
   // Browser targets expose a default() initializer; nodejs targets do not.
@@ -258,23 +251,23 @@ export async function initWasmBrowser(options?: InitOptions): Promise<WasmModule
 async function _initBrowser(options?: InitOptions): Promise<WasmModule> {
   // Dynamic import — bundler resolves 'mds-wasm' or the caller provides the module.
   // In browser environments, the bundler inlines the WASM module at build time.
-  // TypeScript cannot resolve 'mds-wasm' at compile time (it's a bundler alias),
-  // so we use a type assertion here. The shape is validated with validateWasmShape below.
-  let wasmMod: WasmModule;
+  // TypeScript cannot resolve 'mds-wasm' at compile time (it's a bundler alias).
+  // The shape is validated with validateWasmShape below.
+  let imported: unknown;
   try {
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore — 'mds-wasm' is a bundler-resolved module alias, not a npm dependency
-    const imported: unknown = await import('mds-wasm');
-    validateWasmShape(imported);
-    wasmMod = imported;
+    imported = await import('mds-wasm');
   } catch (err) {
-    // Re-throw validateWasmShape errors directly (they are already descriptive).
-    if (err instanceof Error && err.message.startsWith('@mds/mds:')) throw err;
     throw new Error(
       `@mds/mds: failed to load WASM module in browser environment. ` +
       `Ensure 'mds-wasm' is bundled or provide a wasmUrl option. Caused by: ${String(err)}`,
     );
   }
+  // validateWasmShape throws a descriptive error naming the missing member —
+  // no need to catch here; its errors are already actionable.
+  validateWasmShape(imported);
+  const wasmMod = imported;
 
   if (typeof wasmMod.default !== 'function') {
     throw new Error(
