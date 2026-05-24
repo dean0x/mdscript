@@ -61,16 +61,19 @@ describe('backend', () => {
     // so if compile() works without a new init(), TLA must have run — which would
     // be a regression. After reset, compile() must throw.
     _resetForTesting();
-    assert.throws(
-      () => compile('Hello!\n'),
-      (err) => {
-        assert.ok(err instanceof Error);
-        assert.ok(err.message.includes('init()'));
-        return true;
-      },
-    );
-    // Re-init for subsequent tests.
-    await init();
+    try {
+      assert.throws(
+        () => compile('Hello!\n'),
+        (err) => {
+          assert.ok(err instanceof Error);
+          assert.ok(err.message.includes('init()'));
+          return true;
+        },
+      );
+    } finally {
+      // Re-init for subsequent tests regardless of assertion outcome.
+      await init();
+    }
   });
 
   test('U-B7: compile() throws before init() with clear message', () => {

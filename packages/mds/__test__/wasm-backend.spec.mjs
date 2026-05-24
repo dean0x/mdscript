@@ -154,7 +154,7 @@ describe('wasm backend — circuit breaker', () => {
     );
   });
 
-  test('U-WB13: tryLoadCandidate rejects modules missing scanImports', async () => {
+  test('U-WB13: tryLoadCandidate returns null for modules missing scanImports', async () => {
     // This test verifies the shape validation at the boundary.
     // The shape check now requires scanImports; a module without it returns null
     // from tryLoadCandidate. We test this indirectly by verifying that a successful
