@@ -156,8 +156,8 @@ async function ensureBackend(options?: InitOptions): Promise<void> {
  * Idempotent — safe to call multiple times. Concurrent calls share a single
  * promise, preventing double-initialization races.
  */
-export async function init(options?: InitOptions): Promise<void> {
-  if (backend !== undefined) return;
+export function init(options?: InitOptions): Promise<void> {
+  if (backend !== undefined) return Promise.resolve();
   if (initPromise !== null) return initPromise;
   initPromise = ensureBackend(options).catch((err: unknown) => {
     initPromise = null;

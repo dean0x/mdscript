@@ -268,20 +268,6 @@ async function _initBrowser(options?: InitOptions): Promise<WasmModule> {
 }
 
 // ---------------------------------------------------------------------------
-// Backward-compatible async init (re-exports initWasmNode for node.ts)
-// ---------------------------------------------------------------------------
-
-/**
- * Initialize the WASM backend (Node.js). Backward-compatible alias for
- * initWasmNode() used by browser.ts (pre-refactor path).
- *
- * @deprecated Use initWasmNode() or initWasmBrowser() explicitly.
- */
-export async function init(options?: InitOptions): Promise<void> {
-  await initWasmNode(options);
-}
-
-// ---------------------------------------------------------------------------
 // Sync factory
 // ---------------------------------------------------------------------------
 
@@ -296,7 +282,7 @@ const DEFAULT_COMPILE_OPTS = Object.freeze({
 });
 
 /** Build the options object for compile/check, merging vars when present. */
-export function compileOpts(
+function compileOpts(
   options?: CompileOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
   const vars = options?.vars;

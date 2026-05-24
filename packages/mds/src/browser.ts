@@ -1,22 +1,15 @@
-import type {
-  BackendType,
-  CheckResult,
-  CompileOptions,
-  CompileResult,
-  InitOptions,
-  MdsBaseBackend,
-} from './types.js';
+import type { BackendType, CheckResult, CompileOptions, CompileResult, InitOptions, MdsBaseBackend } from './types.js';
 import { initWasmBrowser, createWasmBackend } from './backend/wasm.js';
 
 export { isMdsError } from './types.js';
 export type {
-  CompileResult,
+  BackendType,
   CheckResult,
   CompileOptions,
-  MdsErrorSpan,
-  MdsError,
-  BackendType,
+  CompileResult,
   InitOptions,
+  MdsError,
+  MdsErrorSpan,
 } from './types.js';
 
 let resolvedBackend: MdsBaseBackend | undefined;
