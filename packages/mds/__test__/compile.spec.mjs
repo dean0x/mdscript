@@ -2,11 +2,13 @@
  * Core compile() tests for @mds/mds universal package.
  * Tests: U-C1 through U-C9
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { compile, isMdsError } from '../dist/node.js';
+import { compile, isMdsError, init } from '../dist/node.js';
 
 describe('compile', () => {
+  before(() => init());
+
   test('U-C1: compile plain text with no options', () => {
     const result = compile('Hello World!\n');
     assert.equal(result.output, 'Hello World!\n');

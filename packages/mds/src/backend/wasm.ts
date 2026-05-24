@@ -5,79 +5,77 @@ import type {
   CompileResult,
   FileOptions,
   InitOptions,
-  MdsBackend,
+  MdsBaseBackend,
 } from '../types.js';
-import { buildModulesMap } from '../util/module-scanner.js';
 
 /**
- * Shape of the WASM module exports (built with --target nodejs).
- * The WASM module exports compile(source, options) and check(source, options).
+ * Shape of the WASM module exports (built with wasm-pack).
+ * The WASM module exports compile(source, options), check(source, options),
+ * and scanImports(source) for dependency resolution.
  * options: { filename?, modules?, vars? }
+ *
+ * Exported so callers can type-annotate pre-loaded modules passed to
+ * createWasmBackend().
  */
-interface WasmModule {
+export interface WasmModule {
   compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileResult;
   check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CheckResult;
   scanImports(source: string): string[];
   default?: (input?: unknown) => Promise<void>;
 }
 
-let wasmModule: WasmModule | undefined;
+// ---------------------------------------------------------------------------
+// Node.js init state
+// ---------------------------------------------------------------------------
+
 // Promise cached BEFORE async work starts — prevents double-init race.
-let initPromise: Promise<void> | null = null;
+let cachedNodePromise: Promise<WasmModule> | null = null;
 const MAX_INIT_RETRIES = 3;
-let initFailures = 0;
+let nodeFailures = 0;
+
+// ---------------------------------------------------------------------------
+// Browser init state
+// ---------------------------------------------------------------------------
+
+let cachedBrowserPromise: Promise<WasmModule> | null = null;
+const MAX_BROWSER_RETRIES = 3;
+let browserFailures = 0;
+
+// ---------------------------------------------------------------------------
+// Test reset
+// ---------------------------------------------------------------------------
 
 /**
- * Reset all singleton state, optionally pre-seeding the failure counter.
+ * Reset all singleton state, optionally pre-seeding failure counters.
  *
  * FOR TESTING ONLY — allows integration tests to exercise the retry-exhaustion
  * path without spawning a subprocess or driving N actual failures.
  *
- * @param failures - Number of failures to pre-seed. Defaults to 0 (full reset).
- *                   Pass MAX_INIT_RETRIES (3) to simulate exhaustion directly.
+ * @param failures - Node.js failures to pre-seed. Defaults to 0 (full reset).
+ *                   Pass MAX_INIT_RETRIES (3) to simulate Node.js exhaustion.
+ * @param browserFailuresCount - Browser failures to pre-seed. Defaults to 0.
+ *                   Pass MAX_BROWSER_RETRIES (3) to simulate browser exhaustion.
  * @internal
  */
-export function _resetForTesting(failures = 0): void {
-  wasmModule = undefined;
-  initPromise = null;
-  initFailures = failures;
+export function _resetForTesting(failures = 0, browserFailuresCount = 0): void {
+  cachedNodePromise = null;
+  nodeFailures = failures;
+  cachedBrowserPromise = null;
+  browserFailures = browserFailuresCount;
 }
 
-/**
- * Initialize the WASM backend (idempotent singleton).
- *
- * Must be called before compile/check in browser environments.
- * In Node.js environments loaded via node.ts, this is called automatically.
- *
- * Concurrent calls share the same init promise. If init fails, the cached
- * promise is cleared so subsequent calls can retry, up to MAX_INIT_RETRIES
- * times. After that, every call throws immediately without re-attempting.
- */
-export async function init(options?: InitOptions): Promise<void> {
-  if (initPromise !== null) {
-    return initPromise;
-  }
-  if (initFailures >= MAX_INIT_RETRIES) {
-    throw new Error(
-      `@mds/mds: WASM backend failed to initialize after ${MAX_INIT_RETRIES} attempts. Check that the WASM module is built and accessible.`,
-    );
-  }
-  initPromise = _init(options).catch((err) => {
-    // Reset so a subsequent call can retry after a transient failure.
-    initFailures += 1;
-    initPromise = null;
-    throw err;
-  });
-  return initPromise;
-}
+// ---------------------------------------------------------------------------
+// Shape validation helper
+// ---------------------------------------------------------------------------
 
 /**
- * Attempt to load a single WASM candidate path.
+ * Attempt to load a single WASM candidate path (Node.js only).
  *
  * Returns the loaded module on success, or null if the candidate is not found
- * (MODULE_NOT_FOUND) or the loaded module does not match the expected shape.
- * Re-throws unexpected errors (OOM, corrupted WASM, init failures) so the
- * caller can surface them rather than silently discarding them.
+ * (MODULE_NOT_FOUND). Throws if the loaded module does not match the expected
+ * WasmModule shape (missing compile/check/scanImports). Re-throws unexpected
+ * errors (OOM, corrupted WASM, init failures) so the caller can surface them
+ * rather than silently discarding them.
  */
 async function tryLoadCandidate(
   candidate: string,
@@ -92,24 +90,16 @@ async function tryLoadCandidate(
     throw err;
   }
 
-  // Validate the module shape at the boundary before trusting it as WasmModule.
-  // compile and check are the minimum required exports; scanImports is used by
-  // compileFile/checkFile but is intentionally not guarded here because the
-  // current WASM build may omit it — a runtime error at the call site is
-  // preferable to silently discarding an otherwise-valid module.
-  if (
-    typeof (mod as Record<string, unknown>).compile !== 'function' ||
-    typeof (mod as Record<string, unknown>).check !== 'function'
-  ) {
-    return null;
-  }
+  // Validate the module shape before trusting it as WasmModule.
+  // validateWasmShape throws with an actionable message naming the missing member,
+  // which the caller captures as lastError for the final diagnostic.
+  validateWasmShape(mod);
 
-  const wasmMod = mod as WasmModule;
   // Browser targets expose a default() initializer; nodejs targets do not.
-  if (typeof wasmMod.default === 'function') {
-    await wasmMod.default(wasmUrl);
+  if (typeof mod.default === 'function') {
+    await mod.default(wasmUrl);
   }
-  return wasmMod;
+  return mod;
 }
 
 /** Returns true when an error indicates the required path simply does not exist. */
@@ -121,16 +111,70 @@ function isModuleNotFound(err: unknown): boolean {
 }
 
 /**
- * Internal initialization: locate and load the WASM module from known
+ * Validate that a dynamically loaded module matches the WasmModule shape.
+ *
+ * Checks compile, check, and scanImports are all present as functions.
+ * Throws a descriptive error naming the first missing member so callers get
+ * an actionable message instead of a silent runtime failure later.
+ *
+ * Exported so tests can exercise shape validation directly without going
+ * through the full WASM init path.
+ */
+export function validateWasmShape(mod: unknown): asserts mod is WasmModule {
+  const m = mod as Record<string, unknown>;
+  for (const name of ['compile', 'check', 'scanImports'] as const) {
+    if (typeof m[name] !== 'function') {
+      throw new Error(
+        `@mds/mds: WASM module is missing required export "${name}". ` +
+        `Ensure the module is built with: wasm-pack build crates/mds-wasm --target web --out-dir pkg`,
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Node.js init
+// ---------------------------------------------------------------------------
+
+/**
+ * Initialize the WASM backend for Node.js environments.
+ *
+ * Idempotent — safe to call multiple times. Concurrent calls share the same
+ * promise. If initialization fails, the cached promise is cleared so subsequent
+ * calls can retry, up to MAX_INIT_RETRIES times. After exhaustion, every call
+ * throws immediately without re-attempting.
+ *
+ * Does NOT import node:module at module scope — the import is deferred to this
+ * async function so that the module can be imported in environments where
+ * node:module is unavailable.
+ */
+export async function initWasmNode(options?: InitOptions): Promise<WasmModule> {
+  if (cachedNodePromise !== null) {
+    return cachedNodePromise;
+  }
+  if (nodeFailures >= MAX_INIT_RETRIES) {
+    throw new Error(
+      `@mds/mds: WASM backend failed to initialize after ${MAX_INIT_RETRIES} attempts. Check that the WASM module is built and accessible.`,
+    );
+  }
+  cachedNodePromise = _initNode(options).catch((err) => {
+    // Reset so a subsequent call can retry after a transient failure.
+    nodeFailures += 1;
+    cachedNodePromise = null;
+    throw err;
+  });
+  return cachedNodePromise;
+}
+
+/**
+ * Internal Node.js initialization: locate and load the WASM module from known
  * candidate paths. Tries each path in order, stopping at the first success.
- * If a candidate triggers an unexpected error (not MODULE_NOT_FOUND), that
- * error is propagated immediately — callers should not swallow it.
  *
  * @internal
  */
-async function _init(options?: InitOptions): Promise<void> {
-  // In Node.js: load the built WASM module from the mds-wasm pkg directory.
-  // The WASM is built with `wasm-pack build --target nodejs`.
+async function _initNode(options?: InitOptions): Promise<WasmModule> {
+  // Deferred import — not at module scope so browser-targeting bundlers can
+  // tree-shake this function and avoid bundling node:module.
   const { createRequire } = await import('node:module');
   const require = createRequire(import.meta.url);
 
@@ -149,8 +193,7 @@ async function _init(options?: InitOptions): Promise<void> {
     try {
       const mod = await tryLoadCandidate(candidate, require, options?.wasmUrl);
       if (mod !== null) {
-        wasmModule = mod;
-        return;
+        return mod;
       }
     } catch (err) {
       // tryLoadCandidate re-throws non-MODULE_NOT_FOUND errors — capture the
@@ -165,15 +208,99 @@ async function _init(options?: InitOptions): Promise<void> {
   );
 }
 
-/** Return the initialized WASM module, or throw if init() has not completed. */
-function assertInitialized(): WasmModule {
-  if (wasmModule === undefined) {
+// ---------------------------------------------------------------------------
+// Browser init
+// ---------------------------------------------------------------------------
+
+/**
+ * Initialize the WASM backend for browser environments.
+ *
+ * Accepts a wasmUrl from InitOptions (required in browser unless the WASM
+ * module is bundled with a default export). Does NOT import node:module or
+ * node:fs — safe for browser/edge bundlers.
+ *
+ * Concurrent calls share the same promise. If initialization fails, the cached
+ * promise is cleared so the next call can retry (simpler than Node.js — no
+ * candidate list, so exhaustion means the wasmUrl itself is wrong).
+ */
+export async function initWasmBrowser(options?: InitOptions): Promise<WasmModule> {
+  if (cachedBrowserPromise !== null) {
+    return cachedBrowserPromise;
+  }
+  if (browserFailures >= MAX_BROWSER_RETRIES) {
     throw new Error(
-      '@mds/mds: WASM backend not initialized. Call init() first.',
+      `@mds/mds: WASM browser backend failed to initialize after ${MAX_BROWSER_RETRIES} attempts. ` +
+      `Ensure 'mds-wasm' is bundled or provide a valid wasmUrl option.`,
     );
   }
-  return wasmModule;
+  cachedBrowserPromise = _initBrowser(options).catch((err) => {
+    // Reset so a subsequent call can retry after a transient failure.
+    browserFailures += 1;
+    cachedBrowserPromise = null;
+    throw err;
+  });
+  return cachedBrowserPromise;
 }
+
+/**
+ * Internal browser initialization: dynamically import the WASM module and
+ * call its default initializer with the wasmUrl.
+ *
+ * @internal
+ */
+async function _initBrowser(options?: InitOptions): Promise<WasmModule> {
+  // Dynamic import — bundler resolves 'mds-wasm' or the caller provides the module.
+  // In browser environments, the bundler inlines the WASM module at build time.
+  // TypeScript cannot resolve 'mds-wasm' at compile time (it's a bundler alias).
+  // The shape is validated with validateWasmShape below.
+  let imported: unknown;
+  try {
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore — 'mds-wasm' is a bundler-resolved module alias, not a npm dependency
+    imported = await import('mds-wasm');
+  } catch (err) {
+    throw new Error(
+      `@mds/mds: failed to load WASM module in browser environment. ` +
+      `Ensure 'mds-wasm' is bundled or provide a wasmUrl option. Caused by: ${String(err)}`,
+    );
+  }
+  // validateWasmShape throws a descriptive error naming the missing member —
+  // no need to catch here; its errors are already actionable.
+  validateWasmShape(imported);
+  const wasmMod = imported;
+
+  if (typeof wasmMod.default !== 'function') {
+    throw new Error(
+      '@mds/mds: WASM module missing default() initializer. ' +
+      'Build with: wasm-pack build crates/mds-wasm --target web --out-dir pkg',
+    );
+  }
+
+  try {
+    await wasmMod.default(options?.wasmUrl);
+  } catch (err) {
+    // Detect CSP/fetch errors and provide actionable guidance.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      msg.includes('Content Security Policy') ||
+      msg.includes('unsafe-eval') ||
+      msg.includes('wasm-unsafe-eval') ||
+      msg.includes('fetch')
+    ) {
+      throw new Error(
+        `@mds/mds: WASM initialization blocked — check your Content Security Policy. ` +
+        `Add 'wasm-unsafe-eval' to script-src. Original: ${msg}`,
+      );
+    }
+    throw err;
+  }
+
+  return wasmMod;
+}
+
+// ---------------------------------------------------------------------------
+// Sync factory
+// ---------------------------------------------------------------------------
 
 /**
  * Deep-frozen default compile/check options for the common no-vars path.
@@ -196,7 +323,7 @@ function compileOpts(
 }
 
 /** Build the options object for compileFile/checkFile, merging vars when present. */
-function fileOpts(
+export function fileOpts(
   entryFilename: string,
   modules: Record<string, string>,
   options?: FileOptions,
@@ -208,31 +335,20 @@ function fileOpts(
 }
 
 /**
- * Create a WASM backend instance. Calls init() internally.
+ * Create a WASM backend instance from a pre-initialized WasmModule.
+ *
+ * Synchronous factory — mirrors createNativeBackend(addon) pattern.
+ * Returns MdsBaseBackend (compile, check, getBackend) without file operations.
+ * File operations (compileFile, checkFile) are added in node.ts via wrapWithFileOps().
  */
-export async function createWasmBackend(options?: InitOptions): Promise<MdsBackend> {
-  await init(options);
+export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const wasm = assertInitialized();
-      return wasm.compile(source, compileOpts(options));
+      return wasmModule.compile(source, compileOpts(options));
     },
 
     check(source: string, options?: CompileOptions): CheckResult {
-      const wasm = assertInitialized();
-      return wasm.check(source, compileOpts(options));
-    },
-
-    async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-      const wasm = assertInitialized();
-      const { entryFilename, modules } = await buildModulesMap(path, (src) => wasm.scanImports(src));
-      return wasm.compile(modules[entryFilename] ?? '', fileOpts(entryFilename, modules, options));
-    },
-
-    async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
-      const wasm = assertInitialized();
-      const { entryFilename, modules } = await buildModulesMap(path, (src) => wasm.scanImports(src));
-      return wasm.check(modules[entryFilename] ?? '', fileOpts(entryFilename, modules, options));
+      return wasmModule.check(source, compileOpts(options));
     },
 
     getBackend(): BackendType {

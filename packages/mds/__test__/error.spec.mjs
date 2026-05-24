@@ -2,11 +2,13 @@
  * Error shape tests for @mds/mds universal package.
  * Tests: U-E1 through U-E9
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { compile, check, isMdsError } from '../dist/node.js';
+import { compile, check, isMdsError, init } from '../dist/node.js';
 
 describe('error shape', () => {
+  before(() => init());
+
   test('U-E1: compile syntax error is an Error instance', () => {
     try {
       compile('Hello {name\n');

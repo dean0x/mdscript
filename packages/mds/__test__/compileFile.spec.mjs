@@ -2,12 +2,14 @@
  * compileFile() tests for @mds/mds universal package.
  * Tests: U-CF1 through U-CF9
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { SIMPLE_MDS, IMPORT_CONSUMER_MDS, ENTRY_MDS, EMPTY_MDS, FRONTMATTER_ONLY_MDS, MD_EXTENSION } from './helpers.mjs';
-import { compileFile } from '../dist/node.js';
+import { compileFile, init } from '../dist/node.js';
 
 describe('compileFile', () => {
+  before(() => init());
+
   test('U-CF1: compile simple file', async () => {
     const result = await compileFile(SIMPLE_MDS);
     assert.ok(typeof result.output === 'string', 'output should be string');

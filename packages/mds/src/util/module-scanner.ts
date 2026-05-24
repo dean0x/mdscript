@@ -1,10 +1,37 @@
-import { readFile, lstat, realpath } from 'node:fs/promises';
+import { open, realpath } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
+
+// O_NOFOLLOW prevents the kernel from following a symlink at the final path
+// component. Using it closes the TOCTOU window between lstat and open.
+// On Windows, O_NOFOLLOW is not defined; fall back to 0 (no-op flag) and
+// rely on a post-open lstat check instead.
+const O_NOFOLLOW: number = (constants as Record<string, number>)['O_NOFOLLOW'] ?? 0;
 
 const MAX_PATH_SEGMENTS = 256;
 const MAX_IMPORT_DEPTH = 64;
 export const DEFAULT_MAX_MODULES = 256;
 export const DEFAULT_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
+
+/**
+ * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP /
+ * ENOTDIR errors that the kernel emits when the path is a symlink into a clear
+ * security error. All other OS errors are re-thrown unchanged.
+ *
+ * Module-level helper (not a closure) so that openAndValidateModule's own
+ * try/catch only handles post-open validation, keeping nesting shallow.
+ */
+async function openNoFollow(absolutePath: string): Promise<Awaited<ReturnType<typeof open>>> {
+  try {
+    return await open(absolutePath, constants.O_RDONLY | O_NOFOLLOW);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ELOOP' || code === 'ENOTDIR') {
+      throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
+    }
+    throw err;
+  }
+}
 
 export interface ModuleScannerOptions {
   maxModules?: number;
@@ -76,7 +103,7 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  * suitable for passing to the WASM compile/check functions.
  *
  * Security checks performed:
- * - Rejects symlinks (lstat check)
+ * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)
  * - Rejects paths that escape the project root (entry file's directory)
  * - Rejects paths with null bytes or empty segments
  * - Enforces module count and aggregate size limits
@@ -129,43 +156,61 @@ export async function buildModulesMap(
   }
 
   /**
-   * Validate a module at absolutePath (symlink check, TOCTOU check, project root
-   * containment) and return its OS-reported byte size for size-limit reservation.
-   * Runs lstat and realpath concurrently since they have no ordering dependency.
+   * Open a file with O_NOFOLLOW and validate its security properties (symlink check,
+   * path confinement, regular-file check). Returns the open file handle and the
+   * file's byte size from fstat.
    *
-   * Separated from scan() to isolate filesystem-security logic from orchestration.
+   * The caller is responsible for closing the handle (use try/finally).
+   * Separating open+validate from read allows the aggregate size check to happen
+   * before file content is loaded into memory, bounding worst-case memory use.
+   *
+   * Uses O_NOFOLLOW to eliminate the TOCTOU race window between validation and
+   * content access. If the path is a symlink, O_NOFOLLOW causes open() to fail
+   * with ELOOP, which we surface as a security error. On Windows (where O_NOFOLLOW=0),
+   * a post-open realpath check is performed instead.
    */
-  async function statAndValidateModule(absolutePath: string): Promise<number> {
-    const [stats, resolved] = await Promise.all([
-      lstat(absolutePath),
-      realpath(absolutePath),
-    ]);
-
-    // Security: reject symlinks. Use lstat so we inspect the path itself, not
-    // its target. Then compare the real path to detect TOCTOU swaps.
-    if (stats.isSymbolicLink()) {
-      throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
-    }
-
-    // Security: TOCTOU — verify the path was not swapped for a symlink between
-    // lstat and readFile by comparing the real path to the expected path.
-    if (resolved !== absolutePath) {
-      throw new Error(
-        `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink swap`,
-      );
-    }
-
-    // Security: verify resolved path is within project root.
+  async function openAndValidateModule(
+    absolutePath: string,
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number }> {
+    // Security: verify path is within project root before opening.
     if (!absolutePath.startsWith(projectRoot + '/') && absolutePath !== projectRoot) {
       throw new Error(
         `security: path escapes project root: ${absolutePath} is outside ${projectRoot}`,
       );
     }
 
-    // Return OS byte size so the caller can pre-reserve against the aggregate
-    // size limit before reading content. stats.size is byte-accurate unlike
-    // content.length which counts UTF-16 code units.
-    return stats.size;
+    // O_NOFOLLOW | O_RDONLY: if absolutePath is a symlink the kernel rejects it
+    // with ELOOP before our code reads a single byte — no TOCTOU window.
+    const handle = await openNoFollow(absolutePath);
+
+    try {
+      const [stats, resolved] = await Promise.all([
+        handle.stat(),
+        realpath(absolutePath),
+      ]);
+
+      // fstat on the opened fd: verify it is a regular file (not a device,
+      // directory, socket, etc.). Note: fstat never reports isSymbolicLink()
+      // because it operates on the resolved fd, not the path — symlink
+      // detection is handled by O_NOFOLLOW (ELOOP) and the realpath check below.
+      if (!stats.isFile()) {
+        throw new Error(`security: ${absolutePath} is not a regular file`);
+      }
+
+      // On platforms where O_NOFOLLOW=0 (e.g. Windows), the open() above did
+      // not prevent symlink traversal. A post-open realpath comparison catches
+      // a symlink that was in place at open time.
+      if (resolved !== absolutePath) {
+        throw new Error(
+          `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink`,
+        );
+      }
+
+      return { handle, size: stats.size };
+    } catch (err) {
+      await handle.close();
+      throw err;
+    }
   }
 
   async function scan(absolutePath: string, virtualKey: string, depth: number = 0): Promise<void> {
@@ -191,21 +236,26 @@ export async function buildModulesMap(
       );
     }
 
-    const fileSize = await statAndValidateModule(absolutePath);
+    const { handle, size: fileSize } = await openAndValidateModule(absolutePath);
 
-    // Resource limit: pre-reserve file size (in bytes, from OS metadata) before
-    // reading content so that parallel scan calls cannot each pass the check
-    // independently and collectively overshoot the limit.
-    // JS is single-threaded: the increment and guard below execute atomically
-    // (no await between them), so concurrent scan() calls cannot interleave here.
-    aggregateSize += fileSize;
-    if (aggregateSize > maxAggregateSize) {
-      throw new Error(
-        `resource limit: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
-      );
+    let content: string;
+    try {
+      // Resource limit: check aggregate size using fstat metadata BEFORE reading
+      // content into memory, so that a malicious file cannot force allocation of
+      // content it knows will be rejected.
+      // JS is single-threaded: the increment and guard below execute atomically
+      // (no await between them), so concurrent scan() calls cannot interleave here.
+      aggregateSize += fileSize;
+      if (aggregateSize > maxAggregateSize) {
+        throw new Error(
+          `resource limit: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
+        );
+      }
+
+      content = await handle.readFile({ encoding: 'utf-8' });
+    } finally {
+      await handle.close();
     }
-
-    const content = await readFile(absolutePath, 'utf-8');
 
     modules[virtualKey] = content;
 

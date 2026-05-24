@@ -5,9 +5,9 @@
  * These are lightweight benchmarks that verify the API can handle
  * repeated calls without degradation (not strict timing assertions).
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { compile, compileFile } from '../dist/node.js';
+import { compile, compileFile, init } from '../dist/node.js';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -16,6 +16,25 @@ const FIXTURES = path.join(__dirname, 'fixtures');
 const SIMPLE_MDS = path.join(FIXTURES, 'simple.mds');
 
 describe('performance', () => {
+  before(() => init());
+
+  test('U-PF0: module import completes without top-level await (subprocess check < 5000ms)', async () => {
+    // Verify that importing node.ts does not block on I/O via top-level await (TLA).
+    // Since we've already imported it in this process, use a subprocess to get
+    // a clean measurement. This is a best-effort check — CI machines may vary.
+    // The 5000ms sentinel is generous: TLA would block for seconds, non-TLA is < 50ms.
+    const { execFileSync } = await import('node:child_process');
+    const start = Date.now();
+    execFileSync(process.execPath, ['--input-type=module'], {
+      input: `import '../dist/node.js';\nconsole.log('done');\n`,
+      cwd: new URL('.', import.meta.url).pathname,
+      encoding: 'utf8',
+    });
+    const elapsed = Date.now() - start;
+    // 5000ms is very generous — TLA would block for seconds, non-TLA is < 50ms.
+    assert.ok(elapsed < 5000, `module import blocked for ${elapsed}ms — TLA may be present`);
+  });
+
   test('U-PF1: compile 100 times completes in reasonable time', () => {
     const start = Date.now();
     for (let i = 0; i < 100; i++) {

@@ -2,12 +2,14 @@
  * check() and checkFile() tests for @mds/mds universal package.
  * Tests: U-K1 through U-KF3
  */
-import { test, describe } from 'node:test';
+import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { SIMPLE_MDS, IMPORT_CONSUMER_MDS } from './helpers.mjs';
-import { check, checkFile, isMdsError } from '../dist/node.js';
+import { check, checkFile, isMdsError, init } from '../dist/node.js';
 
 describe('check', () => {
+  before(() => init());
+
   test('U-K1: check valid source returns empty warnings', () => {
     const result = check('---\nname: World\n---\nHello {name}!\n');
     assert.deepEqual(result.warnings, []);
@@ -41,6 +43,8 @@ describe('check', () => {
 });
 
 describe('checkFile', () => {
+  before(() => init());
+
   test('U-KF1: checkFile valid file succeeds', async () => {
     const result = await checkFile(SIMPLE_MDS);
     assert.ok(Array.isArray(result.warnings));

@@ -4,7 +4,7 @@ import type {
   CompileOptions,
   CompileResult,
   FileOptions,
-  MdsBackend,
+  MdsNodeBackend,
 } from '../types.js';
 import { varsOpt } from '../util/options.js';
 
@@ -26,7 +26,7 @@ interface NapiAddon {
  * The addon is injected rather than imported directly so callers can test
  * with a mock and the module remains environment-agnostic.
  */
-export function createNativeBackend(addon: NapiAddon): MdsBackend {
+export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
       return addon.compile(source, varsOpt(options));
