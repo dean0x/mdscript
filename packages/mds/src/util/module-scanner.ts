@@ -238,21 +238,20 @@ export async function buildModulesMap(
 
     const { handle, size: fileSize } = await openAndValidateModule(absolutePath);
 
-    // Resource limit: check aggregate size using fstat metadata BEFORE reading
-    // content into memory, so that a malicious file cannot force allocation of
-    // content it knows will be rejected.
-    // JS is single-threaded: the increment and guard below execute atomically
-    // (no await between them), so concurrent scan() calls cannot interleave here.
-    aggregateSize += fileSize;
-    if (aggregateSize > maxAggregateSize) {
-      await handle.close();
-      throw new Error(
-        `resource limit: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
-      );
-    }
-
     let content: string;
     try {
+      // Resource limit: check aggregate size using fstat metadata BEFORE reading
+      // content into memory, so that a malicious file cannot force allocation of
+      // content it knows will be rejected.
+      // JS is single-threaded: the increment and guard below execute atomically
+      // (no await between them), so concurrent scan() calls cannot interleave here.
+      aggregateSize += fileSize;
+      if (aggregateSize > maxAggregateSize) {
+        throw new Error(
+          `resource limit: aggregate module size exceeds maximum of ${maxAggregateSize} bytes`,
+        );
+      }
+
       content = await handle.readFile({ encoding: 'utf-8' });
     } finally {
       await handle.close();

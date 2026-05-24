@@ -9,6 +9,8 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { mkdtemp, symlink, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -142,5 +144,34 @@ describe('buildModulesMap', () => {
       () => buildModulesMap(entryPath, scanImports, { maxModules: 1 }),
       /resource limit/,
     );
+  });
+
+  test('U-SM6: rejects when aggregate size exceeds maxAggregateSize', async () => {
+    // simple.mds is a small file; maxAggregateSize: 1 byte triggers the guard
+    // immediately after fstat, before readFile, exercising the pre-read check.
+    const entryPath = path.join(FIXTURES, 'simple.mds');
+    await assert.rejects(
+      () => buildModulesMap(entryPath, scanImports, { maxAggregateSize: 1 }),
+      /resource limit.*aggregate module size/,
+    );
+  });
+
+  test('U-SM7: rejects symlink with security error', async () => {
+    // openNoFollow uses O_NOFOLLOW (Linux/macOS) or a post-open realpath check
+    // (Windows) to detect symlinks. This test creates a real symlink in a temp
+    // directory and confirms the scanner surfaces a security error.
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'mds-scanner-test-'));
+    try {
+      const realFile = path.join(tmpDir, 'real.mds');
+      const linkFile = path.join(tmpDir, 'link.mds');
+      await writeFile(realFile, 'Hello world');
+      await symlink(realFile, linkFile);
+      await assert.rejects(
+        () => buildModulesMap(linkFile, scanImports),
+        /security.*symlink/,
+      );
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });
