@@ -1,6 +1,6 @@
 /**
  * WASM backend unit tests for @mds/mds universal package.
- * Tests: U-WB1 through U-WB13
+ * Tests: U-WB1 through U-WB20
  *
  * Imports dist/backend/wasm.js directly to exercise internal state
  * without going through the full node.ts entry point.
@@ -149,11 +149,10 @@ describe('wasm backend — circuit breaker', () => {
     );
   });
 
-  test('U-WB13: tryLoadCandidate returns null for modules missing scanImports', async () => {
-    // This test verifies the shape validation at the boundary.
-    // The shape check now requires scanImports; a module without it returns null
-    // from tryLoadCandidate. We test this indirectly by verifying that a successful
-    // initWasmNode() always yields a module with scanImports (the built WASM has it).
+  test('U-WB13: initWasmNode() only succeeds when module has scanImports', async () => {
+    // Verifies that initWasmNode() only resolves when the loaded module passes
+    // validateWasmShape (compile, check, and scanImports all present). The built
+    // WASM module must expose scanImports for this call to succeed.
     const mod = await initWasmNode();
     assert.equal(
       typeof mod.scanImports,
@@ -227,6 +226,38 @@ describe('wasm backend — browser circuit breaker', () => {
         `after reset, circuit breaker must not fire immediately, got: ${err.message}`,
       );
     }
+  });
+
+  test('U-WB21: browserFailures counter increments on actual initWasmBrowser() failure', async () => {
+    // Verify the browserFailures += 1 catch handler in initWasmBrowser() fires
+    // on a real failure (not just pre-seeded state). Pre-seed to one below the
+    // limit, fail once via an actual call, then confirm the circuit breaker now
+    // fires on the next call — proving the counter was incremented.
+    //
+    // In Node.js, import('mds-wasm') always fails (no bundler alias), so every
+    // initWasmBrowser() call here produces a real failure that should increment
+    // the counter.
+    _resetForTesting(0, MAX_BROWSER_RETRIES - 1);
+    // This call must fail for a reason OTHER than the circuit breaker.
+    const firstErr = await initWasmBrowser().then(() => null, (e) => e);
+    assert.ok(firstErr instanceof Error, 'initWasmBrowser() must fail in Node.js environment');
+    assert.ok(
+      !firstErr.message.includes('failed to initialize after'),
+      `first failure must not be the circuit-breaker error; got: ${firstErr.message}`,
+    );
+    // The catch handler must have incremented browserFailures to MAX_BROWSER_RETRIES.
+    // The next call should hit the circuit breaker immediately.
+    await assert.rejects(
+      () => initWasmBrowser(),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('failed to initialize after'),
+          `second call must hit circuit breaker, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
   });
 });
 
