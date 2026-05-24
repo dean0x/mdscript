@@ -18,8 +18,7 @@
     }
   },
   "files": [
-    "dist/",
-    "wasm/"
+    "dist/"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

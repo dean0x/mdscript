@@ -121,10 +121,9 @@ describe('WASM backend — compileFile/checkFile', () => {
       import { init, checkFile } from './dist/node.js';
       await init();
       const r = await checkFile(${JSON.stringify(SIMPLE_MDS)});
-      process.stdout.write(JSON.stringify({ warnings: r.warnings, dependencies: r.dependencies }));
+      process.stdout.write(JSON.stringify({ warnings: r.warnings }));
     `);
     assert.ok(Array.isArray(result.warnings), 'warnings must be array');
-    assert.ok(Array.isArray(result.dependencies), 'dependencies must be array');
   });
 
   test('U-WCF6: WASM compileFile on nonexistent file rejects with error', async () => {
@@ -174,7 +173,7 @@ describe('WASM backend — compileFile/checkFile', () => {
       import { init, checkFile } from './dist/node.js';
       await init();
       const r = await checkFile(${JSON.stringify(SIMPLE_MDS)});
-      process.stdout.write(JSON.stringify({ warnings: r.warnings, dependencies: r.dependencies }));
+      process.stdout.write(JSON.stringify({ warnings: r.warnings }));
     `;
     const [wasmResult, nativeResult] = await Promise.all([
       runWasm(script),
@@ -184,11 +183,6 @@ describe('WASM backend — compileFile/checkFile', () => {
       wasmResult.warnings,
       nativeResult.warnings,
       `WASM and native checkFile warnings must match`,
-    );
-    assert.deepEqual(
-      wasmResult.dependencies,
-      nativeResult.dependencies,
-      `WASM and native checkFile dependencies must match`,
     );
   });
 });

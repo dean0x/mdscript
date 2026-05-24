@@ -64,12 +64,21 @@ function wrapWithFileOps(
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
       const { entryFilename, modules } = await buildModulesMap(path, (src) => wasmModule.scanImports(src));
-      return wasmModule.compile(modules[entryFilename] ?? '', fileOpts(entryFilename, modules, options));
+      // Extract the entry source and remove it from the modules map before passing
+      // to WASM. The WASM build_modules() function treats `modules` as "extra"
+      // dependencies and inserts the entry source separately under `filename` — if
+      // the entry key is still present in `modules`, it throws mds::filename_collision.
+      const source = modules[entryFilename] ?? '';
+      delete modules[entryFilename];
+      return wasmModule.compile(source, fileOpts(entryFilename, modules, options));
     },
 
     async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
       const { entryFilename, modules } = await buildModulesMap(path, (src) => wasmModule.scanImports(src));
-      return wasmModule.check(modules[entryFilename] ?? '', fileOpts(entryFilename, modules, options));
+      // Same fix as compileFile: remove entry from modules to avoid filename_collision.
+      const source = modules[entryFilename] ?? '';
+      delete modules[entryFilename];
+      return wasmModule.check(source, fileOpts(entryFilename, modules, options));
     },
   };
 }
