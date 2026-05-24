@@ -174,19 +174,17 @@ export async function buildModulesMap(
         realpath(absolutePath),
       ]);
 
-      // Secondary check: verify the fd we opened is a regular file (not a device,
-      // socket, etc.) and that the resolved path matches (guards Windows fallback
-      // where O_NOFOLLOW=0).
-      if (stats.isSymbolicLink()) {
-        throw new Error(`security: symlink detected at ${absolutePath} — symlinks are not allowed`);
-      }
+      // fstat on the opened fd: verify it is a regular file (not a device,
+      // directory, socket, etc.). Note: fstat never reports isSymbolicLink()
+      // because it operates on the resolved fd, not the path — symlink
+      // detection is handled by O_NOFOLLOW (ELOOP) and the realpath check below.
       if (!stats.isFile()) {
         throw new Error(`security: ${absolutePath} is not a regular file`);
       }
 
-      // On platforms where O_NOFOLLOW=0, the open() above did not prevent symlink
-      // traversal. A post-open realpath comparison catches a symlink that was in
-      // place at open time.
+      // On platforms where O_NOFOLLOW=0 (e.g. Windows), the open() above did
+      // not prevent symlink traversal. A post-open realpath comparison catches
+      // a symlink that was in place at open time.
       if (resolved !== absolutePath) {
         throw new Error(
           `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink`,

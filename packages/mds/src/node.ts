@@ -1,5 +1,6 @@
 import type {
   BackendType,
+  MdsBaseBackend,
   MdsNodeBackend,
   CompileResult,
   CheckResult,
@@ -55,7 +56,7 @@ export function _resetForTesting(): void {
  * wasm.ts remains browser-safe.
  */
 function wrapWithFileOps(
-  base: ReturnType<typeof createWasmBackend>,
+  base: MdsBaseBackend,
   wasmModule: WasmModule,
 ): MdsNodeBackend {
   return {
@@ -98,8 +99,8 @@ async function loadNativeBackend(): Promise<{ backend: MdsNodeBackend; error: nu
  * Load the WASM backend for Node.js. Always returns a MdsNodeBackend.
  * Throws if the WASM module cannot be loaded.
  */
-async function loadWasmNodeBackend(): Promise<MdsNodeBackend> {
-  const wasmModule = await initWasmNode();
+async function loadWasmNodeBackend(options?: InitOptions): Promise<MdsNodeBackend> {
+  const wasmModule = await initWasmNode(options);
   const base = createWasmBackend(wasmModule);
   return wrapWithFileOps(base, wasmModule);
 }
@@ -112,9 +113,9 @@ async function loadWasmNodeBackend(): Promise<MdsNodeBackend> {
  * Ensure the backend is initialized, with promise deduplication.
  * Called by init() and is the single source of truth for backend selection.
  */
-async function ensureBackend(): Promise<void> {
+async function ensureBackend(options?: InitOptions): Promise<void> {
   if (forceBackend === 'wasm') {
-    backend = await loadWasmNodeBackend();
+    backend = await loadWasmNodeBackend(options);
     return;
   }
 
@@ -136,7 +137,7 @@ async function ensureBackend(): Promise<void> {
 
   console.warn('@mds/mds: native addon unavailable, falling back to WASM');
   try {
-    backend = await loadWasmNodeBackend();
+    backend = await loadWasmNodeBackend(options);
   } catch (wasmErr) {
     throw new Error(
       `@mds/mds: no backend available. Native: ${nativeResult.error.message}. WASM: ${String(wasmErr)}`,
@@ -155,10 +156,10 @@ async function ensureBackend(): Promise<void> {
  * Idempotent — safe to call multiple times. Concurrent calls share a single
  * promise, preventing double-initialization races.
  */
-export async function init(_options?: InitOptions): Promise<void> {
+export async function init(options?: InitOptions): Promise<void> {
   if (backend !== undefined) return;
   if (initPromise !== null) return initPromise;
-  initPromise = ensureBackend().catch((err: unknown) => {
+  initPromise = ensureBackend(options).catch((err: unknown) => {
     initPromise = null;
     throw err;
   });
@@ -201,12 +202,12 @@ export function getBackend(): BackendType {
 
 export { isMdsError } from './types.js';
 export type {
-  CompileResult,
+  BackendType,
   CheckResult,
   CompileOptions,
+  CompileResult,
   FileOptions,
-  MdsErrorSpan,
-  MdsError,
-  BackendType,
   InitOptions,
+  MdsError,
+  MdsErrorSpan,
 } from './types.js';
