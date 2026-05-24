@@ -38,25 +38,30 @@ let nodeFailures = 0;
 // ---------------------------------------------------------------------------
 
 let cachedBrowserPromise: Promise<WasmModule> | null = null;
+const MAX_BROWSER_RETRIES = 3;
+let browserFailures = 0;
 
 // ---------------------------------------------------------------------------
 // Test reset
 // ---------------------------------------------------------------------------
 
 /**
- * Reset all singleton state, optionally pre-seeding the Node.js failure counter.
+ * Reset all singleton state, optionally pre-seeding failure counters.
  *
  * FOR TESTING ONLY — allows integration tests to exercise the retry-exhaustion
  * path without spawning a subprocess or driving N actual failures.
  *
- * @param failures - Number of failures to pre-seed. Defaults to 0 (full reset).
- *                   Pass MAX_INIT_RETRIES (3) to simulate exhaustion directly.
+ * @param failures - Node.js failures to pre-seed. Defaults to 0 (full reset).
+ *                   Pass MAX_INIT_RETRIES (3) to simulate Node.js exhaustion.
+ * @param browserFailuresCount - Browser failures to pre-seed. Defaults to 0.
+ *                   Pass MAX_BROWSER_RETRIES (3) to simulate browser exhaustion.
  * @internal
  */
-export function _resetForTesting(failures = 0): void {
+export function _resetForTesting(failures = 0, browserFailuresCount = 0): void {
   cachedNodePromise = null;
   nodeFailures = failures;
   cachedBrowserPromise = null;
+  browserFailures = browserFailuresCount;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +115,28 @@ function isModuleNotFound(err: unknown): boolean {
     err instanceof Error &&
     (err as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND'
   );
+}
+
+/**
+ * Validate that a dynamically loaded module matches the WasmModule shape.
+ *
+ * Checks compile, check, and scanImports are all present as functions.
+ * Throws a descriptive error naming the first missing member so callers get
+ * an actionable message instead of a silent runtime failure later.
+ *
+ * Exported so tests can exercise shape validation directly without going
+ * through the full WASM init path.
+ */
+export function validateWasmShape(mod: unknown): asserts mod is WasmModule {
+  const m = mod as Record<string, unknown>;
+  for (const name of ['compile', 'check', 'scanImports'] as const) {
+    if (typeof m[name] !== 'function') {
+      throw new Error(
+        `@mds/mds: WASM module is missing required export "${name}". ` +
+        `Ensure the module is built with: wasm-pack build crates/mds-wasm --target web --out-dir pkg`,
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +234,15 @@ export async function initWasmBrowser(options?: InitOptions): Promise<WasmModule
   if (cachedBrowserPromise !== null) {
     return cachedBrowserPromise;
   }
+  if (browserFailures >= MAX_BROWSER_RETRIES) {
+    throw new Error(
+      `@mds/mds: WASM browser backend failed to initialize after ${MAX_BROWSER_RETRIES} attempts. ` +
+      `Ensure 'mds-wasm' is bundled or provide a valid wasmUrl option.`,
+    );
+  }
   cachedBrowserPromise = _initBrowser(options).catch((err) => {
+    // Reset so a subsequent call can retry after a transient failure.
+    browserFailures += 1;
     cachedBrowserPromise = null;
     throw err;
   });
@@ -224,14 +259,17 @@ async function _initBrowser(options?: InitOptions): Promise<WasmModule> {
   // Dynamic import — bundler resolves 'mds-wasm' or the caller provides the module.
   // In browser environments, the bundler inlines the WASM module at build time.
   // TypeScript cannot resolve 'mds-wasm' at compile time (it's a bundler alias),
-  // so we use a type assertion here. The shape is validated below.
+  // so we use a type assertion here. The shape is validated with validateWasmShape below.
   let wasmMod: WasmModule;
   try {
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore — 'mds-wasm' is a bundler-resolved module alias, not a npm dependency
-    const imported = await import('mds-wasm') as WasmModule;
+    const imported: unknown = await import('mds-wasm');
+    validateWasmShape(imported);
     wasmMod = imported;
   } catch (err) {
+    // Re-throw validateWasmShape errors directly (they are already descriptive).
+    if (err instanceof Error && err.message.startsWith('@mds/mds:')) throw err;
     throw new Error(
       `@mds/mds: failed to load WASM module in browser environment. ` +
       `Ensure 'mds-wasm' is bundled or provide a wasmUrl option. Caused by: ${String(err)}`,

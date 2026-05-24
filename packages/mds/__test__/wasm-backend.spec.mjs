@@ -7,7 +7,7 @@
  */
 import { test, describe, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { initWasmNode, createWasmBackend, _resetForTesting } from '../dist/backend/wasm.js';
+import { initWasmNode, initWasmBrowser, createWasmBackend, _resetForTesting, validateWasmShape } from '../dist/backend/wasm.js';
 
 // Mirror of MAX_INIT_RETRIES from src/backend/wasm.ts.
 // If this value drifts from the source, U-WB2 will fail to trigger the
@@ -164,6 +164,136 @@ describe('wasm backend — circuit breaker', () => {
       typeof mod.scanImports,
       'function',
       'initWasmNode() must only succeed when scanImports is present in the WASM module',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Browser circuit breaker (issues wasm:206 and wasm:232)
+// ---------------------------------------------------------------------------
+
+// Mirror of MAX_BROWSER_RETRIES from src/backend/wasm.ts.
+const MAX_BROWSER_RETRIES = 3;
+
+describe('wasm backend — browser circuit breaker', () => {
+  afterEach(() => {
+    _resetForTesting(0);
+  });
+
+  test('U-WB14: initWasmBrowser() throws permanently once browserFailures reaches MAX_BROWSER_RETRIES', async () => {
+    // Pre-seed exactly MAX_BROWSER_RETRIES failures to simulate exhaustion.
+    // _resetForTesting(failures, browserFailures) — second param seeds browser counter.
+    _resetForTesting(0, MAX_BROWSER_RETRIES);
+    await assert.rejects(
+      () => initWasmBrowser(),
+      (err) => {
+        assert.ok(err instanceof Error, 'must be an Error instance');
+        assert.ok(
+          err.message.includes('failed to initialize after'),
+          `expected permanent-failure message, got: ${err.message}`,
+        );
+        assert.ok(
+          err.message.includes(String(MAX_BROWSER_RETRIES)),
+          `expected retry count in message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-WB15: initWasmBrowser() allows retries below MAX_BROWSER_RETRIES', async () => {
+    // With failures below the limit, initWasmBrowser() should not throw the
+    // circuit-breaker error on the first call (though it may fail for other reasons
+    // like missing bundler module in Node.js — we only verify the CB is not triggered).
+    _resetForTesting(0, MAX_BROWSER_RETRIES - 1);
+    // We expect any error other than the circuit-breaker permanent-failure message.
+    const err = await initWasmBrowser().then(() => null, (e) => e);
+    if (err !== null) {
+      assert.ok(
+        !err.message.includes('failed to initialize after'),
+        `circuit breaker must not fire below limit, got: ${err.message}`,
+      );
+    }
+  });
+
+  test('U-WB16: _resetForTesting resets browserFailures counter', async () => {
+    // Exhaust browser retries, then reset, and verify the circuit breaker no
+    // longer fires immediately.
+    _resetForTesting(0, MAX_BROWSER_RETRIES);
+    // Confirm it fires.
+    await assert.rejects(() => initWasmBrowser(), /failed to initialize after/);
+    // Reset to 0 browser failures.
+    _resetForTesting(0, 0);
+    // Should NOT throw the circuit-breaker error immediately.
+    const err = await initWasmBrowser().then(() => null, (e) => e);
+    if (err !== null) {
+      assert.ok(
+        !err.message.includes('failed to initialize after'),
+        `after reset, circuit breaker must not fire immediately, got: ${err.message}`,
+      );
+    }
+  });
+});
+
+describe('wasm backend — browser shape validation', () => {
+  afterEach(() => {
+    _resetForTesting(0);
+  });
+
+  test('U-WB17: validateWasmShape accepts a well-formed module', () => {
+    const validMod = {
+      compile: () => {},
+      check: () => {},
+      scanImports: () => [],
+    };
+    assert.doesNotThrow(
+      () => validateWasmShape(validMod),
+      'validateWasmShape must not throw for a well-formed module',
+    );
+  });
+
+  test('U-WB18: validateWasmShape throws when compile is missing', () => {
+    const mod = { check: () => {}, scanImports: () => [] };
+    assert.throws(
+      () => validateWasmShape(mod),
+      (err) => {
+        assert.ok(err instanceof Error, 'must throw an Error');
+        assert.ok(
+          err.message.includes('compile'),
+          `error must mention missing function "compile", got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-WB19: validateWasmShape throws when check is missing', () => {
+    const mod = { compile: () => {}, scanImports: () => [] };
+    assert.throws(
+      () => validateWasmShape(mod),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('check'),
+          `error must mention missing function "check", got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-WB20: validateWasmShape throws when scanImports is missing', () => {
+    const mod = { compile: () => {}, check: () => {} };
+    assert.throws(
+      () => validateWasmShape(mod),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('scanImports'),
+          `error must mention missing function "scanImports", got: ${err.message}`,
+        );
+        return true;
+      },
     );
   });
 });
