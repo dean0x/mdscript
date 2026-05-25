@@ -24,9 +24,6 @@ function createMockMds(overrides = {}) {
         dependencies: [],
       };
     },
-    isMdsError(err) {
-      return err instanceof Error && typeof err.code === 'string' && err.code.startsWith('mds::');
-    },
     get initCallCount() { return initCallCount; },
     get compileFileCalls() { return compileFileCalls; },
     ...overrides,
@@ -191,6 +188,31 @@ describe('createMdsTransformer', () => {
     assert.ok(exportLine, 'should have export default line');
     assert.ok(!exportLine.includes('\x00'), 'null byte must be escaped in JS string literal');
     assert.ok(exportLine.includes('\\0'), 'null byte must be escaped as \\0');
+  });
+
+  test('metadata is safe for inline script embedding (no </script> or U+2028/U+2029)', async () => {
+    const u2028 = ' ';
+    const u2029 = ' ';
+    const mds = createMockMds({
+      async compileFile() {
+        return {
+          output: 'content',
+          // Warnings may contain compiler output that includes these characters.
+          warnings: ['</script> injection', `line${u2028}sep`, `para${u2029}sep`],
+          dependencies: [],
+        };
+      },
+    });
+    const transformer = createMdsTransformer(mds);
+    const result = await transformer.transform('/file.mds');
+
+    const metaLine = result.code.split('\n').find(l => l.startsWith('export const metadata'));
+    assert.ok(metaLine, 'should have metadata export line');
+    // '</script>' must not appear verbatim — would close an enclosing <script> block
+    assert.ok(!metaLine.includes('</script>'), '</script> must be escaped in metadata');
+    // U+2028/U+2029 are JS line terminators and must not appear verbatim
+    assert.ok(!metaLine.includes(u2028), 'U+2028 must be escaped in metadata');
+    assert.ok(!metaLine.includes(u2029), 'U+2029 must be escaped in metadata');
   });
 
   test('poisoned promise resets on init rejection, allowing retry', async () => {

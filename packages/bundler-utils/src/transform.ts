@@ -1,5 +1,5 @@
 import type { MdsApi, MdsPluginOptions, TransformResult } from './types.js';
-import { shouldTransform as checkTransform, cleanId } from './frontmatter.js';
+import { shouldTransform as checkTransform } from './frontmatter.js';
 
 // Characters that must be escaped inside a JS double-quoted string literal.
 // U+2028 (line separator) and U+2029 (paragraph separator) are treated as
@@ -21,6 +21,28 @@ const JS_ESCAPE_MAP: Record<string, string> = {
 
 function escapeForJs(str: string): string {
   return str.replace(JS_ESCAPE_RE, (ch) => JS_ESCAPE_MAP[ch] ?? ch);
+}
+
+// Characters that are safe in JSON but unsafe when embedded inline in a
+// <script> block: '<' can close the script tag (e.g. "</script>"); U+2028 and
+// U+2029 are JS line terminators that JSON.stringify does not escape.
+// Constructed via new RegExp() for the same reason as JS_ESCAPE_RE above.
+const SAFE_JSON_RE = new RegExp('[<\\u2028\\u2029]', 'g');
+const SAFE_JSON_MAP: Record<string, string> = {
+  '<': '\\u003c',
+  ' ': '\\u2028',
+  ' ': '\\u2029',
+};
+
+/**
+ * JSON-serialize a value for safe inline embedding in a JS script context.
+ * JSON.stringify does not escape U+2028 (line separator), U+2029 (paragraph
+ * separator), or '<' — all of which can break an inline <script> block or
+ * be treated as JS line terminators. Escaping them to their Unicode escape
+ * sequences is harmless for JSON consumers but safe for script contexts.
+ */
+function safeJsonForJs(value: unknown): string {
+  return JSON.stringify(value).replace(SAFE_JSON_RE, (ch) => SAFE_JSON_MAP[ch] ?? ch);
 }
 
 export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
@@ -46,15 +68,16 @@ export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
 
     async transform(id: string): Promise<TransformResult> {
       await ensureInit();
-      const clean = cleanId(id);
-      // id is trusted — sourced from the bundler's module resolution pipeline
+      // id is trusted — sourced from the bundler's module resolution pipeline.
+      // Callers (vite-plugin, rollup-plugin, webpack-loader) are responsible for
+      // stripping query/hash before calling transform().
       const result = await mds.compileFile(
-        clean,
+        id,
         options?.vars !== undefined ? { vars: options.vars } : undefined,
       );
       const code =
         `export default "${escapeForJs(result.output)}";\n` +
-        `export const metadata = ${JSON.stringify({ warnings: result.warnings, dependencies: result.dependencies })};\n`;
+        `export const metadata = ${safeJsonForJs({ warnings: result.warnings, dependencies: result.dependencies })};\n`;
       return {
         code,
         dependencies: result.dependencies,
