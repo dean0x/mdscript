@@ -13,6 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Bundler integration packages** — import `.mds` templates natively in JavaScript/TypeScript bundlers
+  - `@mds/bundler-utils` — shared transform, frontmatter detection, and error formatting utilities
+  - `@mds/vite-plugin` — Vite transform hook with HMR support (`vite ^5 || ^6`)
+  - `@mds/rollup-plugin` — Rollup 3/4 transform hook
+  - `@mds/webpack-loader` — Webpack 5 async loader
+  - All plugins accept `{ vars?: Record<string, unknown> }` for template variables
+  - TypeScript module declarations via `@mds/bundler-utils/mds`
+
 - **`@mds/mds` npm package** — universal JavaScript/TypeScript bindings for the MDS compiler
   - Node.js entry auto-selects the native addon with WASM fallback
   - Browser entry via WASM; requires `init()` before use

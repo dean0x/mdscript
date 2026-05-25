@@ -67,6 +67,25 @@ Exit codes:
   3   Resource limit exceeded
 ```
 
+## Bundler Integration
+
+Import `.mds` templates directly in Vite, Rollup, and Webpack projects:
+
+```ts
+import systemPrompt from './prompts/system.mds';
+// systemPrompt is the compiled Markdown string
+```
+
+| Package | Bundler | Version |
+|---------|---------|---------|
+| [`@mds/vite-plugin`](packages/vite-plugin/README.md) | Vite | ^5 \|\| ^6 |
+| [`@mds/rollup-plugin`](packages/rollup-plugin/README.md) | Rollup | ^3 \|\| ^4 |
+| [`@mds/webpack-loader`](packages/webpack-loader/README.md) | Webpack | ^5 |
+
+All plugins require `@mds/mds` as a peer dependency and accept `{ vars?: Record<string, unknown> }` for runtime template variables. See each package README for configuration details.
+
+TypeScript module declarations (`.mds` → `string`) are provided by `@mds/bundler-utils/mds`.
+
 ## Library Usage
 
 ```rust
