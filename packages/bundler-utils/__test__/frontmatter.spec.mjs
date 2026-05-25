@@ -3,7 +3,7 @@
  */
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { shouldTransform, isMdsExtension, cleanId } from '../dist/index.js';
@@ -54,7 +54,7 @@ after(() => {
   for (const f of files) {
     try { unlinkSync(f); } catch { /* ignore */ }
   }
-  try { unlinkSync(TMP); } catch { /* ignore */ }
+  try { rmSync(TMP, { recursive: true }); } catch { /* ignore */ }
 });
 
 // ---------------------------------------------------------------------------

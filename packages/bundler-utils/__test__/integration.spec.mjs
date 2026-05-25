@@ -5,7 +5,7 @@ import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { writeFileSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createMdsTransformer } from '../dist/index.js';
 
@@ -52,7 +52,7 @@ describe('bundler-utils integration', () => {
     const result = await transformer.transform(ENTRY_MDS);
 
     assert.ok(result.code.includes('export default'), 'should have default export');
-    assert.ok(typeof result.code, 'string');
+    assert.equal(typeof result.code, 'string');
   });
 
   test('.md file with type: mds frontmatter is transformed', async () => {
@@ -72,7 +72,7 @@ describe('bundler-utils integration', () => {
       // The output should contain compiled content
       assert.ok(result.code.includes('Hello World!'), `expected "Hello World!" in: ${result.code}`);
     } finally {
-      try { unlinkSync(tmpMd); } catch { /* ignore */ }
+      try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
     }
   });
 
@@ -87,12 +87,14 @@ describe('bundler-utils integration', () => {
       const transformer = createMdsTransformer(mds);
       const result = await transformer.transform(tmpFile);
 
-      // The code should have escaped newlines, not raw newlines in the string
+      // The code should have escaped newlines, not raw newlines in the string.
+      // The export default must be a single complete line with no embedded literal newlines.
       const exportLine = result.code.split('\n')[0] ?? '';
-      assert.ok(!exportLine.includes('\n'), 'should not have raw newline in export line');
+      assert.ok(exportLine.startsWith('export default "'), 'first line should be export default');
+      assert.ok(exportLine.endsWith('";'), 'export default should end on same line');
       assert.ok(exportLine.includes('\\n'), 'should have escaped newline');
     } finally {
-      try { unlinkSync(tmpFile); } catch { /* ignore */ }
+      try { rmSync(tmpDir, { recursive: true }); } catch { /* ignore */ }
     }
   });
 });

@@ -135,6 +135,21 @@ describe('mdsPlugin', () => {
     assert.deepEqual(result, []);
   });
 
+  test('transform throws error with .id when compile fails', async () => {
+    const plugin = mdsPlugin();
+    const ctx = createPluginContext();
+    await plugin.buildStart.call(ctx);
+
+    // Compiling a nonexistent .mds file should throw with .id attached for the
+    // Vite error overlay (equivalent to Rollup's this.error behavior).
+    const err = await plugin.transform.call(ctx, '', '/nonexistent/path/file.mds').then(
+      () => null,
+      (e) => e,
+    );
+    assert.ok(err instanceof Error, 'should throw an Error');
+    assert.equal(err.id, '/nonexistent/path/file.mds', 'error should have .id set to the file path');
+  });
+
   test('options passed to plugin are available', () => {
     const options = { vars: { env: 'test' } };
     const plugin = mdsPlugin(options);

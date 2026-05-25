@@ -91,8 +91,12 @@ describe('createMdsTransformer', () => {
     const lines = result.code.split('\n');
     const exportLine = lines.find(l => l.startsWith('export default'));
     assert.ok(exportLine, 'should have export default line');
-    // Should not contain raw unescaped newline in the string
-    assert.ok(!exportLine.includes('\n'), 'export default line should not have raw newline');
+    // Verify that the special characters are properly escaped in the JS string literal.
+    // After escapeForJs, \n → \\n, \r → \\r, " → \", \\ → \\\\ (backslash).
+    assert.ok(exportLine.includes('\\n'), 'newline should be escaped as \\n');
+    assert.ok(exportLine.includes('\\r'), 'carriage return should be escaped as \\r');
+    assert.ok(exportLine.includes('\\"'), 'double quote should be escaped as \\"');
+    assert.ok(exportLine.includes('\\\\'), 'backslash should be escaped as \\\\');
   });
 
   test('dependencies passed through in result', async () => {
