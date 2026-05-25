@@ -17,21 +17,12 @@ const SIMPLE_MDS = resolve(__dirname, '../../mds/__test__/fixtures/simple.mds');
 function createPluginContext(overrides = {}) {
   const addedWatchFiles = [];
   const warnings = [];
-  const errors = [];
 
   return {
     warn(msg) { warnings.push(msg); },
     addWatchFile(id) { addedWatchFiles.push(id); },
-    error(msg) {
-      const err = typeof msg === 'string' ? new Error(msg) : new Error(msg.message);
-      if (typeof msg === 'object' && msg.id) err.id = msg.id;
-      if (typeof msg === 'object' && msg.loc) err.loc = msg.loc;
-      errors.push(err);
-      throw err;
-    },
     get addedWatchFiles() { return addedWatchFiles; },
     get warnings() { return warnings; },
-    get errors() { return errors; },
     ...overrides,
   };
 }

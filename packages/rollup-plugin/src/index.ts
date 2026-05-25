@@ -28,7 +28,7 @@ interface RollupPlugin {
  * Inject a pre-built transformer for testing without going through the real
  * @mds/mds import. Allows tests to provide a mock transformer that returns
  * controlled warnings, dependencies, and output.
- * FOR TESTING ONLY — does not affect production builds.
+ * FOR TESTING ONLY — throws unless NODE_ENV=test.
  */
 let _testTransformer: ReturnType<typeof createMdsTransformer> | null = null;
 export function _setTransformerForTesting(t: ReturnType<typeof createMdsTransformer> | null): void {

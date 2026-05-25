@@ -26,14 +26,7 @@ async function ensureTransformer(options: MdsPluginOptions): Promise<NonNullable
     // supported by a module-level singleton — use separate webpack processes
     // in that scenario.
     initPromise = import('@mds/mds').then(
-      (mds) => {
-        try {
-          transformer = createMdsTransformer(mds, options);
-        } catch (err) {
-          initPromise = null;
-          throw err;
-        }
-      },
+      (mds) => { transformer = createMdsTransformer(mds, options); },
       (err: unknown) => { initPromise = null; throw err; },
     );
   }
