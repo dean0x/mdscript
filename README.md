@@ -82,7 +82,7 @@ import systemPrompt from './prompts/system.mds';
 | [`@mds/rollup-plugin`](packages/rollup-plugin/README.md) | Rollup | ^3 \|\| ^4 |
 | [`@mds/webpack-loader`](packages/webpack-loader/README.md) | Webpack | ^5 |
 
-All plugins require `@mds/mds` as a peer dependency and accept `{ vars?: Record<string, string> }` for runtime template variables. See each package README for configuration details.
+All plugins require `@mds/mds` as a peer dependency and accept `{ vars?: Record<string, unknown> }` for runtime template variables. See each package README for configuration details.
 
 TypeScript module declarations (`.mds` → `string`) are provided by `@mds/bundler-utils/mds`.
 

@@ -2,6 +2,7 @@
   "name": "@mds/bundler-utils",
   "version": "0.1.0",
   "description": "Shared utilities for MDS bundler plugins",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"

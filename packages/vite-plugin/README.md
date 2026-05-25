@@ -63,7 +63,7 @@ Add the module declaration to your `tsconfig.json` so TypeScript recognises
 ```ts
 interface MdsPluginOptions {
   /** Variables available for interpolation in .mds templates. */
-  vars?: Record<string, string>;
+  vars?: Record<string, unknown>;
 }
 ```
 

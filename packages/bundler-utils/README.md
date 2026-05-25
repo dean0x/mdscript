@@ -64,7 +64,7 @@ and the module also exports `metadata: { warnings: string[]; dependencies: strin
 ```ts
 interface MdsPluginOptions {
   /** Variables available for interpolation in .mds templates. */
-  vars?: Record<string, string>;
+  vars?: Record<string, unknown>;
 }
 ```
 

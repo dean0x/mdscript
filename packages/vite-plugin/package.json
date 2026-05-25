@@ -2,6 +2,7 @@
   "name": "@mds/vite-plugin",
   "version": "0.1.0",
   "description": "Vite plugin for importing MDS templates as ES modules",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"

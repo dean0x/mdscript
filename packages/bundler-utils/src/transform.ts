@@ -45,6 +45,21 @@ function safeJsonForJs(value: unknown): string {
   return JSON.stringify(value).replace(SAFE_JSON_RE, (ch) => SAFE_JSON_MAP[ch] ?? ch);
 }
 
+/**
+ * Create a transformer object that bundler plugins (Vite, Rollup, Webpack) use
+ * to decide which module IDs to handle and to perform the actual compilation.
+ *
+ * The transformer is stateful: it lazily initialises the MDS compiler on first
+ * use and reuses the same instance across all subsequent transform calls.
+ *
+ * @param mds - The MDS compiler API (satisfies {@link MdsApi}).  Pass the result
+ *   of `import('@mds/mds')` or a compatible test double.
+ * @param options - Optional plugin options.  `options.vars` are forwarded to
+ *   every {@link MdsApi.compileFile} call as runtime template variables.
+ * @returns An object with two methods:
+ *   - `shouldTransform(id)` — returns `true` when `id` refers to an `.mds` file.
+ *   - `transform(id)` — compiles the file and returns the generated JS module source.
+ */
 export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
   shouldTransform(id: string): boolean | Promise<boolean>;
   transform(id: string): Promise<TransformResult>;
