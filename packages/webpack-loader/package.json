@@ -2,18 +2,33 @@
   "name": "@mds/webpack-loader",
   "version": "0.1.0",
   "type": "module",
-  "engines": { "node": ">=22.0.0" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist/"],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "node --test __test__/*.spec.mjs"
   },
-  "dependencies": { "@mds/bundler-utils": "file:../bundler-utils" },
-  "peerDependencies": { "@mds/mds": "^0.1.0", "webpack": "^5.0.0" },
+  "dependencies": {
+    "@mds/bundler-utils": "file:../bundler-utils"
+  },
+  "peerDependencies": {
+    "@mds/mds": "^0.1.0",
+    "webpack": "^5.0.0"
+  },
   "devDependencies": {
     "@mds/mds": "file:../mds",
     "@types/node": "^22.0.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "webpack": "^5.0.0"
   }
 }

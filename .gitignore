@@ -5,4 +5,4 @@ crates/mds-wasm/pkg-web/
 node_modules/
 crates/mds-napi/index.d.ts
 crates/mds-napi/package-lock.json
-packages/mds/dist/
+packages/*/dist/

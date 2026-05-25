@@ -40,7 +40,7 @@ export default function mdsPlugin(options?: MdsPluginOptions): VitePlugin {
       if (!should) return null;
 
       try {
-        const result = await transformer.transform(id);
+        const result = await transformer.transform(clean);
         for (const dep of result.dependencies) {
           this.addWatchFile(dep);
         }
