@@ -42,9 +42,7 @@ export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
   }
 
   return {
-    shouldTransform(id: string): boolean | Promise<boolean> {
-      return checkTransform(id);
-    },
+    shouldTransform: checkTransform,
 
     async transform(id: string): Promise<TransformResult> {
       await ensureInit();

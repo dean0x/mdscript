@@ -45,14 +45,10 @@ export default function mdsPlugin(options?: MdsPluginOptions): RollupPlugin {
         return { code: result.code, map: null };
       } catch (err) {
         const formatted = formatMdsError(err, clean);
-        if (formatted.line !== undefined) {
-          this.error(formatted.message, {
-            line: formatted.line,
-            column: formatted.column ?? 0,
-          });
-        } else {
-          this.error(formatted.message);
-        }
+        const pos = formatted.line !== undefined
+          ? { line: formatted.line, column: formatted.column ?? 0 }
+          : undefined;
+        this.error(formatted.message, pos);
       }
     },
   };

@@ -52,14 +52,12 @@ export default function mdsPlugin(options?: MdsPluginOptions): VitePlugin {
         const formatted = formatMdsError(err, clean);
         // Vite expects thrown errors (not this.error()) for the error overlay.
         // Attach loc and id so Vite can display the error with position info.
-        const error = new Error(formatted.message) as Error & {
-          id?: string;
-          loc?: { line: number; column: number };
-        };
-        error.id = formatted.id;
-        if (formatted.line !== undefined) {
-          error.loc = { line: formatted.line, column: formatted.column ?? 0 };
-        }
+        const error = Object.assign(new Error(formatted.message), {
+          id: formatted.id,
+          loc: formatted.line !== undefined
+            ? { line: formatted.line, column: formatted.column ?? 0 }
+            : undefined,
+        });
         throw error;
       }
     },

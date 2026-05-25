@@ -32,9 +32,8 @@ async function ensureTransformer(options: MdsPluginOptions): Promise<NonNullable
       });
   }
   await initPromise;
-  // After initPromise resolves, transformer is guaranteed to be set.
-  // The non-null assertion is safe here because the Promise sets transformer before resolving.
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  // After initPromise resolves, transformer is guaranteed non-null:
+  // the .then() callback sets it before the promise resolves.
   return transformer!;
 }
 
