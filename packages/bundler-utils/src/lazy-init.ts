@@ -10,7 +10,7 @@
  */
 export class LazyInit<T> {
   private resolved = false;
-  private instance: T | undefined = undefined;
+  private instance: T | undefined;
   private pending: Promise<T> | null = null;
   private generation = 0;
 

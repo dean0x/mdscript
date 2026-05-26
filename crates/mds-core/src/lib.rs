@@ -983,10 +983,8 @@ mod tests {
     fn load_vars_str_rejects_oversized_input() {
         // Construct a string that exceeds MAX_FILE_SIZE (10 MB).
         let oversized = "x".repeat((MAX_FILE_SIZE as usize) + 1);
-        let result = load_vars_str(&oversized);
-        assert!(result.is_err(), "expected error for oversized input");
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
+        let err = load_vars_str(&oversized).expect_err("expected error for oversized input");
+        let msg = err.to_string();
         assert!(
             msg.contains("exceeds maximum size"),
             "error message should mention size limit, got: {msg}"
