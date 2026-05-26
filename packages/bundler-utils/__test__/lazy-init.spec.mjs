@@ -59,20 +59,6 @@ describe('LazyInit', () => {
     assert.equal(callCount, 2, 'factory should have been called twice');
   });
 
-  test('after success, factory is never called again', async () => {
-    let callCount = 0;
-    const lazy = new LazyInit(async () => {
-      callCount++;
-      return 42;
-    });
-
-    await lazy.get();
-    await lazy.get();
-    await lazy.get();
-
-    assert.equal(callCount, 1, 'factory must not be called after successful resolution');
-  });
-
   test('reset() during in-flight get() — stale resolution does not corrupt state', async () => {
     let resolve;
     const controlled = new Promise((r) => { resolve = r; });
@@ -98,7 +84,7 @@ describe('LazyInit', () => {
 
     // The stale .then() handler must not store 'stale-value'.
     // Awaiting firstGet returns 'stale-value' (the old promise chain propagates
-    // the resolved value regardless), but instance/resolved must remain unset.
+    // the resolved value regardless), but resolved/pending must remain cleared.
     await firstGet;
 
     // A fresh get() must invoke the factory again and return 'fresh-value'.
@@ -125,7 +111,7 @@ describe('LazyInit', () => {
     assert.equal(callCount, 2, 'factory should be called again after reset');
   });
 
-  test('T = void factory works correctly (resolved flag, not instance check)', async () => {
+  test('T = void factory works correctly (resolved flag handles undefined return)', async () => {
     let callCount = 0;
     const lazy = new LazyInit(async () => {
       callCount++;

@@ -3,14 +3,14 @@
  *
  * - Concurrent `get()` calls share the in-flight promise — factory is invoked once.
  * - On factory rejection the pending promise is cleared so the next `get()` retries.
- * - Uses a `resolved` boolean flag (not `instance !== undefined`) so `T = void`
- *   and `T = null` work correctly.
+ * - Uses a `resolved` boolean flag so `T = void` and `T = null` work correctly.
  * - A generation counter prevents a stale in-flight factory resolution from
  *   overwriting state that was cleared by `reset()` (TOCTOU safety).
+ * - After resolution, `pending` is replaced with a pre-resolved `Promise.resolve(result)`
+ *   so subsequent `get()` calls return the same object without allocating a new promise.
  */
 export class LazyInit<T> {
   private resolved = false;
-  private instance: T | undefined;
   private pending: Promise<T> | null = null;
   private generation = 0;
 
@@ -29,9 +29,6 @@ export class LazyInit<T> {
         (result) => {
           if (this.generation === gen) {
             this.resolved = true;
-            this.instance = result;
-            // Cache the resolved promise so subsequent get() calls return
-            // the same object instead of allocating a new Promise.resolve().
             this.pending = Promise.resolve(result);
           }
           return result;
@@ -55,7 +52,6 @@ export class LazyInit<T> {
   reset(): void {
     this.generation++;
     this.resolved = false;
-    this.instance = undefined;
     this.pending = null;
   }
 }
