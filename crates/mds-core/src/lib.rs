@@ -177,9 +177,7 @@ pub fn check(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<(), MdsError> {
     let path = path.as_ref();
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| MdsError::io("path is not valid UTF-8"))?;
+    let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
@@ -254,6 +252,15 @@ pub fn check_str_with(
     Ok(())
 }
 
+/// Convert a `Path` to `&str`, returning an explicit error for non-UTF-8 paths.
+///
+/// Used at the public API boundary before passing the path string to the resolver,
+/// which expects `&str` rather than `&Path`.
+fn path_to_str(path: &Path) -> Result<&str, MdsError> {
+    path.to_str()
+        .ok_or_else(|| MdsError::io("path is not valid UTF-8"))
+}
+
 /// Print warnings to stderr. Each warning is printed on its own line.
 fn emit_warnings(warnings: &[String]) {
     for w in warnings {
@@ -292,9 +299,7 @@ pub fn compile_collecting_warnings(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<(String, Vec<String>), MdsError> {
     let path = path.as_ref();
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| MdsError::io("path is not valid UTF-8"))?;
+    let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
@@ -339,9 +344,7 @@ pub fn check_collecting_warnings(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<((), Vec<String>), MdsError> {
     let path = path.as_ref();
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| MdsError::io("path is not valid UTF-8"))?;
+    let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
@@ -547,9 +550,7 @@ pub fn compile_with_deps(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<CompileOutput, MdsError> {
     let path = path.as_ref();
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| MdsError::io("path is not valid UTF-8"))?;
+    let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];

@@ -653,6 +653,43 @@ fn load_vars_str_feeds_compile_virtual() {
     assert_eq!(output, "Hello Test!\n");
 }
 
+// ── Non-UTF-8 path rejection ──────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_non_utf8_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Construct a path whose bytes are not valid UTF-8.
+    let invalid_utf8: &OsStr = OsStrExt::from_bytes(b"/tmp/\xFF\xFE.mds");
+    let path = Path::new(invalid_utf8);
+
+    let err = mds::check(path, None).expect_err("expected error for non-UTF-8 path");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not valid UTF-8"),
+        "error message should mention 'not valid UTF-8', got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn compile_rejects_non_utf8_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let invalid_utf8: &OsStr = OsStrExt::from_bytes(b"/tmp/\xFF\xFE.mds");
+    let path = Path::new(invalid_utf8);
+
+    let err = mds::compile(path, None).expect_err("expected error for non-UTF-8 path");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not valid UTF-8"),
+        "error message should mention 'not valid UTF-8', got: {msg}"
+    );
+}
+
 // ── Issue #23: resolve_path and resolve_source accept &str, not &Path ─────────
 
 #[test]
