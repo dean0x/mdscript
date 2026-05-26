@@ -11,7 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`isMdsError()` stricter identification** — the function now requires the `code` property to start with `"mds::"` in addition to being an `Error` instance with a string `code`. Consumers who previously created synthetic error objects with arbitrary `code` strings and relied on `isMdsError()` returning `true` must prefix their codes with `"mds::"` or use a separate check.
 
+- **`ModuleCache::resolve_path` and `ModuleCache::resolve_source` accept `&str` instead of `&Path`** — eliminates silent UTF-8 corruption on non-UTF-8 paths; non-UTF-8 paths now fail with an explicit error at the public API boundary rather than producing garbled output. Rust library consumers calling these methods must pass `&str`; this is a breaking change for direct users of the `mds-core` crate (#23, #12).
+
 ### Added
+
+- **`LazyInit<T>` utility in `@mds/bundler-utils`** — concurrency-safe lazy initialization with deduplication of concurrent factory calls, retry-on-reject semantics, and a TOCTOU-safe `reset()`. Extracted from the webpack-loader for shared use across bundler plugins (#32).
+
+- **API surface tests and non-UTF-8 rejection tests** — `api_surface.rs` covers the new `&str` signatures for `resolve_path` and `resolve_source`; Unix-only tests verify that non-UTF-8 `OsStr` paths are rejected at the boundary with a clear error (#12).
 
 - **Bundler integration packages** — import `.mds` templates natively in JavaScript/TypeScript bundlers
   - `@mds/bundler-utils` — shared transform, frontmatter detection, and error formatting utilities
