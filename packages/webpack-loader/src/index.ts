@@ -67,15 +67,18 @@ export function _resetForTesting(): void {
 /**
  * Inject a pre-built transformer for testing without going through the real
  * @mds/mds import. Allows tests to provide a mock transformer that returns
- * controlled warnings, dependencies, and output.
+ * controlled warnings, dependencies, and output. Pass null to tear down the
+ * injected transformer (equivalent to calling _resetForTesting).
  * FOR TESTING ONLY — throws unless NODE_ENV=test.
  */
-export async function _setTransformerForTesting(t: Transformer): Promise<void> {
+export function _setTransformerForTesting(t: Transformer | null): void {
   if (process.env['NODE_ENV'] !== 'test') {
     throw new Error('_setTransformerForTesting is only allowed when NODE_ENV=test');
   }
+  if (t === null) {
+    lazy?.reset();
+    lazy = null;
+    return;
+  }
   lazy = new LazyInit(async () => t);
-  // Pre-resolve so get() returns immediately on next call. Awaited so callers
-  // can be certain the lazy is fully resolved before proceeding.
-  await lazy.get();
 }

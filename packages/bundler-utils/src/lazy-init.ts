@@ -16,8 +16,13 @@ export class LazyInit<T> {
 
   constructor(private readonly factory: () => Promise<T>) {}
 
+  /**
+   * Returns the cached value, or invokes the factory if not yet resolved.
+   * Concurrent calls share the same in-flight promise — factory is invoked once.
+   * If the factory rejects, the next call will retry.
+   */
   get(): Promise<T> {
-    if (this.resolved) return Promise.resolve(this.instance as T);
+    if (this.resolved) return this.pending as Promise<T>;
     if (this.pending === null) {
       const gen = ++this.generation;
       this.pending = this.factory().then(
@@ -25,6 +30,9 @@ export class LazyInit<T> {
           if (this.generation === gen) {
             this.resolved = true;
             this.instance = result;
+            // Cache the resolved promise so subsequent get() calls return
+            // the same object instead of allocating a new Promise.resolve().
+            this.pending = Promise.resolve(result);
           }
           return result;
         },
@@ -39,6 +47,11 @@ export class LazyInit<T> {
     return this.pending;
   }
 
+  /**
+   * Clears the cached value and pending promise. The next get() call will
+   * re-invoke the factory. Safe to call while a factory is in-flight — the
+   * stale result will be discarded via generation counter.
+   */
   reset(): void {
     this.generation++;
     this.resolved = false;

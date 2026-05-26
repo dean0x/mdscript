@@ -59,6 +59,36 @@ Or add a triple-slash reference in any `.d.ts` file in your project:
 This makes `import content from './prompt.mds'` type-safe: `content` is `string`
 and the module also exports `metadata: { warnings: string[]; dependencies: string[] }`.
 
+## LazyInit
+
+`LazyInit<T>` is a single-init lazy value holder with concurrent-call deduplication
+and retry-on-rejection semantics. It is exported for bundler plugin authors who need
+the same guarantee.
+
+```ts
+import { LazyInit } from '@mds/bundler-utils';
+
+// Factory is invoked at most once per successful resolution.
+const lazy = new LazyInit(async () => {
+  const mds = await import('@mds/mds');
+  return createMdsTransformer(mds, options);
+});
+
+// Concurrent calls share the in-flight promise — factory runs once.
+const transformer = await lazy.get();
+
+// Reset clears state; the next get() re-invokes the factory.
+lazy.reset();
+```
+
+Key properties:
+
+- **Single init** — factory is called exactly once until `reset()`.
+- **Deduplication** — concurrent `get()` calls share the in-flight promise.
+- **Retry on rejection** — a failed factory clears pending state so the next call retries.
+- **TOCTOU safety** — a generation counter prevents stale in-flight results from
+  overwriting state after `reset()`.
+
 ## Options
 
 ```ts

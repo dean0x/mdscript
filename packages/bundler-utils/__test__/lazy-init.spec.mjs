@@ -138,6 +138,26 @@ describe('LazyInit', () => {
     assert.equal(callCount, 1, 'void factory should be called exactly once');
   });
 
+  test('concurrent get() calls all reject when factory rejects', async () => {
+    let callCount = 0;
+    const lazy = new LazyInit(async () => {
+      callCount++;
+      throw new Error('factory-rejection');
+    });
+
+    const results = await Promise.allSettled([
+      lazy.get(),
+      lazy.get(),
+      lazy.get(),
+    ]);
+
+    assert.equal(callCount, 1, 'factory should be called once even when all concurrent callers reject');
+    for (const result of results) {
+      assert.equal(result.status, 'rejected', 'all concurrent callers should receive the rejection');
+      assert.match(result.reason.message, /factory-rejection/);
+    }
+  });
+
   test('factory that returns null works correctly (null is valid T value)', async () => {
     let callCount = 0;
     const lazy = new LazyInit(async () => {
