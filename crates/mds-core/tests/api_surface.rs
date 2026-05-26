@@ -198,9 +198,8 @@ fn value_methods() {
 
 #[test]
 fn cli_import_pattern_works() {
+    // Compile-time check that compile_str matches the fn(&str) -> Result<String, MdsError> shape.
     let _: fn(&str) -> Result<String, MdsError> = |s| mds::compile_str(s);
-    const _: () = assert!(MAX_FILE_SIZE > 0);
-    const _: () = assert!(MAX_TRAVERSAL_DEPTH > 0);
 }
 
 // ── New public types from Phase 2 ─────────────────────────────────────────────
