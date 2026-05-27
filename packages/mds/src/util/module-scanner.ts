@@ -1,6 +1,6 @@
 import { open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
-import { resolve, dirname, basename, relative } from 'node:path';
+import { resolve, dirname, relative } from 'node:path';
 
 // O_NOFOLLOW prevents the kernel from following a symlink at the final path
 // component. Using it closes the TOCTOU window between lstat and open.
@@ -33,29 +33,53 @@ const projectRootCache = new Map<string, string>();
  *
  * Results are cached by start directory: the project root is invariant within
  * a build, so repeated calls incur only a single Map lookup after the first.
+ *
+ * ARCHITECTURE EXCEPTION: Uses synchronous `existsSync` despite the otherwise
+ * fully-async module pattern. This is a deliberate trade-off: (a) the result
+ * is cached so the sync traversal runs at most once per unique start directory
+ * per process, and (b) keeping this function synchronous avoids propagating
+ * `async` through every call site (including test utilities that call it
+ * directly). The blocking window is bounded by MAX_TRAVERSAL_DEPTH (256) ×
+ * |markers| (2) I/O calls on an uncached first call — acceptable for a
+ * one-time startup cost on local filesystems.
  */
 export function findProjectRoot(start: string): string {
-  const cached = projectRootCache.get(start);
+  const normalized = resolve(start);
+  const cached = projectRootCache.get(normalized);
   if (cached !== undefined) {
     return cached;
   }
 
+  const result = _findProjectRootUncached(normalized);
+  projectRootCache.set(normalized, result);
+  return result;
+}
+
+/**
+ * Clear the project root cache. Intended for use in tests only — production
+ * code should never call this because the cache is an intentional correctness
+ * optimization (project root is invariant within a build).
+ *
+ * @internal
+ */
+export function _clearProjectRootCacheForTesting(): void {
+  projectRootCache.clear();
+}
+
+function _findProjectRootUncached(start: string): string {
   let dir = start;
   for (let i = 0; i < MAX_TRAVERSAL_DEPTH; i++) {
     for (const marker of PROJECT_ROOT_MARKERS) {
       if (existsSync(resolve(dir, marker))) {
-        projectRootCache.set(start, dir);
         return dir;
       }
     }
     const parent = dirname(dir);
     if (parent === dir) {
-      projectRootCache.set(start, start);
       return start;
     }
     dir = parent;
   }
-  projectRootCache.set(start, start);
   return start;
 }
 
@@ -156,6 +180,16 @@ export function normalizeVirtualKey(base: string, relative: string): string {
 /**
  * Recursively resolve an MDS file and all its imports into a flat modules map
  * suitable for passing to the WASM compile/check functions.
+ *
+ * The returned `entryFilename` is a **project-root-relative** slash path
+ * (e.g. `"src/templates/foo.mds"`), computed via `path.relative(projectRoot,
+ * absoluteEntry)`. This mirrors the virtual key used in the `modules` map and
+ * is the value that must be passed as the `filename` argument to
+ * `build_modules()` / `check()` on the WASM side.
+ *
+ * Note: prior to this change `entryFilename` was the basename of the entry
+ * file. Callers that relied on the basename form must be updated to use the
+ * relative path.
  *
  * Security checks performed:
  * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)

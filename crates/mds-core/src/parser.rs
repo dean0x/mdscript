@@ -290,10 +290,11 @@ impl Parser<'_> {
             self.pos += 1;
 
             // Extract condition string: strip "@elseif " prefix and trailing ":".
+            // strip_prefix cannot fail here: the while guard already checked starts_with("@elseif ").
             let elseif_cond_str = elseif_dir
                 .trim()
                 .strip_prefix("@elseif ")
-                .ok_or_else(|| MdsError::syntax("internal error: expected @elseif prefix"))?
+                .expect("loop guard guarantees @elseif prefix")
                 .trim()
                 .strip_suffix(':')
                 .ok_or_else(|| MdsError::syntax("@elseif directive must end with ':'"))?
@@ -511,6 +512,18 @@ fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
 ///
 /// Returns `Some((byte_index, "=="` or `"!="))` pointing to the start of the
 /// operator, or `None` if no unquoted operator is present.
+///
+/// # Byte-level scan safety
+///
+/// This function receives a `&str`, which Rust guarantees is valid UTF-8.  The
+/// ASCII bytes we search for (`!`, `=`, `"`, `'`, `\`) are all single-byte
+/// characters in the range 0x00–0x7F.  In UTF-8, continuation bytes of
+/// multi-byte sequences always have their high bit set (≥ 0x80), so they can
+/// never be mistaken for any ASCII byte we inspect.  Consequently, scanning
+/// `s.as_bytes()` byte-by-byte and acting only on those ASCII sentinel values
+/// is sound: we never split a multi-byte code-point, and every byte index we
+/// return points to the first byte of an ASCII character that is also a valid
+/// `str` boundary.
 fn find_unquoted_operator(s: &str) -> Option<(usize, &'static str)> {
     let bytes = s.as_bytes();
     let len = bytes.len();
@@ -560,6 +573,28 @@ fn find_unquoted_operator(s: &str) -> Option<(usize, &'static str)> {
     None
 }
 
+/// Parse the body of a negation condition (everything after the leading `!`).
+///
+/// Validates that the negation is not doubled (`!!`), not combined with a
+/// comparison operator, and not missing the variable name.  Returns
+/// `Condition::Not(path)` on success.
+fn parse_negation_condition(rest: &str) -> Result<Condition, MdsError> {
+    if rest.starts_with('!') {
+        return Err(MdsError::syntax("double negation is not supported"));
+    }
+    if find_unquoted_operator(rest).is_some() {
+        return Err(MdsError::syntax(
+            "cannot combine negation with comparison; use @if var != 'value': instead",
+        ));
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err(MdsError::syntax("expected variable name after '!'"));
+    }
+    let path = parse_dot_path(rest)?;
+    Ok(Condition::Not(path))
+}
+
 /// Parse an `@if` or `@elseif` condition string into a `Condition`.
 ///
 /// Accepted forms:
@@ -571,23 +606,7 @@ fn parse_condition(s: &str) -> Result<Condition, MdsError> {
 
     // Negation prefix
     if let Some(rest) = s.strip_prefix('!') {
-        // Double negation
-        if rest.starts_with('!') {
-            return Err(MdsError::syntax("double negation is not supported"));
-        }
-        // Negation combined with comparison
-        if find_unquoted_operator(rest).is_some() {
-            return Err(MdsError::syntax(
-                "cannot combine negation with comparison; use @if var != 'value': instead",
-            ));
-        }
-        // Empty after '!'
-        let rest = rest.trim();
-        if rest.is_empty() {
-            return Err(MdsError::syntax("expected variable name after '!'"));
-        }
-        let path = parse_dot_path(rest)?;
-        return Ok(Condition::Not(path));
+        return parse_negation_condition(rest);
     }
 
     // Equality/inequality operators
@@ -608,7 +627,9 @@ fn parse_condition(s: &str) -> Result<Condition, MdsError> {
         return match op {
             "==" => Ok(Condition::Eq(path, value)),
             "!=" => Ok(Condition::NotEq(path, value)),
-            _ => unreachable!(),
+            other => Err(MdsError::syntax(format!(
+                "internal error: unrecognised operator '{other}' in @if condition"
+            ))),
         };
     }
 
