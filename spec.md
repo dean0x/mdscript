@@ -680,7 +680,7 @@ A language server (Rust) providing diagnostics, completions, go-to-definition fo
 These are intentionally deferred to keep the language simple and the compiler focused:
 
 - Structured JSON output (chat message arrays)
-- TypeScript/JS integration or runtime bindings
+- TypeScript/JS integration or runtime bindings (shipped post-v0.1: see `@mds/mds` npm package)
 - Built-in functions (upper, lower, join, etc.)
 - Recursion
 - Macros, async functions, streaming
@@ -728,8 +728,9 @@ escaped_brace   := "\{" | "\}"
 
 identifier      := [a-zA-Z_][a-zA-Z0-9_]*
 identifier_list := identifier ("," identifier)*
-quoted_string   := "\"" string_chars "\"" | "'" string_chars "'"
-string_chars    := (escape_seq | [^"\\] | [^'\\])*
+quoted_string   := "\"" dq_chars "\"" | "'" sq_chars "'"
+dq_chars        := (escape_seq | [^"\\])*
+sq_chars        := (escape_seq | [^'\\])*
 escape_seq      := "\\\\" | "\\\"" | "\\'"
 quoted_path     := "\"" path_chars "\""
 ```
@@ -738,4 +739,6 @@ quoted_path     := "\"" path_chars "\""
 
 ## 12. Status
 
-v0.1 — Initial release. The compiler is feature-complete as described in this specification.
+v0.1 — Initial release. The core compiler is feature-complete as described in this specification.
+
+Post-v0.1 additions (not yet released): negation in `@if` conditions (`!dot_path`), equality/inequality comparisons (`==`, `!=`), `@elseif` directive, NaN and Infinity rejection at parse time. These features are implemented and tested but will ship in the next release.
