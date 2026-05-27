@@ -21,6 +21,8 @@
     "dist-cjs/"
   ],
   "scripts": {
+    "clean:cjs": "node -e \"require('fs').rmSync('dist-cjs', { recursive: true, force: true })\"",
+    "prebuild": "npm run clean:cjs",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node -e \"require('fs').writeFileSync('dist-cjs/package.json', '{\\\"type\\\":\\\"commonjs\\\"}\\n')\"",
     "test": "NODE_ENV=test node --test __test__/*.spec.mjs"
   },

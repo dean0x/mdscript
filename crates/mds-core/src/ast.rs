@@ -19,6 +19,16 @@ pub enum CondValue {
     /// A string literal: `"admin"` or `'admin'`
     String(String),
     /// A numeric literal: `42`, `3.14`, `-5`
+    ///
+    /// # Invariant
+    ///
+    /// The parser rejects non-finite values (`NaN`, `+Inf`, `-Inf`) via
+    /// `is_finite()` before constructing this variant, so any `Number` in a
+    /// well-formed AST holds a finite `f64`. `PartialEq` is derived for
+    /// convenience; callers must not compare two `Number` values expecting
+    /// IEEE 754 NaN-equality — the invariant guarantees NaN is never stored,
+    /// but the derive means two `NaN` values would compare unequal if the
+    /// invariant were ever violated.
     Number(f64),
     /// A boolean literal: `true` or `false`
     Boolean(bool),
@@ -27,6 +37,15 @@ pub enum CondValue {
 }
 
 /// A condition in an `@if` or `@elseif` directive.
+///
+/// # Why no `PartialEq`
+///
+/// `Condition` intentionally does **not** derive `PartialEq` even though `CondValue`
+/// does. `CondValue::Number(f64)` uses IEEE 754 semantics where `NaN != NaN`, so
+/// a blanket derived `PartialEq` on `Condition` would be surprising and error-prone
+/// (the evaluator handles NaN safety explicitly). If structural comparison of
+/// `Condition` values is needed in the future, implement `PartialEq` manually with a
+/// clear comment about the NaN case rather than deriving it.
 #[derive(Debug, Clone)]
 pub enum Condition {
     /// `@if config.debug:` — truthy check on a dot-path variable
