@@ -15,11 +15,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 describe('bundler-utils CJS build', () => {
-  let cjsBuild;
-
   test('loads without error via require()', () => {
     const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
-    cjsBuild = require(cjsPath);
+    const cjsBuild = require(cjsPath);
     assert.ok(cjsBuild, 'CJS build should load successfully');
   });
 

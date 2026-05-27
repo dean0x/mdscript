@@ -1,6 +1,6 @@
 import { open, realpath } from 'node:fs/promises';
-import { constants } from 'node:fs';
-import { resolve, dirname, basename } from 'node:path';
+import { constants, existsSync } from 'node:fs';
+import { resolve, dirname, basename, relative } from 'node:path';
 
 // O_NOFOLLOW prevents the kernel from following a symlink at the final path
 // component. Using it closes the TOCTOU window between lstat and open.
@@ -10,8 +10,34 @@ const O_NOFOLLOW: number = (constants as Record<string, number>)['O_NOFOLLOW'] ?
 
 const MAX_PATH_SEGMENTS = 256;
 const MAX_IMPORT_DEPTH = 64;
+const MAX_TRAVERSAL_DEPTH = 256;
+const PROJECT_ROOT_MARKERS = ['.git', '.mdsroot'] as const;
 export const DEFAULT_MAX_MODULES = 256;
 export const DEFAULT_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
+
+/**
+ * Walk up from a directory to find the project root.
+ *
+ * Looks for `.git` or `.mdsroot` markers — the same markers the Rust
+ * NativeFs::find_project_root uses. Falls back to the given directory if no
+ * marker is found within MAX_TRAVERSAL_DEPTH parent directories.
+ */
+export function findProjectRoot(start: string): string {
+  let dir = start;
+  for (let i = 0; i < MAX_TRAVERSAL_DEPTH; i++) {
+    for (const marker of PROJECT_ROOT_MARKERS) {
+      if (existsSync(resolve(dir, marker))) {
+        return dir;
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      return start;
+    }
+    dir = parent;
+  }
+  return start;
+}
 
 /**
  * Open a file descriptor with O_NOFOLLOW | O_RDONLY, translating the ELOOP /
@@ -113,7 +139,7 @@ export function normalizeVirtualKey(base: string, relative: string): string {
  *
  * Security checks performed:
  * - Rejects symlinks (O_NOFOLLOW open; realpath check on Windows fallback)
- * - Rejects paths that escape the project root (entry file's directory)
+ * - Rejects paths that escape the project root (discovered via .git/.mdsroot markers)
  * - Rejects paths with null bytes or empty segments
  * - Enforces module count and aggregate size limits
  */
@@ -126,8 +152,8 @@ export async function buildModulesMap(
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
 
   const absoluteEntry = resolve(entryPath);
-  const projectRoot = dirname(absoluteEntry);
-  const entryFilename = basename(absoluteEntry);
+  const projectRoot = findProjectRoot(dirname(absoluteEntry));
+  const entryFilename = relative(projectRoot, absoluteEntry);
 
   // Security: entry file must not be at filesystem root — that would disable the
   // path traversal guard (projectRoot === '/' makes startsWith checks meaningless).

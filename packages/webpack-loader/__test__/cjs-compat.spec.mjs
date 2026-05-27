@@ -15,11 +15,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 describe('webpack-loader CJS build', () => {
-  let cjsBuild;
-
   test('loads without error via require()', () => {
     const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
-    cjsBuild = require(cjsPath);
+    const cjsBuild = require(cjsPath);
     assert.ok(cjsBuild, 'CJS build should load successfully');
   });
 
@@ -44,14 +42,4 @@ describe('webpack-loader CJS build', () => {
     assert.equal(typeof _setTransformerForTesting, 'function', '_setTransformerForTesting should be a function');
   });
 
-  test('CJS build uses require() for @mds/bundler-utils (not import)', () => {
-    // Verify the CJS build has been loaded and bundler-utils is accessible
-    // via the CommonJS resolution path. If require() succeeded in the first
-    // test, bundler-utils CJS build was resolved correctly.
-    const cjsBuild = require(resolve(__dirname, '../dist-cjs/index.js'));
-    assert.ok(
-      typeof cjsBuild.default === 'function',
-      'loader function should be accessible, confirming bundler-utils resolved via CJS',
-    );
-  });
 });

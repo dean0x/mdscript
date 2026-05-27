@@ -100,8 +100,8 @@ describe('buildModulesMap', () => {
   test('U-SM1: builds modules map for entry with imports', async () => {
     const entryPath = path.join(FIXTURES, 'imports', 'entry.mds');
     const { entryFilename, modules } = await buildModulesMap(entryPath, scanImports);
-    assert.equal(entryFilename, 'entry.mds');
-    assert.ok(typeof modules['entry.mds'] === 'string', 'entry should be in modules');
+    assert.ok(entryFilename.endsWith('imports/entry.mds'), `entry key should end with imports/entry.mds: ${entryFilename}`);
+    assert.ok(typeof modules[entryFilename] === 'string', 'entry should be in modules');
     // lib.mds and deep.mds should also be included
     assert.ok(Object.keys(modules).length >= 3, `expected at least 3 modules, got: ${Object.keys(modules)}`);
   });
@@ -109,8 +109,8 @@ describe('buildModulesMap', () => {
   test('U-SM2: builds modules map for file with no imports', async () => {
     const entryPath = path.join(FIXTURES, 'simple.mds');
     const { entryFilename, modules } = await buildModulesMap(entryPath, scanImports);
-    assert.equal(entryFilename, 'simple.mds');
-    assert.ok(typeof modules['simple.mds'] === 'string');
+    assert.ok(entryFilename.endsWith('simple.mds'), `entry key should end with simple.mds: ${entryFilename}`);
+    assert.ok(typeof modules[entryFilename] === 'string');
     assert.equal(Object.keys(modules).length, 1);
   });
 
@@ -154,6 +154,22 @@ describe('buildModulesMap', () => {
       () => buildModulesMap(entryPath, scanImports, { maxAggregateSize: 1 }),
       /resource limit.*aggregate module size/,
     );
+  });
+
+  test('U-SM8: resolves cross-directory imports via project root discovery', async () => {
+    // cross-dir/app/entry.mds imports ../lib/helpers.mds — a sibling directory.
+    // The scanner must walk up to find the project root (via .git marker) so that
+    // the import resolves within the project boundary instead of being rejected.
+    const entryPath = path.join(FIXTURES, 'cross-dir', 'app', 'entry.mds');
+    const { entryFilename, modules } = await buildModulesMap(entryPath, scanImports);
+    // Entry key should end with the path from the cross-dir root.
+    assert.ok(entryFilename.endsWith('cross-dir/app/entry.mds'), `entry key should include path: ${entryFilename}`);
+    // The entry module should be in the map under its key.
+    assert.ok(modules[entryFilename], 'entry should be in modules under its key');
+    // The sibling-directory module should also be present.
+    const helperKey = Object.keys(modules).find(k => k.endsWith('cross-dir/lib/helpers.mds'));
+    assert.ok(helperKey, `sibling dir module should be included, got keys: ${Object.keys(modules)}`);
+    assert.equal(Object.keys(modules).length, 2, 'should have exactly entry + helper');
   });
 
   test('U-SM7: rejects symlink with security error', async () => {

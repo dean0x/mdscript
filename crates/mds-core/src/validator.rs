@@ -133,10 +133,10 @@ fn validate_condition(
     offset: usize,
 ) -> Result<(), MdsError> {
     let root = condition.root()?;
-    scope.get_var(root).ok_or_else(|| {
-        MdsError::undefined_var_at(root, file, source, offset, root.len())
-    })?;
-    Ok(())
+    scope
+        .get_var(root)
+        .ok_or_else(|| MdsError::undefined_var_at(root, file, source, offset, root.len()))
+        .map(|_| ())
 }
 
 fn validate_expr(
