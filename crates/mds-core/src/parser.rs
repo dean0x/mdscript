@@ -9,8 +9,12 @@ use crate::lexer::Token;
 use crate::limits::MAX_DOT_SEGMENTS;
 
 /// Maximum nesting depth for @if/@for/@define blocks.
-/// Prevents stack overflow from crafted inputs with thousands of nested blocks.
-pub(crate) const MAX_NESTING_DEPTH: usize = 256;
+///
+/// Prevents stack overflow from crafted inputs with deeply-nested blocks.
+/// 64 levels is generous for any real template while keeping recursive parse
+/// frames well within the 2 MB default thread stack on Linux/macOS (debug and
+/// release builds).  256 required an 8 MB stack in tests; 64 does not.
+pub(crate) const MAX_NESTING_DEPTH: usize = 64;
 
 /// Parse a stream of tokens into a Module AST with optional source context for error spans.
 ///
@@ -208,8 +212,22 @@ impl Parser<'_> {
             ));
         }
 
+        // Give targeted hints for @elseif used outside an @if block
+        if trimmed.starts_with("@elseif ") || trimmed == "@elseif" {
+            return Err(MdsError::syntax(
+                "@elseif must appear inside an @if block",
+            ));
+        }
+
+        // Give a targeted hint for @elseif: (missing condition after the colon)
+        if trimmed.starts_with("@elseif:") {
+            return Err(MdsError::syntax(
+                "found '@elseif:' without a condition — use '@elseif <condition>:' (condition required)",
+            ));
+        }
+
         Err(MdsError::syntax(format!(
-            "unknown directive: {trimmed}. Valid directives: @if, @else:, @end, @for, @define, @import, @export, @include"
+            "unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include"
         )))
     }
 
@@ -229,22 +247,20 @@ impl Parser<'_> {
 
         // Collect @elseif branches
         let mut elseif_branches: Vec<(Condition, Vec<Node>)> = Vec::new();
-        while matches!(self.peek(), Some(Token::Directive(d, _)) if d.trim().starts_with("@elseif "))
-        {
+        while let Some(Token::Directive(d, _)) = self.peek() {
+            if !d.trim().starts_with("@elseif ") {
+                break;
+            }
             // Consume the @elseif directive token
-            let elseif_dir = match &self.tokens[self.pos] {
-                Token::Directive(d, _) => d.clone(),
-                _ => unreachable!(),
-            };
+            let elseif_dir = d.clone();
             self.pos += 1;
 
             // Extract condition string: strip "@elseif " prefix and trailing ":"
-            let elseif_trimmed = elseif_dir.trim();
-            let elseif_rest = elseif_trimmed
+            let elseif_cond_str = elseif_dir
+                .trim()
                 .strip_prefix("@elseif ")
                 .ok_or_else(|| MdsError::syntax("internal error: expected @elseif prefix"))?
-                .trim();
-            let elseif_cond_str = elseif_rest
+                .trim()
                 .strip_suffix(':')
                 .ok_or_else(|| MdsError::syntax("@elseif directive must end with ':'"))?
                 .trim();
@@ -254,13 +270,13 @@ impl Parser<'_> {
             // Parse body for this branch
             let elseif_body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
 
-            elseif_branches.push((elseif_cond, elseif_body));
-
-            if elseif_branches.len() > MAX_ELSEIF_BRANCHES {
+            if elseif_branches.len() >= MAX_ELSEIF_BRANCHES {
                 return Err(MdsError::syntax(format!(
                     "@if block has more than {MAX_ELSEIF_BRANCHES} @elseif branches"
                 )));
             }
+
+            elseif_branches.push((elseif_cond, elseif_body));
         }
 
         let else_body = if matches!(self.peek(), Some(Token::Directive(d, _)) if d.trim() == "@else:")
@@ -440,7 +456,7 @@ fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
         || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
     {
         let inner = &s[1..s.len() - 1];
-        return Ok(CondValue::String(inner.to_string()));
+        return Ok(CondValue::String(unescape_string(inner)));
     }
 
     // Unterminated string
@@ -465,6 +481,11 @@ fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
 
     // Numeric (integer or float, including negative)
     if let Ok(n) = s.parse::<f64>() {
+        if !n.is_finite() {
+            return Err(MdsError::syntax(
+                "NaN and infinity are not valid condition values",
+            ));
+        }
         return Ok(CondValue::Number(n));
     }
 
@@ -493,13 +514,15 @@ fn find_unquoted_operator(s: &str) -> Option<(usize, &'static str)> {
         let ch = bytes[i];
 
         if in_string {
-            if ch == string_char {
-                in_string = false;
-            }
-            // Skip escaped characters inside strings
+            // Check escape before close-quote: a backslash always consumes the
+            // next character, so the close-quote check must never run for the
+            // escaped character.
             if ch == b'\\' && i + 1 < len {
                 i += 2;
                 continue;
+            }
+            if ch == string_char {
+                in_string = false;
             }
             i += 1;
             continue;
@@ -537,12 +560,6 @@ fn find_unquoted_operator(s: &str) -> Option<(usize, &'static str)> {
 /// - `var == "value"` / `var != 42` → `Condition::Eq` / `Condition::NotEq`
 fn parse_condition(s: &str) -> Result<Condition, MdsError> {
     let s = s.trim();
-
-    // Check for bare `=` (not `==`) — common mistake
-    // We check this after the equality operator scan, but we do a quick
-    // pre-check here so we can give a targeted hint.
-    // (We only check for bare `=` not preceded/followed by another `=`.)
-    // This is handled below after the equality check.
 
     // Negation prefix
     if let Some(rest) = s.strip_prefix('!') {
@@ -1554,62 +1571,50 @@ mod tests {
         // Build a source string with MAX_NESTING_DEPTH + 1 nested @if blocks.
         // Each @if requires a condition variable — we use "x" consistently.
         //
-        // Run in a thread with a larger stack (8 MB) because deeply-nested @if
-        // blocks create equally deep parse_body/parse_if_block call chains.
-        // The depth limit error must fire BEFORE the system stack overflows.
-        let handle = std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let depth = MAX_NESTING_DEPTH + 1;
-                let mut src = String::new();
-                for _ in 0..depth {
-                    src.push_str("@if x:\n");
-                }
-                for _ in 0..depth {
-                    src.push_str("@end\n");
-                }
-                let tokens = tokenize(&src, "test.mds").unwrap();
-                let result = parse_with_ctx(&tokens, "", "");
-                assert!(
-                    result.is_err(),
-                    "nesting depth > MAX_NESTING_DEPTH must be rejected"
-                );
-                let err = result.unwrap_err();
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("nesting depth"),
-                    "error must mention nesting depth, got: {msg}"
-                );
-            })
-            .unwrap();
-        handle.join().unwrap();
+        // MAX_NESTING_DEPTH=64 keeps recursive parse frames well within the
+        // 2 MB default thread stack, so no enlarged stack is required here.
+        let depth = MAX_NESTING_DEPTH + 1;
+        let mut src = String::new();
+        for _ in 0..depth {
+            src.push_str("@if x:\n");
+        }
+        for _ in 0..depth {
+            src.push_str("@end\n");
+        }
+        let tokens = tokenize(&src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(
+            result.is_err(),
+            "nesting depth > MAX_NESTING_DEPTH must be rejected"
+        );
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nesting depth"),
+            "error must mention nesting depth, got: {msg}"
+        );
     }
 
     #[test]
     fn parse_nesting_depth_at_limit_accepted() {
         // Exactly MAX_NESTING_DEPTH nested @if blocks must succeed.
         //
-        // Run in a thread with a larger stack (8 MB) — see above.
-        let handle = std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                let depth = MAX_NESTING_DEPTH;
-                let mut src = String::new();
-                for _ in 0..depth {
-                    src.push_str("@if x:\n");
-                }
-                for _ in 0..depth {
-                    src.push_str("@end\n");
-                }
-                let tokens = tokenize(&src, "test.mds").unwrap();
-                let result = parse_with_ctx(&tokens, "", "");
-                assert!(
-                    result.is_ok(),
-                    "nesting depth == MAX_NESTING_DEPTH must be accepted: {result:?}"
-                );
-            })
-            .unwrap();
-        handle.join().unwrap();
+        // MAX_NESTING_DEPTH=64 keeps recursive parse frames well within the
+        // 2 MB default thread stack, so no enlarged stack is required here.
+        let depth = MAX_NESTING_DEPTH;
+        let mut src = String::new();
+        for _ in 0..depth {
+            src.push_str("@if x:\n");
+        }
+        for _ in 0..depth {
+            src.push_str("@end\n");
+        }
+        let tokens = tokenize(&src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(
+            result.is_ok(),
+            "nesting depth == MAX_NESTING_DEPTH must be accepted: {result:?}"
+        );
     }
 
     #[test]
@@ -1621,5 +1626,128 @@ mod tests {
         );
         assert!(is_valid_identifier("hello"), "ascii ident must be accepted");
         assert!(is_valid_identifier("_foo_42"), "underscored ident ok");
+    }
+
+    // --- Tests for batch-1 fixes ---
+
+    // Fix: parser:212:error-msg — @elseif outside @if gives targeted error
+    #[test]
+    fn elseif_outside_if_gives_targeted_error() {
+        let src = "@elseif x:\nfoo\n@end\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(result.is_err(), "@elseif outside @if must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("@elseif must appear inside an @if block"),
+            "error must mention @if block context, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn elseif_colon_without_condition_gives_targeted_error() {
+        // @elseif: (has colon but no condition) used as a top-level directive
+        let src = "@elseif:\nfoo\n@end\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(result.is_err(), "@elseif: at top level must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("condition required") || msg.contains("@elseif"),
+            "error must mention missing condition, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_directive_lists_elseif() {
+        // An unrecognized directive gives an error listing valid directives
+        // including @elseif
+        let src = "@bogus\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let result = parse_with_ctx(&tokens, "", "");
+        assert!(result.is_err(), "@bogus must be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("@elseif"),
+            "valid-directives list must include @elseif, got: {msg}"
+        );
+    }
+
+    // Fix: parser:464:nan-infinity — NaN/Infinity rejected in condition values
+    #[test]
+    fn condition_value_nan_rejected() {
+        let result = parse_cond_value("NaN");
+        assert!(result.is_err(), "NaN must be rejected as a condition value");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("NaN") || msg.contains("infinity"),
+            "error must mention NaN/infinity, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn condition_value_infinity_rejected() {
+        let result = parse_cond_value("inf");
+        assert!(
+            result.is_err(),
+            "infinity must be rejected as a condition value"
+        );
+    }
+
+    #[test]
+    fn condition_value_negative_infinity_rejected() {
+        let result = parse_cond_value("-inf");
+        assert!(
+            result.is_err(),
+            "-infinity must be rejected as a condition value"
+        );
+    }
+
+    #[test]
+    fn condition_value_finite_numbers_accepted() {
+        assert!(parse_cond_value("42").is_ok());
+        assert!(parse_cond_value("-5").is_ok());
+        assert!(parse_cond_value("3.14").is_ok());
+    }
+
+    // Fix: parser:436:escape-sequences — escape sequences in condition string literals
+    #[test]
+    fn condition_value_escaped_quote_in_string() {
+        // @if var == "say \"hi\"": — inner escaped quote must be unescaped
+        let result = parse_cond_value(r#""say \"hi\"""#);
+        assert!(result.is_ok(), "escaped quote in condition value must parse");
+        if let Ok(CondValue::String(s)) = result {
+            assert_eq!(s, r#"say "hi""#, "escaped quote must be unescaped");
+        } else {
+            panic!("expected CondValue::String");
+        }
+    }
+
+    #[test]
+    fn condition_value_unescaped_string_unchanged() {
+        // Plain strings with no escapes must pass through unchanged
+        let result = parse_cond_value(r#""hello world""#);
+        assert!(result.is_ok());
+        if let Ok(CondValue::String(s)) = result {
+            assert_eq!(s, "hello world");
+        } else {
+            panic!("expected CondValue::String");
+        }
+    }
+
+    // Fix: parser:493:escape-order — escaped close-quote inside string does not
+    // terminate the string prematurely in find_unquoted_operator
+    #[test]
+    fn find_unquoted_operator_escaped_close_quote_not_terminator() {
+        // In `var == "say \"hi\""`, the \" inside the string must not end the string.
+        // The operator == must still be found (outside the string).
+        let result = find_unquoted_operator(r#"var == "say \"hi\"""#);
+        assert!(
+            result.is_some(),
+            "== must be found outside the string literal"
+        );
+        let (pos, op) = result.unwrap();
+        assert_eq!(op, "==");
+        assert_eq!(pos, 4, "== must be at byte 4");
     }
 }
