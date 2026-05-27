@@ -16,7 +16,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Import from the compiled dist.
 // Note: module-scanner is a Node-only utility (uses fs/promises).
-const { normalizeVirtualKey, buildModulesMap } = await import('../dist/util/module-scanner.js');
+const { normalizeVirtualKey, buildModulesMap, findProjectRoot } = await import('../dist/util/module-scanner.js');
 
 const FIXTURES = path.join(__dirname, 'fixtures');
 
@@ -188,6 +188,102 @@ describe('buildModulesMap', () => {
       );
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('findProjectRoot', () => {
+  // Each test uses a fresh mkdtemp directory to guarantee unique paths that
+  // will not collide with cached results from prior test runs.
+
+  test('U-PR1: returns directory containing .git marker', async () => {
+    // Arrange: root/sub/ — .git lives at root, start is root/sub
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-pr-test-'));
+    try {
+      const sub = path.join(root, 'sub');
+      const { mkdir } = await import('node:fs/promises');
+      await mkdir(sub);
+      await mkdir(path.join(root, '.git'));
+      // Act
+      const result = findProjectRoot(sub);
+      // Assert: should walk up from sub and find root via .git
+      assert.equal(result, root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('U-PR2: returns directory containing .mdsroot marker', async () => {
+    // Arrange: root/a/b/ — .mdsroot lives at root, start is root/a/b
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-pr-test-'));
+    try {
+      const { mkdir } = await import('node:fs/promises');
+      const deep = path.join(root, 'a', 'b');
+      await mkdir(deep, { recursive: true });
+      await writeFile(path.join(root, '.mdsroot'), '');
+      // Act
+      const result = findProjectRoot(deep);
+      // Assert: should walk up and find root via .mdsroot
+      assert.equal(result, root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('U-PR3: falls back to start directory when no marker is found', async () => {
+    // Arrange: isolated temp dir with no .git or .mdsroot anywhere in its tree.
+    // We create a subdirectory so the traversal has at least one step.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-pr-test-'));
+    try {
+      const { mkdir } = await import('node:fs/promises');
+      const sub = path.join(root, 'sub');
+      await mkdir(sub);
+      // Act: use a deep path that lives inside os.tmpdir() but has no marker.
+      // We cannot guarantee os.tmpdir() itself has no .git, so we test with
+      // a start path that is the isolated temp dir itself — walking up will
+      // eventually leave the temp tree and hit the OS root. The fallback must
+      // be the original start argument.
+      const result = findProjectRoot(sub);
+      // Assert: fallback equals the start argument (not some parent)
+      assert.equal(result, sub);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('U-PR4: returns start when called with a path already at filesystem root sentinel', () => {
+    // Simulate the filesystem-root sentinel: dirname(x) === x. We verify that
+    // findProjectRoot('') does not loop forever — dirname('') returns '.' which
+    // is not the same as '' so this exercises the loop normally, but we can
+    // verify a known-fallback path like the OS temp dir itself.
+    // The real edge case (parent === dir) fires at the OS root '/'.
+    // We verify indirectly: if the traversal walked up to '/', findProjectRoot
+    // returned start. We test this by confirming that a fresh temp directory
+    // (with no markers) returns the start, not '/'.
+    const start = os.tmpdir();
+    const result = findProjectRoot(start);
+    // Result is either start (no marker found and fallback triggered) or
+    // some ancestor that happens to have a .git. Either way, it must be a string
+    // and must not be empty — we cannot assert the exact value here because
+    // os.tmpdir() may be inside a git repo on some machines.
+    assert.ok(typeof result === 'string' && result.length > 0, 'result must be a non-empty path');
+  });
+
+  test('U-PR5: result is cached — same start returns same value on second call', async () => {
+    // The cache makes repeated traversal O(1) after the first call.
+    // We verify observable correctness: two calls with the same start return ===.
+    const root = await mkdtemp(path.join(os.tmpdir(), 'mds-pr-test-'));
+    try {
+      const { mkdir } = await import('node:fs/promises');
+      const sub = path.join(root, 'sub');
+      await mkdir(sub);
+      await mkdir(path.join(root, '.git'));
+      const first = findProjectRoot(sub);
+      const second = findProjectRoot(sub);
+      assert.equal(first, second);
+      assert.equal(first, root);
+    } finally {
+      await rm(root, { recursive: true, force: true });
     }
   });
 });

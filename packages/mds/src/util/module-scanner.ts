@@ -16,26 +16,46 @@ export const DEFAULT_MAX_MODULES = 256;
 export const DEFAULT_MAX_AGGREGATE_SIZE = 10 * 1024 * 1024; // 10 MiB
 
 /**
+ * Cache from start-directory → project-root result. The project root is
+ * invariant within a single build, so repeated calls from the same start
+ * directory (one per Webpack loader invocation) skip the traversal entirely.
+ * Each traversal performs up to MAX_TRAVERSAL_DEPTH × |markers| synchronous
+ * I/O calls, which can block the event loop on deep trees or network FSes.
+ */
+const projectRootCache = new Map<string, string>();
+
+/**
  * Walk up from a directory to find the project root.
  *
  * Looks for `.git` or `.mdsroot` markers — the same markers the Rust
  * NativeFs::find_project_root uses. Falls back to the given directory if no
  * marker is found within MAX_TRAVERSAL_DEPTH parent directories.
+ *
+ * Results are cached by start directory: the project root is invariant within
+ * a build, so repeated calls incur only a single Map lookup after the first.
  */
 export function findProjectRoot(start: string): string {
+  const cached = projectRootCache.get(start);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   let dir = start;
   for (let i = 0; i < MAX_TRAVERSAL_DEPTH; i++) {
     for (const marker of PROJECT_ROOT_MARKERS) {
       if (existsSync(resolve(dir, marker))) {
+        projectRootCache.set(start, dir);
         return dir;
       }
     }
     const parent = dirname(dir);
     if (parent === dir) {
+      projectRootCache.set(start, start);
       return start;
     }
     dir = parent;
   }
+  projectRootCache.set(start, start);
   return start;
 }
 
