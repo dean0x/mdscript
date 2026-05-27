@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::{Arg, CondValue, Condition, Expr, ForBlock, IfBlock, IncludeDirective, Node};
+use crate::ast::{
+    Arg, CondValue, Condition, Expr, ForBlock, IfBlock, IncludeDirective, Node, MAX_ELSEIF_BRANCHES,
+};
 use crate::error::MdsError;
 use crate::limits::MAX_DOT_SEGMENTS;
 use crate::scope::{FunctionDef, Scope};
@@ -374,6 +376,14 @@ fn evaluate_if(
     }
 
     // Evaluate @elseif branches in order (short-circuit: first true branch wins)
+    // Parser enforces MAX_ELSEIF_BRANCHES at construction time; assert the invariant
+    // holds so evaluator correctness cannot silently depend on the parser limit alone.
+    debug_assert!(
+        block.elseif_branches.len() <= MAX_ELSEIF_BRANCHES,
+        "elseif_branches length {} exceeds MAX_ELSEIF_BRANCHES {}",
+        block.elseif_branches.len(),
+        MAX_ELSEIF_BRANCHES,
+    );
     for (cond, body) in &block.elseif_branches {
         if evaluate_condition(cond, scope)? {
             return evaluate_nodes(body, scope, ctx);

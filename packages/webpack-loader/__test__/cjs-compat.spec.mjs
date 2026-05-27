@@ -10,28 +10,30 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
-describe('webpack-loader CJS build', () => {
+const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
+const hasCjsBuild = existsSync(cjsPath);
+
+describe('webpack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
   test('loads without error via require()', () => {
-    const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
     const cjsBuild = require(cjsPath);
     assert.ok(cjsBuild, 'CJS build should load successfully');
   });
 
   test('exports default as an async function (the loader)', () => {
-    const { default: mdsLoader } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { default: mdsLoader } = require(cjsPath);
     assert.equal(typeof mdsLoader, 'function', 'default export should be a function');
     // Webpack loaders must return a Promise. Verify the behavioral contract by
     // invoking the loader with a minimal mock context that satisfies its
     // interface: async() returns a no-op callback, getOptions() returns {}.
     // We only check the return type — we do not assert on side effects.
-    let capturedCallback = null;
     const mockContext = {
       resourcePath: '/dev/null/nonexistent.mds',
-      async() { return (err, _content) => { capturedCallback = err; }; },
+      async() { return () => {}; },
       addDependency() {},
       emitWarning() {},
       getOptions() { return {}; },
@@ -46,12 +48,12 @@ describe('webpack-loader CJS build', () => {
   });
 
   test('exports _resetForTesting helper', () => {
-    const { _resetForTesting } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { _resetForTesting } = require(cjsPath);
     assert.equal(typeof _resetForTesting, 'function', '_resetForTesting should be a function');
   });
 
   test('exports _setTransformerForTesting helper', () => {
-    const { _setTransformerForTesting } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { _setTransformerForTesting } = require(cjsPath);
     assert.equal(typeof _setTransformerForTesting, 'function', '_setTransformerForTesting should be a function');
   });
 

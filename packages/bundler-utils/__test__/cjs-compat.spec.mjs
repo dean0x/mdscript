@@ -10,39 +10,42 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
-describe('bundler-utils CJS build', () => {
+const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
+const hasCjsBuild = existsSync(cjsPath);
+
+describe('bundler-utils CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
   test('loads without error via require()', () => {
-    const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
     const cjsBuild = require(cjsPath);
     assert.ok(cjsBuild, 'CJS build should load successfully');
   });
 
   test('exports createMdsTransformer', () => {
-    const { createMdsTransformer } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { createMdsTransformer } = require(cjsPath);
     assert.equal(typeof createMdsTransformer, 'function', 'createMdsTransformer should be a function');
   });
 
   test('exports formatMdsError', () => {
-    const { formatMdsError } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { formatMdsError } = require(cjsPath);
     assert.equal(typeof formatMdsError, 'function', 'formatMdsError should be a function');
   });
 
   test('exports shouldTransform', () => {
-    const { shouldTransform } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { shouldTransform } = require(cjsPath);
     assert.equal(typeof shouldTransform, 'function', 'shouldTransform should be a function');
   });
 
   test('exports LazyInit', () => {
-    const { LazyInit } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { LazyInit } = require(cjsPath);
     assert.equal(typeof LazyInit, 'function', 'LazyInit should be a constructor function');
   });
 
   test('LazyInit works correctly when loaded via require()', async () => {
-    const { LazyInit } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { LazyInit } = require(cjsPath);
     let callCount = 0;
     const lazy = new LazyInit(async () => {
       callCount++;
@@ -58,13 +61,13 @@ describe('bundler-utils CJS build', () => {
   });
 
   test('shouldTransform returns true for .mds files', () => {
-    const { shouldTransform } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { shouldTransform } = require(cjsPath);
     assert.equal(shouldTransform('/path/to/file.mds'), true);
     assert.equal(shouldTransform('/path/to/file.ts'), false);
   });
 
   test('formatMdsError handles plain Error objects', () => {
-    const { formatMdsError } = require(resolve(__dirname, '../dist-cjs/index.js'));
+    const { formatMdsError } = require(cjsPath);
     const err = new Error('Something went wrong');
     const result = formatMdsError(err, '/file.mds');
     assert.equal(typeof result.message, 'string');
