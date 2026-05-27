@@ -60,7 +60,7 @@ function getLazy(options: MdsPluginOptions, emitWarning: (err: Error) => void): 
         typeof (importResult as { then?: unknown }).then !== 'function'
       ) {
         throw new Error(
-          '_esmImport() did not return a thenable. The new Function() wrapper is broken in this environment.',
+          'esmImport() did not return a thenable. The new Function() wrapper is broken in this environment.',
         );
       }
       const mds = await importResult as typeof import('@mds/mds');
@@ -104,12 +104,8 @@ export default async function mdsLoader(this: LoaderContext): Promise<void> {
 
 /**
  * Reset singleton state for testing.
- * FOR TESTING ONLY — throws unless NODE_ENV=test.
  */
 export function _resetForTesting(): void {
-  if (process.env['NODE_ENV'] !== 'test') {
-    throw new Error('_resetForTesting is only allowed when NODE_ENV=test');
-  }
   lazy?.reset();
   lazy = null;
   capturedOptions = null;
@@ -120,12 +116,8 @@ export function _resetForTesting(): void {
  * @mds/mds import. Allows tests to provide a mock transformer that returns
  * controlled warnings, dependencies, and output. Pass null to tear down the
  * injected transformer (equivalent to calling _resetForTesting).
- * FOR TESTING ONLY — throws unless NODE_ENV=test.
  */
 export function _setTransformerForTesting(t: Transformer | null): void {
-  if (process.env['NODE_ENV'] !== 'test') {
-    throw new Error('_setTransformerForTesting is only allowed when NODE_ENV=test');
-  }
   if (t === null) {
     lazy?.reset();
     lazy = null;

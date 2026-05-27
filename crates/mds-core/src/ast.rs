@@ -62,7 +62,10 @@ impl Condition {
     /// Extract the dot-path from any condition variant.
     pub fn path(&self) -> &[String] {
         match self {
-            Condition::Truthy(p) | Condition::Not(p) | Condition::Eq(p, _) | Condition::NotEq(p, _) => p,
+            Condition::Truthy(p)
+            | Condition::Not(p)
+            | Condition::Eq(p, _)
+            | Condition::NotEq(p, _) => p,
         }
     }
 
