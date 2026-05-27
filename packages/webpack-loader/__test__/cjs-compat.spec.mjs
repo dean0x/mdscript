@@ -19,13 +19,14 @@ const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
 const hasCjsBuild = existsSync(cjsPath);
 
 describe('webpack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
+  const cjsBuild = require(cjsPath);
+  const { default: mdsLoader, _resetForTesting, _setTransformerForTesting } = cjsBuild;
+
   test('loads without error via require()', () => {
-    const cjsBuild = require(cjsPath);
     assert.ok(cjsBuild, 'CJS build should load successfully');
   });
 
   test('exports default as an async function (the loader)', () => {
-    const { default: mdsLoader } = require(cjsPath);
     assert.equal(typeof mdsLoader, 'function', 'default export should be a function');
     // Webpack loaders must return a Promise. Verify the behavioral contract by
     // invoking the loader with a minimal mock context that satisfies its
@@ -48,12 +49,10 @@ describe('webpack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not buil
   });
 
   test('exports _resetForTesting helper', () => {
-    const { _resetForTesting } = require(cjsPath);
     assert.equal(typeof _resetForTesting, 'function', '_resetForTesting should be a function');
   });
 
   test('exports _setTransformerForTesting helper', () => {
-    const { _setTransformerForTesting } = require(cjsPath);
     assert.equal(typeof _setTransformerForTesting, 'function', '_setTransformerForTesting should be a function');
   });
 

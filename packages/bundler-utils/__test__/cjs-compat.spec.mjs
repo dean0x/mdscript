@@ -19,33 +19,30 @@ const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
 const hasCjsBuild = existsSync(cjsPath);
 
 describe('bundler-utils CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
+  const cjsBuild = require(cjsPath);
+  const { createMdsTransformer, formatMdsError, shouldTransform, LazyInit } = cjsBuild;
+
   test('loads without error via require()', () => {
-    const cjsBuild = require(cjsPath);
     assert.ok(cjsBuild, 'CJS build should load successfully');
   });
 
   test('exports createMdsTransformer', () => {
-    const { createMdsTransformer } = require(cjsPath);
     assert.equal(typeof createMdsTransformer, 'function', 'createMdsTransformer should be a function');
   });
 
   test('exports formatMdsError', () => {
-    const { formatMdsError } = require(cjsPath);
     assert.equal(typeof formatMdsError, 'function', 'formatMdsError should be a function');
   });
 
   test('exports shouldTransform', () => {
-    const { shouldTransform } = require(cjsPath);
     assert.equal(typeof shouldTransform, 'function', 'shouldTransform should be a function');
   });
 
   test('exports LazyInit', () => {
-    const { LazyInit } = require(cjsPath);
     assert.equal(typeof LazyInit, 'function', 'LazyInit should be a constructor function');
   });
 
   test('LazyInit works correctly when loaded via require()', async () => {
-    const { LazyInit } = require(cjsPath);
     let callCount = 0;
     const lazy = new LazyInit(async () => {
       callCount++;
@@ -61,13 +58,11 @@ describe('bundler-utils CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built
   });
 
   test('shouldTransform returns true for .mds files', () => {
-    const { shouldTransform } = require(cjsPath);
     assert.equal(shouldTransform('/path/to/file.mds'), true);
     assert.equal(shouldTransform('/path/to/file.ts'), false);
   });
 
   test('formatMdsError handles plain Error objects', () => {
-    const { formatMdsError } = require(cjsPath);
     const err = new Error('Something went wrong');
     const result = formatMdsError(err, '/file.mds');
     assert.equal(typeof result.message, 'string');
