@@ -82,7 +82,7 @@ jobs:
       - name: Build addon
         working-directory: crates/mds-napi
         run: npx ${{ matrix.settings.build }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.settings.target }}
           path: crates/mds-napi/*.node
@@ -119,7 +119,7 @@ jobs:
       - name: A3 — name <-> loader verification gate
         run: node scripts/verify-napi-names.mjs
       - name: Upload staged napi tree
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: napi-staged
           path: |
