@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - name: Assert synchronized versions, no file: refs
+      - name: "Assert synchronized versions, no file: refs"
         run: node scripts/verify-versions.mjs
 
   # ---------------------------------------------------------------------------
@@ -75,7 +75,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: ${{ matrix.settings.target }} }
+        with:
+          targets: ${{ matrix.settings.target }}
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
       - name: Build addon
