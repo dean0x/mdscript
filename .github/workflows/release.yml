@@ -185,6 +185,8 @@ jobs:
         with: { targets: wasm32-unknown-unknown }
       - uses: Swatinem/rust-cache@v2
       - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
       - run: npm ci
       - name: Restore staged napi tree (.node + npm/ platform dirs)
         uses: actions/download-artifact@v4

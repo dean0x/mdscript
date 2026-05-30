@@ -56,6 +56,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
       - name: Build (nodejs + web targets)
         run: |
           wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
@@ -87,6 +89,8 @@ jobs:
         run: npx napi build --platform --release --no-js
       # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
       - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
       - name: Build WASM (nodejs)
         run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
       - name: Build TS packages
