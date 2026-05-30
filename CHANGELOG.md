@@ -89,6 +89,6 @@ stamps the version number and date at tag time.
 
 ### Tests
 
-- 292 Rust tests (integration, unit, and doc-tests) plus the JavaScript package suites
+- 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
 [Unreleased]: https://github.com/dean0x/mds/commits/main
