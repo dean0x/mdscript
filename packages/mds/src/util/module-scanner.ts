@@ -1,6 +1,6 @@
 import { open, realpath } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
-import { resolve, dirname, relative } from 'node:path';
+import { resolve, dirname, relative, isAbsolute, sep } from 'node:path';
 
 // O_NOFOLLOW prevents the kernel from following a symlink at the final path
 // component. Using it closes the TOCTOU window between lstat and open.
@@ -84,6 +84,21 @@ function _findProjectRootUncached(start: string): string {
     dir = parent;
   }
   return start;
+}
+
+/**
+ * Cross-platform check that `candidate` is the project root itself or nested
+ * within it. Uses `path.relative` rather than string prefix matching so it is
+ * correct on Windows (backslash separators, drive letters, case-insensitive
+ * filesystem) as well as POSIX: a candidate outside the root yields a relative
+ * path that is either absolute or begins with `..`.
+ */
+function isWithinRoot(root: string, candidate: string): boolean {
+  if (candidate === root) {
+    return true;
+  }
+  const rel = relative(root, candidate);
+  return rel.length > 0 && rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel);
 }
 
 /**
@@ -210,11 +225,15 @@ export async function buildModulesMap(
 
   const absoluteEntry = resolve(entryPath);
   const projectRoot = findProjectRoot(dirname(absoluteEntry));
-  const entryFilename = relative(projectRoot, absoluteEntry);
+  // Virtual keys are always slash-separated to mirror Rust's VirtualFs; on
+  // Windows `relative` yields backslashes, so normalize to '/'.
+  const entryFilename = relative(projectRoot, absoluteEntry).split(sep).join('/');
 
   // Security: entry file must not be at filesystem root — that would disable the
-  // path traversal guard (projectRoot === '/' makes startsWith checks meaningless).
-  if (projectRoot === '/' || projectRoot === '') {
+  // path traversal guard (a root project dir makes containment checks meaningless).
+  // `dirname(root) === root` is true exactly at a filesystem root on every
+  // platform ('/', 'C:\\', '\\\\server\\share\\').
+  if (projectRoot === '' || dirname(projectRoot) === projectRoot) {
     throw new Error('security: project root cannot be filesystem root');
   }
 
@@ -238,7 +257,7 @@ export async function buildModulesMap(
     const childAbsolute = resolve(absoluteDir, importPath);
 
     // Security: verify child is within project root.
-    if (!childAbsolute.startsWith(projectRoot + '/') && childAbsolute !== projectRoot) {
+    if (!isWithinRoot(projectRoot, childAbsolute)) {
       throw new Error(
         `security: import path escapes project root: ${childAbsolute} is outside ${projectRoot}`,
       );
@@ -265,7 +284,7 @@ export async function buildModulesMap(
     absolutePath: string,
   ): Promise<{ handle: Awaited<ReturnType<typeof open>>; size: number }> {
     // Security: verify path is within project root before opening.
-    if (!absolutePath.startsWith(projectRoot + '/') && absolutePath !== projectRoot) {
+    if (!isWithinRoot(projectRoot, absolutePath)) {
       throw new Error(
         `security: path escapes project root: ${absolutePath} is outside ${projectRoot}`,
       );
@@ -291,8 +310,13 @@ export async function buildModulesMap(
 
       // On platforms where O_NOFOLLOW=0 (e.g. Windows), the open() above did
       // not prevent symlink traversal. A post-open realpath comparison catches
-      // a symlink that was in place at open time.
-      if (resolved !== absolutePath) {
+      // a symlink that was in place at open time. Windows' filesystem is
+      // case-insensitive and `realpath` may return a different drive-letter
+      // case than `resolve` produced, so compare case-insensitively there.
+      const realpathMismatch = process.platform === 'win32'
+        ? resolved.toLowerCase() !== absolutePath.toLowerCase()
+        : resolved !== absolutePath;
+      if (realpathMismatch) {
         throw new Error(
           `security: path ${absolutePath} resolved to unexpected location ${resolved} — possible symlink`,
         );
