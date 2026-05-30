@@ -3,7 +3,7 @@
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeFileSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -41,9 +41,10 @@ describe('bundler-utils integration', () => {
 
     assert.ok(result.code.includes('export default'), 'should have default export');
     assert.ok(result.dependencies.length >= 1, 'should have at least one dependency');
-    // The dependency should be an absolute path
+    // The dependency should be an absolute path (cross-platform: POSIX `/…`,
+    // Windows `D:\…` or `\\?\D:\…`).
     for (const dep of result.dependencies) {
-      assert.ok(dep.startsWith('/'), `dependency should be absolute path: ${dep}`);
+      assert.ok(isAbsolute(dep), `dependency should be absolute path: ${dep}`);
     }
   });
 
