@@ -1,0 +1,37 @@
+---
+empty_arr: []
+empty_obj: {}
+filled_arr:
+  - one
+label: test
+---
+
+Before empty array loop.
+
+@for item in empty_arr:
+FAIL: should not render {item}
+@end
+
+After empty array loop.
+
+@for key, val in empty_obj:
+FAIL: should not render {key} {val}
+@end
+
+After empty object loop.
+
+@if empty_arr:
+FAIL: empty array truthy
+@end
+
+@if empty_obj:
+FAIL: empty object truthy
+@end
+
+Non-empty works: {label}
+
+@for item in filled_arr:
+- {item}
+@end
+
+Done.

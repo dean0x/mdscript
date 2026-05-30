@@ -1,0 +1,36 @@
+---
+language: Python
+framework: FastAPI
+---
+
+@import "../lib/formatting.mds" as fmt
+
+# {fmt.bold(language)} Code Examples
+
+Here's a {language} example using {framework}:
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/items/{item_id}")
+async def read_item(item_id: int):
+    return {"item_id": item_id, "status": "active"}
+
+config = {"key": "value", "nested": {"deep": True}}
+template = f"Hello {name}!"
+```
+
+After the code block, interpolation resumes: {language} with {framework}.
+
+```json
+{
+  "name": "test",
+  "config": {
+    "debug": true
+  }
+}
+```
+
+Final interpolation: {fmt.badge("Stack", language)}

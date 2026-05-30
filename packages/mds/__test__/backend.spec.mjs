@@ -1,5 +1,5 @@
 /**
- * Backend selection tests for @mds/mds universal package.
+ * Backend selection tests for @mdscript/mds universal package.
  * Tests: U-B1 through U-B11
  */
 import { test, describe, before } from 'node:test';

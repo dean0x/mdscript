@@ -1,0 +1,74 @@
+---
+project_name: AI Agent Factory
+version: "1.0"
+environment: production
+debug: false
+enabled_agents:
+  - DataInsight Pro
+  - CodeReview Bot
+  - Orchestrator
+metadata:
+  author: Stress Test Suite
+  generated: true
+---
+
+@import "./lib/index.mds" as lib
+@import "./agents/data-analyst.mds" as analyst
+@import "./agents/orchestrator.mds" as orch
+@import "./shared/output-formats.mds"
+
+# {lib.bold(project_name)} v{version}
+
+{lib.badge("Environment", environment)}
+{lib.badge("Debug", debug)}
+
+## Enabled Agents
+
+@for agent in enabled_agents:
+- {lib.code(agent)}
+@end
+
+## Safety
+
+{lib.safety_rules()}
+
+## Persona: Data Analyst
+
+{lib.data_analyst("Finance", enabled_agents)}
+
+## Output Configuration
+
+{format_output("markdown", debug)}
+
+## Code Block Passthrough
+
+```yaml
+config:
+  name: "{project_name}"
+  nested: {key: value}
+  template: "@if condition:"
+```
+
+After code block: {project_name} still works.
+
+## Escaped Braces
+
+Literal braces: \{not_interpolated\} but this is: {version}
+
+## Included Modules
+
+@include analyst
+
+---
+
+@include orch
+
+## Summary
+
+{lib.bold(project_name)} is configured with {lib.code(version)} in {environment} mode.
+
+@if debug:
+Debug mode is ON — verbose logging enabled.
+@else:
+Running in production mode.
+@end

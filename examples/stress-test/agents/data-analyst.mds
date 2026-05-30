@@ -1,0 +1,78 @@
+---
+agent_name: DataInsight Pro
+version: "2.1"
+model: claude-sonnet-4-6
+capabilities:
+  - SQL query generation
+  - Statistical analysis
+  - Data visualization
+  - Anomaly detection
+constraints:
+  max_rows: 50000
+  timeout: 30
+  allowed_schemas:
+    - analytics
+    - reporting
+    - staging
+tools:
+  - name: sql_runner
+    type: query
+    safe: true
+  - name: chart_builder
+    type: visualization
+    safe: true
+  - name: data_export
+    type: export
+    safe: false
+debug: false
+output_format: markdown
+---
+
+@import "../lib/index.mds" as lib
+@import "../shared/output-formats.mds"
+
+# {lib.bold(agent_name)} Configuration
+
+{lib.badge("Version", version)}
+{lib.badge("Model", model)}
+
+## Capabilities
+
+@for cap in capabilities:
+- {lib.code(cap)}
+@end
+
+## Tools
+
+@for tool in tools:
+@if tool.safe:
+- {lib.bold(tool.name)} ({tool.type}) — Safe
+@else:
+- {lib.bold(tool.name)} ({tool.type}) — Requires approval
+@end
+@end
+
+## Schema Access
+
+Allowed schemas:
+@for schema in constraints.allowed_schemas:
+- `{schema}`
+@end
+
+Max rows: {constraints.max_rows} | Timeout: {constraints.timeout}s
+
+@if debug:
+## Debug Mode
+
+Debug logging is enabled. All queries will be logged.
+@end
+
+## Output
+
+@if output_format == "json":
+{format_output("json", debug)}
+@elseif output_format == "markdown":
+{format_output("markdown", debug)}
+@else:
+{format_output("plain", debug)}
+@end

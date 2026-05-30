@@ -254,8 +254,15 @@ fn if_negation_supported() {
     // With premium=true, the negated condition is false → else branch.
     let source = "---\npremium: true\n---\n@if !premium:\nnegated_yes\n@else:\nnegated_no\n@end\n";
     let result = mds::compile_str(source);
-    assert!(result.is_ok(), "@if with negation must succeed, got: {:?}", result);
-    assert!(result.unwrap().contains("negated_no"), "negation of true must take else branch");
+    assert!(
+        result.is_ok(),
+        "@if with negation must succeed, got: {:?}",
+        result
+    );
+    assert!(
+        result.unwrap().contains("negated_no"),
+        "negation of true must take else branch"
+    );
 }
 
 #[test]
@@ -388,7 +395,10 @@ fn elseif_after_else_is_parse_error() {
     // accepts @end as a terminator so @elseif is an unknown directive there.
     let source = "---\nx: true\n---\n@if x:\nyes\n@else:\nno\n@elseif x:\nbad\n@end\n";
     let result = mds::compile_str(source);
-    assert!(result.is_err(), "@elseif after @else: must be a parse error");
+    assert!(
+        result.is_err(),
+        "@elseif after @else: must be a parse error"
+    );
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("@elseif") || err.contains("unknown directive"),
@@ -427,7 +437,10 @@ fn if_eq_undefined_variable_is_error() {
     // `@if missing == "x":` — undefined variable in equality
     let source = "---\nvar: x\n---\n@if missing == \"x\":\nyes\n@end\n";
     let result = mds::compile_str(source);
-    assert!(result.is_err(), "undefined variable in equality must be an error");
+    assert!(
+        result.is_err(),
+        "undefined variable in equality must be an error"
+    );
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("missing") || err.contains("undefined"),
@@ -440,7 +453,10 @@ fn if_negation_undefined_variable_is_error() {
     // `@if !missing:` — undefined variable in negation
     let source = "---\nvar: x\n---\n@if !missing:\nyes\n@end\n";
     let result = mds::compile_str(source);
-    assert!(result.is_err(), "undefined variable in negation must be an error");
+    assert!(
+        result.is_err(),
+        "undefined variable in negation must be an error"
+    );
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("missing") || err.contains("undefined"),

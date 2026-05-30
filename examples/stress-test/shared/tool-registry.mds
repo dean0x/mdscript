@@ -1,0 +1,34 @@
+---
+type: mds
+tools:
+  web_search:
+    description: Search the web for real-time information
+    tier: basic
+  code_exec:
+    description: Execute code in a sandboxed environment
+    tier: premium
+  db_query:
+    description: Run read-only SQL queries against analytics DB
+    tier: premium
+  file_read:
+    description: Read files from the workspace
+    tier: basic
+---
+
+## Available Tools
+
+@for name, config in tools:
+@if config.tier == "premium":
+- **{name}** (Premium): {config.description}
+@else:
+- **{name}**: {config.description}
+@end
+@end
+
+@define tool_list(registry):
+@for tool_name, tool_config in registry:
+- {tool_name}: {tool_config.description} [{tool_config.tier}]
+@end
+@end
+
+@export tool_list

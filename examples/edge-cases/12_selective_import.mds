@@ -1,0 +1,14 @@
+---
+name: World
+---
+
+@import { bold, badge } from "../prompt-library/formatting.mds"
+@import { teacher } from "../prompt-library/personas.mds"
+
+# Welcome
+
+Hello {bold(name)}!
+
+{badge("Status", "Active")}
+
+{teacher("Physics")}

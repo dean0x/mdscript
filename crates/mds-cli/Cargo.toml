@@ -15,7 +15,7 @@ name = "mds"
 path = "src/main.rs"
 
 [dependencies]
-mds = { package = "mds-core", path = "../mds-core" }
+mds = { package = "mds-core", path = "../mds-core", version = "0.1.0" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

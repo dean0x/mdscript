@@ -1,0 +1,44 @@
+---
+type: mds
+---
+
+@define bold(text):
+**{text}**
+@end
+
+@define italic(text):
+*{text}*
+@end
+
+@define h1(text):
+# {text}
+@end
+
+@define h2(text):
+## {text}
+@end
+
+@define h3(text):
+### {text}
+@end
+
+@define badge(label, value):
+**{label}**: `{value}`
+@end
+
+@define separator():
+---
+@end
+
+@define blockquote(text):
+> {text}
+@end
+
+@export bold
+@export italic
+@export h1
+@export h2
+@export h3
+@export badge
+@export separator
+@export blockquote

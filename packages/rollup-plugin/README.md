@@ -1,4 +1,4 @@
-# @mds/rollup-plugin
+# @mdscript/rollup-plugin
 
 Rollup plugin for importing `.mds` templates as ES modules.
 
@@ -7,13 +7,13 @@ Rollup plugin for importing `.mds` templates as ES modules.
 ## Installation
 
 ```sh
-npm install @mds/rollup-plugin
+npm install @mdscript/rollup-plugin
 ```
 
 ## Peer dependencies
 
 ```sh
-npm install @mds/mds rollup
+npm install @mdscript/mds rollup
 ```
 
 Supported: `rollup ^3.0.0 || ^4.0.0`.
@@ -22,7 +22,7 @@ Supported: `rollup ^3.0.0 || ^4.0.0`.
 
 ```js
 // rollup.config.js
-import mdsPlugin from '@mds/rollup-plugin';
+import mdsPlugin from '@mdscript/rollup-plugin';
 
 export default {
   plugins: [
@@ -52,7 +52,7 @@ Add the module declaration to your `tsconfig.json` so TypeScript recognises
 ```json
 {
   "compilerOptions": {
-    "types": ["@mds/bundler-utils/mds"]
+    "types": ["@mdscript/bundler-utils/mds"]
   }
 }
 ```

@@ -1,5 +1,5 @@
 /**
- * Tests for @mds/webpack-loader.
+ * Tests for @mdscript/webpack-loader.
  */
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';

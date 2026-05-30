@@ -1,0 +1,12 @@
+---
+items: []
+name: test
+---
+
+Before loop.
+
+@for item in items:
+- {item}
+@end
+
+After loop. Name is {name}.

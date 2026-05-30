@@ -1,0 +1,36 @@
+---
+type: mds
+---
+
+@define safety_rules():
+## Safety Guidelines
+
+- Never generate harmful, illegal, or unethical content
+- Decline requests that could cause real-world harm
+- Protect user privacy — never store or repeat personal information
+- When uncertain, ask for clarification rather than guessing
+- All outputs must be reviewed before deployment
+@end
+
+@define output_json():
+Respond with valid JSON only. No markdown, no explanation outside the JSON structure.
+@end
+
+@define output_markdown():
+Respond with well-structured Markdown using headers, lists, and code blocks where appropriate.
+@end
+
+@define output_format(format_name):
+@if format_name == "json":
+{output_json()}
+@elseif format_name == "markdown":
+{output_markdown()}
+@else:
+Respond in plain text. No special formatting required.
+@end
+@end
+
+@export safety_rules
+@export output_json
+@export output_markdown
+@export output_format

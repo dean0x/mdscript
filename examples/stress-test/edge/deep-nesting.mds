@@ -1,0 +1,50 @@
+---
+departments:
+  - name: Engineering
+    active: true
+    teams:
+      - name: Platform
+        lead: Alice
+        members:
+          - name: Bob
+            senior: true
+          - name: Carol
+            senior: false
+      - name: Frontend
+        lead: Dave
+        members:
+          - name: Eve
+            senior: true
+  - name: Marketing
+    active: false
+    teams:
+      - name: Growth
+        lead: Frank
+        members:
+          - name: Grace
+            senior: false
+show_inactive: false
+---
+
+# Organization
+
+@for dept in departments:
+@if dept.active:
+## {dept.name}
+
+@for team in dept.teams:
+### {team.name} (Lead: {team.lead})
+
+@for member in team.members:
+@if member.senior:
+- **{member.name}** (Senior)
+@else:
+- {member.name}
+@end
+@end
+
+@end
+@elseif show_inactive:
+## {dept.name} (Inactive)
+@end
+@end

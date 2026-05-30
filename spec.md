@@ -692,7 +692,7 @@ A language server (Rust) providing diagnostics, completions, go-to-definition fo
 These are intentionally deferred to keep the language simple and the compiler focused:
 
 - Structured JSON output (chat message arrays)
-- TypeScript/JS integration or runtime bindings (shipped post-v0.1: see `@mds/mds` npm package)
+- TypeScript/JS *language* features — note that runtime bindings for calling the compiler from JS/TS *are* provided (see the `@mdscript/mds` npm package); this item refers to in-template scripting, which is out of scope
 - Built-in functions (upper, lower, join, etc.)
 - Recursion
 - Macros, async functions, streaming
@@ -751,6 +751,4 @@ quoted_path     := "\"" path_chars "\""
 
 ## 12. Status
 
-v0.1 — Initial release. The core compiler is feature-complete as described in this specification.
-
-Post-v0.1 additions (not yet released): negation in `@if` conditions (`!dot_path`), equality/inequality comparisons (`==`, `!=`), `@elseif` directive, NaN and Infinity rejection at parse time. These features are implemented and tested but will ship in the next release.
+v0.1.0 — Initial public release. The core compiler is feature-complete as described in this specification, including negation in `@if` conditions (`!dot_path`), equality/inequality comparisons (`==`, `!=`), the `@elseif` directive, and `NaN`/`Infinity` rejection at parse time.

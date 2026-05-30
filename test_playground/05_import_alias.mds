@@ -1,9 +1,0 @@
----
-title: System Prompt
----
-
-@import "./lib/format.mds" as fmt
-
-{fmt.heading(title)}
-
-This is a {fmt.bold("system prompt")} built with MDS.

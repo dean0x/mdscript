@@ -1,11 +1,11 @@
-# @mds/mds
+# @mdscript/mds
 
 JavaScript/TypeScript bindings for the [MDS](../../README.md) compiler.
 
 ## Installation
 
 ```sh
-npm install @mds/mds
+npm install @mdscript/mds
 ```
 
 > **Note:** This package is pre-release and not yet published to npm.
@@ -16,7 +16,7 @@ Node.js auto-selects the native addon and falls back to WASM if unavailable.
 No initialization required.
 
 ```ts
-import { compile, check, compileFile, checkFile, getBackend, isMdsError } from '@mds/mds';
+import { compile, check, compileFile, checkFile, getBackend, isMdsError } from '@mdscript/mds';
 
 // Compile MDS source to Markdown
 const result = compile('Hello {name}', { vars: { name: 'world' } });
@@ -41,7 +41,7 @@ The browser entry requires an explicit `init()` call before any compile/check
 operations. `init()` is idempotent — safe to call multiple times.
 
 ```ts
-import { init, compile, check, isMdsError } from '@mds/mds';
+import { init, compile, check, isMdsError } from '@mdscript/mds';
 
 await init();
 // or with a custom WASM URL:
@@ -71,7 +71,7 @@ MDS_BACKEND=wasm node my-script.js
 Use `isMdsError` to distinguish MDS compiler errors from other exceptions:
 
 ```ts
-import { compile, isMdsError } from '@mds/mds';
+import { compile, isMdsError } from '@mdscript/mds';
 
 try {
   compile(source);

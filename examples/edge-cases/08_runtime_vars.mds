@@ -1,0 +1,30 @@
+---
+app_name: MyApp
+is_production: false
+is_development: true
+debug: false
+---
+
+# {app_name}
+
+@if debug:
+## Debug Mode Enabled
+
+Verbose logging is ON. All queries will be traced.
+@end
+
+@if is_production:
+## Production Checklist
+
+- Ensure all secrets are rotated
+- Verify CDN configuration
+- Check rate limiting
+@end
+
+@if is_development:
+## Development Notes
+
+- Using local database
+- Hot reload enabled
+- Mock services active
+@end

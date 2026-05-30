@@ -1,8 +1,16 @@
 {
-  "name": "@mds/rollup-plugin",
+  "name": "@mdscript/rollup-plugin",
   "version": "0.1.0",
   "description": "Rollup plugin for importing MDS templates as ES modules",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/mds.git",
+    "directory": "packages/rollup-plugin"
+  },
+  "homepage": "https://github.com/dean0x/mds#readme",
+  "bugs": "https://github.com/dean0x/mds/issues",
+  "keywords": ["mds", "rollup", "rollup-plugin", "markdown", "template", "llm", "prompt"],
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
@@ -18,17 +26,17 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "NODE_ENV=test node --test __test__/*.spec.mjs"
+    "test": "node --test __test__/*.spec.mjs"
   },
   "dependencies": {
-    "@mds/bundler-utils": "^0.1.0"
+    "@mdscript/bundler-utils": "^0.1.0"
   },
   "peerDependencies": {
-    "@mds/mds": "^0.1.0",
+    "@mdscript/mds": "^0.1.0",
     "rollup": "^3.0.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@mds/mds": "file:../mds",
+    "@mdscript/mds": "file:../mds",
     "@types/node": "^22.0.0",
     "rollup": "^4.0.0",
     "typescript": "^5.4.0"

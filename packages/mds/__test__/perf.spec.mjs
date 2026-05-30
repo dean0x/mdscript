@@ -1,5 +1,5 @@
 /**
- * Performance benchmarks for @mds/mds universal package.
+ * Performance benchmarks for @mdscript/mds universal package.
  * Tests: U-PF1 through U-PF5
  *
  * These are lightweight benchmarks that verify the API can handle
@@ -27,7 +27,9 @@ describe('performance', () => {
     const start = Date.now();
     execFileSync(process.execPath, ['--input-type=module'], {
       input: `import '../dist/node.js';\nconsole.log('done');\n`,
-      cwd: new URL('.', import.meta.url).pathname,
+      // fileURLToPath, not URL.pathname: the latter yields '/D:/...' on Windows,
+      // which is not a valid cwd and makes spawnSync fail with ENOENT.
+      cwd: __dirname,
       encoding: 'utf8',
     });
     const elapsed = Date.now() - start;

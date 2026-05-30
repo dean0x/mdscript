@@ -1,0 +1,6 @@
+{
+  "is_production": true,
+  "is_development": false,
+  "debug": true,
+  "app_name": "ProductionApp"
+}

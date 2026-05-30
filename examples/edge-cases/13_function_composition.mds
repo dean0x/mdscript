@@ -1,0 +1,27 @@
+---
+items:
+  - name: Alpha
+    is_high: true
+  - name: Beta
+    is_high: false
+  - name: Gamma
+    is_high: true
+---
+
+@define format_priority(is_high):
+@if is_high:
+HIGH
+@else:
+LOW
+@end
+@end
+
+@define task_line(task):
+- **{task.name}**: {format_priority(task.is_high)}
+@end
+
+# Task List
+
+@for item in items:
+{task_line(item)}
+@end

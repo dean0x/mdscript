@@ -1,0 +1,102 @@
+---
+empty_string: ""
+zero: 0
+false_val: false
+empty_array: []
+empty_object: {}
+non_empty_string: "hello"
+one: 1
+true_val: true
+non_empty_array:
+  - item
+---
+
+@if empty_string:
+FAIL: empty string truthy
+@else:
+PASS: empty string falsy
+@end
+
+@if zero:
+FAIL: zero truthy
+@else:
+PASS: zero falsy
+@end
+
+@if false_val:
+FAIL: false truthy
+@else:
+PASS: false falsy
+@end
+
+@if empty_array:
+FAIL: empty array truthy
+@else:
+PASS: empty array falsy
+@end
+
+@if empty_object:
+FAIL: empty object truthy
+@else:
+PASS: empty object falsy
+@end
+
+@if !empty_string:
+PASS: negated empty string truthy
+@else:
+FAIL: negated empty string falsy
+@end
+
+@if !false_val:
+PASS: negated false truthy
+@else:
+FAIL: negated false falsy
+@end
+
+@if non_empty_string:
+PASS: non-empty string truthy
+@else:
+FAIL: non-empty string falsy
+@end
+
+@if one:
+PASS: one truthy
+@else:
+FAIL: one falsy
+@end
+
+@if true_val:
+PASS: true truthy
+@else:
+FAIL: true falsy
+@end
+
+@if non_empty_array:
+PASS: non-empty array truthy
+@else:
+FAIL: non-empty array falsy
+@end
+
+@if zero == 0:
+PASS: zero equals zero
+@else:
+FAIL: zero not equals zero
+@end
+
+@if empty_string == "":
+PASS: empty string equals empty string
+@else:
+FAIL: empty string not equals empty string
+@end
+
+@if false_val == false:
+PASS: false equals false
+@else:
+FAIL: false not equals false
+@end
+
+@if false_val != true:
+PASS: false not equals true
+@else:
+FAIL: false equals true
+@end

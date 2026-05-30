@@ -1,4 +1,4 @@
-# @mds/vite-plugin
+# @mdscript/vite-plugin
 
 Vite plugin for importing `.mds` templates as ES modules with HMR support.
 
@@ -7,13 +7,13 @@ Vite plugin for importing `.mds` templates as ES modules with HMR support.
 ## Installation
 
 ```sh
-npm install @mds/vite-plugin
+npm install @mdscript/vite-plugin
 ```
 
 ## Peer dependencies
 
 ```sh
-npm install @mds/mds vite
+npm install @mdscript/mds vite
 ```
 
 Supported: `vite ^5.0.0 || ^6.0.0`.
@@ -23,7 +23,7 @@ Supported: `vite ^5.0.0 || ^6.0.0`.
 ```ts
 // vite.config.ts
 import { defineConfig } from 'vite';
-import mdsPlugin from '@mds/vite-plugin';
+import mdsPlugin from '@mdscript/vite-plugin';
 
 export default defineConfig({
   plugins: [
@@ -53,7 +53,7 @@ Add the module declaration to your `tsconfig.json` so TypeScript recognises
 ```json
 {
   "compilerOptions": {
-    "types": ["@mds/bundler-utils/mds"]
+    "types": ["@mdscript/bundler-utils/mds"]
   }
 }
 ```

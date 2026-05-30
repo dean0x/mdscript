@@ -1,0 +1,19 @@
+{
+  "name": "mds-rollup-test-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "rollup -c"
+  },
+  "dependencies": {
+    "@mdscript/mds": "file:../../packages/mds",
+    "@mdscript/rollup-plugin": "file:../../packages/rollup-plugin",
+    "@mdscript/bundler-utils": "file:../../packages/bundler-utils"
+  },
+  "devDependencies": {
+    "rollup": "^4.0.0",
+    "@rollup/plugin-node-resolve": "^16.0.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    Arg, Condition, CondValue, DefineBlock, ExportDirective, Expr, ForBlock, Frontmatter, IfBlock,
+    Arg, CondValue, Condition, DefineBlock, ExportDirective, Expr, ForBlock, Frontmatter, IfBlock,
     ImportDirective, IncludeDirective, Interpolation, Module, Node, TextNode, MAX_ELSEIF_BRANCHES,
 };
 use crate::error::MdsError;
@@ -214,9 +214,7 @@ impl Parser<'_> {
 
         // Give targeted hints for @elseif used outside an @if block
         if trimmed.starts_with("@elseif ") || trimmed == "@elseif" {
-            return Err(MdsError::syntax(
-                "@elseif must appear inside an @if block",
-            ));
+            return Err(MdsError::syntax("@elseif must appear inside an @if block"));
         }
 
         // Give a targeted hint for @elseif: (missing condition after the colon)
@@ -617,9 +615,7 @@ fn parse_condition(s: &str) -> Result<Condition, MdsError> {
         let rhs = s[rhs_start..].trim();
 
         if rhs.is_empty() {
-            return Err(MdsError::syntax(format!(
-                "expected value after '{op}'"
-            )));
+            return Err(MdsError::syntax(format!("expected value after '{op}'")));
         }
 
         let path = parse_dot_path(lhs)?;
@@ -641,9 +637,7 @@ fn parse_condition(s: &str) -> Result<Condition, MdsError> {
         let after = &s[eq_pos + 1..];
         // Bare `=` (not `==` and not `!=`)
         if !after.starts_with('=') && !before.ends_with('!') {
-            return Err(MdsError::syntax(
-                "use '==' for comparison, not '='",
-            ));
+            return Err(MdsError::syntax("use '==' for comparison, not '='"));
         }
     }
 
@@ -1745,7 +1739,10 @@ mod tests {
     fn condition_value_escaped_quote_in_string() {
         // @if var == "say \"hi\"": — inner escaped quote must be unescaped
         let result = parse_cond_value(r#""say \"hi\"""#);
-        assert!(result.is_ok(), "escaped quote in condition value must parse");
+        assert!(
+            result.is_ok(),
+            "escaped quote in condition value must parse"
+        );
         if let Ok(CondValue::String(s)) = result {
             assert_eq!(s, r#"say "hi""#, "escaped quote must be unescaped");
         } else {

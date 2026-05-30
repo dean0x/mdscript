@@ -1,5 +1,5 @@
 /**
- * CJS compatibility tests for @mds/bundler-utils.
+ * CJS compatibility tests for @mdscript/bundler-utils.
  *
  * Verifies that the CJS build (dist-cjs/) can be loaded via require() and
  * exports all expected symbols. This ensures the package is usable from

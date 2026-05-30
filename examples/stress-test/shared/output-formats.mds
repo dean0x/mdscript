@@ -1,0 +1,21 @@
+---
+type: mds
+---
+
+@define format_output(format, strict):
+@if format == "json":
+@if strict:
+Output ONLY valid JSON. No comments, no trailing commas, no explanation.
+@else:
+Output JSON. Brief explanation is allowed before the JSON block.
+@end
+@elseif format == "markdown":
+Output well-structured Markdown with headers and lists.
+@elseif format == "csv":
+Output CSV with headers in the first row.
+@else:
+Output plain text.
+@end
+@end
+
+@export format_output

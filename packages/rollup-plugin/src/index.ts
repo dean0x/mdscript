@@ -1,5 +1,5 @@
-import type { MdsPluginOptions } from '@mds/bundler-utils';
-import { createMdsTransformer, formatMdsError, cleanId } from '@mds/bundler-utils';
+import type { MdsPluginOptions } from '@mdscript/bundler-utils';
+import { createMdsTransformer, formatMdsError, cleanId } from '@mdscript/bundler-utils';
 
 // Structural subset of Rollup's PluginContext and Plugin. We intentionally keep
 // narrow interfaces rather than importing `Plugin` from 'rollup' because:
@@ -28,7 +28,7 @@ type Transformer = ReturnType<typeof createMdsTransformer>;
 
 /**
  * Inject a pre-built transformer for testing without going through the real
- * @mds/mds import. Allows tests to provide a mock transformer that returns
+ * @mdscript/mds import. Allows tests to provide a mock transformer that returns
  * controlled warnings, dependencies, and output.
  * FOR TESTING ONLY — throws unless NODE_ENV=test.
  */
@@ -57,7 +57,7 @@ export default function mdsPlugin(options?: MdsPluginOptions): RollupPlugin {
         transformer = _testTransformer;
         return;
       }
-      const mds = await import('@mds/mds');
+      const mds = await import('@mdscript/mds');
       transformer = createMdsTransformer(mds, options);
     },
 

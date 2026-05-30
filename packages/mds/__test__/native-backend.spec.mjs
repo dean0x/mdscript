@@ -1,5 +1,5 @@
 /**
- * Native backend tests for @mds/mds universal package.
+ * Native backend tests for @mdscript/mds universal package.
  * Tests: U-N1 through U-N6
  *
  * Verifies that the native NAPI backend behaves correctly in isolation.
@@ -15,7 +15,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
 const FIXTURES = path.join(__dirname, 'fixtures');
-const napiAddon = require(path.join(__dirname, '../../..', 'crates/mds-napi/mds-napi.node'));
+// Load the native addon through its loader (crates/mds-napi/index.js), which
+// resolves the correct binary for the host. With `napi build --platform` (as CI
+// builds it) the file is named mds-napi.<triple>.node, so requiring a bare
+// mds-napi.node is not portable across build flags. The loader returns the same
+// raw addon exports either way.
+const napiAddon = require(path.join(__dirname, '../../..', 'crates/mds-napi/index.js'));
 const nativeBackend = createNativeBackend(napiAddon);
 
 describe('native backend', () => {

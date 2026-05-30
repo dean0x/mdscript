@@ -1,5 +1,5 @@
-import type { MdsPluginOptions } from '@mds/bundler-utils';
-import { createMdsTransformer, formatMdsError, cleanId, isMdsExtension } from '@mds/bundler-utils';
+import type { MdsPluginOptions } from '@mdscript/bundler-utils';
+import { createMdsTransformer, formatMdsError, cleanId, isMdsExtension } from '@mdscript/bundler-utils';
 
 // Structural subset of Vite's PluginContext. We intentionally keep a narrow
 // interface rather than importing `Plugin` from 'vite' because:
@@ -34,7 +34,7 @@ type Transformer = ReturnType<typeof createMdsTransformer>;
 
 /**
  * Inject a pre-built transformer for testing without going through the real
- * @mds/mds import. Allows tests to provide a mock transformer that returns
+ * @mdscript/mds import. Allows tests to provide a mock transformer that returns
  * controlled warnings, dependencies, and output.
  * FOR TESTING ONLY — throws unless NODE_ENV=test.
  */
@@ -64,7 +64,7 @@ export default function mdsPlugin(options?: MdsPluginOptions): VitePlugin {
         transformer = _testTransformer;
         return;
       }
-      const mds = await import('@mds/mds');
+      const mds = await import('@mdscript/mds');
       transformer = createMdsTransformer(mds, options);
     },
 

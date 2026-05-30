@@ -8,8 +8,8 @@
     "declaration": false,
     "declarationMap": false,
     "paths": {
-      "@mds/bundler-utils": ["../bundler-utils/dist/index.d.ts"],
-      "@mds/mds": ["../mds/dist/node.d.ts"]
+      "@mdscript/bundler-utils": ["../bundler-utils/dist/index.d.ts"],
+      "@mdscript/mds": ["../mds/dist/node.d.ts"]
     }
   },
   "include": ["src/**/*.ts"],

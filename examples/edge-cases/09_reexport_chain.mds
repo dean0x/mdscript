@@ -1,0 +1,8 @@
+---
+type: mds
+---
+
+@export bold from "../prompt-library/formatting.mds"
+@export italic from "../prompt-library/formatting.mds"
+@export teacher from "../prompt-library/personas.mds"
+@export safety_rules from "../prompt-library/guardrails.mds"

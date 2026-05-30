@@ -1,6 +1,0 @@
----
-name: Claude
-role: assistant
----
-
-You are {name}, an AI {role}.

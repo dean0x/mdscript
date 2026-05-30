@@ -1,0 +1,6 @@
+{
+  "debug": true,
+  "environment": "staging",
+  "version": "2.0-rc1",
+  "output_format": "json"
+}

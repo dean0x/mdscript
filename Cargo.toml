@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.88" # napi 3.9.0 sets rust-version = "1.88" in its published Cargo.toml
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/deanshrn/mdl"
+repository = "https://github.com/dean0x/mds"
 keywords = ["markdown", "template", "llm", "prompt", "compiler"]
 
 [workspace.dependencies]

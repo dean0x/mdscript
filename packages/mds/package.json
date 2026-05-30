@@ -1,6 +1,16 @@
 {
-  "name": "@mds/mds",
+  "name": "@mdscript/mds",
   "version": "0.1.0",
+  "description": "Universal JavaScript/TypeScript bindings for the MDS (Markdown Script) compiler — native addon with WASM fallback",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/mds.git",
+    "directory": "packages/mds"
+  },
+  "homepage": "https://github.com/dean0x/mds#readme",
+  "bugs": "https://github.com/dean0x/mds/issues",
+  "keywords": ["markdown", "template", "llm", "prompt", "compiler", "mds"],
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
@@ -26,8 +36,11 @@
     "test:native": "node --test __test__/native-backend.spec.mjs",
     "test:perf": "node --test __test__/perf.spec.mjs"
   },
+  "dependencies": {
+    "@mdscript/mds-wasm": "^0.1.0"
+  },
   "optionalDependencies": {
-    "mds-napi": "file:../../crates/mds-napi"
+    "@mdscript/mds-napi": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

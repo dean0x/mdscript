@@ -1,5 +1,5 @@
 /**
- * CJS compatibility tests for @mds/webpack-loader.
+ * CJS compatibility tests for @mdscript/webpack-loader.
  *
  * Verifies that the CJS build (dist-cjs/) can be loaded via require() and
  * exports the default loader function. This is the primary condition for

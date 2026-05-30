@@ -1,5 +1,0 @@
-@import "./13_reexport.mds"
-
-{bold("Re-exported!")}
-
-{safety_rules()}

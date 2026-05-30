@@ -1,4 +1,4 @@
-# @mds/bundler-utils
+# @mdscript/bundler-utils
 
 Shared transform utilities for MDS bundler plugins (Vite, Rollup, Webpack).
 
@@ -7,26 +7,26 @@ Shared transform utilities for MDS bundler plugins (Vite, Rollup, Webpack).
 ## Installation
 
 ```sh
-npm install @mds/bundler-utils
+npm install @mdscript/bundler-utils
 ```
 
 ## Peer dependencies
 
 ```sh
-npm install @mds/mds
+npm install @mdscript/mds
 ```
 
 ## Usage
 
 This package is primarily consumed by the bundler-specific plugin packages
-(`@mds/vite-plugin`, `@mds/rollup-plugin`, `@mds/webpack-loader`). You only
+(`@mdscript/vite-plugin`, `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`). You only
 need to use it directly if you are writing a plugin for another bundler.
 
 ```ts
-import { createMdsTransformer, formatMdsError, shouldTransform } from '@mds/bundler-utils';
+import { createMdsTransformer, formatMdsError, shouldTransform } from '@mdscript/bundler-utils';
 
-// Lazily initialize (call once per build, after loading @mds/mds)
-const mds = await import('@mds/mds');
+// Lazily initialize (call once per build, after loading @mdscript/mds)
+const mds = await import('@mdscript/mds');
 const transformer = createMdsTransformer(mds, { vars: { env: 'production' } });
 
 // Transform a .mds file to a JavaScript module
@@ -45,7 +45,7 @@ To tell TypeScript about `.mds` imports, add the following to your `tsconfig.jso
 ```json
 {
   "compilerOptions": {
-    "types": ["@mds/bundler-utils/mds"]
+    "types": ["@mdscript/bundler-utils/mds"]
   }
 }
 ```
@@ -53,7 +53,7 @@ To tell TypeScript about `.mds` imports, add the following to your `tsconfig.jso
 Or add a triple-slash reference in any `.d.ts` file in your project:
 
 ```ts
-/// <reference types="@mds/bundler-utils/mds" />
+/// <reference types="@mdscript/bundler-utils/mds" />
 ```
 
 This makes `import content from './prompt.mds'` type-safe: `content` is `string`
@@ -66,11 +66,11 @@ and retry-on-rejection semantics. It is exported for bundler plugin authors who 
 the same guarantee.
 
 ```ts
-import { LazyInit } from '@mds/bundler-utils';
+import { LazyInit } from '@mdscript/bundler-utils';
 
 // Factory is invoked at most once per successful resolution.
 const lazy = new LazyInit(async () => {
-  const mds = await import('@mds/mds');
+  const mds = await import('@mdscript/mds');
   return createMdsTransformer(mds, options);
 });
 

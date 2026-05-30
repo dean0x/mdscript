@@ -637,7 +637,10 @@ fn if_negation_truthy_variable_skips_then_body() {
     // `@if !premium:` with premium=true → else branch executes
     let source = "---\npremium: true\n---\n@if !premium:\nfree_tier\n@else:\npaid_tier\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("paid_tier"), "negation of true must take else branch");
+    assert!(
+        result.contains("paid_tier"),
+        "negation of true must take else branch"
+    );
     assert!(!result.contains("free_tier"), "then body must be skipped");
 }
 
@@ -646,7 +649,10 @@ fn if_negation_falsy_variable_enters_then_body() {
     // `@if !premium:` with premium=false → then branch executes
     let source = "---\npremium: false\n---\n@if !premium:\nfree_tier\n@else:\npaid_tier\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("free_tier"), "negation of false must take then branch");
+    assert!(
+        result.contains("free_tier"),
+        "negation of false must take then branch"
+    );
     assert!(!result.contains("paid_tier"), "else body must be skipped");
 }
 
@@ -655,7 +661,10 @@ fn if_negation_zero_is_truthy_branch() {
     // `@if !count:` with count=0 → 0 is falsy, so !0 is truthy
     let source = "---\ncount: 0\n---\n@if !count:\nzero_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("zero_branch"), "negation of 0 must enter then branch");
+    assert!(
+        result.contains("zero_branch"),
+        "negation of 0 must enter then branch"
+    );
 }
 
 #[test]
@@ -663,7 +672,10 @@ fn if_negation_empty_string_is_truthy_branch() {
     // `@if !name:` with name="" → empty string is falsy, so !name is truthy
     let source = "---\nname: \"\"\n---\n@if !name:\nempty_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("empty_branch"), "negation of empty string must enter then branch");
+    assert!(
+        result.contains("empty_branch"),
+        "negation of empty string must enter then branch"
+    );
 }
 
 #[test]
@@ -671,7 +683,10 @@ fn if_negation_null_is_truthy_branch() {
     // `@if !val:` with val=null → null is falsy, so !val is truthy
     let source = "---\nval: null\n---\n@if !val:\nnull_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("null_branch"), "negation of null must enter then branch");
+    assert!(
+        result.contains("null_branch"),
+        "negation of null must enter then branch"
+    );
 }
 
 #[test]
@@ -679,7 +694,10 @@ fn if_negation_dot_path() {
     // `@if !config.debug:` with config.debug=false → enters then branch
     let source = "---\nconfig:\n  debug: false\n---\n@if !config.debug:\ndebug_off_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("debug_off_branch"), "negation of config.debug=false must enter then branch");
+    assert!(
+        result.contains("debug_off_branch"),
+        "negation of config.debug=false must enter then branch"
+    );
 }
 
 // ── @if negation with undefined variable tests ───────────────────────────────
@@ -691,7 +709,8 @@ fn if_negation_undefined_variable_is_error() {
     let result = mds::compile_str(source);
     assert!(
         result.is_err(),
-        "negation of undefined variable must produce an error, got: {:?}", result
+        "negation of undefined variable must produce an error, got: {:?}",
+        result
     );
     let err = format!("{}", result.unwrap_err());
     assert!(
@@ -705,35 +724,51 @@ fn if_negation_undefined_variable_is_error() {
 #[test]
 fn if_eq_string_match_enters_then_body() {
     // `@if role == "admin":` with role=admin → then branch
-    let source = "---\nrole: admin\n---\n@if role == \"admin\":\nadmin_yes\n@else:\nadmin_no\n@end\n";
+    let source =
+        "---\nrole: admin\n---\n@if role == \"admin\":\nadmin_yes\n@else:\nadmin_no\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("admin_yes"), "exact string match must enter then branch");
+    assert!(
+        result.contains("admin_yes"),
+        "exact string match must enter then branch"
+    );
     assert!(!result.contains("admin_no"), "else body must not appear");
 }
 
 #[test]
 fn if_eq_string_no_match_enters_else_body() {
     // `@if role == "admin":` with role=user → else branch
-    let source = "---\nrole: user\n---\n@if role == \"admin\":\nadmin_yes\n@else:\nadmin_no\n@end\n";
+    let source =
+        "---\nrole: user\n---\n@if role == \"admin\":\nadmin_yes\n@else:\nadmin_no\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("admin_no"), "string mismatch must take else branch");
+    assert!(
+        result.contains("admin_no"),
+        "string mismatch must take else branch"
+    );
     assert!(!result.contains("admin_yes"), "then body must not appear");
 }
 
 #[test]
 fn if_eq_number_match() {
     // `@if count == 42:` with count=42 → then branch
-    let source = "---\ncount: 42\n---\n@if count == 42:\ncount_match\n@else:\ncount_nomatch\n@end\n";
+    let source =
+        "---\ncount: 42\n---\n@if count == 42:\ncount_match\n@else:\ncount_nomatch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("count_match") && !result.contains("count_nomatch"), "number equality must match");
+    assert!(
+        result.contains("count_match") && !result.contains("count_nomatch"),
+        "number equality must match"
+    );
 }
 
 #[test]
 fn if_eq_bool_true_match() {
     // `@if active == true:` with active=true → then branch
-    let source = "---\nactive: true\n---\n@if active == true:\nactive_on\n@else:\nactive_off\n@end\n";
+    let source =
+        "---\nactive: true\n---\n@if active == true:\nactive_on\n@else:\nactive_off\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("active_on") && !result.contains("active_off"), "bool true equality must match");
+    assert!(
+        result.contains("active_on") && !result.contains("active_off"),
+        "bool true equality must match"
+    );
 }
 
 #[test]
@@ -749,16 +784,23 @@ fn if_eq_strict_no_type_coercion_number_vs_string() {
     // `@if x == "3":` with x=3 (number) → strict, no coercion → else branch
     let source = "---\nx: 3\n---\n@if x == \"3\":\ncoercion_yes\n@else:\nstrict_types\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("strict_types"), "number 3 must not equal string \"3\"");
+    assert!(
+        result.contains("strict_types"),
+        "number 3 must not equal string \"3\""
+    );
     assert!(!result.contains("coercion_yes"), "coercion must not happen");
 }
 
 #[test]
 fn if_eq_strict_no_type_coercion_bool_vs_string() {
     // `@if x == "true":` with x=true (bool) → strict, no coercion → else branch
-    let source = "---\nx: true\n---\n@if x == \"true\":\ncoercion_yes\n@else:\nstrict_types\n@end\n";
+    let source =
+        "---\nx: true\n---\n@if x == \"true\":\ncoercion_yes\n@else:\nstrict_types\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("strict_types"), "bool true must not equal string \"true\"");
+    assert!(
+        result.contains("strict_types"),
+        "bool true must not equal string \"true\""
+    );
     assert!(!result.contains("coercion_yes"), "coercion must not happen");
 }
 
@@ -767,7 +809,10 @@ fn if_eq_single_quoted_rhs() {
     // `@if role == 'admin':` with role=admin → then branch (single quotes)
     let source = "---\nrole: admin\n---\n@if role == 'admin':\nadmin_singlequote\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("admin_singlequote"), "single-quoted RHS must work");
+    assert!(
+        result.contains("admin_singlequote"),
+        "single-quoted RHS must work"
+    );
 }
 
 #[test]
@@ -775,7 +820,10 @@ fn if_eq_empty_string_rhs() {
     // `@if name == "":` with name="" → then branch
     let source = "---\nname: \"\"\n---\n@if name == \"\":\nempty_name_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("empty_name_branch"), "empty string equality must match");
+    assert!(
+        result.contains("empty_name_branch"),
+        "empty string equality must match"
+    );
 }
 
 #[test]
@@ -784,8 +832,14 @@ fn if_eq_operator_in_string_rhs() {
     // The `==` inside the string must not be mistaken for the operator
     let source = "---\nmsg: \"a == b\"\n---\n@if msg == \"a == b\":\nop_inside_string_match\n@else:\nop_inside_string_nomatch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("op_inside_string_match"), "operator inside string must not confuse the parser");
-    assert!(!result.contains("op_inside_string_nomatch"), "nomatch branch must not appear");
+    assert!(
+        result.contains("op_inside_string_match"),
+        "operator inside string must not confuse the parser"
+    );
+    assert!(
+        !result.contains("op_inside_string_nomatch"),
+        "nomatch branch must not appear"
+    );
 }
 
 #[test]
@@ -793,7 +847,10 @@ fn if_eq_negative_number() {
     // `@if temp == -5:` with temp=-5 → then branch
     let source = "---\ntemp: -5\n---\n@if temp == -5:\ncold_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("cold_branch"), "negative number equality must match");
+    assert!(
+        result.contains("cold_branch"),
+        "negative number equality must match"
+    );
 }
 
 #[test]
@@ -811,7 +868,10 @@ fn if_neq_string_no_match_enters_then_body() {
     // `@if role != "admin":` with role=user → then branch
     let source = "---\nrole: user\n---\n@if role != \"admin\":\nnot_admin_branch\n@else:\nis_admin_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("not_admin_branch"), "inequality with non-matching value must enter then branch");
+    assert!(
+        result.contains("not_admin_branch"),
+        "inequality with non-matching value must enter then branch"
+    );
     assert!(!result.contains("is_admin_branch"), "else must not appear");
 }
 
@@ -820,16 +880,26 @@ fn if_neq_string_match_enters_else_body() {
     // `@if role != "admin":` with role=admin → else branch
     let source = "---\nrole: admin\n---\n@if role != \"admin\":\nnot_admin_branch\n@else:\nis_admin_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("is_admin_branch"), "inequality with matching value must take else branch");
-    assert!(!result.contains("not_admin_branch"), "then branch must not appear");
+    assert!(
+        result.contains("is_admin_branch"),
+        "inequality with matching value must take else branch"
+    );
+    assert!(
+        !result.contains("not_admin_branch"),
+        "then branch must not appear"
+    );
 }
 
 #[test]
 fn if_neq_cross_type_always_true() {
     // `@if x != "3":` with x=3 (number) → types differ, always true
-    let source = "---\nx: 3\n---\n@if x != \"3\":\ndiff_type_branch\n@else:\nsame_type_branch\n@end\n";
+    let source =
+        "---\nx: 3\n---\n@if x != \"3\":\ndiff_type_branch\n@else:\nsame_type_branch\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("diff_type_branch"), "cross-type != must be true");
+    assert!(
+        result.contains("diff_type_branch"),
+        "cross-type != must be true"
+    );
     assert!(!result.contains("same_type_branch"), "else must not appear");
 }
 
@@ -840,7 +910,10 @@ fn elseif_first_branch_matches() {
     // tier=enterprise → first branch matches
     let source = "---\ntier: enterprise\n---\n@if tier == \"enterprise\":\nenterprise_body\n@elseif tier == \"pro\":\npro_body\n@else:\nfree_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("enterprise_body"), "enterprise branch must match");
+    assert!(
+        result.contains("enterprise_body"),
+        "enterprise branch must match"
+    );
     assert!(!result.contains("pro_body"), "pro branch must not appear");
     assert!(!result.contains("free_body"), "else branch must not appear");
 }
@@ -851,7 +924,10 @@ fn elseif_second_branch_matches() {
     let source = "---\ntier: pro\n---\n@if tier == \"enterprise\":\nenterprise_body\n@elseif tier == \"pro\":\npro_body\n@else:\nfree_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
     assert!(result.contains("pro_body"), "pro branch must match");
-    assert!(!result.contains("enterprise_body"), "enterprise branch must not appear");
+    assert!(
+        !result.contains("enterprise_body"),
+        "enterprise branch must not appear"
+    );
     assert!(!result.contains("free_body"), "else branch must not appear");
 }
 
@@ -860,8 +936,14 @@ fn elseif_falls_through_to_else() {
     // tier=starter → falls through to @else
     let source = "---\ntier: starter\n---\n@if tier == \"enterprise\":\nenterprise_body\n@elseif tier == \"pro\":\npro_body\n@else:\nfree_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("free_body"), "unmatched tiers must fall through to else");
-    assert!(!result.contains("enterprise_body"), "enterprise branch must not appear");
+    assert!(
+        result.contains("free_body"),
+        "unmatched tiers must fall through to else"
+    );
+    assert!(
+        !result.contains("enterprise_body"),
+        "enterprise branch must not appear"
+    );
     assert!(!result.contains("pro_body"), "pro branch must not appear");
 }
 
@@ -870,8 +952,14 @@ fn elseif_no_match_no_else_empty_output() {
     // No matching branch and no @else → only frontmatter in output
     let source = "---\ntier: starter\n---\n@if tier == \"enterprise\":\nenterprise_body\n@elseif tier == \"pro\":\npro_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(!result.contains("enterprise_body"), "unmatched must produce no enterprise output");
-    assert!(!result.contains("pro_body"), "unmatched must produce no pro output");
+    assert!(
+        !result.contains("enterprise_body"),
+        "unmatched must produce no enterprise output"
+    );
+    assert!(
+        !result.contains("pro_body"),
+        "unmatched must produce no pro output"
+    );
 }
 
 #[test]
@@ -880,9 +968,18 @@ fn elseif_five_branches_matches_fourth() {
     let source = "---\nval: delta\n---\n@if val == \"alpha\":\nalpha_out\n@elseif val == \"bravo\":\nbravo_out\n@elseif val == \"charlie\":\ncharlie_out\n@elseif val == \"delta\":\ndelta_out\n@elseif val == \"echo\":\necho_out\n@else:\nother_out\n@end\n";
     let result = mds::compile_str(source).unwrap();
     assert!(result.contains("delta_out"), "fourth branch must match");
-    assert!(!result.contains("alpha_out"), "alpha branch must not appear");
-    assert!(!result.contains("bravo_out"), "bravo branch must not appear");
-    assert!(!result.contains("charlie_out"), "charlie branch must not appear");
+    assert!(
+        !result.contains("alpha_out"),
+        "alpha branch must not appear"
+    );
+    assert!(
+        !result.contains("bravo_out"),
+        "bravo branch must not appear"
+    );
+    assert!(
+        !result.contains("charlie_out"),
+        "charlie branch must not appear"
+    );
     assert!(!result.contains("echo_out"), "echo branch must not appear");
     assert!(!result.contains("other_out"), "else branch must not appear");
 }
@@ -901,7 +998,10 @@ fn elseif_with_negation() {
     // `@if flag_x:` / `@elseif !flag_y:` — negation in elseif
     let source = "---\nflag_x: false\nflag_y: false\n---\n@if flag_x:\nbranch_x\n@elseif !flag_y:\nbranch_not_y\n@else:\nbranch_none\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("branch_not_y"), "negation in elseif must work");
+    assert!(
+        result.contains("branch_not_y"),
+        "negation in elseif must work"
+    );
     assert!(!result.contains("branch_x"), "x branch must not appear");
 }
 
@@ -911,7 +1011,10 @@ fn elseif_with_equality() {
     let source = "---\nrole: mod\n---\n@if role == \"admin\":\nadmin_body\n@elseif role == \"mod\":\nmod_body\n@else:\nother_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
     assert!(result.contains("mod_body"), "equality in elseif must work");
-    assert!(!result.contains("admin_body"), "admin branch must not appear");
+    assert!(
+        !result.contains("admin_body"),
+        "admin branch must not appear"
+    );
 }
 
 #[test]
@@ -919,8 +1022,14 @@ fn elseif_nested_if_in_body() {
     // Nested @if inside @elseif body
     let source = "---\ntier: pro\nextra: true\n---\n@if tier == \"enterprise\":\nenterprise_body\n@elseif tier == \"pro\":\n@if extra:\npro_plus_body\n@else:\npro_basic_body\n@end\n@else:\nfree_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("pro_plus_body"), "nested @if inside elseif body must work");
-    assert!(!result.contains("enterprise_body"), "enterprise must not appear");
+    assert!(
+        result.contains("pro_plus_body"),
+        "nested @if inside elseif body must work"
+    );
+    assert!(
+        !result.contains("enterprise_body"),
+        "enterprise must not appear"
+    );
 }
 
 #[test]
@@ -933,9 +1042,18 @@ fn elseif_mixed_equality_and_inequality_in_chain() {
         @else:\nanon_visitor\n\
         @end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("registered_user"), "mod != visitor so != branch must match");
-    assert!(!result.contains("admin_only"), "admin branch must not appear");
-    assert!(!result.contains("anon_visitor"), "else branch must not appear");
+    assert!(
+        result.contains("registered_user"),
+        "mod != visitor so != branch must match"
+    );
+    assert!(
+        !result.contains("admin_only"),
+        "admin branch must not appear"
+    );
+    assert!(
+        !result.contains("anon_visitor"),
+        "else branch must not appear"
+    );
 
     // role=visitor → first branch (==) fails, second branch (!=) is false → else branch
     let source2 = "---\nrole: visitor\n---\n\
@@ -944,9 +1062,18 @@ fn elseif_mixed_equality_and_inequality_in_chain() {
         @else:\nanon_visitor\n\
         @end\n";
     let result2 = mds::compile_str(source2).unwrap();
-    assert!(result2.contains("anon_visitor"), "visitor == visitor so != is false, must fall to else");
-    assert!(!result2.contains("registered_user"), "registered branch must not appear");
-    assert!(!result2.contains("admin_only"), "admin branch must not appear");
+    assert!(
+        result2.contains("anon_visitor"),
+        "visitor == visitor so != is false, must fall to else"
+    );
+    assert!(
+        !result2.contains("registered_user"),
+        "registered branch must not appear"
+    );
+    assert!(
+        !result2.contains("admin_only"),
+        "admin branch must not appear"
+    );
 }
 
 #[test]
@@ -954,6 +1081,12 @@ fn elseif_short_circuit_only_matched_branch_evaluates() {
     // Short-circuit: once a branch matches, subsequent @elseif are not evaluated.
     let source = "---\nval: first\n---\n@if val == \"first\":\nfirst_match_body\n@elseif val == \"first\":\nduplicate_match_body\n@end\n";
     let result = mds::compile_str(source).unwrap();
-    assert!(result.contains("first_match_body"), "first matching branch must win");
-    assert!(!result.contains("duplicate_match_body"), "subsequent branches must be skipped");
+    assert!(
+        result.contains("first_match_body"),
+        "first matching branch must win"
+    );
+    assert!(
+        !result.contains("duplicate_match_body"),
+        "subsequent branches must be skipped"
+    );
 }

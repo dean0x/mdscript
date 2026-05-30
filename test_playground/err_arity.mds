@@ -1,5 +1,0 @@
-@define greet(name):
-Hello {name}!
-@end
-
-{greet("Alice", "extra")}

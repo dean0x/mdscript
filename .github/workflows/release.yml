@@ -1,0 +1,238 @@
+name: Release
+
+# Two entry points:
+#   * push a version tag (v*) -> full coordinated release (crates + all npm pkgs)
+#   * workflow_dispatch       -> DRY RUN: build the napi matrix, stage the
+#                                platform packages, run the name + version gates,
+#                                upload artifacts. Publishes NOTHING.
+#
+# The dry run lets the risky musl/arm cross-compile + the A3 name<->loader gate be
+# validated before the real, deferred release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # D1 — version-consistency gate. Cheap; fails fast before any build/publish.
+  # ---------------------------------------------------------------------------
+  version-gate:
+    name: Version gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: "Assert synchronized versions, no file: refs"
+        run: node scripts/verify-versions.mjs
+
+  # ---------------------------------------------------------------------------
+  # A6 — cross-compile the native addon for all 7 targets.
+  # Linux gnu/musl/arm use napi v3 `--use-napi-cross` (zig-based sysroots);
+  # bare `rustup target add` cannot link musl/arm. macOS x86_64 cross-links from
+  # the arm64 host via the installed target. `--no-js` preserves the hand-written
+  # index.js loader (index.d.ts still regenerates).
+  # ---------------------------------------------------------------------------
+  build-napi:
+    name: Build napi (${{ matrix.settings.target }})
+    needs: [version-gate]
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            build: napi build --platform --release --target aarch64-apple-darwin --no-js
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            build: napi build --platform --release --target x86_64-apple-darwin --no-js
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            build: napi build --platform --release --target x86_64-unknown-linux-gnu --use-napi-cross --no-js
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: napi build --platform --release --target x86_64-unknown-linux-musl --use-napi-cross --no-js
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            build: napi build --platform --release --target aarch64-unknown-linux-gnu --use-napi-cross --no-js
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: napi build --platform --release --target aarch64-unknown-linux-musl --use-napi-cross --no-js
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: napi build --platform --release --target x86_64-pc-windows-msvc --no-js
+    runs-on: ${{ matrix.settings.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.settings.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Build addon
+        working-directory: crates/mds-napi
+        run: npx ${{ matrix.settings.build }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: crates/mds-napi/*.node
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # A3/A7/D2 — stage the per-platform npm packages from the built .node files,
+  # then run the CRITICAL name<->loader gate. Runs on BOTH tag push and the
+  # workflow_dispatch dry run; it never publishes. The publish job consumes the
+  # exact staged tree this job uploads.
+  # ---------------------------------------------------------------------------
+  stage-and-verify-napi:
+    name: Stage + verify platform packages
+    needs: [build-napi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Download all .node artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/mds-napi/artifacts
+          pattern: bindings-*
+          merge-multiple: true
+      - name: Stage per-platform packages
+        working-directory: crates/mds-napi
+        run: |
+          npx napi create-npm-dirs
+          npx napi artifacts --output-dir .
+      - name: Copy LICENSE into each platform package
+        run: for d in crates/mds-napi/npm/*/; do cp LICENSE "$d"; done
+      - name: A3 — name <-> loader verification gate
+        run: node scripts/verify-napi-names.mjs
+      - name: Upload staged napi tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-staged
+          path: |
+            crates/mds-napi/npm/**
+            crates/mds-napi/*.node
+
+  # ===========================================================================
+  # Everything below publishes — gated to tag pushes only. workflow_dispatch
+  # stops after stage-and-verify-napi above (the dry run).
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # crates.io — library then CLI (CLI depends on the library; order + index
+  # propagation matter). Requires repo secret CARGO_REGISTRY_TOKEN.
+  # ---------------------------------------------------------------------------
+  publish-crates:
+    name: Publish to crates.io
+    needs: [version-gate]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches workspace version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE_VER="$(cargo metadata --no-deps --format-version 1 \
+            | grep -o '"name":"mds-core","version":"[^"]*"' \
+            | grep -o '[0-9][^"]*' | head -1)"
+          echo "tag=$TAG crate=$CRATE_VER"
+          test "$TAG" = "$CRATE_VER" || { echo "::error::tag v$TAG != crate version $CRATE_VER"; exit 1; }
+      - name: Publish mds-core
+        run: cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+      - name: Wait for crates.io index to update
+        run: sleep 30
+      - name: Publish mds-cli
+        run: cargo publish -p mds-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+  # ---------------------------------------------------------------------------
+  # A7/B4/D3 — publish all npm packages with provenance (OIDC).
+  # NPM_CONFIG_PROVENANCE=true makes every `npm publish` (including the ones napi
+  # prepublish runs for the platform packages) emit a provenance attestation.
+  # ---------------------------------------------------------------------------
+  publish-npm:
+    name: Publish to npm
+    needs: [stage-and-verify-napi, publish-crates]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC for npm provenance
+      contents: read
+    env:
+      NPM_CONFIG_PROVENANCE: "true"
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - run: npm ci
+      - name: Restore staged napi tree (.node + npm/ platform dirs)
+        uses: actions/download-artifact@v4
+        with:
+          name: napi-staged
+          path: crates/mds-napi
+      # A4 — regenerate index.d.ts on the publish host (hand-written index.js is
+      # preserved by --no-js); the stray host .node is not in the package `files`.
+      - name: Generate napi types
+        working-directory: crates/mds-napi
+        run: npx napi build --platform --release --no-js
+      - name: Re-run A3 gate against the restored tree
+        run: node scripts/verify-napi-names.mjs
+      - name: Publish platform packages (napi prepublish)
+        working-directory: crates/mds-napi
+        run: npx napi prepublish -t npm --skip-gh-release
+      - name: Publish host napi package
+        run: npm publish -w @mdscript/mds-napi --access public
+      - name: Build WASM + TS packages
+        run: |
+          npm run build -w @mdscript/mds-wasm
+          npm run build --workspaces --if-present
+      - name: Publish @mdscript/mds-wasm
+        run: npm publish -w @mdscript/mds-wasm --access public
+      - name: Publish @mdscript/mds + bundler packages
+        run: |
+          npm publish -w @mdscript/mds --access public
+          npm publish -w @mdscript/bundler-utils --access public
+          npm publish -w @mdscript/vite-plugin --access public
+          npm publish -w @mdscript/rollup-plugin --access public
+          npm publish -w @mdscript/webpack-loader --access public
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release — cut last, after crates + npm succeed.
+  # ---------------------------------------------------------------------------
+  github-release:
+    name: GitHub Release
+    needs: [publish-crates, publish-npm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,8 +1,16 @@
 {
-  "name": "@mds/bundler-utils",
+  "name": "@mdscript/bundler-utils",
   "version": "0.1.0",
   "description": "Shared utilities for MDS bundler plugins",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/mds.git",
+    "directory": "packages/bundler-utils"
+  },
+  "homepage": "https://github.com/dean0x/mds#readme",
+  "bugs": "https://github.com/dean0x/mds/issues",
+  "keywords": ["mds", "bundler", "vite", "rollup", "webpack", "markdown", "template"],
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
@@ -31,10 +39,10 @@
     "test": "node --test __test__/*.spec.mjs"
   },
   "peerDependencies": {
-    "@mds/mds": "^0.1.0"
+    "@mdscript/mds": "^0.1.0"
   },
   "devDependencies": {
-    "@mds/mds": "file:../mds",
+    "@mdscript/mds": "file:../mds",
     "@types/node": "^22.0.0",
     "typescript": "^5.4.0"
   }

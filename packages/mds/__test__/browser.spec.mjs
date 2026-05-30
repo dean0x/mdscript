@@ -1,5 +1,5 @@
 /**
- * Browser entry point behavioral tests for @mds/mds.
+ * Browser entry point behavioral tests for @mdscript/mds.
  * Tests: U-BR1 through U-BR13
  *
  * Imports dist/browser.js directly. Node.js ESM module state is shared within

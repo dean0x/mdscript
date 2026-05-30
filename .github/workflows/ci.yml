@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust — fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --all --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-version = 1.88 is declared workspace-wide; verify the published
+      # crates still compile on it. napi/wasm bindings are checked on stable
+      # in their own jobs since their toolchain needs can differ.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p mds-core -p mds-cli
+
+  wasm:
+    name: WASM — build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Build (nodejs + web targets)
+        run: |
+          wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
+          wasm-pack build crates/mds-wasm --target web --out-dir pkg-web
+      - name: Test (node)
+        run: wasm-pack test --node crates/mds-wasm
+
+  js:
+    name: JS packages — build & test
+    # Run on every host OS so the native addon path is exercised everywhere.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Build the native addon for the host so @mdscript/mds resolves a backend.
+      # --no-js preserves the hand-maintained crates/mds-napi/index.js loader.
+      - name: Build native addon (host)
+        working-directory: crates/mds-napi
+        run: npx napi build --platform --release --no-js
+      # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
+      - uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: latest
+      - name: Build WASM (nodejs)
+        run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
+      - name: Build TS packages
+        run: npm run build --workspaces --if-present
+      - name: Test
+        run: npm test --workspaces --if-present

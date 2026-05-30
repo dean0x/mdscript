@@ -1,0 +1,53 @@
+---
+users:
+  - name: Alice
+    role: admin
+    projects:
+      - name: Alpha
+        active: true
+        tasks:
+          - Deploy v2
+          - Update docs
+      - name: Beta
+        active: false
+        tasks:
+          - Fix bug
+  - name: Bob
+    role: member
+    projects:
+      - name: Gamma
+        active: true
+        tasks:
+          - Write tests
+          - Review PR
+show_paused: false
+---
+
+# Project Report
+
+@for user in users:
+## {user.name} ({user.role})
+
+@for project in user.projects:
+@if project.active:
+### {project.name} — Active
+
+Tasks:
+@for task in project.tasks:
+- [ ] {task}
+@end
+
+@else:
+@if show_paused:
+### {project.name} — Paused
+
+Tasks:
+@for task in project.tasks:
+- [x] {task} (on hold)
+@end
+
+@end
+@end
+@end
+
+@end

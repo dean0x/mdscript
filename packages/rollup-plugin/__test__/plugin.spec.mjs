@@ -1,11 +1,16 @@
 /**
- * Tests for @mds/rollup-plugin.
+ * Tests for @mdscript/rollup-plugin.
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import mdsPlugin, { _setTransformerForTesting } from '../dist/index.js';
+
+// _setTransformerForTesting is gated behind NODE_ENV=test. Set it here so the
+// test script stays a plain cross-platform `node --test` (a `NODE_ENV=test`
+// prefix is POSIX-only and fails under Windows cmd.exe).
+process.env.NODE_ENV = 'test';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SIMPLE_MDS = resolve(__dirname, '../../mds/__test__/fixtures/simple.mds');

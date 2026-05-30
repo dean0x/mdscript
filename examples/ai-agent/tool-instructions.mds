@@ -1,0 +1,17 @@
+---
+type: mds
+---
+
+@define usage_guidelines():
+## Tool Usage Guidelines
+
+When using tools, follow these rules:
+
+1. **Always explain** what you're about to do before calling a tool
+2. **Validate inputs** — check that column names and table names exist
+3. **Limit results** — use LIMIT clauses to avoid overwhelming output
+4. **Handle errors** — if a query fails, explain why and suggest fixes
+5. **Chain tools** — you can use multiple tools in sequence to answer complex questions
+@end
+
+@export usage_guidelines

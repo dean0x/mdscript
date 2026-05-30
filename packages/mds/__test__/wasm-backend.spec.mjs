@@ -1,5 +1,5 @@
 /**
- * WASM backend unit tests for @mds/mds universal package.
+ * WASM backend unit tests for @mdscript/mds universal package.
  * Tests: U-WB1 through U-WB20
  *
  * Imports dist/backend/wasm.js directly to exercise internal state

@@ -1,5 +1,5 @@
 /**
- * Core compile() tests for @mds/mds universal package.
+ * Core compile() tests for @mdscript/mds universal package.
  * Tests: U-C1 through U-C9
  */
 import { test, describe, before } from 'node:test';

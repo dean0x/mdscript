@@ -1,8 +1,16 @@
 {
-  "name": "@mds/webpack-loader",
+  "name": "@mdscript/webpack-loader",
   "version": "0.1.0",
   "description": "Webpack loader for importing MDS templates as ES modules",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/mds.git",
+    "directory": "packages/webpack-loader"
+  },
+  "homepage": "https://github.com/dean0x/mds#readme",
+  "bugs": "https://github.com/dean0x/mds/issues",
+  "keywords": ["mds", "webpack", "webpack-loader", "markdown", "template", "llm", "prompt"],
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
@@ -24,17 +32,17 @@
     "clean:cjs": "node -e \"require('fs').rmSync('dist-cjs', { recursive: true, force: true })\"",
     "prebuild": "npm run clean:cjs",
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node ../../scripts/write-cjs-package.cjs dist-cjs",
-    "test": "NODE_ENV=test node --test __test__/*.spec.mjs"
+    "test": "node --test __test__/*.spec.mjs"
   },
   "dependencies": {
-    "@mds/bundler-utils": "^0.1.0"
+    "@mdscript/bundler-utils": "^0.1.0"
   },
   "peerDependencies": {
-    "@mds/mds": "^0.1.0",
+    "@mdscript/mds": "^0.1.0",
     "webpack": "^5.0.0"
   },
   "devDependencies": {
-    "@mds/mds": "file:../mds",
+    "@mdscript/mds": "file:../mds",
     "@types/node": "^22.0.0",
     "typescript": "^5.4.0",
     "webpack": "^5.0.0"

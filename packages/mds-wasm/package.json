@@ -1,0 +1,41 @@
+{
+  "name": "@mdscript/mds-wasm",
+  "version": "0.1.0",
+  "description": "WebAssembly build of the MDS (Markdown Script) compiler — used as the portable fallback by @mdscript/mds",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/mds.git",
+    "directory": "packages/mds-wasm"
+  },
+  "homepage": "https://github.com/dean0x/mds#readme",
+  "bugs": "https://github.com/dean0x/mds/issues",
+  "keywords": ["markdown", "template", "llm", "prompt", "compiler", "mds", "wasm", "webassembly"],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./dist/node/mds_wasm.d.ts",
+        "default": "./dist/node/mds_wasm.js"
+      },
+      "browser": {
+        "types": "./dist/web/mds_wasm.d.ts",
+        "default": "./dist/web/mds_wasm.js"
+      },
+      "default": {
+        "types": "./dist/web/mds_wasm.d.ts",
+        "default": "./dist/web/mds_wasm.js"
+      }
+    }
+  },
+  "files": [
+    "dist/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm && rm -f dist/node/.gitignore dist/web/.gitignore"
+  }
+}

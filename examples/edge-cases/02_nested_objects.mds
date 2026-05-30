@@ -1,0 +1,27 @@
+---
+config:
+  database:
+    host: localhost
+    port: 5432
+    name: myapp
+  cache:
+    enabled: true
+    ttl: 3600
+  features:
+    - name: dark_mode
+      enabled: true
+    - name: beta_api
+      enabled: false
+---
+
+## Configuration Report
+
+Database: `{config.database.host}:{config.database.port}/{config.database.name}`
+
+Cache enabled: {config.cache.enabled} (TTL: {config.cache.ttl}s)
+
+### Feature Flags
+
+@for feature in config.features:
+- **{feature.name}**: {feature.enabled}
+@end

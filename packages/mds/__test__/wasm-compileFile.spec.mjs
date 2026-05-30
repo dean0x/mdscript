@@ -1,5 +1,5 @@
 /**
- * WASM backend compileFile/checkFile tests for @mds/mds universal package.
+ * WASM backend compileFile/checkFile tests for @mdscript/mds universal package.
  * Tests: U-WCF1 through U-WCF11
  *
  * Uses subprocess isolation with MDS_BACKEND=wasm to force the WASM backend

@@ -1,5 +1,5 @@
 /**
- * Module scanner unit tests for @mds/mds universal package.
+ * Module scanner unit tests for @mdscript/mds universal package.
  * Tests: U-S1 through U-S10
  *
  * Tests the normalizeVirtualKey and buildModulesMap utilities directly

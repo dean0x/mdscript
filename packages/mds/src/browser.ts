@@ -70,7 +70,7 @@ export function init(options?: InitOptions): Promise<void> {
 
 function assertReady(): MdsBaseBackend {
   if (resolvedBackend === undefined) {
-    throw new Error('@mds/mds: call await init() before using compile/check in a browser environment');
+    throw new Error('@mdscript/mds: call await init() before using compile/check in a browser environment');
   }
   return resolvedBackend;
 }

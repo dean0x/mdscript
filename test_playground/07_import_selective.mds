@@ -1,9 +1,0 @@
----
-name: Dean
----
-
-@import { bold, heading } from "./lib/format.mds"
-
-{heading("Welcome")}
-
-Hello {bold(name)}, only bold and heading were imported.

@@ -1,0 +1,42 @@
+---
+type: mds
+---
+
+@define bold(text):
+**{text}**
+@end
+
+@define italic(text):
+*{text}*
+@end
+
+@define code(text):
+`{text}`
+@end
+
+@define badge(label, value):
+**{label}**: `{value}`
+@end
+
+@define h2(text):
+## {text}
+@end
+
+@define h3(text):
+### {text}
+@end
+
+@define table_row(cells):
+@for cell in cells:
+| {cell}
+@end
+|
+@end
+
+@export bold
+@export italic
+@export code
+@export badge
+@export h2
+@export h3
+@export table_row

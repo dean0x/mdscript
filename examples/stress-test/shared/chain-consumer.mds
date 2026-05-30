@@ -1,0 +1,13 @@
+---
+topic: Algebra
+---
+
+@import "./reexport-chain.mds" as chain
+
+# Module Chain Test
+
+{chain.bold("Testing 3-level import chain")}
+
+{chain.safety_rules()}
+
+{chain.teacher(topic)}

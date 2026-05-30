@@ -1,4 +1,4 @@
-# @mds/webpack-loader
+# @mdscript/webpack-loader
 
 Webpack 5 loader for importing `.mds` templates as ES modules.
 
@@ -7,13 +7,13 @@ Webpack 5 loader for importing `.mds` templates as ES modules.
 ## Installation
 
 ```sh
-npm install @mds/webpack-loader
+npm install @mdscript/webpack-loader
 ```
 
 ## Peer dependencies
 
 ```sh
-npm install @mds/mds webpack
+npm install @mdscript/mds webpack
 ```
 
 Supported: `webpack ^5.0.0`.
@@ -28,7 +28,7 @@ export default {
       {
         test: /\.mds$/,
         use: {
-          loader: '@mds/webpack-loader',
+          loader: '@mdscript/webpack-loader',
           options: {
             // optional
             vars: { env: 'production' },
@@ -59,7 +59,7 @@ Add the module declaration to your `tsconfig.json` so TypeScript recognises
 ```json
 {
   "compilerOptions": {
-    "types": ["@mds/bundler-utils/mds"]
+    "types": ["@mdscript/bundler-utils/mds"]
   }
 }
 ```

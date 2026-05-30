@@ -1,0 +1,5 @@
+---
+known_var: hello
+---
+
+{known_var} and {unknown_var}

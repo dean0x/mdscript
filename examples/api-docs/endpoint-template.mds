@@ -1,0 +1,103 @@
+---
+api_name: User Management API
+base_url: "https://api.example.com/v2"
+auth_type: Bearer Token
+endpoints:
+  - method: GET
+    path: /users
+    description: List all users with pagination
+    params:
+      - name: page
+        type: integer
+        required: false
+        default: "1"
+      - name: limit
+        type: integer
+        required: false
+        default: "20"
+    response_code: 200
+  - method: POST
+    path: /users
+    description: Create a new user
+    params:
+      - name: email
+        type: string
+        required: true
+        default: ""
+      - name: name
+        type: string
+        required: true
+        default: ""
+      - name: role
+        type: string
+        required: false
+        default: member
+    response_code: 201
+  - method: GET
+    path: "/users/{id}"
+    description: Get user by ID
+    params:
+      - name: id
+        type: string
+        required: true
+        default: ""
+    response_code: 200
+  - method: DELETE
+    path: "/users/{id}"
+    description: Delete a user
+    params:
+      - name: id
+        type: string
+        required: true
+        default: ""
+    response_code: 204
+rate_limit:
+  requests_per_minute: 100
+  burst: 20
+---
+
+@import "../prompt-library/formatting.mds" as fmt
+@import "./response-schemas.mds" as schemas
+
+# {api_name}
+
+Base URL: `{base_url}`
+
+Authentication: **{auth_type}**
+
+Rate Limit: {rate_limit.requests_per_minute} req/min (burst: {rate_limit.burst})
+
+{fmt.separator()}
+
+## Endpoints
+
+@for endpoint in endpoints:
+### {endpoint.method} `{endpoint.path}`
+
+{endpoint.description}
+
+@if endpoint.params:
+#### Parameters
+
+| Name | Type | Required | Default |
+|------|------|----------|---------|
+@for param in endpoint.params:
+| `{param.name}` | {param.type} | {param.required} | {param.default} |
+@end
+@end
+
+**Response**: `{endpoint.response_code}`
+
+{fmt.separator()}
+
+@end
+
+{schemas.error_format()}
+
+## Authentication
+
+Include the following header with every request:
+
+```
+Authorization: Bearer YOUR_API_TOKEN
+```

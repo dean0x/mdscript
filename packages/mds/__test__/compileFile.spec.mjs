@@ -1,5 +1,5 @@
 /**
- * compileFile() tests for @mds/mds universal package.
+ * compileFile() tests for @mdscript/mds universal package.
  * Tests: U-CF1 through U-CF9
  */
 import { test, describe, before } from 'node:test';

@@ -1,0 +1,17 @@
+---
+title: My Document
+author: Dean
+version: 1
+tags:
+  - test
+  - frontmatter
+---
+
+# {title}
+
+By {author}, version {version}.
+
+Tags:
+@for tag in tags:
+`{tag}`
+@end

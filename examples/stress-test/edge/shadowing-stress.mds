@@ -1,0 +1,40 @@
+---
+name: outer_value
+items:
+  - first
+  - second
+records:
+  - name: record_one
+  - name: record_two
+---
+
+@define greet(name):
+Function sees: {name}
+@end
+
+Before anything: {name}
+
+{greet("func_arg")}
+
+After function: {name}
+
+@for name in items:
+Loop sees: {name}
+@end
+
+After loop: {name}
+
+@for record in records:
+Object loop sees record.name: {record.name}
+Outer name still: {name}
+@end
+
+After object loop: {name}
+
+@define transform(name):
+Transform: {name}
+@end
+
+{transform("transform_arg")}
+
+Final outer: {name}

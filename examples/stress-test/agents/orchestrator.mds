@@ -1,0 +1,62 @@
+---
+orchestrator_name: AgentOrch
+max_concurrent: 3
+sub_agents:
+  - name: DataInsight Pro
+    role: analyst
+    active: true
+  - name: CodeReview Bot
+    role: reviewer
+    active: true
+  - name: Legacy Scanner
+    role: scanner
+    active: false
+  - name: Report Writer
+    role: writer
+    active: true
+fallback_strategy: queue
+debug: false
+strict_output: true
+---
+
+@import "../lib/index.mds" as lib
+@import "../shared/output-formats.mds"
+
+# {lib.bold(orchestrator_name)}
+
+{lib.badge("Max Concurrent", max_concurrent)}
+{lib.badge("Fallback", fallback_strategy)}
+
+## Active Sub-Agents
+
+@for agent in sub_agents:
+@if agent.active:
+- {lib.bold(agent.name)} — Role: {lib.code(agent.role)}
+@end
+@end
+
+## Inactive Sub-Agents
+
+@for agent in sub_agents:
+@if !agent.active:
+- ~~{agent.name}~~ — Role: {lib.code(agent.role)} (disabled)
+@end
+@end
+
+## Orchestration Rules
+
+@if max_concurrent == 1:
+Running in sequential mode — one agent at a time.
+@else:
+Running up to {max_concurrent} agents concurrently.
+@end
+
+@if fallback_strategy == "queue":
+When at capacity, additional tasks are queued.
+@elseif fallback_strategy == "reject":
+When at capacity, additional tasks are rejected.
+@else:
+Fallback strategy: {fallback_strategy}
+@end
+
+{format_output("json", strict_output)}

@@ -1,0 +1,40 @@
+---
+agent: Claude Code
+version: "4.6"
+capabilities:
+  - code generation
+  - debugging
+  - refactoring
+  - code review
+  - architecture design
+rules:
+  - Always explain changes before making them
+  - Prefer editing existing files over creating new ones
+  - Run tests after changes
+  - Never hardcode secrets
+max_file_edits: 10
+---
+
+@import "./shared.mds" as shared
+
+# {agent} Configuration (v{version})
+
+{shared.preamble()}
+
+## Capabilities
+
+@for cap in capabilities:
+- {cap}
+@end
+
+## Rules
+
+@for rule in rules:
+1. {rule}
+@end
+
+## Limits
+
+- Maximum file edits per turn: **{max_file_edits}**
+
+{shared.footer()}

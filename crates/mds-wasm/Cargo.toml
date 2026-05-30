@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "MDS compiler WebAssembly bindings"
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-keywords.workspace = true
+# Explicit (not workspace-inherited) on purpose: older wasm-pack manifest parsers
+# read these npm-metadata fields without resolving Cargo workspace inheritance and
+# choke on `license.workspace = true` ("invalid type: map, expected a string").
+# mds-wasm is not published to crates.io, so DRY inheritance buys nothing here.
+license = "MIT"
+repository = "https://github.com/dean0x/mds"
+keywords = ["markdown", "template", "llm", "prompt", "compiler"]
 categories = ["wasm", "template-engine"]
 
 [features]
@@ -20,7 +23,7 @@ debug-panics = []
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mds = { package = "mds-core", path = "../mds-core" }
+mds = { package = "mds-core", path = "../mds-core", version = "0.1.0" }
 wasm-bindgen = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +31,7 @@ serde_json = { workspace = true }
 js-sys = { workspace = true }
 
 [dev-dependencies]
-mds = { package = "mds-core", path = "../mds-core" }
+mds = { package = "mds-core", path = "../mds-core", version = "0.1.0" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]

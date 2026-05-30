@@ -1,0 +1,14 @@
+---
+real_var: INTERPOLATED
+label: Status
+---
+
+@import "../lib/formatting.mds" as fmt
+
+Escaped: \{not_a_var\} but real: {real_var}
+
+Mixed line: \{literal\} then {real_var} then \{another_literal\}
+
+{fmt.bold(real_var)} vs \{fmt.bold("nope")\}
+
+Template syntax guide: use \{var_name\} for literal braces and {label} for values.

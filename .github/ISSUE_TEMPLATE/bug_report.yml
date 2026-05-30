@@ -1,0 +1,60 @@
+name: Bug report
+description: Report incorrect behavior in the MDS compiler, CLI, bindings, or plugins
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please **do not** use this form
+        for security vulnerabilities — see [SECURITY.md](../security/policy) and use
+        private vulnerability reporting instead.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of MDS is affected?
+      options:
+        - CLI (`mds` binary)
+        - Library (`mds-core`)
+        - Native addon (`@mdscript/mds-napi`)
+        - WASM (`@mdscript/mds-wasm`)
+        - Universal bindings (`@mdscript/mds`)
+        - Vite plugin
+        - Rollup plugin
+        - Webpack loader
+        - Other / not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Crate or npm package version (e.g. `mds-cli 0.1.0`, `@mdscript/mds 0.1.0`).
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including the actual vs. expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        A minimal `.mds` template (and any vars/imports) plus the exact command or
+        API call that triggers the bug. Minimal, self-contained repros get fixed fastest.
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS + arch, Node version (if applicable), Rust version (if building from source).
+      placeholder: "macOS 14 arm64, Node 22.3, rustc 1.88"
+    validations:
+      required: false

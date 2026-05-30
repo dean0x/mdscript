@@ -1,0 +1,18 @@
+{
+  "name": "mds-webpack-test-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "webpack --config webpack.config.mjs"
+  },
+  "dependencies": {
+    "@mdscript/mds": "file:../../packages/mds",
+    "@mdscript/webpack-loader": "file:../../packages/webpack-loader",
+    "@mdscript/bundler-utils": "file:../../packages/bundler-utils"
+  },
+  "devDependencies": {
+    "webpack": "^5.0.0",
+    "webpack-cli": "^6.0.0"
+  }
+}

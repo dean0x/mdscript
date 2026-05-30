@@ -1,5 +1,5 @@
 /**
- * Error shape tests for @mds/mds universal package.
+ * Error shape tests for @mdscript/mds universal package.
  * Tests: U-E1 through U-E9
  */
 import { test, describe, before } from 'node:test';

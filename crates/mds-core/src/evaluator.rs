@@ -356,12 +356,14 @@ fn evaluate_condition(condition: &Condition, scope: &Scope) -> Result<bool, MdsE
     match condition {
         Condition::Truthy(_) => Ok(resolve_condition_value(condition, scope)?.is_truthy()),
         Condition::Not(_) => Ok(!resolve_condition_value(condition, scope)?.is_truthy()),
-        Condition::Eq(_, expected) => {
-            Ok(values_equal(&resolve_condition_value(condition, scope)?, expected))
-        }
-        Condition::NotEq(_, expected) => {
-            Ok(!values_equal(&resolve_condition_value(condition, scope)?, expected))
-        }
+        Condition::Eq(_, expected) => Ok(values_equal(
+            &resolve_condition_value(condition, scope)?,
+            expected,
+        )),
+        Condition::NotEq(_, expected) => Ok(!values_equal(
+            &resolve_condition_value(condition, scope)?,
+            expected,
+        )),
     }
 }
 

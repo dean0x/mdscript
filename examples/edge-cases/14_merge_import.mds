@@ -1,0 +1,14 @@
+---
+topic: Rust Ownership
+---
+
+@import "../prompt-library/formatting.mds"
+@import "../prompt-library/personas.mds"
+
+# {bold(topic)}
+
+{teacher("Rust")}
+
+Key concepts to cover:
+
+{badge("Topic", topic)}

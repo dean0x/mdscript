@@ -1,0 +1,22 @@
+---
+name: outer
+items:
+  - first
+  - second
+---
+
+@define greet(name):
+Hello {name} from function!
+@end
+
+Outer name: {name}
+
+{greet("inner")}
+
+After function, outer name: {name}
+
+@for name in items:
+Loop name: {name}
+@end
+
+After loop, outer name: {name}

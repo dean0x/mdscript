@@ -54,7 +54,7 @@ function safeJsonForJs(value: unknown): string {
  * use and reuses the same instance across all subsequent transform calls.
  *
  * @param mds - The MDS compiler API (satisfies {@link MdsApi}).  Pass the result
- *   of `import('@mds/mds')` or a compatible test double.
+ *   of `import('@mdscript/mds')` or a compatible test double.
  * @param options - Optional plugin options.  `options.vars` are forwarded to
  *   every {@link MdsApi.compileFile} call as runtime template variables.
  * @returns An object with two methods:

@@ -1,5 +1,5 @@
 /**
- * check() and checkFile() tests for @mds/mds universal package.
+ * check() and checkFile() tests for @mdscript/mds universal package.
  * Tests: U-K1 through U-KF3
  */
 import { test, describe, before } from 'node:test';

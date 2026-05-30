@@ -1,5 +1,5 @@
 /**
- * Shared test helpers for @mds/mds tests.
+ * Shared test helpers for @mdscript/mds tests.
  */
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';

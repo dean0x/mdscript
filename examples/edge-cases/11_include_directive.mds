@@ -1,0 +1,17 @@
+---
+name: Test
+---
+
+@import "../prompt-library/guardrails.mds" as guard
+
+# Header
+
+This is the main content for {name}.
+
+## Included Guardrails Module
+
+@include guard
+
+## Back to Main
+
+This is after the include.

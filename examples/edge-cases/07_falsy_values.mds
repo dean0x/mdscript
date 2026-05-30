@@ -1,0 +1,61 @@
+---
+empty_string: ""
+zero: 0
+false_val: false
+empty_array: []
+empty_object: {}
+truthy_string: "hello"
+truthy_number: 42
+truthy_array:
+  - one
+---
+
+Testing truthiness:
+
+@if empty_string:
+FAIL: empty string is truthy
+@else:
+PASS: empty string is falsy
+@end
+
+@if zero:
+FAIL: zero is truthy
+@else:
+PASS: zero is falsy
+@end
+
+@if false_val:
+FAIL: false is truthy
+@else:
+PASS: false is falsy
+@end
+
+@if empty_array:
+FAIL: empty array is truthy
+@else:
+PASS: empty array is falsy
+@end
+
+@if empty_object:
+FAIL: empty object is truthy
+@else:
+PASS: empty object is falsy
+@end
+
+@if truthy_string:
+PASS: non-empty string is truthy
+@else:
+FAIL: non-empty string is falsy
+@end
+
+@if truthy_number:
+PASS: non-zero number is truthy
+@else:
+FAIL: non-zero number is falsy
+@end
+
+@if truthy_array:
+PASS: non-empty array is truthy
+@else:
+FAIL: non-empty array is falsy
+@end

@@ -1,0 +1,19 @@
+{
+  "name": "mds-vite-test-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "dependencies": {
+    "@mdscript/mds": "file:../../packages/mds",
+    "@mdscript/vite-plugin": "file:../../packages/vite-plugin",
+    "@mdscript/bundler-utils": "file:../../packages/bundler-utils"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "typescript": "^5.4.0"
+  }
+}

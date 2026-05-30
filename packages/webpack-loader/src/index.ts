@@ -1,13 +1,13 @@
-import type { MdsPluginOptions } from '@mds/bundler-utils';
-import { LazyInit, createMdsTransformer, formatMdsError } from '@mds/bundler-utils';
+import type { MdsPluginOptions } from '@mdscript/bundler-utils';
+import { LazyInit, createMdsTransformer, formatMdsError } from '@mdscript/bundler-utils';
 
 // WORKAROUND: When compiled to CJS, TypeScript rewrites `import()` to
-// `require()`, breaking ESM-only packages like `@mds/mds`. This wrapper
+// `require()`, breaking ESM-only packages like `@mdscript/mds`. This wrapper
 // preserves native `import()` by creating a new Function at runtime — the
 // compiler cannot see through the string literal.
 // See: https://github.com/microsoft/TypeScript/issues/43329
 //
-// The wrapper is intentionally parameter-less (calls `import('@mds/mds')`
+// The wrapper is intentionally parameter-less (calls `import('@mdscript/mds')`
 // directly) so that no arbitrary module ID can be passed through
 // new Function — eliminating the latent code-loading vector.
 //
@@ -19,7 +19,7 @@ import { LazyInit, createMdsTransformer, formatMdsError } from '@mds/bundler-uti
 // or switch to an ESM-only build pipeline.
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
 const esmImport: () => Promise<unknown> = new Function(
-  'return import("@mds/mds")',
+  'return import("@mdscript/mds")',
 ) as () => Promise<unknown>;
 
 // Hand-rolled rather than `import type { LoaderContext } from 'webpack'` because
@@ -63,11 +63,11 @@ function getLazy(options: MdsPluginOptions, emitWarning: (err: Error) => void): 
           'esmImport() did not return a thenable. The new Function() wrapper is broken in this environment.',
         );
       }
-      const mds = await importResult as typeof import('@mds/mds');
+      const mds = await importResult as typeof import('@mdscript/mds');
       const mdsAny = mds as Record<string, unknown>;
       if (typeof mdsAny['compileFile'] !== 'function' || typeof mdsAny['init'] !== 'function') {
         throw new Error(
-          '@mds/mds module shape is unexpected: compileFile and init must both be functions. ' +
+          '@mdscript/mds module shape is unexpected: compileFile and init must both be functions. ' +
           'Check that the installed version is compatible.',
         );
       }
@@ -113,7 +113,7 @@ export function _resetForTesting(): void {
 
 /**
  * Inject a pre-built transformer for testing without going through the real
- * @mds/mds import. Allows tests to provide a mock transformer that returns
+ * @mdscript/mds import. Allows tests to provide a mock transformer that returns
  * controlled warnings, dependencies, and output. Pass null to tear down the
  * injected transformer (equivalent to calling _resetForTesting).
  */

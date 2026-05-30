@@ -1,0 +1,50 @@
+---
+type: mds
+---
+
+@define safety_rules():
+## Safety Guidelines
+
+- Never generate harmful, illegal, or unethical content
+- Decline requests that could cause real-world harm
+- Protect user privacy — never store or repeat personal information
+- When uncertain, ask for clarification rather than guessing
+@end
+
+@define output_json():
+## Output Format
+
+Respond with valid JSON only. No markdown, no explanation outside the JSON.
+@end
+
+@define output_markdown():
+## Output Format
+
+Respond with well-structured Markdown using headers, lists, and code blocks.
+@end
+
+@define output_plain():
+## Output Format
+
+Respond with plain text only. No formatting, no markdown.
+@end
+
+@define tone_professional():
+Maintain a professional, clear, and concise tone throughout your response.
+@end
+
+@define tone_casual():
+Keep it friendly and conversational. Use simple language.
+@end
+
+@define tone_academic():
+Use precise academic language with proper citations and formal structure.
+@end
+
+@export safety_rules
+@export output_json
+@export output_markdown
+@export output_plain
+@export tone_professional
+@export tone_casual
+@export tone_academic

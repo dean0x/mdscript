@@ -1,0 +1,7 @@
+---
+not_an_array: "just a string"
+---
+
+@for item in not_an_array:
+- {item}
+@end

@@ -1,0 +1,26 @@
+---
+type: mds
+---
+
+@define coding_standards():
+## Coding Standards
+
+- Write clean, readable code with meaningful names
+- Always handle errors explicitly — no silent failures
+- Write tests for all new functionality
+- Keep functions focused — single responsibility
+@end
+
+@define response_format():
+## Response Format
+
+When responding to code questions:
+
+1. **Understand** — restate the problem in your own words
+2. **Plan** — outline your approach before coding
+3. **Implement** — write the code with inline explanations
+4. **Verify** — suggest tests or validation steps
+@end
+
+@export coding_standards
+@export response_format
