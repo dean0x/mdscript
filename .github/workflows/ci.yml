@@ -42,7 +42,7 @@ jobs:
       # rust-version = 1.88 is declared workspace-wide; verify the published
       # crates still compile on it. napi/wasm bindings are checked on stable
       # in their own jobs since their toolchain needs can differ.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.100
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p mds-core -p mds-cli
 
