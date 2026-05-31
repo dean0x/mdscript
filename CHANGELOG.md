@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-First public release of the MDS (Markdown Script) compiler. The release step
-stamps the version number and date at tag time.
+## [0.1.0] — 2026-05-31
+
+First public release of the MDS (Markdown Script) compiler.
 
 ### Language features
 
@@ -91,4 +92,5 @@ stamps the version number and date at tag time.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mds/commits/main
+[Unreleased]: https://github.com/dean0x/mds/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/dean0x/mds/releases/tag/v0.1.0
