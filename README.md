@@ -5,59 +5,66 @@
 [![npm](https://img.shields.io/npm/v/@mdscript/mds.svg)](https://www.npmjs.com/package/@mdscript/mds)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-MDS is a template language for composable LLM prompt engineering. Write prompts with variables, loops, conditionals, functions, and imports, then compile them to clean Markdown.
+LLM prompts grow into copy-pasted walls of text that drift across agents, models, and environments. MDS gives you variables, functions, imports, and conditionals so you can write prompts once and compose them everywhere, compiled to clean Markdown.
+
+Built for AI engineers who manage prompt libraries across agents, models, and environments.
 
 ## Quick Start
 
-**Install the CLI:**
-
-```bash
-cargo install mds-cli        # installs the `mds` binary from crates.io
-```
-
-Or build from source:
-
-```bash
-cargo install --path crates/mds-cli
-```
-
-**Use from JavaScript/TypeScript** (Node or browser):
+**Install via npm** (Node or browser):
 
 ```bash
 npm install @mdscript/mds
 ```
 
-**Create your first template** (`hello.mds`):
+**Or install the CLI** (Rust):
+
+```bash
+cargo install mds-cli
+```
+
+**Create a prompt template** (`system.mds`):
 
 ```
 ---
-name: World
-items: [one, two, three]
+model: claude-sonnet
+tools: [search, calculator]
 ---
 
-Hello {name}!
+@import "./safety.mds" as guard
+@import "./personas.mds" as persona
 
-Your items:
-@for item in items:
-- {item}
+{persona.code_reviewer("TypeScript")}
+
+{guard.safety_rules()}
+
+## Available Tools
+
+@for tool in tools:
+- **{tool}**
+@end
+
+@if model == "claude-sonnet":
+Use extended thinking for complex tasks.
 @end
 ```
 
 **Compile it**:
 
 ```bash
-mds build hello.mds          # writes hello.md
-mds build hello.mds -o -     # stdout
+mds build system.mds          # writes system.md
+mds build system.mds -o -     # stdout
 ```
+
+Unlike general-purpose template engines, MDS is Markdown-native: no delimiters to escape, no runtime to configure. The compiler catches undefined variables, import cycles, and arity mismatches at build time, not in production.
 
 ## Features
 
 - **Variables**: YAML frontmatter or runtime `--set KEY=VALUE` flags
-- **Conditionals**: `@if`/`@elseif`/`@else`/`@end` blocks with negation (`!`) and equality comparisons (`==`/`!=`)
-- **Loops**: `@for item in list:` iteration over arrays
+- **Conditionals**: `@if`/`@elseif`/`@else`/`@end` with negation and equality comparisons
+- **Loops**: `@for item in list:` iteration over arrays and objects
 - **Functions**: `@define` reusable blocks with parameters
-- **Imports**: `@import` for modular prompt libraries (alias, merge, selective)
-- **Exports**: `@export` for building prompt component libraries
+- **Imports/Exports**: modular prompt libraries with alias, merge, and selective imports
 - **Security**: path traversal guards, symlink rejection, file size limits
 - **Rich errors**: source-span diagnostics with line/column context
 
