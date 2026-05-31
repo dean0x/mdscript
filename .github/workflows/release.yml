@@ -192,6 +192,7 @@ jobs:
       contents: read
     env:
       NPM_CONFIG_PROVENANCE: "true"
+      NPM_CONFIG_ACCESS: "public"
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
