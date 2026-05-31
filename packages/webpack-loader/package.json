@@ -44,7 +44,7 @@
   "devDependencies": {
     "@mdscript/mds": "file:../mds",
     "@types/node": "^22.0.0",
-    "typescript": "^5.4.0",
+    "typescript": "^6.0.3",
     "webpack": "^5.0.0"
   }
 }
