@@ -194,7 +194,7 @@ impl Parser<'_> {
             return parse_import_directive(trimmed, offset);
         }
         if is_directive_token(trimmed, "@export") {
-            return parse_export_directive(trimmed, offset);
+            return parse_export_directive(trimmed);
         }
         if let Some(rest) = trimmed.strip_prefix("@include ") {
             let alias = rest.trim().to_string();

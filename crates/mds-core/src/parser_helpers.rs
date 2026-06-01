@@ -293,7 +293,7 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
 }
 
 /// Parse an `@export` directive into a Node.
-pub(super) fn parse_export_directive(directive: &str, _offset: usize) -> Result<Node, MdsError> {
+pub(super) fn parse_export_directive(directive: &str) -> Result<Node, MdsError> {
     let rest = directive.trim_start_matches("@export").trim();
 
     // Wildcard re-export: @export * from "path"
