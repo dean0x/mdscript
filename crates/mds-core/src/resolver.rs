@@ -30,15 +30,6 @@ pub struct ResolvedModule {
 /// Maximum import depth to prevent stack overflow from deeply chained imports.
 const MAX_IMPORT_DEPTH: usize = 64;
 
-/// Maximum directory traversal depth when searching for project root markers.
-///
-/// Exported as `pub(crate)` so `src/lib.rs` can re-export it, and `fs.rs`
-/// can import it for the `find_project_root` upward directory walk.
-pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
-
-/// Maximum file size (10 MB) to prevent runaway memory use.
-pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.

@@ -217,7 +217,7 @@ fn validate_var_args(
     offset: usize,
     depth: usize,
 ) -> Result<(), MdsError> {
-    if depth > crate::parser::MAX_NESTING_DEPTH {
+    if depth > crate::limits::MAX_NESTING_DEPTH {
         return Err(MdsError::syntax(
             "nested argument validation depth exceeded",
         ));

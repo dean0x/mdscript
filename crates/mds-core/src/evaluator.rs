@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ast::{
-    Arg, CondValue, Condition, Expr, ForBlock, IfBlock, IncludeDirective, Node, MAX_ELSEIF_BRANCHES,
-};
+use crate::ast::{Arg, CondValue, Condition, Expr, ForBlock, IfBlock, IncludeDirective, Node};
 use crate::error::MdsError;
-use crate::limits::MAX_DOT_SEGMENTS;
+use crate::limits::{MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES};
 use crate::scope::{FunctionDef, Scope};
 use crate::value::Value;
 

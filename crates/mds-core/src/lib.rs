@@ -83,13 +83,13 @@ pub struct CompileOutput {
 ///
 /// This is the single source of truth shared by the file resolver and the
 /// stdin reader in the CLI binary.
-pub const MAX_FILE_SIZE: u64 = resolver::MAX_FILE_SIZE;
+pub const MAX_FILE_SIZE: u64 = limits::MAX_FILE_SIZE;
 
 /// Maximum directory traversal depth for upward directory walks.
 ///
 /// Shared between `find_project_root` in the resolver and `load_config` in the
 /// CLI binary — eliminating the duplicate definition.
-pub const MAX_TRAVERSAL_DEPTH: usize = resolver::MAX_TRAVERSAL_DEPTH;
+pub const MAX_TRAVERSAL_DEPTH: usize = limits::MAX_TRAVERSAL_DEPTH;
 
 /// Compile an MDS file to a final Markdown string.
 ///

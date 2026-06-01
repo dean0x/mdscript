@@ -5,11 +5,6 @@ pub struct Module {
     pub body: Vec<Node>,
 }
 
-/// Maximum number of @elseif branches on a single @if block.
-/// @elseif branches are flat (no stack frames), so 256 is safe independently of
-/// MAX_NESTING_DEPTH (64), which limits recursive nesting depth.
-pub const MAX_ELSEIF_BRANCHES: usize = 256;
-
 /// A literal value on the RHS of an equality condition.
 ///
 /// Only string, number, boolean, and null literals are supported.

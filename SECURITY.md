@@ -51,7 +51,7 @@ input. The compiler enforces several defense-in-depth controls:
 
 | Limit | Value | Location |
 |-------|-------|----------|
-| Max file size | 10 MB per source file | `resolver.rs` (`MAX_FILE_SIZE`) |
+| Max file size | 10 MB per source file | `limits.rs` (`MAX_FILE_SIZE`) |
 | Max `mds.json` size | 1 MB | `mds-cli/src/main.rs` (`MAX_CONFIG_SIZE`) |
 | Max call depth | 128 | `evaluator.rs` (`MAX_CALL_DEPTH`) |
 | Max iterations per loop | 100,000 | `evaluator.rs` (`MAX_LOOP_ITERATIONS`) |
@@ -59,7 +59,8 @@ input. The compiler enforces several defense-in-depth controls:
 | Max output size | 50 MB | `evaluator.rs` (`MAX_OUTPUT_SIZE`) |
 | Max warnings | 1,000 | `evaluator.rs` (`MAX_WARNINGS`) |
 | Max import depth | 64 | `resolver.rs` (`MAX_IMPORT_DEPTH`) |
-| Max block nesting depth | 64 | `parser.rs` (`MAX_NESTING_DEPTH`) |
+| Max block nesting depth | 64 | `limits.rs` (`MAX_NESTING_DEPTH`) |
+| Max @elseif branches per @if | 256 | `limits.rs` (`MAX_ELSEIF_BRANCHES`) |
 | Max value (YAML/JSON) nesting depth | 64 | `value.rs` (`MAX_VALUE_DEPTH`) |
 | Max dot-path segments | 32 | `limits.rs` (`MAX_DOT_SEGMENTS`) |
 

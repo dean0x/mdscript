@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::error::MdsError;
-use crate::resolver::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use crate::limits::{MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
 
 /// Maximum number of path segments allowed in a single import path.
 ///
