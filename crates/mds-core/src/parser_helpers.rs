@@ -553,6 +553,10 @@ pub(super) fn parse_args(args_str: &str) -> Result<Vec<Arg>, MdsError> {
     parse_args_inner(args_str, 0)
 }
 
+/// Inner recursive implementation of [`parse_args`].
+///
+/// `depth` tracks the current nesting level and is checked against
+/// [`MAX_NESTING_DEPTH`] to prevent stack overflow on adversarial input.
 pub(super) fn parse_args_inner(args_str: &str, depth: usize) -> Result<Vec<Arg>, MdsError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(MdsError::syntax(format!(
@@ -627,11 +631,20 @@ pub(super) fn parse_args_inner(args_str: &str, depth: usize) -> Result<Vec<Arg>,
     Ok(args)
 }
 
+/// Parse a single argument string into an [`Arg`] node.
+///
+/// Test-only convenience wrapper around [`parse_single_arg_inner`] that starts
+/// at nesting depth 0.
 #[cfg(test)]
 pub(super) fn parse_single_arg(s: &str) -> Result<Arg, MdsError> {
     parse_single_arg_inner(s, 0)
 }
 
+/// Inner implementation of single-argument parsing.
+///
+/// Classifies `s` as a string literal, a nested function call, or a bare
+/// identifier/variable reference. `depth` is forwarded to [`parse_args_inner`]
+/// for nested calls.
 pub(super) fn parse_single_arg_inner(s: &str, depth: usize) -> Result<Arg, MdsError> {
     let s = s.trim();
     if s.len() >= 2
@@ -711,6 +724,10 @@ pub(super) fn is_directive_token(directive: &str, keyword: &str) -> bool {
             .is_some_and(|rest| matches!(rest.chars().next(), Some(' ' | '\t' | '{')))
 }
 
+/// Returns `true` if `s` is a valid MDS identifier.
+///
+/// An identifier must start with an ASCII letter or `_` and contain only
+/// ASCII alphanumeric characters or `_`.
 pub(crate) fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
