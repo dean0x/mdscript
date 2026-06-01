@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- Consolidated parser constants into `crates/mds-core/src/constants.rs`
+- Split `parser.rs` into focused modules: `parser.rs` (core), `parser_tests.rs` (tests), and helpers
+
 ## [0.1.0] — 2026-05-31
 
 First public release of the MDS (Markdown Script) compiler.

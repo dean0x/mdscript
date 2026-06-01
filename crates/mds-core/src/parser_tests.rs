@@ -1,3 +1,5 @@
+//! Parser unit and integration tests, extracted from parser.rs.
+
 use super::helpers::*;
 use super::*;
 use crate::ast::{Arg, CondValue, ExportDirective, Expr, ImportDirective};
