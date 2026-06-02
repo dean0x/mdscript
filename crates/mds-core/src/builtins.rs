@@ -256,14 +256,12 @@ fn builtin_slice(args: &[Value]) -> Result<Value, MdsError> {
     match &args[0] {
         Value::String(s) => {
             let start = require_number_index(&args[1], "slice", "second")?;
-            let bytes = s.as_bytes();
-            let len = bytes.len();
-            // Clamp start to bounds
-            let start = start.min(len);
+            let len = s.len();
+            // Clamp start to bounds, then snap to nearest valid char boundary
+            let start = snap_to_char_boundary(s, start.min(len));
             if args.len() == 3 {
                 let end = require_number_index(&args[2], "slice", "third")?;
-                let end = end.clamp(start, len);
-                // Slice on char boundaries — find the char-aligned end
+                let end = snap_to_char_boundary(s, end.clamp(start, len));
                 Ok(Value::String(s[start..end].to_string()))
             } else {
                 Ok(Value::String(s[start..].to_string()))
@@ -294,15 +292,27 @@ fn builtin_slice(args: &[Value]) -> Result<Value, MdsError> {
 /// Clamps negative numbers to 0. Returns an error for non-number values.
 fn require_number_index(val: &Value, fn_name: &str, pos: &str) -> Result<usize, MdsError> {
     match val {
-        Value::Number(n) => {
-            if *n < 0.0 {
-                Ok(0)
-            } else {
-                Ok(n.floor() as usize)
-            }
-        }
+        Value::Number(n) => Ok(n.max(0.0).floor() as usize),
         other => Err(type_err(fn_name, pos, "number", other.type_name())),
     }
+}
+
+/// Snap a byte index to the nearest valid UTF-8 char boundary in `s`.
+///
+/// If `idx` is already on a char boundary, returns it unchanged.
+/// Otherwise, walks backward to find the start of the enclosing character.
+/// This prevents panics when byte-based slice indices fall inside multi-byte
+/// UTF-8 sequences (e.g. slicing into the middle of an emoji or accented char).
+fn snap_to_char_boundary(s: &str, idx: usize) -> usize {
+    if s.is_char_boundary(idx) {
+        return idx;
+    }
+    // Walk backward at most 3 bytes (max UTF-8 continuation sequence length).
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 // ── Array operations ──────────────────────────────────────────────────────────
@@ -374,13 +384,11 @@ fn builtin_sort(args: &[Value]) -> Result<Value, MdsError> {
         return Ok(Value::Array(vec![]));
     }
 
-    // Determine element type from first element, then reject mixed types.
+    // Determine element type from first element, then verify homogeneity and sort.
     let mut sorted = arr.clone();
-    let first = &sorted[0];
-    match first {
+    match &sorted[0] {
         Value::String(_) => {
-            // Verify all elements are strings
-            for item in sorted.iter() {
+            for item in &sorted {
                 if !matches!(item, Value::String(_)) {
                     return Err(MdsError::builtin_error(format!(
                         "sort() requires a homogeneous array; found {} mixed with string",
@@ -388,21 +396,13 @@ fn builtin_sort(args: &[Value]) -> Result<Value, MdsError> {
                     )));
                 }
             }
-            sorted.sort_by(|a, b| {
-                let a = match a {
-                    Value::String(s) => s.as_str(),
-                    _ => unreachable!(),
-                };
-                let b = match b {
-                    Value::String(s) => s.as_str(),
-                    _ => unreachable!(),
-                };
-                a.cmp(b)
+            sorted.sort_by(|a, b| match (a, b) {
+                (Value::String(a), Value::String(b)) => a.cmp(b),
+                _ => unreachable!(),
             });
         }
         Value::Number(_) => {
-            // Verify all elements are numbers
-            for item in sorted.iter() {
+            for item in &sorted {
                 if !matches!(item, Value::Number(_)) {
                     return Err(MdsError::builtin_error(format!(
                         "sort() requires a homogeneous array; found {} mixed with number",
@@ -410,16 +410,11 @@ fn builtin_sort(args: &[Value]) -> Result<Value, MdsError> {
                     )));
                 }
             }
-            sorted.sort_by(|a, b| {
-                let a = match a {
-                    Value::Number(n) => *n,
-                    _ => unreachable!(),
-                };
-                let b = match b {
-                    Value::Number(n) => *n,
-                    _ => unreachable!(),
-                };
-                a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+            sorted.sort_by(|a, b| match (a, b) {
+                (Value::Number(a), Value::Number(b)) => {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                }
+                _ => unreachable!(),
             });
         }
         other => {
@@ -438,11 +433,9 @@ fn builtin_unique(args: &[Value]) -> Result<Value, MdsError> {
         other => return Err(type_err("unique", "", "array", other.type_name())),
     };
     // Order-preserving deduplication
-    let mut seen: Vec<&Value> = Vec::new();
     let mut result: Vec<Value> = Vec::new();
     for item in arr {
-        if !seen.contains(&item) {
-            seen.push(item);
+        if !result.contains(item) {
             result.push(item.clone());
         }
     }
@@ -613,6 +606,33 @@ mod tests {
         // Start beyond end → empty
         let result = call_builtin("slice", &[s("hi"), Value::Number(100.0)]).unwrap();
         assert_eq!(result, s(""));
+    }
+
+    #[test]
+    fn slice_string_multibyte_snaps_to_char_boundary() {
+        // "café" is 5 bytes: c(1) a(1) f(1) é(2 bytes: 0xC3 0xA9).
+        // Slicing at byte 4 falls inside the 2-byte 'é'. snap_to_char_boundary
+        // must round down to byte 3 (start of 'é' is actually byte 3 in "café").
+        // This must NOT panic.
+        let cafe = s("café");
+        let result = call_builtin(
+            "slice",
+            &[cafe.clone(), Value::Number(0.0), Value::Number(4.0)],
+        );
+        assert!(result.is_ok(), "slice into multibyte char must not panic");
+        // Byte 4 snaps to byte 3 (start of 'é' = bytes 3..5), so we get "caf".
+        assert_eq!(result.unwrap(), s("caf"));
+    }
+
+    #[test]
+    fn slice_string_emoji_does_not_panic() {
+        // "a😀b" — 😀 is 4 bytes (U+1F600). Slicing mid-emoji must not panic.
+        let emoji_str = s("a😀b");
+        let result = call_builtin(
+            "slice",
+            &[emoji_str, Value::Number(2.0), Value::Number(4.0)],
+        );
+        assert!(result.is_ok(), "slice mid-emoji must not panic");
     }
 
     #[test]
@@ -789,6 +809,33 @@ mod tests {
     fn number_idempotent() {
         let result = call_builtin("number", &[Value::Number(3.5)]).unwrap();
         assert_eq!(result, Value::Number(3.5));
+    }
+
+    // ── snap_to_char_boundary ──────────────────────────────────────────────
+
+    #[test]
+    fn snap_to_char_boundary_on_boundary() {
+        assert_eq!(snap_to_char_boundary("hello", 0), 0);
+        assert_eq!(snap_to_char_boundary("hello", 3), 3);
+        assert_eq!(snap_to_char_boundary("hello", 5), 5);
+    }
+
+    #[test]
+    fn snap_to_char_boundary_mid_multibyte() {
+        // "café" = c(1) a(1) f(1) é(2 bytes at index 3..5)
+        // Index 4 is inside 'é' → should snap to 3
+        assert_eq!(snap_to_char_boundary("café", 4), 3);
+    }
+
+    #[test]
+    fn snap_to_char_boundary_emoji() {
+        // "a😀b" = a(1) 😀(4 bytes at index 1..5) b(1 byte at index 5)
+        // Indices 2, 3, 4 are inside 😀 → should snap to 1
+        assert_eq!(snap_to_char_boundary("a😀b", 2), 1);
+        assert_eq!(snap_to_char_boundary("a😀b", 3), 1);
+        assert_eq!(snap_to_char_boundary("a😀b", 4), 1);
+        // Index 5 is on boundary (start of 'b')
+        assert_eq!(snap_to_char_boundary("a😀b", 5), 5);
     }
 
     // ── get_builtin lookup ────────────────────────────────────────────────────

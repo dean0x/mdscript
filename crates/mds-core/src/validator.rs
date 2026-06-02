@@ -1,12 +1,8 @@
-use crate::ast::{Arg, Condition, Expr, Node, Param};
+use crate::ast::{Arg, Condition, Expr, Node};
 use crate::error::MdsError;
+use crate::evaluator::required_param_count;
 use crate::scope::Scope;
 use crate::value::Value;
-
-/// Count required (no-default) parameters in a param list.
-fn required_param_count(params: &[Param]) -> usize {
-    params.iter().filter(|p| p.default.is_none()).count()
-}
 
 /// Validate semantic correctness of a module AST.
 /// Checks variable references, function arity, and type constraints

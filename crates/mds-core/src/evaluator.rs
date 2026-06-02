@@ -251,7 +251,7 @@ pub(crate) fn condvalue_to_value(cv: &CondValue) -> Value {
 }
 
 /// Count required (no-default) parameters in a param list.
-fn required_param_count(params: &[Param]) -> usize {
+pub(crate) fn required_param_count(params: &[Param]) -> usize {
     params.iter().filter(|p| p.default.is_none()).count()
 }
 

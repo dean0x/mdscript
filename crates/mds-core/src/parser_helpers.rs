@@ -931,10 +931,7 @@ fn find_unquoted_equals(s: &str) -> Option<usize> {
 /// Enforces:
 /// - Required parameters must come before optional (defaulted) parameters
 /// - No duplicate parameter names
-pub(super) fn parse_define_params(
-    params_str: &str,
-    fn_name: &str,
-) -> Result<Vec<Param>, crate::error::MdsError> {
+pub(super) fn parse_define_params(params_str: &str, fn_name: &str) -> Result<Vec<Param>, MdsError> {
     use std::collections::HashSet;
 
     let raw_tokens = split_on_unquoted_commas(params_str);
@@ -953,12 +950,10 @@ pub(super) fn parse_define_params(
             let rhs = token[eq_pos + 1..].trim();
 
             if !is_valid_identifier(lhs) {
-                return Err(crate::error::MdsError::syntax(format!(
-                    "invalid parameter name: '{lhs}'"
-                )));
+                return Err(MdsError::syntax(format!("invalid parameter name: '{lhs}'")));
             }
             let default_val = parse_cond_value(rhs).map_err(|_| {
-                crate::error::MdsError::syntax(format!(
+                MdsError::syntax(format!(
                     "invalid default value for parameter '{lhs}': '{rhs}' — must be a string, number, boolean, or null"
                 ))
             })?;
@@ -970,12 +965,12 @@ pub(super) fn parse_define_params(
         } else {
             // Required parameter
             if !is_valid_identifier(token) {
-                return Err(crate::error::MdsError::syntax(format!(
+                return Err(MdsError::syntax(format!(
                     "invalid parameter name: '{token}'"
                 )));
             }
             if seen_default {
-                return Err(crate::error::MdsError::syntax(format!(
+                return Err(MdsError::syntax(format!(
                     "required parameter '{token}' cannot follow an optional parameter in @define {fn_name}"
                 )));
             }
@@ -986,7 +981,7 @@ pub(super) fn parse_define_params(
         };
 
         if !seen.insert(param.name.clone()) {
-            return Err(crate::error::MdsError::syntax(format!(
+            return Err(MdsError::syntax(format!(
                 "duplicate parameter name '{}' in @define {fn_name}",
                 param.name
             )));

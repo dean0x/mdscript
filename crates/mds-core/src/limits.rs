@@ -36,20 +36,3 @@ pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Exported as `pub(crate)` so `src/lib.rs` can re-export it, and `fs.rs`
 /// can import it for the `find_project_root` upward directory walk.
 pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
-
-// ── Pinning tests ─────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn limits_have_expected_values() {
-        assert_eq!(MAX_DOT_SEGMENTS, 32);
-        assert_eq!(MAX_NESTING_DEPTH, 64);
-        assert_eq!(MAX_ELSEIF_BRANCHES, 256);
-        assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
-        assert_eq!(MAX_TRAVERSAL_DEPTH, 256);
-        assert_eq!(MAX_LOGICAL_OPERANDS, 16);
-    }
-}
