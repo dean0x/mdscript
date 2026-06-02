@@ -6,7 +6,7 @@ use crate::ast::{
     Node,
 };
 use crate::error::MdsError;
-use crate::limits::{MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES};
+use crate::limits::{MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_OUTPUT_SIZE};
 use crate::scope::{FunctionDef, Scope};
 use crate::value::Value;
 
@@ -19,9 +19,6 @@ const MAX_LOOP_ITERATIONS: usize = 100_000;
 /// Maximum total iterations across all loops in a single compilation.
 /// This prevents nested loops from multiplying iterations into the billions.
 const MAX_TOTAL_ITERATIONS: usize = 1_000_000;
-
-/// Maximum size of the output string in bytes (50 MB).
-const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 
 /// Maximum number of accumulated warnings before further warnings are silently dropped.
 const MAX_WARNINGS: usize = 1_000;
