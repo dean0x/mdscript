@@ -17,7 +17,7 @@ use crate::ast::{
     Arg, CondValue, Condition, ExportDirective, Expr, ImportDirective, Interpolation, Node, Param,
 };
 use crate::error::MdsError;
-use crate::limits::{MAX_DOT_SEGMENTS, MAX_NESTING_DEPTH};
+use crate::limits::{MAX_DOT_SEGMENTS, MAX_LOGICAL_OPERANDS, MAX_NESTING_DEPTH};
 
 /// Parse a dot-separated path string (e.g. `"config.debug"`) into a `Vec<String>`.
 ///
@@ -192,13 +192,138 @@ pub(super) fn parse_negation_condition(rest: &str) -> Result<Condition, MdsError
     Ok(Condition::Not(path))
 }
 
+/// Split a string on a 2-character operator (`&&` or `||`) that appears outside
+/// of quoted strings.
+///
+/// Returns a `Vec<&str>` of the parts (not trimmed). Returns a single-element
+/// vec containing the original string if the operator is not found.
+///
+/// # Byte-level scan safety
+///
+/// `&&` and `||` are both ASCII (single-byte), so byte-level scanning is sound
+/// for the same reason as `find_unquoted_operator`.
+fn split_on_unquoted_op<'a>(s: &'a str, op: &str) -> Vec<&'a str> {
+    debug_assert_eq!(op.len(), 2, "op must be a 2-byte ASCII operator");
+    let op_bytes = op.as_bytes();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut parts: Vec<&'a str> = Vec::new();
+    let mut in_string = false;
+    let mut string_char = b'"';
+    let mut segment_start = 0;
+    let mut i = 0;
+
+    while i < len {
+        let ch = bytes[i];
+        if in_string {
+            if ch == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if ch == string_char {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == b'"' || ch == b'\'' {
+            in_string = true;
+            string_char = ch;
+            i += 1;
+            continue;
+        }
+        // Check for the operator at position i
+        if i + 1 < len && bytes[i] == op_bytes[0] && bytes[i + 1] == op_bytes[1] {
+            parts.push(&s[segment_start..i]);
+            segment_start = i + 2;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&s[segment_start..]);
+    parts
+}
+
+/// Count the total number of leaf operands in a condition tree.
+/// Used to enforce MAX_LOGICAL_OPERANDS.
+fn count_leaf_operands(condition: &Condition) -> usize {
+    match condition {
+        Condition::And(ops) | Condition::Or(ops) => ops.iter().map(count_leaf_operands).sum(),
+        _ => 1,
+    }
+}
+
+/// Parse an `@if` condition at the "and-level" — a chain of `&&` separated simple conditions.
+fn parse_and_level(s: &str) -> Result<Condition, MdsError> {
+    let parts = split_on_unquoted_op(s, "&&");
+    if parts.len() == 1 {
+        return parse_simple_condition(parts[0].trim());
+    }
+    let mut operands: Vec<Condition> = Vec::new();
+    for part in &parts {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(MdsError::syntax("empty operand in '&&' expression"));
+        }
+        operands.push(parse_simple_condition(trimmed)?);
+    }
+    Ok(Condition::And(operands))
+}
+
 /// Parse an `@if` or `@elseif` condition string into a `Condition`.
 ///
 /// Accepted forms:
 /// - `var` / `config.debug` → `Condition::Truthy`
 /// - `!var` / `!config.debug` → `Condition::Not`
 /// - `var == "value"` / `var != 42` → `Condition::Eq` / `Condition::NotEq`
+/// - `a && b` → `Condition::And([a, b])`
+/// - `a || b` → `Condition::Or([a, b])`
+/// - `a && b || c` → `Condition::Or([And([a, b]), c])` (`||` binds less tightly)
 pub(super) fn parse_condition(s: &str) -> Result<Condition, MdsError> {
+    let s = s.trim();
+
+    // Split on `||` first (lower precedence)
+    let or_parts = split_on_unquoted_op(s, "||");
+    if or_parts.len() > 1 {
+        let mut operands: Vec<Condition> = Vec::new();
+        for part in &or_parts {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return Err(MdsError::syntax("empty operand in '||' expression"));
+            }
+            operands.push(parse_and_level(trimmed)?);
+        }
+        let cond = Condition::Or(operands);
+        let leaf_count = count_leaf_operands(&cond);
+        if leaf_count > MAX_LOGICAL_OPERANDS {
+            return Err(MdsError::syntax(format!(
+                "logical expression has {leaf_count} operands, exceeding maximum of {MAX_LOGICAL_OPERANDS}"
+            )));
+        }
+        return Ok(cond);
+    }
+
+    // No `||` — check for `&&`
+    let cond = parse_and_level(s)?;
+    if let Condition::And(_) = &cond {
+        let leaf_count = count_leaf_operands(&cond);
+        if leaf_count > MAX_LOGICAL_OPERANDS {
+            return Err(MdsError::syntax(format!(
+                "logical expression has {leaf_count} operands, exceeding maximum of {MAX_LOGICAL_OPERANDS}"
+            )));
+        }
+    }
+    Ok(cond)
+}
+
+/// Parse a single (non-compound) `@if` or `@elseif` condition.
+///
+/// Accepted forms:
+/// - `var` / `config.debug` → `Condition::Truthy`
+/// - `!var` / `!config.debug` → `Condition::Not`
+/// - `var == "value"` / `var != 42` → `Condition::Eq` / `Condition::NotEq`
+fn parse_simple_condition(s: &str) -> Result<Condition, MdsError> {
     let s = s.trim();
 
     // Negation prefix

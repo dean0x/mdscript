@@ -51,28 +51,44 @@ pub enum Condition {
     Eq(Vec<String>, CondValue),
     /// `@if role != "admin":` — strict inequality
     NotEq(Vec<String>, CondValue),
+    /// `@if a && b && c:` — all operands must be truthy (short-circuits on first false)
+    And(Vec<Condition>),
+    /// `@if a || b || c:` — any operand must be truthy (short-circuits on first true)
+    Or(Vec<Condition>),
 }
 
 impl Condition {
-    /// Extract the dot-path from any condition variant.
+    /// Extract the dot-path from a leaf condition variant, or return an empty slice for
+    /// compound conditions (`And`/`Or`).
+    ///
+    /// Callers that need to handle compound conditions must match on the variant directly.
     pub fn path(&self) -> &[String] {
         match self {
             Condition::Truthy(p)
             | Condition::Not(p)
             | Condition::Eq(p, _)
             | Condition::NotEq(p, _) => p,
+            Condition::And(_) | Condition::Or(_) => &[],
         }
     }
 
-    /// Return the root (first) segment of the condition path, or an error if the path is empty.
+    /// Return the root (first) segment of the condition path, or an error.
     ///
-    /// An empty path is an internal invariant violation — the parser always produces a
-    /// non-empty path for a valid `@if` condition.
+    /// For leaf conditions: errors if the path is empty (internal invariant violation).
+    /// For compound conditions (`And`/`Or`): always returns an error — callers must
+    /// recurse into operands directly.
     #[must_use = "errors should be handled"]
     pub fn root(&self) -> Result<&str, crate::error::MdsError> {
-        self.path().first().map(String::as_str).ok_or_else(|| {
-            crate::error::MdsError::syntax("internal error: @if block has empty condition path")
-        })
+        match self {
+            Condition::And(_) | Condition::Or(_) => Err(crate::error::MdsError::syntax(
+                "internal error: root() called on compound And/Or condition — recurse operands instead",
+            )),
+            _ => self.path().first().map(String::as_str).ok_or_else(|| {
+                crate::error::MdsError::syntax(
+                    "internal error: @if block has empty condition path",
+                )
+            }),
+        }
     }
 }
 

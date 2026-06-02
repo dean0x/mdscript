@@ -17,6 +17,12 @@ pub(crate) const MAX_NESTING_DEPTH: usize = 64;
 /// MAX_NESTING_DEPTH (64), which limits recursive nesting depth.
 pub(crate) const MAX_ELSEIF_BRANCHES: usize = 256;
 
+/// Maximum number of leaf operands in a single `&&` or `||` expression.
+///
+/// Prevents adversarial inputs from creating exponentially-evaluated condition
+/// trees. 16 operands allows complex but realistic conditions.
+pub(crate) const MAX_LOGICAL_OPERANDS: usize = 16;
+
 // ── Size / traversal limits ───────────────────────────────────────────────────
 
 /// Maximum file size (10 MB) to prevent runaway memory use.
@@ -44,5 +50,6 @@ mod tests {
         assert_eq!(MAX_ELSEIF_BRANCHES, 256);
         assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
         assert_eq!(MAX_TRAVERSAL_DEPTH, 256);
+        assert_eq!(MAX_LOGICAL_OPERANDS, 16);
     }
 }

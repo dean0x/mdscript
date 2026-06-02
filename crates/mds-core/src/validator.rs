@@ -129,7 +129,10 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
     }
 }
 
-/// Validate that the root variable of a condition path is defined in scope.
+/// Validate that the root variable(s) of a condition are defined in scope.
+///
+/// For compound conditions (`And`/`Or`), recursively validates all operands
+/// (conservative — validates all branches, not just the short-circuit path).
 fn validate_condition(
     condition: &Condition,
     scope: &Scope,
@@ -137,11 +140,21 @@ fn validate_condition(
     source: &str,
     offset: usize,
 ) -> Result<(), MdsError> {
-    let root = condition.root()?;
-    scope
-        .get_var(root)
-        .ok_or_else(|| MdsError::undefined_var_at(root, file, source, offset, root.len()))
-        .map(|_| ())
+    match condition {
+        Condition::And(operands) | Condition::Or(operands) => {
+            for operand in operands {
+                validate_condition(operand, scope, file, source, offset)?;
+            }
+            Ok(())
+        }
+        _ => {
+            let root = condition.root()?;
+            scope
+                .get_var(root)
+                .ok_or_else(|| MdsError::undefined_var_at(root, file, source, offset, root.len()))
+                .map(|_| ())
+        }
+    }
 }
 
 fn validate_expr(

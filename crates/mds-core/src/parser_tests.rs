@@ -912,3 +912,148 @@ fn parse_define_mixed_required_and_optional() {
         panic!("expected Define node");
     }
 }
+
+// ── Logical operators ─────────────────────────────────────────────────────────
+
+#[test]
+fn parse_condition_and_two_vars() {
+    let cond = parse_condition("a && b").unwrap();
+    assert!(matches!(cond, crate::ast::Condition::And(_)));
+    if let crate::ast::Condition::And(ops) = cond {
+        assert_eq!(ops.len(), 2);
+    }
+}
+
+#[test]
+fn parse_condition_or_two_vars() {
+    let cond = parse_condition("a || b").unwrap();
+    assert!(matches!(cond, crate::ast::Condition::Or(_)));
+    if let crate::ast::Condition::Or(ops) = cond {
+        assert_eq!(ops.len(), 2);
+    }
+}
+
+#[test]
+fn parse_condition_and_with_equality() {
+    let cond = parse_condition("role == \"admin\" && active").unwrap();
+    assert!(matches!(cond, crate::ast::Condition::And(_)));
+    if let crate::ast::Condition::And(ops) = cond {
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], crate::ast::Condition::Eq(..)));
+        assert!(matches!(ops[1], crate::ast::Condition::Truthy(..)));
+    }
+}
+
+#[test]
+fn parse_condition_and_with_negation() {
+    let cond = parse_condition("a && !b").unwrap();
+    assert!(matches!(cond, crate::ast::Condition::And(_)));
+    if let crate::ast::Condition::And(ops) = cond {
+        assert!(matches!(ops[1], crate::ast::Condition::Not(..)));
+    }
+}
+
+#[test]
+fn parse_condition_or_higher_precedence_than_and() {
+    // `a && b || c` → Or([And([a, b]), c])
+    let cond = parse_condition("a && b || c").unwrap();
+    assert!(matches!(cond, crate::ast::Condition::Or(_)));
+    if let crate::ast::Condition::Or(ops) = cond {
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], crate::ast::Condition::And(_)));
+        assert!(matches!(ops[1], crate::ast::Condition::Truthy(..)));
+    }
+}
+
+#[test]
+fn parse_condition_string_with_operator_inside_quotes() {
+    // The `||` inside the string should NOT be treated as a logical operator
+    let cond = parse_condition("msg == \"a || b\"").unwrap();
+    assert!(
+        matches!(cond, crate::ast::Condition::Eq(..)),
+        "operator inside string should not split condition"
+    );
+}
+
+#[test]
+fn parse_condition_complex_three_or() {
+    let cond = parse_condition("a || b || c").unwrap();
+    assert!(matches!(cond, crate::ast::Condition::Or(_)));
+    if let crate::ast::Condition::Or(ops) = cond {
+        assert_eq!(ops.len(), 3);
+    }
+}
+
+#[test]
+fn parse_condition_empty_operand_rejected() {
+    let result = parse_condition("a && ");
+    assert!(result.is_err(), "empty operand after && should fail");
+}
+
+#[test]
+fn parse_condition_empty_or_operand_rejected() {
+    let result = parse_condition("|| b");
+    assert!(result.is_err(), "empty operand before || should fail");
+}
+
+#[test]
+fn parse_condition_max_operands_exceeded_rejected() {
+    // MAX_LOGICAL_OPERANDS is 16; 17 operands in a || chain should be rejected.
+    let parts: Vec<String> = (0..17).map(|i| format!("v{i}")).collect();
+    let src_condition = parts.join(" || ");
+    let result = parse_condition(&src_condition);
+    assert!(
+        result.is_err(),
+        "more than MAX_LOGICAL_OPERANDS operands must be rejected"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("operand") || err.contains("maximum"),
+        "error should mention operand limit, got: {err}"
+    );
+}
+
+// ── Logical operator integration tests ───────────────────────────────────────
+
+#[test]
+fn evaluate_and_condition_both_true() {
+    let result =
+        crate::compile_str("---\na: true\nb: true\n---\n@if a && b:\nyes\n@end\n").unwrap();
+    assert!(
+        result.contains("yes"),
+        "and with both true should render body, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_and_condition_one_false() {
+    let result =
+        crate::compile_str("---\na: true\nb: false\n---\n@if a && b:\nyes\n@else:\nno\n@end\n")
+            .unwrap();
+    assert!(
+        result.contains("no"),
+        "and with one false should take else, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_or_condition_one_true() {
+    let result =
+        crate::compile_str("---\na: false\nb: true\n---\n@if a || b:\nyes\n@else:\nno\n@end\n")
+            .unwrap();
+    assert!(
+        result.contains("yes"),
+        "or with one true should render body, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_or_condition_both_false() {
+    let result =
+        crate::compile_str("---\na: false\nb: false\n---\n@if a || b:\nyes\n@else:\nno\n@end\n")
+            .unwrap();
+    assert!(
+        result.contains("no"),
+        "or with both false should take else, got: {result}"
+    );
+}

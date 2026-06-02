@@ -408,6 +408,24 @@ fn evaluate_condition(condition: &Condition, scope: &Scope) -> Result<bool, MdsE
             &resolve_condition_value(condition, scope)?,
             expected,
         )),
+        // Short-circuit And: return false on first false operand
+        Condition::And(operands) => {
+            for operand in operands {
+                if !evaluate_condition(operand, scope)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        // Short-circuit Or: return true on first true operand
+        Condition::Or(operands) => {
+            for operand in operands {
+                if evaluate_condition(operand, scope)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
     }
 }
 

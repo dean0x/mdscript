@@ -1,4 +1,4 @@
-# MDS Language Specification (v0.1)
+# MDS Language Specification (v0.2)
 
 ## 1. Overview
 
@@ -159,6 +159,10 @@ Free tier.
   - Truthy check: `@if var:` or `@if config.debug:`
   - Negation: `@if !var:` or `@if !config.debug:`
   - Equality: `@if var == "value":` / `@if var != "value":` (both double and single quotes are valid: `@if var == 'value':`)
+  - Logical AND: `@if a && b:` — true when both operands are truthy (short-circuits on first false)
+  - Logical OR: `@if a || b:` — true when any operand is truthy (short-circuits on first true)
+  - Compound: `@if a && b || c:` — `||` has lower precedence than `&&`; operators inside quoted strings are not parsed as operators
+  - Maximum 16 leaf operands per logical expression
 - Falsy values: `false`, `null`, empty string `""`, empty array `[]`, empty object `{}`, `0`, `NaN`
 - Everything else is truthy
 - Equality is **strict**, no type coercion: `@if count == "3":` is false when count is the number 3
@@ -209,6 +213,17 @@ Hello {name}, welcome!
 @end
 ```
 
+With default arguments:
+
+```mds
+@define greet(name = "World"):
+Hello {name}!
+@end
+
+{greet()}         @# → Hello World!
+{greet("Alice")}  @# → Hello Alice!
+```
+
 Invocation:
 
 ```mds
@@ -221,8 +236,37 @@ Invocation:
 - Arguments are positional
 - Functions can call other functions; direct recursion is rejected at compile time, and indirect call chains are bounded by a maximum call depth of 128
 - Function body has its own scope; params shadow outer vars
-- No default arguments in v0.1
+- Parameters may have default values: `@define name(param = default):` — defaults are string, number, boolean, or null literals
+- Required parameters must appear before optional (defaulted) parameters
 - String arguments accept both double-quoted (`"value"`) and single-quoted (`'value'`) literals; both support `\\`, `\"`, and `\'` escape sequences
+- Literal argument types: strings `"x"`, numbers `42`, `-1.5`, booleans `true`/`false`, null
+
+**Built-in functions:**
+
+MDS provides 18 built-in functions that can be called without `@define`:
+
+| Function | Args | Description |
+|----------|------|-------------|
+| `upper(s)` | 1 | Convert string to uppercase |
+| `lower(s)` | 1 | Convert string to lowercase |
+| `trim(s)` | 1 | Strip leading/trailing whitespace |
+| `replace(s, from, to)` | 3 | Literal string replacement |
+| `split(s, sep)` | 2 | Split string into array |
+| `starts_with(s, prefix)` | 2 | Returns true/false |
+| `ends_with(s, suffix)` | 2 | Returns true/false |
+| `contains(s_or_arr, needle)` | 2 | Works on string and array |
+| `slice(s_or_arr, start[, end])` | 2–3 | Extract substring or sub-array; clamps to bounds |
+| `join(arr, sep)` | 2 | Join array of strings |
+| `length(s_or_arr)` | 1 | String byte length or array count |
+| `first(arr)` | 1 | First element or null for empty |
+| `last(arr)` | 1 | Last element or null for empty |
+| `reverse(s_or_arr)` | 1 | Reverse string or array |
+| `sort(arr)` | 1 | Sort homogeneous array (strings or numbers) |
+| `unique(arr)` | 1 | Deduplicate (order-preserving) |
+| `string(v)` | 1 | Convert any value to string |
+| `number(v)` | 1 | Convert string/boolean/null to number |
+
+User-defined functions shadow built-ins with the same name.
 
 ---
 
@@ -691,20 +735,22 @@ A language server (Rust) providing diagnostics, completions, go-to-definition fo
 
 ---
 
-## 10. What's NOT in v0.1
+## 10. What's NOT in v0.2
 
 These are intentionally deferred to keep the language simple and the compiler focused:
 
 - Structured JSON output (chat message arrays)
 - TypeScript/JS *language* features (note: runtime bindings for calling the compiler from JS/TS *are* provided via the `@mdscript/mds` npm package; this item refers to in-template scripting, which is out of scope)
-- Built-in functions (upper, lower, join, etc.)
 - Unbounded recursion: direct recursion is rejected; indirect chains are capped at depth 128 (see §4.5)
 - Macros, async functions, streaming
-- Default function arguments
 - URL-based imports (remote modules)
 - Source maps
 - Template inheritance
-- Logical operators in `@if` (`&&`, `||`): use `@elseif` chains instead
+- Function calls in `@if` conditions (e.g. `@if length(items) == 0:`) — not supported
+- Function calls in `@for` iterables (e.g. `@for item in split(csv, ","):`) — not supported
+- Parenthesized sub-expressions in conditions (e.g. `@if (a || b) && c:`) — not supported
+- Negative indexing in `slice()` — clamped to 0 instead
+- Array element indexing (`{items[0]}`) — not supported
 
 ---
 
@@ -726,9 +772,14 @@ reexport        := "@export" identifier "from" quoted_path
 wildcard_reexport := "@export" "*" "from" quoted_path
 
 define          := "@define" identifier "(" params? "):" body "@end"
+params          := param ("," param)*
+param           := identifier | identifier "=" cond_value
 include         := "@include" identifier
 if_block        := "@if" condition ":" body ("@elseif" condition ":" body)* ("@else:" body)? "@end"
-condition       := "!" dot_path | dot_path ("==" | "!=") cond_value | dot_path
+condition       := or_expr
+or_expr         := and_expr ("||" and_expr)*
+and_expr        := simple_cond ("&&" simple_cond)*
+simple_cond     := "!" dot_path | dot_path ("==" | "!=") cond_value | dot_path
 cond_value      := quoted_string | number | "true" | "false" | "null"
 number          := "-"? [0-9]+ ("." [0-9]+)?   (* not NaN or Infinity; those are rejected at parse time *)
 for_block       := "@for" loop_vars "in" dot_path ":" body "@end"
@@ -739,6 +790,8 @@ interpolation   := "{" (qualified_call | member_access | function_call | identif
 qualified_call  := identifier "." identifier "(" arguments? ")"
 member_access   := identifier ("." identifier)+
 function_call   := identifier "(" arguments? ")"
+arguments       := argument ("," argument)*
+argument        := quoted_string | number | "true" | "false" | "null" | function_call | member_access | identifier
 dot_path        := identifier ("." identifier)*
 escaped_brace   := "\{" | "\}"
 
@@ -754,5 +807,7 @@ quoted_path     := "\"" path_chars "\""
 ---
 
 ## 12. Status
+
+v0.2.0 - Language enrichment release. Adds built-in functions (18 functions for string, array, and type-conversion operations), default function arguments, and logical operators (`&&`, `||`) in `@if` conditions with short-circuit evaluation and operator-precedence semantics.
 
 v0.1.0 - Initial public release. The core compiler is feature-complete as described in this specification, including negation in `@if` conditions (`!dot_path`), equality/inequality comparisons (`==`, `!=`), the `@elseif` directive, and `NaN`/`Infinity` rejection at parse time.
