@@ -1058,4 +1058,58 @@ mod tests {
     fn get_builtin_returns_none_for_unknown() {
         assert!(get_builtin("nonexistent").is_none());
     }
+
+    // ── Missing negative / not-found tests (batch-5) ─────────────────────────
+
+    #[test]
+    fn contains_requires_string_or_array() {
+        let err = call_builtin("contains", &[Value::Number(1.0), s("x")]).unwrap_err();
+        assert!(
+            err.to_string().contains("string or array"),
+            "expected 'string or array' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn contains_array_not_found() {
+        let result = call_builtin("contains", &[arr(&["a", "b"]), s("z")]).unwrap();
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn reverse_requires_string_or_array() {
+        let err = call_builtin("reverse", &[Value::Number(42.0)]).unwrap_err();
+        assert!(
+            err.to_string().contains("string or array"),
+            "expected 'string or array' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slice_requires_string_or_array() {
+        let err = call_builtin("slice", &[Value::Number(1.0), Value::Number(0.0)]).unwrap_err();
+        assert!(
+            err.to_string().contains("string or array"),
+            "expected 'string or array' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn number_rejects_array() {
+        let err = call_builtin("number", &[arr(&["a", "b"])]).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot convert"),
+            "expected 'cannot convert' in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn number_rejects_object() {
+        let obj = Value::Object(std::collections::HashMap::new());
+        let err = call_builtin("number", &[obj]).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot convert"),
+            "expected 'cannot convert' in error, got: {err}"
+        );
+    }
 }

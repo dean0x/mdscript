@@ -111,7 +111,7 @@ fn validate_for_node(
     // resolves to a non-array) surfaces as a MdsError::TypeError at evaluation time via
     // `resolve_dot_path`, with less precise span information than a validator diagnostic.
     // Resolving object fields statically would require a full type-system pass that is
-    // out of scope for v0.1.
+    // out of scope for the current release.
     if block.key_var.is_none()
         && block.iterable.len() == 1
         && !matches!(iterable_val, Value::Array(_))
@@ -174,6 +174,53 @@ fn validate_condition(
     }
 }
 
+/// Resolve a call by name and validate arity.
+///
+/// Returns `Ok(true)` if the call resolved to a builtin (so the caller can
+/// skip further variable-existence checks on its arguments), `Ok(false)` if
+/// it resolved to a user-defined function, or an error if the function is
+/// unknown or the arity is out of range.
+///
+/// `len` is the span length used for error diagnostics — callers pass the
+/// full call-site span for top-level calls and `name.len()` for nested calls
+/// inside argument lists.
+fn validate_call_arity(
+    name: &str,
+    arg_count: usize,
+    scope: &Scope,
+    file: &str,
+    source: &str,
+    offset: usize,
+    len: usize,
+) -> Result<bool, MdsError> {
+    if let Some(func) = scope.get_function(name) {
+        let required = required_param_count(&func.params);
+        let total = func.params.len();
+        if arg_count < required || arg_count > total {
+            return Err(MdsError::arity_at(
+                name, required, total, arg_count, file, source, offset, len,
+            ));
+        }
+        Ok(false)
+    } else if let Some(meta) = crate::builtins::get_builtin(name) {
+        if arg_count < meta.min_args || arg_count > meta.max_args {
+            return Err(MdsError::arity_at(
+                name,
+                meta.min_args,
+                meta.max_args,
+                arg_count,
+                file,
+                source,
+                offset,
+                len,
+            ));
+        }
+        Ok(true)
+    } else {
+        Err(MdsError::undefined_fn_at(name, file, source, offset, len))
+    }
+}
+
 fn validate_expr(
     expr: &Expr,
     scope: &Scope,
@@ -198,39 +245,11 @@ fn validate_expr(
                 .map(|_| ())
         }
         Expr::Call { name, args } => {
-            if let Some(func) = scope.get_function(name) {
-                let required = required_param_count(&func.params);
-                let total = func.params.len();
-                if args.len() < required || args.len() > total {
-                    return Err(MdsError::arity_at(
-                        name,
-                        required,
-                        total,
-                        args.len(),
-                        file,
-                        source,
-                        offset,
-                        len,
-                    ));
-                }
-            } else if let Some(meta) = crate::builtins::get_builtin(name) {
-                if args.len() < meta.min_args || args.len() > meta.max_args {
-                    return Err(MdsError::arity_at(
-                        name,
-                        meta.min_args,
-                        meta.max_args,
-                        args.len(),
-                        file,
-                        source,
-                        offset,
-                        len,
-                    ));
-                }
+            let is_builtin = validate_call_arity(name, args.len(), scope, file, source, offset, len)?;
+            if is_builtin {
                 // Built-in args may be any type — no variable-existence check needed.
                 // However, we still validate any nested calls or variable references within args.
                 return validate_var_args(args, scope, file, source, offset, 0);
-            } else {
-                return Err(MdsError::undefined_fn_at(name, file, source, offset, len));
             }
             validate_var_args(args, scope, file, source, offset, 0)
         }
@@ -303,43 +322,8 @@ fn validate_var_args(
                 args: inner_args,
             } => {
                 // Validate the nested call — check user-defined first, then builtins.
-                if let Some(func) = scope.get_function(name) {
-                    let required = required_param_count(&func.params);
-                    let total = func.params.len();
-                    if inner_args.len() < required || inner_args.len() > total {
-                        return Err(MdsError::arity_at(
-                            name,
-                            required,
-                            total,
-                            inner_args.len(),
-                            file,
-                            source,
-                            offset,
-                            name.len(),
-                        ));
-                    }
-                } else if let Some(meta) = crate::builtins::get_builtin(name) {
-                    if inner_args.len() < meta.min_args || inner_args.len() > meta.max_args {
-                        return Err(MdsError::arity_at(
-                            name,
-                            meta.min_args,
-                            meta.max_args,
-                            inner_args.len(),
-                            file,
-                            source,
-                            offset,
-                            name.len(),
-                        ));
-                    }
-                } else {
-                    return Err(MdsError::undefined_fn_at(
-                        name,
-                        file,
-                        source,
-                        offset,
-                        name.len(),
-                    ));
-                }
+                // Nested calls use name.len() as the span (no full call-site span available).
+                validate_call_arity(name, inner_args.len(), scope, file, source, offset, name.len())?;
                 validate_var_args(inner_args, scope, file, source, offset, depth + 1)?;
             }
         }
