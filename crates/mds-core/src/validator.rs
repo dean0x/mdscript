@@ -245,7 +245,8 @@ fn validate_expr(
                 .map(|_| ())
         }
         Expr::Call { name, args } => {
-            let is_builtin = validate_call_arity(name, args.len(), scope, file, source, offset, len)?;
+            let is_builtin =
+                validate_call_arity(name, args.len(), scope, file, source, offset, len)?;
             if is_builtin {
                 // Built-in args may be any type — no variable-existence check needed.
                 // However, we still validate any nested calls or variable references within args.
@@ -323,7 +324,15 @@ fn validate_var_args(
             } => {
                 // Validate the nested call — check user-defined first, then builtins.
                 // Nested calls use name.len() as the span (no full call-site span available).
-                validate_call_arity(name, inner_args.len(), scope, file, source, offset, name.len())?;
+                validate_call_arity(
+                    name,
+                    inner_args.len(),
+                    scope,
+                    file,
+                    source,
+                    offset,
+                    name.len(),
+                )?;
                 validate_var_args(inner_args, scope, file, source, offset, depth + 1)?;
             }
         }
