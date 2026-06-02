@@ -13,6 +13,8 @@
 //!   `unescape_string`, `is_valid_identifier`, `is_directive_token`,
 //!   `strip_leading_newline`, `strip_trailing_newline`
 
+use std::collections::HashSet;
+
 use crate::ast::{
     Arg, CondValue, Condition, ExportDirective, Expr, ImportDirective, Interpolation, Node, Param,
 };
@@ -932,8 +934,6 @@ fn find_unquoted_equals(s: &str) -> Option<usize> {
 /// - Required parameters must come before optional (defaulted) parameters
 /// - No duplicate parameter names
 pub(super) fn parse_define_params(params_str: &str, fn_name: &str) -> Result<Vec<Param>, MdsError> {
-    use std::collections::HashSet;
-
     let raw_tokens = split_on_unquoted_commas(params_str);
     let mut params: Vec<Param> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();

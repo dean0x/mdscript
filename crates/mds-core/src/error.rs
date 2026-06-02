@@ -370,6 +370,22 @@ impl MdsError {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn builtin_error_at(
+        msg: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::BuiltinError {
+            message: msg.into(),
+            span,
+            src,
+        }
+    }
+
     pub(crate) fn type_error(got: impl Into<String>) -> Self {
         MdsError::TypeError {
             got: got.into(),

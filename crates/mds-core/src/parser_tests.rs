@@ -954,7 +954,7 @@ fn parse_condition_and_with_negation() {
 }
 
 #[test]
-fn parse_condition_or_higher_precedence_than_and() {
+fn parse_condition_and_has_higher_precedence_than_or() {
     // `a && b || c` → Or([And([a, b]), c])
     let cond = parse_condition("a && b || c").unwrap();
     assert!(matches!(cond, crate::ast::Condition::Or(_)));
@@ -1055,5 +1055,42 @@ fn evaluate_or_condition_both_false() {
     assert!(
         result.contains("no"),
         "or with both false should take else, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_elseif_with_logical_and_operator() {
+    // parse_condition is shared between @if and @elseif; verify logical operators
+    // work correctly in @elseif branches (b && c evaluates to BC when a=false, b=true, c=true).
+    let src =
+        "---\na: false\nb: true\nc: true\n---\n@if a:\nA\n@elseif b && c:\nBC\n@else:\nNO\n@end\n";
+    let result = crate::compile_str(src).unwrap();
+    assert!(
+        result.contains("BC"),
+        "@elseif with && should render branch when both operands are true, got: {result}"
+    );
+    assert!(
+        !result.contains("A"),
+        "@if branch should not render when a is false, got: {result}"
+    );
+    assert!(
+        !result.contains("NO"),
+        "@else branch should not render when @elseif matches, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_elseif_with_logical_or_operator() {
+    // Verify @elseif with || takes the branch when at least one operand is true.
+    let src =
+        "---\na: false\nb: false\nc: true\n---\n@if a:\nA\n@elseif b || c:\nBC\n@else:\nNO\n@end\n";
+    let result = crate::compile_str(src).unwrap();
+    assert!(
+        result.contains("BC"),
+        "@elseif with || should render branch when one operand is true, got: {result}"
+    );
+    assert!(
+        !result.contains("NO"),
+        "@else branch should not render when @elseif matches, got: {result}"
     );
 }
