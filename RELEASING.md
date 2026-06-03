@@ -134,7 +134,8 @@ The `release.yml` workflow runs, in order:
   `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
   `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`,
   `x86_64-pc-windows-msvc`. Linux musl/arm builds use napi's `--use-napi-cross`.
-- `wasm-opt` is currently disabled (`crates/mds-wasm/Cargo.toml`); re-enable once
-  CI provides Binaryen to recover ~10–20% wasm size.
+- `wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...]` is enabled in `crates/mds-wasm/Cargo.toml`; CI installs
+  wasm-pack and Binaryen v129 via the composite action at `.github/actions/setup-wasm/` (version pins live there). Local builds need Binaryen separately
+  (`brew install binaryen` / `apt install binaryen`).
 - Platform packages are generated **in CI only** — they cannot be validated with a
   local `npm pack`; use the dry-run workflow above instead.

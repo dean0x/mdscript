@@ -35,8 +35,7 @@ mds = { package = "mds-core", path = "../mds-core", version = "0.1.0" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]
-# wasm-opt disabled: Binaryen is not guaranteed to be installed in all build
-# environments and no CI is configured yet. Re-enable once CI installs Binaryen
-# (e.g. wasm-pack CI action) to recover ~10-20% binary size reduction.
-# Enable with: wasm-opt = ["-Oz"]
-wasm-opt = false
+# -Oz: optimize for size. Rust 1.88+ emits post-MVP WASM features that wasm-opt
+# rejects by default — each must be explicitly enabled.
+# Requires Binaryen: CI uses phi-ag/setup-binaryen; locally `brew install binaryen`.
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", "--enable-nontrapping-float-to-int", "--enable-mutable-globals"]
