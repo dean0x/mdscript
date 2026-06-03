@@ -35,8 +35,9 @@ mds = { package = "mds-core", path = "../mds-core", version = "0.1.0" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]
-# -Oz: aggressively optimize for size (smallest gzipped transfer weight).
-# CI installs Binaryen v129 via phi-ag/setup-binaryen before wasm-pack build.
-# Local WASM builds require Binaryen: `brew install binaryen` (macOS) /
-# `apt install binaryen` (Linux) before running `npm run build -w @mdscript/mds-wasm`.
-wasm-opt = ["-Oz"]
+# -Oz: optimize for size. --enable-bulk-memory: Rust 1.88+ emits memory.copy
+# (bulk memory proposal) by default; wasm-opt v129 rejects these without this
+# flag. Bulk memory is supported by all modern browsers (since 2020) and Node 12+.
+# CI installs Binaryen v129 via phi-ag/setup-binaryen;
+# local builds need `brew install binaryen` / `apt install binaryen`.
+wasm-opt = ["-Oz", "--enable-bulk-memory"]
