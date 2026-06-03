@@ -57,13 +57,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.14.0
+      - uses: phi-ag/setup-binaryen@f7f99985a69ad20f08b12ad725865b14a7f875a4  # v1.0.8
+        with:
+          version: 129
+      - name: Verify wasm-opt
+        run: wasm-opt --version
       - name: Build (nodejs + web targets)
         run: |
           wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
           wasm-pack build crates/mds-wasm --target web --out-dir pkg-web
       - name: Test (node)
         run: wasm-pack test --node crates/mds-wasm
+      - name: Test (node, release profile — verifies wasm-opt output)
+        run: wasm-pack test --node --release crates/mds-wasm
+      - name: Report WASM binary sizes
+        if: always()
+        continue-on-error: true
+        run: |
+          for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
+            raw=$(wc -c < "$f" | tr -d ' ')
+            gz=$(gzip -c "$f" | wc -c | tr -d ' ')
+            label="${f#crates/mds-wasm/}"
+            echo "::notice::WASM ${label}: ${raw} bytes raw, ${gz} bytes gzipped"
+          done
 
   js:
     name: JS packages — build & test
@@ -90,7 +107,10 @@ jobs:
       # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
       - uses: jetli/wasm-pack-action@v0.4.0
         with:
-          version: latest
+          version: v0.14.0
+      - uses: phi-ag/setup-binaryen@f7f99985a69ad20f08b12ad725865b14a7f875a4  # v1.0.8
+        with:
+          version: 129
       - name: Build WASM (nodejs)
         run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
       - name: Build TS packages

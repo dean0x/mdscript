@@ -35,8 +35,8 @@ mds = { package = "mds-core", path = "../mds-core", version = "0.1.0" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]
-# wasm-opt disabled: Binaryen is not guaranteed to be installed in all build
-# environments and no CI is configured yet. Re-enable once CI installs Binaryen
-# (e.g. wasm-pack CI action) to recover ~10-20% binary size reduction.
-# Enable with: wasm-opt = ["-Oz"]
-wasm-opt = false
+# -Oz: aggressively optimize for size (smallest gzipped transfer weight).
+# CI installs Binaryen v129 via phi-ag/setup-binaryen before wasm-pack build.
+# Local WASM builds require Binaryen: `brew install binaryen` (macOS) /
+# `apt install binaryen` (Linux) before running `npm run build -w @mdscript/mds-wasm`.
+wasm-opt = ["-Oz"]
