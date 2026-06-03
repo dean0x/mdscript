@@ -73,7 +73,6 @@ jobs:
         run: wasm-pack test --node --release crates/mds-wasm
       - name: Report WASM binary sizes
         if: always()
-        continue-on-error: true
         run: |
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
@@ -85,7 +84,7 @@ jobs:
             label="${f#crates/mds-wasm/}"
             echo "::notice::WASM ${label}: ${raw} bytes raw, ${gz} bytes gzipped"
             if [ "$raw" -gt 600000 ]; then
-              echo "::error::WASM binary exceeds 600 KB threshold: ${label} is ${raw} bytes"
+              echo "::error::WASM binary exceeds 600,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
             fi
           done
