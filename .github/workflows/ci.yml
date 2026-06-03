@@ -55,18 +55,20 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.14.0
-      - uses: phi-ag/setup-binaryen@f7f99985a69ad20f08b12ad725865b14a7f875a4  # v1.0.8
-        with:
-          version: 129
+      - uses: ./.github/actions/setup-wasm
       - name: Verify wasm-opt
         run: wasm-opt --version
       - name: Build (nodejs + web targets)
         run: |
           wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
           wasm-pack build crates/mds-wasm --target web --out-dir pkg-web
+      - name: Smoke-test built artifact
+        run: |
+          node -e "
+            const m = require('./crates/mds-wasm/pkg/mds_wasm.js');
+            const r = m.compile('Hello!\n', null);
+            console.log('smoke ok:', r.output);
+          "
       - name: Test (node)
         run: wasm-pack test --node crates/mds-wasm
       - name: Test (node, release — verifies wasm-opt)
@@ -76,10 +78,18 @@ jobs:
         continue-on-error: true
         run: |
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
+            if [ ! -f "$f" ]; then
+              echo "::warning::WASM file missing: $f"
+              continue
+            fi
             raw=$(wc -c < "$f" | tr -d ' ')
             gz=$(gzip -c "$f" | wc -c | tr -d ' ')
             label="${f#crates/mds-wasm/}"
             echo "::notice::WASM ${label}: ${raw} bytes raw, ${gz} bytes gzipped"
+            if [ "$raw" -gt 600000 ]; then
+              echo "::error::WASM binary exceeds 600 KB threshold: ${label} is ${raw} bytes"
+              exit 1
+            fi
           done
 
   js:
@@ -105,12 +115,7 @@ jobs:
         working-directory: crates/mds-napi
         run: npx napi build --platform --release --no-js
       # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
-      - uses: jetli/wasm-pack-action@v0.4.0
-        with:
-          version: v0.14.0
-      - uses: phi-ag/setup-binaryen@f7f99985a69ad20f08b12ad725865b14a7f875a4  # v1.0.8
-        with:
-          version: 129
+      - uses: ./.github/actions/setup-wasm
       - name: Build WASM (nodejs)
         run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
       - name: Build TS packages
