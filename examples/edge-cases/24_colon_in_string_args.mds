@@ -1,0 +1,28 @@
+---
+# Edge case: colon inside string arguments must not corrupt directive parsing
+path: "usr:local:bin"
+csv: "a:b:c"
+greeting: "hello:world"
+---
+
+# Colon in string arguments
+
+## @if with colon inside string literal argument
+@if contains(path, "usr:local"):
+Path contains usr:local
+@end
+
+## @for with colon as separator
+@for part in split(path, ":"):
+- {part}
+@end
+
+## @if comparing a string containing a colon
+@if greeting == "hello:world":
+Greeting matches
+@end
+
+## @for splitting csv by colon
+@for x in split(csv, ":"):
+- {x}
+@end

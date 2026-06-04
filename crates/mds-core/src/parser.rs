@@ -15,7 +15,7 @@ use crate::ast::{
 };
 use crate::error::MdsError;
 use crate::lexer::Token;
-use crate::limits::{MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_NESTING_DEPTH};
+use crate::limits::{MAX_ELSEIF_BRANCHES, MAX_NESTING_DEPTH};
 
 #[path = "parser_helpers.rs"]
 mod helpers;
@@ -242,11 +242,15 @@ impl Parser<'_> {
     fn parse_if_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
         self.enter_block()?;
 
-        let condition_str = rest
-            .trim()
-            .strip_suffix(':')
-            .ok_or_else(|| MdsError::syntax("@if directive must end with ':'"))?
-            .trim();
+        let trimmed = rest.trim();
+        let condition_str = strip_trailing_directive_colon(trimmed).ok_or_else(|| {
+            // Give a more targeted error when the issue is an unterminated string literal
+            if has_unterminated_string(trimmed) {
+                MdsError::syntax("unterminated string literal in @if condition")
+            } else {
+                MdsError::syntax("@if directive must end with ':'")
+            }
+        })?;
 
         let condition = parse_condition(condition_str)?;
 
@@ -299,14 +303,13 @@ impl Parser<'_> {
 
             // Extract condition string: strip "@elseif " prefix and trailing ":".
             // strip_prefix cannot fail here: the while guard already checked starts_with("@elseif ").
-            let elseif_cond_str = elseif_dir
+            let elseif_rest = elseif_dir
                 .trim()
                 .strip_prefix("@elseif ")
                 .expect("loop guard guarantees @elseif prefix")
-                .trim()
-                .strip_suffix(':')
-                .ok_or_else(|| MdsError::syntax("@elseif directive must end with ':'"))?
                 .trim();
+            let elseif_cond_str = strip_trailing_directive_colon(elseif_rest)
+                .ok_or_else(|| MdsError::syntax("@elseif directive must end with ':'"))?;
 
             let elseif_cond = parse_condition(elseif_cond_str)?;
             let elseif_body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
@@ -319,11 +322,8 @@ impl Parser<'_> {
     fn parse_for_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
         self.enter_block()?;
 
-        let rest = rest.trim();
-        let rest = rest
-            .strip_suffix(':')
-            .ok_or_else(|| MdsError::syntax("@for directive must end with ':'"))?
-            .trim();
+        let rest = strip_trailing_directive_colon(rest.trim())
+            .ok_or_else(|| MdsError::syntax("@for directive must end with ':'"))?;
 
         // Split on " in " to separate variable part from iterable part.
         // Supports both:
@@ -337,22 +337,20 @@ impl Parser<'_> {
 
         let (key_var, var) = parse_for_vars(var_part)?;
 
-        // Parse iterable as dot-separated path
-        let iterable: Vec<String> = iterable_str
-            .split('.')
-            .map(|s| s.trim().to_string())
-            .collect();
-        if iterable.len() > MAX_DOT_SEGMENTS {
-            return Err(MdsError::syntax(format!(
-                "@for iterable dot path exceeds maximum segment count of {MAX_DOT_SEGMENTS}"
-            )));
-        }
-        for part in &iterable {
-            if !is_valid_identifier(part) {
+        // Parse iterable as a full expression (variable, dot-path, function call, etc.)
+        let iterable = parse_expr_inner(iterable_str)?;
+        // Reject bare literals as iterables: @for x in "str": makes no sense.
+        use crate::ast::Expr as ExprAlias;
+        match &iterable {
+            ExprAlias::StringLiteral(_)
+            | ExprAlias::NumberLiteral(_)
+            | ExprAlias::BooleanLiteral(_)
+            | ExprAlias::NullLiteral => {
                 return Err(MdsError::syntax(format!(
-                    "invalid iterable: '{iterable_str}' — must be a variable name or dot path"
+                    "cannot iterate over a literal value: '{iterable_str}'"
                 )));
             }
+            _ => {}
         }
 
         let body = self.parse_body(&["@end"], &[])?;

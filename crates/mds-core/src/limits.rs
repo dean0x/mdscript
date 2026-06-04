@@ -43,3 +43,11 @@ pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256;
 /// output (e.g. `replace()`) to prevent runaway memory use from adversarial
 /// inputs. Shared with `builtins.rs` to ensure a single authoritative limit.
 pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Maximum number of elements that `split()` may produce in a single call.
+///
+/// Prevents adversarial inputs from producing arrays with hundreds of thousands
+/// of elements that could exhaust memory during subsequent `@for` iteration or
+/// `join()` calls. 100 000 elements is generous for any real template while
+/// bounding worst-case memory use.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;

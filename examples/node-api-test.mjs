@@ -414,6 +414,119 @@ test('compileFile: combined v2 features', async () => {
   assert(result.output.includes('Account suspended: charlie'), 'combined: inactive branch');
 });
 
+// ─── Tests: expression directives (issue #74) ───────────────────
+test('expression @if: function call truthy', () => {
+  const result = mds.compile(`---
+tags:
+  - rust
+  - go
+---
+@if contains(tags, "rust"):
+yes
+@else:
+no
+@end
+`);
+  assert(result.output.includes('yes'), '@if contains() should be truthy');
+});
+
+test('expression @if: negated function call', () => {
+  const result = mds.compile(`---
+name: alice
+---
+@if !starts_with(name, "z"):
+yes
+@else:
+no
+@end
+`);
+  assert(result.output.includes('yes'), '@if !starts_with() should be truthy for non-z name');
+});
+
+test('expression @if: comparison with expression on both sides', () => {
+  const result = mds.compile(`---
+a: Alice
+b: ALICE
+---
+@if lower(a) == lower(b):
+match
+@else:
+no-match
+@end
+`);
+  assert(result.output.includes('match'), '@if lower(a)==lower(b) should match');
+});
+
+test('expression @for: function call iterable', () => {
+  const result = mds.compile(`---
+csv: "x,y,z"
+---
+@for item in split(csv, ","):
+- {item}
+@end
+`);
+  assert(result.output.includes('- x'), '@for split iterable should produce x');
+  assert(result.output.includes('- y'), '@for split iterable should produce y');
+  assert(result.output.includes('- z'), '@for split iterable should produce z');
+});
+
+test('expression @for: nested calls (sort+unique)', () => {
+  const result = mds.compile(`---
+tags:
+  - b
+  - a
+  - b
+---
+@for t in sort(unique(tags)):
+- {t}
+@end
+`);
+  const lines = result.output.split('\n').filter(l => l.startsWith('- '));
+  assert(lines.length === 2, `should have 2 unique items, got ${lines.length}`);
+  assert(result.output.includes('- a'), 'sorted unique should include a');
+  assert(result.output.includes('- b'), 'sorted unique should include b');
+});
+
+test('expression @if: logical AND with function calls', () => {
+  const result = mds.compile(`---
+text: grunge
+---
+@if contains(text, "g") && contains(text, "r"):
+yes
+@else:
+no
+@end
+`);
+  assert(result.output.includes('yes'), '@if && with calls should work');
+});
+
+test('expression @if: error cases (undefined function)', () => {
+  try {
+    mds.compile('@if notabuiltin(x):\nyes\n@end\n');
+    assert(false, 'should have thrown');
+  } catch {
+    // expected
+  }
+});
+
+test('compileFile: expression directives', async () => {
+  const result = await mds.compileFile(
+    resolve(__dirname, 'edge-cases/23_expression_directives.mds'),
+  );
+  assert(result.output.includes('Has rust tag'), 'expression @if contains should work');
+  assert(result.output.includes('Admin access granted'), 'expression @if lower==admin should work');
+  assert(result.output.includes('- a'), '@for split iterable should work');
+  assert(result.output.includes('- go'), '@for sort(unique) should produce sorted results');
+});
+
+test('compileFile: colon in string args', async () => {
+  const result = await mds.compileFile(
+    resolve(__dirname, 'edge-cases/24_colon_in_string_args.mds'),
+  );
+  assert(result.output.includes('Path contains usr:local'), 'colon in string arg for @if');
+  assert(result.output.includes('- usr'), '@for with colon separator should work');
+});
+
 // ─── Run all tests ───────────────────────────────────────────────
 console.log(`\nRunning ${tests.length} tests...\n`);
 

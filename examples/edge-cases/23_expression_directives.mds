@@ -1,0 +1,57 @@
+---
+# Edge case: expression support in @for and @if directives
+name: Alice
+tags:
+  - rust
+  - go
+  - rust
+csv: "a,b,c"
+role: ADMIN
+greeting: hello
+---
+
+# Expression directives
+
+## @if with function call (truthy check)
+@if contains(tags, "rust"):
+Has rust tag
+@end
+
+## @if with negated function call
+@if !starts_with(name, "z"):
+Name does not start with z
+@end
+
+## @if with expression comparison (LHS = call)
+@if lower(role) == "admin":
+Admin access granted
+@end
+
+## @if with comparison both sides as calls
+@if lower(name) == lower("ALICE"):
+Names match (case-insensitive)
+@end
+
+## @if with logical AND combining calls
+@if contains(tags, "rust") && contains(tags, "go"):
+Has both rust and go
+@end
+
+## @for with function call iterable (split)
+@for x in split(csv, ","):
+- {x}
+@end
+
+## @for with nested call iterable (sort + unique)
+@for t in sort(unique(tags)):
+- {t}
+@end
+
+## @elseif with expression
+@if lower(greeting) == "hi":
+Hi greeting
+@elseif lower(greeting) == "hello":
+Hello greeting
+@else:
+Other greeting
+@end

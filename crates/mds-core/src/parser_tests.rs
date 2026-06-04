@@ -4,6 +4,7 @@ use super::helpers::*;
 use super::*;
 use crate::ast::{Arg, CondValue, ExportDirective, Expr, ImportDirective};
 use crate::lexer::tokenize;
+use crate::limits::MAX_DOT_SEGMENTS;
 
 #[test]
 fn parse_simple_text() {
@@ -275,7 +276,11 @@ fn parse_for_key_value_destructuring() {
     if let Node::For(block) = &module.body[0] {
         assert_eq!(block.key_var.as_deref(), Some("key"));
         assert_eq!(block.var, "value");
-        assert_eq!(block.iterable, &["obj"]);
+        assert!(
+            matches!(&block.iterable, Expr::Var(v) if v == "obj"),
+            "expected Expr::Var(\"obj\"), got {:?}",
+            block.iterable
+        );
     } else {
         panic!("expected For node");
     }
@@ -290,7 +295,12 @@ fn parse_for_dot_path_iterable() {
     if let Node::For(block) = &module.body[0] {
         assert_eq!(block.key_var, None);
         assert_eq!(block.var, "item");
-        assert_eq!(block.iterable, &["data", "list"]);
+        assert!(
+            matches!(&block.iterable, Expr::MemberAccess { object, fields }
+                if object == "data" && fields == &["list"]),
+            "expected Expr::MemberAccess(data.list), got {:?}",
+            block.iterable
+        );
     } else {
         panic!("expected For node");
     }
@@ -298,14 +308,15 @@ fn parse_for_dot_path_iterable() {
 
 #[test]
 fn parse_if_dot_path_condition() {
-    // @if config.debug: — condition is Condition::Truthy with dot path
+    // @if config.debug: — condition is Condition::Truthy with MemberAccess expr
     let src = "@if config.debug:\nDebugging\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::If(block) = &module.body[0] {
         assert!(
-            matches!(&block.condition, Condition::Truthy(p) if p == &["config", "debug"]),
-            "expected Condition::Truthy([\"config\", \"debug\"]), got {:?}",
+            matches!(&block.condition, Condition::Truthy(Expr::MemberAccess { object, fields })
+                if object == "config" && fields == &["debug"]),
+            "expected Condition::Truthy(MemberAccess{{config.debug}}), got {:?}",
             block.condition
         );
         assert!(block.elseif_branches.is_empty());
@@ -1060,5 +1071,510 @@ fn evaluate_elseif_with_logical_or_operator() {
     assert!(
         !result.contains("NO"),
         "@else branch should not render when @elseif matches, got: {result}"
+    );
+}
+
+// ── Expression directives: parser tests (new feature) ───────────────────────
+
+#[test]
+fn parse_if_call_truthy() {
+    // @if func(x): → Condition::Truthy(Expr::Call)
+    let src = "@if contains(tags, \"rust\"):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Truthy(Expr::Call { name, .. }) if name == "contains"),
+            "expected Condition::Truthy(Call{{contains}}), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_if_not_call() {
+    // @if !func(x): → Condition::Not(Expr::Call)
+    let src = "@if !starts_with(name, \"z\"):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Not(Expr::Call { name, .. }) if name == "starts_with"),
+            "expected Condition::Not(Call{{starts_with}}), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_if_call_eq_literal() {
+    // @if func(x) == "val": → Eq(Expr::Call, Expr::StringLiteral)
+    let src = "@if lower(name) == \"alice\":\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Eq(Expr::Call { name, .. }, Expr::StringLiteral(s))
+                if name == "lower" && s == "alice"),
+            "expected Condition::Eq(Call, StringLiteral), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_if_call_eq_call() {
+    // @if func(a) == func(b): → Eq(Expr::Call, Expr::Call)
+    let src = "@if lower(a) == lower(b):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Eq(Expr::Call { name: lhs, .. }, Expr::Call { name: rhs, .. })
+                if lhs == "lower" && rhs == "lower"),
+            "expected Condition::Eq(Call, Call), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_if_and_with_calls() {
+    // @if func(a) && func(b): → And with Truthy(Call) operands
+    let src = "@if contains(t, \"r\") && contains(t, \"g\"):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::And(_)),
+            "expected Condition::And, got {:?}",
+            block.condition
+        );
+        if let Condition::And(ops) = &block.condition {
+            assert_eq!(ops.len(), 2);
+            assert!(matches!(&ops[0], Condition::Truthy(Expr::Call { .. })));
+            assert!(matches!(&ops[1], Condition::Truthy(Expr::Call { .. })));
+        }
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_if_qualified_call_truthy() {
+    // @if ns.func(x): → Truthy(QualifiedCall)
+    let src = "@if utils.check(val):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Truthy(Expr::QualifiedCall { namespace, name, .. })
+                if namespace == "utils" && name == "check"),
+            "expected Condition::Truthy(QualifiedCall), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_for_call_iterable() {
+    // @for x in func(args): → ForBlock with Expr::Call
+    let src = "@for x in split(csv, \",\"):\n- {x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::For(block) = &module.body[0] {
+        assert!(
+            matches!(&block.iterable, Expr::Call { name, .. } if name == "split"),
+            "expected Expr::Call{{split}}, got {:?}",
+            block.iterable
+        );
+    } else {
+        panic!("expected For node");
+    }
+}
+
+#[test]
+fn parse_for_nested_call_iterable() {
+    // @for x in sort(unique(tags)): → nested calls
+    let src = "@for x in sort(unique(tags)):\n- {x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::For(block) = &module.body[0] {
+        assert!(
+            matches!(&block.iterable, Expr::Call { name, .. } if name == "sort"),
+            "expected Expr::Call{{sort}}, got {:?}",
+            block.iterable
+        );
+    } else {
+        panic!("expected For node");
+    }
+}
+
+#[test]
+fn parse_if_colon_in_string_arg() {
+    // @if contains(s, "a:b"): — colon inside string arg must not corrupt directive parsing
+    let src = "@if contains(s, \"a:b\"):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "colon inside string arg should not corrupt directive parsing: {result:?}"
+    );
+    if let Ok(module) = result {
+        if let Node::If(block) = &module.body[0] {
+            assert!(
+                matches!(&block.condition, Condition::Truthy(Expr::Call { name, .. }) if name == "contains"),
+                "expected Truthy(Call{{contains}}), got {:?}",
+                block.condition
+            );
+        } else {
+            panic!("expected If node");
+        }
+    }
+}
+
+#[test]
+fn parse_for_colon_as_separator() {
+    // @for x in split(s, ":"): — colon as argument must not corrupt directive parsing
+    let src = "@for x in split(s, \":\"):\n- {x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "colon as separator arg should parse correctly: {result:?}"
+    );
+    if let Ok(module) = result {
+        if let Node::For(block) = &module.body[0] {
+            assert!(
+                matches!(&block.iterable, Expr::Call { name, .. } if name == "split"),
+                "expected Expr::Call{{split}}, got {:?}",
+                block.iterable
+            );
+        } else {
+            panic!("expected For node");
+        }
+    }
+}
+
+#[test]
+fn parse_if_bare_literal_rejected() {
+    // @if true: → parse error "use a variable or function call"
+    let src = "@if true:\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@if true: should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("literal"),
+        "error should mention literal, got: {err}"
+    );
+}
+
+#[test]
+fn parse_if_string_literal_truthy_rejected() {
+    // @if "literal": → parse error
+    let src = "@if \"hello\":\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@if \"literal\": should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("literal"),
+        "error should mention literal, got: {err}"
+    );
+}
+
+#[test]
+fn parse_for_literal_iterable_rejected() {
+    // @for x in "literal": → parse error
+    let src = "@for x in \"items\":\n- {x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@for x in \"literal\": should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("literal"),
+        "error should mention literal, got: {err}"
+    );
+}
+
+#[test]
+fn parse_if_negation_combined_with_comparison_rejected() {
+    // @if !func(x) == "v": → parse error "cannot combine negation"
+    let src = "@if !lower(name) == \"alice\":\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_err(),
+        "@if !func == val: should be rejected (negation + comparison)"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("negation") || err.contains("comparison"),
+        "error should mention negation/comparison, got: {err}"
+    );
+}
+
+#[test]
+fn parse_elseif_call_condition() {
+    // @elseif func(x) == "v": → Condition with Eq
+    let src = "@if a:\nA\n@elseif lower(b) == \"val\":\nB\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert_eq!(block.elseif_branches.len(), 1);
+        let (cond, _) = &block.elseif_branches[0];
+        assert!(
+            matches!(cond, Condition::Eq(Expr::Call { name, .. }, Expr::StringLiteral(s))
+                if name == "lower" && s == "val"),
+            "expected Eq(Call, StringLiteral), got {:?}",
+            cond
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+// ── Backward compatibility parser tests ──────────────────────────────────────
+
+#[test]
+fn parse_backward_compat_if_var_truthy() {
+    // @if active: → Truthy(Expr::Var("active"))
+    let src = "@if active:\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Truthy(Expr::Var(v)) if v == "active"),
+            "expected Truthy(Var(active)), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_backward_compat_if_var_eq_string() {
+    // @if role == "admin": → Eq(Expr::Var, Expr::StringLiteral)
+    let src = "@if role == \"admin\":\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Eq(Expr::Var(v), Expr::StringLiteral(s))
+                if v == "role" && s == "admin"),
+            "expected Eq(Var(role), StringLiteral(admin)), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn parse_backward_compat_for_var_iterable() {
+    // @for x in items: → ForBlock with Expr::Var
+    let src = "@for x in items:\n- {x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::For(block) = &module.body[0] {
+        assert!(
+            matches!(&block.iterable, Expr::Var(v) if v == "items"),
+            "expected Expr::Var(items), got {:?}",
+            block.iterable
+        );
+    } else {
+        panic!("expected For node");
+    }
+}
+
+// ── Evaluator integration tests for expression directives ────────────────────
+
+#[test]
+fn evaluate_if_call_truthy_contains() {
+    let result = crate::compile_str(
+        "---\ntags:\n  - rust\n  - go\n---\n@if contains(tags, \"rust\"):\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if contains(tags, \"rust\") with rust in tags should be truthy, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_if_not_call() {
+    let result = crate::compile_str(
+        "---\nname: abc\n---\n@if !starts_with(name, \"z\"):\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if !starts_with should be truthy when name doesn't start with z, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_if_lower_eq_literal() {
+    let result = crate::compile_str(
+        "---\nname: Alice\n---\n@if lower(name) == \"alice\":\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if lower(name) == \"alice\" should match, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_if_call_eq_call_match() {
+    let result = crate::compile_str(
+        "---\na: Alice\nb: ALICE\n---\n@if lower(a) == lower(b):\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if lower(a) == lower(b) should match when both lowercase to same, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_if_call_eq_call_no_match() {
+    let result = crate::compile_str(
+        "---\na: Alice\nb: Bob\n---\n@if lower(a) == lower(b):\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("no"),
+        "@if lower(a) == lower(b) should not match when different, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_if_and_with_calls() {
+    let result = crate::compile_str(
+        "---\nt: grunge\n---\n@if contains(t, \"r\") && contains(t, \"g\"):\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if contains && contains should be truthy when both true, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_for_split_iterable() {
+    let result =
+        crate::compile_str("---\ncsv: \"a,b,c\"\n---\n@for x in split(csv, \",\"):\n- {x}\n@end\n")
+            .unwrap();
+    assert!(
+        result.contains("- a") && result.contains("- b") && result.contains("- c"),
+        "@for split iterable should iterate over parts, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_for_sort_unique_iterable() {
+    let result = crate::compile_str(
+        "---\ntags:\n  - b\n  - a\n  - b\n---\n@for t in sort(unique(tags)):\n- {t}\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("- a") && result.contains("- b"),
+        "@for sort(unique(tags)) should produce sorted unique items, got: {result}"
+    );
+    // Ensure deduplication — only 2 items, not 3
+    let dashes: Vec<_> = result.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(
+        dashes.len(),
+        2,
+        "should have exactly 2 unique items, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_for_non_array_result_is_error() {
+    let result = crate::compile_str("---\nname: Alice\n---\n@for x in upper(name):\n- {x}\n@end\n");
+    assert!(
+        result.is_err(),
+        "non-array result from @for expression should error"
+    );
+}
+
+#[test]
+fn evaluate_if_undefined_function_is_error() {
+    let result = crate::compile_str("@if notabuiltin(x):\nyes\n@end\n");
+    assert!(result.is_err(), "undefined function in @if should error");
+}
+
+#[test]
+fn evaluate_elseif_with_expression() {
+    let result = crate::compile_str(
+        "---\nname: Alice\n---\n@if lower(name) == \"bob\":\nBob\n@elseif lower(name) == \"alice\":\nAlice\n@else:\nOther\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("Alice"),
+        "@elseif with expression should work, got: {result}"
+    );
+}
+
+// ── Security tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn split_resource_limit_too_many_elements() {
+    // split() producing more than MAX_ARRAY_ELEMENTS should be rejected.
+    use crate::limits::MAX_ARRAY_ELEMENTS;
+    // Create a string with MAX_ARRAY_ELEMENTS+1 commas → MAX_ARRAY_ELEMENTS+2 parts
+    let big_input: String = std::iter::repeat_n("x,", MAX_ARRAY_ELEMENTS + 1).collect();
+    let result = crate::builtins::call_builtin(
+        "split",
+        &[
+            crate::value::Value::String(big_input),
+            crate::value::Value::String(",".to_string()),
+        ],
+    );
+    assert!(
+        result.is_err(),
+        "split() producing > MAX_ARRAY_ELEMENTS elements must be rejected"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("element") || err.contains("maximum") || err.contains("limit"),
+        "error should mention element limit, got: {err}"
+    );
+}
+
+#[test]
+fn join_resource_limit_output_too_large() {
+    // join() producing output > MAX_OUTPUT_SIZE (50 MB) should be rejected.
+    use crate::limits::MAX_OUTPUT_SIZE;
+    let big_element = "a".repeat(1024); // 1 KB per element
+    let item_count = (MAX_OUTPUT_SIZE / 1024) + 100; // just over 50K elements
+    let items: Vec<crate::value::Value> = (0..item_count)
+        .map(|_| crate::value::Value::String(big_element.clone()))
+        .collect();
+    let arr = crate::value::Value::Array(items);
+    let sep = crate::value::Value::String(",".to_string());
+    let result = crate::builtins::call_builtin("join", &[arr, sep]);
+    assert!(
+        result.is_err(),
+        "join() producing > MAX_OUTPUT_SIZE must be rejected"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("maximum size") || err.contains("output"),
+        "error should mention output size limit, got: {err}"
     );
 }

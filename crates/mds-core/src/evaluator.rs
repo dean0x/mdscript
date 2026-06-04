@@ -65,7 +65,7 @@ fn evaluate_nodes(
             Node::Text(t) => output.push_str(&t.text),
             Node::EscapedBrace => output.push('{'),
             Node::Interpolation(interp) => {
-                output.push_str(&evaluate_expr(&interp.expr, scope, ctx)?);
+                output.push_str(&render_expr(&interp.expr, scope, ctx)?);
             }
             Node::If(block) => {
                 output.push_str(&evaluate_if(block, scope, ctx)?);
@@ -138,27 +138,19 @@ fn resolve_dot_path(root: &str, fields: &[String], scope: &Scope) -> Result<Valu
     Ok(current)
 }
 
-fn evaluate_expr(
-    expr: &Expr,
-    scope: &mut Scope,
-    ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
+/// Evaluate an expression to its runtime `Value`.
+///
+/// This is the core expression evaluator used by both interpolation (via `render_expr`)
+/// and directive conditions/iterables (via `evaluate_condition` and `evaluate_for`).
+fn evaluate_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<Value, MdsError> {
     match expr {
-        Expr::Var(name) => {
-            let value = scope
-                .get_var(name)
-                .ok_or_else(|| MdsError::undefined_var(name))?;
-            // Objects cannot be directly interpolated — user must access a specific field
-            if matches!(value, Value::Object(_)) {
-                return Err(MdsError::syntax(format!(
-                    "cannot interpolate object '{name}' directly, access a specific field with dot notation (e.g. {{{name}.field}})"
-                )));
-            }
-            Ok(value.to_string())
-        }
+        Expr::Var(name) => scope
+            .get_var(name)
+            .cloned()
+            .ok_or_else(|| MdsError::undefined_var(name)),
         Expr::Call { name, args } => {
             let resolved_args = resolve_args(args, scope, ctx, 0)?;
-            Ok(call_function(name, &resolved_args, scope, ctx)?.to_string())
+            call_function(name, &resolved_args, scope, ctx)
         }
         Expr::QualifiedCall {
             namespace,
@@ -166,7 +158,7 @@ fn evaluate_expr(
             args,
         } => {
             let resolved_args = resolve_args(args, scope, ctx, 0)?;
-            Ok(call_qualified_function(namespace, name, &resolved_args, scope, ctx)?.to_string())
+            call_qualified_function(namespace, name, &resolved_args, scope, ctx)
         }
         Expr::MemberAccess { object, fields } => {
             // Give a targeted error when the name refers to an imported namespace rather
@@ -176,16 +168,37 @@ fn evaluate_expr(
                     "'{object}' is an imported module, not a variable — to call a function use {{{object}.func()}}"
                 )));
             }
-            let value = resolve_dot_path(object, fields, scope)?;
-            // Objects cannot be directly interpolated — user must access a specific field
-            match value {
-                Value::Object(_) => Err(MdsError::syntax(format!(
+            resolve_dot_path(object, fields, scope)
+        }
+        Expr::StringLiteral(s) => Ok(Value::String(s.clone())),
+        Expr::NumberLiteral(n) => Ok(Value::Number(*n)),
+        Expr::BooleanLiteral(b) => Ok(Value::Boolean(*b)),
+        Expr::NullLiteral => Ok(Value::Null),
+    }
+}
+
+/// Render an expression to a string for interpolation output.
+///
+/// Thin wrapper around `evaluate_expr` that enforces the rule that objects
+/// cannot be directly interpolated — the user must access a specific field.
+fn render_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<String, MdsError> {
+    let value = evaluate_expr(expr, scope, ctx)?;
+    match &value {
+        Value::Object(_) => {
+            // Build a descriptive error depending on the expression type
+            let hint = match expr {
+                Expr::Var(name) => format!(
+                    "cannot interpolate object '{name}' directly, access a specific field with dot notation (e.g. {{{name}.field}})"
+                ),
+                Expr::MemberAccess { object, fields } => format!(
                     "cannot interpolate object directly, access a specific field with dot notation (e.g. {{{object}.{field}}})",
                     field = fields.last().map_or("field", |f| f.as_str())
-                ))),
-                _ => Ok(value.to_string()),
-            }
+                ),
+                _ => "cannot interpolate an object value directly".to_string(),
+            };
+            Err(MdsError::syntax(hint))
         }
+        _ => Ok(value.to_string()),
     }
 }
 
@@ -383,39 +396,48 @@ fn call_qualified_function(
     invoke_function(&func, &qualified_name, args, scope, ctx).map(Value::String)
 }
 
-/// Compare a runtime `Value` against a literal `CondValue` using strict equality.
+/// Compare two runtime `Value` instances using strict equality.
 ///
 /// Type matching is strict — `Number(3) != String("3")`. Different types always
 /// return `false`. `NaN == NaN` is `false` (IEEE 754 via Rust's `f64 ==`).
-fn values_equal(value: &Value, expected: &CondValue) -> bool {
-    match (value, expected) {
-        (Value::String(s), CondValue::String(e)) => s == e,
-        (Value::Number(n), CondValue::Number(e)) => n == e,
-        (Value::Boolean(b), CondValue::Boolean(e)) => b == e,
-        (Value::Null, CondValue::Null) => true,
+fn values_equal_runtime(lhs: &Value, rhs: &Value) -> bool {
+    match (lhs, rhs) {
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => a == b,
+        (Value::Boolean(a), Value::Boolean(b)) => a == b,
+        (Value::Null, Value::Null) => true,
         _ => false,
     }
 }
 
-/// Resolve the dot-path for a condition, returning the runtime `Value`.
-fn resolve_condition_value(condition: &Condition, scope: &Scope) -> Result<Value, MdsError> {
-    let path = condition.path();
-    resolve_dot_path(condition.root()?, &path[1..], scope)
+/// Evaluate a condition expression to a runtime `Value`.
+fn evaluate_condition_value(
+    expr: &Expr,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<Value, MdsError> {
+    evaluate_expr(expr, scope, ctx)
 }
 
-/// Evaluate a condition to a boolean, resolving the dot-path variable from scope.
-fn evaluate_condition(condition: &Condition, scope: &Scope) -> Result<bool, MdsError> {
+/// Evaluate a condition to a boolean, resolving expressions from scope.
+fn evaluate_condition(
+    condition: &Condition,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<bool, MdsError> {
     match condition {
-        Condition::Truthy(_) => Ok(resolve_condition_value(condition, scope)?.is_truthy()),
-        Condition::Not(_) => Ok(!resolve_condition_value(condition, scope)?.is_truthy()),
-        Condition::Eq(_, expected) => Ok(values_equal(
-            &resolve_condition_value(condition, scope)?,
-            expected,
-        )),
-        Condition::NotEq(_, expected) => Ok(!values_equal(
-            &resolve_condition_value(condition, scope)?,
-            expected,
-        )),
+        Condition::Truthy(expr) => Ok(evaluate_condition_value(expr, scope, ctx)?.is_truthy()),
+        Condition::Not(expr) => Ok(!evaluate_condition_value(expr, scope, ctx)?.is_truthy()),
+        Condition::Eq(lhs, rhs) => {
+            let lhs_val = evaluate_condition_value(lhs, scope, ctx)?;
+            let rhs_val = evaluate_condition_value(rhs, scope, ctx)?;
+            Ok(values_equal_runtime(&lhs_val, &rhs_val))
+        }
+        Condition::NotEq(lhs, rhs) => {
+            let lhs_val = evaluate_condition_value(lhs, scope, ctx)?;
+            let rhs_val = evaluate_condition_value(rhs, scope, ctx)?;
+            Ok(!values_equal_runtime(&lhs_val, &rhs_val))
+        }
         // Short-circuit And: return false on first false operand.
         // Parser invariant: And operands are always leaf conditions (parse_and_level calls
         // parse_simple_condition for each part). The total operand count is bounded at
@@ -429,7 +451,7 @@ fn evaluate_condition(condition: &Condition, scope: &Scope) -> Result<bool, MdsE
                     !matches!(operand, Condition::And(_) | Condition::Or(_)),
                     "And operand should be a leaf condition, not And/Or"
                 );
-                if !evaluate_condition(operand, scope)? {
+                if !evaluate_condition(operand, scope, ctx)? {
                     return Ok(false);
                 }
             }
@@ -446,7 +468,7 @@ fn evaluate_condition(condition: &Condition, scope: &Scope) -> Result<bool, MdsE
                     !matches!(operand, Condition::Or(_)),
                     "Or operand should not be Or (parser flattens same-level operators)"
                 );
-                if evaluate_condition(operand, scope)? {
+                if evaluate_condition(operand, scope, ctx)? {
                     return Ok(true);
                 }
             }
@@ -461,7 +483,7 @@ fn evaluate_if(
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
     // Evaluate the primary condition
-    if evaluate_condition(&block.condition, scope)? {
+    if evaluate_condition(&block.condition, scope, ctx)? {
         return evaluate_nodes(&block.then_body, scope, ctx);
     }
 
@@ -475,7 +497,7 @@ fn evaluate_if(
         MAX_ELSEIF_BRANCHES,
     );
     for (cond, body) in &block.elseif_branches {
-        if evaluate_condition(cond, scope)? {
+        if evaluate_condition(cond, scope, ctx)? {
             return evaluate_nodes(body, scope, ctx);
         }
     }
@@ -601,11 +623,7 @@ fn evaluate_for(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    let root = block
-        .iterable
-        .first()
-        .ok_or_else(|| MdsError::syntax("internal error: @for block has empty iterable path"))?;
-    let iterable = resolve_dot_path(root, &block.iterable[1..], scope)?;
+    let iterable = evaluate_expr(&block.iterable, scope, ctx)?;
 
     if let Some(ref key_var) = block.key_var {
         // Key-value iteration: @for key, value in obj:
@@ -709,7 +727,7 @@ mod tests {
     #[test]
     fn evaluate_if_truthy() {
         let nodes = vec![Node::If(IfBlock {
-            condition: Condition::Truthy(vec!["flag".to_string()]),
+            condition: Condition::Truthy(Expr::Var("flag".to_string())),
             elseif_branches: vec![],
             then_body: vec![text("yes")],
             else_body: Some(vec![text("no")]),
@@ -724,7 +742,7 @@ mod tests {
     #[test]
     fn evaluate_if_falsy() {
         let nodes = vec![Node::If(IfBlock {
-            condition: Condition::Truthy(vec!["flag".to_string()]),
+            condition: Condition::Truthy(Expr::Var("flag".to_string())),
             elseif_branches: vec![],
             then_body: vec![text("yes")],
             else_body: Some(vec![text("no")]),
@@ -741,7 +759,7 @@ mod tests {
         let nodes = vec![Node::For(ForBlock {
             var: "item".to_string(),
             key_var: None,
-            iterable: vec!["items".to_string()],
+            iterable: Expr::Var("items".to_string()),
             body: vec![
                 text("- "),
                 Node::Interpolation(Interpolation {
@@ -920,18 +938,18 @@ mod tests {
         );
     }
 
-    // ── values_equal: NaN semantics ──────────────────────────────────────────
+    // ── values_equal_runtime: NaN semantics ─────────────────────────────────
 
     #[test]
     fn values_equal_nan_is_not_equal_to_itself() {
-        // IEEE 754 defines NaN != NaN. values_equal must follow this — even though
-        // the parser rejects NaN literals in condition values, the runtime Value type
-        // holds f64 and could theoretically carry a NaN produced by arithmetic.
-        // Verify that values_equal returns false for NaN == NaN.
+        // IEEE 754 defines NaN != NaN. values_equal_runtime must follow this — even
+        // though the parser rejects NaN literals in condition expressions, the runtime
+        // Value type holds f64 and could theoretically carry a NaN produced by arithmetic.
+        // Verify that values_equal_runtime returns false for NaN == NaN.
         let nan_value = Value::Number(f64::NAN);
-        let nan_cond = CondValue::Number(f64::NAN);
+        let nan_value2 = Value::Number(f64::NAN);
         assert!(
-            !values_equal(&nan_value, &nan_cond),
+            !values_equal_runtime(&nan_value, &nan_value2),
             "NaN must not equal NaN (IEEE 754)"
         );
     }

@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use crate::error::MdsError;
-use crate::limits::MAX_OUTPUT_SIZE;
+use crate::limits::{MAX_ARRAY_ELEMENTS, MAX_OUTPUT_SIZE};
 use crate::value::Value;
 
 /// Metadata and dispatch handler for a built-in function.
@@ -258,6 +258,15 @@ fn builtin_split(args: &[Value]) -> Result<Value, MdsError> {
         ));
     }
     let parts: Vec<Value> = s.split(sep).map(|p| Value::String(p.to_string())).collect();
+    // Guard against producing enormous arrays that would exhaust memory during
+    // subsequent @for iteration or join() calls.
+    if parts.len() > MAX_ARRAY_ELEMENTS {
+        return Err(MdsError::resource_limit(format!(
+            "split() produced {} elements, exceeding maximum of {}",
+            parts.len(),
+            MAX_ARRAY_ELEMENTS
+        )));
+    }
     Ok(Value::Array(parts))
 }
 
@@ -377,6 +386,15 @@ fn builtin_join(args: &[Value]) -> Result<Value, MdsError> {
                     out.push_str(sep);
                 }
                 out.push_str(s);
+                // Guard against amplification: large arrays with long elements
+                // can produce output far exceeding MAX_OUTPUT_SIZE before the
+                // evaluator's per-node check fires.
+                if out.len() > MAX_OUTPUT_SIZE {
+                    return Err(MdsError::builtin_error(format!(
+                        "join() output exceeds maximum size of {} bytes",
+                        MAX_OUTPUT_SIZE
+                    )));
+                }
             }
             other => {
                 return Err(MdsError::builtin_error(format!(

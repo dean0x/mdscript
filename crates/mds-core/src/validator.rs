@@ -1,4 +1,4 @@
-use crate::ast::{required_param_count, Arg, Condition, Expr, ForBlock, IfBlock, Node};
+use crate::ast::{required_param_count, Arg, Condition, Expr, IfBlock, Node};
 use crate::error::MdsError;
 use crate::scope::Scope;
 use crate::value::Value;
@@ -80,62 +80,108 @@ fn validate_if_node(
     Ok(())
 }
 
-/// Validate a `@for` block: iterable type check and body with loop variables in scope.
+/// Validate a `@for` block: iterable expression check and body with loop variables in scope.
 ///
-/// Static type checks are restricted to simple identifiers (no dot-path iterables)
-/// because dot-path field types cannot be resolved without a full type-system pass.
-/// Any type mismatch on dot-path iterables surfaces at evaluation time.
+/// Static type checks are performed only when the iterable is a simple `Expr::Var`
+/// because other expression types (Call, QualifiedCall, MemberAccess) have return
+/// types that cannot be determined statically. Any type mismatch on those expressions
+/// surfaces at evaluation time.
 fn validate_for_node(
-    block: &ForBlock,
+    block: &crate::ast::ForBlock,
     scope: &mut Scope,
     file: &str,
     source: &str,
 ) -> Result<(), MdsError> {
-    // Parser invariant: iterable is always non-empty. Use .first() with an error return
-    // rather than a debug_assert!+index so this holds in release builds too.
-    let root = block
-        .iterable
-        .first()
-        .ok_or_else(|| MdsError::syntax("internal error: @for block has empty iterable path"))?;
-    let iterable_val = scope
-        .get_var(root)
-        .ok_or_else(|| MdsError::undefined_var_at(root, file, source, block.offset, root.len()))?;
-    // Only perform static type checks when:
-    // 1. No key_var (single-var iteration should be an array)
-    // 2. The iterable is a simple identifier (no dot path — can't statically resolve type)
-    //
-    // ACCEPTED LIMITATION: when the iterable is a dot-path (block.iterable.len() > 1,
-    // e.g. `@for item in data.list:`), we skip the static array-type check here because
-    // `data.list` is a field on a runtime Value::Object whose type cannot be determined
-    // statically from the scope's root variable. Any type mismatch (e.g., `data.list`
-    // resolves to a non-array) surfaces as a MdsError::TypeError at evaluation time via
-    // `resolve_dot_path`, with less precise span information than a validator diagnostic.
-    // Resolving object fields statically would require a full type-system pass that is
-    // out of scope for the current release.
-    if block.key_var.is_none()
-        && block.iterable.len() == 1
-        && !matches!(iterable_val, Value::Array(_))
-    {
-        if matches!(iterable_val, Value::Object(_)) {
-            return Err(MdsError::syntax_at(
-                format!(
-                    "cannot iterate over object '{root}' with a single variable — \
-                     use @for key, value in {root}: to iterate over an object's entries"
-                ),
+    // Validate the iterable expression.
+    match &block.iterable {
+        Expr::Var(root) => {
+            let iterable_val = scope.get_var(root).ok_or_else(|| {
+                MdsError::undefined_var_at(root, file, source, block.offset, root.len())
+            })?;
+            // Only perform static type checks for simple identifier iterables when
+            // there is no key_var (single-var iteration should be an array or object).
+            //
+            // ACCEPTED LIMITATION: same as before — for object fields, dot-paths, and
+            // expression iterables, type mismatches surface at evaluation time.
+            if block.key_var.is_none() && !matches!(iterable_val, Value::Array(_)) {
+                if matches!(iterable_val, Value::Object(_)) {
+                    return Err(MdsError::syntax_at(
+                        format!(
+                            "cannot iterate over object '{root}' with a single variable — \
+                             use @for key, value in {root}: to iterate over an object's entries"
+                        ),
+                        file,
+                        source,
+                        block.offset,
+                        root.len(),
+                    ));
+                }
+                return Err(MdsError::type_error_at(
+                    iterable_val.type_name(),
+                    file,
+                    source,
+                    block.offset,
+                    root.len(),
+                ));
+            }
+        }
+        Expr::MemberAccess { object, .. } => {
+            // Validate that the root object exists; field type is checked at runtime.
+            scope.get_var(object).ok_or_else(|| {
+                MdsError::undefined_var_at(object, file, source, block.offset, object.len())
+            })?;
+        }
+        Expr::Call { name, args } => {
+            validate_call_arity(
+                name,
+                args.len(),
+                scope,
                 file,
                 source,
                 block.offset,
-                root.len(),
+                name.len(),
+            )?;
+            validate_var_args(args, scope, file, source, block.offset, 0)?;
+        }
+        Expr::QualifiedCall {
+            namespace,
+            name,
+            args,
+        } => {
+            let ns = scope.get_namespace(namespace).ok_or_else(|| {
+                MdsError::undefined_var_at(namespace, file, source, block.offset, namespace.len())
+            })?;
+            let qualified = format!("{namespace}.{name}");
+            let func = ns.functions.get(name).ok_or_else(|| {
+                MdsError::undefined_fn_at(&qualified, file, source, block.offset, name.len())
+            })?;
+            let required = crate::ast::required_param_count(&func.params);
+            let total = func.params.len();
+            if args.len() < required || args.len() > total {
+                return Err(MdsError::arity_at(
+                    &qualified,
+                    required,
+                    total,
+                    args.len(),
+                    file,
+                    source,
+                    block.offset,
+                    name.len(),
+                ));
+            }
+            validate_var_args(args, scope, file, source, block.offset, 0)?;
+        }
+        // Literal variants should have been rejected at parse time; guard defensively.
+        Expr::StringLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NullLiteral => {
+            return Err(MdsError::syntax(
+                "internal error: literal value used as @for iterable — should have been rejected at parse time",
             ));
         }
-        return Err(MdsError::type_error_at(
-            iterable_val.type_name(),
-            file,
-            source,
-            block.offset,
-            root.len(),
-        ));
     }
+
     scope.push();
     if let Some(ref key_var) = block.key_var {
         scope.set_var(key_var, Value::Null);
@@ -146,10 +192,11 @@ fn validate_for_node(
     result
 }
 
-/// Validate that the root variable(s) of a condition are defined in scope.
+/// Validate condition expressions: check that variables and functions are defined in scope.
 ///
 /// For compound conditions (`And`/`Or`), recursively validates all operands
 /// (conservative — validates all branches, not just the short-circuit path).
+/// Literal Expr variants (StringLiteral, NumberLiteral, etc.) need no validation.
 fn validate_condition(
     condition: &Condition,
     scope: &Scope,
@@ -164,12 +211,43 @@ fn validate_condition(
             }
             Ok(())
         }
+        Condition::Truthy(expr) | Condition::Not(expr) => {
+            validate_condition_expr(expr, scope, file, source, offset)
+        }
+        Condition::Eq(lhs, rhs) | Condition::NotEq(lhs, rhs) => {
+            validate_condition_expr(lhs, scope, file, source, offset)?;
+            validate_condition_expr(rhs, scope, file, source, offset)
+        }
+    }
+}
+
+/// Validate a single expression used inside a condition.
+///
+/// Literal variants (StringLiteral, NumberLiteral, BooleanLiteral, NullLiteral)
+/// are always valid and need no scope lookup. All other variants delegate to
+/// `validate_expr` which performs the full expression validation.
+fn validate_condition_expr(
+    expr: &Expr,
+    scope: &Scope,
+    file: &str,
+    source: &str,
+    offset: usize,
+) -> Result<(), MdsError> {
+    match expr {
+        Expr::StringLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NullLiteral => Ok(()),
         _ => {
-            let root = condition.root()?;
-            scope
-                .get_var(root)
-                .ok_or_else(|| MdsError::undefined_var_at(root, file, source, offset, root.len()))
-                .map(|_| ())
+            // Use the expression's own name length as the span length for errors
+            let len = match expr {
+                Expr::Var(name) => name.len(),
+                Expr::Call { name, .. } => name.len(),
+                Expr::QualifiedCall { name, .. } => name.len(),
+                Expr::MemberAccess { object, .. } => object.len(),
+                _ => unreachable!("literal variants handled above"),
+            };
+            validate_expr(expr, scope, file, source, offset, len)
         }
     }
 }
@@ -283,6 +361,11 @@ fn validate_expr(
             }
             validate_var_args(args, scope, file, source, offset, 0)
         }
+        // Literal variants are always valid — no scope lookup required.
+        Expr::StringLiteral(_)
+        | Expr::NumberLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NullLiteral => Ok(()),
     }
 }
 

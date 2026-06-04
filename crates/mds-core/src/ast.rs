@@ -5,10 +5,9 @@ pub struct Module {
     pub body: Vec<Node>,
 }
 
-/// A literal value on the RHS of an equality condition.
+/// A literal value on the RHS of an equality condition or as a default parameter value.
 ///
 /// Only string, number, boolean, and null literals are supported.
-/// No variable-to-variable comparison.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CondValue {
     /// A string literal: `"admin"` or `'admin'`
@@ -36,60 +35,25 @@ pub enum CondValue {
 /// # Why no `PartialEq`
 ///
 /// `Condition` intentionally does **not** derive `PartialEq` even though `CondValue`
-/// does. `CondValue::Number(f64)` uses IEEE 754 semantics where `NaN != NaN`, so
+/// does. `Expr::NumberLiteral(f64)` uses IEEE 754 semantics where `NaN != NaN`, so
 /// a blanket derived `PartialEq` on `Condition` would be surprising and error-prone
 /// (the evaluator handles NaN safety explicitly). If structural comparison of
 /// `Condition` values is needed in the future, implement `PartialEq` manually with a
 /// clear comment about the NaN case rather than deriving it.
 #[derive(Debug, Clone)]
 pub enum Condition {
-    /// `@if config.debug:` — truthy check on a dot-path variable
-    Truthy(Vec<String>),
-    /// `@if !config.debug:` — negated truthy check
-    Not(Vec<String>),
-    /// `@if role == "admin":` — strict equality
-    Eq(Vec<String>, CondValue),
-    /// `@if role != "admin":` — strict inequality
-    NotEq(Vec<String>, CondValue),
+    /// `@if config.debug:` or `@if func(x):` — truthy check on an expression
+    Truthy(Expr),
+    /// `@if !config.debug:` or `@if !func(x):` — negated truthy check
+    Not(Expr),
+    /// `@if role == "admin":` or `@if func(a) == func(b):` — strict equality (both sides are expressions)
+    Eq(Expr, Expr),
+    /// `@if role != "admin":` or `@if func(a) != func(b):` — strict inequality
+    NotEq(Expr, Expr),
     /// `@if a && b && c:` — all operands must be truthy (short-circuits on first false)
     And(Vec<Condition>),
     /// `@if a || b || c:` — any operand must be truthy (short-circuits on first true)
     Or(Vec<Condition>),
-}
-
-impl Condition {
-    /// Extract the dot-path from a leaf condition variant, or return an empty slice for
-    /// compound conditions (`And`/`Or`).
-    ///
-    /// Callers that need to handle compound conditions must match on the variant directly.
-    pub fn path(&self) -> &[String] {
-        match self {
-            Condition::Truthy(p)
-            | Condition::Not(p)
-            | Condition::Eq(p, _)
-            | Condition::NotEq(p, _) => p,
-            Condition::And(_) | Condition::Or(_) => &[],
-        }
-    }
-
-    /// Return the root (first) segment of the condition path, or an error.
-    ///
-    /// For leaf conditions: errors if the path is empty (internal invariant violation).
-    /// For compound conditions (`And`/`Or`): always returns an error — callers must
-    /// recurse into operands directly.
-    #[must_use = "errors should be handled"]
-    pub fn root(&self) -> Result<&str, crate::error::MdsError> {
-        match self {
-            Condition::And(_) | Condition::Or(_) => Err(crate::error::MdsError::syntax(
-                "internal error: root() called on compound And/Or condition — recurse operands instead",
-            )),
-            _ => self.path().first().map(String::as_str).ok_or_else(|| {
-                crate::error::MdsError::syntax(
-                    "internal error: @if block has empty condition path",
-                )
-            }),
-        }
-    }
 }
 
 /// YAML frontmatter block.
@@ -134,7 +98,7 @@ pub struct Interpolation {
     pub len: usize,
 }
 
-/// Expressions that can appear inside `{ }`.
+/// Expressions that can appear inside `{ }`, directive conditions, and directive iterables.
 #[derive(Debug, Clone)]
 pub enum Expr {
     /// Simple variable reference: `{name}`
@@ -149,6 +113,14 @@ pub enum Expr {
     },
     /// Object field access: `{config.key}` or `{a.b.c}`
     MemberAccess { object: String, fields: Vec<String> },
+    /// A string literal used in condition comparisons: `"admin"`
+    StringLiteral(String),
+    /// A numeric literal used in condition comparisons: `42`, `3.14`
+    NumberLiteral(f64),
+    /// A boolean literal used in condition comparisons: `true`, `false`
+    BooleanLiteral(bool),
+    /// The null literal used in condition comparisons: `null`
+    NullLiteral,
 }
 
 /// A function argument — a string literal, variable reference, or nested call.
@@ -190,8 +162,8 @@ pub struct ForBlock {
     pub var: String,
     /// Optional key variable for `@for key, value in obj:` iteration.
     pub key_var: Option<String>,
-    /// Iterable as a dot-separated path: `vec!["items"]` or `vec!["config", "items"]`.
-    pub iterable: Vec<String>,
+    /// The expression to iterate over. May be a variable, dot-path, function call, etc.
+    pub iterable: Expr,
     pub body: Vec<Node>,
     pub offset: usize,
 }
