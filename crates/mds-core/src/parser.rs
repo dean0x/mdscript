@@ -330,8 +330,9 @@ impl Parser<'_> {
     fn parse_for_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
         self.enter_block()?;
 
-        let rest = strip_trailing_directive_colon(rest.trim())
-            .ok_or_else(|| MdsError::syntax("@for directive must end with ':'"))?;
+        let trimmed = rest.trim();
+        let rest = strip_trailing_directive_colon(trimmed)
+            .ok_or_else(|| directive_colon_error("@for", trimmed))?;
 
         // Split on " in " to separate variable part from iterable part.
         // Supports both:
@@ -378,6 +379,11 @@ impl Parser<'_> {
         self.enter_block()?;
 
         let rest = rest.trim();
+        // `strip_suffix(':')` is safe here (unlike @if/@for which use the quote+paren-aware
+        // strip_trailing_directive_colon). @define's grammar enforces `name(params):` — the
+        // entire parameter list is enclosed in parentheses, so any colon inside a default-value
+        // string literal (e.g., `@define foo(sep = ":")`) is contained within the parens and
+        // the final character of the directive is always the unambiguous directive colon.
         let rest = rest
             .strip_suffix(':')
             .ok_or_else(|| MdsError::syntax("@define directive must end with ':'"))?

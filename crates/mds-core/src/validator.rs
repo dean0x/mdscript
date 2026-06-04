@@ -131,17 +131,7 @@ fn validate_for_node(
                 MdsError::undefined_var_at(object, file, source, block.offset, object.len())
             })?;
         }
-        Expr::Call { name, .. } => {
-            validate_expr(
-                &block.iterable,
-                scope,
-                file,
-                source,
-                block.offset,
-                name.len(),
-            )?;
-        }
-        Expr::QualifiedCall { name, .. } => {
+        Expr::Call { name, .. } | Expr::QualifiedCall { name, .. } => {
             validate_expr(
                 &block.iterable,
                 scope,

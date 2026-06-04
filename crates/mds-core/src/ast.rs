@@ -8,6 +8,22 @@ pub struct Module {
 /// A literal value for a default parameter in `@define` blocks.
 ///
 /// Only string, number, boolean, and null literals are supported.
+///
+/// # TODO: Type Duplication
+///
+/// `CondValue` (String, Number, Boolean, Null) is structurally identical to the
+/// literal variants of `Expr` (StringLiteral, NumberLiteral, BooleanLiteral, NullLiteral),
+/// and `Arg` has the same four literal variants as well — creating three parallel hierarchies.
+///
+/// The correct fix is:
+/// - Replace `Param.default: Option<CondValue>` with `Param.default: Option<Expr>`
+/// - Remove `CondValue` and `condvalue_to_value` from the evaluator
+/// - Change `parse_cond_value` to call `parse_expr_inner` and return `Expr`
+///
+/// This was deferred because it is cross-cutting (touches `Param`, `parse_define_params`,
+/// `condvalue_to_value`, and all test code that pattern-matches on `CondValue`), and
+/// the current PR scope is expression directives in `@for`/`@if`. Address in a dedicated
+/// cleanup PR — no behaviour change, pure type unification.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CondValue {
     /// A string literal: `"admin"` or `'admin'`
