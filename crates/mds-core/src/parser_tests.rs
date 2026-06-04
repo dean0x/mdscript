@@ -1641,7 +1641,10 @@ fn parse_elseif_unterminated_string_error() {
     let src = "@if x:\nA\n@elseif lower(name) == \"alice:\nB\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
-    assert!(result.is_err(), "unterminated string in @elseif should error");
+    assert!(
+        result.is_err(),
+        "unterminated string in @elseif should error"
+    );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("unterminated string"),

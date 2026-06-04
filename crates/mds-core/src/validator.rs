@@ -132,10 +132,24 @@ fn validate_for_node(
             })?;
         }
         Expr::Call { name, .. } => {
-            validate_expr(&block.iterable, scope, file, source, block.offset, name.len())?;
+            validate_expr(
+                &block.iterable,
+                scope,
+                file,
+                source,
+                block.offset,
+                name.len(),
+            )?;
         }
         Expr::QualifiedCall { name, .. } => {
-            validate_expr(&block.iterable, scope, file, source, block.offset, name.len())?;
+            validate_expr(
+                &block.iterable,
+                scope,
+                file,
+                source,
+                block.offset,
+                name.len(),
+            )?;
         }
         // Literal variants should have been rejected at parse time; guard defensively.
         Expr::StringLiteral(_)

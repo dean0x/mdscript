@@ -59,7 +59,9 @@ struct Parser<'a> {
 /// an unclosed quote, or a generic "must end with ':'" message otherwise.
 fn directive_colon_error(directive: &str, rest: &str) -> MdsError {
     if has_unterminated_string(rest) {
-        MdsError::syntax(format!("unterminated string literal in {directive} condition"))
+        MdsError::syntax(format!(
+            "unterminated string literal in {directive} condition"
+        ))
     } else {
         MdsError::syntax(format!("{directive} directive must end with ':'"))
     }
