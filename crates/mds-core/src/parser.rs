@@ -309,7 +309,13 @@ impl Parser<'_> {
                 .expect("loop guard guarantees @elseif prefix")
                 .trim();
             let elseif_cond_str = strip_trailing_directive_colon(elseif_rest)
-                .ok_or_else(|| MdsError::syntax("@elseif directive must end with ':'"))?;
+                .ok_or_else(|| {
+                    if has_unterminated_string(elseif_rest) {
+                        MdsError::syntax("unterminated string literal in @elseif condition")
+                    } else {
+                        MdsError::syntax("@elseif directive must end with ':'")
+                    }
+                })?;
 
             let elseif_cond = parse_condition(elseif_cond_str)?;
             let elseif_body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;

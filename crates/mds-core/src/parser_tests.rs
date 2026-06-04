@@ -1530,6 +1530,125 @@ fn evaluate_elseif_with_expression() {
     );
 }
 
+// ── NotEq operator tests ──────────────────────────────────────────────────────
+
+#[test]
+fn parse_if_call_not_eq_literal() {
+    // @if lower(name) != "alice": → NotEq(Expr::Call, Expr::StringLiteral)
+    let src = "@if lower(name) != \"alice\":\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::NotEq(Expr::Call { name, .. }, Expr::StringLiteral(s))
+                if name == "lower" && s == "alice"),
+            "expected Condition::NotEq(Call{{lower}}, StringLiteral(alice)), got {:?}",
+            block.condition
+        );
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn evaluate_if_call_not_eq_truthy() {
+    // @if lower(name) != "bob": with name:Alice → truthy branch taken
+    let result = crate::compile_str(
+        "---\nname: Alice\n---\n@if lower(name) != \"bob\":\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if lower(name) != \"bob\" should be truthy when name is Alice, got: {result}"
+    );
+}
+
+#[test]
+fn evaluate_if_call_not_eq_falsy() {
+    // @if lower(name) != "alice": with name:Alice → false branch taken
+    let result = crate::compile_str(
+        "---\nname: Alice\n---\n@if lower(name) != \"alice\":\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("no"),
+        "@if lower(name) != \"alice\" should be falsy when name is Alice, got: {result}"
+    );
+}
+
+// ── OR operator with expression operands ──────────────────────────────────────
+
+#[test]
+fn parse_if_or_with_calls() {
+    // @if contains(t, "r") || contains(t, "z"): → Or with Truthy(Call) operands
+    let src = "@if contains(t, \"r\") || contains(t, \"z\"):\nyes\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::If(block) = &module.body[0] {
+        assert!(
+            matches!(&block.condition, Condition::Or(_)),
+            "expected Condition::Or, got {:?}",
+            block.condition
+        );
+        if let Condition::Or(ops) = &block.condition {
+            assert_eq!(ops.len(), 2);
+            assert!(matches!(&ops[0], Condition::Truthy(Expr::Call { .. })));
+            assert!(matches!(&ops[1], Condition::Truthy(Expr::Call { .. })));
+        }
+    } else {
+        panic!("expected If node");
+    }
+}
+
+#[test]
+fn evaluate_if_or_with_calls() {
+    // first operand is false, second is true → truthy
+    let result = crate::compile_str(
+        "---\nt: grunge\n---\n@if contains(t, \"z\") || contains(t, \"g\"):\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+    assert!(
+        result.contains("yes"),
+        "@if contains(t,z) || contains(t,g) should be truthy when second matches, got: {result}"
+    );
+}
+
+// ── @for with QualifiedCall iterable ─────────────────────────────────────────
+
+#[test]
+fn parse_for_qualified_call_iterable() {
+    // @for x in ns.func(args): → ForBlock with Expr::QualifiedCall
+    let src = "@for x in utils.items(config):\n- {x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::For(block) = &module.body[0] {
+        assert!(
+            matches!(&block.iterable, Expr::QualifiedCall { namespace, name, .. }
+                if namespace == "utils" && name == "items"),
+            "expected Expr::QualifiedCall{{utils.items}}, got {:?}",
+            block.iterable
+        );
+    } else {
+        panic!("expected For node");
+    }
+}
+
+// ── @elseif unterminated string error ────────────────────────────────────────
+
+#[test]
+fn parse_elseif_unterminated_string_error() {
+    // @elseif with unterminated string should give targeted error, not generic "must end with ':'"
+    let src = "@if x:\nA\n@elseif lower(name) == \"alice:\nB\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "unterminated string in @elseif should error");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("unterminated string"),
+        "error should mention unterminated string, got: {err}"
+    );
+}
+
 // ── Security tests ────────────────────────────────────────────────────────────
 
 #[test]
