@@ -357,7 +357,7 @@ impl Parser<'_> {
                 | Expr::NullLiteral
         ) {
             return Err(MdsError::syntax(format!(
-                "cannot iterate over a literal value: '{iterable_str}'"
+                "cannot use a literal value as @for iterable: '{iterable_str}' — use a variable or function call"
             )));
         }
 

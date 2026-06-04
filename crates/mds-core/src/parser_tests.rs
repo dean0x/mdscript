@@ -1751,3 +1751,79 @@ fn join_resource_limit_output_too_large() {
         "error should mention output size limit, got: {err}"
     );
 }
+
+// ── Escape-aware string literal boundary detection ────────────────────────
+//
+// Fix: rust-HIGH-parser_helpers:146 — parse_expr_inner, parse_cond_value, and
+// parse_single_arg_inner previously accepted `"\"` as a complete string literal
+// with value `\`. The closing quote in `"\"` is preceded by an odd number of
+// backslashes, making it an escaped quote — the string is unterminated.
+
+#[test]
+fn parse_expr_inner_escaped_closing_quote_is_unterminated() {
+    // `"\"`  — quote, backslash, quote: closing quote is escaped → unterminated
+    let result = parse_expr_inner(r#""\""#);
+    assert!(
+        result.is_err(),
+        "escaped closing quote must not be accepted as a complete string literal, got {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("unterminated"),
+        "error must mention unterminated string, got: {msg}"
+    );
+}
+
+#[test]
+fn parse_expr_inner_double_backslash_then_quote_is_complete() {
+    // `"\\"` — 4 bytes: open-quote, backslash, backslash, close-quote.
+    // The two backslashes form a `\\` escape, so the closing quote is unescaped → complete.
+    // Inner content is `\\`, unescape → `\`.
+    // Note: in a Rust string literal, `"\"\\\\\""` produces the 4 bytes `"\\"`
+    let s = "\"\\\\\"";
+    let result = parse_expr_inner(s);
+    assert!(
+        result.is_ok(),
+        "double-backslash-terminated string must parse as complete: {result:?}"
+    );
+    if let Ok(Expr::StringLiteral(v)) = result {
+        assert_eq!(v, "\\", "inner `\\\\` must unescape to a single backslash");
+    } else {
+        panic!("expected StringLiteral");
+    }
+}
+
+#[test]
+fn parse_expr_inner_escaped_quote_in_middle_followed_by_close() {
+    // `"say \"hi\""` — the inner `\"` is an escaped quote, the final `"` is the real close
+    let result = parse_expr_inner(r#""say \"hi\"""#);
+    assert!(
+        result.is_ok(),
+        "string with escaped inner quote must parse: {result:?}"
+    );
+    if let Ok(Expr::StringLiteral(s)) = result {
+        assert_eq!(s, r#"say "hi""#);
+    } else {
+        panic!("expected StringLiteral");
+    }
+}
+
+#[test]
+fn parse_cond_value_escaped_closing_quote_is_unterminated() {
+    // `"\"` in a condition value context — must be rejected as unterminated
+    let result = parse_cond_value(r#""\""#);
+    assert!(
+        result.is_err(),
+        "escaped closing quote must not be accepted as a complete condition string: {result:?}"
+    );
+}
+
+#[test]
+fn parse_single_arg_escaped_closing_quote_is_unterminated() {
+    // `"\"` as a function argument — must not silently parse as string literal `\`
+    let result = parse_single_arg(r#""\""#);
+    assert!(
+        result.is_err(),
+        "escaped closing quote must not be accepted as a complete arg string: {result:?}"
+    );
+}

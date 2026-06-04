@@ -24,6 +24,93 @@ use crate::ast::{
 use crate::error::MdsError;
 use crate::limits::{MAX_DOT_SEGMENTS, MAX_LOGICAL_OPERANDS, MAX_NESTING_DEPTH};
 
+/// Return `true` if `s` is a complete, properly-terminated quoted string literal.
+///
+/// A string is complete when:
+/// 1. It begins and ends with the same quote character (`"` or `'`), and
+/// 2. The final character is **not** preceded by an odd number of backslashes
+///    (i.e., the closing quote is not escaped).
+///
+/// Examples:
+/// - `"hello"` → true
+/// - `"say \"hi\""` → true (inner `\"` is escaped; the outer `"` closes the string)
+/// - `"\""` → false (the only closing candidate is escaped — unterminated)
+/// - `"\\"` → true (double-backslash then unescaped closing quote)
+fn is_complete_string_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let n = bytes.len();
+    if n < 2 {
+        return false;
+    }
+    let open = bytes[0];
+    if open != b'"' && open != b'\'' {
+        return false;
+    }
+    if bytes[n - 1] != open {
+        return false;
+    }
+    // Count consecutive backslashes immediately before the closing quote.
+    // An even number means the closing quote is unescaped; an odd number means it is escaped.
+    let mut backslashes: usize = 0;
+    let mut i = n - 2; // byte just before the closing quote
+    loop {
+        if bytes[i] != b'\\' {
+            break;
+        }
+        backslashes += 1;
+        if i == 1 {
+            break; // reached the byte after the opening quote — stop
+        }
+        i -= 1;
+    }
+    backslashes.is_multiple_of(2)
+}
+
+/// Return `true` if `s` contains a bare `=` (not `==` and not `!=`) that appears
+/// outside any quoted string or parenthesised group.
+///
+/// Used by [`parse_simple_condition`] to give a targeted error hint when a user
+/// writes `var = "value"` instead of `var == "value"`.
+fn has_bare_equals(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut string_char = b'"';
+    let mut paren_depth: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if in_string {
+            if ch == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if ch == string_char {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            b'"' | b'\'' => {
+                in_string = true;
+                string_char = ch;
+            }
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'=' if paren_depth == 0 => {
+                let after_eq = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+                let before_is_bang = i > 0 && bytes[i - 1] == b'!';
+                if after_eq != b'=' && !before_is_bang {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Strip the trailing `:` from a directive condition/iterable string, respecting
 /// quoted strings and parentheses so that colons inside string literals or function
 /// arguments are not mistaken for the directive colon.
@@ -125,6 +212,75 @@ pub(super) fn has_unterminated_string(s: &str) -> bool {
     in_string
 }
 
+/// Parse a function-call or qualified-call expression from `parse_expr_inner`.
+///
+/// Called when a `(` appears before any `.` (simple call) or when a `.` precedes
+/// a `(` (qualified call: `ns.func(args)`). Returns `None` when the input falls
+/// through to the member-access path instead.
+fn parse_call_expr(
+    s: &str,
+    first_dot: Option<usize>,
+    first_paren: usize,
+) -> Option<Result<Expr, MdsError>> {
+    if first_dot.is_none_or(|d| first_paren < d) {
+        // Simple call: func(args)
+        let name = s[..first_paren].trim().to_string();
+        if !is_valid_identifier(&name) {
+            return Some(Err(MdsError::syntax(format!(
+                "invalid function name in directive expression: '{name}'"
+            ))));
+        }
+        let args_str = match s[first_paren + 1..].trim().strip_suffix(')') {
+            Some(a) => a,
+            None => {
+                return Some(Err(MdsError::syntax(
+                    "unclosed parenthesis in directive expression",
+                )))
+            }
+        };
+        let args = match parse_args(args_str) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(Ok(Expr::Call { name, args }));
+    }
+
+    // dot before paren: qualified call — or falls through to member-access if no '(' after dot.
+    let dot_pos = first_dot?;
+    let rest_after_dot = &s[dot_pos + 1..];
+    let paren_in_rest = rest_after_dot.find('(')?;
+
+    let namespace = s[..dot_pos].trim().to_string();
+    let name = rest_after_dot[..paren_in_rest].trim().to_string();
+    if !is_valid_identifier(&namespace) {
+        return Some(Err(MdsError::syntax(format!(
+            "invalid namespace in qualified call: '{namespace}'"
+        ))));
+    }
+    if !is_valid_identifier(&name) {
+        return Some(Err(MdsError::syntax(format!(
+            "invalid function name in qualified call: '{name}'"
+        ))));
+    }
+    let args_str = match rest_after_dot[paren_in_rest + 1..].trim().strip_suffix(')') {
+        Some(a) => a,
+        None => {
+            return Some(Err(MdsError::syntax(
+                "unclosed parenthesis in qualified call expression",
+            )))
+        }
+    };
+    let args = match parse_args(args_str) {
+        Ok(a) => a,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok(Expr::QualifiedCall {
+        namespace,
+        name,
+        args,
+    }))
+}
+
 /// Parse an expression for use in directive conditions or iterables.
 ///
 /// Accepts the same forms as interpolation expressions plus literal values:
@@ -142,10 +298,8 @@ pub(super) fn parse_expr_inner(s: &str) -> Result<Expr, MdsError> {
         return Err(MdsError::syntax("expected an expression"));
     }
 
-    // Quoted string literal
-    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
-        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
-    {
+    // Quoted string literal — only accept when the closing quote is not escaped.
+    if is_complete_string_literal(s) {
         let inner = &s[1..s.len() - 1];
         return Ok(Expr::StringLiteral(unescape_string(inner)));
     }
@@ -182,55 +336,13 @@ pub(super) fn parse_expr_inner(s: &str) -> Result<Expr, MdsError> {
         }
     }
 
-    // Function call or qualified call: look for '(' before any dot
+    // Function call or qualified call: look for '(' before any dot.
     let first_dot = s.find('.');
     let first_paren = s.find('(');
 
     if let Some(paren_pos) = first_paren {
-        if first_dot.is_none_or(|d| paren_pos < d) {
-            // Simple call: func(args)
-            let name = s[..paren_pos].trim().to_string();
-            if !is_valid_identifier(&name) {
-                return Err(MdsError::syntax(format!(
-                    "invalid function name in directive expression: '{name}'"
-                )));
-            }
-            let args_str = s[paren_pos + 1..]
-                .trim()
-                .strip_suffix(')')
-                .ok_or_else(|| MdsError::syntax("unclosed parenthesis in directive expression"))?;
-            let args = parse_args(args_str)?;
-            return Ok(Expr::Call { name, args });
-        } else if let Some(dot_pos) = first_dot {
-            // dot before paren: qualified call — or falls through to member-access check below
-            // if there is no '(' after the dot.
-            let rest_after_dot = &s[dot_pos + 1..];
-            if let Some(paren_in_rest) = rest_after_dot.find('(') {
-                let namespace = s[..dot_pos].trim().to_string();
-                let name = rest_after_dot[..paren_in_rest].trim().to_string();
-                if !is_valid_identifier(&namespace) {
-                    return Err(MdsError::syntax(format!(
-                        "invalid namespace in qualified call: '{namespace}'"
-                    )));
-                }
-                if !is_valid_identifier(&name) {
-                    return Err(MdsError::syntax(format!(
-                        "invalid function name in qualified call: '{name}'"
-                    )));
-                }
-                let args_str = rest_after_dot[paren_in_rest + 1..]
-                    .trim()
-                    .strip_suffix(')')
-                    .ok_or_else(|| {
-                        MdsError::syntax("unclosed parenthesis in qualified call expression")
-                    })?;
-                let args = parse_args(args_str)?;
-                return Ok(Expr::QualifiedCall {
-                    namespace,
-                    name,
-                    args,
-                });
-            }
+        if let Some(result) = parse_call_expr(s, first_dot, paren_pos) {
+            return result;
         }
     }
 
@@ -272,10 +384,8 @@ pub(super) fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
         ));
     }
 
-    // Quoted string (single or double)
-    if (s.starts_with('"') && s.ends_with('"') && s.len() >= 2)
-        || (s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2)
-    {
+    // Quoted string (single or double) — only accept when the closing quote is not escaped.
+    if is_complete_string_literal(s) {
         let inner = &s[1..s.len() - 1];
         return Ok(CondValue::String(unescape_string(inner)));
     }
@@ -427,7 +537,7 @@ pub(super) fn parse_negation_condition(rest: &str) -> Result<Condition, MdsError
         | Expr::BooleanLiteral(_)
         | Expr::NullLiteral => {
             return Err(MdsError::syntax(
-                "use a variable or function call, not a bare literal, after '!'",
+                "cannot use a literal value after '!' — use a variable or function call",
             ));
         }
         _ => {}
@@ -618,46 +728,8 @@ fn parse_simple_condition(s: &str) -> Result<Condition, MdsError> {
     }
 
     // Check for bare `=` (not `==`) — give a targeted hint.
-    // We look for `=` that is NOT followed by another `=` and NOT preceded by `!`.
-    // Only check outside parens (scan byte-by-byte).
-    {
-        let bytes = s.as_bytes();
-        let mut in_string = false;
-        let mut string_char = b'"';
-        let mut paren_depth: usize = 0;
-        let mut i = 0;
-        while i < bytes.len() {
-            let ch = bytes[i];
-            if in_string {
-                if ch == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                    continue;
-                }
-                if ch == string_char {
-                    in_string = false;
-                }
-                i += 1;
-                continue;
-            }
-            match ch {
-                b'"' | b'\'' => {
-                    in_string = true;
-                    string_char = ch;
-                }
-                b'(' => paren_depth += 1,
-                b')' => paren_depth = paren_depth.saturating_sub(1),
-                b'=' if paren_depth == 0 => {
-                    let after_eq = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
-                    let before_is_bang = i > 0 && bytes[i - 1] == b'!';
-                    // Bare `=` (not `==` and not `!=`)
-                    if after_eq != b'=' && !before_is_bang {
-                        return Err(MdsError::syntax("use '==' for comparison, not '='"));
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
+    if has_bare_equals(s) {
+        return Err(MdsError::syntax("use '==' for comparison, not '='"));
     }
 
     // Default: truthy check — evaluate as expression
@@ -669,7 +741,7 @@ fn parse_simple_condition(s: &str) -> Result<Condition, MdsError> {
         | Expr::BooleanLiteral(_)
         | Expr::NullLiteral => {
             return Err(MdsError::syntax(
-                "use a variable or function call, not a bare literal, in @if condition",
+                "cannot use a literal value in @if condition — use a variable or function call",
             ));
         }
         _ => {}
@@ -1092,9 +1164,8 @@ pub(super) fn parse_single_arg(s: &str) -> Result<Arg, MdsError> {
 /// for nested calls.
 pub(super) fn parse_single_arg_inner(s: &str, depth: usize) -> Result<Arg, MdsError> {
     let s = s.trim();
-    if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
-    {
+    // Only accept as a complete string literal when the closing quote is not escaped.
+    if is_complete_string_literal(s) {
         let inner = &s[1..s.len() - 1];
         let unescaped = unescape_string(inner);
         Ok(Arg::StringLiteral(unescaped))
