@@ -1210,11 +1210,31 @@ fn parse_for_nested_call_iterable() {
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
-        assert!(
-            matches!(&block.iterable, Expr::Call { name, .. } if name == "sort"),
-            "expected Expr::Call{{sort}}, got {:?}",
-            block.iterable
-        );
+        if let Expr::Call { name, args } = &block.iterable {
+            assert_eq!(name, "sort", "outer call should be 'sort'");
+            assert_eq!(args.len(), 1, "sort() should have exactly one argument");
+            if let Arg::Call {
+                name: inner_name,
+                args: inner_args,
+            } = &args[0]
+            {
+                assert_eq!(inner_name, "unique", "inner call should be 'unique'");
+                assert_eq!(
+                    inner_args.len(),
+                    1,
+                    "unique() should have exactly one argument"
+                );
+                assert!(
+                    matches!(&inner_args[0], Arg::Var(v) if v == "tags"),
+                    "unique() argument should be Arg::Var(\"tags\"), got {:?}",
+                    inner_args[0]
+                );
+            } else {
+                panic!("expected inner Arg::Call{{unique}}, got {:?}", args[0]);
+            }
+        } else {
+            panic!("expected Expr::Call{{sort}}, got {:?}", block.iterable);
+        }
     } else {
         panic!("expected For node");
     }
@@ -1490,16 +1510,21 @@ fn evaluate_for_sort_unique_iterable() {
         "---\ntags:\n  - b\n  - a\n  - b\n---\n@for t in sort(unique(tags)):\n- {t}\n@end\n",
     )
     .unwrap();
-    assert!(
-        result.contains("- a") && result.contains("- b"),
-        "@for sort(unique(tags)) should produce sorted unique items, got: {result}"
-    );
     // Ensure deduplication — only 2 items, not 3
     let dashes: Vec<_> = result.lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(
         dashes.len(),
         2,
         "should have exactly 2 unique items, got: {result}"
+    );
+    // Ensure sort order — ascending lexicographic: a before b
+    assert_eq!(
+        dashes[0], "- a",
+        "first item should be '- a' (sorted), got: {result}"
+    );
+    assert_eq!(
+        dashes[1], "- b",
+        "second item should be '- b' (sorted), got: {result}"
     );
 }
 
@@ -1510,12 +1535,22 @@ fn evaluate_for_non_array_result_is_error() {
         result.is_err(),
         "non-array result from @for expression should error"
     );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("array") || err.contains("iterate"),
+        "error should mention array type mismatch, got: {err}"
+    );
 }
 
 #[test]
 fn evaluate_if_undefined_function_is_error() {
     let result = crate::compile_str("@if notabuiltin(x):\nyes\n@end\n");
     assert!(result.is_err(), "undefined function in @if should error");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("notabuiltin") || err.contains("undefined"),
+        "error should mention the unknown function name, got: {err}"
+    );
 }
 
 #[test]
