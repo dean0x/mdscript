@@ -3,12 +3,15 @@
 //! This module contains the low-level parsing primitives used by the main
 //! [`super::parser`] module. Responsibilities are organised by concern:
 //!
+//! - **Directive string utilities** — `strip_trailing_directive_colon`,
+//!   `has_unterminated_string`
+//! - **Expression parsing** — `parse_expr_inner`
 //! - **Condition parsing** — `parse_condition`, `parse_negation_condition`,
-//!   `find_unquoted_operator`, `parse_cond_value`, `parse_dot_path`
+//!   `find_unquoted_operator`, `parse_cond_value`
 //! - **Directive parsing** — `parse_import_directive`, `parse_export_directive`,
-//!   `parse_for_vars`
+//!   `parse_for_vars`, `parse_define_params`
 //! - **Interpolation parsing** — `parse_interpolation_expr`, `parse_dot_expr`,
-//!   `parse_args`, `parse_args_inner`, `parse_single_arg_inner`
+//!   `parse_args`, `parse_args_inner`, `parse_single_arg`, `parse_single_arg_inner`
 //! - **Utilities** — `parse_quoted_path`, `validate_dot_path_parts`,
 //!   `unescape_string`, `is_valid_identifier`, `is_directive_token`,
 //!   `strip_leading_newline`, `strip_trailing_newline`
@@ -72,6 +75,14 @@ pub(super) fn strip_trailing_directive_colon(s: &str) -> Option<&str> {
             _ => {}
         }
         i += 1;
+    }
+
+    // An unclosed parenthesis group means the directive string is structurally
+    // malformed (e.g. `func(a:`). Treat it the same as a missing colon so the
+    // caller reports a parse error rather than silently using a colon that was
+    // inside an argument list.
+    if paren_depth > 0 {
+        return None;
     }
 
     last_bare_colon.and_then(|pos| {
@@ -517,9 +528,13 @@ fn parse_and_level(s: &str) -> Result<Condition, MdsError> {
 /// Parse an `@if` or `@elseif` condition string into a `Condition`.
 ///
 /// Accepted forms:
-/// - `var` / `config.debug` → `Condition::Truthy`
-/// - `!var` / `!config.debug` → `Condition::Not`
-/// - `var == "value"` / `var != 42` → `Condition::Eq` / `Condition::NotEq`
+/// - `var` / `config.debug` / `func(args)` / `ns.func(args)` → `Condition::Truthy`
+/// - `!var` / `!func(args)` → `Condition::Not`
+/// - `expr == expr` / `expr != expr` → `Condition::Eq` / `Condition::NotEq`
+///   where each side is any expression accepted by `parse_expr_inner`:
+///   variables, dot-paths, function calls, string/number/boolean/null literals.
+///   Examples: `var == "value"`, `var != 42`, `func(a) == func(b)`,
+///   `env.get("KEY") != null`
 /// - `a && b` → `Condition::And([a, b])`
 /// - `a || b` → `Condition::Or([a, b])`
 /// - `a && b || c` → `Condition::Or([And([a, b]), c])` (`||` binds less tightly)

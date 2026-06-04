@@ -257,15 +257,19 @@ fn builtin_split(args: &[Value]) -> Result<Value, MdsError> {
             "split() separator must not be empty",
         ));
     }
-    let parts: Vec<Value> = s.split(sep).map(|p| Value::String(p.to_string())).collect();
     // Guard against producing enormous arrays that would exhaust memory during
-    // subsequent @for iteration or join() calls.
-    if parts.len() > MAX_ARRAY_ELEMENTS {
-        return Err(MdsError::resource_limit(format!(
-            "split() produced {} elements, exceeding maximum of {}",
-            parts.len(),
-            MAX_ARRAY_ELEMENTS
-        )));
+    // subsequent @for iteration or join() calls. Check incrementally so the
+    // limit fires before the full allocation completes (important in WASM where
+    // a large input split on a single byte could otherwise peak at ~240 MB).
+    let mut parts: Vec<Value> = Vec::new();
+    for piece in s.split(sep) {
+        if parts.len() >= MAX_ARRAY_ELEMENTS {
+            return Err(MdsError::resource_limit(format!(
+                "split() produced more than {} elements, exceeding maximum",
+                MAX_ARRAY_ELEMENTS
+            )));
+        }
+        parts.push(Value::String(piece.to_string()));
     }
     Ok(Value::Array(parts))
 }

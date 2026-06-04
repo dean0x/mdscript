@@ -5,7 +5,7 @@ pub struct Module {
     pub body: Vec<Node>,
 }
 
-/// A literal value on the RHS of an equality condition or as a default parameter value.
+/// A literal value for a default parameter in `@define` blocks.
 ///
 /// Only string, number, boolean, and null literals are supported.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,12 +34,12 @@ pub enum CondValue {
 ///
 /// # Why no `PartialEq`
 ///
-/// `Condition` intentionally does **not** derive `PartialEq` even though `CondValue`
-/// does. `Expr::NumberLiteral(f64)` uses IEEE 754 semantics where `NaN != NaN`, so
-/// a blanket derived `PartialEq` on `Condition` would be surprising and error-prone
-/// (the evaluator handles NaN safety explicitly). If structural comparison of
-/// `Condition` values is needed in the future, implement `PartialEq` manually with a
-/// clear comment about the NaN case rather than deriving it.
+/// `Condition` intentionally does **not** derive `PartialEq`. Its variants hold
+/// `Expr` values, and `Expr::NumberLiteral(f64)` uses IEEE 754 semantics where
+/// `NaN != NaN`, so a blanket derived `PartialEq` on `Condition` would be surprising
+/// and error-prone (the evaluator handles NaN safety explicitly). If structural
+/// comparison of `Condition` values is needed in the future, implement `PartialEq`
+/// manually with a clear comment about the NaN case rather than deriving it.
 #[derive(Debug, Clone)]
 pub enum Condition {
     /// `@if config.debug:` or `@if func(x):` — truthy check on an expression

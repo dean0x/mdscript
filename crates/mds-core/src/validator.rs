@@ -1,4 +1,4 @@
-use crate::ast::{required_param_count, Arg, Condition, Expr, IfBlock, Node};
+use crate::ast::{required_param_count, Arg, Condition, Expr, ForBlock, IfBlock, Node};
 use crate::error::MdsError;
 use crate::scope::Scope;
 use crate::value::Value;
@@ -87,7 +87,7 @@ fn validate_if_node(
 /// types that cannot be determined statically. Any type mismatch on those expressions
 /// surfaces at evaluation time.
 fn validate_for_node(
-    block: &crate::ast::ForBlock,
+    block: &ForBlock,
     scope: &mut Scope,
     file: &str,
     source: &str,
@@ -131,45 +131,11 @@ fn validate_for_node(
                 MdsError::undefined_var_at(object, file, source, block.offset, object.len())
             })?;
         }
-        Expr::Call { name, args } => {
-            validate_call_arity(
-                name,
-                args.len(),
-                scope,
-                file,
-                source,
-                block.offset,
-                name.len(),
-            )?;
-            validate_var_args(args, scope, file, source, block.offset, 0)?;
+        Expr::Call { name, .. } => {
+            validate_expr(&block.iterable, scope, file, source, block.offset, name.len())?;
         }
-        Expr::QualifiedCall {
-            namespace,
-            name,
-            args,
-        } => {
-            let ns = scope.get_namespace(namespace).ok_or_else(|| {
-                MdsError::undefined_var_at(namespace, file, source, block.offset, namespace.len())
-            })?;
-            let qualified = format!("{namespace}.{name}");
-            let func = ns.functions.get(name).ok_or_else(|| {
-                MdsError::undefined_fn_at(&qualified, file, source, block.offset, name.len())
-            })?;
-            let required = crate::ast::required_param_count(&func.params);
-            let total = func.params.len();
-            if args.len() < required || args.len() > total {
-                return Err(MdsError::arity_at(
-                    &qualified,
-                    required,
-                    total,
-                    args.len(),
-                    file,
-                    source,
-                    block.offset,
-                    name.len(),
-                ));
-            }
-            validate_var_args(args, scope, file, source, block.offset, 0)?;
+        Expr::QualifiedCall { name, .. } => {
+            validate_expr(&block.iterable, scope, file, source, block.offset, name.len())?;
         }
         // Literal variants should have been rejected at parse time; guard defensively.
         Expr::StringLiteral(_)
