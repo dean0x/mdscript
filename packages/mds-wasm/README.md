@@ -1,6 +1,6 @@
 # @mdscript/mds-wasm
 
-WebAssembly build of the [MDS (Markdown Script)](https://github.com/dean0x/mds)
+WebAssembly build of the [MDS (Markdown Script)](https://github.com/dean0x/mdscript)
 compiler.
 
 This package is the portable fallback used by [`@mdscript/mds`](https://www.npmjs.com/package/@mdscript/mds)

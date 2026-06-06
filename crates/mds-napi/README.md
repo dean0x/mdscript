@@ -1,6 +1,6 @@
 # @mdscript/mds-napi
 
-Native Node.js bindings for the [MDS (Markdown Script)](https://github.com/dean0x/mds)
+Native Node.js bindings for the [MDS (Markdown Script)](https://github.com/dean0x/mdscript)
 compiler, built with [napi-rs](https://napi.rs/).
 
 This is the high-performance backend used by [`@mdscript/mds`](https://www.npmjs.com/package/@mdscript/mds)

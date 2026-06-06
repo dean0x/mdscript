@@ -7,11 +7,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dean0x/mds.git",
+    "url": "git+https://github.com/dean0x/mdscript.git",
     "directory": "crates/mds-napi"
   },
-  "homepage": "https://github.com/dean0x/mds#readme",
-  "bugs": "https://github.com/dean0x/mds/issues",
+  "homepage": "https://github.com/dean0x/mdscript#readme",
+  "bugs": "https://github.com/dean0x/mdscript/issues",
   "keywords": [
     "markdown",
     "template",

@@ -9,7 +9,7 @@ description = "MDS compiler WebAssembly bindings"
 # choke on `license.workspace = true` ("invalid type: map, expected a string").
 # mds-wasm is not published to crates.io, so DRY inheritance buys nothing here.
 license = "MIT"
-repository = "https://github.com/dean0x/mds"
+repository = "https://github.com/dean0x/mdscript"
 keywords = ["markdown", "template", "llm", "prompt", "compiler"]
 categories = ["wasm", "template-engine"]
 

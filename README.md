@@ -1,6 +1,6 @@
 # MDS - Markdown Script
 
-[![CI](https://github.com/dean0x/mds/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/mds/actions/workflows/ci.yml)
+[![CI](https://github.com/dean0x/mdscript/actions/workflows/ci.yml/badge.svg)](https://github.com/dean0x/mdscript/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/mds-cli.svg)](https://crates.io/crates/mds-cli)
 [![npm](https://img.shields.io/npm/v/@mdscript/mds.svg)](https://www.npmjs.com/package/@mdscript/mds)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -162,7 +162,7 @@ workflow and quality gates.
 ## Security
 
 Please report vulnerabilities privately via GitHub's
-[private vulnerability reporting](https://github.com/dean0x/mds/security/advisories/new),
+[private vulnerability reporting](https://github.com/dean0x/mdscript/security/advisories/new),
 not public issues. See [SECURITY.md](SECURITY.md) for the security model, built-in
 resource limits, and supported versions.
 

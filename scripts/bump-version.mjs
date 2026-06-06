@@ -105,7 +105,7 @@ const stamped = cl
   )
   .replace(
     /^(\[[\d.]+\]:.*\/releases\/tag\/)v[\d.]+$/m,
-    `$1v${version}\n[${version}]: https://github.com/dean0x/mds/releases/tag/v${version}`,
+    `$1v${version}\n[${version}]: https://github.com/dean0x/mdscript/releases/tag/v${version}`,
   );
 
 if (stamped !== cl) {

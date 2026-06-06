@@ -6,7 +6,7 @@
 discussions, or pull requests.**
 
 Report vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/dean0x/mds/security/advisories/new).
+[private vulnerability reporting](https://github.com/dean0x/mdscript/security/advisories/new).
 This routes the report to the maintainers privately and lets us collaborate on a
 fix and coordinated disclosure.
 
