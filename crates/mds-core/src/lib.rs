@@ -401,6 +401,15 @@ fn strip_reserved_keys(raw: &str) -> Option<String> {
     let mut in_imports_block = false;
 
     for line in raw.lines() {
+        // Blank lines are not YAML keys — preserve them outside an imports block
+        // and skip them (without resetting state) inside one.
+        if line.is_empty() {
+            if !in_imports_block {
+                filtered.push('\n');
+            }
+            continue;
+        }
+
         // Only inspect top-level (no leading whitespace) keys.
         let is_top_level = !line.starts_with(' ') && !line.starts_with('\t');
 
@@ -945,7 +954,7 @@ mod tests {
     // ── strip_reserved_keys: type: mds variants ───────────────────────────────
 
     #[test]
-    fn strip_type_mds_plain_value() {
+    fn strip_reserved_keys_plain_value() {
         // Baseline: unquoted `type: mds` is stripped.
         let raw = "type: mds\nname: Alice\n";
         let result = strip_reserved_keys(raw);
@@ -953,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_type_mds_double_quoted() {
+    fn strip_reserved_keys_double_quoted() {
         // `type: "mds"` — double-quoted YAML string — must also be stripped.
         let raw = "type: \"mds\"\nname: Alice\n";
         let result = strip_reserved_keys(raw);
@@ -965,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_type_mds_single_quoted() {
+    fn strip_reserved_keys_single_quoted() {
         // `type: 'mds'` — single-quoted YAML string — must also be stripped.
         let raw = "type: 'mds'\nname: Alice\n";
         let result = strip_reserved_keys(raw);
@@ -977,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_type_mds_no_space_after_colon() {
+    fn strip_reserved_keys_no_space_after_colon() {
         // `type:mds` — no space after colon — must also be stripped.
         let raw = "type:mds\nname: Alice\n";
         let result = strip_reserved_keys(raw);
@@ -989,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_type_mds_quoted_only_returns_none() {
+    fn strip_reserved_keys_quoted_only_returns_none() {
         // Frontmatter with only a quoted `type: "mds"` should return None (empty after strip).
         let raw = "type: \"mds\"\n";
         let result = strip_reserved_keys(raw);
@@ -1000,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_type_mds_indented_quoted_not_stripped() {
+    fn strip_reserved_keys_indented_quoted_not_stripped() {
         // Indented `  type: "mds"` inside a nested mapping must NOT be stripped.
         let raw = "type: mds\nconfig:\n  type: \"mds\"\n  theme: dark\n";
         let result = strip_reserved_keys(raw);
@@ -1058,6 +1067,21 @@ mod tests {
             result,
             Some("name: Alice\nconfig:\n  imports: true\n  theme: dark\n".to_string()),
             "nested imports key should be preserved, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_imports_block_with_blank_lines() {
+        // Blank lines inside an `imports:` block must not leak into the output.
+        // An empty line satisfies `!starts_with(' ')` so without an explicit guard
+        // it would reset `in_imports_block` and allow the trailing `greeting:` to
+        // be emitted — but only after the blank-line guard was added.
+        let raw = "imports:\n  - path: ./a.mds\n\n  - path: ./b.mds\ngreeting: hello\n";
+        let result = strip_reserved_keys(raw);
+        assert_eq!(
+            result,
+            Some("greeting: hello\n".to_string()),
+            "blank lines inside imports block must not leak; got: {result:?}"
         );
     }
 
