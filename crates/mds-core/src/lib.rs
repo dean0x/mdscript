@@ -388,46 +388,65 @@ pub fn check_str_collecting_warnings(
     Ok(((), warnings))
 }
 
-/// Remove the `type: mds` line from raw frontmatter content.
+/// Remove reserved keys (`type: mds` and `imports:` blocks) from raw frontmatter content.
 ///
 /// Returns `Some(remaining)` if any non-whitespace content survives after filtering,
 /// or `None` if the frontmatter would be empty (nothing worth emitting).
-fn strip_type_mds(raw: &str) -> Option<String> {
+///
+/// Strips:
+/// - Top-level `type: mds` lines (all three YAML quoting styles).
+/// - Top-level `imports:` key and its continuation lines (indented child lines).
+fn strip_reserved_keys(raw: &str) -> Option<String> {
     let mut filtered = String::with_capacity(raw.len());
+    let mut in_imports_block = false;
+
     for line in raw.lines() {
-        // Only strip the top-level (no leading whitespace) `type: mds` directive.
-        // Using line.trim() here would incorrectly remove indented keys inside nested
-        // YAML objects (e.g. `  type: mds` under a mapping), corrupting the output.
-        //
-        // All three YAML quoting styles for the value "mds" are stripped:
-        //   type: mds     (plain scalar)
-        //   type: "mds"   (double-quoted)
-        //   type: 'mds'   (single-quoted)
-        let is_type_mds = line.strip_prefix("type:").is_some_and(|v| {
-            let v = v.trim();
-            v == "mds" || v == "\"mds\"" || v == "'mds'"
-        });
-        if !is_type_mds {
-            filtered.push_str(line);
-            filtered.push('\n');
+        // Only inspect top-level (no leading whitespace) keys.
+        let is_top_level = !line.starts_with(' ') && !line.starts_with('\t');
+
+        if is_top_level {
+            // Reset imports block tracking whenever we see a new top-level key.
+            if line.starts_with("imports:") || line == "imports:" {
+                in_imports_block = true;
+                // Drop this line (the `imports:` key itself).
+                continue;
+            }
+            in_imports_block = false;
+
+            // Strip the `type: mds` line (plain, double-quoted, and single-quoted).
+            let is_type_mds = line.strip_prefix("type:").is_some_and(|v| {
+                let v = v.trim();
+                v == "mds" || v == "\"mds\"" || v == "'mds'"
+            });
+            if is_type_mds {
+                continue;
+            }
+        } else if in_imports_block {
+            // Continuation lines of the `imports:` block — drop them too.
+            continue;
         }
+
+        filtered.push_str(line);
+        filtered.push('\n');
     }
-    if filtered.trim().is_empty() {
+
+    let trimmed = filtered.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(filtered)
+        Some(format!("{trimmed}\n"))
     }
 }
 
 /// Prepend YAML frontmatter fences to a compiled body.
 ///
-/// If `raw` is `None`, or after stripping `type: mds` the frontmatter is empty,
+/// If `raw` is `None`, or after stripping reserved keys the frontmatter is empty,
 /// the body is returned unchanged.
 fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
     let Some(raw) = raw else {
         return body;
     };
-    let Some(cleaned) = strip_type_mds(raw) else {
+    let Some(cleaned) = strip_reserved_keys(raw) else {
         return body;
     };
     format!("---\n{cleaned}---\n{body}")
@@ -752,6 +771,7 @@ pub fn compile_file(path: &str) -> Result<String, MdsError> {
 ///
 /// Parses the source and walks the AST, collecting the `path` field from every
 /// import and re-export directive:
+/// - Frontmatter `imports:` key (alias, merge, and selective forms) — returned FIRST
 /// - `@import "path" as alias` → path
 /// - `@import "path"` (merge) → path
 /// - `@import { names } from "path"` → path
@@ -759,6 +779,7 @@ pub fn compile_file(path: &str) -> Result<String, MdsError> {
 /// - `@export * from "path"` → path
 /// - `@export name` (named, no path) → skipped
 ///
+/// Frontmatter paths are inserted before body paths, matching resolution order.
 /// Duplicate paths are deduplicated while preserving insertion order.
 /// Returns an error if the source has a syntax error.
 ///
@@ -778,6 +799,22 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 
     let mut paths: IndexSet<String> = IndexSet::new();
 
+    // Insert frontmatter import paths FIRST (they resolve before body imports).
+    if let Some(fm) = module.frontmatter.as_ref() {
+        // Best-effort: ignore parse errors here (parse errors will surface at compile time).
+        if let Ok(fm_imports) = resolver::parse_frontmatter_imports(&fm.raw) {
+            for imp in &fm_imports {
+                let path = match imp {
+                    resolver::FrontmatterImport::Alias { path, .. }
+                    | resolver::FrontmatterImport::Merge { path }
+                    | resolver::FrontmatterImport::Selective { path, .. } => path,
+                };
+                paths.insert(path.clone());
+            }
+        }
+    }
+
+    // Then insert body import paths (deduplication is automatic via IndexSet).
     for node in &module.body {
         match node {
             ast::Node::Import(
@@ -910,13 +947,13 @@ mod tests {
         assert_eq!(clean_output("hello\r\nworld\r\n"), "hello\nworld\n");
     }
 
-    // ── strip_type_mds: YAML quoting variants ─────────────────────────────────
+    // ── strip_reserved_keys: type: mds variants ───────────────────────────────
 
     #[test]
     fn strip_type_mds_plain_value() {
         // Baseline: unquoted `type: mds` is stripped.
         let raw = "type: mds\nname: Alice\n";
-        let result = strip_type_mds(raw);
+        let result = strip_reserved_keys(raw);
         assert_eq!(result, Some("name: Alice\n".to_string()));
     }
 
@@ -924,7 +961,7 @@ mod tests {
     fn strip_type_mds_double_quoted() {
         // `type: "mds"` — double-quoted YAML string — must also be stripped.
         let raw = "type: \"mds\"\nname: Alice\n";
-        let result = strip_type_mds(raw);
+        let result = strip_reserved_keys(raw);
         assert_eq!(
             result,
             Some("name: Alice\n".to_string()),
@@ -936,7 +973,7 @@ mod tests {
     fn strip_type_mds_single_quoted() {
         // `type: 'mds'` — single-quoted YAML string — must also be stripped.
         let raw = "type: 'mds'\nname: Alice\n";
-        let result = strip_type_mds(raw);
+        let result = strip_reserved_keys(raw);
         assert_eq!(
             result,
             Some("name: Alice\n".to_string()),
@@ -948,7 +985,7 @@ mod tests {
     fn strip_type_mds_no_space_after_colon() {
         // `type:mds` — no space after colon — must also be stripped.
         let raw = "type:mds\nname: Alice\n";
-        let result = strip_type_mds(raw);
+        let result = strip_reserved_keys(raw);
         assert_eq!(
             result,
             Some("name: Alice\n".to_string()),
@@ -960,7 +997,7 @@ mod tests {
     fn strip_type_mds_quoted_only_returns_none() {
         // Frontmatter with only a quoted `type: "mds"` should return None (empty after strip).
         let raw = "type: \"mds\"\n";
-        let result = strip_type_mds(raw);
+        let result = strip_reserved_keys(raw);
         assert_eq!(
             result, None,
             "frontmatter with only quoted type:mds should be None, got: {result:?}"
@@ -971,11 +1008,135 @@ mod tests {
     fn strip_type_mds_indented_quoted_not_stripped() {
         // Indented `  type: "mds"` inside a nested mapping must NOT be stripped.
         let raw = "type: mds\nconfig:\n  type: \"mds\"\n  theme: dark\n";
-        let result = strip_type_mds(raw);
+        let result = strip_reserved_keys(raw);
         assert_eq!(
             result,
             Some("config:\n  type: \"mds\"\n  theme: dark\n".to_string()),
             "indented quoted type:mds should be preserved, got: {result:?}"
+        );
+    }
+
+    // ── strip_reserved_keys: imports block stripping ──────────────────────────
+
+    #[test]
+    fn strip_imports_block() {
+        // Multi-line `imports:` block with indented entries is fully stripped.
+        let raw = "name: Alice\nimports:\n  - path: ./lib.mds\n    as: lib\ngreeting: hello\n";
+        let result = strip_reserved_keys(raw);
+        assert_eq!(
+            result,
+            Some("name: Alice\ngreeting: hello\n".to_string()),
+            "imports block should be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_imports_and_type_returns_none_when_empty() {
+        // Only `type: mds` and `imports:` — nothing left after stripping → None.
+        let raw = "type: mds\nimports:\n  - path: ./lib.mds\n";
+        let result = strip_reserved_keys(raw);
+        assert_eq!(
+            result, None,
+            "only reserved keys, should be None, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_imports_flow_style() {
+        // Inline (flow-style) `imports:` key on a single line with no children.
+        // The key line itself is dropped; the next top-level key continues normally.
+        let raw = "imports: []\nname: Bob\n";
+        let result = strip_reserved_keys(raw);
+        assert_eq!(
+            result,
+            Some("name: Bob\n".to_string()),
+            "flow-style imports should be stripped, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn strip_preserves_nested_imports_key() {
+        // An indented `imports:` key inside a nested mapping must NOT be stripped.
+        let raw = "name: Alice\nconfig:\n  imports: true\n  theme: dark\n";
+        let result = strip_reserved_keys(raw);
+        assert_eq!(
+            result,
+            Some("name: Alice\nconfig:\n  imports: true\n  theme: dark\n".to_string()),
+            "nested imports key should be preserved, got: {result:?}"
+        );
+    }
+
+    // ── scan_imports: frontmatter imports paths ───────────────────────────────
+
+    #[test]
+    fn scan_imports_fm_alias() {
+        let source = concat!(
+            "---\n",
+            "imports:\n",
+            "  - path: ./lib.mds\n",
+            "    as: lib\n",
+            "---\n",
+            "Hello!\n",
+        );
+        let paths = scan_imports(source).expect("should succeed");
+        assert_eq!(paths, vec!["./lib.mds".to_string()]);
+    }
+
+    #[test]
+    fn scan_imports_fm_and_body() {
+        // Frontmatter paths must appear BEFORE body paths.
+        let source = concat!(
+            "---\n",
+            "imports:\n",
+            "  - path: ./fm_lib.mds\n",
+            "---\n",
+            "@import \"./body_lib.mds\"\n",
+            "Hello!\n",
+        );
+        let paths = scan_imports(source).expect("should succeed");
+        assert_eq!(
+            paths,
+            vec!["./fm_lib.mds".to_string(), "./body_lib.mds".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_imports_fm_dedup() {
+        // Same path in frontmatter and body → deduplicated, fm path wins (first insertion).
+        let source = concat!(
+            "---\n",
+            "imports:\n",
+            "  - path: ./lib.mds\n",
+            "---\n",
+            "@import \"./lib.mds\"\n",
+            "Hello!\n",
+        );
+        let paths = scan_imports(source).expect("should succeed");
+        assert_eq!(paths, vec!["./lib.mds".to_string()]);
+    }
+
+    #[test]
+    fn scan_imports_fm_all_forms() {
+        // All three frontmatter import forms return their paths.
+        let source = concat!(
+            "---\n",
+            "imports:\n",
+            "  - path: ./a.mds\n",
+            "    as: a\n",
+            "  - path: ./b.mds\n",
+            "  - path: ./c.mds\n",
+            "    names: [f]\n",
+            "---\n",
+            "Hello!\n",
+        );
+        let paths = scan_imports(source).expect("should succeed");
+        assert_eq!(
+            paths,
+            vec![
+                "./a.mds".to_string(),
+                "./b.mds".to_string(),
+                "./c.mds".to_string(),
+            ]
         );
     }
 

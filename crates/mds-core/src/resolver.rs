@@ -8,6 +8,8 @@ use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
+use crate::limits::MAX_FRONTMATTER_IMPORTS;
+use crate::parser::is_valid_identifier;
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
 use crate::validator;
@@ -306,9 +308,14 @@ impl ModuleCache {
         // Capture raw frontmatter before build_scope_from_frontmatter borrows the module.
         let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
 
-        // Build scope from frontmatter + runtime vars
-        let mut scope =
+        // Build scope from frontmatter + runtime vars; extract any frontmatter imports.
+        let (mut scope, fm_imports) =
             build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+
+        // Resolve frontmatter imports BEFORE body imports (per spec).
+        if !fm_imports.is_empty() {
+            self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
+        }
 
         // Walk the AST: collect @define functions (with closure capture), process imports/exports
         let CollectedDefs {
@@ -436,10 +443,104 @@ impl ModuleCache {
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
+        if scope.get_namespace(alias).is_some() {
+            return Err(MdsError::name_collision(alias.to_string()));
+        }
         let resolved = self
             .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         scope.set_namespace(alias, resolved.to_namespace());
+        Ok(())
+    }
+
+    /// Resolve all frontmatter imports, populating `scope` in the same order
+    /// as the declarations. Frontmatter imports run before body imports.
+    fn resolve_frontmatter_imports(
+        &mut self,
+        imports: &[FrontmatterImport],
+        scope: &mut Scope,
+        ctx: &ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), MdsError> {
+        for (i, imp) in imports.iter().enumerate() {
+            let wrap_err = |e: MdsError| {
+                // Attach "(in frontmatter imports[i])" context to error messages
+                // that don't already carry source spans.
+                match e {
+                    MdsError::FileNotFound {
+                        path, span: None, ..
+                    } => MdsError::import_error(format!(
+                        "file not found: \"{path}\" (in frontmatter imports[{i}])"
+                    )),
+                    MdsError::CircularImport {
+                        cycle, span: None, ..
+                    } => MdsError::import_error(format!(
+                        "circular import detected: {cycle} (in frontmatter imports[{i}])"
+                    )),
+                    MdsError::ImportError {
+                        message,
+                        span: None,
+                        ..
+                    } if !message.contains("in frontmatter") => {
+                        MdsError::import_error(format!("{message} (in frontmatter imports[{i}])"))
+                    }
+                    other => other,
+                }
+            };
+
+            match imp {
+                FrontmatterImport::Alias { path, alias } => {
+                    if scope.get_namespace(alias).is_some() {
+                        return Err(MdsError::name_collision(alias.clone()));
+                    }
+                    let resolved = self
+                        .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+                        .map_err(wrap_err)?;
+                    scope.set_namespace(alias, resolved.to_namespace());
+                }
+                FrontmatterImport::Merge { path } => {
+                    let resolved = self
+                        .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+                        .map_err(wrap_err)?;
+                    for (name, func) in resolved.get_all_exports() {
+                        if scope.get_function(&name).is_some() {
+                            return Err(MdsError::name_collision(name));
+                        }
+                        scope.set_function(&name, func);
+                    }
+                    if let Some(val) = resolved.get_prompt_value() {
+                        scope.set_var("prompt", val);
+                    }
+                }
+                FrontmatterImport::Selective { path, names } => {
+                    let resolved = self
+                        .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+                        .map_err(wrap_err)?;
+                    let not_exported = |name: &str| {
+                        MdsError::import_error(format!(
+                            "'{name}' is not exported from '{path}' (in frontmatter imports[{i}])"
+                        ))
+                    };
+                    for name in names {
+                        if name == "prompt" {
+                            scope.set_var(
+                                "prompt",
+                                resolved
+                                    .get_prompt_value()
+                                    .ok_or_else(|| not_exported(name))?,
+                            );
+                        } else {
+                            scope.set_function(
+                                name,
+                                resolved
+                                    .get_export(name)
+                                    .ok_or_else(|| not_exported(name))?,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -668,30 +769,89 @@ fn collect_define(
 /// Parses frontmatter YAML (if present), populates scope with variables,
 /// then applies runtime_vars to override any frontmatter keys.
 /// The `type` key is skipped for `.md` files (it is a file-type marker, not a template var).
+///
+/// For MDS files (`.mds` or `.md` with `type: mds`), the `imports` key is extracted
+/// and returned as a `Vec<FrontmatterImport>` rather than being set as a variable.
+/// For plain `.md` files, `imports` is treated as a regular variable.
+///
+/// Returns `(scope, fm_imports)`.
 fn build_scope_from_frontmatter(
     frontmatter: Option<&crate::ast::Frontmatter>,
     is_md: bool,
     runtime_vars: &HashMap<String, Value>,
-) -> Result<Scope, MdsError> {
+) -> Result<(Scope, Vec<FrontmatterImport>), MdsError> {
     let mut scope = Scope::new();
+    let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
 
     if let Some(fm) = frontmatter {
-        let yaml_vars = parse_frontmatter(&fm.raw)?;
-        for (key, value) in yaml_vars {
-            if key == "type" && is_md {
-                // Skip the 'type' meta-field for .md files (it's a file-type marker)
-                continue;
+        // Parse YAML once to avoid double-parsing
+        let yaml: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&fm.raw).map_err(|e| MdsError::yaml_error(e.to_string()))?;
+
+        // Determine is_mds: a .mds file is always MDS; a .md file is MDS only when
+        // frontmatter contains `type: mds`.
+        let is_mds = if is_md {
+            // Check for type: mds in the parsed YAML mapping
+            if let serde_yaml_ng::Value::Mapping(ref map) = yaml {
+                map.get("type").is_some_and(|v| {
+                    matches!(v, serde_yaml_ng::Value::String(s) if s.eq_ignore_ascii_case("mds"))
+                })
+            } else {
+                false
             }
-            scope.set_var(&key, value);
+        } else {
+            // .mds files are always MDS
+            true
+        };
+
+        if let serde_yaml_ng::Value::Mapping(map) = yaml {
+            for (key, val) in map {
+                let serde_yaml_ng::Value::String(key_str) = key else {
+                    continue;
+                };
+                if key_str == "type" && is_md {
+                    // Skip the 'type' meta-field for .md files (it's a file-type marker)
+                    continue;
+                }
+                if key_str == "imports" {
+                    if is_mds {
+                        // Parse as structured import declarations, not a scope variable
+                        fm_imports = parse_frontmatter_imports_from_yaml(&val)?;
+                    } else {
+                        // Plain .md: treat `imports` as a regular variable
+                        let value = Value::from_yaml(val)?;
+                        scope.set_var(&key_str, value);
+                    }
+                    continue;
+                }
+                let value = Value::from_yaml(val)?;
+                scope.set_var(&key_str, value);
+            }
         }
     }
 
     // Apply runtime vars (override frontmatter)
     for (key, value) in runtime_vars {
+        if key == "imports" {
+            // Block --set imports=... for MDS files where imports is reserved.
+            // We check is_mds conservatively: if frontmatter is present and contains
+            // `type: mds` (for .md) or file is .mds (is_md == false), block it.
+            // Since we no longer track is_mds outside the frontmatter block, we use
+            // whether fm_imports was populated or not — but that's not reliable for
+            // files without a frontmatter imports key. Instead, detect via is_md:
+            // for .mds files (is_md==false), always block; for .md files, allow
+            // (they treat imports as a regular var).
+            if !is_md {
+                return Err(MdsError::import_error(
+                    "'imports' is a reserved frontmatter key for .mds files and cannot be set \
+                     via --set",
+                ));
+            }
+        }
         scope.set_var(key, value.clone());
     }
 
-    Ok(scope)
+    Ok((scope, fm_imports))
 }
 
 /// Validate that all named exports refer to defined functions or the special `"prompt"` export.
@@ -824,21 +984,335 @@ fn attach_import_span(
     }
 }
 
-/// Parse raw YAML frontmatter into a variable map.
-/// Non-string keys are silently skipped (YAML allows integer keys; we only support string names).
-fn parse_frontmatter(raw: &str) -> Result<HashMap<String, Value>, MdsError> {
+// ── Frontmatter imports ───────────────────────────────────────────────────────
+
+/// A single import declaration from YAML frontmatter.
+///
+/// Three forms mirror the body `@import` directive:
+/// - **Alias**: `{ path: "./lib.mds", as: lib }` — imported under a namespace alias.
+/// - **Merge**: `{ path: "./lib.mds" }` — all exports merged into the current scope.
+/// - **Selective**: `{ path: "./lib.mds", names: [greet, farewell] }` — named exports only.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FrontmatterImport {
+    Alias { path: String, alias: String },
+    Merge { path: String },
+    Selective { path: String, names: Vec<String> },
+}
+
+/// Parse the `imports` key from an already-parsed YAML value.
+///
+/// `imports_val` must be a YAML Sequence; each element must be a Mapping with
+/// a required `path` string key and at most one of `as` (alias) or `names` (selective).
+pub(crate) fn parse_frontmatter_imports_from_yaml(
+    imports_val: &serde_yaml_ng::Value,
+) -> Result<Vec<FrontmatterImport>, MdsError> {
+    let serde_yaml_ng::Value::Sequence(seq) = imports_val else {
+        return Err(MdsError::import_error(
+            "imports must be a YAML sequence (in frontmatter)",
+        ));
+    };
+
+    if seq.len() > MAX_FRONTMATTER_IMPORTS {
+        return Err(MdsError::resource_limit(format!(
+            "imports exceeds maximum of {MAX_FRONTMATTER_IMPORTS} entries (in frontmatter)"
+        )));
+    }
+
+    let mut result = Vec::with_capacity(seq.len());
+
+    for (index, entry) in seq.iter().enumerate() {
+        let err =
+            |msg: &str| MdsError::import_error(format!("imports[{index}]: {msg} (in frontmatter)"));
+
+        let serde_yaml_ng::Value::Mapping(map) = entry else {
+            return Err(err("each entry must be a mapping"));
+        };
+
+        // Extract path (required)
+        let path_val = map
+            .get("path")
+            .ok_or_else(|| err("missing required key 'path'"))?;
+        let serde_yaml_ng::Value::String(path) = path_val else {
+            return Err(err("'path' must be a string"));
+        };
+        let path = path.clone();
+
+        // Validate path via the same rules as body @import
+        validate_import_path(&path).map_err(|_| {
+            err(&format!(
+                "invalid path \"{path}\": must start with './' or '../'"
+            ))
+        })?;
+
+        // Extract optional `as` and `names`
+        let as_val = map.get("as");
+        let names_val = map.get("names");
+
+        // Check for unknown keys
+        for (k, _) in map {
+            let serde_yaml_ng::Value::String(key_str) = k else {
+                continue;
+            };
+            match key_str.as_str() {
+                "path" | "as" | "names" => {}
+                other => {
+                    return Err(err(&format!("unknown key '{other}'")));
+                }
+            }
+        }
+
+        match (as_val, names_val) {
+            (Some(_), Some(_)) => {
+                return Err(err("'as' and 'names' are mutually exclusive"));
+            }
+            (Some(as_v), None) => {
+                let serde_yaml_ng::Value::String(alias) = as_v else {
+                    return Err(err("'as' must be a string"));
+                };
+                if !is_valid_identifier(alias) {
+                    return Err(err(&format!(
+                        "invalid identifier '{alias}' for 'as': must start with a letter or '_' \
+                         and contain only alphanumeric characters or '_'"
+                    )));
+                }
+                result.push(FrontmatterImport::Alias {
+                    path,
+                    alias: alias.clone(),
+                });
+            }
+            (None, Some(names_v)) => {
+                let serde_yaml_ng::Value::Sequence(names_seq) = names_v else {
+                    return Err(err("'names' must be a sequence"));
+                };
+                if names_seq.is_empty() {
+                    return Err(err("names cannot be empty"));
+                }
+                let mut names = Vec::with_capacity(names_seq.len());
+                for name_val in names_seq {
+                    let serde_yaml_ng::Value::String(name) = name_val else {
+                        return Err(err("each name in 'names' must be a string"));
+                    };
+                    // "prompt" is a special export name — allowed without identifier validation
+                    if name != "prompt" && !is_valid_identifier(name) {
+                        return Err(err(&format!(
+                            "invalid identifier '{name}' in 'names': must start with a letter or \
+                             '_' and contain only alphanumeric characters or '_'"
+                        )));
+                    }
+                    names.push(name.clone());
+                }
+                result.push(FrontmatterImport::Selective { path, names });
+            }
+            (None, None) => {
+                result.push(FrontmatterImport::Merge { path });
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Parse frontmatter imports from a raw YAML string.
+///
+/// Returns an empty `Vec` if the `imports` key is absent. Propagates any
+/// parse or validation error from [`parse_frontmatter_imports_from_yaml`].
+pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImport>, MdsError> {
     let yaml: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(raw).map_err(|e| MdsError::yaml_error(e.to_string()))?;
 
-    let mut vars = HashMap::new();
-    if let serde_yaml_ng::Value::Mapping(map) = yaml {
-        for (key, val) in map {
-            let serde_yaml_ng::Value::String(key_str) = key else {
-                continue;
-            };
-            let value = Value::from_yaml(val)?;
-            vars.insert(key_str, value);
-        }
+    let serde_yaml_ng::Value::Mapping(ref map) = yaml else {
+        return Ok(vec![]);
+    };
+
+    let Some(imports_val) = map.get("imports") else {
+        return Ok(vec![]);
+    };
+
+    parse_frontmatter_imports_from_yaml(imports_val)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper to build a YAML Value from inline YAML text
+    fn yaml(s: &str) -> serde_yaml_ng::Value {
+        serde_yaml_ng::from_str(s).expect("valid yaml in test")
     }
-    Ok(vars)
+
+    // ── parse_frontmatter_imports_from_yaml ───────────────────────────────────
+
+    #[test]
+    fn parse_fm_import_alias() {
+        let v = yaml("- path: ./lib.mds\n  as: lib\n");
+        let result = parse_frontmatter_imports_from_yaml(&v).expect("should parse");
+        assert_eq!(
+            result,
+            vec![FrontmatterImport::Alias {
+                path: "./lib.mds".into(),
+                alias: "lib".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_fm_import_merge() {
+        let v = yaml("- path: ./lib.mds\n");
+        let result = parse_frontmatter_imports_from_yaml(&v).expect("should parse");
+        assert_eq!(
+            result,
+            vec![FrontmatterImport::Merge {
+                path: "./lib.mds".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_fm_import_selective() {
+        let v = yaml("- path: ./lib.mds\n  names: [greet, farewell]\n");
+        let result = parse_frontmatter_imports_from_yaml(&v).expect("should parse");
+        assert_eq!(
+            result,
+            vec![FrontmatterImport::Selective {
+                path: "./lib.mds".into(),
+                names: vec!["greet".into(), "farewell".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_fm_import_multiple() {
+        let v = yaml(
+            "- path: ./a.mds\n  as: a\n\
+             - path: ./b.mds\n\
+             - path: ./c.mds\n  names: [f]\n",
+        );
+        let result = parse_frontmatter_imports_from_yaml(&v).expect("should parse");
+        assert_eq!(result.len(), 3);
+        assert!(matches!(result[0], FrontmatterImport::Alias { .. }));
+        assert!(matches!(result[1], FrontmatterImport::Merge { .. }));
+        assert!(matches!(result[2], FrontmatterImport::Selective { .. }));
+    }
+
+    #[test]
+    fn parse_fm_import_empty_array() {
+        let v = yaml("[]");
+        let result = parse_frontmatter_imports_from_yaml(&v).expect("empty array is ok");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_fm_no_imports_key() {
+        let result =
+            parse_frontmatter_imports("name: Alice\ngreeting: hello\n").expect("no imports key");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_fm_err_missing_path() {
+        let v = yaml("- as: lib\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("missing path should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing required key 'path'") && msg.contains("in frontmatter"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_fm_err_path_not_string() {
+        let v = yaml("- path: 42\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("non-string path should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("'path' must be a string"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_fm_err_invalid_as_id() {
+        let v = yaml("- path: ./lib.mds\n  as: 123bad\n");
+        let err =
+            parse_frontmatter_imports_from_yaml(&v).expect_err("invalid identifier should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid identifier") && msg.contains("in frontmatter"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_fm_err_as_and_names() {
+        let v = yaml("- path: ./lib.mds\n  as: lib\n  names: [f]\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("mutually exclusive");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutually exclusive") && msg.contains("in frontmatter"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_fm_err_unknown_key() {
+        let v = yaml("- path: ./lib.mds\n  foo: bar\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("unknown key should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown key 'foo'") && msg.contains("in frontmatter"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_fm_err_not_array() {
+        let v = yaml("path: ./lib.mds\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("not array should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be a YAML sequence") && msg.contains("in frontmatter"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_fm_err_empty_names() {
+        let v = yaml("- path: ./lib.mds\n  names: []\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("empty names should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("names cannot be empty") && msg.contains("in frontmatter"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_fm_err_absolute_path() {
+        let v = yaml("- path: /absolute/path.mds\n");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("absolute path should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("in frontmatter"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_fm_err_exceeds_limit() {
+        // Build a sequence with MAX_FRONTMATTER_IMPORTS + 1 entries
+        let entry = "- path: ./lib.mds\n";
+        let many = entry.repeat(MAX_FRONTMATTER_IMPORTS + 1);
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&many).expect("valid yaml");
+        let err = parse_frontmatter_imports_from_yaml(&v).expect_err("should exceed limit");
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds maximum"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_fm_prompt_name_in_selective() {
+        // "prompt" is a special name — allowed without identifier validation
+        let v = yaml("- path: ./lib.mds\n  names: [prompt]\n");
+        let result = parse_frontmatter_imports_from_yaml(&v).expect("prompt is allowed");
+        assert_eq!(
+            result,
+            vec![FrontmatterImport::Selective {
+                path: "./lib.mds".into(),
+                names: vec!["prompt".into()],
+            }]
+        );
+    }
 }

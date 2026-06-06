@@ -51,3 +51,10 @@ pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024;
 /// `join()` calls. 100 000 elements is generous for any real template while
 /// bounding worst-case memory use.
 pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
+
+/// Maximum number of `imports` entries in frontmatter.
+///
+/// Defense-in-depth limit preventing adversarial inputs from triggering
+/// an unbounded number of file resolutions in a single frontmatter block.
+/// 256 entries is generous for any real template.
+pub(crate) const MAX_FRONTMATTER_IMPORTS: usize = 256;
