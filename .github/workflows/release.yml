@@ -82,6 +82,7 @@ jobs:
   build-napi:
     name: Build napi (${{ matrix.settings.target }})
     needs: [version-gate]
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -151,6 +152,7 @@ jobs:
   stage-and-verify-napi:
     name: Stage + verify platform packages
     needs: [build-napi]
+    if: ${{ !cancelled() && needs.build-napi.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -194,7 +196,7 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: [version-gate]
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -230,7 +232,7 @@ jobs:
   publish-npm:
     name: Publish to npm
     needs: [stage-and-verify-napi, publish-crates]
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
+    if: ${{ !cancelled() && needs.stage-and-verify-napi.result == 'success' && needs.publish-crates.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write # OIDC for npm provenance
@@ -290,7 +292,7 @@ jobs:
   github-release:
     name: GitHub Release
     needs: [publish-crates, publish-npm]
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.version != ''
+    if: ${{ !cancelled() && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
