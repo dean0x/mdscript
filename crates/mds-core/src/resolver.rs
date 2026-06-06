@@ -756,18 +756,10 @@ fn build_scope_from_frontmatter(
     let mut scope = Scope::new();
     let mut fm_imports: Vec<FrontmatterImport> = Vec::new();
 
-    // Determine is_mds early so it's available for both frontmatter parsing
-    // AND the runtime_vars guard below. A .mds file is always MDS; a .md file
-    // is MDS only when frontmatter contains `type: mds`.
-    let is_mds = if !is_md {
-        // .mds files are always MDS
-        true
-    } else if let Some(fm) = frontmatter {
-        // .md file — check frontmatter for `type: mds`
-        has_type_mds_frontmatter_raw(&fm.raw)
-    } else {
-        false
-    };
+    // A .mds file is always MDS; a .md file is MDS only when its frontmatter
+    // contains `type: mds`. Determine this early — it gates both frontmatter
+    // parsing and the runtime_vars guard below.
+    let is_mds = !is_md || frontmatter.is_some_and(|fm| has_type_mds_frontmatter_raw(&fm.raw));
 
     if let Some(fm) = frontmatter {
         // Parse YAML once to avoid double-parsing
@@ -876,28 +868,27 @@ fn validate_file_type(key: &str, source: &str) -> Result<(), MdsError> {
     Err(MdsError::not_mds_file(key.to_string()))
 }
 
+/// Return `true` if a frontmatter line declares `type: mds` at the top level.
+///
+/// Only non-indented lines are matched, consistent with `strip_reserved_keys`
+/// which guards with `!starts_with(char::is_whitespace)`. Recognises bare,
+/// single-quoted, and double-quoted YAML values.
+fn is_type_mds_line(line: &str) -> bool {
+    !line.starts_with(char::is_whitespace)
+        && line
+            .strip_prefix("type:")
+            .is_some_and(|v| matches!(v.trim(), "mds" | "\"mds\"" | "'mds'"))
+}
+
 /// Return `true` if `source` has a YAML frontmatter block containing `type: mds`.
 ///
 /// Checks without a full YAML parse by scanning frontmatter lines for the key.
-/// Recognises all three YAML quoting styles: bare, single-quoted, double-quoted.
 fn has_type_mds_frontmatter(source: &str) -> bool {
     source
         .strip_prefix("---\n")
         .or_else(|| source.strip_prefix("---\r\n"))
         .and_then(|after_fence| after_fence.find("\n---").map(|end| &after_fence[..end]))
-        .is_some_and(|fm| {
-            fm.lines().any(|line| {
-                // Only match top-level (non-indented) keys, consistent with
-                // strip_reserved_keys which checks !starts_with(char::is_whitespace).
-                !line.starts_with(char::is_whitespace)
-                    && line.strip_prefix("type:").is_some_and(|v| {
-                        let v = v.trim();
-                        // Match bare, double-quoted, and single-quoted values,
-                        // mirroring the strip_type_mds helper elsewhere.
-                        v == "mds" || v == "\"mds\"" || v == "'mds'"
-                    })
-            })
-        })
+        .is_some_and(|fm| fm.lines().any(is_type_mds_line))
 }
 
 /// Return `true` if raw frontmatter content (without `---` fences) contains `type: mds`.
@@ -905,15 +896,7 @@ fn has_type_mds_frontmatter(source: &str) -> bool {
 /// This is the counterpart of [`has_type_mds_frontmatter`] that works on `fm.raw`
 /// (the already-extracted frontmatter body) rather than the full source.
 fn has_type_mds_frontmatter_raw(raw: &str) -> bool {
-    raw.lines().any(|line| {
-        // Only match top-level (non-indented) keys, consistent with
-        // strip_reserved_keys which checks !starts_with(char::is_whitespace).
-        !line.starts_with(char::is_whitespace)
-            && line.strip_prefix("type:").is_some_and(|v| {
-                let v = v.trim();
-                v == "mds" || v == "\"mds\"" || v == "'mds'"
-            })
-    })
+    raw.lines().any(is_type_mds_line)
 }
 
 /// Format a cycle chain like "a.mds → b.mds → a.mds" from the resolving set.
@@ -1047,11 +1030,23 @@ fn parse_single_import_entry(
     entry: &serde_yaml_ng::Value,
     index: usize,
 ) -> Result<FrontmatterImport, MdsError> {
-    let err = |msg: &str| MdsError::import_error(format!("imports[{index}]: {msg} (in frontmatter)"));
+    let err =
+        |msg: &str| MdsError::import_error(format!("imports[{index}]: {msg} (in frontmatter)"));
 
     let serde_yaml_ng::Value::Mapping(map) = entry else {
         return Err(err("each entry must be a mapping"));
     };
+
+    // Validate all keys first: reject non-string keys and unknown field names.
+    for (k, _) in map {
+        let serde_yaml_ng::Value::String(key_str) = k else {
+            return Err(err("keys must be strings"));
+        };
+        match key_str.as_str() {
+            "path" | "as" | "names" => {}
+            other => return Err(err(&format!("unknown key '{other}'"))),
+        }
+    }
 
     // Extract path (required)
     let path_val = map
@@ -1069,24 +1064,7 @@ fn parse_single_import_entry(
         ))
     })?;
 
-    // Extract optional `as` and `names`
-    let as_val = map.get("as");
-    let names_val = map.get("names");
-
-    // Check for unknown keys and reject non-string keys explicitly.
-    for (k, _) in map {
-        let serde_yaml_ng::Value::String(key_str) = k else {
-            return Err(err("keys must be strings"));
-        };
-        match key_str.as_str() {
-            "path" | "as" | "names" => {}
-            other => {
-                return Err(err(&format!("unknown key '{other}'")));
-            }
-        }
-    }
-
-    match (as_val, names_val) {
+    match (map.get("as"), map.get("names")) {
         (Some(_), Some(_)) => Err(err("'as' and 'names' are mutually exclusive")),
         (Some(as_v), None) => parse_alias_entry(as_v, path, &err),
         (None, Some(names_v)) => parse_selective_entry(names_v, path, &err),
