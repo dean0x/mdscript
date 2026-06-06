@@ -971,3 +971,37 @@ fn fm_import_same_path_diff_alias() {
     assert!(output.contains("Hello X!"), "got: {output}");
     assert!(output.contains("Hello Y!"), "got: {output}");
 }
+
+#[test]
+fn fm_import_collision_merge_within_fm() {
+    // Two merge imports that export the same function name → collision error.
+    // Exercises the scope.get_function() check in the merge-import path
+    // (resolver.rs build_scope_from_frontmatter, FrontmatterImport::Merge branch).
+    let mut modules = HashMap::new();
+    modules.insert(
+        "lib_a.mds".to_string(),
+        "@define common():\nfrom-a\n@end\n".to_string(),
+    );
+    modules.insert(
+        "lib_b.mds".to_string(),
+        "@define common():\nfrom-b\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        concat!(
+            "---\n",
+            "imports:\n",
+            "  - path: ./lib_a.mds\n",
+            "  - path: ./lib_b.mds\n",
+            "---\n",
+            "{common()}\n",
+        )
+        .to_string(),
+    );
+    let err = compile_vfs(modules, "main.mds").expect_err("merge collision should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("common") && (msg.contains("collision") || msg.contains("already defined")),
+        "expected collision error for 'common', got: {msg}"
+    );
+}
