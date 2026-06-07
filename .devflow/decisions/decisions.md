@@ -163,3 +163,21 @@ A fix may be incomplete, mis-scoped, or address a symptom rather than the root c
 - **Decision**: frontmatter imports processed first, duplicate namespace between frontmatter and body is a hard compile error
 - **Consequences**: first-wins ordering makes dependency resolution deterministic
 - **Source**: self-learning:obs_o6p9r3
+
+## ADR-015: Post-release verification checklist: confirm all packages live on registries and npm shows SLSA provenance attestation before declaring release done
+
+- **Date**: 2026-06-06
+- **Status**: Accepted
+- **Context**: after triggering a coordinated release across crates.io and npm for all @mdscript/* packages
+- **Decision**: post-release verification is a required step — confirm each package appears on its registry at the correct version AND that npm shows SLSA v1 provenance attestation
+- **Consequences**: publish jobs can succeed in CI without the package being fully indexed or provenance attached — registry verification catches partial publish failures and attestation drift before users encounter them
+- **Source**: self-learning:obs_s0t4u8
+
+## ADR-016: Re-validate dynamically-resolved values at runtime even when the static literal form is already checked at parse time
+
+- **Date**: 2026-06-07
+- **Status**: Accepted
+- **Context**: @message role validation rejected empty/whitespace roles at parse time, but {expr} dynamic roles resolve to a value only at runtime and thus bypassed the parse-time check
+- **Decision**: enforce the same non-empty-role invariant at runtime for dynamically-resolved roles, mirroring the parse-time rule, rather than trusting that parse-time validation covers all role values
+- **Consequences**: any invariant that can be violated by a value computed after parsing must be re-checked at the point the value becomes concrete — defense in depth keeps the runtime and parse-time contracts identical and prevents silently emitting a structurally invalid message. Extends ADR-010.
+- **Source**: self-learning:obs_u2v6w0

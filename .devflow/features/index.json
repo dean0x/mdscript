@@ -3,12 +3,13 @@
   "features": {
     "mds-napi": {
       "name": "MDS Native Node.js Bindings (napi-rs)",
-      "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error.",
+      "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode.",
       "directories": [
         "crates/mds-napi/"
       ],
       "referencedFiles": [
         "crates/mds-napi/src/lib.rs",
+        "crates/mds-napi/index.js",
         "crates/mds-napi/Cargo.toml",
         "crates/mds-napi/build.rs",
         "crates/mds-napi/package.json",
@@ -20,12 +21,12 @@
         "crates/mds-core/src/options.rs",
         "Cargo.toml"
       ],
-      "lastUpdated": "2026-06-02T13:18:14.172Z",
+      "lastUpdated": "2026-06-07T16:21:58.029Z",
       "createdBy": "implement"
     },
     "mds-compiler": {
       "name": "MDS Compiler",
-      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, or debugging output rendering. Keywords: lexer, parser, evaluator, resolver, validator, scope, builtins, Condition Expr And Or, Arg, Param, CondValue, default arguments, built-in functions, frontmatter imports, FrontmatterImport, parse_expr_inner, strip_trailing_directive_colon, values_equal_runtime, required_param_count (in ast.rs), condvalue_to_value, MAX_FRONTMATTER_IMPORTS, limits.rs, ArityMismatch, BuiltinError.",
+      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, builtins, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input.",
       "directories": [
         "crates/mds-core/src/",
         "crates/mds-cli/src/",
@@ -47,14 +48,16 @@
         "crates/mds-core/src/limits.rs",
         "crates/mds-core/src/builtins.rs",
         "crates/mds-cli/src/main.rs",
-        "crates/mds-core/tests/api_surface.rs"
+        "crates/mds-core/tests/api_surface.rs",
+        "crates/mds-core/tests/messages.rs",
+        "crates/mds-cli/tests/format_messages.rs"
       ],
-      "lastUpdated": "2026-06-06T18:56:39.275Z",
+      "lastUpdated": "2026-06-07T16:22:08.443Z",
       "createdBy": "implement"
     },
     "mds-js": {
-      "name": "MDS JavaScript Package (@mds/mds)",
-      "description": "Use when working on the @mds/mds JavaScript package. Keywords: MdsBaseBackend, MdsNodeBackend, MdsBackend, initWasmNode, initWasmBrowser, createWasmBackend, createNativeBackend, browser entry, node entry, module-scanner, buildModulesMap, findProjectRoot, normalizeVirtualKey, wrapWithFileOps, O_NOFOLLOW, TOCTOU, WasmModule, validateWasmShape, init, compileFile, checkFile, circuit breaker, promise dedup, MDS_BACKEND, forceBackend, ensureBackend, LazyInit, loadNativeBackend, loadWasmNodeBackend, varsOpt, fileOpts, compileOpts, cross-directory imports, project root discovery, .git marker, .mdsroot marker, entryFilename, relative path key, DEFAULT_MAX_MODULES, DEFAULT_MAX_AGGREGATE_SIZE, MAX_IMPORT_DEPTH, MAX_TRAVERSAL_DEPTH.",
+      "name": "MDS JavaScript Package (@mdscript/mds)",
+      "description": "Use when working on the @mdscript/mds JavaScript package. Keywords: MdsBaseBackend, MdsNodeBackend, MdsBackend, initWasmNode, initWasmBrowser, createWasmBackend, createNativeBackend, browser entry, node entry, module-scanner, buildModulesMap, findProjectRoot, normalizeVirtualKey, wrapWithFileOps, O_NOFOLLOW, TOCTOU, WasmModule, validateWasmShape, init, compileFile, checkFile, compileMessages, compile_messages, Message, CompileMessagesResult, @message, @end, structured chat messages, circuit breaker, promise dedup, MDS_BACKEND, forceBackend, ensureBackend, LazyInit, loadNativeBackend, loadWasmNodeBackend, varsOpt, fileOpts, compileOpts, cross-directory imports, project root discovery, .git marker, .mdsroot marker, entryFilename, relative path key, DEFAULT_MAX_MODULES, DEFAULT_MAX_AGGREGATE_SIZE, MAX_IMPORT_DEPTH, MAX_TRAVERSAL_DEPTH.",
       "directories": [
         "packages/mds/"
       ],
@@ -68,9 +71,9 @@
         "packages/mds/src/util/module-scanner.ts",
         "packages/mds/src/util/options.ts",
         "packages/mds/package.json",
-        "packages/mds/__test__/scanner.spec.mjs"
+        "packages/mds/__test__/compile-messages.spec.mjs"
       ],
-      "lastUpdated": "2026-06-01T20:57:49.791Z",
+      "lastUpdated": "2026-06-07T11:04:38.385Z",
       "createdBy": "implement"
     }
   }

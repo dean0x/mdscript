@@ -4,3 +4,39 @@
 
 ---
 
+
+## PF-001: GitHub Actions transitive skip propagation silently skips all downstream jobs unless explicit if conditions are set
+
+- **Area**: CI pipeline reliability
+- **Issue**: when a job is skipped, GitHub Actions propagates the skip transitively through all needs chains — every downstream job is also skipped unless it has an explicit if condition
+- **Impact**: entire release pipeline silently no-ops with no error or warning
+- **Resolution**: add explicit if conditions on every job downstream of a conditional step
+- **Status**: Active
+- **Source**: self-learning:obs_p7q1r5
+
+## PF-002: bump-version script must update path+version workspace crate deps; semver ^0.1.0 does not satisfy 0.2.0
+
+- **Area**: release tooling (scripts/bump-version.mjs, Cargo.toml workspace crates)
+- **Issue**: bump-version.mjs only updated [workspace.package] version but not explicit path+version dependencies in mds-cli, mds-napi, and mds-wasm Cargo.toml files
+- **Impact**: cargo metadata fails in CI because ^0.1.0 does not satisfy 0.2.0 for pre-1.0 crates, blocking the release pipeline
+- **Resolution**: bump-version.mjs must find and update all path+version dep references when bumping the workspace version
+- **Status**: Active
+- **Source**: self-learning:obs_q8r2s6
+
+## PF-003: npm provenance verification rejects publishes when package.json repository.url does not match the GitHub Actions workflow source repository
+
+- **Area**: npm publish with SLSA provenance (release.yml publish-npm job)
+- **Issue**: after renaming the GitHub repo, package.json repository.url fields still referenced the old repo name
+- **Impact**: npm provenance verification performs a strict URL match — all publishes fail with attestation mismatch
+- **Resolution**: update repository.url in every package.json to the current canonical repository name whenever the repo is renamed
+- **Status**: Active
+- **Source**: self-learning:obs_r9s3t7
+
+## PF-004: An alternate output/code path can silently bypass a resource limit that is enforced only on the primary path
+
+- **Area**: CLI input handling (mds-cli read path, MAX_FILE_SIZE / 10 MiB cap)
+- **Issue**: the markdown output mode enforced MAX_FILE_SIZE through the resolver, but a newly added messages output mode read the input with raw std::fs::read and never went through that resolver, silently bypassing the 10 MiB cap
+- **Impact**: the resource-exhaustion protection was real for one output mode and absent for the other — an oversized input would be rejected via markdown mode but accepted via messages mode
+- **Resolution**: extract a single shared input-reading function (read_build_input) that enforces MAX_FILE_SIZE once for both modes, and add an oversized-file rejection test. General lesson: when adding a parallel code path, audit which security/resource boundaries the primary path enforced and route the new path through the same enforcement point rather than re-reading at a lower level.
+- **Status**: Active
+- **Source**: self-learning:obs_v3w7x1
