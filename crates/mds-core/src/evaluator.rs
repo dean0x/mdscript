@@ -838,8 +838,7 @@ fn collect_messages_from_for(
         )));
     }
 
-    let items = array;
-    for item in items {
+    for item in array {
         ctx.total_iterations += 1;
         if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
@@ -850,8 +849,7 @@ fn collect_messages_from_for(
         scope.push();
         scope.set_var(&block.var, item);
         let result = collect_messages(&block.body, scope, ctx, out);
-        let _ = scope.pop();
-        result?;
+        prefer_first_error(result, scope.pop())?;
     }
     Ok(())
 }

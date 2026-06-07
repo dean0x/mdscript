@@ -724,8 +724,8 @@ pub fn compile_virtual_with_deps(
 /// blocks is ignored with a warning. Empty messages (after trimming) are skipped.
 ///
 /// Returns an error when the source contains no `@message` blocks at all.
-/// Warnings are printed to stderr; use [`compile_messages_str_with_deps`] to
-/// capture them instead.
+/// Warnings are returned in [`CompileMessagesOutput::warnings`] and are not
+/// printed to stderr.
 ///
 /// # Examples
 ///
@@ -748,8 +748,8 @@ pub fn compile_messages_str(source: &str) -> Result<CompileMessagesOutput, MdsEr
 /// Like [`compile_messages_str`] but accepts an optional base directory for
 /// resolving `@import` paths and optional runtime variable overrides.
 ///
-/// Warnings are printed to stderr; use [`compile_messages_str_with_deps`] to
-/// capture them instead.
+/// Warnings are returned in [`CompileMessagesOutput::warnings`] and are not
+/// printed to stderr. Use this when you need to control warning presentation.
 #[must_use = "the compiled messages output should be used"]
 pub fn compile_messages_str_with(
     source: &str,
