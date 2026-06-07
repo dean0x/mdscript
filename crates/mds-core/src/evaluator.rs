@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use crate::ast::{
     required_param_count, Arg, CondValue, Condition, Expr, ForBlock, IfBlock, IncludeDirective,
-    Node,
+    MessageBlock, Node,
 };
 use crate::error::MdsError;
-use crate::limits::{MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_OUTPUT_SIZE};
+use crate::limits::{MAX_DOT_SEGMENTS, MAX_ELSEIF_BRANCHES, MAX_MESSAGE_COUNT, MAX_OUTPUT_SIZE};
 use crate::scope::{FunctionDef, Scope};
 use crate::value::Value;
 
@@ -81,6 +81,12 @@ fn evaluate_nodes(
             }
             Node::Include(inc) => {
                 output.push_str(&evaluate_include(inc, scope, ctx)?);
+            }
+            Node::Message(block) => {
+                // Text mode: render the body inline, ignoring the role marker.
+                // This maintains full backward compatibility — @message blocks are
+                // transparent when compiling to plain text.
+                output.push_str(&evaluate_nodes(&block.body, scope, ctx)?);
             }
         }
         if output.len() > MAX_OUTPUT_SIZE {
@@ -660,6 +666,194 @@ fn evaluate_include(
         ));
     }
     Ok(String::new())
+}
+
+/// A single structured message produced by `evaluate_messages`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Evaluate a module body in messages mode, collecting `@message` blocks as
+/// structured `EvalMessage` values.
+///
+/// Orphan text nodes (text outside any `@message` block) are ignored with a
+/// warning. Empty messages (after trimming) are silently skipped.
+/// Returns an error when `MAX_MESSAGE_COUNT` would be exceeded.
+pub fn evaluate_messages(
+    nodes: &[Node],
+    scope: &mut Scope,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<EvalMessage>, MdsError> {
+    let mut ctx = EvalContext {
+        call_stack: Vec::new(),
+        total_iterations: 0,
+        warnings,
+    };
+    let mut messages = Vec::new();
+    collect_messages(nodes, scope, &mut ctx, &mut messages)?;
+    Ok(messages)
+}
+
+/// Recursive collector for messages mode. Descends into control-flow nodes
+/// (`@if`, `@for`) while collecting `@message` blocks into `out`.
+fn collect_messages(
+    nodes: &[Node],
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    out: &mut Vec<EvalMessage>,
+) -> Result<(), MdsError> {
+    for node in nodes {
+        match node {
+            Node::Text(t) => {
+                // Orphan text outside any @message block: warn (once per non-whitespace occurrence).
+                if !t.text.trim().is_empty() && ctx.warnings.len() < MAX_WARNINGS {
+                    ctx.warnings.push(
+                        "warning: text content outside @message block is ignored in messages mode"
+                            .to_string(),
+                    );
+                }
+            }
+            Node::EscapedBrace => {
+                // Orphan escaped brace — treated as orphan text; silently ignored.
+            }
+            Node::Interpolation(_) => {
+                // Orphan interpolation outside @message block — warn.
+                if ctx.warnings.len() < MAX_WARNINGS {
+                    ctx.warnings.push(
+                        "warning: interpolation outside @message block is ignored in messages mode"
+                            .to_string(),
+                    );
+                }
+            }
+            Node::Message(block) => {
+                collect_single_message(block, scope, ctx, out)?;
+            }
+            Node::If(block) => {
+                collect_messages_from_if(block, scope, ctx, out)?;
+            }
+            Node::For(block) => {
+                collect_messages_from_for(block, scope, ctx, out)?;
+            }
+            Node::Define(_) | Node::Import(_) | Node::Export(_) => {
+                // Already handled by the resolver before evaluation.
+            }
+            Node::Include(inc) => {
+                // @include in messages mode is not meaningful — warn.
+                if ctx.warnings.len() < MAX_WARNINGS {
+                    ctx.warnings.push(format!(
+                        "warning: @include '{}' inside messages mode is ignored",
+                        inc.alias
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_single_message(
+    block: &MessageBlock,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    out: &mut Vec<EvalMessage>,
+) -> Result<(), MdsError> {
+    // Evaluate the role expression to a string.
+    let role_value = evaluate_expr(&block.role, scope, ctx)?;
+    let role = match role_value {
+        Value::String(s) => s,
+        other => {
+            return Err(MdsError::type_error(format!(
+                "@message role must evaluate to a string, but got {}",
+                other.type_name()
+            )));
+        }
+    };
+
+    // Evaluate the body as plain text (node evaluation in text mode).
+    let content = evaluate_nodes(&block.body, scope, ctx)?;
+    let content = content.trim().to_string();
+
+    // Skip empty messages.
+    if content.is_empty() {
+        return Ok(());
+    }
+
+    if out.len() >= MAX_MESSAGE_COUNT {
+        return Err(MdsError::resource_limit(format!(
+            "message count exceeded maximum of {}",
+            MAX_MESSAGE_COUNT
+        )));
+    }
+
+    out.push(EvalMessage { role, content });
+    Ok(())
+}
+
+fn collect_messages_from_if(
+    block: &crate::ast::IfBlock,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    out: &mut Vec<EvalMessage>,
+) -> Result<(), MdsError> {
+    if evaluate_condition(&block.condition, scope, ctx)? {
+        return collect_messages(&block.then_body, scope, ctx, out);
+    }
+    for (cond, body) in &block.elseif_branches {
+        if evaluate_condition(cond, scope, ctx)? {
+            return collect_messages(body, scope, ctx, out);
+        }
+    }
+    if let Some(else_body) = &block.else_body {
+        return collect_messages(else_body, scope, ctx, out);
+    }
+    Ok(())
+}
+
+fn collect_messages_from_for(
+    block: &ForBlock,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+    out: &mut Vec<EvalMessage>,
+) -> Result<(), MdsError> {
+    let iterable = evaluate_expr(&block.iterable, scope, ctx)?;
+
+    let array = match iterable {
+        Value::Array(a) => a,
+        Value::String(s) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+        other => {
+            return Err(MdsError::type_error(format!(
+                "@for iterable must be an array or string, but got {}",
+                other.type_name()
+            )));
+        }
+    };
+
+    if array.len() > MAX_LOOP_ITERATIONS {
+        return Err(MdsError::resource_limit(format!(
+            "array has {} elements, exceeding maximum loop iteration limit of {}",
+            array.len(),
+            MAX_LOOP_ITERATIONS
+        )));
+    }
+
+    let items = array;
+    for item in items {
+        ctx.total_iterations += 1;
+        if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
+            return Err(MdsError::resource_limit(format!(
+                "total loop iterations exceeded maximum of {} across all loops in this compilation",
+                MAX_TOTAL_ITERATIONS
+            )));
+        }
+        scope.push();
+        scope.set_var(&block.var, item);
+        let result = collect_messages(&block.body, scope, ctx, out);
+        let _ = scope.pop();
+        result?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

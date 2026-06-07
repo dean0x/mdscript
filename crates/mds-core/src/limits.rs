@@ -58,3 +58,10 @@ pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
 /// an unbounded number of file resolutions in a single frontmatter block.
 /// 256 entries is generous for any real template.
 pub(crate) const MAX_FRONTMATTER_IMPORTS: usize = 256;
+
+/// Maximum number of messages that `compile_messages` may produce.
+///
+/// Prevents runaway memory use from adversarial inputs that generate thousands
+/// of messages via `@for` loops or deeply nested conditionals.
+/// 10 000 messages is generous for any real LLM conversation template.
+pub(crate) const MAX_MESSAGE_COUNT: usize = 10_000;

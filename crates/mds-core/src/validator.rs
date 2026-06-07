@@ -1,4 +1,6 @@
-use crate::ast::{required_param_count, Arg, Condition, Expr, ForBlock, IfBlock, Node};
+use crate::ast::{
+    required_param_count, Arg, Condition, Expr, ForBlock, IfBlock, MessageBlock, Node,
+};
 use crate::error::MdsError;
 use crate::scope::Scope;
 use crate::value::Value;
@@ -49,7 +51,25 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
                 MdsError::undefined_var_at(&inc.alias, file, source, inc.offset, inc.alias.len())
             })
             .map(|_| ()),
+        Node::Message(block) => validate_message_node(block, scope, file, source),
     }
+}
+
+fn validate_message_node(
+    block: &MessageBlock,
+    scope: &mut Scope,
+    file: &str,
+    source: &str,
+) -> Result<(), MdsError> {
+    // Validate the role expression if dynamic.
+    // Bare-word roles are StringLiterals and need no scope validation.
+    match &block.role {
+        Expr::StringLiteral(_) => {}
+        role_expr => {
+            validate_expr(role_expr, scope, file, source, block.offset, 0)?;
+        }
+    }
+    validate(&block.body, scope, file, source)
 }
 
 /// Validate an `@if` block: conditions and all branch bodies.

@@ -5,7 +5,7 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
-use crate::evaluator::evaluate;
+use crate::evaluator::{evaluate, evaluate_messages, EvalMessage};
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::MAX_FRONTMATTER_IMPORTS;
@@ -263,6 +263,94 @@ impl ModuleCache {
 
         let popped = self.resolving.pop();
         Self::check_lifo_pop(resolved, popped, &base_key).map(Arc::new)
+    }
+
+    /// Resolve a module by its normalized virtual key in messages mode.
+    ///
+    /// Like [`resolve_key`] but runs `evaluate_messages` instead of `evaluate`,
+    /// returning structured `EvalMessage` values from `@message` blocks.
+    pub fn resolve_key_messages(
+        &mut self,
+        key: &str,
+        runtime_vars: &HashMap<String, Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<EvalMessage>, MdsError> {
+        // Resolve all imports through the standard path first.
+        self.resolve_by_key(key, runtime_vars, warnings)?;
+        // Re-run the entry module in messages mode. Imports are already cached.
+        let source = self.fs.read(key)?;
+        let is_md = self.fs.is_markdown(key);
+        let ctx = ModuleCtx {
+            file_str: key,
+            source: &source,
+            base_key: key,
+            runtime_vars,
+        };
+        self.process_module_messages(&ctx, is_md, warnings)
+    }
+
+    /// Resolve a module from an in-memory source string in messages mode.
+    ///
+    /// Like [`resolve_source`] but runs `evaluate_messages` instead of `evaluate`.
+    pub fn resolve_source_messages(
+        &mut self,
+        source: &str,
+        base_dir: &str,
+        runtime_vars: &HashMap<String, Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<EvalMessage>, MdsError> {
+        let canonical_str = self.fs.canonicalize(base_dir)?;
+        self.fs.set_root(&canonical_str)?;
+        let base_key = format!("{canonical_str}/<source>");
+        self.check_import_depth()?;
+        self.resolving.insert(base_key.clone());
+        let ctx = ModuleCtx {
+            file_str: "<source>",
+            source,
+            base_key: &base_key,
+            runtime_vars,
+        };
+        let result = self.process_module_messages(&ctx, false, warnings);
+        let popped = self.resolving.pop();
+        Self::check_lifo_pop(result, popped, &base_key)
+    }
+
+    /// Common messages-mode processing: tokenize, parse, build scope, collect messages.
+    ///
+    /// Shares setup with `process_module` but calls `evaluate_messages` at the end.
+    fn process_module_messages(
+        &mut self,
+        ctx: &ModuleCtx<'_>,
+        is_md: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<EvalMessage>, MdsError> {
+        let tokens = tokenize(ctx.source, ctx.file_str)?;
+        let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
+
+        let (mut scope, fm_imports) =
+            build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
+
+        self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
+
+        let CollectedDefs { functions, .. } =
+            self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+
+        // Register collected functions in scope for @define calls within @message bodies.
+        for (name, func) in &functions {
+            scope.set_function(name, Arc::clone(func));
+        }
+
+        validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
+
+        // Check that at least one @message block exists before evaluating.
+        if !has_message_block(&module.body) {
+            return Err(MdsError::syntax(
+                "compile_messages requires at least one @message block, \
+                 but none were found in the template",
+            ));
+        }
+
+        evaluate_messages(&module.body, &mut scope, warnings)
     }
 
     /// Assert the LIFO pop invariant after `process_module`.
@@ -697,6 +785,29 @@ struct ModuleCtx<'a> {
     base_key: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
     runtime_vars: &'a HashMap<String, Value>,
+}
+
+/// Return `true` when the AST body contains at least one `@message` block
+/// (possibly nested inside `@if` or `@for` — a shallow scan is enough for the
+/// "no messages at all" guard; evaluation handles deeper nesting).
+fn has_message_block(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Message(_) => true,
+        Node::If(block) => {
+            has_message_block(&block.then_body)
+                || block
+                    .elseif_branches
+                    .iter()
+                    .any(|(_, body)| has_message_block(body))
+                || block
+                    .else_body
+                    .as_deref()
+                    .map(has_message_block)
+                    .unwrap_or(false)
+        }
+        Node::For(block) => has_message_block(&block.body),
+        _ => false,
+    })
 }
 
 /// Process a single `@define` directive, updating `defs` and `scope` in place.

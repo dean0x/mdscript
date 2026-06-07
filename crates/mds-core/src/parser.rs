@@ -10,8 +10,8 @@
 //! - **`parser_tests.rs`** — integration and unit tests for both modules.
 
 use crate::ast::{
-    Condition, DefineBlock, Expr, ForBlock, Frontmatter, IfBlock, IncludeDirective, Module, Node,
-    TextNode,
+    Condition, DefineBlock, Expr, ForBlock, Frontmatter, IfBlock, IncludeDirective, MessageBlock,
+    Module, Node, TextNode,
 };
 use crate::error::MdsError;
 use crate::lexer::Token;
@@ -39,6 +39,7 @@ pub(crate) fn parse_with_ctx<'src>(
         tokens,
         pos: 0,
         depth: 0,
+        inside_message: false,
         file,
         source,
     };
@@ -49,6 +50,9 @@ struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     depth: usize,
+    /// True when we are currently inside a `@message` block body.
+    /// Used to detect and reject nested `@message` blocks.
+    inside_message: bool,
     file: &'a str,
     source: &'a str,
 }
@@ -228,6 +232,9 @@ impl Parser<'_> {
             }
             return Ok(Node::Include(IncludeDirective { alias, offset }));
         }
+        if let Some(rest) = trimmed.strip_prefix("@message ") {
+            return self.parse_message_block(rest, offset);
+        }
 
         // Give a targeted hint if the user wrote @else without the required colon
         if trimmed == "@else" {
@@ -249,7 +256,7 @@ impl Parser<'_> {
         }
 
         Err(MdsError::syntax(format!(
-            "unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include"
+            "unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message"
         )))
     }
 
@@ -373,6 +380,55 @@ impl Parser<'_> {
             body,
             offset,
         }))
+    }
+
+    /// Parse a `@message role:` ... `@end` block.
+    ///
+    /// Role parsing distinguishes two forms:
+    /// - Bare word: `@message system:` → `Expr::StringLiteral("system")`.
+    /// - Brace expression: `@message {role}:` → parsed via `parse_expr_inner`.
+    ///
+    /// Nested `@message` blocks are rejected (the `inside_message` flag tracks this).
+    fn parse_message_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
+        if self.inside_message {
+            return Err(MdsError::syntax(
+                "@message blocks cannot be nested inside another @message block",
+            ));
+        }
+        self.enter_block()?;
+        self.inside_message = true;
+
+        let trimmed = rest.trim();
+        let role_str = strip_trailing_directive_colon(trimmed)
+            .ok_or_else(|| directive_colon_error("@message", trimmed))?;
+        let role_trimmed = role_str.trim();
+
+        let role = if role_trimmed.starts_with('{') && role_trimmed.ends_with('}') {
+            // Dynamic role expression: @message {role_var}:
+            let inner = role_trimmed[1..role_trimmed.len() - 1].trim();
+            parse_expr_inner(inner)?
+        } else {
+            // Bare-word role: @message system: → literal string "system"
+            if role_trimmed.is_empty() {
+                self.inside_message = false;
+                self.depth -= 1;
+                return Err(MdsError::syntax(
+                    "@message role must not be empty — use e.g. @message system:",
+                ));
+            }
+            Expr::StringLiteral(role_trimmed.to_string())
+        };
+
+        let body = self.parse_body(&["@end"], &[])?;
+        let body = strip_trailing_newline(strip_leading_newline(body));
+
+        // consume_end advances pos past @end; errors here propagate after cleanup.
+        let end_result = self.consume_end("@message");
+        self.inside_message = false;
+        self.depth -= 1;
+        end_result?;
+
+        Ok(Node::Message(MessageBlock { role, body, offset }))
     }
 
     fn parse_define_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {

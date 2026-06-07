@@ -57,6 +57,30 @@ pub use options::{
 };
 pub use resolver::ModuleCache;
 
+/// A single structured message produced by `compile_messages`.
+///
+/// Mirrors a chat API message: `{ "role": "system", "content": "..." }`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Message {
+    /// The role string (e.g. `"system"`, `"user"`, `"assistant"`).
+    pub role: String,
+    /// The rendered body text of the message.
+    pub content: String,
+}
+
+/// The result of compiling an MDS template in messages mode.
+///
+/// Returned by `compile_messages`, `compile_messages_str`, and variants.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct CompileMessagesOutput {
+    /// Structured messages produced from `@message` blocks.
+    pub messages: Vec<Message>,
+    /// Non-fatal diagnostic warnings (e.g. orphan text outside `@message` blocks).
+    pub warnings: Vec<String>,
+    /// Normalized keys of all modules imported during compilation, in depth-first order.
+    pub dependencies: Vec<String>,
+}
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -688,6 +712,178 @@ pub fn compile_virtual_with_deps(
         .collect();
     Ok(CompileOutput {
         output,
+        warnings,
+        dependencies,
+    })
+}
+
+/// Compile an MDS source string in messages mode, returning structured messages.
+///
+/// Each `@message role:` ... `@end` block becomes a [`Message`] with the
+/// evaluated `role` string and `content` body. Orphan text outside `@message`
+/// blocks is ignored with a warning. Empty messages (after trimming) are skipped.
+///
+/// Returns an error when the source contains no `@message` blocks at all.
+/// Warnings are printed to stderr; use [`compile_messages_str_with_deps`] to
+/// capture them instead.
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::compile_messages_str(
+///     "@message system:\nYou are a helpful assistant.\n@end\n"
+/// )?;
+/// assert_eq!(result.messages.len(), 1);
+/// assert_eq!(result.messages[0].role, "system");
+/// assert_eq!(result.messages[0].content, "You are a helpful assistant.");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled messages output should be used"]
+pub fn compile_messages_str(source: &str) -> Result<CompileMessagesOutput, MdsError> {
+    compile_messages_str_with_deps(source, None, None)
+}
+
+/// Compile an MDS source string in messages mode with options.
+///
+/// Like [`compile_messages_str`] but accepts an optional base directory for
+/// resolving `@import` paths and optional runtime variable overrides.
+///
+/// Warnings are printed to stderr; use [`compile_messages_str_with_deps`] to
+/// capture them instead.
+#[must_use = "the compiled messages output should be used"]
+pub fn compile_messages_str_with(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileMessagesOutput, MdsError> {
+    compile_messages_str_with_deps(source, base_dir, runtime_vars)
+}
+
+/// Compile an MDS source string in messages mode, returning structured messages
+/// with full dependency and warning information.
+///
+/// This is the lowest-level string-based messages API. Warnings are NOT printed
+/// to stderr — they are returned in [`CompileMessagesOutput::warnings`].
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::compile_messages_str_with_deps(
+///     "@message user:\nWhat is 2+2?\n@end\n",
+///     None,
+///     None,
+/// )?;
+/// assert_eq!(result.messages[0].role, "user");
+/// assert!(result.warnings.is_empty());
+/// assert!(result.dependencies.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled messages output, warnings, and dependencies should be used"]
+pub fn compile_messages_str_with_deps(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileMessagesOutput, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let dir = resolve_base_dir(base_dir)?;
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    let eval_messages = cache.resolve_source_messages(source, &dir, &vars, &mut warnings)?;
+    let dependencies = cache.dependencies();
+    let messages = eval_messages
+        .into_iter()
+        .map(|m| Message {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+    Ok(CompileMessagesOutput {
+        messages,
+        warnings,
+        dependencies,
+    })
+}
+
+/// Compile a module from an in-memory virtual filesystem in messages mode.
+///
+/// Like [`compile_virtual`] but runs `evaluate_messages` instead of `evaluate`.
+/// Returns structured [`Message`] values from `@message` blocks.
+///
+/// Warnings are printed to stderr; use [`compile_messages_virtual_with_deps`]
+/// to capture them instead.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// let mut modules = HashMap::new();
+/// modules.insert(
+///     "main.mds".to_string(),
+///     "@message system:\nYou are helpful.\n@end\n".to_string(),
+/// );
+///
+/// let result = mds::compile_messages_virtual(modules, "main.mds", None)?;
+/// assert_eq!(result.messages[0].role, "system");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled messages output should be used"]
+pub fn compile_messages_virtual(
+    modules: HashMap<String, String>,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileMessagesOutput, MdsError> {
+    let result = compile_messages_virtual_with_deps(modules, entry, runtime_vars)?;
+    emit_warnings(&result.warnings);
+    Ok(result)
+}
+
+/// Compile a module from an in-memory virtual filesystem in messages mode, with
+/// full dependency and warning information.
+///
+/// This is the lowest-level virtual-filesystem messages API. Warnings are NOT
+/// printed to stderr — they are returned in [`CompileMessagesOutput::warnings`].
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+///
+/// let mut modules = HashMap::new();
+/// modules.insert(
+///     "main.mds".to_string(),
+///     "@message assistant:\nI am ready to help.\n@end\n".to_string(),
+/// );
+///
+/// let result = mds::compile_messages_virtual_with_deps(modules, "main.mds", None)?;
+/// assert_eq!(result.messages[0].role, "assistant");
+/// assert!(result.dependencies.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled messages output, warnings, and dependencies should be used"]
+pub fn compile_messages_virtual_with_deps(
+    modules: HashMap<String, String>,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileMessagesOutput, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut warnings = vec![];
+    let eval_messages = cache.resolve_key_messages(entry, &vars, &mut warnings)?;
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != entry)
+        .collect();
+    let messages = eval_messages
+        .into_iter()
+        .map(|m| Message {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+    Ok(CompileMessagesOutput {
+        messages,
         warnings,
         dependencies,
     })

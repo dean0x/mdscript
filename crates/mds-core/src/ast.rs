@@ -99,6 +99,21 @@ pub enum Node {
     Export(ExportDirective),
     /// `@include alias`
     Include(IncludeDirective),
+    /// `@message role:` ... `@end` — structured message block for LLM chat APIs.
+    Message(MessageBlock),
+}
+
+/// A structured message block: `@message role:` ... `@end`.
+///
+/// In text mode the body is rendered inline (the `@message` markers are invisible).
+/// In messages mode the body is evaluated to a string and collected as a `Message`.
+#[derive(Debug, Clone)]
+pub struct MessageBlock {
+    /// The role expression. Bare words become `Expr::StringLiteral`; `{expr}` forms
+    /// are parsed via `parse_expr_inner`.
+    pub role: Expr,
+    pub body: Vec<Node>,
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone)]
