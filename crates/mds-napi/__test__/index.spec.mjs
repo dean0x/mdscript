@@ -16,7 +16,7 @@ const require = createRequire(import.meta.url);
 
 // Load the native addon from the built .node file.
 const addon = require('../mds-napi.node');
-const { compile, compileFile, check, checkFile } = addon;
+const { compile, compileFile, check, checkFile, compileMessages } = addon;
 
 // Fixture directory.
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -487,5 +487,107 @@ describe('compilation parity', () => {
     const compileResult = compile(source, { basePath: FIXTURES });
     const fileResult = compileFile(SIMPLE_MDS);
     assert.equal(compileResult.output, fileResult.output);
+  });
+});
+
+// ── compileMessages tests ─────────────────────────────────────────────────────
+
+describe('compileMessages', () => {
+  // M-1: basic success path — result shape is correct
+  test('M-1: basic compileMessages returns messages/warnings/dependencies arrays', () => {
+    const source = '@message system:\nYou are helpful.\n@end\n';
+    const result = compileMessages(source);
+    assert.ok(Array.isArray(result.messages), 'messages should be an array');
+    assert.ok(Array.isArray(result.warnings), 'warnings should be an array');
+    assert.ok(Array.isArray(result.dependencies), 'dependencies should be an array');
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].role, 'system');
+    assert.ok(typeof result.messages[0].content === 'string', 'content should be a string');
+  });
+
+  // M-2: vars marshaling — dynamic role via { vars: { ... } } produces correct role
+  test('M-2: vars marshaling — { vars } produces dynamic role correctly', () => {
+    const source = '@message {role}:\nHello!\n@end\n';
+    const result = compileMessages(source, { vars: { role: 'assistant' } });
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].role, 'assistant');
+    assert.equal(result.messages[0].content, 'Hello!');
+  });
+
+  // M-3: no @message blocks throws a JS Error with code property
+  test('M-3: no @message blocks throws JS Error with code property', () => {
+    assert.throws(
+      () => compileMessages('Hello World\n'),
+      (err) => {
+        assert.ok(err instanceof Error, 'should be instanceof Error');
+        assert.ok('code' in err, 'should have code property');
+        assert.ok(typeof err.code === 'string', `code should be string, got ${typeof err.code}`);
+        assert.ok(err.code.startsWith('mds::'), `code should start with mds::, got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // M-4: unknown option key throws mds::invalid_options (parse_compile_opts path)
+  test('M-4: unknown option key throws mds::invalid_options', () => {
+    assert.throws(
+      () => compileMessages('@message user:\nHi\n@end\n', { unknownKey: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // M-5: basePath-relative @import resolves in messages mode; dependencies is non-empty
+  test('M-5: basePath-relative @import resolves; dependencies is non-empty', () => {
+    const source =
+      '@import { greet } from "./import_provider.mds"\n\n@message user:\n{greet("World")}\n@end\n';
+    const result = compileMessages(source, { basePath: FIXTURES });
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.messages[0].role, 'user');
+    assert.ok(
+      result.messages[0].content.includes('Hello World!'),
+      `expected "Hello World!" in content: ${result.messages[0].content}`,
+    );
+    assert.ok(result.dependencies.length > 0, 'dependencies should be non-empty after @import');
+    for (const dep of result.dependencies) {
+      assert.ok(path.isAbsolute(dep), `dependency should be absolute path: ${dep}`);
+    }
+  });
+
+  // M-6: check_source_size rejects oversized source with mds::resource_limit (avoids PF-004)
+  test('M-6: oversized source throws mds::resource_limit', () => {
+    const MAX_SOURCE_SIZE = 10 * 1024 * 1024; // 10 MiB — mirrors R-1/R-2
+    const oversized = 'x'.repeat(MAX_SOURCE_SIZE + 1);
+    assert.throws(
+      () => compileMessages(oversized),
+      (err) => {
+        assert.equal(err.code, 'mds::resource_limit', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // M-7: null and undefined opts are both accepted
+  test('M-7: null opts are accepted', () => {
+    const result = compileMessages('@message user:\nHi\n@end\n', null);
+    assert.equal(result.messages.length, 1);
+  });
+
+  test('M-8: undefined opts are accepted', () => {
+    const result = compileMessages('@message user:\nHi\n@end\n', undefined);
+    assert.equal(result.messages.length, 1);
+  });
+
+  // M-9: multiple messages, correct ordering
+  test('M-9: multiple @message blocks produce ordered messages array', () => {
+    const source =
+      '@message system:\nYou are helpful.\n@end\n@message user:\nWhat is 2+2?\n@end\n@message assistant:\n4\n@end\n';
+    const result = compileMessages(source);
+    assert.equal(result.messages.length, 3);
+    assert.equal(result.messages[0].role, 'system');
+    assert.equal(result.messages[1].role, 'user');
+    assert.equal(result.messages[2].role, 'assistant');
   });
 });
