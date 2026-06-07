@@ -77,7 +77,7 @@ pub struct CheckResult {
 ///
 /// Mirrors a chat API message: `{ role: string, content: string }`.
 #[napi(object)]
-pub struct MessageItem {
+pub struct Message {
     /// The role string (e.g. `"system"`, `"user"`, `"assistant"`).
     pub role: String,
     /// The rendered body text of the message (trimmed).
@@ -88,7 +88,7 @@ pub struct MessageItem {
 #[napi(object)]
 pub struct CompileMessagesResult {
     /// Structured messages produced from `@message` blocks.
-    pub messages: Vec<MessageItem>,
+    pub messages: Vec<Message>,
     /// Warnings emitted during compilation (e.g. orphan text outside `@message`).
     pub warnings: Vec<String>,
     /// Absolute paths of all files imported during compilation, in
@@ -686,7 +686,7 @@ pub fn compile_messages(
     let messages = result
         .messages
         .into_iter()
-        .map(|m| MessageItem {
+        .map(|m| Message {
             role: m.role,
             content: m.content,
         })
