@@ -172,6 +172,18 @@ fn resolve_output_path(
     }
 }
 
+// ── Output format ─────────────────────────────────────────────────────────────
+
+/// Output format for the `build` command.
+#[derive(Debug, Default, Clone, PartialEq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Render the template to Markdown text (default).
+    #[default]
+    Markdown,
+    /// Compile `@message` blocks to a pretty-printed JSON array.
+    Messages,
+}
+
 // ── CLI entry point ───────────────────────────────────────────────────────────
 
 /// Scan the current directory for `.mds` files.
@@ -232,7 +244,7 @@ struct Cli {
 enum Commands {
     /// Compile an MDS file to Markdown
     #[command(
-        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  echo \"Hello {name}!\" | mds build -         Compile from stdin (writes to stdout)"
+        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  mds build template.mds --format messages  Compile @message blocks to JSON\n  echo \"Hello {name}!\" | mds build -         Compile from stdin (writes to stdout)"
     )]
     Build {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
@@ -253,6 +265,9 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
+        /// Output format: "markdown" (default) or "messages" (JSON array of chat messages)
+        #[arg(long = "format", value_name = "FORMAT", default_value = "markdown")]
+        format: OutputFormat,
     },
     /// Validate an MDS file without rendering
     #[command(
@@ -463,6 +478,7 @@ struct BuildArgs {
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
     quiet: bool,
+    format: OutputFormat,
 }
 
 fn run_build(args: BuildArgs) -> Result<()> {
@@ -473,6 +489,7 @@ fn run_build(args: BuildArgs) -> Result<()> {
         vars,
         set_vars,
         quiet,
+        format,
     } = args;
     let runtime_vars = build_runtime_vars(vars, set_vars)?;
 
@@ -485,27 +502,68 @@ fn run_build(args: BuildArgs) -> Result<()> {
 
     reject_directory_input(&input)?;
 
-    // Load project config (mds.json), walking up from the input file.
-    let config = load_config(&input)?;
+    match format {
+        OutputFormat::Messages => {
+            // Messages mode: compile @message blocks to a JSON array.
+            // Output always goes to stdout (or -o) without the output-dir / config logic.
+            let output_path = match output.as_deref() {
+                Some("-") | None => None,
+                Some(o) => Some(PathBuf::from(o)),
+            };
+            let result = if input == Path::new("-") {
+                let (source, cwd) = read_stdin()?;
+                mds::compile_messages_str_with_deps(&source, Some(&cwd), runtime_vars)
+                    .map_err(miette::Error::from)?
+            } else {
+                // Read the file and compile in messages mode.
+                // compile_messages_str_with_deps handles NativeFs canonicalization internally.
+                let base_dir = input.parent().unwrap_or(Path::new("."));
+                let path_str = input
+                    .to_str()
+                    .ok_or_else(|| miette::miette!("input path is not valid UTF-8"))?;
+                let bytes = std::fs::read(&input)
+                    .map_err(|e| miette::miette!("cannot read {path_str}: {e}"))?;
+                let source = String::from_utf8(bytes)
+                    .map_err(|e| miette::miette!("invalid UTF-8 in {path_str}: {e}"))?;
+                mds::compile_messages_str_with_deps(&source, Some(base_dir), runtime_vars)
+                    .map_err(miette::Error::from)?
+            };
+            if !quiet {
+                for w in &result.warnings {
+                    eprintln!("{w}");
+                }
+            }
+            let json = serde_json::to_string_pretty(&result.messages)
+                .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
+            let json_with_newline = format!("{json}\n");
+            write_output(output_path, &json_with_newline, quiet)
+        }
+        OutputFormat::Markdown => {
+            // Load project config (mds.json), walking up from the input file.
+            let config = load_config(&input)?;
 
-    // Resolve output destination before compiling (config discovery happens once).
-    let output_path = resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
+            // Resolve output destination before compiling (config discovery happens once).
+            let output_path =
+                resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
 
-    let (compiled, warnings) = if input == Path::new("-") {
-        let (source, cwd) = read_stdin()?;
-        mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-            .map_err(miette::Error::from)?
-    } else {
-        mds::compile_collecting_warnings(&input, runtime_vars).map_err(miette::Error::from)?
-    };
+            let (compiled, warnings) = if input == Path::new("-") {
+                let (source, cwd) = read_stdin()?;
+                mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
+                    .map_err(miette::Error::from)?
+            } else {
+                mds::compile_collecting_warnings(&input, runtime_vars)
+                    .map_err(miette::Error::from)?
+            };
 
-    if !quiet {
-        for w in &warnings {
-            eprintln!("{w}");
+            if !quiet {
+                for w in &warnings {
+                    eprintln!("{w}");
+                }
+            }
+
+            write_output(output_path, &compiled, quiet)
         }
     }
-
-    write_output(output_path, &compiled, quiet)
 }
 
 fn run_check(
@@ -594,6 +652,7 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
+            format,
         } => run_build(BuildArgs {
             input,
             output,
@@ -601,6 +660,7 @@ fn run(cli: Cli) -> Result<()> {
             vars,
             set_vars,
             quiet,
+            format,
         }),
         Commands::Check {
             input,
