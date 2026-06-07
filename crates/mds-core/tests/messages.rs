@@ -480,3 +480,99 @@ fn message_count_limit_rejects_runaway_generation() {
         "expected message-count limit error; got: {msg}"
     );
 }
+
+// ── AC-6.3: resource limit — cumulative content size enforced ─────────────────
+
+#[test]
+fn cumulative_content_size_limit_rejects_runaway_aggregate() {
+    // SECURITY (AC-6.3): the aggregate content across all messages must be capped at
+    // MAX_MESSAGES_TOTAL_SIZE (50 MB).  We construct a template that produces fewer
+    // than MAX_MESSAGE_COUNT (10 000) messages but whose total content exceeds 50 MB.
+    //
+    // Strategy: build a single large per-message body via a runtime var (avoiding
+    // the individual per-body MAX_OUTPUT_SIZE check) and loop enough times so the
+    // cumulative total crosses the 50 MB ceiling.
+    //
+    // We use a ~5.5 MB chunk × 10 iterations = ~55 MB cumulative → must error.
+    // The chunk is built from many "x\n" lines so YAML parsing stays fast.
+    const CHUNK_SIZE: usize = 5 * 1024 * 1024 + 500_000; // ~5.5 MB
+    let chunk: String = "x\n".repeat(CHUNK_SIZE / 2);
+
+    let vars = HashMap::from([("body".to_string(), mds::Value::String(chunk))]);
+    // 10 messages × ~5.5 MB each = ~55 MB > 50 MB cap.
+    let src = concat!(
+        "---\nroles:\n",
+        "  - m1\n  - m2\n  - m3\n  - m4\n  - m5\n",
+        "  - m6\n  - m7\n  - m8\n  - m9\n  - m10\n",
+        "---\n",
+        "@for r in roles:\n",
+        "@message {r}:\n{body}\n@end\n",
+        "@end\n",
+    );
+
+    let err = mds::compile_messages_str_with(src, None, Some(vars))
+        .expect_err("cumulative content exceeding 50 MB must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("total message content")
+            || msg.contains("cumulative")
+            || msg.contains("maximum"),
+        "expected cumulative-size limit error; got: {msg}"
+    );
+}
+
+// ── @for key, value in obj — messages mode ────────────────────────────────────
+
+#[test]
+fn for_key_value_object_iteration_in_messages_mode() {
+    // Misalignment 4: @for key, value in obj: must work identically in messages
+    // mode as in text mode.  Each object entry produces one @message whose role is
+    // the key and whose content is the value.
+    //
+    // Object entries are iterated in sorted key order (alphabetical), matching the
+    // text-mode evaluate_for_key_value behaviour.
+    let src = concat!(
+        "---\n",
+        "config:\n",
+        "  system: You are helpful.\n",
+        "  user: Hello!\n",
+        "---\n",
+        "@for role, body in config:\n",
+        "@message {role}:\n{body}\n@end\n",
+        "@end\n",
+    );
+    let result = compile_messages_str(src).expect("object key-value iteration must compile");
+    assert_eq!(
+        result.messages.len(),
+        2,
+        "expected one message per object key; got: {:#?}",
+        result.messages
+    );
+    // Keys come out sorted alphabetically: "system" < "user"
+    assert_eq!(result.messages[0].role, "system");
+    assert_eq!(result.messages[0].content, "You are helpful.");
+    assert_eq!(result.messages[1].role, "user");
+    assert_eq!(result.messages[1].content, "Hello!");
+}
+
+#[test]
+fn for_single_var_over_object_in_messages_mode_errors_with_hint() {
+    // Single-variable @for over an object must reject with the same hint as text mode:
+    // "use `@for key, value in obj:` syntax".
+    let src = concat!(
+        "---\n",
+        "config:\n",
+        "  key: value\n",
+        "---\n",
+        "@for item in config:\n",
+        "@message user:\n{item}\n@end\n",
+        "@end\n",
+    );
+    let err = compile_messages_str(src)
+        .expect_err("single-var @for over object in messages mode must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("key, value") || msg.contains("object") || msg.contains("entries"),
+        "expected hint about key-value syntax; got: {msg}"
+    );
+}
