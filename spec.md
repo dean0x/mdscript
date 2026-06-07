@@ -472,7 +472,7 @@ This role comes from the variable.
 | Mode | Invocation | Behaviour |
 |------|------------|-----------|
 | Text (default) | `compile_str` / `mds build` | `@message` body rendered inline; role markers ignored — backward compatible |
-| Messages | `compile_messages` / `mds build --format messages` | JSON array of `{role, content}` objects |
+| Messages | `compile_messages_str` / `compile_messages_virtual` / `mds build --format messages` | JSON array of `{role, content}` objects |
 
 ```mds
 # text mode output:
@@ -488,9 +488,12 @@ Hello!
 
 **Rules:**
 
-- Role must be a non-empty string; an empty role is a parse error
+- Role must be a non-empty string; an empty or whitespace-only bare-word role is
+  a parse error
 - Bare-word roles are always literal strings — they never look up variables
-- Dynamic roles (`{expr}`) must evaluate to a string at runtime; non-string → type error
+- Dynamic roles (`{expr}`) must evaluate to a non-empty, non-whitespace string at
+  runtime: a non-string value → type error; a string that trims to empty →
+  type error (the same rejection applies at runtime as at parse time)
 - Outer whitespace of the body is trimmed; inner whitespace is preserved
 - Empty bodies (trims to empty string) are silently skipped
 - Frontmatter is excluded from message content

@@ -117,7 +117,7 @@ TypeScript module declarations (`.mds` → `string`) are provided by `@mdscript/
 ### TypeScript / JavaScript
 
 ```ts
-import { init, compile, compileFile, isMdsError } from '@mdscript/mds';
+import { init, compile, compileFile, compileMessages, isMdsError } from '@mdscript/mds';
 
 await init();
 
@@ -129,6 +129,10 @@ const result = compile(source, { vars: { env: 'production' } });
 
 // Compile a file (resolves @import directives)
 const { output, dependencies } = await compileFile('./prompts/system.mds');
+
+// Compile @message blocks to a structured chat array
+const { messages, warnings } = compileMessages(source);
+// messages: [{ role: 'system', content: '...' }, { role: 'user', content: '...' }]
 
 // Error handling
 try {

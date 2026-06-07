@@ -24,7 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `compile_messages_str`, `compile_messages_str_with_deps`,
   `compile_messages_virtual`, `compile_messages_virtual_with_deps` (mds-core)
-- `compileMessages` in `@mdscript/mds` (NAPI + WASM backends)
+- `compileMessages(source, options?)` exported from `@mdscript/mds` (both NAPI
+  and WASM backends)
+- `compileMessages` exported directly from `@mdscript/mds-napi` (native addon)
+- `compileMessages` exported from `@mdscript/mds-wasm` (WASM module)
+- New public types: `Message` (`{ role: string; content: string }`) and
+  `CompileMessagesResult` (`{ messages, warnings, dependencies }`)
 
 ### Security & resource limits
 
