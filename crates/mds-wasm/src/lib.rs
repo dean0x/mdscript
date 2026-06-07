@@ -521,6 +521,56 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     }))
 }
 
+/// Compile an MDS template in messages mode, returning structured chat messages.
+///
+/// Each `@message role:` ... `@end` block in the template becomes one entry in
+/// the returned `messages` array. Orphan text outside `@message` blocks is
+/// ignored with a warning. Empty messages (after trimming) are skipped.
+///
+/// Returns an error when the template contains no `@message` blocks.
+///
+/// ## Arguments
+///
+/// - `source`: MDS template source text.
+/// - `options`: optional configuration object (same fields as [`compile`]).
+///
+/// ## Returns
+///
+/// On success, a JS object:
+/// ```json
+/// {
+///   "messages": [{ "role": "system", "content": "..." }, ...],
+///   "warnings": [],
+///   "dependencies": []
+/// }
+/// ```
+///
+/// On failure, throws a JS `Error` with the same structure as [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const result = compileMessages('@message system:\nYou are helpful.\n@end\n');
+/// console.log(result.messages[0].role);    // "system"
+/// console.log(result.messages[0].content); // "You are helpful."
+/// ```
+#[wasm_bindgen(js_name = "compileMessages")]
+pub fn compile_messages(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
+    check_source_size(source)?;
+
+    // Owned String required so the closure satisfies UnwindSafe.
+    let source = source.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let opts = parse_options(options)?;
+        let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
+        let result = mds::compile_messages_virtual_with_deps(modules, &opts.filename, opts.vars)
+            .map_err(mds_error_to_js)?;
+
+        to_js(&result)
+    }))
+}
+
 /// Extract all import and re-export paths from an MDS source string.
 ///
 /// Returns an array of path strings (`string[]`) in insertion order, deduplicated.

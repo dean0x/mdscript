@@ -270,6 +270,7 @@ describe('wasm backend — browser shape validation', () => {
     const validMod = {
       compile: () => {},
       check: () => {},
+      compileMessages: () => {},
       scanImports: () => [],
     };
     assert.doesNotThrow(
@@ -279,7 +280,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB18: validateWasmShape throws when compile is missing', () => {
-    const mod = { check: () => {}, scanImports: () => [] };
+    const mod = { check: () => {}, compileMessages: () => {}, scanImports: () => [] };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -294,7 +295,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB19: validateWasmShape throws when check is missing', () => {
-    const mod = { compile: () => {}, scanImports: () => [] };
+    const mod = { compile: () => {}, compileMessages: () => {}, scanImports: () => [] };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -309,7 +310,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB20: validateWasmShape throws when scanImports is missing', () => {
-    const mod = { compile: () => {}, check: () => {} };
+    const mod = { compile: () => {}, check: () => {}, compileMessages: () => {} };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -317,6 +318,21 @@ describe('wasm backend — browser shape validation', () => {
         assert.ok(
           err.message.includes('scanImports'),
           `error must mention missing function "scanImports", got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-WB21: validateWasmShape throws when compileMessages is missing', () => {
+    const mod = { compile: () => {}, check: () => {}, scanImports: () => [] };
+    assert.throws(
+      () => validateWasmShape(mod),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('compileMessages'),
+          `error must mention missing function "compileMessages", got: ${err.message}`,
         );
         return true;
       },

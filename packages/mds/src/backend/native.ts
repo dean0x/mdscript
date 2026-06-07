@@ -1,6 +1,7 @@
 import type {
   BackendType,
   CheckResult,
+  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   FileOptions,
@@ -10,12 +11,13 @@ import { varsOpt } from '../util/options.js';
 
 /**
  * Shape of the napi addon exports.
- * compile/check accept { basePath?, vars? } for string sources.
+ * compile/check/compileMessages accept { basePath?, vars? } for string sources.
  * compileFile/checkFile accept { vars? } for file paths.
  */
 interface NapiAddon {
   compile(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): CompileResult;
   check(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): CheckResult;
+  compileMessages(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): CompileMessagesResult;
   compileFile(path: string, opts?: { vars?: Record<string, unknown> }): CompileResult;
   checkFile(path: string, opts?: { vars?: Record<string, unknown> }): CheckResult;
 }
@@ -34,6 +36,10 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
 
     check(source: string, options?: CompileOptions): CheckResult {
       return addon.check(source, varsOpt(options));
+    },
+
+    compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
+      return addon.compileMessages(source, varsOpt(options));
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {

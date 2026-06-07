@@ -1,5 +1,7 @@
 export type {
   CompileResult,
+  CompileMessagesResult,
+  Message,
   CheckResult,
   CompileOptions,
   FileOptions,

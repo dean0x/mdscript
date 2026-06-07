@@ -1,13 +1,15 @@
-import type { BackendType, CheckResult, CompileOptions, CompileResult, InitOptions, MdsBaseBackend } from './types.js';
+import type { BackendType, CheckResult, CompileMessagesResult, CompileOptions, CompileResult, InitOptions, MdsBaseBackend } from './types.js';
 import { initWasmBrowser, createWasmBackend } from './backend/wasm.js';
 
 export { isMdsError } from './types.js';
 export type {
   BackendType,
   CheckResult,
+  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   InitOptions,
+  Message,
   MdsError,
   MdsErrorSpan,
 } from './types.js';
@@ -70,7 +72,7 @@ export function init(options?: InitOptions): Promise<void> {
 
 function assertReady(): MdsBaseBackend {
   if (resolvedBackend === undefined) {
-    throw new Error('@mdscript/mds: call await init() before using compile/check in a browser environment');
+    throw new Error('@mdscript/mds: call await init() before using compile/check/compileMessages in a browser environment');
   }
   return resolvedBackend;
 }
@@ -83,6 +85,11 @@ export function compile(source: string, options?: CompileOptions): CompileResult
 /** Validate an MDS source string without rendering. Requires init() to have been called and awaited first. */
 export function check(source: string, options?: CompileOptions): CheckResult {
   return assertReady().check(source, options);
+}
+
+/** Compile `@message` blocks in an MDS source string to structured chat messages. Requires init() to have been called and awaited first. */
+export function compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
+  return assertReady().compileMessages(source, options);
 }
 
 /** Returns the active backend type. Always `'wasm'` in browser environments. */

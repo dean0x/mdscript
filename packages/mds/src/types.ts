@@ -14,6 +14,24 @@ export interface CheckResult {
   warnings: string[];
 }
 
+/** A single structured message from a `compile_messages` call. */
+export interface Message {
+  /** The role string (e.g. `"system"`, `"user"`, `"assistant"`). */
+  role: string;
+  /** The rendered body text of the message (trimmed). */
+  content: string;
+}
+
+/** Result of a successful compileMessages operation. */
+export interface CompileMessagesResult {
+  /** Structured messages produced from `@message` blocks. */
+  messages: Message[];
+  /** Non-fatal diagnostic messages (e.g. orphan text outside `@message`). */
+  warnings: string[];
+  /** Absolute paths of every file transitively imported by the source. */
+  dependencies: string[];
+}
+
 /** Options shared by compile and check operations. */
 export interface CompileOptions {
   /** Runtime variables made available for interpolation in the template. */
@@ -63,12 +81,14 @@ export interface InitOptions {
 }
 
 /**
- * Browser-safe backend interface — compile/check/getBackend only.
+ * Browser-safe backend interface — compile/check/compileMessages/getBackend only.
  * Does not include file operations (which require node:fs).
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;
   check(source: string, options?: CompileOptions): CheckResult;
+  /** Compile `@message` blocks to structured chat messages. */
+  compileMessages(source: string, options?: CompileOptions): CompileMessagesResult;
   getBackend(): BackendType;
 }
 

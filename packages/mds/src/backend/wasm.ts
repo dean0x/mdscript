@@ -1,6 +1,7 @@
 import type {
   BackendType,
   CheckResult,
+  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   FileOptions,
@@ -20,6 +21,7 @@ import type {
 export interface WasmModule {
   compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileResult;
   check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CheckResult;
+  compileMessages(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileMessagesResult;
   scanImports(source: string): string[];
   default?: (input?: unknown) => Promise<void>;
 }
@@ -122,7 +124,7 @@ function isModuleNotFound(err: unknown): boolean {
  */
 export function validateWasmShape(mod: unknown): asserts mod is WasmModule {
   const m = mod as Record<string, unknown>;
-  for (const name of ['compile', 'check', 'scanImports'] as const) {
+  for (const name of ['compile', 'check', 'compileMessages', 'scanImports'] as const) {
     if (typeof m[name] !== 'function') {
       throw new Error(
         `@mdscript/mds: WASM module is missing required export "${name}". ` +
@@ -349,6 +351,10 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
 
     check(source: string, options?: CompileOptions): CheckResult {
       return wasmModule.check(source, compileOpts(options));
+    },
+
+    compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
+      return wasmModule.compileMessages(source, compileOpts(options));
     },
 
     getBackend(): BackendType {

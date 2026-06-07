@@ -2,6 +2,7 @@ import type {
   BackendType,
   MdsBaseBackend,
   MdsNodeBackend,
+  CompileMessagesResult,
   CompileResult,
   CheckResult,
   CompileOptions,
@@ -190,7 +191,7 @@ export function init(options?: InitOptions): Promise<void> {
 function assertReady(): MdsNodeBackend {
   if (backend === undefined) {
     throw new Error(
-      '@mdscript/mds: call await init() before using compile/check/compileFile/checkFile/getBackend',
+      '@mdscript/mds: call await init() before using compile/check/compileMessages/compileFile/checkFile/getBackend',
     );
   }
   return backend;
@@ -204,6 +205,11 @@ export function compile(source: string, options?: CompileOptions): CompileResult
 /** Validate an MDS source string without rendering. Requires init() to have been called and awaited first. */
 export function check(source: string, options?: CompileOptions): CheckResult {
   return assertReady().check(source, options);
+}
+
+/** Compile `@message` blocks in an MDS source string to structured chat messages. Requires init() to have been called and awaited first. */
+export function compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
+  return assertReady().compileMessages(source, options);
 }
 
 /** Compile an MDS file to Markdown, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
@@ -225,10 +231,12 @@ export { isMdsError } from './types.js';
 export type {
   BackendType,
   CheckResult,
+  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   FileOptions,
   InitOptions,
+  Message,
   MdsError,
   MdsErrorSpan,
 } from './types.js';

@@ -73,6 +73,29 @@ pub struct CheckResult {
     pub warnings: Vec<String>,
 }
 
+/// A single structured message returned by `compileMessages`.
+///
+/// Mirrors a chat API message: `{ role: string, content: string }`.
+#[napi(object)]
+pub struct MessageItem {
+    /// The role string (e.g. `"system"`, `"user"`, `"assistant"`).
+    pub role: String,
+    /// The rendered body text of the message (trimmed).
+    pub content: String,
+}
+
+/// Result returned by `compileMessages`.
+#[napi(object)]
+pub struct CompileMessagesResult {
+    /// Structured messages produced from `@message` blocks.
+    pub messages: Vec<MessageItem>,
+    /// Warnings emitted during compilation (e.g. orphan text outside `@message`).
+    pub warnings: Vec<String>,
+    /// Absolute paths of all files imported during compilation, in
+    /// depth-first resolution order. Excludes the entry file itself.
+    pub dependencies: Vec<String>,
+}
+
 // ── Low-level error helpers ───────────────────────────────────────────────────
 
 /// Create a JS Error with a custom code and message using raw N-API.
@@ -618,4 +641,60 @@ pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<
     )?;
 
     Ok(CheckResult { warnings })
+}
+
+/// Compile an MDS template source string in messages mode, returning structured chat messages.
+///
+/// Each `@message role:` ... `@end` block becomes one entry in `messages`.
+/// Orphan text outside `@message` blocks is ignored with a warning.
+/// Empty messages (after trimming) are silently skipped.
+///
+/// Returns an error when the template contains no `@message` blocks.
+///
+/// ## Arguments
+///
+/// - `source`: MDS template source text.
+/// - `opts`: optional configuration object:
+///   - `basePath` (string): base directory for resolving `@import` paths.
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///
+/// ## Returns
+///
+/// On success, `{ messages: [{ role: string, content: string }], warnings: string[], dependencies: string[] }`.
+///
+/// On failure, throws a JS `Error` with additional properties:
+/// - `code`: diagnostic code (e.g. `"mds::syntax"`)
+/// - `help`: optional hint string
+/// - `span`: optional `{ offset, length, line?, column? }`
+#[napi(js_name = "compileMessages")]
+pub fn compile_messages(
+    env: Env,
+    source: String,
+    opts: Option<Object>,
+) -> napi::Result<CompileMessagesResult> {
+    check_source_size(&env, &source)?;
+
+    let (base_path, vars) = parse_compile_opts(&env, opts)?;
+
+    let result = run_catching(
+        &env,
+        AssertUnwindSafe(move || {
+            mds::compile_messages_str_with_deps(&source, base_path.as_deref(), vars)
+        }),
+    )?;
+
+    let messages = result
+        .messages
+        .into_iter()
+        .map(|m| MessageItem {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+
+    Ok(CompileMessagesResult {
+        messages,
+        warnings: result.warnings,
+        dependencies: result.dependencies,
+    })
 }
