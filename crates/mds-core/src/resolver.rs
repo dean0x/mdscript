@@ -350,8 +350,16 @@ impl ModuleCache {
 
         self.resolve_frontmatter_imports(&fm_imports, &mut scope, ctx, warnings)?;
 
-        let CollectedDefs { functions, .. } =
-            self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+        let CollectedDefs {
+            functions,
+            explicit_exports,
+            ..
+        } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
+
+        // Validate that all named exports refer to defined functions or "prompt" —
+        // mirrors process_module exactly so @export <undefined> errors in messages mode
+        // the same way it does in text mode (avoids PF-004: alternate path bypassing a check).
+        validate_exports(&explicit_exports, &functions)?;
 
         // Register collected functions in scope for @define calls within @message bodies.
         for (name, func) in &functions {

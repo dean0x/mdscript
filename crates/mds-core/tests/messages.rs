@@ -631,3 +631,116 @@ fn for_single_var_over_object_in_messages_mode_errors_with_hint() {
         "expected hint about key-value syntax; got: {msg}"
     );
 }
+
+// ── Export validation parity (Issue #1) ──────────────────────────────────────
+
+#[test]
+fn export_undefined_name_errors_in_messages_mode() {
+    // Regression: process_module_messages previously discarded explicit_exports and
+    // never called validate_exports, so `@export <undefined>` compiled silently in
+    // messages mode while the same template errored in text mode (avoids PF-004).
+    // Both modes must now reject this template with an export error.
+    let src = "@export ghost\n@message user:\nHello.\n@end\n";
+    let err = compile_messages_virtual(
+        HashMap::from([("main.mds".to_string(), src.to_string())]),
+        "main.mds",
+        None,
+    )
+    .expect_err("@export of undefined name must error in messages mode");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ghost") || msg.contains("export") || msg.contains("not defined"),
+        "expected export-validation error mentioning 'ghost'; got: {msg}"
+    );
+}
+
+// ── Import / dependency population (Issue #2) ────────────────────────────────
+
+#[test]
+fn import_populates_dependencies_in_messages_mode() {
+    // Affirmative case: when main.mds imports lib.mds and uses a @define from it
+    // inside a @message body, the resolved dependency list must contain lib.mds and
+    // must NOT contain main.mds (entry-key exclusion).
+    let mut modules = HashMap::new();
+    modules.insert(
+        "lib.mds".to_string(),
+        "@define greet(name):\nHello {name}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./lib.mds\"\n@message user:\n{greet(\"World\")}\n@end\n".to_string(),
+    );
+    let result = compile_messages_virtual_with_deps(modules, "main.mds", None)
+        .expect("import inside messages mode should compile");
+    assert_eq!(result.messages.len(), 1);
+    assert_eq!(result.messages[0].content, "Hello World!");
+    assert!(
+        result.dependencies.contains(&"lib.mds".to_string()),
+        "lib.mds must appear in dependencies; got: {:#?}",
+        result.dependencies
+    );
+    assert!(
+        !result.dependencies.contains(&"main.mds".to_string()),
+        "entry file must be excluded from dependencies; got: {:#?}",
+        result.dependencies
+    );
+}
+
+// ── Orphan-interpolation warning (Issue #3) ──────────────────────────────────
+
+#[test]
+fn messages_mode_warns_on_orphan_interpolation() {
+    // An interpolation outside any @message block must emit a warning and be ignored,
+    // matching the orphan-text behaviour (mirrors messages_mode_warns_on_orphan_text).
+    let src = "---\nname: Alice\n---\n{name}\n@message user:\nQ\n@end\n";
+    let result = compile_messages_virtual(
+        HashMap::from([("main.mds".to_string(), src.to_string())]),
+        "main.mds",
+        None,
+    )
+    .expect("orphan interpolation should not prevent compilation");
+    assert!(
+        !result.warnings.is_empty(),
+        "expected warning for orphan interpolation; got none"
+    );
+    let has_interp_warn = result.warnings.iter().any(|w| {
+        w.contains("interpolation") || w.contains("outside @message") || w.contains("ignored")
+    });
+    assert!(
+        has_interp_warn,
+        "expected orphan-interpolation warning; got: {:#?}",
+        result.warnings
+    );
+}
+
+// ── @include-in-messages-mode warning (Issue #4) ─────────────────────────────
+
+#[test]
+fn messages_mode_warns_on_include_at_top_level() {
+    // @include at the top level of a messages template (outside any @message block)
+    // must emit a warning naming the alias and be silently ignored.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "lib.mds".to_string(),
+        "@define greet(x):\nHi {x}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./lib.mds\" as lib\n@include lib\n@message user:\nHello.\n@end\n".to_string(),
+    );
+    let result = compile_messages_virtual_with_deps(modules, "main.mds", None)
+        .expect("@include in messages mode should not prevent compilation");
+    assert!(
+        !result.warnings.is_empty(),
+        "expected warning for @include in messages mode; got none"
+    );
+    let has_include_warn = result
+        .warnings
+        .iter()
+        .any(|w| w.contains("@include") || w.contains("lib") || w.contains("ignored"));
+    assert!(
+        has_include_warn,
+        "expected @include warning mentioning the alias; got: {:#?}",
+        result.warnings
+    );
+}
