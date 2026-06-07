@@ -610,6 +610,7 @@ echo "Hello {name}!" | mds build -         # Compile from stdin (writes to stdou
 | `--out-dir <DIR>` | Output directory. Creates `<stem>.md` inside it. Created if absent. |
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
+| `--format <FORMAT>` | Output format: `markdown` (default) or `messages` (JSON `[{role, content}]` array). In `messages` mode, output goes to stdout or `-o <path>`; `--out-dir` and `mds.json` `output_dir` are ignored. |
 | `-q, --quiet` | Suppress status messages and warnings on stderr. |
 
 **Output path resolution** (precedence order, highest first):
@@ -877,7 +878,9 @@ number          := "-"? [0-9]+ ("." [0-9]+)?   (* not NaN or Infinity; those are
 for_block       := "@for" loop_vars "in" dot_path ":" body "@end"
 loop_vars       := identifier | identifier "," identifier
 message_block   := "@message" role ":" body "@end"
-role            := identifier | "{" dot_path "}"
+role            := bare_role | "{" message_role_expr "}"
+bare_role       := <any non-empty text up to the trailing ":"> (* literal string; no identifier validation *)
+message_role_expr := qualified_call | member_access | function_call | identifier
 
 text            := (raw_text | interpolation | escaped_brace)*
 interpolation   := "{" (qualified_call | member_access | function_call | identifier) "}"

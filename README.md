@@ -65,6 +65,7 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 - **Loops**: `@for item in list:` iteration over arrays and objects
 - **Functions**: `@define` reusable blocks with parameters
 - **Imports/Exports**: modular prompt libraries with alias, merge, and selective imports
+- **Messages**: `@message role: … @end` blocks compile to a JSON `[{role, content}]` array via `--format messages`
 - **Security**: path traversal guards, symlink rejection, file size limits
 - **Rich errors**: source-span diagnostics with line/column context
 
@@ -83,6 +84,7 @@ Build options:
   --out-dir <DIR>             Output directory (creates <stem>.md inside it)
   --vars <FILE>               JSON file with variable overrides
   --set KEY=VALUE             Set a single variable (repeatable)
+  --format <FORMAT>           markdown (default) or messages (JSON chat array)
 
 Exit codes:
   0   Success

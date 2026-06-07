@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Language features
+
+- `@message role: … @end` blocks for structured chat-message output. Roles may be
+  bare words (literal strings) or `{expr}` (evaluated at runtime using the full
+  expression grammar). Templates without `@message` blocks compile identically to
+  before; in `markdown` mode `@message` body content renders inline.
+
+### CLI
+
+- `mds build --format messages` emits a pretty-printed JSON `[{role, content}]` array
+  to stdout or `-o <path>`; `--out-dir` and `mds.json` `output_dir` are ignored in
+  this mode.
+
+### Library API
+
+- `compile_messages_str`, `compile_messages_str_with`, `compile_messages_str_with_deps`,
+  `compile_messages_virtual`, `compile_messages_virtual_with_deps` (mds-core)
+- `compileMessages` in `@mdscript/mds` (NAPI + WASM backends)
+
+### Security & resource limits
+
+- `MAX_MESSAGE_COUNT` (10,000) cap: templates exceeding this limit return a resource
+  error rather than allocating unboundedly.
+- Cumulative message-content size cap (50 MB): enforced per-compile across all
+  `@message` blocks.
+
 ## [0.2.0] — 2026-06-06
 
 ### Language features
