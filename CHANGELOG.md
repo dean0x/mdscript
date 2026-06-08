@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CLI
+
+- `mds watch` subcommand: watches an `.mds` file (or directory) and auto-recompiles on
+  save. Single-file mode tracks transitive `@import` deps — editing any imported file
+  triggers a rebuild. Directory mode compiles each changed `.mds` independently.
+  Full flag parity with `mds build`: `-o`, `--out-dir`, `--vars`, `--set`, `--format`
+  (single-file only), `--clear` (clears terminal before rebuild when stderr is a TTY),
+  `--debounce` (milliseconds, default 100). Status/warnings/errors go to stderr; compiled
+  content goes to stdout only when `-o -`. Ctrl+C exits cleanly with code 0.
+  Depends on `notify 8` and `ctrlc 3.5` (both MSRV 1.77 ≤ 1.88).
+- Internal refactor: build logic extracted from `main.rs` into `build.rs` with
+  `pub(crate)` helpers; `compile_and_write` shared helper routes both markdown and
+  messages modes through `read_build_input` / `compile_with_deps`, preserving the
+  10 MiB file-size cap on all code paths (PF-004).
+
 ### Language features
 
 - `@message role: … @end` blocks for structured chat-message output. Roles may be

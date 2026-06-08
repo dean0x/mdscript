@@ -27,6 +27,8 @@ js-sys = "0.3"
 napi = { version = "3.9.0", default-features = false, features = ["napi3", "serde-json"] }
 napi-derive = "3.5.6"
 napi-build = "2"
+notify = "8"
+ctrlc = "3.5"
 
 # panic = "unwind" is required workspace-wide because mds-wasm and mds-napi use
 # catch_unwind at the JS boundary to convert panics into structured JS errors.

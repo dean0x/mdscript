@@ -20,6 +20,11 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 miette = { workspace = true, features = ["fancy"] }
+notify = { workspace = true }
+ctrlc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
