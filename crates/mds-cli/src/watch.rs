@@ -199,9 +199,8 @@ pub(crate) fn output_path_for(
     out_dir: Option<&Path>,
     config: &Option<(crate::build::MdsConfig, PathBuf)>,
 ) -> PathBuf {
-    // Convert out_dir to an Option<PathBuf> for resolve_output_path_no_create.
-    let out_dir_pb = out_dir.map(|d| d.to_path_buf());
     // No explicit -o flag in directory mode; pass None for output.
+    let out_dir_pb = out_dir.map(|d| d.to_path_buf());
     match resolve_output_path_no_create(&Some(source.to_path_buf()), &None, &out_dir_pb, config) {
         Ok(Some(path)) => path,
         // Fallback: next-to-source (should not normally reach here since source is a real path)
@@ -212,6 +211,20 @@ pub(crate) fn output_path_for(
             source.parent().unwrap_or(Path::new(".")).join(name)
         }
     }
+}
+
+/// Canonicalize an optional vars path so it matches the canonical paths in notify
+/// events (e.g. resolves `/tmp` → `/private/tmp` on macOS).
+///
+/// Falls back to the raw path when canonicalization fails (file may not exist yet).
+pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Option<PathBuf> {
+    vars.map(|p| {
+        if p.exists() {
+            p.canonicalize().unwrap_or(p)
+        } else {
+            p
+        }
+    })
 }
 
 /// Write the ANSI clear-screen sequence to stderr if stderr is a TTY.
@@ -388,17 +401,8 @@ fn run_watch_file(
     // Resolve output path ONCE at startup (before entering the watch loop).
     let config = load_config(&entry)?;
     let output_path = resolve_output_path(&Some(entry.clone()), &output, &out_dir, &config)?;
-    // Canonicalize the vars path so it matches the canonical paths in notify events.
-    let vars_path: Option<PathBuf> = if let Some(ref v) = vars {
-        let vp = PathBuf::from(v);
-        if vp.exists() {
-            vp.canonicalize().map(Some).unwrap_or_else(|_| Some(vp))
-        } else {
-            Some(vp)
-        }
-    } else {
-        None
-    };
+    // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
+    let vars_path = canonicalize_vars_path(vars);
 
     // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
     let static_set_vars = set_vars;
@@ -548,17 +552,8 @@ fn run_watch_dir(
 ) -> Result<()> {
     // Load config once from the root directory.
     let config = load_config(&root)?;
-    // Canonicalize vars path so it matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    let vars_path: Option<PathBuf> = if let Some(ref v) = vars {
-        let vp = PathBuf::from(v);
-        if vp.exists() {
-            vp.canonicalize().map(Some).unwrap_or_else(|_| Some(vp))
-        } else {
-            Some(vp)
-        }
-    } else {
-        None
-    };
+    // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
+    let vars_path = canonicalize_vars_path(vars);
     let static_set_vars = set_vars;
 
     // Resolve the out_dir as absolute if it isn't already.
@@ -707,36 +702,30 @@ fn run_watch_dir(
             // Compile / delete individual files.
             for path in mds_changed {
                 if path.exists() {
-                    // File exists: compile it.
+                    // File exists: compile it. Reuse vars loaded for this rebuild cycle.
                     let out = output_path_for(&path, abs_out_dir.as_deref(), &config);
                     let t0 = Instant::now();
-                    let rv = build_runtime_vars(vars_path.clone(), static_set_vars.clone());
-                    match rv {
-                        Ok(vars) => {
-                            match compile_and_write(
-                                &path,
-                                Some(out.clone()),
-                                vars,
-                                &OutputFormat::Markdown,
-                                quiet,
-                            ) {
-                                Ok(deps) => {
-                                    let elapsed = t0.elapsed().as_millis();
-                                    if !quiet {
-                                        eprintln!(
-                                            "Recompiled {} ({} deps) in {}ms",
-                                            out.display(),
-                                            deps.len(),
-                                            elapsed
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("{e:?}");
-                                }
+                    match compile_and_write(
+                        &path,
+                        Some(out.clone()),
+                        runtime_vars.clone(),
+                        &OutputFormat::Markdown,
+                        quiet,
+                    ) {
+                        Ok(deps) => {
+                            let elapsed = t0.elapsed().as_millis();
+                            if !quiet {
+                                eprintln!(
+                                    "Recompiled {} ({} deps) in {}ms",
+                                    out.display(),
+                                    deps.len(),
+                                    elapsed
+                                );
                             }
                         }
-                        Err(e) => eprintln!("{e:?}"),
+                        Err(e) => {
+                            eprintln!("{e:?}");
+                        }
                     }
                 } else {
                     // Source file deleted: remove matching output (conservative — single file only).
@@ -775,15 +764,14 @@ fn compile_all_dir(
 ) {
     for source in files {
         let out = output_path_for(source, out_dir, config);
-        match compile_and_write(
+        if let Err(e) = compile_and_write(
             source,
             Some(out),
             runtime_vars.clone(),
             &OutputFormat::Markdown,
             quiet,
         ) {
-            Ok(_) => {}
-            Err(e) => eprintln!("{e:?}"),
+            eprintln!("{e:?}");
         }
     }
 }
