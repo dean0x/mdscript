@@ -3,6 +3,7 @@
 # Only curated, shared team knowledge is committed to git:
 #   - decisions/decisions.md, decisions/pitfalls.md      (ADR / pitfall records)
 #   - features/index.json, features/<slug>/KNOWLEDGE.md  (feature knowledge bases)
+#   - release-baseline.md                                (release config baseline)
 #
 # Everything else under .devflow/ is per-developer or transient (memory, dream,
 # docs, locks, runtime state, manifest, scratch results) and is
@@ -25,3 +26,6 @@
 !features/index.json
 !features/*/
 !features/*/KNOWLEDGE.md
+
+# 5. Track the release baseline (curated, shared)
+!release-baseline.md
