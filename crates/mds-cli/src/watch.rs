@@ -443,6 +443,41 @@ pub(crate) fn rearm(
     all_ok
 }
 
+/// Decide whether a missing/recovered external dep dir should trigger a full
+/// reconcile, and compute the new "missing" set for the next tick.
+///
+/// Edge-triggered (ADR-021 / AC-P1): a missing external dir forces a reconcile
+/// only when it *reappears* (was in `prev_missing`, now exists). A dir that stays
+/// missing across ticks does NOT trigger a walk — otherwise a permanently-deleted
+/// cross-root dep dir would cause an O(tree) rescan on every idle tick.
+///
+/// `statuses` is one `(dir, exists, rearm_ok)` per current external dep dir, where
+/// `rearm_ok` is the result of attempting to re-arm an existing dir (ignored when
+/// `exists` is false).
+///
+/// Returns `(recovery_needed, now_missing)`.
+pub(crate) fn external_recovery_decision(
+    prev_missing: &BTreeSet<PathBuf>,
+    statuses: &[(PathBuf, bool, bool)],
+) -> (bool, BTreeSet<PathBuf>) {
+    let mut now_missing = BTreeSet::new();
+    let mut recovery = false;
+    for (dir, exists, rearm_ok) in statuses {
+        if *exists {
+            if !*rearm_ok {
+                // Re-arming an existing dir failed: genuine watch loss.
+                recovery = true;
+            } else if prev_missing.contains(dir) {
+                // Was missing last tick, now exists and re-armed: recovery edge.
+                recovery = true;
+            }
+        } else {
+            now_missing.insert(dir.clone());
+        }
+    }
+    (recovery, now_missing)
+}
+
 /// Canonicalize an optional vars path so it matches the canonical paths in notify
 /// events (e.g. resolves `/tmp` → `/private/tmp` on macOS).
 ///
@@ -495,6 +530,55 @@ pub(crate) fn resync_watches(
         result.remove(dir);
     }
     result
+}
+
+// ── Small shared helpers ──────────────────────────────────────────────────────
+
+/// Emit "Stopped watching." to stderr (unless quiet) and return `Ok(())`.
+///
+/// Called at every Ctrl+C exit point in both watch loops.
+fn stop_watching(quiet: bool) -> Result<()> {
+    if !quiet {
+        eprintln!("Stopped watching.");
+    }
+    Ok(())
+}
+
+/// Receive the next message from the watch channel.
+///
+/// Returns:
+/// - `Ok(Some(msg))` — a message arrived.
+/// - `Ok(None)`      — idle tick (only when `tick` is `Some`).
+/// - `Err(_)`        — channel disconnected; caller should `break`.
+fn recv_next(
+    rx: &mpsc::Receiver<Msg>,
+    tick: Option<Duration>,
+) -> std::result::Result<Option<Msg>, mpsc::RecvTimeoutError> {
+    match tick {
+        Some(t) => rx.recv_timeout(t).map(Some).or_else(|e| match e {
+            mpsc::RecvTimeoutError::Timeout => Ok(None),
+            mpsc::RecvTimeoutError::Disconnected => Err(e),
+        }),
+        None => rx
+            .recv()
+            .map(Some)
+            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+    }
+}
+
+/// Snapshot the `(mtime, size)` of a single path into `last_mtimes`.
+///
+/// Called at every error-settle point: after a compile error or a write error,
+/// the snapshot prevents the liveness tick from re-firing on the same unchanged file.
+fn settle_mtime(
+    path: &Path,
+    last_mtimes: &mut HashMap<PathBuf, (Option<std::time::SystemTime>, Option<u64>)>,
+) {
+    let entry = match std::fs::metadata(path) {
+        Ok(m) => (m.modified().ok(), Some(m.len())),
+        Err(_) => (None, None),
+    };
+    last_mtimes.insert(path.to_path_buf(), entry);
 }
 
 // ── Debounce loop ─────────────────────────────────────────────────────────────
@@ -748,18 +832,7 @@ fn run_watch_file(
     // The outer loop processes one event batch at a time and is bounded:
     // it terminates on Interrupt, Disconnected, or when tick probe fires.
     loop {
-        let msg_result = match tick {
-            Some(t) => rx.recv_timeout(t).map(Some).or_else(|e| match e {
-                mpsc::RecvTimeoutError::Timeout => Ok(None),
-                mpsc::RecvTimeoutError::Disconnected => Err(e),
-            }),
-            None => rx
-                .recv()
-                .map(Some)
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-        };
-
-        match msg_result {
+        match recv_next(&rx, tick) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(None) => {
                 // Idle tick — run liveness probe (ADR-021).
@@ -785,8 +858,17 @@ fn run_watch_file(
                 if recovery || changed {
                     // Rebuild: compile to content first, then compare with last-written.
                     let t0 = Instant::now();
+                    // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
+                    // Print the error, settle mtime to avoid re-fire, and keep watching.
                     let runtime_vars =
-                        build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+                        match build_runtime_vars(vars_path.clone(), static_set_vars.clone()) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("{e:?}");
+                                last_mtimes = snapshot_state(&foi);
+                                continue;
+                            }
+                        };
                     match compile_to_content(&entry, runtime_vars, &format, quiet) {
                         Ok(compiled) => {
                             // Content-based dedup: skip write + summary line when unchanged.
@@ -862,19 +944,13 @@ fn run_watch_file(
                 };
 
                 if interrupted {
-                    if !quiet {
-                        eprintln!("Stopped watching.");
-                    }
-                    return Ok(());
+                    return stop_watching(quiet);
                 }
 
                 // Drain the debounce window.
                 let (_extra_paths, interrupted2) = drain_debounce(&rx, debounce_ms);
                 if interrupted2 {
-                    if !quiet {
-                        eprintln!("Stopped watching.");
-                    }
-                    return Ok(());
+                    return stop_watching(quiet);
                 }
 
                 // Clear terminal if requested (only when stderr is a TTY).
@@ -885,7 +961,16 @@ fn run_watch_file(
                 // Rebuild: compile to content first, then compare with last-written
                 // to detect content-identical rebuilds (synthetic FSEvents, no-op saves).
                 let t0 = Instant::now();
-                let runtime_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+                // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
+                let runtime_vars =
+                    match build_runtime_vars(vars_path.clone(), static_set_vars.clone()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{e:?}");
+                            last_mtimes = snapshot_state(&foi);
+                            continue;
+                        }
+                    };
                 match compile_to_content(&entry, runtime_vars, &format, quiet) {
                     Ok(compiled) => {
                         // Content-based dedup.
@@ -942,10 +1027,7 @@ fn run_watch_file(
         }
     }
 
-    if !quiet {
-        eprintln!("Stopped watching.");
-    }
-    Ok(())
+    stop_watching(quiet)
 }
 
 // ── Directory watch ───────────────────────────────────────────────────────────
@@ -976,6 +1058,13 @@ struct LivenessState {
     first_tick: bool,
     /// Tracks whether the root existed on the previous tick.
     root_was_missing: bool,
+    /// External dep dirs that were missing on the previous tick.
+    ///
+    /// Recovery is **edge-triggered**: a missing external dir triggers a full
+    /// reconcile only when it *reappears* (vanish→reappear), never while it stays
+    /// missing. A permanently-missing external dir must NOT force an O(tree) walk
+    /// on every idle tick (ADR-021 / AC-P1).
+    missing_external_dirs: BTreeSet<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1057,17 +1146,12 @@ fn run_watch_dir(
 
                 // Partials (DD2): track in graph but don't emit their own output.
                 if !is_partial(source) {
-                    // Write the output.
                     if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
                     {
                         eprintln!("{e:?}");
                     } else {
                         state.last_written.insert(out, compiled.content);
                     }
-                } else {
-                    // Partial: record in last_written as empty so we can dedup later,
-                    // but don't create any output file.
-                    // (Nothing to record — no output path for partials.)
                 }
             }
             Err(e) => {
@@ -1172,49 +1256,44 @@ fn run_watch_dir(
     let mut liveness = LivenessState {
         first_tick: true,
         root_was_missing: !root.exists(),
+        // Seed with any external dep dirs that don't exist yet so their first
+        // appearance is treated as a recovery edge (not a per-tick walk).
+        missing_external_dirs: state
+            .external_dep_dirs
+            .iter()
+            .filter(|d| !d.exists())
+            .cloned()
+            .collect(),
     };
 
     // ── Watch loop ────────────────────────────────────────────────────────────
     loop {
-        let msg_result = match tick {
-            Some(t) => rx.recv_timeout(t).map(Some).or_else(|e| match e {
-                mpsc::RecvTimeoutError::Timeout => Ok(None),
-                mpsc::RecvTimeoutError::Disconnected => Err(e),
-            }),
-            None => rx
-                .recv()
-                .map(Some)
-                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-        };
-
-        match msg_result {
+        match recv_next(&rx, tick) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(None) => {
                 // Idle tick — run liveness probe (ADR-021, DD1).
-                // 1. Re-arm all desired watches.
-                let mut desired = BTreeSet::new();
-                desired.insert(root.clone());
-                desired.extend(state.external_dep_dirs.iter().cloned());
-                if let Some(ref vd) = vars_dir_extra {
-                    desired.insert(vd.clone());
-                }
-
-                // Re-arm root as Recursive, external dirs as NonRecursive.
+                // 1. Re-arm all desired watches (root as Recursive, external dirs as NonRecursive).
                 let root_ok = if root.exists() {
                     watcher.watch(&root, RecursiveMode::Recursive).is_ok()
                 } else {
                     false
                 };
-                let mut ext_ok = true;
-                for ext_dir in &state.external_dep_dirs {
-                    if ext_dir.exists() {
-                        if watcher.watch(ext_dir, RecursiveMode::NonRecursive).is_err() {
-                            ext_ok = false;
-                        }
-                    } else {
-                        ext_ok = false;
-                    }
-                }
+                // External dirs are edge-triggered: a missing one only forces a
+                // reconcile when it reappears, never while it stays missing — a
+                // permanently-missing external dir must not cause an O(tree) walk
+                // on every idle tick (ADR-021 / AC-P1).
+                let ext_statuses: Vec<(PathBuf, bool, bool)> = state
+                    .external_dep_dirs
+                    .iter()
+                    .map(|ext_dir| {
+                        let exists = ext_dir.exists();
+                        let rearm_ok =
+                            exists && watcher.watch(ext_dir, RecursiveMode::NonRecursive).is_ok();
+                        (ext_dir.clone(), exists, rearm_ok)
+                    })
+                    .collect();
+                let (external_recovery, now_missing_external) =
+                    external_recovery_decision(&liveness.missing_external_dirs, &ext_statuses);
                 if let Some(ref vd) = vars_dir_extra {
                     if vd.exists() {
                         let _ = watcher.watch(vd, RecursiveMode::NonRecursive);
@@ -1225,10 +1304,11 @@ fn run_watch_dir(
                 let root_now_exists = root.exists();
                 let recovery = liveness.first_tick
                     || !root_ok
-                    || !ext_ok
+                    || external_recovery
                     || (liveness.root_was_missing && root_now_exists);
                 liveness.first_tick = false;
                 liveness.root_was_missing = !root_now_exists;
+                liveness.missing_external_dirs = now_missing_external;
 
                 if recovery {
                     // Full reconcile: re-collect all files and diff vs known_files.
@@ -1249,8 +1329,18 @@ fn run_watch_dir(
                         .collect();
 
                     if !appeared.is_empty() || !removed.is_empty() {
+                        // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
                         let runtime_vars =
-                            build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+                            match build_runtime_vars(vars_path.clone(), static_set_vars.clone()) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("{e:?}");
+                                    let known_set: HashSet<PathBuf> =
+                                        state.known_files.iter().cloned().collect();
+                                    state.last_mtimes = snapshot_state(&known_set);
+                                    continue;
+                                }
+                            };
                         let mut batch: BTreeSet<PathBuf> = appeared.clone();
                         batch.extend(removed.iter().cloned());
                         process_dir_batch(
@@ -1292,20 +1382,14 @@ fn run_watch_dir(
                 }
 
                 if interrupted {
-                    if !quiet {
-                        eprintln!("Stopped watching.");
-                    }
-                    return Ok(());
+                    return stop_watching(quiet);
                 }
 
                 // Drain debounce window.
                 let (extra, interrupted2) = drain_debounce(&rx, debounce_ms);
                 changed.extend(extra);
                 if interrupted2 {
-                    if !quiet {
-                        eprintln!("Stopped watching.");
-                    }
-                    return Ok(());
+                    return stop_watching(quiet);
                 }
 
                 // Defense-in-depth: ignore events from inside the out-dir subtree.
@@ -1342,7 +1426,18 @@ fn run_watch_dir(
                 }
 
                 // ADR-016: reload vars from disk on every rebuild.
-                let runtime_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+                // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
+                let runtime_vars =
+                    match build_runtime_vars(vars_path.clone(), static_set_vars.clone()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{e:?}");
+                            let known_set: HashSet<PathBuf> =
+                                state.known_files.iter().cloned().collect();
+                            state.last_mtimes = snapshot_state(&known_set);
+                            continue;
+                        }
+                    };
 
                 process_dir_batch(
                     &mds_changed,
@@ -1358,10 +1453,7 @@ fn run_watch_dir(
         }
     }
 
-    if !quiet {
-        eprintln!("Stopped watching.");
-    }
-    Ok(())
+    stop_watching(quiet)
 }
 
 /// Process a batch of changed `.mds` paths in directory mode.
@@ -1437,10 +1529,7 @@ fn process_dir_batch(
                                 Err(e) => {
                                     eprintln!("{e:?}");
                                     // Error-settle: update mtime so the gate won't re-fire.
-                                    let p_set: HashSet<PathBuf> =
-                                        std::iter::once(src.clone()).collect();
-                                    let snap = snapshot_state(&p_set);
-                                    state.last_mtimes.extend(snap);
+                                    settle_mtime(src, &mut state.last_mtimes);
                                 }
                             }
                         }
@@ -1450,10 +1539,7 @@ fn process_dir_batch(
                     eprintln!("{e:?}");
                     new_errored.insert(src.clone());
                     new_forward_deps.insert(src.clone(), vec![]);
-                    // Error-settle.
-                    let p_set: HashSet<PathBuf> = std::iter::once(src.clone()).collect();
-                    let snap = snapshot_state(&p_set);
-                    state.last_mtimes.extend(snap);
+                    settle_mtime(src, &mut state.last_mtimes);
                 }
             }
         }
@@ -1512,10 +1598,7 @@ fn process_dir_batch(
                 Err(e) => {
                     eprintln!("{e:?}");
                     state.errored.insert(src.clone());
-                    // Error-settle.
-                    let p_set: HashSet<PathBuf> = std::iter::once(src.clone()).collect();
-                    let snap = snapshot_state(&p_set);
-                    state.last_mtimes.extend(snap);
+                    settle_mtime(src, &mut state.last_mtimes);
                 }
             }
             continue;
@@ -1547,10 +1630,7 @@ fn process_dir_batch(
                 if is_partial(src) {
                     // Update known_files if this is a new partial.
                     state.known_files.insert(src.clone());
-                    // Update mtime baseline.
-                    let p_set: HashSet<PathBuf> = std::iter::once(src.clone()).collect();
-                    let snap = snapshot_state(&p_set);
-                    state.last_mtimes.extend(snap);
+                    settle_mtime(src, &mut state.last_mtimes);
                     continue;
                 }
 
@@ -1576,28 +1656,20 @@ fn process_dir_batch(
                         }
                         Err(e) => {
                             eprintln!("{e:?}");
-                            // Error-settle: snapshot so the gate won't re-fire.
-                            let p_set: HashSet<PathBuf> = std::iter::once(src.clone()).collect();
-                            let snap = snapshot_state(&p_set);
-                            state.last_mtimes.extend(snap);
+                            settle_mtime(src, &mut state.last_mtimes);
                         }
                     }
                 } else {
                     // Content unchanged — update known_files and mtime baseline.
                     state.known_files.insert(src.clone());
-                    let p_set: HashSet<PathBuf> = std::iter::once(src.clone()).collect();
-                    let snap = snapshot_state(&p_set);
-                    state.last_mtimes.extend(snap);
+                    settle_mtime(src, &mut state.last_mtimes);
                 }
             }
             Err(e) => {
                 // Compile error: add to errored set, keep prior graph edges.
                 eprintln!("{e:?}");
                 state.errored.insert(src.clone());
-                // Error-settle: snapshot so the gate doesn't re-fire on unchanged files.
-                let p_set: HashSet<PathBuf> = std::iter::once(src.clone()).collect();
-                let snap = snapshot_state(&p_set);
-                state.last_mtimes.extend(snap);
+                settle_mtime(src, &mut state.last_mtimes);
             }
         }
     }
@@ -1968,6 +2040,75 @@ mod tests {
         // B should appear exactly once.
         let b_count = affected.iter().filter(|p| *p == &b).count();
         assert_eq!(b_count, 1, "dual-role node B should appear exactly once");
+    }
+
+    // external_recovery_decision: a dir that STAYS missing across ticks does NOT
+    // trigger recovery (ADR-021 / AC-P1 — no per-tick full-tree walk).
+    #[test]
+    fn external_recovery_missing_stays_missing_no_recovery() {
+        let gone = PathBuf::from("/elsewhere/shared");
+        let prev_missing: BTreeSet<PathBuf> = std::iter::once(gone.clone()).collect();
+        // Still missing this tick.
+        let statuses = vec![(gone.clone(), false, false)];
+        let (recovery, now_missing) = external_recovery_decision(&prev_missing, &statuses);
+        assert!(
+            !recovery,
+            "a permanently-missing external dir must NOT trigger a reconcile"
+        );
+        assert!(
+            now_missing.contains(&gone),
+            "still-missing dir stays tracked"
+        );
+    }
+
+    // external_recovery_decision: a previously-missing dir that REAPPEARS triggers
+    // recovery (vanish→reappear edge).
+    #[test]
+    fn external_recovery_reappear_triggers_recovery() {
+        let dir = PathBuf::from("/elsewhere/shared");
+        let prev_missing: BTreeSet<PathBuf> = std::iter::once(dir.clone()).collect();
+        // Now exists and re-armed OK.
+        let statuses = vec![(dir.clone(), true, true)];
+        let (recovery, now_missing) = external_recovery_decision(&prev_missing, &statuses);
+        assert!(
+            recovery,
+            "a reappeared external dir must trigger a reconcile"
+        );
+        assert!(
+            now_missing.is_empty(),
+            "reappeared dir no longer tracked as missing"
+        );
+    }
+
+    // external_recovery_decision: re-arming an EXISTING dir failed → genuine watch
+    // loss → recovery.
+    #[test]
+    fn external_recovery_rearm_failure_triggers_recovery() {
+        let dir = PathBuf::from("/elsewhere/shared");
+        let prev_missing = BTreeSet::new();
+        // Exists but re-arm failed.
+        let statuses = vec![(dir.clone(), true, false)];
+        let (recovery, now_missing) = external_recovery_decision(&prev_missing, &statuses);
+        assert!(
+            recovery,
+            "a failed re-arm of an existing dir must trigger a reconcile"
+        );
+        assert!(now_missing.is_empty());
+    }
+
+    // external_recovery_decision: all dirs present and stable → no recovery, no walk.
+    #[test]
+    fn external_recovery_stable_no_recovery() {
+        let a = PathBuf::from("/ext/a");
+        let b = PathBuf::from("/ext/b");
+        let prev_missing = BTreeSet::new();
+        let statuses = vec![(a, true, true), (b, true, true)];
+        let (recovery, now_missing) = external_recovery_decision(&prev_missing, &statuses);
+        assert!(
+            !recovery,
+            "stable existing external dirs must not trigger a reconcile"
+        );
+        assert!(now_missing.is_empty());
     }
 
     // snapshot_state / state_differs.

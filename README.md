@@ -90,6 +90,10 @@ Build/Watch options:
 Watch-only options:
   --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
   --debounce <MS>             Debounce window in milliseconds (default: 100)
+  --poll-interval <MS>        Liveness-probe interval in milliseconds (default: 1000).
+                              0 disables self-heal (native events only). Clamped to ≥50ms.
+                              The watcher self-heals after a watched dir/root is deleted and
+                              recreated; --poll-interval controls how quickly it detects recovery.
 
 Exit codes:
   0   Success (or clean Ctrl+C in watch mode)
@@ -113,12 +117,23 @@ Watch an entire directory:
 
 ```bash
 mds watch src/                  # compile each .mds next to its source
-mds watch src/ --out-dir dist   # compile all to dist/
+mds watch src/ --out-dir dist   # mirror source subtree under dist/
+                                # src/a/b/foo.mds → dist/a/b/foo.md  (not dist/foo.md)
 ```
 
+> **Breaking change (v0.3.0):** Directory mode with `--out-dir` or `mds.json output_dir`
+> now mirrors the source subtree instead of writing flat stems. Old flat outputs are
+> orphaned and must be removed manually.
+
 **Single-file mode** tracks transitive imports: editing any `@import`-ed file triggers a
-recompile of the entry. **Directory mode** compiles each changed `.mds` independently;
-editing a shared partial does _not_ recompile files that import it (documented limitation).
+recompile of the entry. **Directory mode** tracks a reverse-dependency graph: editing a
+shared partial rebuilds **all transitive importers** automatically.
+
+- `_`-prefixed files are **partials**: tracked in the dependency graph and their importers
+  are rebuilt when edited, but the partial itself never emits its own `.md` output.
+- **Cross-root imports**: if a file imports a partial located outside the watched root
+  (e.g. `../shared/_x.mds`), editing that external partial rebuilds its in-root importers.
+  The external file is never compiled to its own output.
 
 - Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
