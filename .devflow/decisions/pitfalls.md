@@ -49,3 +49,12 @@
 - **Resolution**: restore the deleted files from the known-good commit with git restore --worktree <paths> (worktree-only, no re-staging) so they return to disk as ignored. General lesson: when a tracking-policy change (git rm --cached) and a branch/commit relocation (reset/checkout) happen close together, the reset can purge now-untracked files from disk — verify the working tree after the move and restore from history rather than assuming untracked-on-disk files survive a hard reset.
 - **Status**: Active
 - **Source**: self-learning:obs_a8b2c6
+
+## PF-006: A file watcher that recompiles on filesystem events self-triggers an infinite loop when compilation reads the watched file and that read itself emits an event (Linux inotify Access)
+
+- **Area**: mds watch event loop, cross-platform notify backend (Linux inotify vs macOS FSEvents)
+- **Issue**: on Linux, inotify reports read-access (IN_ACCESS -> EventKind::Access) events. The watcher recompiles a .mds on any event, and compilation opens/reads the watched source, which emits an Access event that retriggers compilation — an unbounded self-feedback loop (2846 errors observed in CI). It was invisible on macOS because FSEvents does not surface read-access as a change event, so it only manifested in the Linux CI job. The (mtime,size) change gate did not stop it because Access events arrive with the file unchanged yet still drive the event handler
+- **Impact**: a Linux-only busy-loop that spams thousands of recompiles/errors and would peg CPU for any user on Linux
+- **Resolution**: filter out EventKind::Access(_) at the event-intake boundary so reads never count as change events (fix 6b7f2fe, PR #57). General lesson: a watcher that reads the files it watches must exclude read/access event classes, and platform watcher backends differ in which event classes they emit — test the watch loop on every target OS, not just the development platform.
+- **Status**: Active
+- **Source**: self-learning:obs_c0d4e8

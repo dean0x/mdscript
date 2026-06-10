@@ -3,7 +3,7 @@
   "features": {
     "mds-cli": {
       "name": "MDS CLI",
-      "description": "Use when working on the mds command-line front-end: the build/check/watch subcommands, output-path resolution, mds.json project config, runtime variable assembly (--vars/--set), the file-watch architecture, or the stdout/stderr stream contract and exit-code mapping. mds-cli is the CLI layer that calls into mds-compiler (compile_with_deps / compile_messages_str_with_deps); see the mds-compiler feature for the compilation pipeline itself. Keywords: mds watch, mds build, mds check, clap, Commands, run_watch, run_watch_file, run_watch_dir, watch.rs, build.rs, compile_and_write, compile_to_content, resolve_output_path, resolve_output_path_no_create, load_config, MdsConfig, build_runtime_vars, write_output, read_build_input, auto_detect_mds_file, reject_directory_input, OutputFormat, BuildArgs, exit_code, notify, ctrlc, recommended_watcher, debounce, dirs_to_watch, files_of_interest, event_is_relevant, resync_watches, collect_mds_files, output_path_for, clear_terminal, last_written, content dedup, FSEvents synthetic events, MAX_FILE_SIZE, PF-004, ADR-016, --out-dir, --vars, --set, --clear, --debounce, --format messages.",
+      "description": "Use when adding new subcommands, changing output-path resolution logic, modifying the watch architecture (single-file or directory mode), adding new compile paths, updating mds.json config handling, debugging stdout/stderr stream separation, or investigating exit codes. Keywords: mds build, mds check, mds watch, mds init, OutputFormat, messages mode, run_build, run_watch, build.rs, watch.rs, mds.json, output_dir, resolve_output_path, resolve_output_base, OutputBase, output_path_for, compile_and_write, compile_to_content, debounce, notify, ctrlc, content-dedup, last_written, dirs_to_watch, files_of_interest, exit_code, MAX_FILE_SIZE, read_build_input, BuildArgs, WatchArgs, forward_deps, affected_sources, is_partial, graph_key, process_dir_batch, liveness_probe, snapshot_state, state_differs, rearm, poll_interval, is_content_event, inotify Access, Linux busy-loop, external_recovery_decision, edge-triggered recovery, missing_watched_dirs, missing_external_dirs, recv_next, settle_mtime.",
       "directories": [
         "crates/mds-cli/src/",
         "crates/mds-cli/tests/"
@@ -16,7 +16,7 @@
         "crates/mds-cli/tests/common/mod.rs",
         "crates/mds-cli/Cargo.toml"
       ],
-      "lastUpdated": "2026-06-09T07:29:14.000Z",
+      "lastUpdated": "2026-06-10T09:26:50.122Z",
       "createdBy": "implement"
     },
     "mds-napi": {
@@ -39,12 +39,12 @@
         "crates/mds-core/src/options.rs",
         "Cargo.toml"
       ],
-      "lastUpdated": "2026-06-08T05:01:45.690Z",
+      "lastUpdated": "2026-06-09T21:41:13.101Z",
       "createdBy": "implement"
     },
     "mds-compiler": {
       "name": "MDS Compiler",
-      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, builtins, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, MAX_LOOP_ITERATIONS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, MessageGuard, validate_exports, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, run_build_messages, run_build_markdown, BuildArgs.",
+      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch.",
       "directories": [
         "crates/mds-core/src/",
         "crates/mds-cli/src/",
@@ -66,11 +66,13 @@
         "crates/mds-core/src/limits.rs",
         "crates/mds-core/src/builtins.rs",
         "crates/mds-cli/src/main.rs",
+        "crates/mds-cli/src/build.rs",
+        "crates/mds-cli/src/watch.rs",
         "crates/mds-core/tests/api_surface.rs",
         "crates/mds-core/tests/messages.rs",
         "crates/mds-cli/tests/format_messages.rs"
       ],
-      "lastUpdated": "2026-06-08T05:01:26.587Z",
+      "lastUpdated": "2026-06-10T09:27:10.208Z",
       "createdBy": "implement"
     },
     "mds-js": {

@@ -217,3 +217,12 @@ A fix may be incomplete, mis-scoped, or address a symptom rather than the root c
 - **Decision**: sequence the work — do NOT stash, discard, reset, or checkout over those files mid-flight
 - **Consequences**: a stash/checkout/reset that races an actively-writing agent can drop or corrupt curated decision/knowledge output. The irreversible step (the merge) was already complete, so the reversible local cleanup can safely wait for maintenance to settle.
 - **Source**: self-learning:obs_z7a1b5
+
+## ADR-021: Liveness-gated reconcile for the file-watch loop: cheap per-tick re-arm, full directory rescan only on watch-loss/recovery
+
+- **Date**: 2026-06-09
+- **Status**: Accepted
+- **Context**: designing the mds watch event loop to recompute file/dependency state without paying a full directory tree walk on every filesystem event
+- **Decision**: gate reconciliation on watcher liveness — on each tick do only a cheap re-arm of watches, and perform a full directory rescan ONLY when the watcher is lost and recovers
+- **Consequences**: a per-tick tree walk is O(tree) work on every event and does not scale
+- **Source**: self-learning:obs_b9c3d7
