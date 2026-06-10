@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch."
 category: architecture
 directories: [crates/mds-core/src/, crates/mds-cli/src/, crates/mds-cli/tests/]
 referencedFiles:
@@ -20,11 +20,13 @@ referencedFiles:
   - crates/mds-core/src/limits.rs
   - crates/mds-core/src/builtins.rs
   - crates/mds-cli/src/main.rs
+  - crates/mds-cli/src/build.rs
+  - crates/mds-cli/src/watch.rs
   - crates/mds-core/tests/api_surface.rs
   - crates/mds-core/tests/messages.rs
   - crates/mds-cli/tests/format_messages.rs
 created: 2026-05-12
-updated: 2026-06-08T00:00:00Z
+updated: 2026-06-10T00:00:00Z
 ---
 
 # MDS Compiler
@@ -313,33 +315,110 @@ Both types derive `serde::Serialize` — `serde_json::to_string_pretty` on the `
 
 All `compile_messages*` functions carry `#[must_use]`.
 
-### CLI: `--format messages` (`crates/mds-cli/src/main.rs`)
+### CLI Module Layout (`crates/mds-cli/src/`)
 
-**`OutputFormat` enum**:
+The CLI is split across three source files as of the watch refactor (Issue #57):
+
+- **`main.rs`** — CLI entry point only: `Cli` struct (clap), `Commands` enum (`Build`, `Check`, `Init`, `Watch`), `main()`, `run()`, `run_check()`, `run_init()`. Imports `OutputFormat`, `BuildArgs`, `run_build`, `build_runtime_vars`, `exit_code`, `parse_key_value`, `reject_directory_input`, `resolve_input` from `build`. Imports `run_watch`, `WatchArgs` from `watch`.
+- **`build.rs`** — all shared build logic and the `build` subcommand: `OutputFormat`, `BuildArgs`, `run_build()`, `run_build_messages()`, `run_build_markdown()`, `compile_to_content()`, `compile_and_write()`, `resolve_input()`, `read_build_input()`, `read_stdin()`, `write_output()`, `load_config()`, `resolve_output_path()`, `build_runtime_vars()`, `parse_key_value()`, `parse_cli_value()`, `exit_code()`, `auto_detect_mds_file()`, `reject_directory_input()`, `load_optional_vars_file()`, `derive_output_filename()`, `compute_output_dir_path()`, `prepare_output_dir()`. Also defines the **local** `pub(crate) struct CompileOutput { content, dependencies }`. Note: `resolve_output_path_no_create` was removed in the dir-mode refactor.
+- **`watch.rs`** — watch subcommand: `WatchArgs`, `run_watch()`, `run_watch_file()`, `run_watch_dir()`, `dir_watch_startup()`; context structs `FileCompileCtx`, `FileWatchState`, `DirWatchCtx`, `DirWatchState` (with methods `record_success`, `record_error`, `known_set`, `forget`), `LivenessState`, `DirStartup`; extracted helpers `rebuild_file`, `liveness_probe_file`, `liveness_probe_dir`, `handle_fs_event_file`, `handle_fs_event_dir`, `compile_one_source`, `process_dir_batch`, `process_dir_batch_incremental`, `process_dir_batch_vars_changed`; pure helpers (`dirs_to_watch`, `files_of_interest`, `event_is_relevant`, `collect_mds_files`, `output_path_for`, `canonicalize_vars_path`, `clear_terminal`, `resync_watches`, `drain_debounce`, `affected_sources`, `is_partial`, `graph_key`, `snapshot_state`, `state_differs`, `external_recovery_decision`, `is_content_event`, `recv_next`, `stop_watching`). Calls `compile_and_write` and `compile_to_content` from `build.rs` for all compilation. `compile_all_dir` was removed — startup compile is now inline in `dir_watch_startup`.
+
+**Important naming distinction**: `build::CompileOutput` (defined in `build.rs`) is a CLI-internal struct with `{ content: String, dependencies: Vec<String> }`. It is **not** the same as `mds::CompileOutput` (defined in `mds-core/src/lib.rs`) which has `{ output: String, warnings: Vec<String>, dependencies: Vec<String> }`. The CLI struct exists to carry pre-serialized content (plain Markdown or pretty JSON) through `compile_to_content` → `compile_and_write`, abstracting away the format difference.
+
+### CLI: `OutputFormat` and `--format` flag
+
+**`OutputFormat` enum** (in `build.rs`, not `main.rs`):
 ```rust
-enum OutputFormat {
+#[derive(Debug, Default, Clone, PartialEq, clap::ValueEnum)]
+pub(crate) enum OutputFormat {
     #[default]
     Markdown,
     Messages,
 }
 ```
 
-The `build` subcommand accepts `--format <FORMAT>` (values: `markdown`, `messages`). In messages mode:
+Both `build` and `watch` subcommands accept `--format <FORMAT>` (values: `markdown`, `messages`). In `watch`, `--format messages` is only valid in single-file mode.
+
+### CLI: `compile_to_content` and `compile_and_write` (in `build.rs`)
+
+These two helpers are the shared compile-then-write contract used by both the `build` and `watch` subcommands.
+
+**`compile_to_content(input, runtime_vars, format, quiet) -> Result<CompileOutput>`**:
+- Markdown mode: calls `mds::compile_with_deps` — enforces `MAX_FILE_SIZE` via the file resolver.
+- Messages mode: calls `read_build_input` → `mds::compile_messages_str_with_deps` → serializes `result.messages` with `serde_json::to_string_pretty` + trailing `\n`.
+- Returns `build::CompileOutput { content, dependencies }` (the pre-serialized string + dep list).
+- Does NOT write output — it is a pure "compile to content" step.
+
+**`compile_and_write(input, output_path, runtime_vars, format, quiet) -> Result<Vec<String>>`**:
+- Calls `compile_to_content`, then `write_output`.
+- Returns the transitive dependency list. `build` ignores the deps; `watch` uses them to update the set of watched files (ADR-016: dep set recomputed on every rebuild).
+
+All file reads go through `compile_to_content` → `read_build_input` or `mds::compile_with_deps` (which uses the resolver that enforces `MAX_FILE_SIZE`). There is no bare `std::fs::read_to_string` path — avoids PF-004.
+
+### CLI: `--format messages` (`crates/mds-cli/src/build.rs`)
+
+In messages mode:
 - The output-dir / `mds.json` project-config logic is **skipped** — output always goes to stdout (or `-o`).
 - The compiler calls `compile_messages_str_with_deps` instead of `compile*` — source is read via `read_build_input`, not the `mds::compile_collecting_warnings` path.
 - The result's `messages` array is serialized with `serde_json::to_string_pretty` and written as `{json}\n`.
 
-**`run_build_messages(input, output, runtime_vars, quiet) -> Result<()>`** — extracted helper (refactored out of `run_build` in commit a375e58) that handles the messages-mode arm. Reads source via `read_build_input`, calls `compile_messages_str_with_deps`, serializes `result.messages` with `serde_json::to_string_pretty`, and writes via `write_output`. Skips all output-dir / `mds.json` config logic — output always goes to stdout or an explicit `-o` path.
+**`run_build_messages(input, output, runtime_vars, quiet) -> Result<()>`** — handles the messages-mode arm. Reads source via `read_build_input`, calls `compile_messages_str_with_deps`, serializes `result.messages` with `serde_json::to_string_pretty`, and writes via `write_output`. Skips all output-dir / `mds.json` config logic — output always goes to stdout or an explicit `-o` path.
 
 **`run_build_markdown(input, output, out_dir, runtime_vars, quiet) -> Result<()>`** — extracted helper for the markdown arm. Loads `mds.json` config, calls `resolve_output_path`, handles stdin or file compilation via `mds::compile_str_collecting_warnings` / `mds::compile_collecting_warnings`, and writes via `write_output`.
 
-**`run_build(args: BuildArgs) -> Result<()>`** — dispatches to `run_build_messages` or `run_build_markdown` based on `args.format`. `BuildArgs` is a plain struct carrying all build subcommand fields.
+**`run_build(args: BuildArgs) -> Result<()>`** — dispatches to `run_build_messages` or `run_build_markdown` based on `args.format`. `BuildArgs` is a plain struct carrying all build subcommand fields (defined in `build.rs`).
 
-**`read_build_input(input: &Path) -> Result<(String, PathBuf)>`** — shared helper used by the messages-mode path. Handles stdin (`-`) and file paths. Enforces `MAX_FILE_SIZE` on file reads (reads at most `MAX_FILE_SIZE + 1` bytes and errors if exceeded). Returns `(source_string, base_dir)`. This ensures the messages-mode path has the same size defense-in-depth as file-path compilation.
+**`read_build_input(input: &Path) -> Result<(String, PathBuf)>`** — shared helper used by the messages-mode path and the watch loop. Handles stdin (`-`) and file paths. Enforces `MAX_FILE_SIZE` on file reads (reads at most `MAX_FILE_SIZE + 1` bytes and errors if exceeded). Returns `(source_string, base_dir)`. This ensures the messages-mode path has the same size defense-in-depth as file-path compilation.
 
 **`read_stdin() -> Result<(String, PathBuf)>`** — reads from stdin, also enforcing `MAX_FILE_SIZE + 1` byte limit. Returns `(source, cwd)` where `cwd` is the current working directory used as `base_dir`.
 
 Warnings from `CompileMessagesOutput::warnings` are still emitted to stderr (same as text mode).
+
+### CLI: `watch` subcommand (`crates/mds-cli/src/watch.rs`)
+
+The `watch` subcommand (added in Issue #57) recompiles `.mds` files on save using `notify` (cross-platform filesystem events) and `ctrlc` (graceful Ctrl+C shutdown).
+
+**`WatchArgs` struct** — `input, output, out_dir, vars, set_vars, format, clear, debounce, quiet`.
+
+**`run_watch(args: WatchArgs) -> Result<()>`** — dispatcher: detects whether the (resolved) input is a file or directory, calls `run_watch_file` or `run_watch_dir` accordingly.
+
+**`run_watch_file(...) -> Result<()>`** — single-file mode:
+- Performs an initial compile via `compile_and_write`.
+- Watches the entry file's directory plus all transitive import directories (`dirs_to_watch`).
+- On each relevant change, recompiles via `compile_and_write` and updates the watched directory set (ADR-016: dep set recomputed on every rebuild, never stale).
+- Content-dedup: calls `compile_to_content` first; if content is identical to `last_written`, skips the write to avoid spurious downstream tool triggers.
+- `--clear` clears the terminal before each rebuild (TTY-gated).
+- `--debounce <MS>` (default 100ms) batches rapid saves before triggering a rebuild.
+
+**`run_watch_dir(...) -> Result<()>`** — directory mode:
+- Delegates startup to `dir_watch_startup`, then runs the event loop.
+- Compiles all `.mds` files in the root directory at startup (bounded depth walk via `collect_mds_files`).
+- Tracks a reverse-dependency graph (`forward_deps`): editing a shared partial recompiles all transitive importers via `affected_sources` DFS.
+- `_`-prefixed partials are tracked in the graph but never emit their own `.md` output.
+- Cross-root dependencies are watched NonRecursively; their parent dirs are tracked in `external_dep_dirs`.
+- Output mirrors the source subtree under `--out-dir` / `mds.json output_dir` via `OutputBase`.
+- On source deletion, removes the matching output file and cleans graph state.
+- `--format messages` is not supported in directory mode.
+
+**Watch helper functions** (all `pub(crate)` in `watch.rs`):
+- `dirs_to_watch(entry, deps, vars_file) -> BTreeSet<PathBuf>` — union of the entry's parent, all dep parent dirs, and the vars file's parent; deduplicates parent-child pairs.
+- `files_of_interest(entry, deps, vars_file) -> HashSet<PathBuf>` — the set of paths that should trigger a rebuild when changed.
+- `event_is_relevant(event, watched) -> bool` — filters notify events to only those touching `files_of_interest`.
+- `collect_mds_files(root, max_depth) -> Vec<PathBuf>` — bounded recursive directory scan for `.mds` files.
+- `output_path_for(source, root, base: &OutputBase) -> PathBuf` — derives the mirrored output path for a source file in directory mode. Infallible, no dir creation. `Dir(d)`: mirrors source subtree under `d`; `NextToSource`: `source.with_extension("md")`. Path-escape guard (AC-M7) via `debug_assert!`.
+- `canonicalize_vars_path(vars) -> Option<PathBuf>` — canonicalizes the vars file path if provided.
+- `clear_terminal()` — writes ANSI clear-screen escape sequence to stderr if stderr is a TTY.
+- `resync_watches(watcher, current_dirs, new_dirs) -> BTreeSet<PathBuf>` — unregisters removed dirs, registers added dirs; returns the new active set.
+- `drain_debounce(rx, debounce_ms) -> (BTreeSet<PathBuf>, bool)` — drains the event channel over the debounce window; returns changed paths and a quit flag.
+
+**Msg enum** (private, in `watch.rs`):
+```rust
+enum Msg {
+    Fs(notify::Result<Event>),
+    Interrupt,
+}
+```
+The `notify` watcher and `ctrlc` handler both send to the same `mpsc::Sender<Msg>` channel. `drain_debounce` drains this channel to collect events over the debounce window. The `Fs` variant wraps `notify::Result` to propagate watcher errors (not just success events) through the same channel.
 
 ### Error System (`crates/mds-core/src/error.rs`)
 
@@ -419,6 +498,13 @@ When adding a new public function to `lib.rs`:
 3. For functions that accept user input, enforce resource limits (file size, etc.)
 4. Follow the `*_collecting_warnings` naming pattern for functions that return warnings without printing
 
+### Adding a New CLI Input Path
+
+When adding a new way to read input in the CLI:
+1. Route all file reads through `read_build_input` (for `.mds` files) or `mds::compile_with_deps` (file-path compilation).
+2. Route all stdin reads through `read_stdin`.
+3. Do NOT use bare `std::fs::read_to_string` — both `read_build_input` and the resolver enforce `MAX_FILE_SIZE`. Avoids PF-004.
+
 ## Anti-Patterns
 
 - **Calling `eprintln!` from evaluator or resolver code** — use `ctx.warnings` or `warnings: &mut Vec<String>`.
@@ -446,6 +532,10 @@ When adding a new public function to `lib.rs`:
 - **Calling `ModuleCache::resolve_source` with a `&Path` directly** — the method takes `base_dir: &str`. Convert via `path.to_str()` or go through `lib.rs` wrappers.
 - **Skipping `validate_exports` in a new compilation code path** — both `process_module` and `process_module_messages` call `validate_exports`; any new "alternate" path that produces or evaluates module content must also call it. Omitting it means `@export <undefined>` errors are silently dropped. Avoids PF-004.
 - **Manually restoring `inside_message` on error paths in `parse_message_block`** — use `MessageGuard` (RAII struct in `parser.rs`) instead. Manual flag-restore is error-prone and will be missed on new `?`-propagation paths. `MessageGuard::drop` handles both `inside_message = false` and `depth -= 1` atomically.
+- **Looking for `OutputFormat`, `BuildArgs`, `run_build_messages`, or `run_build_markdown` in `main.rs`** — these now live in `build.rs` after the watch refactor (Issue #57). `main.rs` only contains the `Cli`/`Commands` structs and entry point.
+- **Confusing `build::CompileOutput` with `mds::CompileOutput`** — the CLI-internal `build::CompileOutput { content: String, dependencies: Vec<String> }` holds pre-serialized content (Markdown string or pretty JSON). The core `mds::CompileOutput { output: String, warnings: Vec<String>, dependencies: Vec<String> }` holds the raw compiled string plus warnings. Different structs; different purposes.
+- **Calling `std::fs::read_to_string` directly in CLI input paths** — always route through `read_build_input` or `mds::compile_with_deps` to enforce `MAX_FILE_SIZE`. Avoids PF-004.
+- **Calling `compile_all_dir` in `watch.rs`** — this function was removed. Startup compilation is now inline in `dir_watch_startup`. Use `compile_one_source` for the shared compile→dedup→write→settle sequence in dir mode.
 
 ## Gotchas
 
@@ -470,7 +560,9 @@ When adding a new public function to `lib.rs`:
 - **Injection safety**: `@message`/`@end` tokenization runs on the original source before any variable substitution. A variable containing literal `@end` text cannot break out of a message block body — it is never re-tokenized.
 - **`EvalMessage` is not purely internal** — it is `pub` and lives in `evaluator.rs`, but it is converted to the public `mds::Message` type in `lib.rs` before leaving the crate. The `pub` is needed because `resolver.rs` receives and returns `Vec<EvalMessage>` from `process_module_messages`. Do not expose `EvalMessage` through the public API.
 - **`MAX_ARRAY_ELEMENTS` is not exported** — it is `pub(crate)` in `limits.rs`. It is not part of the public API and should not be referenced outside of `builtins.rs`.
-- **`read_build_input` enforces `MAX_FILE_SIZE`** — this is a defense-in-depth measure for the CLI's messages mode. The napi layer has its own `check_source_size`. Ensure new CLI input paths (stdin or file) go through `read_build_input` or `read_stdin` rather than raw `std::fs::read_to_string`.
+- **`read_build_input` enforces `MAX_FILE_SIZE`** — this is a defense-in-depth measure for the CLI's messages mode and watch loop. The napi layer has its own `check_source_size`. Ensure new CLI input paths (stdin or file) go through `read_build_input` or `read_stdin` rather than raw `std::fs::read_to_string`.
+- **`compile_and_write` returns deps, not a boolean** — the watch loop uses the returned `Vec<String>` to update `dirs_to_watch` and `files_of_interest` (ADR-016). The build subcommand ignores the return value.
+- **`OutputFormat` derives `clap::ValueEnum`** — this means adding a new variant automatically makes it a valid `--format` value. Ensure new variants are intentional additions to the public CLI surface, not internal implementation details.
 
 ## Key Files
 
@@ -478,23 +570,27 @@ When adding a new public function to `lib.rs`:
 - `crates/mds-core/src/ast.rs` — all AST types; `Node::Message(MessageBlock)` added; `Condition` variants hold `Expr`; `ForBlock.iterable: Expr`; `Param` struct; `required_param_count` function
 - `crates/mds-core/src/builtins.rs` — 18 built-in functions; `BuiltinMeta` struct; `get_builtin` / `call_builtin` entry points; `split()` enforces `MAX_ARRAY_ELEMENTS`
 - `crates/mds-core/src/parser_helpers.rs` — `parse_expr_inner` (shared expression grammar); `strip_trailing_directive_colon`; condition precedence parser; default param parsing; `find_unquoted_operator` and `split_on_unquoted_op` with paren-depth tracking
-- `crates/mds-core/src/parser.rs` — `parse_message_block`; `inside_message` flag; role parsing (bare-word vs `{expr}`)
+- `crates/mds-core/src/parser.rs` — `parse_message_block`; `inside_message` flag; role parsing (bare-word vs `{expr}`); `MessageGuard` RAII
 - `crates/mds-core/src/evaluator.rs` — `evaluate_expr` (Expr → Value); `evaluate_messages` and `collect_messages` (messages mode); `collect_single_message`; `EvalContext` (call_stack, total_iterations, total_message_bytes, warnings, MAX_CALL_DEPTH=128, MAX_TOTAL_ITERATIONS=1_000_000, MAX_WARNINGS=1_000); `values_equal_runtime`; `condvalue_to_value`; `And`/`Or` short-circuit in `evaluate_condition`
 - `crates/mds-core/src/validator.rs` — builtin-aware `validate_expr`; range arity checks; recursive `validate_condition`; `Node::Message` arm validates role + recurses body
 - `crates/mds-core/src/resolver.rs` — orchestrator; `ModuleCache`; `process_module_messages`; `resolve_key_messages` / `resolve_source_messages` (take `base_dir: &str`); `FrontmatterImport` enum and parse functions; import semantics; security enforcement
 - `crates/mds-core/src/lib.rs` — public API; `Message` struct; `CompileMessagesOutput` struct; `compile_messages*` function family; `scan_imports`; `load_vars_file`; `load_vars_str`; `check_virtual`; `compile_file`; `strip_reserved_keys` and `prepend_frontmatter`
-- `crates/mds-cli/src/main.rs` — CLI: `OutputFormat` enum; `--format messages` on `build`; `run_build` (dispatcher) → `run_build_messages` (messages path) + `run_build_markdown` (markdown path); `read_build_input` + `read_stdin` (file readers with `MAX_FILE_SIZE` enforcement); `BuildArgs` struct; `run_check`/`run_init`; `exit_code`; `resolve_output_path`; `load_config`
+- `crates/mds-cli/src/main.rs` — CLI entry point: `Cli` struct; `Commands` enum (Build/Check/Init/Watch); `main()`; `run()`; `run_check()`; `run_init()`. Does NOT define `OutputFormat`, `BuildArgs`, or the run helpers — those are in `build.rs`.
+- `crates/mds-cli/src/build.rs` — shared build logic: `OutputFormat`; `BuildArgs`; `CompileOutput` (CLI-internal); `compile_to_content`; `compile_and_write`; `run_build` / `run_build_messages` / `run_build_markdown`; `read_build_input`; `read_stdin`; `write_output`; `load_config`; `resolve_output_path`; `build_runtime_vars`; `exit_code`; `auto_detect_mds_file`; `reject_directory_input`; `parse_key_value`; `parse_cli_value`
+- `crates/mds-cli/src/watch.rs` — watch subcommand: `WatchArgs`; `run_watch`; `run_watch_file`; `run_watch_dir`; `compile_all_dir`; watch helper functions (`dirs_to_watch`, `files_of_interest`, `event_is_relevant`, `collect_mds_files`, `output_path_for`, `canonicalize_vars_path`, `clear_terminal`, `resync_watches`, `drain_debounce`)
 - `crates/mds-core/tests/messages.rs` — integration tests for `@message` / messages mode
 - `crates/mds-cli/tests/format_messages.rs` — CLI integration tests for `--format messages`
+- `crates/mds-cli/tests/cli_watch.rs` — integration tests for `mds watch` (file and directory mode, deps tracking, content-dedup, Ctrl+C, debounce)
 - `crates/mds-core/tests/api_surface.rs` — public API regression tests; update when adding public symbols
 
 ## Related
 
 - ADR-008: bundles related language features in single PR (applied to v0.2.0 — built-ins, default args, and logical operators shipped together; `@message` + `compile_messages` + `--format messages` shipped together in Issue #56)
 - ADR-010: reuse `parse_expr_inner` across interpolation and directive parsing — `@message` role expressions (`{expr}` form) follow this same pattern; bare-word roles bypass `parse_expr_inner` and become `Expr::StringLiteral` directly
+- ADR-016: dep set recomputed on every rebuild in `watch` — `compile_and_write` returns the new transitive dep list; `run_watch_file` updates `files_of_interest` and `dirs_to_watch` on every successful rebuild. Never cache the dep set across rebuilds.
 - `crates/mds-core/src/resolver.rs` — canonical reference for module system, import semantics, `FrontmatterImport`, messages-mode resolution, `Arc<ResolvedModule>` cache
 - `crates/mds-core/src/evaluator.rs` — canonical reference for `EvalContext`, `evaluate_expr`, `evaluate_messages`, `collect_messages`, directive execution, closure restore, call-depth guards
 - `crates/mds-core/src/scope.rs` — canonical reference for `CapturedScope`, `Arc<FunctionDef>`, closure capture API
 - `crates/mds-core/src/ast.rs` — canonical reference for all AST types including `MessageBlock`; start here for new argument, expression, or directive forms
-- `crates/mds-cli/tests/` — end-to-end tests across 10+ categorized files (`language.rs`, `objects.rs`, `imports.rs`, `errors.rs`, `cli_build.rs`, `cli_commands.rs`, `security.rs`, `frontmatter.rs`, `warnings.rs`, `format_messages.rs`) plus `common/mod.rs`
+- `crates/mds-cli/tests/` — end-to-end tests across 11+ categorized files (`language.rs`, `objects.rs`, `imports.rs`, `errors.rs`, `cli_build.rs`, `cli_commands.rs`, `security.rs`, `frontmatter.rs`, `warnings.rs`, `format_messages.rs`, `cli_watch.rs`) plus `common/mod.rs`
 - Tech debt: issue #77 (ScanState extraction), #78 (CondValue/Expr unification), #79 (parse_interpolation_expr delegation), #80 (parse_simple_condition complexity)

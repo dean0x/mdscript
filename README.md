@@ -73,25 +73,74 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 
 ```
 mds build [FILE] [OPTIONS]    Compile an MDS template to Markdown
+mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE] [OPTIONS]    Validate without rendering
 mds init [FILENAME]           Create a starter MDS file
 
 Global options:
   -q, --quiet                 Suppress status messages (applies to all commands)
 
-Build options:
-  -o, --output <PATH>         Output file, or "-" for stdout
-  --out-dir <DIR>             Output directory (creates <stem>.md inside it)
-  --vars <FILE>               JSON file with variable overrides
+Build/Watch options:
+  -o, --output <PATH>         Output file, or "-" for stdout (build and single-file watch only;
+                              rejected in directory watch mode — use --out-dir instead)
+  --out-dir <DIR>             Output directory (build/single-file watch: <stem>.md; dir-mode watch: mirrors source subtree)
+  --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable)
-  --format <FORMAT>           markdown (default) or messages (JSON chat array)
+  --format <FORMAT>           markdown (default) or messages (JSON chat array;
+                              messages is single-file only — rejected in directory watch mode)
+
+Watch-only options:
+  --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
+  --debounce <MS>             Debounce window in milliseconds (default: 100)
+  --poll-interval <MS>        Liveness-probe interval in milliseconds (default: 1000).
+                              0 disables self-heal (native events only). Clamped to ≥50ms.
+                              The watcher self-heals after a watched dir/root is deleted and
+                              recreated; --poll-interval controls how quickly it detects recovery.
 
 Exit codes:
-  0   Success
+  0   Success (or clean Ctrl+C in watch mode)
   1   Template error (syntax, undefined variable, arity mismatch)
-  2   I/O error (file not found, not an MDS file)
+  2   I/O error (file not found, not an MDS file), or invalid CLI argument (clap parse error)
   3   Resource limit exceeded
 ```
+
+### Live preview with `mds watch`
+
+Watch a single file and recompile whenever it (or any of its imports) changes:
+
+```bash
+mds watch system.mds            # recompiles to system.md on every save
+mds watch system.mds -o -       # stream output to stdout
+mds watch system.mds --clear    # clear terminal before each rebuild
+mds watch system.mds --vars vars.json  # with variable overrides
+```
+
+Watch an entire directory:
+
+```bash
+mds watch src/                  # compile each .mds next to its source
+mds watch src/ --out-dir dist   # mirror source subtree under dist/
+                                # src/a/b/foo.mds → dist/a/b/foo.md  (not dist/foo.md)
+```
+
+> **Breaking change (next release):** Directory mode with `--out-dir` or `mds.json output_dir`
+> now mirrors the source subtree instead of writing flat stems. Old flat outputs are
+> orphaned and must be removed manually.
+
+**Single-file mode** tracks transitive imports: editing any `@import`-ed file triggers a
+recompile of the entry. **Directory mode** tracks a reverse-dependency graph: editing a
+shared partial rebuilds **all transitive importers** automatically.
+
+- `_`-prefixed files are **partials**: tracked in the dependency graph and their importers
+  are rebuilt when edited, but the partial itself never emits its own `.md` output.
+- **Cross-root imports**: if a file imports a partial located outside the watched root
+  (e.g. `../shared/_x.mds`), editing that external partial rebuilds its in-root importers.
+  The external file is never compiled to its own output.
+
+- Status lines and warnings go to stderr (pipe-safe). Compiled content only goes to stdout when `-o -`.
+- `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
+- Ctrl+C exits with code 0 and prints `Stopped watching.`
+- `--vars` file is reloaded from disk on every rebuild; edits to it trigger a recompile.
 
 ## Bundler Integration
 

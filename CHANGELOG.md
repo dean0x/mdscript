@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CLI
+
+- `mds watch` subcommand: watches an `.mds` file (or directory) and auto-recompiles on
+  save. Single-file mode tracks transitive `@import` deps — editing any imported file
+  triggers a rebuild. Directory mode tracks a **reverse-dependency graph**: editing a
+  shared partial recompiles all transitive importers. Full flag parity with `mds build`:
+  `-o`, `--out-dir`, `--vars`, `--set`, `--format` (single-file only), `--clear`
+  (clears terminal before rebuild when stderr is a TTY), `--debounce` (milliseconds,
+  default 100), `--poll-interval` (self-heal tick in ms, default 1000; `0` disables).
+  Status/warnings/errors go to stderr; compiled content goes to stdout only when `-o -`.
+  Ctrl+C exits cleanly with code 0. Depends on `notify 8` and `ctrlc 3.5` (both
+  compatible with the workspace MSRV of 1.88).
+- Internal refactor: build logic extracted from `main.rs` into `build.rs` with
+  `pub(crate)` helpers; `compile_and_write` shared helper routes both markdown and
+  messages modes through `read_build_input` / `compile_with_deps`, preserving the
+  10 MiB file-size cap on all code paths (PF-004).
+
+### **BREAKING** — `mds watch` output layout change (dir mode)
+
+- **`--out-dir` and `mds.json output_dir` now mirror the source subtree** instead of
+  using a flat stem. `src/a/b/foo.mds` now compiles to `out/a/b/foo.md` (was `out/foo.md`).
+  Old flat outputs are orphaned on disk — no auto-migration. Users with `--out-dir`
+  must delete stale flat outputs manually. Zero published users.
+- **`_`-prefixed files are now treated as partials**: they are tracked in the dependency
+  graph and trigger rebuilds of their importers, but they no longer emit their own `.md`
+  output file. Rename any `_`-prefixed files you previously wanted to compile to
+  a name without a leading underscore.
+
 ### Language features
 
 - `@message role: … @end` blocks for structured chat-message output. Roles may be

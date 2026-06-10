@@ -199,3 +199,30 @@ A fix may be incomplete, mis-scoped, or address a symptom rather than the root c
 - **Decision**: skip the second cycle when the convergence signal is strong — zero blocking items, all should-fix items resolved, CI green, and only consciously deferred/wont-fix items remain
 - **Consequences**: a second cycle yields diminishing returns when the first cycle fixed everything actionable
 - **Source**: self-learning:obs_m4n7p1
+
+## ADR-019: Track only curated team knowledge under .devflow/ via ignore-by-default plus explicit re-includes
+
+- **Date**: 2026-06-08
+- **Status**: Accepted
+- **Context**: 519 files under .devflow/ were tracked in git, most per-developer or transient (docs reports, dream runtime markers, locks, scratch results) rather than shared team knowledge
+- **Decision**: adopt an ignore-by-default .devflow/.gitignore (* then explicit !re-includes) tracking ONLY the curated shared set — decisions/decisions.md, decisions/pitfalls.md, features/index.json, features/*/KNOWLEDGE.md, release-baseline.md, and the policy .gitignore files
+- **Consequences**: shared knowledge belongs in git, transient/per-developer state does not. Ignore-by-default makes any NEW .devflow/ file ignored unless explicitly listed, preventing future drift where scratch or runtime files silently re-enter tracking. Committed as PR #92.
+- **Source**: self-learning:obs_y6z0a4
+
+## ADR-020: Do not mutate the working tree while background maintenance agents are actively writing .devflow/ files — wait for them to settle first
+
+- **Date**: 2026-06-08
+- **Status**: Accepted
+- **Context**: a branch switch / cleanup (checkout main, delete merged branch) was blocked by uncommitted .devflow/ changes that background Dream maintenance agents (decisions + knowledge) were concurrently writing
+- **Decision**: sequence the work — do NOT stash, discard, reset, or checkout over those files mid-flight
+- **Consequences**: a stash/checkout/reset that races an actively-writing agent can drop or corrupt curated decision/knowledge output. The irreversible step (the merge) was already complete, so the reversible local cleanup can safely wait for maintenance to settle.
+- **Source**: self-learning:obs_z7a1b5
+
+## ADR-021: Liveness-gated reconcile for the file-watch loop: cheap per-tick re-arm, full directory rescan only on watch-loss/recovery
+
+- **Date**: 2026-06-09
+- **Status**: Accepted
+- **Context**: designing the mds watch event loop to recompute file/dependency state without paying a full directory tree walk on every filesystem event
+- **Decision**: gate reconciliation on watcher liveness — on each tick do only a cheap re-arm of watches, and perform a full directory rescan ONLY when the watcher is lost and recovers
+- **Consequences**: a per-tick tree walk is O(tree) work on every event and does not scale
+- **Source**: self-learning:obs_b9c3d7

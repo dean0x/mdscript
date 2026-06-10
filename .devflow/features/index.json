@@ -1,6 +1,24 @@
 {
   "version": 1,
   "features": {
+    "mds-cli": {
+      "name": "MDS CLI",
+      "description": "Use when adding new subcommands, changing output-path resolution logic, modifying the watch architecture (single-file or directory mode), adding new compile paths, updating mds.json config handling, debugging stdout/stderr stream separation, or investigating exit codes. Keywords: mds build, mds check, mds watch, mds init, OutputFormat, messages mode, run_build, run_watch, build.rs, watch.rs, mds.json, output_dir, resolve_output_path, resolve_output_base, OutputBase, output_path_for, compile_and_write, compile_to_content, debounce, notify, ctrlc, content-dedup, last_written, dirs_to_watch, files_of_interest, exit_code, MAX_FILE_SIZE, read_build_input, BuildArgs, WatchArgs, forward_deps, affected_sources, is_partial, graph_key, process_dir_batch, process_dir_batch_incremental, process_dir_batch_vars_changed, liveness_probe_file, liveness_probe_dir, snapshot_state, state_differs, poll_interval, is_content_event, inotify Access, Linux busy-loop, external_recovery_decision, edge-triggered recovery, missing_watched_dirs, missing_external_dirs, recv_next, settle_mtime, FileCompileCtx, FileWatchState, DirWatchCtx, DirWatchState, LivenessState, compile_one_source, DirStartup, dir_watch_startup, handle_fs_event_file, handle_fs_event_dir, rebuild_file, armed_dirs, known_set, record_success, record_error, forget, stop_watching.",
+      "directories": [
+        "crates/mds-cli/src/",
+        "crates/mds-cli/tests/"
+      ],
+      "referencedFiles": [
+        "crates/mds-cli/src/main.rs",
+        "crates/mds-cli/src/build.rs",
+        "crates/mds-cli/src/watch.rs",
+        "crates/mds-cli/tests/cli_watch.rs",
+        "crates/mds-cli/tests/common/mod.rs",
+        "crates/mds-cli/Cargo.toml"
+      ],
+      "lastUpdated": "2026-06-10T17:34:31.143Z",
+      "createdBy": "implement"
+    },
     "mds-napi": {
       "name": "MDS Native Node.js Bindings (napi-rs)",
       "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode.",
@@ -21,12 +39,12 @@
         "crates/mds-core/src/options.rs",
         "Cargo.toml"
       ],
-      "lastUpdated": "2026-06-08T05:01:45.690Z",
+      "lastUpdated": "2026-06-10T17:34:40.090Z",
       "createdBy": "implement"
     },
     "mds-compiler": {
       "name": "MDS Compiler",
-      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, builtins, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, MAX_LOOP_ITERATIONS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, MessageGuard, validate_exports, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, run_build_messages, run_build_markdown, BuildArgs.",
+      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, or the compile_messages API family. Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch.",
       "directories": [
         "crates/mds-core/src/",
         "crates/mds-cli/src/",
@@ -48,11 +66,13 @@
         "crates/mds-core/src/limits.rs",
         "crates/mds-core/src/builtins.rs",
         "crates/mds-cli/src/main.rs",
+        "crates/mds-cli/src/build.rs",
+        "crates/mds-cli/src/watch.rs",
         "crates/mds-core/tests/api_surface.rs",
         "crates/mds-core/tests/messages.rs",
         "crates/mds-cli/tests/format_messages.rs"
       ],
-      "lastUpdated": "2026-06-08T05:01:26.587Z",
+      "lastUpdated": "2026-06-10T17:34:54.459Z",
       "createdBy": "implement"
     },
     "mds-js": {
