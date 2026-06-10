@@ -145,12 +145,7 @@ pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase) -> 
             );
             out
         }
-        OutputBase::NextToSource => {
-            let stem = source.file_stem().unwrap_or(source.as_os_str());
-            let mut name = std::ffi::OsString::from(stem);
-            name.push(".md");
-            source.parent().unwrap_or(Path::new(".")).join(name)
-        }
+        OutputBase::NextToSource => source.with_extension("md"),
     }
 }
 
@@ -516,23 +511,20 @@ pub(crate) fn resync_watches(
     current_dirs: &BTreeSet<PathBuf>,
     new_dirs: &BTreeSet<PathBuf>,
 ) -> BTreeSet<PathBuf> {
+    let mut result = current_dirs.clone();
     // Unwatch removed directories.
     for dir in current_dirs.difference(new_dirs) {
         // Errors here are non-fatal (dir may have been deleted).
         let _ = watcher.unwatch(dir);
+        result.remove(dir);
     }
     // Watch new directories.
-    let mut result = current_dirs.clone();
     for dir in new_dirs.difference(current_dirs) {
         if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
             eprintln!("warning: failed to watch {}: {e}", dir.display());
         } else {
             result.insert(dir.clone());
         }
-    }
-    // Remove unwatched dirs from result.
-    for dir in current_dirs.difference(new_dirs) {
-        result.remove(dir);
     }
     result
 }
@@ -1198,6 +1190,11 @@ impl DirWatchState {
         settle_mtime(src, &mut self.last_mtimes);
     }
 
+    /// Collect `known_files` as a `HashSet` for use with `snapshot_state`.
+    fn known_set(&self) -> HashSet<PathBuf> {
+        self.known_files.iter().cloned().collect()
+    }
+
     /// Remove all state for a deleted source and its output.
     fn forget(&mut self, src: &Path, out: &Path) {
         self.last_written.remove(out);
@@ -1413,9 +1410,7 @@ fn liveness_probe_dir(
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("{e:?}");
-                        let known_set: HashSet<PathBuf> =
-                            state.known_files.iter().cloned().collect();
-                        state.last_mtimes = snapshot_state(&known_set);
+                        state.last_mtimes = snapshot_state(&state.known_set());
                         return;
                     }
                 };
@@ -1435,8 +1430,7 @@ fn liveness_probe_dir(
         // Replace known_files with the current snapshot.
         state.known_files = current_files;
         // Refresh mtime snapshot.
-        let known_set: HashSet<PathBuf> = state.known_files.iter().cloned().collect();
-        state.last_mtimes = snapshot_state(&known_set);
+        state.last_mtimes = snapshot_state(&state.known_set());
     }
 }
 
@@ -1534,8 +1528,7 @@ fn handle_fs_event_dir(
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e:?}");
-            let known_set: HashSet<PathBuf> = state.known_files.iter().cloned().collect();
-            state.last_mtimes = snapshot_state(&known_set);
+            state.last_mtimes = snapshot_state(&state.known_set());
             return DirEventOutcome::Done;
         }
     };
@@ -1748,10 +1741,7 @@ fn dir_watch_startup(
     }
 
     // Pre-loop mtime snapshot for liveness probe state.
-    {
-        let known_set: HashSet<PathBuf> = state.known_files.iter().cloned().collect();
-        state.last_mtimes = snapshot_state(&known_set);
-    }
+    state.last_mtimes = snapshot_state(&state.known_set());
 
     let liveness = LivenessState {
         first_tick: true,
