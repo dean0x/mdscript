@@ -81,11 +81,13 @@ Global options:
   -q, --quiet                 Suppress status messages (applies to all commands)
 
 Build/Watch options:
-  -o, --output <PATH>         Output file, or "-" for stdout
+  -o, --output <PATH>         Output file, or "-" for stdout (build and single-file watch only;
+                              rejected in directory watch mode — use --out-dir instead)
   --out-dir <DIR>             Output directory (build/single-file watch: <stem>.md; dir-mode watch: mirrors source subtree)
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable)
-  --format <FORMAT>           markdown (default) or messages (JSON chat array)
+  --format <FORMAT>           markdown (default) or messages (JSON chat array;
+                              messages is single-file only — rejected in directory watch mode)
 
 Watch-only options:
   --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
