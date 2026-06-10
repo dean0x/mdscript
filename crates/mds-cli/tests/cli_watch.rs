@@ -800,10 +800,10 @@ fn watch_ctrl_c_exits_cleanly() {
     );
 }
 
-// ── T-P1: Debounce coalesces rapid edits ──────────────────────────────────
+// ── T-P1: Debounce — final value wins after rapid edits ───────────────────
 
 #[test]
-fn watch_debounce_coalesces_rapid_edits() {
+fn watch_debounce_final_value_wins_after_rapid_edits() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
     std::fs::write(&src, "---\nname: v0\n---\nHello {name}!\n").unwrap();
@@ -2688,25 +2688,31 @@ fn watch_dir_mode_delete_partial_surfaces_broken_import() {
     // Delete the partial.
     std::fs::remove_file(&partial).unwrap();
 
-    // Give the watcher time to process the deletion and attempt recompile.
-    std::thread::sleep(Duration::from_millis(600));
+    // Poll for the broken-import error rather than sleeping: wait until stderr
+    // contains the "file not found" message that the compiler emits for a missing import.
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    loop {
+        let bytes = stderr_buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        if s.contains("file not found") || s.contains("No such file") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "expected a 'file not found' / 'No such file' error after deleting imported \
+                 partial within {:?}; stderr so far:\n{s}",
+                TIMEOUT
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
-    // Verify the importer's output was removed (no valid compilation possible).
-    // Actually: the importer recompiles but fails due to broken import.
-    // The old output may be preserved (watcher keeps last good output on error).
+    // Verify the importer's output was not silently invalidated.
     // The important assertion: the process stays alive.
     let still_running = child.0.try_wait().unwrap().is_none();
     assert!(
         still_running,
         "watcher must stay alive after partial deletion surfaces broken import"
-    );
-
-    // Verify an error appeared in stderr (broken import surfaced).
-    let bytes = stderr_buf.lock().unwrap().clone();
-    let stderr_str = String::from_utf8_lossy(&bytes);
-    assert!(
-        !stderr_str.is_empty(),
-        "watcher should have emitted an error after deleting imported partial"
     );
 
     drop(child);
@@ -2911,8 +2917,28 @@ fn watch_dir_mode_persistent_error_bounded_count() {
         "a.md should compile despite bad.mds error"
     );
 
-    // Idle for ≥3 ticks (300ms at 100ms poll-interval) — error-settle must suppress re-fires.
-    std::thread::sleep(Duration::from_millis(600));
+    // Scale-invariant error bound (applies ADR-021, guards PF-006): run two equal idle
+    // windows and assert the "undefined variable" count does NOT grow in the second window.
+    // A per-tick implementation would fire continuously; error-settle means it fires once at
+    // startup and then goes silent.
+    //
+    // Window 1 — ≥5 ticks at 100ms (~500ms): initial startup error may appear here.
+    std::thread::sleep(Duration::from_millis(500));
+    let count_w1 = {
+        let bytes = stderr_buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        // Count exactly once per error emission (each miette block contains this phrase once).
+        s.matches("undefined variable").count()
+    };
+
+    // Window 2 — another ≥5 ticks: nothing changed, error-settle must keep count frozen.
+    // Any increase here proves the watcher is still firing per-tick (the bug).
+    std::thread::sleep(Duration::from_millis(500));
+    let count_w2 = {
+        let bytes = stderr_buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&bytes);
+        s.matches("undefined variable").count()
+    };
 
     // Watcher must still be alive.
     let still_running = child.0.try_wait().unwrap().is_none();
@@ -2928,15 +2954,11 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     let stderr_bytes = stderr_buf.lock().unwrap().clone();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
-    // Count DISTINCT error events for bad.mds — count `"undefined variable"` which appears
-    // exactly once per error emission (not per line of the multi-line miette block).
-    // Error-settle must suppress re-fires, so the count must be bounded (not once per tick).
-    // Upper bound: ≤6 (initial + possible reconcile rounds; generous for CI load).
-    let bad_error_count = stderr_str.matches("undefined variable").count();
-    assert!(
-        bad_error_count <= 6,
-        "error for bad.mds must be bounded (not once per tick); \
-         got {bad_error_count} events; stderr:\n{stderr_str}"
+    assert_eq!(
+        count_w1, count_w2,
+        "error count must not grow in a second idle window (not once-per-tick); \
+         w1={count_w1}, w2={count_w2} (applies ADR-021, guards PF-006); \
+         stderr:\n{stderr_str}"
     );
 }
 
@@ -3212,7 +3234,7 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
     let still_running = child.0.try_wait().unwrap().is_none();
     assert!(still_running, "watcher must remain alive after 50 edits");
 
-    // Drop (kills + waits) → clean exit verified by absence of panic.
+    // Drop (kills the child process) — process stays responsive across 50 edits; teardown via kill.
     drop(child);
 }
 
@@ -3220,14 +3242,14 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
 
 /// Regression test for the edge-triggered recovery fix (ADR-021).
 ///
-/// When the watched entry's PARENT DIRECTORY is deleted entirely, `rearm()` returns
-/// `false` every idle tick (the parent is missing).  Before the fix this forced
-/// `recovery = true` every tick → one compile attempt → one "file not found" error
-/// PER TICK, violating the design's error-settle intent (DD1: "print at most once per
-/// real attempt, not per tick").
+/// When the watched entry's PARENT DIRECTORY is deleted entirely, the per-tick
+/// `watcher.watch()` re-arm fails every idle tick (the parent is missing).  Before the
+/// fix this forced `recovery = true` every tick → one compile attempt → one "file not
+/// found" error PER TICK, violating the design's error-settle intent (DD1: "print at
+/// most once per real attempt, not per tick").
 ///
-/// After the fix the recovery logic is edge-triggered (mirrors the
-/// `external_recovery_decision` / `LivenessState.missing_external_dirs` pattern):
+/// After the fix the recovery logic is edge-triggered (uses
+/// `external_recovery_decision` / `FileWatchState.missing_watched_dirs`):
 /// - While the parent stays deleted, the watcher is quiet (no per-tick error).
 /// - The moment the parent reappears (vanish→reappear edge), recovery fires and
 ///   recompiles (AC-W1 preserved).
