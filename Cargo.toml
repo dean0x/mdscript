@@ -28,9 +28,14 @@ napi = { version = "3.9.0", default-features = false, features = ["napi3", "serd
 napi-derive = "3.5.6"
 napi-build = "2"
 # notify is CC0-1.0 (public-domain dedication). CC0 is permissive and non-contaminating
-# with respect to the workspace MIT license. Explicitly accepted here. A cargo-deny
-# license allowlist (licenses.allow = ["CC0-1.0"]) would enforce this acceptance in CI
-# (suggested follow-up, out of scope for this batch).
+# with respect to the workspace MIT license. Explicitly accepted here.
+# notify and ctrlc also introduce additional transitive license families (platform-specific):
+#   - inotify 0.11.1 / inotify-sys 0.1.5 → ISC (Linux only)
+#   - dispatch2 0.3.1 → Zlib OR Apache-2.0 OR MIT (macOS only, via ctrlc)
+# ISC and Zlib are permissive and MIT-compatible; no copyleft or contamination risk.
+# All three families are explicitly accepted here.
+# A cargo-deny license allowlist (licenses.allow = ["MIT","Apache-2.0","CC0-1.0","ISC","Zlib"])
+# would enforce this acceptance in CI (suggested follow-up, out of scope for this batch).
 notify = "8"
 ctrlc = "3.5"
 
