@@ -384,6 +384,11 @@ impl ModuleCache {
     /// Common messages-mode processing: tokenize, parse, build scope, collect messages.
     ///
     /// Shares setup with `process_module` but calls `evaluate_messages` at the end.
+    /// When the parsed module has an `@extends` directive the shared extends pipeline
+    /// (`resolve_extends_components`) builds `final_body` and `scope` identically to
+    /// text mode — then the `has_message_block` guard and `evaluate_messages` are called
+    /// on `final_body` (NOT `module.body`), so @message blocks inside base @block
+    /// defaults are correctly detected (avoids PF-004 divergence, decision #8).
     fn process_module_messages(
         &mut self,
         ctx: &ModuleCtx<'_>,
@@ -392,6 +397,35 @@ impl ModuleCache {
     ) -> Result<Vec<EvalMessage>, MdsError> {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
+
+        // ── Extends branch (decision #8) ─────────────────────────────────────
+        // When the child has @extends, delegate to the shared extends pipeline so that:
+        // - PF-004 (avoids PF-004): oversized-base guard fires via resolve_by_key_skeleton.
+        // - has_message_block is checked against final_body (base+overrides spliced), not module.body.
+        // - Scope and final_body are assembled identically to text mode (no drift).
+        if let Some(ext) = module.extends.clone() {
+            let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+            let ExtendsComponents {
+                final_body,
+                mut scope,
+                ..
+            } =
+                self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+
+            // Check @message presence against final_body (NOT module.body): a base whose
+            // @message blocks live inside @block defaults is correctly detected after splice.
+            // (ADR-016: re-validate dynamically-assembled content at the leaf.)
+            if !has_message_block(&final_body) {
+                return Err(MdsError::syntax(
+                    "compile_messages requires at least one @message block, \
+                     but none were found in the template",
+                ));
+            }
+
+            return evaluate_messages(&final_body, &mut scope, warnings);
+        }
+
+        // ── Standalone (non-extending) path ──────────────────────────────────
 
         let (mut scope, fm_imports) =
             build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
@@ -544,24 +578,27 @@ impl ModuleCache {
         })
     }
 
-    /// Process a child template that has an `@extends` directive.
+    /// Shared extends-pipeline: steps 3a-3e are identical for text and messages modes.
     ///
-    /// Skeleton-resolves the base, validates child body, splices the final body,
-    /// then validates and evaluates against the merged scope.
+    /// Builds the `final_body` (splice of base skeleton with effective block overrides)
+    /// and the `scope` (deep-merged frontmatter + FM imports + functions) needed by
+    /// both `process_module_extends` (text) and `process_module_messages` (messages).
     ///
-    /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
-    /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
-    #[allow(clippy::too_many_arguments)]
-    fn process_module_extends(
+    /// Callers differ only in the terminal step (step 3f):
+    /// - Text mode:     `validate` → `evaluate(&final_body, …)`
+    /// - Messages mode: `has_message_block` guard → `evaluate_messages(&final_body, …)`
+    ///
+    /// Factoring here enforces that BOTH modes go through the same PF-004-safe
+    /// `resolve_by_key_skeleton` path for the base, and share one copy of the
+    /// scope-construction pipeline (ADR-016: re-validate at the leaf; decision #3/7).
+    fn resolve_extends_components(
         &mut self,
-        module: crate::ast::Module,
-        ext: crate::ast::ExtendsDirective,
+        module: &crate::ast::Module,
+        ext: &crate::ast::ExtendsDirective,
         ctx: &ModuleCtx<'_>,
-        _is_md: bool,
-        raw_frontmatter: Option<String>,
-        frontmatter_values: Option<serde_yaml_ng::Mapping>,
+        frontmatter_values: &Option<serde_yaml_ng::Mapping>,
         warnings: &mut Vec<String>,
-    ) -> Result<ResolvedModule, MdsError> {
+    ) -> Result<ExtendsComponents, MdsError> {
         // ── Step 3a: validate and resolve the base in skeleton mode ──────────
         validate_import_path(&ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
@@ -571,8 +608,9 @@ impl ModuleCache {
             .normalize(ctx.base_key, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
-        // PF-004: resolve through resolve_by_key_skeleton so cycle detection,
-        // MAX_IMPORT_DEPTH, dependency tracking, and MAX_FILE_SIZE all apply.
+        // PF-004 (avoids PF-004): resolve through resolve_by_key_skeleton so cycle
+        // detection, MAX_IMPORT_DEPTH, dependency tracking, and MAX_FILE_SIZE all apply.
+        // This guard holds for BOTH text and messages modes — they share this path.
         let base = self
             .resolve_by_key_skeleton(&base_key, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
@@ -638,14 +676,14 @@ impl ModuleCache {
             .frontmatter_values
             .as_ref()
             .and_then(|m| m.get("imports"))
-            .map(|imports_val| parse_frontmatter_imports_from_yaml(imports_val))
+            .map(parse_frontmatter_imports_from_yaml)
             .transpose()?
             .unwrap_or_default();
 
         let child_fm_imports: Vec<FrontmatterImport> = frontmatter_values
             .as_ref()
             .and_then(|m| m.get("imports"))
-            .map(|imports_val| parse_frontmatter_imports_from_yaml(imports_val))
+            .map(parse_frontmatter_imports_from_yaml)
             .transpose()?
             .unwrap_or_default();
 
@@ -709,10 +747,49 @@ impl ModuleCache {
         // pass through verbatim. Between-block spacing (Text nodes) is preserved (decision #9, F11).
         let final_body = splice_skeleton(&effective_skeleton, &effective_blocks);
 
+        Ok(ExtendsComponents {
+            final_body,
+            scope,
+            functions,
+            effective_skeleton,
+            effective_blocks,
+            has_explicit_exports,
+            explicit_exports,
+        })
+    }
+
+    /// Evaluate an extending child template in text mode.
+    ///
+    /// Delegates the shared pipeline (steps 3a-3e) to `resolve_extends_components`,
+    /// then runs `validator::validate` + `evaluate` on `final_body` (step 3f).
+    ///
+    /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
+    /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
+    #[allow(clippy::too_many_arguments)]
+    fn process_module_extends(
+        &mut self,
+        module: crate::ast::Module,
+        ext: crate::ast::ExtendsDirective,
+        ctx: &ModuleCtx<'_>,
+        _is_md: bool,
+        raw_frontmatter: Option<String>,
+        frontmatter_values: Option<serde_yaml_ng::Mapping>,
+        warnings: &mut Vec<String>,
+    ) -> Result<ResolvedModule, MdsError> {
+        let ExtendsComponents {
+            final_body,
+            mut scope,
+            functions,
+            effective_skeleton,
+            effective_blocks,
+            has_explicit_exports,
+            explicit_exports,
+        } = self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+
         // ── Step 3f: validate + evaluate on final_body ────────────────────────
         // Operates on final_body, NOT module.body. This is what makes E12 work:
         // a base default block referencing an undefined var is caught HERE against
-        // the merged leaf scope.
+        // the merged leaf scope. (ADR-016: re-validate dynamically-assembled content.)
         validator::validate(&final_body, &mut scope, ctx.file_str, ctx.source)?;
 
         let prompt_body = evaluate(&final_body, &mut scope, warnings)?;
@@ -1274,6 +1351,30 @@ struct CollectedDefs {
     /// Shared with `collect_define` so that a `@block foo:` and a `@define foo()` in the same
     /// module surface as `mds::name_collision` (same namespace — decision #10).
     block_names: HashSet<String>,
+}
+
+/// Shared output of [`ModuleCache::resolve_extends_components`].
+///
+/// Steps 3a-3e (base resolution, child-only-blocks check, effective-blocks construction,
+/// scope merge, and skeleton splice) are identical for text and messages modes. This struct
+/// carries those results so the two terminal steps differ only in the final evaluate call:
+/// - Text mode:     `validator::validate` → `evaluate(&final_body, …)`
+/// - Messages mode: `has_message_block` guard → `evaluate_messages(&final_body, …)`
+struct ExtendsComponents {
+    /// Spliced final body: base skeleton with effective block bodies inlined.
+    final_body: Vec<Node>,
+    /// Merged scope (base < child < runtime), with FM imports and functions loaded.
+    scope: Scope,
+    /// Merged function map (base functions + child overrides).
+    functions: HashMap<String, Arc<FunctionDef>>,
+    /// Root ancestor skeleton, Arc-shared (O(1), no deep-clone).
+    effective_skeleton: Arc<[Node]>,
+    /// Fully-overridden block map for this subtree.
+    effective_blocks: IndexMap<String, Arc<BlockNode>>,
+    /// Whether the child declared any `@export` directives.
+    has_explicit_exports: bool,
+    /// Named exports from the child.
+    explicit_exports: HashSet<String>,
 }
 
 /// Bundle of borrowed per-module context threaded through the AST walk helpers.
@@ -3620,6 +3721,310 @@ mod tests {
         assert!(
             result.contains("c=from_c"),
             "c=from_c (C overrides B): {result}"
+        );
+    }
+
+    // ── Phase 4: messages-mode inheritance ───────────────────────────────────
+
+    /// Helper: compile a VirtualFs entry in messages mode.
+    fn compile_messages_virtual_helper(
+        files: &[(&str, &str)],
+        entry: &str,
+    ) -> Result<Vec<crate::Message>, MdsError> {
+        let map: std::collections::HashMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        crate::compile_messages_virtual(map, entry, None).map(|output| output.messages)
+    }
+
+    // ── F9: messages mode — @message-structured base + child @block override ──
+    //
+    // Layout: @block is at top-level (base skeleton), @message is inside the @block body.
+    // @block cannot appear inside @message (parser enforces top-level only).
+
+    #[test]
+    fn f9_messages_mode_block_override_compiles_to_message_array() {
+        // Base: @block at top level, @message inside the block body (default).
+        // Child: overrides the block — the @message in the override surfaces in output.
+        let base = concat!(
+            "@block msg:\n",
+            "@message user:\n",
+            "Default question.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let child = concat!(
+            "@extends \"./base.mds\"\n",
+            "@block msg:\n",
+            "@message user:\n",
+            "Child override question.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let files = [("base.mds", base), ("child.mds", child)];
+        let messages = compile_messages_virtual_helper(&files, "child.mds")
+            .expect("F9: messages-mode inheritance should compile");
+        assert_eq!(
+            messages.len(),
+            1,
+            "F9: expected 1 message, got {messages:?}"
+        );
+        assert_eq!(messages[0].role, "user", "F9: expected role=user");
+        assert!(
+            messages[0].content.contains("Child override question."),
+            "F9: child block override should appear in message content: {:?}",
+            messages[0].content,
+        );
+    }
+
+    #[test]
+    fn f9_messages_mode_default_block_in_message_body() {
+        // @message inside a base default block (un-overridden by child) surfaces in output.
+        // @block is top-level; @message is inside the @block body.
+        let base = concat!(
+            "@block intro:\n",
+            "@message system:\n",
+            "You are a helpful assistant.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+        let messages = compile_messages_virtual_helper(&files, "child.mds")
+            .expect("F9: @message inside un-overridden base default block should surface");
+        assert_eq!(
+            messages.len(),
+            1,
+            "F9: expected 1 message, got {messages:?}"
+        );
+        assert_eq!(messages[0].role, "system");
+        assert!(
+            messages[0].content.contains("You are a helpful assistant."),
+            "F9: message from base default block: {:?}",
+            messages[0].content,
+        );
+    }
+
+    // ── E13: messages mode — base with no @message → clear error ─────────────
+
+    #[test]
+    fn e13_messages_mode_base_no_message_block_clear_error() {
+        // Base has @block placeholders but no @message — compiling child in
+        // messages mode should return the existing "no @message block" guard error.
+        let base = concat!(
+            "You are an assistant.\n",
+            "@block instructions:\n",
+            "Do things carefully.\n",
+            "@end\n",
+        );
+        let child = concat!(
+            "@extends \"./base.mds\"\n",
+            "@block instructions:\n",
+            "Do things quickly.\n",
+            "@end\n",
+        );
+        let files = [("base.mds", base), ("child.mds", child)];
+        let err = compile_messages_virtual_helper(&files, "child.mds")
+            .expect_err("E13: no @message in final_body → should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("@message") || msg.contains("message"),
+            "E13: error should mention @message: {msg}"
+        );
+        // Must be mds::syntax (existing guard) not an internal panic.
+        let code = err.serialize().code;
+        assert_eq!(
+            code, "mds::syntax",
+            "E13: error code should be mds::syntax: {code}"
+        );
+    }
+
+    // ── F10 (messages half): empty block renders empty in messages mode ────────
+
+    #[test]
+    fn f10_messages_mode_empty_block_renders_empty() {
+        // An @block with no default and no child override renders empty — surrounding
+        // @message content intact. @block is at top level; @message is a sibling,
+        // not a parent (parser rejects @block inside @message).
+        let base = concat!(
+            // A @message block with literal surrounding text — no @block inside message.
+            "@message user:\n",
+            "Before.\n",
+            "@end\n",
+            // The @block placeholder at top level: empty default body.
+            "@block gap:\n",
+            "@end\n",
+            // Another @message for content after the gap placeholder.
+            "@message user:\n",
+            "After.\n",
+            "@end\n",
+        );
+        // Child overrides the gap block with an empty body (same as default).
+        let child = concat!("@extends \"./base.mds\"\n", "@block gap:\n", "@end\n",);
+        let files = [("base.mds", base), ("child.mds", child)];
+        let messages = compile_messages_virtual_helper(&files, "child.mds")
+            .expect("F10 messages: empty block should not break compilation");
+        // Two @message blocks: Before. and After.
+        assert_eq!(
+            messages.len(),
+            2,
+            "F10: expected 2 messages, got {messages:?}"
+        );
+        let first_content = &messages[0].content;
+        let second_content = &messages[1].content;
+        assert!(
+            first_content.contains("Before."),
+            "F10: first message must contain 'Before.': {first_content}"
+        );
+        assert!(
+            second_content.contains("After."),
+            "F10: second message must contain 'After.': {second_content}"
+        );
+    }
+
+    // ── P5: deep-chain performance guard (TEXT + MESSAGES, < 2 s) ────────────
+
+    #[test]
+    fn p5_deep_chain_32_levels_text_and_messages_under_2s() {
+        // Build a 32-level chain: file0 @extends file1 @extends ... @extends file31
+        // file31 is the root with @block + @message content.
+        // Both text and messages compilation must complete in < 2 s with no OOM.
+        let depth = 32usize;
+        let mut files: Vec<(String, String)> = Vec::new();
+
+        // Root base: lightweight skeleton with @block containing @message — @block at
+        // top-level, @message inside it. Both text and messages modes work with this.
+        let root_src = concat!(
+            "@block content:\n",
+            "@message user:\n",
+            "Hello from root.\n",
+            "@end\n",
+            "@end\n",
+        )
+        .to_string();
+        files.push((format!("file{depth}.mds"), root_src));
+
+        // Each level just extends the next — no frontmatter, no overrides.
+        for i in (0..depth).rev() {
+            let src = format!("@extends \"./file{}.mds\"\n", i + 1);
+            files.push((format!("file{i}.mds"), src));
+        }
+
+        let file_refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let text_result = compile_virtual(&file_refs, "file0.mds");
+        let messages_result = compile_messages_virtual_helper(&file_refs, "file0.mds");
+        let elapsed = start.elapsed();
+
+        assert!(
+            text_result.is_ok(),
+            "P5: 32-level chain text compile failed: {:?}",
+            text_result.err()
+        );
+        assert!(
+            messages_result.is_ok(),
+            "P5: 32-level chain messages compile failed: {:?}",
+            messages_result.err()
+        );
+        assert!(
+            elapsed.as_secs() < 2,
+            "P5: 32-level chain took {:?}, must be < 2 s",
+            elapsed
+        );
+    }
+
+    // ── P6: PF-004 oversized base rejected in BOTH modes ─────────────────────
+
+    #[test]
+    fn p6_pf004_oversized_base_rejected_in_text_mode() {
+        // PF-004 (applying avoids PF-004): a base larger than MAX_FILE_SIZE is rejected
+        // via resolve_by_key_skeleton (FileSystem trait path, never std::fs).
+        // Text mode must return mds::resource_limit.
+        use crate::limits::MAX_FILE_SIZE;
+        // One byte over the limit — large enough to trigger the guard.
+        let oversized = "x".repeat((MAX_FILE_SIZE + 1) as usize);
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", oversized.as_str()), ("child.mds", child)];
+        let err = compile_virtual(&files, "child.mds")
+            .expect_err("P6 text: oversized base must be rejected");
+        let code = err.serialize().code;
+        assert_eq!(
+            code, "mds::resource_limit",
+            "P6 text: error code must be mds::resource_limit: {code}"
+        );
+        // PF-004 + debug-panics gotcha: no base filesystem path in error message.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("/Users/") && !msg.contains("\\Users\\"),
+            "P6 text: error must not leak absolute filesystem path: {msg}"
+        );
+    }
+
+    #[test]
+    fn p6_pf004_oversized_base_rejected_in_messages_mode() {
+        // PF-004 (applying avoids PF-004): same oversized-base guard must also fire
+        // in messages mode — both modes go through resolve_by_key_skeleton.
+        use crate::limits::MAX_FILE_SIZE;
+        let oversized = "x".repeat((MAX_FILE_SIZE + 1) as usize);
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", oversized.as_str()), ("child.mds", child)];
+        let err = compile_messages_virtual_helper(&files, "child.mds")
+            .expect_err("P6 messages: oversized base must be rejected");
+        let code = err.serialize().code;
+        assert_eq!(
+            code, "mds::resource_limit",
+            "P6 messages: error code must be mds::resource_limit: {code}"
+        );
+        // PF-004 + debug-panics gotcha: no base filesystem path in error message.
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("/Users/") && !msg.contains("\\Users\\"),
+            "P6 messages: error must not leak absolute filesystem path: {msg}"
+        );
+    }
+
+    // ── F9 multi-level messages (two-hop chain) ───────────────────────────────
+
+    #[test]
+    fn f9_messages_mode_multilevel_chain() {
+        // A←B←C: C extends B extends A. A has @block (top-level) with @message inside.
+        // B overrides the block. C overrides again. Most-derived (C) wins.
+        let a = concat!(
+            "@block msg:\n",
+            "@message user:\n",
+            "From A.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let b = concat!(
+            "@extends \"./a.mds\"\n",
+            "@block msg:\n",
+            "@message user:\n",
+            "From B.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let c = concat!(
+            "@extends \"./b.mds\"\n",
+            "@block msg:\n",
+            "@message user:\n",
+            "From C.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let files = [("a.mds", a), ("b.mds", b), ("c.mds", c)];
+        let messages = compile_messages_virtual_helper(&files, "c.mds")
+            .expect("F9 multilevel: should compile");
+        assert_eq!(messages.len(), 1, "F9 multilevel: got {messages:?}");
+        assert!(
+            messages[0].content.contains("From C."),
+            "F9 multilevel: most-derived (C) wins: {:?}",
+            messages[0].content
         );
     }
 }
