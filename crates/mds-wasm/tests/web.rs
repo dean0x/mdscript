@@ -497,11 +497,17 @@ fn scan_imports_handles_all_directive_forms() {
 
 // ── Template inheritance tests (@extends / @block) ───────────────────────────
 
-/// Build a modules option from a two-file virtual FS map: child + base.
+/// Build a modules option for inheritance tests.
+///
+/// `source` (child_src) is passed as the first argument to `compile` /
+/// `compile_messages` and is registered under `"filename"` by the binding.
+/// `modules` must therefore contain ONLY the *other* files (the base template),
+/// not the entry file — otherwise the binding rejects it with
+/// `mds::filename_collision`.
 fn inheritance_modules_opts(child_src: &str, base_src: &str) -> JsValue {
+    let _ = child_src; // entry content is passed as `source`, not in modules
     to_js_object(&serde_json::json!({
         "modules": {
-            "child.mds": child_src,
             "base.mds": base_src,
         },
         "filename": "child.mds"
@@ -598,15 +604,8 @@ fn compile_extends_messages_mode() {
         "@extends \"./base.mds\"\n",
         "@block user_msg:\n@message user:\nSummarize findings.\n@end\n@end\n",
     );
-    let opts = to_js_object(&serde_json::json!({
-        "modules": {
-            "child.mds": child_src,
-            "base.mds": base_src,
-        },
-        "filename": "child.mds"
-    }));
+    let opts = inheritance_modules_opts(child_src, base_src);
 
-    // compile_messages_virtual is exposed as compileMessages in WASM? Check lib.
     // The WASM binding exposes `compile_messages` as the messages-mode entry point.
     let result = mds_wasm::compile_messages(child_src, opts).unwrap();
 
