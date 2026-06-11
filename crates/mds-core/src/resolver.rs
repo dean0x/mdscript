@@ -2888,6 +2888,74 @@ mod tests {
         );
     }
 
+    // ── F4/E4 intermediate: intermediate template may not declare new @block ────
+    //
+    // AC: In an A←B←C chain, only the root (A) may declare @block placeholders.
+    // B is an intermediate — it extends A but is itself extended by C. If B
+    // introduces a brand-new @block name absent from A, both compiling B standalone
+    // and compiling the leaf C must reject with mds::extends.
+
+    #[test]
+    fn f4_intermediate_new_block_rejected() {
+        // A = root base with one declared @block.
+        let a = "@block known:\nRoot default.\n@end\n";
+        // B = intermediate: extends A, overrides the known block (valid), but also
+        // declares a NEW @block name that A never declared (invalid).
+        let b = concat!(
+            "@extends \"./a.mds\"\n",
+            "@block known:\nB override.\n@end\n",
+            "@block new_in_b:\nThis must be rejected.\n@end\n",
+        );
+        // C = leaf extending B (valid chain if B were valid).
+        let c = "@extends \"./b.mds\"\n@block known:\nC override.\n@end\n";
+        let files = [("a.mds", a), ("b.mds", b), ("c.mds", c)];
+
+        // Compiling B directly must fail.
+        let err_b = compile_virtual(&files, "b.mds")
+            .expect_err("F4-intermediate: new @block in intermediate B must be rejected");
+        let serialized_b = err_b.serialize();
+        assert_eq!(
+            serialized_b.code, "mds::extends",
+            "F4-intermediate: B compile error code must be mds::extends: {serialized_b:?}"
+        );
+        assert!(
+            serialized_b
+                .message
+                .contains("only the root template may declare"),
+            "F4-intermediate: B error message must mention root template: {}",
+            serialized_b.message
+        );
+        assert!(
+            serialized_b.span.is_some(),
+            "F4-intermediate: B error must carry a span"
+        );
+
+        // Compiling the leaf C must also fail (B is invalid, so C cannot build on it).
+        let err_c = compile_virtual(&files, "c.mds")
+            .expect_err("F4-intermediate: leaf C on invalid intermediate B must be rejected");
+        let serialized_c = err_c.serialize();
+        assert_eq!(
+            serialized_c.code, "mds::extends",
+            "F4-intermediate: C compile error code must be mds::extends: {serialized_c:?}"
+        );
+        assert!(
+            serialized_c
+                .message
+                .contains("only the root template may declare"),
+            "F4-intermediate: C error message must mention root template: {}",
+            serialized_c.message
+        );
+
+        // check_virtual on B must produce the same error (A5 parity).
+        let check_err_b = check_virtual(&files, "b.mds")
+            .expect_err("F4-intermediate: check_virtual on B must also reject");
+        assert_eq!(
+            check_err_b.serialize().code,
+            "mds::extends",
+            "F4-intermediate: check_virtual B error code must be mds::extends"
+        );
+    }
+
     // ── E5: circular inheritance → mds::circular_import ──────────────────────
 
     #[test]
@@ -4100,6 +4168,98 @@ mod tests {
             "F9 multilevel: most-derived (C) wins: {:?}",
             messages[0].content
         );
+    }
+
+    // ── F11: whitespace contract — 4-combination byte-exact matrix ───────────────
+    //
+    // Decision #9 (from spec): block-body edge newlines (ONE leading + ONE trailing
+    // `\n`) are stripped at parse time. Between-block Text nodes in the skeleton
+    // are preserved verbatim. This test pins all four observable combinations:
+    //
+    //  1. Base default (no override):    skeleton text nodes pass through; block
+    //                                    body edge newlines stripped.
+    //  2. Child override, no blanks:     body = "Override." — only text, no leading/
+    //                                    trailing blank lines.
+    //  3. Child override WITH blanks:    extra blank lines inside the block body
+    //                                    survive (only ONE edge \n is stripped each
+    //                                    side), producing one extra \n in output.
+    //  4. Child override, indented:      leading spaces inside block body are
+    //                                    preserved verbatim; edge \n still stripped.
+
+    #[test]
+    fn f11_whitespace_contract_4_combination_matrix() {
+        // Base skeleton: text before, one @block, text after.
+        // Between the Text("Intro.\n\n") node and the @block body there is NO
+        // extra whitespace beyond what the skeleton text nodes carry.
+        //
+        // Base source (repr): "Intro.\n\n@block body:\nDefault body.\n@end\n\nAfter.\n"
+        //
+        // Skeleton nodes after parse:
+        //   Text("Intro.\n\n")
+        //   Block("body")  body = [Text("Default body.")]   ← edge \n stripped
+        //   Text("\nAfter.\n")                              ← the blank line + After.
+        let base = "Intro.\n\n@block body:\nDefault body.\n@end\n\nAfter.\n";
+
+        // ── Combination 1: base default, no child override ────────────────────
+        // Child has no @block override — effective_blocks use the base default.
+        // Between-block blank line (\n before "After.") preserved verbatim.
+        {
+            let child = "@extends \"./base.mds\"\n";
+            let files = [("base.mds", base), ("child.mds", child)];
+            let out = compile_virtual(&files, "child.mds").expect("F11 combo-1: should compile");
+            assert_eq!(
+                out,
+                "Intro.\n\nDefault body.\nAfter.\n",
+                "F11 combo-1: base default — between-block blank line preserved, body edge stripped"
+            );
+        }
+
+        // ── Combination 2: override with no surrounding blank lines ───────────
+        // Block body = "Override." (no leading/trailing blank lines).
+        // After edge-strip: body = [Text("Override.")].
+        {
+            let child = "@extends \"./base.mds\"\n@block body:\nOverride.\n@end\n";
+            let files = [("base.mds", base), ("child.mds", child)];
+            let out = compile_virtual(&files, "child.mds").expect("F11 combo-2: should compile");
+            assert_eq!(
+                out, "Intro.\n\nOverride.\nAfter.\n",
+                "F11 combo-2: override without blank lines — clean output"
+            );
+        }
+
+        // ── Combination 3: override WITH leading+trailing blank lines ─────────
+        // Block body raw = "\nOverride.\n\n" (blank line before + blank line after).
+        // strip_leading_newline removes ONE leading \n  → "Override.\n\n"
+        // strip_trailing_newline removes ONE trailing \n → "Override.\n"
+        // Residual \n becomes part of the rendered block body, producing an extra
+        // blank line BEFORE the "After." skeleton text node ("\nAfter.\n").
+        // This pins decision #9: only one edge \n is stripped — extra interior
+        // blank lines are preserved.
+        {
+            let child = "@extends \"./base.mds\"\n@block body:\n\nOverride.\n\n@end\n";
+            let files = [("base.mds", base), ("child.mds", child)];
+            let out = compile_virtual(&files, "child.mds").expect("F11 combo-3: should compile");
+            assert_eq!(
+                out,
+                "Intro.\n\nOverride.\n\nAfter.\n",
+                "F11 combo-3: override with surrounding blanks — extra blank line inside body preserved (only edge \n stripped)"
+            );
+        }
+
+        // ── Combination 4: override with indented content ─────────────────────
+        // Block body raw = "  Indented.\n".
+        // strip_leading_newline: no leading \n, no change.
+        // strip_trailing_newline: pop \n → "  Indented."
+        // Leading spaces are preserved verbatim (base author's indentation style).
+        {
+            let child = "@extends \"./base.mds\"\n@block body:\n  Indented.\n@end\n";
+            let files = [("base.mds", base), ("child.mds", child)];
+            let out = compile_virtual(&files, "child.mds").expect("F11 combo-4: should compile");
+            assert_eq!(
+                out, "Intro.\n\n  Indented.\nAfter.\n",
+                "F11 combo-4: indented override — leading spaces preserved verbatim"
+            );
+        }
     }
 
     // ── A3: Error-code mapping consolidation (resolver layer) ─────────────────
