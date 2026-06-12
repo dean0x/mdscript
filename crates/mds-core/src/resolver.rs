@@ -2682,6 +2682,61 @@ mod tests {
         );
     }
 
+    // ── Task-1 regression: compute_line_column UTF-8 boundary-safe ──────────
+    //
+    // Root cause: `compute_line_column` previously panicked with
+    // "byte index N is not a char boundary" when a base-template span offset
+    // (computed against the base source) was reused against the child source
+    // containing multibyte UTF-8 characters.  After the fix the error is
+    // returned gracefully (e.g. mds::undefined_var) without a panic.
+
+    #[test]
+    fn task1_compile_virtual_no_panic_multibyte_child_source() {
+        // Base has an undefined variable — validation will fire a span.
+        // The base offset lands at byte 16 in the base source ("@block content:\n"
+        // = 16 bytes, then "{undefined_var}").  The child source contains a
+        // multibyte character (Japanese ああ = 6 bytes each = 6 bytes for "あ").
+        // If the base offset (16) is used against the child source, byte 16 may
+        // land mid-codepoint → previously panicked, now returns graceful error.
+        let base = "@block content:\n{undefined_var}\n@end\n";
+        let child = "@extends \"./ああb.mds\"\n";
+        // Note: the filesystem key must match the path literal in the child.
+        let files = [("ああb.mds", base), ("child.mds", child)];
+        let result = compile_virtual(&files, "child.mds");
+        // Must NOT panic — any Err is acceptable (undefined_var or similar).
+        assert!(
+            result.is_err(),
+            "task1: should error (undefined variable), not succeed: {:?}",
+            result.ok()
+        );
+        let err = result.unwrap_err();
+        let code = err.serialize().code;
+        // The error must be a graceful mds:: error, not a panic.
+        assert!(
+            code.starts_with("mds::"),
+            "task1: expected an mds:: error code, got: {code}"
+        );
+    }
+
+    #[test]
+    fn task1_check_virtual_no_panic_multibyte_child_source() {
+        // Same scenario via check_virtual — validates only, no evaluate.
+        let base = "@block content:\n{undefined_var}\n@end\n";
+        let child = "@extends \"./ああb.mds\"\n";
+        let files = [("ああb.mds", base), ("child.mds", child)];
+        let result = check_virtual(&files, "child.mds");
+        assert!(
+            result.is_err(),
+            "task1 check_virtual: should error (undefined variable), not succeed"
+        );
+        let err = result.unwrap_err();
+        let code = err.serialize().code;
+        assert!(
+            code.starts_with("mds::"),
+            "task1 check_virtual: expected an mds:: error code, got: {code}"
+        );
+    }
+
     // ── F3: multi-level chain A←B←C, most-derived wins ──────────────────────
 
     #[test]

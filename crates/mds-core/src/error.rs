@@ -31,14 +31,19 @@ pub struct SerializedError {
 
 /// Compute the 1-indexed line and column (byte-based) for a byte offset in source.
 ///
-/// Returns `None` if `offset` exceeds `source.len()`. Both line and column are
-/// 1-indexed: the very first byte is (1, 1).
+/// Returns `None` if `offset` exceeds `source.len()` OR if `offset` does not fall
+/// on a UTF-8 character boundary. A foreign or stale offset (e.g. one computed
+/// against a different source string — as can occur when a base-template span is
+/// reported against a child source in `@extends` validation) will yield `None`
+/// rather than panicking with "byte index N is not a char boundary".
+///
+/// Both line and column are 1-indexed: the very first byte is (1, 1).
 ///
 /// Column counts bytes from the start of the current line (NOT UTF-16 code units
 /// and NOT Unicode scalar values). This matches the convention used by most
 /// command-line tools and language servers when operating in byte mode.
 fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
-    if offset > source.len() {
+    if offset > source.len() || !source.is_char_boundary(offset) {
         return None;
     }
     let mut line = 1usize;
