@@ -99,8 +99,8 @@ fn evaluate_nodes(
                 // Standalone mode: render the block's default body inline.
                 // The block markers are invisible in text output — @block is a
                 // transparent wrapper in non-extending files.
-                // In Phase 2, the resolver splices child overrides before evaluation,
-                // so this arm handles both base defaults and child-override bodies.
+                // The resolver splices child overrides before evaluation, so this arm
+                // handles both base defaults and child-override bodies.
                 output.push_str(&evaluate_block(block, scope, ctx)?);
             }
         }
@@ -779,8 +779,8 @@ fn collect_messages(
             Node::Block(block) => {
                 // Descend into @block body to surface any @message blocks it contains.
                 // In standalone mode the block body is the default content; in inheritance
-                // mode (Phase 2) the resolver has already spliced the final body before
-                // evaluation, so this arm is reached for both cases.
+                // mode the resolver has already spliced the final body before evaluation,
+                // so this arm is reached for both cases.
                 collect_messages(&block.body, scope, ctx, out)?;
             }
         }

@@ -130,16 +130,16 @@ pub enum Node {
     /// `@block name:` ... `@end` — a named placeholder block for template inheritance.
     ///
     /// In a standalone (non-extending) module the body is rendered inline as the default
-    /// content. In a child module (Phase 2) these are override nodes that replace the
-    /// base template's corresponding block.
+    /// content. In a child module these are override nodes that replace the base template's
+    /// corresponding block.
     Block(BlockNode),
 }
 
 /// A named template block: `@block name:` ... `@end`.
 ///
 /// In standalone mode the body is evaluated inline (the markers are invisible).
-/// In inheritance mode (Phase 2) the resolver splices overrides from the child into the
-/// base skeleton before validation and evaluation.
+/// In inheritance mode the resolver splices overrides from the child into the base skeleton
+/// before validation and evaluation.
 #[derive(Debug, Clone)]
 pub struct BlockNode {
     /// The block name — a valid identifier, e.g. `instructions`.
