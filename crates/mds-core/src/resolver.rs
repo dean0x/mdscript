@@ -585,19 +585,7 @@ impl ModuleCache {
         let effective_skeleton: Arc<[Node]> = Arc::from(module.body.as_slice());
 
         // Build effective_blocks from this module's own @block declarations.
-        let effective_blocks = block_names
-            .iter()
-            .filter_map(|name| {
-                module.body.iter().find_map(|n| {
-                    if let Node::Block(b) = n {
-                        if b.name == *name {
-                            return Some((name.clone(), Arc::new(b.clone())));
-                        }
-                    }
-                    None
-                })
-            })
-            .collect::<IndexMap<_, _>>();
+        let effective_blocks = seed_effective_blocks(&module.body, &block_names);
 
         Ok(ResolvedModule {
             functions,
@@ -934,19 +922,7 @@ impl ModuleCache {
             } else {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
                 let eff_skeleton: Arc<[Node]> = Arc::from(module.body.as_slice());
-                let eff_blocks = module
-                    .body
-                    .iter()
-                    .filter_map(|n| {
-                        if let Node::Block(b) = n {
-                            block_names
-                                .contains(&b.name)
-                                .then(|| (b.name.clone(), Arc::new(b.clone())))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<IndexMap<_, _>>();
+                let eff_blocks = seed_effective_blocks(&module.body, &block_names);
                 // Root base: frontmatter_values is its own raw FM (no ancestors).
                 (eff_skeleton, eff_blocks, own_fm_values)
             };
@@ -1418,6 +1394,31 @@ fn collect_define(
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));
     scope.set_function(&def.name, arc);
     Ok(())
+}
+
+/// Build the `effective_blocks` map for a root (non-extending) module.
+///
+/// Walks `body` and collects all `Node::Block` entries whose name appears in
+/// `block_names`.  Output order follows body declaration order (IndexMap preserves
+/// insertion order, giving deterministic diamond-inheritance merges downstream).
+///
+/// Called from both `process_module` (standalone) and `process_module_skeleton`
+/// (root-base arm) to eliminate the duplicated seeding loop.
+fn seed_effective_blocks(
+    body: &[Node],
+    block_names: &HashSet<String>,
+) -> IndexMap<String, Arc<BlockNode>> {
+    body.iter()
+        .filter_map(|n| {
+            if let Node::Block(b) = n {
+                block_names
+                    .contains(&b.name)
+                    .then(|| (b.name.clone(), Arc::new(b.clone())))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Process a single `@block` directive, updating the `block_names` set in `defs`.
