@@ -25,11 +25,9 @@ pub struct ExtendsDirective {
     pub path: String,
     /// Byte offset of the `@extends` token in the source.
     ///
-    /// Used by Phase 2 to attach precise error spans when the base file is not found
-    /// or when a stray `@extends` occurs mid-file. Retained in the struct now so that
-    /// the Phase 2 resolver can call `attach_import_span(e, path, file, source, ext.offset)`.
-    // Phase 1 only stores the offset; Phase 2 resolver reads it for error span attachment.
-    #[allow(dead_code)]
+    /// The resolver uses this to attach precise error spans when the base file is not
+    /// found or when a stray `@extends` occurs mid-file, via
+    /// `attach_import_span(e, path, file, source, ext.offset)`.
     pub offset: usize,
 }
 

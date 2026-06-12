@@ -345,8 +345,12 @@ impl Parser<'_> {
         // parse_extends_if_present already consumed the leading @extends (if any);
         // any @extends that reaches parse_directive is by definition misplaced.
         if trimmed == "@extends" || trimmed.starts_with("@extends ") {
-            return Err(MdsError::extends_error(
+            return Err(MdsError::extends_error_at(
                 "@extends must be the first directive after frontmatter — only one @extends is allowed and it must appear before any other content",
+                self.file,
+                self.source,
+                offset,
+                dir.len(),
             ));
         }
 

@@ -2077,10 +2077,14 @@ fn a3_parser_error_code_table() {
         let src = "Some text.\n@extends \"./base.mds\"\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let err = parse_with_ctx(&tokens, "", "").unwrap_err();
+        let s = err.serialize();
         assert_eq!(
-            err.serialize().code,
-            "mds::extends",
+            s.code, "mds::extends",
             "A3 E1: stray @extends must be mds::extends"
+        );
+        assert!(
+            s.span.is_some(),
+            "A3 E1: stray @extends error must carry a source span"
         );
     }
 
@@ -2089,10 +2093,14 @@ fn a3_parser_error_code_table() {
         let src = "@extends \"./a.mds\"\n@extends \"./b.mds\"\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         let err = parse_with_ctx(&tokens, "", "").unwrap_err();
+        let s = err.serialize();
         assert_eq!(
-            err.serialize().code,
-            "mds::extends",
+            s.code, "mds::extends",
             "A3 E2: double @extends must be mds::extends"
+        );
+        assert!(
+            s.span.is_some(),
+            "A3 E2: double @extends error must carry a source span"
         );
     }
 
