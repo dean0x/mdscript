@@ -623,13 +623,13 @@ Respond in plain text.
 | Text (default) | `@block` bodies render inline where declared in the base skeleton |
 | Messages | `@message` blocks inside `@block` bodies participate in the messages array |
 
-Messages mode example (base defines `@message` blocks):
+Messages mode example (base defines `@message` blocks inside `@block` bodies):
 
 ```mds
 # base.mds
+@block context:
 @message system:
 You are a {role} assistant.
-@block context:
 No additional context.
 @end
 @end
@@ -642,7 +642,10 @@ role: research
 ---
 @extends "./base.mds"
 @block context:
+@message system:
+You are a {role} assistant.
 Focus on peer-reviewed sources.
+@end
 @end
 ```
 
@@ -1033,6 +1036,7 @@ for_block       := "@for" loop_vars "in" dot_path ":" body "@end"
 loop_vars       := identifier | identifier "," identifier
 message_block   := "@message" role ":" body "@end"
 block           := "@block" identifier ":" body "@end"
+                   (* grammar is context-free; `@block` is additionally constrained to top-level only by the parser — see §4.11 Rules *)
 role            := bare_role | "{" message_role_expr "}"
 bare_role       := <any non-empty text up to the trailing ":"> (* literal string; no identifier validation *)
 message_role_expr := qualified_call | member_access | function_call | identifier
