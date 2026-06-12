@@ -260,9 +260,8 @@ pub enum MdsError {
 
     /// Errors in template inheritance (`@extends` / `@block`).
     ///
-    /// Used by Phase 2 for child-only-blocks violations (3b) and unknown-override (3c).
-    /// Phase 5 will retarget the two Phase-1 `TODO(phase5)` `mds::syntax` markers to
-    /// this variant — do NOT re-add it then.
+    /// Used for child-only-blocks violations (3b), unknown-override (3c), and
+    /// stray `@extends` directives detected at parse time.
     #[error("extends error: {message}")]
     #[diagnostic(code(mds::extends))]
     Extends {
@@ -590,15 +589,6 @@ impl MdsError {
     pub(crate) fn json_error(message: impl Into<String>) -> Self {
         MdsError::JsonError {
             message: message.into(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn extends_error(message: impl Into<String>) -> Self {
-        MdsError::Extends {
-            message: message.into(),
-            span: None,
-            src: None,
         }
     }
 

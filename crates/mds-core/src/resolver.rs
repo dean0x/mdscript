@@ -21,7 +21,7 @@ use crate::value::Value;
 /// (`get_export`, `get_all_exports`, `get_prompt_value`, `to_namespace`) which
 /// enforce export-visibility logic. Direct field access bypasses that logic.
 ///
-/// # Template Inheritance Fields (Phase 2)
+/// # Template Inheritance Fields
 ///
 /// - `effective_skeleton`: the root-ancestor body as a shared `Arc<[Node]>`. For a
 ///   non-extending module this is the module's own body (built once; Arc-shared across
@@ -33,11 +33,9 @@ use crate::value::Value;
 ///   is a clone of `base.effective_blocks` with the child's overrides applied (most-
 ///   derived wins, diamond-inheritance safe — NEVER mutate the cached base map).
 ///
-/// - `frontmatter_values`: the module's parsed YAML mapping. Reserved-key splitting is
-///   deferred to Phase 3 (`deep_merge_yaml` refactor); Phase 3 can refine this without
-///   re-architecting the field.
-///
-/// - `extends_path`: the raw `@extends` path string if this was a child template.
+/// - `frontmatter_values`: the module's parsed YAML mapping. For intermediate bases in a
+///   chain this is the transitive accumulated deep-merge of all ancestors' FM, so a leaf
+///   descending from it gets the full chain without re-traversing.
 ///
 /// # Cache-poisoning invariant (A1)
 ///
@@ -73,12 +71,8 @@ pub struct ResolvedModule {
     /// Fully-overridden block map for this subtree. Seeded from own @block declarations
     /// (non-extending) or clone(base.effective_blocks)+child overrides (extending).
     pub(crate) effective_blocks: IndexMap<String, Arc<BlockNode>>,
-    /// Parsed YAML frontmatter mapping. Reserved-key splitting deferred to Phase 3.
+    /// Parsed YAML frontmatter mapping. Reserved-key splitting deferred to future refactor.
     pub(crate) frontmatter_values: Option<serde_yaml_ng::Mapping>,
-    /// The raw @extends path, if this was a child template.
-    // Used by Phase 3 (reserved-key exclusion for the `extends` key) and Phase 5 (diagnostics).
-    #[allow(dead_code)]
-    pub(crate) extends_path: Option<String>,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
     /// `@extends` base: collect-only, NO standalone validate/evaluate, `prompt_body = None`).
     ///
@@ -614,7 +608,6 @@ impl ModuleCache {
             effective_skeleton,
             effective_blocks,
             frontmatter_values,
-            extends_path: None,
             is_skeleton: false,
         })
     }
@@ -810,7 +803,6 @@ impl ModuleCache {
             effective_skeleton,
             effective_blocks,
             frontmatter_values,
-            extends_path: Some(ext.path),
             is_skeleton: false,
         })
     }
@@ -968,7 +960,6 @@ impl ModuleCache {
             effective_skeleton,
             effective_blocks,
             frontmatter_values,
-            extends_path: module.extends.map(|e| e.path),
             is_skeleton: true,
         })
     }
@@ -4389,11 +4380,16 @@ mod tests {
             let files = [("base.mds", base), ("child.mds", child)];
             let err = compile_virtual(&files, "child.mds")
                 .expect_err("A3 E3: stray child content should error");
+            let s = err.serialize();
             assert_eq!(
-                err.serialize().code,
-                "mds::extends",
+                s.code, "mds::extends",
                 "A3 E3: stray child content must be mds::extends, got: {:?}",
-                err.serialize()
+                s
+            );
+            assert!(
+                s.span.is_some(),
+                "A3 E3: mds::extends error must carry a span, got: {:?}",
+                s
             );
         }
 
@@ -4404,11 +4400,16 @@ mod tests {
             let files = [("base.mds", base), ("child.mds", child)];
             let err = compile_virtual(&files, "child.mds")
                 .expect_err("A3 E4: unknown override should error");
+            let s = err.serialize();
             assert_eq!(
-                err.serialize().code,
-                "mds::extends",
+                s.code, "mds::extends",
                 "A3 E4: unknown block override must be mds::extends, got: {:?}",
-                err.serialize()
+                s
+            );
+            assert!(
+                s.span.is_some(),
+                "A3 E4: mds::extends error must carry a span, got: {:?}",
+                s
             );
         }
 
