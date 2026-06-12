@@ -21,7 +21,7 @@
     },
     "mds-napi": {
       "name": "MDS Native Node.js Bindings (napi-rs)",
-      "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode, template inheritance, extends, block, mds::extends.",
+      "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode, template inheritance, extends, block, mds::extends, INH-1, INH-2, compileFile, A4 shape stability.",
       "directories": [
         "crates/mds-napi/"
       ],
@@ -39,12 +39,12 @@
         "crates/mds-core/src/options.rs",
         "Cargo.toml"
       ],
-      "lastUpdated": "2026-06-11T23:48:44.332Z",
+      "lastUpdated": "2026-06-12T18:57:53.256Z",
       "createdBy": "implement"
     },
     "mds-compiler": {
       "name": "MDS Compiler",
-      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, the compile_messages API family, or template inheritance (@extends/@block). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, Condition, CondValue, And, Or, logical operators, Param, default arguments, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch, extends, block, skeleton, ExtendsDirective, BlockNode, effective_skeleton, effective_blocks, frontmatter_values, process_module_skeleton, resolve_by_key_skeleton, resolve_extends_components, ExtendsComponents, splice_skeleton, deep_merge_yaml, build_scope_from_merged_mapping, apply_block_overrides, check_child_only_blocks, MAX_BLOCKS_PER_MODULE, MAX_FRONTMATTER_MERGE_DEPTH, mds::extends, template inheritance, diamond inheritance, seed_effective_blocks, pf004_messages_mode_extends_validates_final_body_parity, utf8_boundary, compute_line_column, extends_error_at, p5b_deep_chain.",
+      "description": "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, the compile_messages API family, or template inheritance (@extends/@block). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, Condition, CondValue, And, Or, logical operators, Param, default arguments, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch, extends, block, skeleton, ExtendsDirective, BlockNode, effective_skeleton, effective_blocks, frontmatter_values, process_module_skeleton, resolve_by_key_skeleton, resolve_extends_components, ExtendsComponents, splice_skeleton, deep_merge_yaml, build_scope_from_merged_mapping, apply_block_overrides, check_child_only_blocks, MAX_BLOCKS_PER_MODULE, MAX_FRONTMATTER_MERGE_DEPTH, mds::extends, template inheritance, diamond inheritance, seed_effective_blocks, pf004_messages_mode_extends_validates_final_body_parity, utf8_boundary, compute_line_column, extends_error_at, p5b_deep_chain, SYNC_POINT, strip_reserved_keys, debug_assert, A1 invariant, is_skeleton.",
       "directories": [
         "crates/mds-core/src/",
         "crates/mds-cli/src/",
@@ -72,7 +72,7 @@
         "crates/mds-cli/tests/format_messages.rs",
         "crates/mds-cli/tests/inheritance.rs"
       ],
-      "lastUpdated": "2026-06-12T08:49:20.193Z",
+      "lastUpdated": "2026-06-12T18:57:42.818Z",
       "createdBy": "implement"
     },
     "mds-js": {

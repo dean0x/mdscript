@@ -27,7 +27,7 @@ referencedFiles:
   - crates/mds-cli/tests/format_messages.rs
   - crates/mds-cli/tests/inheritance.rs
 created: 2026-05-12
-updated: 2026-06-12T00:00:00Z
+updated: 2026-06-12
 ---
 
 # MDS Compiler
@@ -168,6 +168,10 @@ This is the most significant change. The resolver now has two resolution paths: 
 
 **Note**: The `extends_path` field that appeared in earlier drafts of this feature was removed — it was set but never read anywhere in the workspace. Dead code removal keeps the zero-warnings gate clean.
 
+**`Arc::from(body)` consuming move**: On both the standalone path (`process_module`) and the root-base arm of `process_module_skeleton`, `effective_skeleton` is built via `Arc::from(module.body)` (consuming the `Vec<Node>` directly), not `Arc::from(body.as_slice())`. This reuses the Vec allocation with no per-element Node clones. `seed_effective_blocks` is called before the Arc construction so the borrow ends first.
+
+**A1 invariant `debug_assert!`**: `process_module_skeleton` has a `debug_assert!(prompt_body.is_none(), "A1 invariant: …")` pinned immediately before the `Ok(ResolvedModule { is_skeleton: true, … })` return. This catches accidental evaluate calls on the skeleton path in debug builds. The full `SkeletonEntry`/`StandaloneEntry` enum split is tracked as tech debt.
+
 **Cache-poisoning invariant (A1)**: A file may be resolved as a skeleton base before it is compiled standalone (or vice-versa). Cache key is the same normalized file key in both cases. Rules:
 - Standalone-first → skeleton reuses the full entry as-is (it has everything a base needs).
 - Skeleton-first → `resolve_by_key` detects `is_skeleton` on cache hit, performs full compile, upgrades the entry in place; reuses the skeleton's Arcs so descendants keep pointer-identity.
@@ -187,7 +191,7 @@ Steps executed by `resolve_extends_components`:
 4. **3d**: Build merged scope — `deep_merge_yaml(base_fm, child_fm)` then `build_scope_from_merged_mapping`; resolve base FM imports (relative to base key) then child FM imports (relative to child key); merge base functions into scope; collect child body definitions.
 5. **3e**: `splice_skeleton(effective_skeleton, effective_blocks)` — linear O(S+B) pass over the skeleton, replacing each `Node::Block` placeholder with the effective body. Non-block nodes pass verbatim. Between-block spacing (Text nodes) preserved.
 
-**`process_module_extends(module, ext, ctx, ...)`** — calls `resolve_extends_components`, then runs `validator::validate(&final_body, ...)` + `evaluate(&final_body, ...)` (step 3f, text mode). Operates on `final_body`, NOT `module.body` — this is what makes validation of base default blocks using the merged leaf scope work (ADR-016).
+**`process_module_extends(module, ext, ctx, raw_frontmatter, frontmatter_values, warnings)`** — 6-parameter function (the dead `_is_md` parameter was removed in batch-B cleanup; `#[allow(clippy::too_many_arguments)]` removed with it). Calls `resolve_extends_components`, then runs `validator::validate(&final_body, ...)` + `evaluate(&final_body, ...)` (step 3f, text mode). Operates on `final_body`, NOT `module.body` — this is what makes validation of base default blocks using the merged leaf scope work (ADR-016).
 
 **`process_module_messages`** — for the `@extends` branch, calls `resolve_extends_components`, then calls `validator::validate(&final_body, ...)` (step 3f, messages), checks `has_message_block(&final_body)` (NOT `module.body`), then calls `evaluate_messages(&final_body, ...)`. The validate call before evaluate was added to close a PF-004 parallel-path gap where the primary path (text mode) ran validation but the messages-mode `@extends` branch did not.
 
@@ -198,7 +202,7 @@ Steps executed by `resolve_extends_components`:
 - Otherwise: child wins (scalar over scalar, array over array, etc.).
 - Arrays REPLACE WHOLESALE — no element-level merge.
 - Key ORDER: base-then-child (determinism). Child-only keys appended in child order.
-- Reserved keys (`imports`, `type`, `extends`) EXCLUDED from output.
+- Reserved keys (`imports`, `type`, `extends`) EXCLUDED from output. SYNC POINT: these three keys are in `deep_merge_yaml::RESERVED` to prevent propagation as FM variables; `strip_reserved_keys` in `lib.rs` has a different (intentionally non-identical) list — `extends` appears in `RESERVED` but NOT in `strip_reserved_keys` because it is never emitted as output YAML. Both functions carry cross-reference SYNC POINT comments to keep maintenance in sync.
 - Recursion bounded by `MAX_FRONTMATTER_MERGE_DEPTH = 64`; exceeding returns `mds::resource_limit`.
 
 Precedence: **base < child < runtime** (decision #3 / F7).
@@ -209,11 +213,11 @@ Precedence: **base < child < runtime** (decision #3 / F7).
 
 **`seed_effective_blocks(body, block_names) -> IndexMap<String, Arc<BlockNode>>`** — extracted helper that seeds the `effective_blocks` map from a body slice and the set of known block names. Used in both `process_module` (standalone path) and `process_module_skeleton` (root-base arm) to eliminate the duplicated seeding loop. Uses a `filter_map` iterator over the body to preserve declaration order in the `IndexMap`.
 
-**`check_child_only_blocks(body, ctx)`** — validates that every top-level node in a child body is `Node::Block` or whitespace-only `Text`. Returns `mds::extends` with span on first stray node.
+**`check_child_only_blocks(body, ctx)`** — validates that every top-level node in a child body is `Node::Block` or whitespace-only `Text`. Returns `mds::extends` with span on first stray node. Has a `debug_assert!(ctx.source.is_char_boundary(offset))` guard before indexing into source (mirrors the safety added to `compute_line_column`).
 
 **`apply_block_overrides(parent_blocks, body, ctx)`** — clones parent map, applies child overrides. Returns `mds::extends` for unknown block name (child overriding a block not in parent).
 
-**`splice_skeleton(skeleton, effective_blocks) -> Vec<Node>`** — produces `final_body`. For each `Node::Block` in the skeleton, looks up the effective body by name (O(1) in `IndexMap`); non-block nodes pass through. The result is a flat `Vec<Node>` with no `Node::Block` wrappers — block markers are invisible to validate+evaluate.
+**`splice_skeleton(skeleton, effective_blocks) -> Vec<Node>`** — produces `final_body`. For each `Node::Block` in the skeleton, looks up the effective body by name (O(1) in `IndexMap`); non-block nodes pass through. The result is a flat `Vec<Node>` with no `Node::Block` wrappers — block markers are invisible to validate+evaluate. A missing block name (every skeleton block must be in `effective_blocks` after `apply_block_overrides`) triggers a `debug_assert!(false, ...)` in debug builds with a "compiler bug" message; the release build falls back to the skeleton's own default body to avoid silent empty output.
 
 **`collect_block(block, defs, count, ctx)`** — registers a `@block` name in `defs.block_names`; checks for duplicate names and `@block`-vs-`@define` collisions (same namespace, decision #10); enforces `MAX_BLOCKS_PER_MODULE`.
 
@@ -392,7 +396,7 @@ Follow the pattern used by `type: mds` and `imports`:
 - **Mutating a cached base's `effective_blocks` directly** — always `clone()` first (diamond-inheritance correctness). `apply_block_overrides` does this correctly.
 - **Calling `validate` or `evaluate` on `module.body` in `process_module_extends`** — must call on `final_body` (the spliced result), not the raw child body. ADR-016.
 - **Treating `@block` nesting as an `mds::extends` error** — nested `@block` is `mds::syntax` (parse-time); `mds::extends` is reserved for inheritance-semantic violations.
-- **Adding a non-reserved key to the `RESERVED` list in `deep_merge_yaml` without matching change in `strip_reserved_keys`** — both must stay in sync.
+- **Adding a non-reserved key to the `RESERVED` list in `deep_merge_yaml` without updating the SYNC POINT comment in `strip_reserved_keys` (lib.rs)** — the two lists have DIFFERENT purposes and are intentionally not identical; `extends` is in `RESERVED` but not in `strip_reserved_keys`. Read both SYNC POINT cross-reference comments before editing either list.
 - **Expecting `scan_imports` to return `@extends` path anywhere except first position** — it is always prepended as the leading dependency.
 - **Calling `compile_all_dir` in `watch.rs`** — this function was removed. Use `compile_one_source`.
 - **Calling `extends_error()` (no-span variant)** — it was removed; always use `extends_error_at()`. Both E3 (stray child content) and E4 (unknown block override) carry span context.
@@ -430,7 +434,8 @@ Follow the pattern used by `type: mds` and `imports`:
 - **`@extends` must be the first directive after frontmatter** — `parse_extends_if_present` only recognizes it in the leading position (after blank lines). A stray `@extends` mid-body → `mds::extends` error from `parse_directive`.
 - **`compute_line_column` handles UTF-8 boundaries safely** — returns `None` for offsets that land mid-character or beyond `source.len()`. `offset == source.len()` (exclusive-end) returns `Some`. This prevents panics when spans from multi-byte sources (e.g., a base template containing emoji or accented characters) are used to build error diagnostics in the messages-mode `@extends` path.
 - **FM-carrying deep chains are O(N^2) in the merge path** — `deep_merge_yaml` is called at each level of `process_module_skeleton`, so a 32-level chain where every level adds FM keys accumulates merge work quadratically. The current implementation is correct and passes the `p5b_deep_chain_32_levels_with_frontmatter_under_2s` guard (< 2 s on typical hardware), but fixing the O(N^2) behaviour is tracked as tech debt.
-- **Test name renames** — resolver test functions were renamed from `task1_*` / `task2_*` to domain-descriptive names: `task1_*` → `utf8_boundary_*` (UTF-8 boundary regression tests); `task2_*` → `pf004_*` (PF-004 parity tests). Do not search for the old names.
+- **Test name convention** — resolver test functions use domain-descriptive names throughout: UTF-8 boundary regression tests are `utf8_boundary_*`; PF-004 parity tests are `pf004_*`. These were originally named `task1_*` and `task2_*` but were renamed for consistency with the existing `f*/e*/a*/p*` convention. Do not search for the old task-prefixed names.
+- **P2 perf bound is 1s** — the `p2_wide_base_200_blocks_under_1s` test (CLI integration, `inheritance.rs`) uses a 1-second wall-clock bound, relaxed from the original 200ms to avoid CI flakiness. The guard still catches O(N²) blowup; it is intentionally generous for CI variability.
 
 ## Key Files
 
@@ -445,7 +450,7 @@ Follow the pattern used by `type: mds` and `imports`:
 - `crates/mds-core/src/lib.rs` — public API; `scan_imports` (prepends `@extends` path first); `Message`; `CompileMessagesOutput`; `compile_messages*` family
 - `crates/mds-cli/src/build.rs` — `OutputFormat`; `BuildArgs`; `compile_to_content`; `compile_and_write`; `read_build_input`
 - `crates/mds-cli/src/watch.rs` — watch subcommand; reverse-dep graph; `compile_one_source`
-- `crates/mds-cli/tests/inheritance.rs` — CLI integration tests for template inheritance (F1/F11 worked example, F2 standalone base, F6/F7 FM merge + --set, F8 @if/@interp in block body, F9/E13 messages mode, F13 watch partials, E5 circular, A2 dep order, P2 wide-base perf)
+- `crates/mds-cli/tests/inheritance.rs` — CLI integration tests for template inheritance (F1/F11 worked example, F2 standalone base, F6/F7 FM merge + --set, F8 @if/@interp in block body, F9/E13 messages mode, F13 watch partials, E5 circular, A2 dep order, P2 wide-base perf bound of 1s)
 - `crates/mds-core/tests/messages.rs` — integration tests for `@message` / messages mode
 - `crates/mds-cli/tests/format_messages.rs` — CLI integration tests for `--format messages`
 - `crates/mds-core/tests/api_surface.rs` — public API regression tests

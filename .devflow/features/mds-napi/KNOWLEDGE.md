@@ -18,7 +18,7 @@ referencedFiles:
   - crates/mds-core/src/options.rs
   - Cargo.toml
 created: 2026-05-20
-updated: 2026-06-12
+updated: 2026-06-12T22:00:00Z
 ---
 
 # MDS Native Node.js Bindings (napi-rs)
