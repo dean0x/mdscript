@@ -444,6 +444,14 @@ impl ModuleCache {
             } =
                 self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
+            // ── Step 3f (messages): validate final_body before evaluate ──────
+            // Mirrors text-mode process_module_extends and the standalone messages path —
+            // both call validator::validate before evaluate (avoids PF-004: alternate-path
+            // bypass of a check present on the primary path).  Safe to add here because
+            // Task 1 made compute_line_column boundary-safe, so cross-source span offsets
+            // can no longer panic.  (Anti-pattern: "Calling evaluate before validate".)
+            validator::validate(&final_body, &mut scope, ctx.file_str, ctx.source)?;
+
             // Check @message presence against final_body (NOT module.body): a base whose
             // @message blocks live inside @block defaults is correctly detected after splice.
             // (ADR-016: re-validate dynamically-assembled content at the leaf.)
@@ -4222,6 +4230,47 @@ mod tests {
             messages[0].content.contains("From C."),
             "F9 multilevel: most-derived (C) wins: {:?}",
             messages[0].content
+        );
+    }
+
+    // ── Task-2 parity: messages-mode @extends path validates final_body ─────
+    //
+    // PF-004: a check on the primary path (text-mode process_module_extends calls
+    // validator::validate before evaluate) must not be absent on the parallel path
+    // (messages-mode @extends branch).  This test verifies that an @extends child
+    // compiled in messages mode whose base-default block references an undefined var
+    // produces the SAME error (mds::undefined_var) as text mode does.
+
+    #[test]
+    fn task2_messages_mode_extends_validates_final_body_parity() {
+        // Base: @block with @message inside, and an undefined variable.
+        // Child: @extends the base, provides no override (uses default).
+        let base = concat!(
+            "@block content:\n",
+            "@message user:\n",
+            "Hello {undefined_var}.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+
+        // Text mode: must error with mds::undefined_var
+        let text_err =
+            compile_virtual(&files, "child.mds").expect_err("task2 text: undefined var must error");
+        let text_code = text_err.serialize().code;
+        assert_eq!(
+            text_code, "mds::undefined_var",
+            "task2 text: expected mds::undefined_var, got: {text_code}"
+        );
+
+        // Messages mode: must produce the SAME error (avoids PF-004 parallel-path divergence).
+        let messages_err = compile_messages_virtual_helper(&files, "child.mds")
+            .expect_err("task2 messages: undefined var must error");
+        let messages_code = messages_err.serialize().code;
+        assert_eq!(
+            messages_code, "mds::undefined_var",
+            "task2 messages: expected mds::undefined_var (same as text mode), got: {messages_code}"
         );
     }
 
