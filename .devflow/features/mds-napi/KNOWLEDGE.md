@@ -1,7 +1,7 @@
 ---
 feature: mds-napi
 name: MDS Native Node.js Bindings (napi-rs)
-description: "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode."
+description: "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode, template inheritance, extends, block, mds::extends."
 category: component-patterns
 directories: [crates/mds-napi/]
 referencedFiles:
@@ -18,7 +18,7 @@ referencedFiles:
   - crates/mds-core/src/options.rs
   - Cargo.toml
 created: 2026-05-20
-updated: 2026-06-10T00:00:00Z
+updated: 2026-06-12
 ---
 
 # MDS Native Node.js Bindings (napi-rs)
@@ -62,6 +62,16 @@ The crate sits at the boundary between Rust and JavaScript. Its primary concerns
 - Throws an error when the template contains no `@message` blocks at all.
 - Calls `mds::compile_messages_str_with_deps` from `mds-core` inside `run_catching`.
 - Applies `check_source_size` and `parse_compile_opts` — identical guard/parse steps to `compile`.
+
+### Template Inheritance (@extends / @block)
+
+Template inheritance (`@extends` / `@block`) is a **pure mds-core compile-path feature**. The napi addon's public surface (`compileFile`, `compile`) is **unchanged** — no new exports, no new option keys. Inheritance round-trips through the existing binding:
+
+- `compileFile` on a child template that has `@extends "./base.mds"` merges the base skeleton and applies `@block` overrides. The base file appears in `result.dependencies` (absolute path, as with any resolved import).
+- The `CompileResult` shape `{ output, warnings, dependencies }` is stable — inheritance does not add fields (A4: shape stable).
+- A stray `@extends` directive (one that appears after content text, or in a non-inheritance position) surfaces a `mds::extends` error code. This code originates in `mds-core` and passes through `throw_mds_error` to JS unchanged, like all other `mds-core` error codes.
+
+Tests INH-1 and INH-2 in `index.spec.mjs` cover these two cases: round-trip correctness and error code propagation.
 
 ### #[napi(object)] structs
 
@@ -151,12 +161,13 @@ Every JS error thrown by this crate carries a `code` string. The codes defined b
 | `mds::invalid_options` | napi boundary | Malformed or type-incorrect JS options object |
 | `mds::resource_limit` | napi boundary | Source string exceeds 10 MiB |
 
-Two additional codes originate in `mds-core` and pass through the napi boundary unchanged:
+Additional codes originate in `mds-core` and pass through the napi boundary unchanged:
 
 | Code | Origin | Meaning |
 |---|---|---|
 | `mds::builtin_type_error` | mds-core builtins module | A built-in function was called with an argument of the wrong type |
 | `mds::arity_mismatch` | mds-core evaluator | A function was called with the wrong number of arguments |
+| `mds::extends` | mds-core template inheritance | A stray `@extends` directive in an invalid position |
 
 `MdsError` is `#[non_exhaustive]`, so new error variants can be added to `mds-core` without a breaking change to this crate. The `throw_mds_error` helper maps all `MdsError` variants by code string, so new codes from `mds-core` flow through to JS automatically.
 
@@ -233,9 +244,10 @@ When adding a new option key:
 - **`resolve_base_dir` now returns `String`, not `PathBuf`.** As of the unified backend refactor, the private `resolve_base_dir` helper in `mds-core/src/lib.rs` converts `Option<&Path>` directly to a UTF-8 `String` (failing explicitly on non-UTF-8 paths). `ModuleCache::resolve_source` correspondingly takes `&str` for path arguments instead of `&Path`. This is transparent to the napi layer because it calls the stable public wrappers (`compile_with_deps`, etc.), but matters if you read resolver internals.
 - **Test runner requires Node.js 22+.** Tests use the built-in `node:test` runner. Running them with Node 18 or 20 will fail with import errors or missing test API features.
 - **The built `.node` binary must exist before running tests.** Tests load `../mds-napi.node` directly via `require`. The file is produced by `cargo build --release` plus `napi-rs CLI`. Tests cannot be run from source alone.
-- **The napi test suite now has full `compileMessages` coverage.** Tests M-1 through M-9 in `index.spec.mjs` cover: basic result shape, vars marshaling with dynamic role, no-`@message`-blocks error code, unknown option key rejection, basePath-relative `@import` with non-empty dependencies, `check_source_size` resource limit, null/undefined opts, and multi-message ordering. The addon destructures `{ compile, compileFile, check, checkFile, compileMessages }` from the native module. Total test count is 59 (50 pre-existing + 9 new), 8 suites.
+- **The napi test suite now has full `compileMessages` and template inheritance coverage.** Tests M-1 through M-9 cover compileMessages; tests INH-1 and INH-2 (added in Issue #58 / PR #95) cover template inheritance through the unchanged `compileFile`/`compile` surface. Total test count is 61 (59 prior + 2 new), 9 suites.
+- **Template inheritance does not change the addon API surface.** `@extends`/`@block` is purely a mds-core compile-path feature. The `compileFile` return shape `{ output, warnings, dependencies }` is unchanged; the resolved base template file appears in `dependencies` like any other `@import`-resolved file.
 - **Dependency paths in `CompileResult` are absolute when using `compileFile`.** The `dependencies` field contains paths as returned by `mds-core`'s module cache, which normalizes them to absolute paths. For `compile` (source string variant), dependencies are also absolute if the provider files are resolved from an absolute `basePath`.
-- **`MdsError` is `#[non_exhaustive]`.** New variants (e.g. `BuiltinError` and `ArityMismatch`) do not break the napi layer's `throw_mds_error` — it maps errors by their code string. However, exhaustive match arms on `MdsError` in any future helper code will fail to compile when new variants are added.
+- **`MdsError` is `#[non_exhaustive]`.** New variants (e.g. `BuiltinError`, `ArityMismatch`, `Extends`) do not break the napi layer's `throw_mds_error` — it maps errors by their code string. However, exhaustive match arms on `MdsError` in any future helper code will fail to compile when new variants are added.
 - **npm package name is `@mdscript/mds-napi`, not `mds-napi`.** The crate is named `mds-napi` but the published npm host package is `@mdscript/mds-napi`. Platform packages are `@mdscript/mds-napi-{platform}`. The `node.ts` loader uses `require('@mdscript/mds-napi')`.
 - **Path+version dep on mds-core requires explicit version sync.** When the workspace version bumps, `mds = { package = "mds-core", path = "../mds-core", version = "X.Y.Z" }` must reflect the new version. `bump-version.mjs` handles this since v0.2.0.
 - **A3 name-gate: `napi build` without `--no-js` clobbers the hand-maintained `index.js` loader.** `crates/mds-napi/index.js` is a 49-line hand-maintained file — it is NOT auto-generated. During Issue #56 development, running `napi build` (without `--no-js`) regenerated this file with auto-generated content that referenced wrong package names (e.g. `undefined-<triple>` instead of `@mdscript/mds-napi-<triple>`) and wrong `.node` filenames, causing the A3 name-gate (`scripts/verify-napi-names.mjs`) to fail. The file had to be restored from version control. Rules: (1) always pass `--no-js` when invoking `napi build` inside `crates/mds-napi/`, or (2) restore `index.js` immediately afterward from git before running the A3 gate. The gate (`scripts/verify-napi-names.mjs`) checks that the loader's platform-package names and `.node` filenames match what `napi create-npm-dirs` would generate — drift causes silent binary load failures at runtime on every platform. The gate is a hard checkpoint in the release workflow; do not proceed past a failing gate.
@@ -248,7 +260,7 @@ When adding a new option key:
 - `crates/mds-napi/Cargo.toml` — crate manifest; declares `cdylib` type, `debug-panics` feature, workspace dependency pins, and the path+version dep on `mds-core`.
 - `crates/mds-napi/build.rs` — single call to `napi_build::setup()`, generates module registration.
 - `crates/mds-napi/package.json` — npm package metadata (`@mdscript/mds-napi`) used by `@napi-rs/cli` for binary distribution.
-- `crates/mds-napi/__test__/index.spec.mjs` — integration test suite (Node.js 22+, `node:test`), covers compile/compileFile/check/checkFile/compileMessages plus error shape, options validation, resource limits, and compilation parity. 59 tests, 8 suites (M-1 through M-9 are the compileMessages suite added in commit 5ab392b).
+- `crates/mds-napi/__test__/index.spec.mjs` — integration test suite (Node.js 22+, `node:test`), covers compile/compileFile/check/checkFile/compileMessages plus error shape, options validation, resource limits, compilation parity, and template inheritance. 61 tests, 9 suites (M-1 through M-9 are the compileMessages suite; INH-1 and INH-2 are the template inheritance suite added in Issue #58 / PR #95).
 - `crates/mds-core/src/lib.rs` — public API surface that napi bridges; `compile_with_deps`, `compile_str_with_deps`, `check_collecting_warnings`, `check_str_collecting_warnings`, `compile_messages_str_with_deps` are the functions called by the addon. Defines `MdsError` (`#[non_exhaustive]`).
 - `scripts/verify-napi-names.mjs` — A3 gate; verifies the hand-written loader's platform-package names and `.node` filenames match generated platform package names. Run in CI at stage-and-verify-napi and publish-npm steps.
 - `Cargo.toml` (workspace) — defines `panic = "unwind"` profiles and workspace-level napi dependency versions.
@@ -256,7 +268,7 @@ When adding a new option key:
 ## Related
 
 - `crates/mds-core/src/options.rs` — defines the shared options utilities imported by this crate. Changes to `parse_json_vars` or `format_unknown_keys_error` affect both mds-napi and mds-wasm.
-- `crates/mds-core/src/lib.rs` — defines `MdsError`, `CompileOutput`, `VarsError`, `MessagesOutput`, and the `*_collecting_warnings` functions that the addon calls.
+- `crates/mds-core/src/lib.rs` — defines `MdsError`, `CompileOutput`, `VarsError`, `MessagesOutput`, and the `*_collecting_warnings` functions that the addon calls. Template inheritance (`@extends`/`@block`) is implemented entirely here; the napi layer is unaffected.
 - `crates/mds-wasm/` — parallel WASM binding for the same compiler; uses `wasm-bindgen` instead of napi-rs but shares the same `mds-core::options` utilities and applies the same `catch_unwind` pattern at the boundary. Compare when making changes that affect both targets.
 - `scripts/bump-version.mjs` — handles path+version dep updates for `mds-core` across `mds-cli`, `mds-napi`, and `mds-wasm` Cargo.toml files. Required because `^0.X.Y` in pre-1.0 semver does not satisfy the next minor version.
 - `scripts/verify-napi-names.mjs` — A3 gate; avoids the pitfall where the hand-written loader drifts from generated platform packages, which silently breaks native binary loading at runtime on every affected platform.
