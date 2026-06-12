@@ -594,7 +594,7 @@ Respond in plain text.
 
 - `@extends` must be the first directive after the optional frontmatter — only one `@extends` is allowed
 - `@block name:` ... `@end` declares a named region in the base, or overrides it in a child
-- `@block` is top-level only; it cannot appear inside `@if`, `@for`, `@define`, or another `@block`
+- `@block` is top-level only; it cannot appear inside `@if`, `@for`, `@define`, `@message`, or another `@block`
 
 **Child body constraints:**
 
@@ -623,7 +623,7 @@ Respond in plain text.
 | Text (default) | `@block` bodies render inline where declared in the base skeleton |
 | Messages | `@message` blocks inside `@block` bodies participate in the messages array |
 
-Text mode example (base defines `@message` blocks):
+Messages mode example (base defines `@message` blocks):
 
 ```mds
 # base.mds

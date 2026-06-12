@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Language features
 
+- `@extends "./base.mds"` + `@block name: … @end` template inheritance — a child template
+  extends a base, overriding named `@block` placeholders; only the root base declares block
+  names. Frontmatter deep-merges base < child < runtime (arrays replace wholesale). New error
+  code `mds::extends`; new limits `MAX_BLOCKS_PER_MODULE` (256) and
+  `MAX_FRONTMATTER_MERGE_DEPTH` (64). See spec §4.11.
 - `@message role: … @end` blocks for structured chat-message output. Roles may be
   bare words (literal strings) or `{expr}` (evaluated at runtime using the full
   expression grammar). Templates without `@message` blocks compile identically to
