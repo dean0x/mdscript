@@ -1,4 +1,4 @@
-<!-- TL;DR: 21 decisions. Key: ADR-017, ADR-018, ADR-019, ADR-020, ADR-021 -->
+<!-- TL;DR: 22 decisions. Key: ADR-018, ADR-019, ADR-020, ADR-021, ADR-022 -->
 # Architectural Decisions
 
 Append-only. Status changes allowed; deletions prohibited.
@@ -225,3 +225,12 @@ A fix may be incomplete, mis-scoped, or address a symptom rather than the root c
 - **Decision**: gate reconciliation on watcher liveness — on each tick do only a cheap re-arm of watches, and perform a full directory rescan ONLY when the watcher is lost and recovers
 - **Consequences**: a per-tick tree walk is O(tree) work on every event and does not scale
 - **Source**: self-learning:obs_b9c3d7
+
+## ADR-022: Diagnostic source-origin rides along the data (Origin{file,source} on each spliced block + skeleton via Arc::clone) rather than being looked up from a path->source cache map
+
+- **Date**: 2026-06-14
+- **Status**: Accepted
+- **Context**: PR #58 spliced @block override bodies into a base @extends skeleton
+- **Decision**: carry the diagnostic origin as ride-along data — an Origin{file, source: Arc<str>} attached to every spliced block and to the skeleton, stamped at the last-wins insertion and propagated down the chain by Arc::clone — instead of reconstructing source at diagnostic time from a path->source cache map
+- **Consequences**: the cache-map approach has a fatal miss for the in-memory <source> entry (no file path key) and would display the wrong filename
+- **Source**: self-learning:obs_d1e5f9
