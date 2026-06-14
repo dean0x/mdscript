@@ -524,3 +524,24 @@ fn line_col_at_end_of_source() {
     // (offset == len is the exclusive-end sentinel, not out-of-bounds).
     assert_eq!(compute_line_column("abc", 3), Some((1, 4)));
 }
+
+// ── compute_line_column — char-based column (C3, C5) ─────────────────────
+
+#[test]
+fn compute_line_column_is_char_based() {
+    // "日本語\n!" — each CJK char is 3 bytes; offset 6 points to '語' (the 3rd char).
+    // Byte-based col would be 7 (6 bytes consumed + 1); char-based col is 3 (2 chars before).
+    let src = "日本語\n!";
+    let (line, col) = compute_line_column(src, 6).expect("offset 6 should be valid");
+    assert_eq!(line, 1, "char-based: line should be 1");
+    assert_eq!(
+        col, 3,
+        "char-based: col should be 3 (two chars before: 日, 本), not 7 (byte-based)"
+    );
+
+    // Start-of-line after multibyte: col is 1 regardless of byte/char mode.
+    assert_eq!(compute_line_column("café\nworld", 6), Some((2, 1)));
+
+    // Out-of-bounds still returns None.
+    assert_eq!(compute_line_column("short", 100), None);
+}

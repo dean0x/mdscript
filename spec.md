@@ -533,6 +533,161 @@ Exceeding either limit returns a `resource_limit` error rather than allowing run
 
 ---
 
+### 4.11 Template Inheritance (@extends / @block)
+
+Template inheritance lets a **child** template reuse a **base** template's skeleton while selectively overriding named regions.
+
+#### Overview
+
+A **base** template defines named placeholder regions with `@block name:` ... `@end`. It compiles standalone; its block bodies serve as defaults.
+
+A **child** template declares `@extends "./base.mds"` and then provides `@block name:` ... `@end` overrides. The child must contain **only** block overrides (plus optional blank lines) — any other content is a compile error.
+
+The compiler splices overridden blocks into the base skeleton, validates and evaluates the merged result as a single unit.
+
+#### Syntax
+
+```mds
+# base.mds — defines three placeholder blocks
+You are a {role} assistant.
+
+@block instructions:
+Analyze data carefully.
+@end
+
+@block tools:
+@end
+
+@block output_format:
+Respond in plain text.
+@end
+```
+
+```mds
+# child.mds — overrides instructions and tools; inherits output_format default
+---
+role: data analysis
+---
+@extends "./base.mds"
+@block instructions:
+Perform statistical analysis.
+@end
+@block tools:
+You have access to: Python, R
+@end
+```
+
+Compiled output:
+
+```
+---
+role: data analysis
+---
+You are a data analysis assistant.
+
+Perform statistical analysis.
+You have access to: Python, R
+Respond in plain text.
+```
+
+#### Rules
+
+**Directive placement:**
+
+- `@extends` must be the first directive after the optional frontmatter — only one `@extends` is allowed
+- `@block name:` ... `@end` declares a named region in the base, or overrides it in a child
+- `@block` is top-level only; it cannot appear inside `@if`, `@for`, `@define`, `@message`, or another `@block`
+
+**Child body constraints:**
+
+- A child template may contain only `@block` overrides (plus blank lines between them)
+- Any other content (text, `@import`, `@if`, etc.) outside a block override is a compile error
+- A child may override a block multiple times — last definition wins (per parse order)
+
+**Block ownership and scope:**
+
+- Block names must be declared in the **root base** template; a child cannot introduce new block names
+- Blocks share the merged scope — all frontmatter variables, functions, and imports are available inside any block body
+- Block name collides with `@define` → `mds::name_collision`; duplicate `@block` in the same module → `mds::name_collision`
+
+**Frontmatter merging:**
+
+- Frontmatter from all ancestors is deep-merged in order: base < intermediate < child < runtime vars
+- Nested mappings are merged key-by-key; arrays replace wholesale; scalars: child wins
+- Reserved keys (`imports`, `type`, `extends`) are excluded from the merged scope
+- Per-file `imports:` entries in frontmatter are each resolved against their own file's location
+- The child's raw frontmatter fence is the only one emitted in the output (base frontmatter is input to scope, not output)
+
+**Output modes:**
+
+| Mode | Behaviour |
+|------|-----------|
+| Text (default) | `@block` bodies render inline where declared in the base skeleton |
+| Messages | `@message` blocks inside `@block` bodies participate in the messages array |
+
+Messages mode example (base defines `@message` blocks inside `@block` bodies):
+
+```mds
+# base.mds
+@block context:
+@message system:
+You are a {role} assistant.
+No additional context.
+@end
+@end
+```
+
+```mds
+# child.mds
+---
+role: research
+---
+@extends "./base.mds"
+@block context:
+@message system:
+You are a {role} assistant.
+Focus on peer-reviewed sources.
+@end
+@end
+```
+
+Messages mode output (`mds build --format messages`):
+
+```json
+[
+  { "role": "system", "content": "You are a research assistant.\nFocus on peer-reviewed sources." }
+]
+```
+
+**Whitespace contract:**
+
+- Block body edges are stripped of leading/trailing blank lines (same rule as `@message` and `@define`)
+- Skeleton whitespace around a spliced block carries through to the output verbatim, except that `@end` consumes the single newline immediately following it. So a blank line between two `@block` declarations renders as one line break, and back-to-back declarations (no separating line) render with no separator between their bodies — author the base skeleton's spacing accordingly
+- Spacing before and after a spliced block is determined by the surrounding base skeleton, not the block body
+
+**Error codes:**
+
+| Error | Trigger | Code |
+|-------|---------|------|
+| E1 | `@extends` not first directive | `mds::extends` |
+| E2 | Two `@extends` in one file | `mds::extends` |
+| E3 | Child content outside `@block` overrides | `mds::extends` |
+| E4 | Child overrides a block not declared by the root base | `mds::extends` |
+| E5 | Circular inheritance (A→B→A, or self-extension) | `mds::circular_import` |
+| E7 | `@block` name collides with `@define` | `mds::name_collision` |
+| E8 | Duplicate `@block` in same module | `mds::name_collision` |
+| E9 | `@block` nested inside another `@block` | `mds::syntax` |
+| E10 | Base file not found | `mds::file_not_found` |
+
+**Resource limits:**
+
+| Limit | Value |
+|-------|-------|
+| `MAX_BLOCKS_PER_MODULE` | 256 blocks per module |
+| `MAX_FRONTMATTER_MERGE_DEPTH` | 64 levels of nested YAML merging |
+
+---
+
 ## 5. Compilation Model
 
 | Phase | Description | Errors |
@@ -842,7 +997,6 @@ These are intentionally deferred to keep the language simple and the compiler fo
 - Macros, async functions, streaming
 - URL-based imports (remote modules)
 - Source maps
-- Template inheritance
 - Function calls in `@if` conditions (e.g. `@if length(items) == 0:`) — not supported
 - Function calls in `@for` iterables (e.g. `@for item in split(csv, ","):`) — not supported
 - Parenthesized sub-expressions in conditions (e.g. `@if (a || b) && c:`) — not supported
@@ -854,9 +1008,10 @@ These are intentionally deferred to keep the language simple and the compiler fo
 ## 11. Grammar Summary
 
 ```
-file            := frontmatter? (directive | text)*
+file            := frontmatter? extends? (directive | text)*
 frontmatter     := "---\n" yaml_content "---\n"
-directive       := import | export | define | include | if_block | for_block | message_block
+extends         := "@extends" quoted_path
+directive       := import | export | define | include | if_block | for_block | message_block | block
 
 import          := alias_import | merge_import | selective_import
 alias_import    := "@import" quoted_path "as" identifier
@@ -882,6 +1037,8 @@ number          := "-"? [0-9]+ ("." [0-9]+)?   (* not NaN or Infinity; those are
 for_block       := "@for" loop_vars "in" dot_path ":" body "@end"
 loop_vars       := identifier | identifier "," identifier
 message_block   := "@message" role ":" body "@end"
+block           := "@block" identifier ":" body "@end"
+                   (* grammar is context-free; `@block` is additionally constrained to top-level only by the parser — see §4.11 Rules *)
 role            := bare_role | "{" message_role_expr "}"
 bare_role       := <any non-empty text up to the trailing ":"> (* literal string; no identifier validation *)
 message_role_expr := qualified_call | member_access | function_call | identifier

@@ -429,6 +429,14 @@ pub fn check_str_collecting_warnings(
 /// Strips:
 /// - Top-level `type: mds` lines (all three YAML quoting styles).
 /// - Top-level `imports:` key and its continuation lines (indented child lines).
+///
+/// SYNC POINT: `deep_merge_yaml` in resolver.rs has a RESERVED list `["imports", "type", "extends"]`
+/// that excludes keys from inherited FM variables.  The two lists serve different purposes and are
+/// intentionally not identical: `deep_merge_yaml::RESERVED` prevents keys from propagating as FM
+/// variables; `strip_reserved_keys` removes keys from raw YAML before re-emitting output.  `extends`
+/// appears only in the merge list (it is a directive token, not an output FM key) and is intentionally
+/// absent here.  Keep this note and the SYNC POINT comment in `deep_merge_yaml` in sync when either
+/// list changes.
 fn strip_reserved_keys(raw: &str) -> Option<String> {
     let mut filtered = String::with_capacity(raw.len());
     let mut in_imports_block = false;
@@ -988,7 +996,12 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 
     let mut paths: IndexSet<String> = IndexSet::new();
 
-    // Insert frontmatter import paths FIRST (they resolve before body imports).
+    // Insert @extends base path FIRST — the base is the first dependency (spec §4.11).
+    if let Some(ext) = module.extends.as_ref() {
+        paths.insert(ext.path.clone());
+    }
+
+    // Insert frontmatter import paths (they resolve before body imports).
     // Best-effort: ignore parse errors here (parse errors will surface at compile time).
     if let Some(fm) = module.frontmatter.as_ref() {
         if let Ok(fm_imports) = resolver::parse_frontmatter_imports(&fm.raw) {
@@ -1296,6 +1309,34 @@ mod tests {
         assert_eq!(
             paths,
             vec!["./fm_lib.mds".to_string(), "./body_lib.mds".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_imports_extends_before_fm_and_body() {
+        // A2: the @extends base path must appear FIRST — before frontmatter imports
+        // AND before body imports — so a dependency scanner sees the base as the
+        // leading dependency. Exercises the ordering branch with all three present.
+        // scan_imports is a static parse-only scan (no child-only-blocks enforcement),
+        // so a top-level @import alongside @extends exercises the ordering directly.
+        let source = concat!(
+            "---\n",
+            "imports:\n",
+            "  - path: ./fm_lib.mds\n",
+            "---\n",
+            "@extends \"./base.mds\"\n",
+            "@import \"./body_lib.mds\"\n",
+            "Hello!\n",
+        );
+        let paths = scan_imports(source).expect("should succeed");
+        assert_eq!(
+            paths,
+            vec![
+                "./base.mds".to_string(),
+                "./fm_lib.mds".to_string(),
+                "./body_lib.mds".to_string(),
+            ],
+            "A2: extends path must precede frontmatter and body imports"
         );
     }
 

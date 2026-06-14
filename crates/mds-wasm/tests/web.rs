@@ -494,3 +494,192 @@ fn scan_imports_handles_all_directive_forms() {
     assert_eq!(js_array_str(&result, 3), "./d.mds");
     assert_eq!(js_array_str(&result, 4), "./e.mds");
 }
+
+// ── Template inheritance tests (@extends / @block) ───────────────────────────
+
+/// Build a modules option for inheritance tests.
+///
+/// `source` (child_src) is passed as the first argument to `compile` /
+/// `compile_messages` and is registered under `"filename"` by the binding.
+/// `modules` must therefore contain ONLY the *other* files (the base template),
+/// not the entry file — otherwise the binding rejects it with
+/// `mds::filename_collision`.
+fn inheritance_modules_opts(child_src: &str, base_src: &str) -> JsValue {
+    let _ = child_src; // entry content is passed as `source`, not in modules
+    to_js_object(&serde_json::json!({
+        "modules": {
+            "base.mds": base_src,
+        },
+        "filename": "child.mds"
+    }))
+}
+
+#[wasm_bindgen_test]
+fn compile_extends_text_mode_skeleton_and_override() {
+    // F1 (WASM): child overrides instructions + tools, inherits output_format default.
+    // Output must contain the overridden blocks and the base skeleton text.
+    let base_src = concat!(
+        "---\nrole: general\n---\n",
+        "You are a {role} assistant.\n",
+        "@block instructions:\nAnalyze data carefully.\n@end\n",
+        "@block tools:\n@end\n",
+        "@block output_format:\nRespond in plain text.\n@end\n",
+    );
+    let child_src = concat!(
+        "---\nrole: data analysis\n---\n",
+        "@extends \"./base.mds\"\n",
+        "@block instructions:\nPerform statistical analysis.\n@end\n",
+        "@block tools:\nYou have access to: Python, R\n@end\n",
+    );
+    let opts = inheritance_modules_opts(child_src, base_src);
+    let result = mds_wasm::compile(child_src, opts).unwrap();
+
+    let output = get_str(&result, "output");
+    assert!(
+        output.contains("You are a data analysis assistant."),
+        "WASM F1: base skeleton with child role should render; got: {output}"
+    );
+    assert!(
+        output.contains("Perform statistical analysis."),
+        "WASM F1: overridden instructions block should render; got: {output}"
+    );
+    assert!(
+        output.contains("You have access to: Python, R"),
+        "WASM F1: overridden tools block should render; got: {output}"
+    );
+    assert!(
+        output.contains("Respond in plain text."),
+        "WASM F1: base default output_format block should render; got: {output}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn compile_extends_dependencies_contains_base() {
+    // A4 (WASM): output shape must have {output, warnings, dependencies} — no new fields.
+    // The base must appear in the dependencies list.
+    let base_src = "@block body:\nBase default.\n@end\n";
+    let child_src = "@extends \"./base.mds\"\n";
+    let opts = inheritance_modules_opts(child_src, base_src);
+    let result = mds_wasm::compile(child_src, opts).unwrap();
+
+    // A4: shape check — only {output, warnings, dependencies}.
+    let output = get_prop(&result, "output");
+    assert!(
+        output.as_string().is_some(),
+        "WASM A4: output must be a string"
+    );
+    let warnings = get_prop(&result, "warnings");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "WASM A4: warnings must be an array"
+    );
+    let deps_val = get_prop(&result, "dependencies");
+    assert!(
+        js_sys::Array::is_array(&deps_val),
+        "WASM A4: dependencies must be an array"
+    );
+
+    // Base must be in dependencies.
+    let deps = js_sys::Array::from(&deps_val);
+    let dep_strings: Vec<String> = (0..deps.length())
+        .map(|i| deps.get(i).as_string().unwrap_or_default())
+        .collect();
+    assert!(
+        dep_strings.iter().any(|s| s.contains("base.mds")),
+        "WASM F1: dependencies must contain base.mds; got: {dep_strings:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn compile_extends_messages_mode() {
+    // F9 (WASM): child overrides a block containing a @message; messages mode
+    // must return the correct {messages, warnings, dependencies} shape.
+    let base_src = concat!(
+        "---\nrole: assistant\n---\n",
+        "@block system_msg:\n@message system:\nYou are a {role}.\n@end\n@end\n",
+        "@block user_msg:\n@message user:\nHello!\n@end\n@end\n",
+    );
+    let child_src = concat!(
+        "---\nrole: researcher\n---\n",
+        "@extends \"./base.mds\"\n",
+        "@block user_msg:\n@message user:\nSummarize findings.\n@end\n@end\n",
+    );
+    let opts = inheritance_modules_opts(child_src, base_src);
+
+    // The WASM binding exposes `compile_messages` as the messages-mode entry point.
+    let result = mds_wasm::compile_messages(child_src, opts).unwrap();
+
+    let messages_val = get_prop(&result, "messages");
+    assert!(
+        js_sys::Array::is_array(&messages_val),
+        "WASM F9: messages must be an array"
+    );
+    let messages = js_sys::Array::from(&messages_val);
+    assert_eq!(
+        messages.length(),
+        2,
+        "WASM F9: expected 2 messages (system + user); got: {}",
+        messages.length()
+    );
+    let system_msg = messages.get(0);
+    let role = get_str(&system_msg, "role");
+    assert_eq!(
+        role, "system",
+        "WASM F9: first message role should be system"
+    );
+    let content = get_str(&system_msg, "content");
+    assert!(
+        content.contains("researcher"),
+        "WASM F9: system message should use child's role; got: {content}"
+    );
+    let user_msg = messages.get(1);
+    let user_content = get_str(&user_msg, "content");
+    assert!(
+        user_content.contains("Summarize findings."),
+        "WASM F9: user message should use overridden block; got: {user_content}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn compile_extends_error_code_is_mds_extends() {
+    // E1 (WASM): stray @extends (not first directive) → error.code must be mds::extends.
+    let source = "Some text.\n@extends \"./base.mds\"\n";
+    let err = mds_wasm::compile(source, JsValue::NULL).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::extends",
+        "WASM E1: stray @extends must have code mds::extends; got: {code}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn compile_extends_undefined_var_in_base_default_carries_real_span() {
+    // C4 (WASM): an undefined variable referenced in a base template's default
+    // block must produce code=mds::undefined_var with a real span (line/column
+    // are numbers, not undefined) when the child does not override that block.
+    // Regression: before the source-attribution fix (7d4310f), line/column were
+    // absent (miette reported OutOfBounds for the cross-source offset).
+    let base_src = "@block greeting:\nHello {customer_name}, welcome.\n@end\n";
+    let child_src = "@extends \"./base.mds\"\n";
+    let opts = inheritance_modules_opts(child_src, base_src);
+
+    let err = mds_wasm::compile(child_src, opts).unwrap_err();
+
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::undefined_var",
+        "WASM C4: expected mds::undefined_var for undefined var in base default block; got: {code}"
+    );
+
+    let span = get_prop(&err, "span");
+    assert!(
+        !span.is_undefined() && !span.is_null(),
+        "WASM C4: err.span must be present for inherited undefined_var"
+    );
+    let _line = get_prop(&span, "line")
+        .as_f64()
+        .expect("WASM C4: span.line must be a number, not undefined");
+    let _column = get_prop(&span, "column")
+        .as_f64()
+        .expect("WASM C4: span.column must be a number, not undefined");
+}

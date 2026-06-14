@@ -1,0 +1,9 @@
+---
+role: researcher
+---
+@extends "./inh_messages_base.mds"
+@block user_msg:
+@message user:
+Summarize the latest findings.
+@end
+@end

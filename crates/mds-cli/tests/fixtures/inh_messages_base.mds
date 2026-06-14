@@ -1,0 +1,14 @@
+---
+role: assistant
+---
+@block system_msg:
+@message system:
+You are a {role}.
+@end
+@end
+
+@block user_msg:
+@message user:
+Describe your capabilities.
+@end
+@end

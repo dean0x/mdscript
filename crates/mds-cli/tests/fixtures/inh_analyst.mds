@@ -1,0 +1,10 @@
+---
+role: data analysis
+---
+@extends "./inh_base.mds"
+@block instructions:
+Perform statistical analysis.
+@end
+@block tools:
+You have access to: Python, R
+@end

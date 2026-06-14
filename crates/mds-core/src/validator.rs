@@ -1,5 +1,5 @@
 use crate::ast::{
-    required_param_count, Arg, Condition, Expr, ForBlock, IfBlock, MessageBlock, Node,
+    required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock, MessageBlock, Node,
 };
 use crate::error::MdsError;
 use crate::scope::Scope;
@@ -52,6 +52,7 @@ fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Re
             })
             .map(|_| ()),
         Node::Message(block) => validate_message_node(block, scope, file, source),
+        Node::Block(block) => validate_block_node(block, scope, file, source),
     }
 }
 
@@ -69,6 +70,15 @@ fn validate_message_node(
             validate_expr(role_expr, scope, file, source, block.offset, 0)?;
         }
     }
+    validate(&block.body, scope, file, source)
+}
+
+fn validate_block_node(
+    block: &BlockNode,
+    scope: &mut Scope,
+    file: &str,
+    source: &str,
+) -> Result<(), MdsError> {
     validate(&block.body, scope, file, source)
 }
 

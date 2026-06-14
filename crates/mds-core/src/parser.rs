@@ -10,8 +10,8 @@
 //! - **`parser_tests.rs`** — integration and unit tests for both modules.
 
 use crate::ast::{
-    Condition, DefineBlock, Expr, ForBlock, Frontmatter, IfBlock, IncludeDirective, MessageBlock,
-    Module, Node, TextNode,
+    BlockNode, Condition, DefineBlock, Expr, ExtendsDirective, ForBlock, Frontmatter, IfBlock,
+    IncludeDirective, MessageBlock, Module, Node, TextNode,
 };
 use crate::error::MdsError;
 use crate::lexer::Token;
@@ -40,6 +40,7 @@ pub(crate) fn parse_with_ctx<'src>(
         pos: 0,
         depth: 0,
         inside_message: false,
+        inside_block: false,
         file,
         source,
     };
@@ -53,6 +54,10 @@ struct Parser<'a> {
     /// True when we are currently inside a `@message` block body.
     /// Used to detect and reject nested `@message` blocks.
     inside_message: bool,
+    /// True when we are currently inside a `@block` body.
+    /// Used to enforce that `@block` is top-level only (cannot nest inside itself or
+    /// inside `@if`, `@for`, `@define`, or `@message`).
+    inside_block: bool,
     file: &'a str,
     source: &'a str,
 }
@@ -74,6 +79,21 @@ impl Drop for MessageGuard<'_, '_> {
     }
 }
 
+/// RAII guard that restores `inside_block` and decrements `depth` when dropped.
+///
+/// Modeled on `MessageGuard`. Created immediately after `enter_block()` and
+/// `inside_block = true` in `parse_block`. All `?` error paths trigger Drop,
+/// keeping the invariant structural rather than manual.
+struct BlockGuard<'p, 'a>(&'p mut Parser<'a>);
+
+impl Drop for BlockGuard<'_, '_> {
+    fn drop(&mut self) {
+        debug_assert!(self.0.depth > 0, "BlockGuard::drop: depth underflow");
+        self.0.inside_block = false;
+        self.0.depth -= 1;
+    }
+}
+
 /// Build the appropriate parse error when a directive's trailing `:` is missing.
 ///
 /// Produces a targeted "unterminated string literal" message when the input contains
@@ -91,8 +111,54 @@ fn directive_colon_error(directive: &str, rest: &str) -> MdsError {
 impl Parser<'_> {
     fn parse_module(&mut self) -> Result<Module, MdsError> {
         let frontmatter = self.parse_frontmatter();
+        // Consume an optional leading `@extends "path"` before parsing the body.
+        // `parse_extends_if_present` will reject a stray @extends later in the body.
+        let extends = self.parse_extends_if_present()?;
         let body = self.parse_body(&[], &[])?;
-        Ok(Module { frontmatter, body })
+        Ok(Module {
+            frontmatter,
+            extends,
+            body,
+        })
+    }
+
+    /// Consume a leading `@extends "path"` directive if present.
+    ///
+    /// "Leading" means: before any non-blank-text node. Blank-line `Text` nodes
+    /// (whitespace-only) are tolerated before `@extends`.
+    ///
+    /// If `@extends` is found, returns `Ok(Some(ExtendsDirective))` and advances
+    /// `self.pos` past that token. If the next meaningful token is not `@extends`,
+    /// returns `Ok(None)` without advancing. A later stray `@extends` is surfaced
+    /// as an error in `parse_directive`.
+    fn parse_extends_if_present(&mut self) -> Result<Option<ExtendsDirective>, MdsError> {
+        // Peek ahead over any blank Text tokens.
+        let mut scan = self.pos;
+        loop {
+            match self.tokens.get(scan) {
+                Some(Token::Text(t, _)) if t.trim().is_empty() => scan += 1,
+                Some(Token::Directive(d, offset)) => {
+                    let trimmed = d.trim();
+                    if trimmed == "@extends" || trimmed.starts_with("@extends ") {
+                        // Consume the blank text tokens we scanned over.
+                        self.pos = scan + 1;
+                        let offset = *offset;
+                        // Parse the path.
+                        let rest = trimmed.strip_prefix("@extends").unwrap_or("").trim();
+                        if rest.is_empty() {
+                            return Err(MdsError::syntax(
+                                "@extends requires a quoted path: @extends \"./base.mds\"",
+                            ));
+                        }
+                        let path = parse_quoted_path(rest)?;
+                        return Ok(Some(ExtendsDirective { path, offset }));
+                    }
+                    break;
+                }
+                _ => break,
+            }
+        }
+        Ok(None)
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -252,6 +318,9 @@ impl Parser<'_> {
         if let Some(rest) = trimmed.strip_prefix("@message ") {
             return self.parse_message_block(rest, offset);
         }
+        if let Some(rest) = trimmed.strip_prefix("@block ") {
+            return self.parse_block(rest, offset);
+        }
 
         // Give a targeted hint if the user wrote @else without the required colon
         if trimmed == "@else" {
@@ -272,8 +341,21 @@ impl Parser<'_> {
             ));
         }
 
+        // Reject a stray @extends that is not at the leading position (E1/E2).
+        // parse_extends_if_present already consumed the leading @extends (if any);
+        // any @extends that reaches parse_directive is by definition misplaced.
+        if trimmed == "@extends" || trimmed.starts_with("@extends ") {
+            return Err(MdsError::extends_error_at(
+                "@extends must be the first directive after frontmatter — only one @extends is allowed and it must appear before any other content",
+                self.file,
+                self.source,
+                offset,
+                dir.len(),
+            ));
+        }
+
         Err(MdsError::syntax(format!(
-            "unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message"
+            "unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message, @block, @extends"
         )))
     }
 
@@ -453,6 +535,68 @@ impl Parser<'_> {
 
         // Guard drops here, restoring inside_message=false and depth-=1.
         Ok(Node::Message(MessageBlock { role, body, offset }))
+    }
+
+    /// Parse a `@block name:` ... `@end` node.
+    ///
+    /// `@block` is top-level only: rejected inside `@if`, `@for`, `@define`, `@message`,
+    /// or another `@block`. The `inside_block` flag (and the `inside_message` flag)
+    /// enforce this at parse time.
+    ///
+    /// State invariant: `inside_block` and `depth` are set AFTER name parsing succeeds,
+    /// so any `?` on name parsing does not leave them in an inconsistent state.
+    /// A `BlockGuard` Drop implementation ensures both are restored on every exit path.
+    ///
+    /// Block bodies have their leading/trailing blank lines stripped — same as
+    /// `@message` and `@define` (decision #9).
+    fn parse_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
+        // Reject @block inside other blocks (top-level only — decision #5).
+        // E9: @block-nesting → mds::syntax (correct; not mds::extends — per error-code mapping).
+        if self.inside_block {
+            return Err(MdsError::syntax(
+                "@block cannot be nested inside another @block",
+            ));
+        }
+        if self.inside_message {
+            return Err(MdsError::syntax(
+                "@block cannot be nested inside a @message block",
+            ));
+        }
+        // depth > 0 means we are inside @if, @for, or @define (top-level depth == 0).
+        if self.depth > 0 {
+            return Err(MdsError::syntax(
+                "@block is top-level only — it cannot appear inside @if, @for, or @define",
+            ));
+        }
+
+        // Parse the name BEFORE mutating parser state, so a `?` leaves flags untouched.
+        let trimmed = rest.trim();
+        let name_str = strip_trailing_directive_colon(trimmed)
+            .ok_or_else(|| directive_colon_error("@block", trimmed))?;
+        let name = name_str.trim().to_string();
+        if name.is_empty() {
+            return Err(MdsError::syntax(
+                "@block name must not be empty — use e.g. @block instructions:",
+            ));
+        }
+        if !is_valid_identifier(&name) {
+            return Err(MdsError::syntax(format!(
+                "invalid @block name: '{name}' — must be a valid identifier"
+            )));
+        }
+
+        // Name is valid — now commit to the block and set flags.
+        self.enter_block()?;
+        self.inside_block = true;
+        let _guard = BlockGuard(self);
+
+        let body = _guard.0.parse_body(&["@end"], &[])?;
+        let body = strip_trailing_newline(strip_leading_newline(body));
+
+        _guard.0.consume_end("@block")?;
+
+        // Guard drops here, restoring inside_block=false and depth-=1.
+        Ok(Node::Block(BlockNode { name, body, offset }))
     }
 
     fn parse_define_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {

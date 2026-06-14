@@ -1827,3 +1827,292 @@ fn parse_single_arg_escaped_closing_quote_is_unterminated() {
         "escaped closing quote must not be accepted as a complete arg string: {result:?}"
     );
 }
+
+// ── Phase 1: @extends / @block tests ──────────────────────────────────────────
+
+#[test]
+fn parse_block_standalone_basic() {
+    // A standalone @block with a default body should parse to Node::Block.
+    let src = "@block instructions:\nDo something useful.\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    assert_eq!(module.body.len(), 1);
+    if let Node::Block(b) = &module.body[0] {
+        assert_eq!(b.name, "instructions");
+        assert!(!b.body.is_empty(), "block body should not be empty");
+    } else {
+        panic!("expected Block node, got {:?}", module.body[0]);
+    }
+}
+
+#[test]
+fn parse_block_empty_body() {
+    // @block with no body (just @end) is valid — default is empty.
+    let src = "@block tools:\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    assert_eq!(module.body.len(), 1);
+    assert!(matches!(module.body[0], Node::Block(_)));
+}
+
+#[test]
+fn parse_block_body_edge_newlines_stripped() {
+    // Leading/trailing single newline stripped like @message/@define (decision #9).
+    // Input: @block intro:\n<body-starts-here-after-newline>\nHello world.\n\n@end\n
+    // strip_leading_newline removes the first \n; strip_trailing_newline removes the last \n.
+    // Result: text = "\nHello world.\n" — inner blank line preserved, outermost \n stripped.
+    let src = "@block intro:\nHello world.\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    if let Node::Block(b) = &module.body[0] {
+        assert!(!b.body.is_empty(), "block body should not be empty");
+        // strip_leading_newline strips the newline immediately after the colon.
+        // strip_trailing_newline strips the newline before @end.
+        // Resulting text should be exactly "Hello world." with no surrounding newlines.
+        if let Node::Text(t) = &b.body[0] {
+            assert_eq!(
+                t.text, "Hello world.",
+                "block body text should have leading/trailing newlines stripped"
+            );
+        } else {
+            panic!("expected Text node in block body");
+        }
+    } else {
+        panic!("expected Block node");
+    }
+}
+
+#[test]
+fn parse_block_missing_colon_rejected() {
+    // @block without trailing colon → syntax error.
+    let src = "@block instructions\nsome body\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "missing colon must be a syntax error");
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("@block"), "error should mention @block: {msg}");
+}
+
+#[test]
+fn parse_block_invalid_identifier_rejected() {
+    // @block with a non-identifier name → syntax error.
+    let src = "@block 123bad:\nbody\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "invalid identifier must be a syntax error");
+}
+
+#[test]
+fn parse_block_empty_name_rejected() {
+    // @block with empty name (just whitespace before colon) → syntax error.
+    let src = "@block :\nbody\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "empty block name must be a syntax error");
+}
+
+#[test]
+fn parse_block_nested_inside_block_rejected() {
+    // Nesting @block inside another @block → syntax error.
+    let src = "@block outer:\n@block inner:\nbody\n@end\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "nested @block must be rejected");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("@block") || msg.contains("nested") || msg.contains("top-level"),
+        "error should explain nesting restriction: {msg}"
+    );
+}
+
+#[test]
+fn parse_block_nested_inside_if_rejected() {
+    // @block inside @if → syntax error (top-level only).
+    let src = "@if flag:\n@block instructions:\nbody\n@end\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@block inside @if must be rejected");
+}
+
+#[test]
+fn parse_block_nested_inside_for_rejected() {
+    // @block inside @for → syntax error (top-level only).
+    let src = "@for x in items:\n@block b:\nbody\n@end\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@block inside @for must be rejected");
+}
+
+#[test]
+fn parse_block_nested_inside_message_rejected() {
+    // @block inside @message → syntax error (top-level only).
+    let src = "@message system:\n@block b:\nbody\n@end\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@block inside @message must be rejected");
+}
+
+#[test]
+fn parse_block_nested_inside_define_rejected() {
+    // @block inside @define → syntax error (top-level only).
+    let src = "@define foo():\n@block b:\nbody\n@end\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@block inside @define must be rejected");
+}
+
+#[test]
+fn parse_extends_basic() {
+    // @extends "path" should parse into Module.extends with correct path and offset.
+    let src = "@extends \"./base.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    assert!(
+        module.extends.is_some(),
+        "module.extends should be Some after @extends directive"
+    );
+    let ext = module.extends.unwrap();
+    assert_eq!(ext.path, "./base.mds");
+    // The offset should be 0 — @extends is the first token.
+    assert_eq!(ext.offset, 0, "offset of leading @extends should be 0");
+}
+
+#[test]
+fn parse_extends_after_frontmatter() {
+    // @extends after frontmatter is valid (it's the first directive after FM).
+    let src = "---\nrole: assistant\n---\n@extends \"./base.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    assert!(module.extends.is_some());
+    assert_eq!(module.extends.unwrap().path, "./base.mds");
+}
+
+#[test]
+fn parse_extends_after_blank_line_ok() {
+    // A blank-line Text node before @extends should still count as "first directive after FM".
+    let src = "\n@extends \"./base.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    assert!(module.extends.is_some());
+}
+
+#[test]
+fn parse_extends_sets_module_extends_none_for_standalone() {
+    // A module with no @extends should have extends: None.
+    let src = "Hello world!\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", "").unwrap();
+    assert!(
+        module.extends.is_none(),
+        "standalone module must have extends = None"
+    );
+}
+
+#[test]
+fn parse_extends_stray_not_first_directive_rejected() {
+    // E1: @extends appearing after a non-whitespace node → mds::extends (not mds::syntax).
+    let src = "Some text.\n@extends \"./base.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    let err = result.expect_err("stray @extends must be rejected");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::extends",
+        "E1: stray @extends must map to mds::extends, got: {}",
+        serialized.code
+    );
+    assert!(
+        err.to_string().contains("first") || err.to_string().contains("@extends"),
+        "error should explain placement rule: {}",
+        err
+    );
+}
+
+#[test]
+fn parse_extends_duplicate_rejected() {
+    // E2: Two @extends directives → mds::extends (not mds::syntax).
+    let src = "@extends \"./a.mds\"\n@extends \"./b.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    let err = result.expect_err("duplicate @extends must be rejected");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::extends",
+        "E2: duplicate @extends must map to mds::extends, got: {}",
+        serialized.code
+    );
+}
+
+#[test]
+fn parse_extends_missing_path_rejected() {
+    // @extends without a quoted path → syntax error.
+    let src = "@extends\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "@extends without path must be rejected");
+}
+
+#[test]
+fn parse_extends_unquoted_path_rejected() {
+    // @extends with an unquoted path → syntax error.
+    let src = "@extends ./base.mds\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_err(), "unquoted path must be rejected");
+}
+
+// ── A3: Error-code mapping consolidation ─────────────────────────────────────
+
+/// A3 — parser-layer error codes (E1 / E2 / E9):
+///
+/// | Error | Trigger | Expected code |
+/// |-------|---------|---------------|
+/// | E1 | @extends not first directive | mds::extends |
+/// | E2 | two @extends declarations | mds::extends |
+/// | E9 | @block nested inside @block | mds::syntax |
+#[test]
+fn a3_parser_error_code_table() {
+    // E1: stray @extends → mds::extends
+    {
+        let src = "Some text.\n@extends \"./base.mds\"\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let err = parse_with_ctx(&tokens, "", "").unwrap_err();
+        let s = err.serialize();
+        assert_eq!(
+            s.code, "mds::extends",
+            "A3 E1: stray @extends must be mds::extends"
+        );
+        assert!(
+            s.span.is_some(),
+            "A3 E1: stray @extends error must carry a source span"
+        );
+    }
+
+    // E2: double @extends → mds::extends (second one is stray)
+    {
+        let src = "@extends \"./a.mds\"\n@extends \"./b.mds\"\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let err = parse_with_ctx(&tokens, "", "").unwrap_err();
+        let s = err.serialize();
+        assert_eq!(
+            s.code, "mds::extends",
+            "A3 E2: double @extends must be mds::extends"
+        );
+        assert!(
+            s.span.is_some(),
+            "A3 E2: double @extends error must carry a source span"
+        );
+    }
+
+    // E9: @block nested inside @block → mds::syntax (correct per spec; NOT mds::extends)
+    {
+        let src = "@block outer:\n@block inner:\nbody\n@end\n@end\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let err = parse_with_ctx(&tokens, "", "").unwrap_err();
+        assert_eq!(
+            err.serialize().code,
+            "mds::syntax",
+            "A3 E9: @block nesting must be mds::syntax"
+        );
+    }
+}

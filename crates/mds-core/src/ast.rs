@@ -2,7 +2,33 @@
 #[derive(Debug, Clone)]
 pub struct Module {
     pub frontmatter: Option<Frontmatter>,
+    /// `@extends "path"` directive, present only in child templates.
+    ///
+    /// When `Some`, this module is a child template and its body may only contain
+    /// `@block` override nodes (plus blank lines). When `None`, it is a standalone
+    /// module that renders its own body directly.
+    ///
+    /// `module.extends.is_some()` is the canonical child-vs-standalone discriminator —
+    /// illegal states are unrepresentable: a module without `extends` cannot have
+    /// inherited blocks, and a module with `extends` cannot render stand-alone.
+    pub extends: Option<ExtendsDirective>,
     pub body: Vec<Node>,
+}
+
+/// The `@extends "path"` directive that makes a module a child template.
+///
+/// Modeled after `ImportDirective` — one path string plus the byte offset of the
+/// directive in the source (for error span reporting).
+#[derive(Debug, Clone)]
+pub struct ExtendsDirective {
+    /// The raw quoted path, e.g. `"./base.mds"`.
+    pub path: String,
+    /// Byte offset of the `@extends` token in the source.
+    ///
+    /// The resolver uses this to attach precise error spans when the base file is not
+    /// found or when a stray `@extends` occurs mid-file, via
+    /// `attach_import_span(e, path, file, source, ext.offset)`.
+    pub offset: usize,
 }
 
 /// A literal value for a default parameter in `@define` blocks.
@@ -101,6 +127,26 @@ pub enum Node {
     Include(IncludeDirective),
     /// `@message role:` ... `@end` — structured message block for LLM chat APIs.
     Message(MessageBlock),
+    /// `@block name:` ... `@end` — a named placeholder block for template inheritance.
+    ///
+    /// In a standalone (non-extending) module the body is rendered inline as the default
+    /// content. In a child module these are override nodes that replace the base template's
+    /// corresponding block.
+    Block(BlockNode),
+}
+
+/// A named template block: `@block name:` ... `@end`.
+///
+/// In standalone mode the body is evaluated inline (the markers are invisible).
+/// In inheritance mode the resolver splices overrides from the child into the base skeleton
+/// before validation and evaluation.
+#[derive(Debug, Clone)]
+pub struct BlockNode {
+    /// The block name — a valid identifier, e.g. `instructions`.
+    pub name: String,
+    pub body: Vec<Node>,
+    /// Byte offset of the `@block` token in the source (for error spans).
+    pub offset: usize,
 }
 
 /// A structured message block: `@message role:` ... `@end`.

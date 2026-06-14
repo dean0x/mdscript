@@ -1,0 +1,15 @@
+---
+role: general
+---
+You are a {role} assistant.
+
+@block instructions:
+Analyze data carefully.
+@end
+
+@block tools:
+@end
+
+@block output_format:
+Respond in plain text.
+@end

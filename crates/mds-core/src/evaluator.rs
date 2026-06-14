@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ast::{
-    required_param_count, Arg, CondValue, Condition, Expr, ForBlock, IfBlock, IncludeDirective,
-    MessageBlock, Node,
+    required_param_count, Arg, BlockNode, CondValue, Condition, Expr, ForBlock, IfBlock,
+    IncludeDirective, MessageBlock, Node,
 };
 use crate::error::MdsError;
 use crate::limits::{
@@ -95,6 +95,14 @@ fn evaluate_nodes(
                 // transparent when compiling to plain text.
                 output.push_str(&evaluate_nodes(&block.body, scope, ctx)?);
             }
+            Node::Block(block) => {
+                // Standalone mode: render the block's default body inline.
+                // The block markers are invisible in text output — @block is a
+                // transparent wrapper in non-extending files.
+                // The resolver splices child overrides before evaluation, so this arm
+                // handles both base defaults and child-override bodies.
+                output.push_str(&evaluate_block(block, scope, ctx)?);
+            }
         }
         if output.len() > MAX_OUTPUT_SIZE {
             return Err(MdsError::resource_limit(format!(
@@ -105,6 +113,18 @@ fn evaluate_nodes(
     }
 
     Ok(output)
+}
+
+/// Render a `@block` node's body inline.
+///
+/// In standalone mode (no `@extends`) the block body is the default content and is
+/// rendered as plain text — the `@block` markers are invisible.
+fn evaluate_block(
+    block: &BlockNode,
+    scope: &mut Scope,
+    ctx: &mut EvalContext,
+) -> Result<String, MdsError> {
+    evaluate_nodes(&block.body, scope, ctx)
 }
 
 /// Resolve a dot-separated path against the current scope.
@@ -756,6 +776,13 @@ fn collect_messages(
                     ));
                 }
             }
+            Node::Block(block) => {
+                // Descend into @block body to surface any @message blocks it contains.
+                // In standalone mode the block body is the default content; in inheritance
+                // mode the resolver has already spliced the final body before evaluation,
+                // so this arm is reached for both cases.
+                collect_messages(&block.body, scope, ctx, out)?;
+            }
         }
     }
     Ok(())
@@ -1403,5 +1430,72 @@ mod tests {
     fn builtin_string_with_number_literal_arg() {
         let result = crate::compile_str("{string(42)}\n").unwrap();
         assert_eq!(result.trim(), "42");
+    }
+
+    // ── Phase 1: standalone @block rendering tests ────────────────────────────
+
+    #[test]
+    fn block_standalone_renders_default_inline_text_mode() {
+        // A standalone @block renders its default body inline in text mode.
+        let src = "Before.\n@block content:\nDefault body.\n@end\nAfter.\n";
+        let result = crate::compile_str(src).unwrap();
+        assert!(
+            result.contains("Default body."),
+            "standalone @block default should render inline in text mode, got: {result}"
+        );
+        assert!(
+            result.contains("Before."),
+            "text before @block should appear: {result}"
+        );
+        assert!(
+            result.contains("After."),
+            "text after @block should appear: {result}"
+        );
+    }
+
+    #[test]
+    fn block_standalone_renders_empty_body_in_text_mode() {
+        // An empty @block renders nothing (no crash, no marker text).
+        let src = "A\n@block empty:\n@end\nB\n";
+        let result = crate::compile_str(src).unwrap();
+        // Should produce "A\nB\n" — empty block body contributes nothing.
+        assert!(
+            !result.contains("@block") && !result.contains("@end"),
+            "block markers must not appear in output: {result}"
+        );
+        assert!(
+            result.contains('A') && result.contains('B'),
+            "surrounding text should remain: {result}"
+        );
+    }
+
+    #[test]
+    fn block_with_interpolation_renders_inline() {
+        // A @block body that contains interpolation resolves variables from scope.
+        let src = "---\nname: Alice\n---\n@block greeting:\nHello {name}!\n@end\n";
+        let result = crate::compile_str(src).unwrap();
+        assert!(
+            result.contains("Hello Alice!"),
+            "block body interpolation should resolve, got: {result}"
+        );
+    }
+
+    #[test]
+    fn block_messages_mode_descends_into_block_body() {
+        // In messages mode, @message inside a @block body should surface as a message.
+        let src = "@block wrapper:\n@message system:\nSystem prompt.\n@end\n@end\n";
+        let result = crate::compile_messages_str(src);
+        assert!(
+            result.is_ok(),
+            "compile_messages should succeed for @block containing @message: {result:?}"
+        );
+        let output = result.unwrap();
+        assert_eq!(
+            output.messages.len(),
+            1,
+            "@message inside @block should surface in messages mode"
+        );
+        assert_eq!(output.messages[0].role, "system");
+        assert!(output.messages[0].content.contains("System prompt."));
     }
 }
