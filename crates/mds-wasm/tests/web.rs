@@ -651,3 +651,35 @@ fn compile_extends_error_code_is_mds_extends() {
         "WASM E1: stray @extends must have code mds::extends; got: {code}"
     );
 }
+
+#[wasm_bindgen_test]
+fn compile_extends_undefined_var_in_base_default_carries_real_span() {
+    // C4 (WASM): an undefined variable referenced in a base template's default
+    // block must produce code=mds::undefined_var with a real span (line/column
+    // are numbers, not undefined) when the child does not override that block.
+    // Regression: before the source-attribution fix (7d4310f), line/column were
+    // absent (miette reported OutOfBounds for the cross-source offset).
+    let base_src = "@block greeting:\nHello {customer_name}, welcome.\n@end\n";
+    let child_src = "@extends \"./base.mds\"\n";
+    let opts = inheritance_modules_opts(child_src, base_src);
+
+    let err = mds_wasm::compile(child_src, opts).unwrap_err();
+
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::undefined_var",
+        "WASM C4: expected mds::undefined_var for undefined var in base default block; got: {code}"
+    );
+
+    let span = get_prop(&err, "span");
+    assert!(
+        !span.is_undefined() && !span.is_null(),
+        "WASM C4: err.span must be present for inherited undefined_var"
+    );
+    let _line = get_prop(&span, "line")
+        .as_f64()
+        .expect("WASM C4: span.line must be a number, not undefined");
+    let _column = get_prop(&span, "column")
+        .as_f64()
+        .expect("WASM C4: span.column must be a number, not undefined");
+}

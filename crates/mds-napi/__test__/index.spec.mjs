@@ -657,4 +657,40 @@ describe('template inheritance', () => {
       },
     );
   });
+
+  // INH-3: C4 regression — undefined var in base default block carries a real span
+  // (line/column) rather than undefined when the child does not override the block.
+  test('INH-3: undefined var in inherited base default block has code mds::undefined_var and a real span', () => {
+    const baseContent = '@block greeting:\nHello {customer_name}, welcome.\n@end\n';
+    const childContent = '@extends "./base.mds"\n';
+
+    withInheritanceFixtures(baseContent, childContent, (childPath) => {
+      assert.throws(
+        () => compileFile(childPath),
+        (err) => {
+          assert.ok(err instanceof Error, 'INH-3: error should be instanceof Error');
+          assert.equal(
+            err.code,
+            'mds::undefined_var',
+            `INH-3: expected mds::undefined_var, got: ${err.code}`,
+          );
+          assert.ok(
+            err.span !== undefined && err.span !== null,
+            'INH-3: err.span must be present for inherited undefined_var',
+          );
+          assert.equal(
+            typeof err.span.line,
+            'number',
+            `INH-3: span.line must be a number, got: ${typeof err.span.line}`,
+          );
+          assert.equal(
+            typeof err.span.column,
+            'number',
+            `INH-3: span.column must be a number, got: ${typeof err.span.column}`,
+          );
+          return true;
+        },
+      );
+    });
+  });
 });
