@@ -548,14 +548,16 @@ The compiler splices overridden blocks into the base skeleton, validates and eva
 #### Syntax
 
 ```mds
-# base.mds — defines two placeholder blocks
+# base.mds — defines three placeholder blocks
 You are a {role} assistant.
 
 @block instructions:
 Analyze data carefully.
 @end
+
 @block tools:
 @end
+
 @block output_format:
 Respond in plain text.
 @end
@@ -660,7 +662,7 @@ Messages mode output (`mds build --format messages`):
 **Whitespace contract:**
 
 - Block body edges are stripped of leading/trailing blank lines (same rule as `@message` and `@define`)
-- Blank lines between `@block` declarations in the base skeleton are preserved in the output
+- Skeleton whitespace around a spliced block carries through to the output verbatim, except that `@end` consumes the single newline immediately following it. So a blank line between two `@block` declarations renders as one line break, and back-to-back declarations (no separating line) render with no separator between their bodies — author the base skeleton's spacing accordingly
 - Spacing before and after a spliced block is determined by the surrounding base skeleton, not the block body
 
 **Error codes:**
