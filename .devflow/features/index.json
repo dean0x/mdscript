@@ -21,7 +21,7 @@
     },
     "mds-napi": {
       "name": "MDS Native Node.js Bindings (napi-rs)",
-      "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode, template inheritance, extends, block, mds::extends, INH-1, INH-2, compileFile, A4 shape stability.",
+      "description": "Use when adding new exports to the native Node.js addon, changing error codes or error shape, working with N-API raw system calls, updating options parsing, or investigating the panic-safety boundary. Keywords: napi-rs, native addon, node, N-API, napi_create_error, catch_unwind, cdylib, mds-napi, @mdscript/mds-napi, bindings, options.rs, VarsError, parse_json_vars, BuiltinError, builtin_type_error, compileMessages, Message, CompileMessagesResult, messages mode, template inheritance, extends, block, mds::extends, INH-1, INH-2, INH-3, compileFile, A4 shape stability, SerializedSpan, character-based column, cross-source-offset, span attribution.",
       "directories": [
         "crates/mds-napi/"
       ],
@@ -39,7 +39,7 @@
         "crates/mds-core/src/options.rs",
         "Cargo.toml"
       ],
-      "lastUpdated": "2026-06-12T18:57:53.256Z",
+      "lastUpdated": "2026-06-14T21:17:50.764Z",
       "createdBy": "implement"
     },
     "mds-compiler": {
