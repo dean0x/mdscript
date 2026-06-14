@@ -466,3 +466,106 @@ fn p2_wide_base_200_blocks_under_1s() {
         elapsed.as_millis()
     );
 }
+
+// ── E12 CLI: base-default undefined var renders with base span, no OutOfBounds ──
+
+/// Run `mds check` on a file and return (stderr, success).
+fn check_file(path: &str) -> (String, bool) {
+    let output = mds_bin()
+        .args(["check", path])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    (
+        String::from_utf8(output.stderr).unwrap(),
+        output.status.success(),
+    )
+}
+
+#[test]
+fn e12_base_default_undefined_var_render_points_at_base() {
+    // E12: base has an undefined var in a default block; child extends base without
+    // providing the var. The CLI human render must show a real span from base.mds,
+    // not `OutOfBounds` / "Failed to read contents".
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("base.mds");
+    let child_path = dir.path().join("child.mds");
+
+    std::fs::write(
+        &base_path,
+        "@block greeting:\nHello {customer_name}, welcome.\n@end\n",
+    )
+    .unwrap();
+    std::fs::write(&child_path, "@extends \"./base.mds\"\n").unwrap();
+
+    let (_, stderr, ok) = build_file(child_path.to_str().unwrap());
+
+    assert!(!ok, "E12 CLI: compile must fail; stderr: {stderr}");
+    assert!(
+        stderr.contains("mds::undefined_var"),
+        "E12 CLI: stderr must contain mds::undefined_var; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Failed to read contents"),
+        "E12 CLI: stderr must NOT contain 'Failed to read contents' (OutOfBounds); got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("OutOfBounds"),
+        "E12 CLI: stderr must NOT contain 'OutOfBounds'; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("base.mds"),
+        "E12 CLI: stderr must name base.mds; got: {stderr}"
+    );
+    // The label text "not defined" appears only when the span renders against a readable source.
+    assert!(
+        stderr.contains("not defined") || stderr.contains("customer_name"),
+        "E12 CLI: stderr must contain 'not defined' or 'customer_name' (readable span); got: {stderr}"
+    );
+}
+
+#[test]
+fn e12_check_and_build_diagnostics_match() {
+    // E12 A5: `mds check` and `mds build` on the same inheritance error must produce
+    // the same error code and both name the base file.
+    let dir = tempfile::tempdir().unwrap();
+    let base_path = dir.path().join("base.mds");
+    let child_path = dir.path().join("child.mds");
+
+    std::fs::write(&base_path, "@block content:\n{missing_var}\n@end\n").unwrap();
+    std::fs::write(&child_path, "@extends \"./base.mds\"\n").unwrap();
+
+    let (_, build_stderr, build_ok) = build_file(child_path.to_str().unwrap());
+    let (check_stderr, check_ok) = check_file(child_path.to_str().unwrap());
+
+    assert!(!build_ok, "E12 A5: build must fail");
+    assert!(!check_ok, "E12 A5: check must fail");
+
+    assert!(
+        build_stderr.contains("mds::undefined_var"),
+        "E12 A5: build stderr must contain mds::undefined_var; got: {build_stderr}"
+    );
+    assert!(
+        check_stderr.contains("mds::undefined_var"),
+        "E12 A5: check stderr must contain mds::undefined_var; got: {check_stderr}"
+    );
+
+    assert!(
+        build_stderr.contains("base.mds"),
+        "E12 A5: build stderr must name base.mds; got: {build_stderr}"
+    );
+    assert!(
+        check_stderr.contains("base.mds"),
+        "E12 A5: check stderr must name base.mds; got: {check_stderr}"
+    );
+
+    assert!(
+        !build_stderr.contains("Failed to read contents"),
+        "E12 A5: build must not render OutOfBounds; got: {build_stderr}"
+    );
+    assert!(
+        !check_stderr.contains("Failed to read contents"),
+        "E12 A5: check must not render OutOfBounds; got: {check_stderr}"
+    );
+}
