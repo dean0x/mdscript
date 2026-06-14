@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, the compile_messages API family, or template inheritance (@extends/@block). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch, extends, block, skeleton, ExtendsDirective, BlockNode, effective_skeleton, effective_blocks, frontmatter_values, process_module_skeleton, resolve_by_key_skeleton, resolve_extends_components, ExtendsComponents, splice_skeleton, deep_merge_yaml, build_scope_from_merged_mapping, apply_block_overrides, check_child_only_blocks, MAX_BLOCKS_PER_MODULE, MAX_FRONTMATTER_MERGE_DEPTH, mds::extends, template inheritance, diamond inheritance, seed_effective_blocks, pf004_messages_mode_extends_validates_final_body_parity, utf8_boundary, compute_line_column, extends_error_at, p5b_deep_chain."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, the compile_messages API family, or template inheritance (@extends/@block). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch, extends, block, skeleton, ExtendsDirective, BlockNode, effective_skeleton, effective_blocks, frontmatter_values, process_module_skeleton, resolve_by_key_skeleton, resolve_extends_components, ExtendsComponents, splice_skeleton, spliced_regions, validate_extends_components, deep_merge_yaml, build_scope_from_merged_mapping, apply_block_overrides, check_child_only_blocks, MAX_BLOCKS_PER_MODULE, MAX_FRONTMATTER_MERGE_DEPTH, mds::extends, template inheritance, diamond inheritance, seed_effective_blocks, pf004_messages_mode_extends_validates_final_body_parity, utf8_boundary, compute_line_column, extends_error_at, p5b_deep_chain, Origin, EffectiveBlock, skeleton_origin, region-aware validation, ride-along, spliced_regions, ADR-022, diagnostic attribution, cross-source offset, OutOfBounds, SerializedSpan, character-based column."
 category: architecture
 directories: [crates/mds-core/src/, crates/mds-cli/src/, crates/mds-cli/tests/]
 referencedFiles:
@@ -27,7 +27,7 @@ referencedFiles:
   - crates/mds-cli/tests/format_messages.rs
   - crates/mds-cli/tests/inheritance.rs
 created: 2026-05-12
-updated: 2026-06-12
+updated: 2026-06-14
 ---
 
 # MDS Compiler
@@ -151,7 +151,37 @@ All cross-pipeline defense-in-depth constants:
 
 ### Resolver (`crates/mds-core/src/resolver.rs`)
 
-This is the most significant change. The resolver now has two resolution paths: standalone (`process_module`) and skeleton (`process_module_skeleton` / `resolve_by_key_skeleton`).
+The resolver has two resolution paths: standalone (`process_module`) and skeleton (`process_module_skeleton` / `resolve_by_key_skeleton`).
+
+#### Region-Aware Validation — `Origin` "Ride-Along" Architecture (ADR-022)
+
+Previously the resolver spliced base+child into `final_body` and called `validator::validate(&final_body, ..., ctx.file_str, ctx.source)` once with the CHILD's single source. When a validation error's AST offset came from a BASE/ancestor node, it was paired with the child's `NamedSource`, causing miette to render `OutOfBounds` ("Failed to read contents for label ... : OutOfBounds") in the CLI human path. The JSON `serialize()` path degraded more gracefully (via `compute_line_column`'s OOB guard) but still reported wrong file attribution. This is the cross-source-offset class.
+
+The fix: each spliced region carries its own source ("ride-along"):
+
+**`struct Origin { pub(crate) file: Arc<str>, pub(crate) source: Arc<str> }`** — the display filename plus the source bytes its offsets index into. Manual `Debug` impl prints `file` + `source.len()` only — NEVER raw source bytes (no-leak rule, `debug-panics` constraint).
+
+**`struct EffectiveBlock { pub(crate) node: Arc<BlockNode>, pub(crate) origin: Origin }`** — replaces the bare `Arc<BlockNode>` value type of `ResolvedModule.effective_blocks` and `ExtendsComponents.effective_blocks`. Now `IndexMap<String, EffectiveBlock>`. `Clone` = three refcount bumps (one `Arc<BlockNode>` + two `Arc<str>` inside `Origin`). Manual elided `Debug`.
+
+**`ResolvedModule.skeleton_origin: Origin`** — the root-base skeleton's origin (file + source for non-block skeleton nodes). `Arc::clone`'d down the chain so deep multi-level chains have zero extra allocations.
+
+**`ExtendsComponents.skeleton_origin: Origin`** — carries the same root skeleton origin through `resolve_extends_components` to the validate/evaluate sites.
+
+**`ResolvedModule`'s `#[derive(Debug)]`** is replaced by a manual `Debug` that elides source bytes (avoids leaking source in panic/debug output).
+
+**Arc allocation rule**: One `Origin` is built PER MODULE RESOLUTION (in `process_module` root path and `process_module_skeleton` root-base arm) and `Arc::clone`d into each block — NEVER `Arc::from(ctx.source)` inside a per-block loop. Load-bearing perf rule: O(blocks×source) allocation would break the `p2_wide_base_200_blocks_under_1s` guard. Tested by `p_block_sources_share_one_arc` (asserts `Arc::ptr_eq` — all blocks from one file share ONE `Arc<str>` source).
+
+**Origin follows the winning override**: `apply_block_overrides` keeps each inherited (un-overridden) entry's existing origin on the cloned map, and stamps each override INSERT with an `Origin` built from the CURRENT (overriding) `ctx`. A base-default block keeps the root base's origin; a child override carries child offsets+source. Test: `e12_child_override_undefined_var_attributes_to_child` (F3 in unit tests).
+
+**Root source reaches the leaf**: extending modules `Arc::clone` the ancestor's `skeleton_origin` down the chain (in `resolve_extends_components`, the `process_module_skeleton` intermediate arm, `process_module_extends` construction, and the `resolve_by_key` A1 cache-upgrade). In an A←B←C chain the leaf reads A's source bytes for skeleton non-block nodes. Test: `e12_multilevel_undefined_var_attributes_to_root_base` (F4).
+
+#### Single Shared Skeleton Walk — `spliced_regions`
+
+**`fn spliced_regions(skeleton, effective_blocks, skeleton_origin) -> Vec<(&[Node], &Origin)>`** — a `Node::Block` placeholder yields `(&eff_block.node.body, &eff_block.origin)`; any other skeleton node yields `(slice::from_ref(node), skeleton_origin)`. Mirrors the old missing-block `debug_assert!(false, ...)` + release fallback.
+
+**`splice_skeleton`** is now a thin adapter: `spliced_regions(...).into_iter().flat_map(|(nodes, _)| nodes.iter().cloned()).collect()`. BOTH `splice_skeleton` (eval) and `validate_extends_components` (validate) consume this one iterator — eval and validate node sets can never drift (PF-004 lesson). This is the primary correctness mechanism against parallel-path divergence.
+
+**`fn validate_extends_components(components: &ExtendsComponents, scope: &mut Scope) -> Result<(), MdsError>`** — walks `spliced_regions` and calls `validator::validate(nodes, scope, &origin.file, &origin.source)?` per region. BOTH the text site (`process_module_extends`) and the messages site (`process_module_messages`) call this single helper instead of validating `final_body` against `ctx.source` — preserving PF-004 parity by construction. Per-region validation equals whole-slice validation because `validator::validate` only does local scope push/pop for `@define`/`@for` and functions are pre-registered; document order (which-error-first) is preserved.
 
 #### Template Inheritance Architecture
 
@@ -162,7 +192,8 @@ This is the most significant change. The resolver now has two resolution paths: 
 - `has_explicit_exports: bool`
 - `explicit_exports: HashSet<String>`
 - `effective_skeleton: Arc<[Node]>` — root-ancestor body, Arc-shared across all descendants. For standalone modules: own body (built once, Arc-shared). For extending modules: `Arc::clone` of the base's skeleton — never a deep-clone.
-- `effective_blocks: IndexMap<String, Arc<BlockNode>>` — name → fully-overridden `BlockNode`. Seeded from own `@block` declarations (standalone) or `clone(base.effective_blocks)` + child overrides (extending). Most-derived wins.
+- `effective_blocks: IndexMap<String, EffectiveBlock>` — name → `EffectiveBlock { node: Arc<BlockNode>, origin: Origin }`. Seeded from own `@block` declarations (standalone) or `clone(base.effective_blocks)` + child overrides (extending). Most-derived wins; each entry carries the origin of its winning file.
+- `skeleton_origin: Origin` — root-base file + source for non-block skeleton nodes. `Arc::clone`'d down the chain.
 - `frontmatter_values: Option<serde_yaml_ng::Mapping>` — raw parsed YAML for this module. For intermediate bases in a chain, this is the *transitive accumulated merge* of all ancestors' FM + own FM, so a leaf descending from it gets the full chain without re-traversing.
 - `is_skeleton: bool` — `true` when produced by `process_module_skeleton` (no validate/evaluate). Cache-poisoning guard: `prompt_body.is_none()` is NOT a reliable skeleton signal (standalone modules with empty body also have `None`). Always use `is_skeleton`.
 
@@ -174,26 +205,26 @@ This is the most significant change. The resolver now has two resolution paths: 
 
 **Cache-poisoning invariant (A1)**: A file may be resolved as a skeleton base before it is compiled standalone (or vice-versa). Cache key is the same normalized file key in both cases. Rules:
 - Standalone-first → skeleton reuses the full entry as-is (it has everything a base needs).
-- Skeleton-first → `resolve_by_key` detects `is_skeleton` on cache hit, performs full compile, upgrades the entry in place; reuses the skeleton's Arcs so descendants keep pointer-identity.
+- Skeleton-first → `resolve_by_key` detects `is_skeleton` on cache hit, performs full compile, upgrades the entry in place; reuses the skeleton's `effective_skeleton` / `effective_blocks` / `skeleton_origin` Arcs so descendants keep pointer-identity.
 
 #### Resolution Flow for Extending Modules
 
 **`resolve_by_key_skeleton(key, runtime_vars, warnings)`** — resolves a file for use as an `@extends` base. Uses the same `ModuleCache` and `resolving` stack as `resolve_by_key`, so cycle detection (`mds::circular_import`), `MAX_IMPORT_DEPTH`, dependency tracking, and `MAX_FILE_SIZE` all apply automatically (applies PF-004). Calls `process_module_skeleton`.
 
-**`process_module_skeleton(ctx, is_md, warnings)`** — tokenize → parse → collect (functions/blocks/frontmatter); NO validate/evaluate. Sets `is_skeleton = true`, `prompt_body = None`. For intermediate bases in a chain (B in A←B←C): recursively resolves the grandparent via `resolve_by_key_skeleton`, applies `check_child_only_blocks`, runs `apply_block_overrides`, and deep-merges FM transitively (`grandparent.frontmatter_values < own_fm_values`).
+**`process_module_skeleton(ctx, is_md, warnings)`** — tokenize → parse → collect (functions/blocks/frontmatter); NO validate/evaluate. Sets `is_skeleton = true`, `prompt_body = None`. For intermediate bases in a chain (B in A←B←C): recursively resolves the grandparent via `resolve_by_key_skeleton`, applies `check_child_only_blocks`, runs `apply_block_overrides`, and deep-merges FM transitively (`grandparent.frontmatter_values < own_fm_values`). `skeleton_origin` is `Arc::clone`'d from the grandparent so the root base's source bytes ride down the chain.
 
 **`resolve_extends_components(module, ext, ctx, frontmatter_values, warnings) -> Result<ExtendsComponents>`** — the shared pipeline for steps 3a–3e, called by both `process_module_extends` (text) and `process_module_messages` (messages). Both modes go through exactly the same path, avoiding PF-004 divergence.
 
 Steps executed by `resolve_extends_components`:
 1. **3a**: validate import path, resolve base via `resolve_by_key_skeleton`.
 2. **3b**: `check_child_only_blocks` — every top-level node in `module.body` must be `Node::Block` or whitespace-only `Text`. Stray content → `mds::extends`.
-3. **3c**: `apply_block_overrides` — clones `base.effective_blocks` (diamond-safe: never mutates cached base), then for each `Node::Block` in `module.body`, updates the block entry. Child block name not in base → `mds::extends` (unknown override, E4). Most-derived wins.
-4. **3d**: Build merged scope — `deep_merge_yaml(base_fm, child_fm)` then `build_scope_from_merged_mapping`; resolve base FM imports (relative to base key) then child FM imports (relative to child key); merge base functions into scope; collect child body definitions.
-5. **3e**: `splice_skeleton(effective_skeleton, effective_blocks)` — linear O(S+B) pass over the skeleton, replacing each `Node::Block` placeholder with the effective body. Non-block nodes pass verbatim. Between-block spacing (Text nodes) preserved.
+3. **3c**: `apply_block_overrides` — clones `base.effective_blocks` (diamond-safe: never mutates cached base), then for each `Node::Block` in `module.body`, updates the block entry with the child's override origin. Child block name not in base → `mds::extends` (unknown override, E4). Most-derived wins.
+4. **3d**: Build merged scope — `deep_merge_yaml(base_fm, child_fm)` then `build_scope_from_merged_mapping`; resolve base FM imports (relative to base key, using `base.skeleton_origin.source` so any span-carrying errors attribute correctly) then child FM imports (relative to child key); merge base functions into scope; collect child body definitions.
+5. **3e**: `splice_skeleton(effective_skeleton, effective_blocks, skeleton_origin)` — produces `final_body` via `spliced_regions` adapter. Linear O(S+B) pass.
 
-**`process_module_extends(module, ext, ctx, raw_frontmatter, frontmatter_values, warnings)`** — 6-parameter function (the dead `_is_md` parameter was removed in batch-B cleanup; `#[allow(clippy::too_many_arguments)]` removed with it). Calls `resolve_extends_components`, then runs `validator::validate(&final_body, ...)` + `evaluate(&final_body, ...)` (step 3f, text mode). Operates on `final_body`, NOT `module.body` — this is what makes validation of base default blocks using the merged leaf scope work (ADR-016).
+**`process_module_extends(module, ext, ctx, raw_frontmatter, frontmatter_values, warnings)`** — calls `resolve_extends_components`, then calls `validate_extends_components` (region-aware validation via `spliced_regions`) + `evaluate(&final_body, ...)` (step 3f, text mode). Operates on `final_body`, NOT `module.body` — this is what makes validation of base default blocks using the merged leaf scope work (ADR-016).
 
-**`process_module_messages`** — for the `@extends` branch, calls `resolve_extends_components`, then calls `validator::validate(&final_body, ...)` (step 3f, messages), checks `has_message_block(&final_body)` (NOT `module.body`), then calls `evaluate_messages(&final_body, ...)`. The validate call before evaluate was added to close a PF-004 parallel-path gap where the primary path (text mode) ran validation but the messages-mode `@extends` branch did not.
+**`process_module_messages`** — for the `@extends` branch, calls `resolve_extends_components`, then calls `validate_extends_components` (step 3f, messages), checks `has_message_block(&final_body)` (NOT `module.body`), then calls `evaluate_messages(&final_body, ...)`. Both text and messages mode call the same `validate_extends_components` helper, preserving PF-004 parity.
 
 #### Scope Construction for Inheritance
 
@@ -211,19 +242,21 @@ Precedence: **base < child < runtime** (decision #3 / F7).
 
 #### Helper Functions
 
-**`seed_effective_blocks(body, block_names) -> IndexMap<String, Arc<BlockNode>>`** — extracted helper that seeds the `effective_blocks` map from a body slice and the set of known block names. Used in both `process_module` (standalone path) and `process_module_skeleton` (root-base arm) to eliminate the duplicated seeding loop. Uses a `filter_map` iterator over the body to preserve declaration order in the `IndexMap`.
+**`seed_effective_blocks(body, block_names, origin) -> IndexMap<String, EffectiveBlock>`** — extracted helper that seeds the `effective_blocks` map from a body slice, the set of known block names, and an `&Origin` (cloned into each seeded `EffectiveBlock`). Used in both `process_module` (standalone path) and `process_module_skeleton` (root-base arm). Uses a `filter_map` iterator over the body to preserve declaration order in the `IndexMap`.
 
-**`check_child_only_blocks(body, ctx)`** — validates that every top-level node in a child body is `Node::Block` or whitespace-only `Text`. Returns `mds::extends` with span on first stray node. Has a `debug_assert!(ctx.source.is_char_boundary(offset))` guard before indexing into source (mirrors the safety added to `compute_line_column`).
+**`check_child_only_blocks(body, ctx)`** — validates that every top-level node in a child body is `Node::Block` or whitespace-only `Text`. Returns `mds::extends` with span on first stray node. Has a `debug_assert!(ctx.source.is_char_boundary(offset))` guard before indexing into source.
 
-**`apply_block_overrides(parent_blocks, body, ctx)`** — clones parent map, applies child overrides. Returns `mds::extends` for unknown block name (child overriding a block not in parent).
+**`apply_block_overrides(parent_blocks, body, ctx)`** — clones parent map, builds one `Origin` from `ctx` OUTSIDE the loop (perf rule), applies child overrides stamped with that origin. Returns `mds::extends` for unknown block name (child overriding a block not in parent). Inherited (un-overridden) entries keep their existing origin from the cloned map.
 
-**`splice_skeleton(skeleton, effective_blocks) -> Vec<Node>`** — produces `final_body`. For each `Node::Block` in the skeleton, looks up the effective body by name (O(1) in `IndexMap`); non-block nodes pass through. The result is a flat `Vec<Node>` with no `Node::Block` wrappers — block markers are invisible to validate+evaluate. A missing block name (every skeleton block must be in `effective_blocks` after `apply_block_overrides`) triggers a `debug_assert!(false, ...)` in debug builds with a "compiler bug" message; the release build falls back to the skeleton's own default body to avoid silent empty output.
+**`splice_skeleton(skeleton, effective_blocks, skeleton_origin) -> Vec<Node>`** — thin adapter over `spliced_regions`; flat-maps the `(nodes, _)` pairs into a `Vec<Node>`. The result is a flat `Vec<Node>` with no `Node::Block` wrappers — block markers are invisible to validate+evaluate.
+
+**`spliced_regions(skeleton, effective_blocks, skeleton_origin) -> Vec<(&[Node], &Origin)>`** — canonical single walk used by BOTH splice and validate. See "Single Shared Skeleton Walk" above.
 
 **`collect_block(block, defs, count, ctx)`** — registers a `@block` name in `defs.block_names`; checks for duplicate names and `@block`-vs-`@define` collisions (same namespace, decision #10); enforces `MAX_BLOCKS_PER_MODULE`.
 
 **`CollectedDefs`** — private struct with `block_names: HashSet<String>` added alongside the existing `functions`, `has_explicit_exports`, `explicit_exports`.
 
-**`ExtendsComponents`** — private struct returned by `resolve_extends_components`: `final_body`, `scope`, `functions`, `effective_skeleton`, `effective_blocks`, `has_explicit_exports`, `explicit_exports`.
+**`ExtendsComponents`** — private struct returned by `resolve_extends_components`: `final_body`, `scope`, `functions`, `effective_skeleton`, `effective_blocks`, `skeleton_origin`, `has_explicit_exports`, `explicit_exports`.
 
 #### `scan_imports` Update
 
@@ -231,7 +264,9 @@ Precedence: **base < child < runtime** (decision #3 / F7).
 
 ### Error System (`crates/mds-core/src/error.rs`)
 
-**`compute_line_column(source, offset) -> Option<(usize, usize)>`** — private helper that converts a byte offset into a 1-based (line, column) pair. Boundary-safe: returns `None` for `offset > source.len()` or when `offset` is not a valid UTF-8 char boundary (guards against panic on multi-byte UTF-8 strings). `offset == source.len()` is a valid exclusive-end sentinel and returns `Some`. This boundary safety was required before adding `validator::validate` to the messages-mode `@extends` branch (removing the risk of a cross-source offset panic).
+**`fn at(file, source, offset, len) -> (Option<SourceSpan>, Option<Arc<NamedSource<String>>>)`** — private shared constructor called by all `*_at` error constructors. Computes `end = offset.saturating_add(len)` and `in_bounds = end <= source.len() && source.is_char_boundary(offset) && source.is_char_boundary(end)`. When `!in_bounds`, returns `(Some(SourceSpan::new(offset, len)), None)` — keeps the raw offset/length for `serialize()` but drops `src` so miette never reads outside the source string (eliminates `OutOfBounds` in ALL render paths: CLI human AND JSON). A `debug_assert!(in_bounds || source.is_empty(), "cross-source offset mismatch…")` fires in debug/test builds for the cross-source bug case; the empty-source escape prevents false-fires on unit tests that pass `""` as source.
+
+**`compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)>`** — private helper that converts a byte offset into a 1-based (line, column) pair. Boundary-safe: returns `None` for `offset > source.len()` or when `offset` is not a valid UTF-8 char boundary (guards against panic on multi-byte UTF-8). `offset == source.len()` (exclusive-end) returns `Some`. Column is **character-based** (Unicode scalar values via `source[..offset].chars()`), not byte-based — so `SerializedSpan.column` equals the visual column on multibyte lines; ASCII is unchanged. `SerializedSpan` doc was corrected to state "character position (Unicode scalar values)". Test: `compute_line_column_is_char_based` in `error_tests.rs` (CJK 3-byte chars: byte-col would be 7, char-col is 3).
 
 **`MdsError::Extends { message, span, src }`** — code `mds::extends`. Used for:
 - Child-only-blocks violations (stray top-level content in a child body).
@@ -243,11 +278,13 @@ Note: `@block` nesting violations (E9) use `mds::syntax` (not `mds::extends`) �
 
 Full error code set for the inheritance subsystem: `mds::extends`, `mds::name_collision` (duplicate block name, block/define collision, duplicate FM import alias), `mds::circular_import` (cycle through `@extends` chain), `mds::syntax` (stray `@extends`, nested `@block`).
 
+**`SerializedSpan`** — `offset` and `length` are raw bytes; `column` is the 1-indexed character position (Unicode scalar values) — NOT a byte offset and NOT UTF-16 code units. `line` and `column` are `None` when `src` is `None` (cross-source out-of-bounds case), but `offset`/`length` still reflect raw `SourceSpan` values.
+
 ### Messages-Mode Resolution
 
 **Messages-mode resolution path** — `resolve_key_messages` and `resolve_source_messages` delegate to `process_module_messages`, which uses `resolve_extends_components` for extending modules (identical pipeline to text mode). The `has_message_block` check runs against `final_body` (not `module.body`), so `@message` blocks inside base `@block` defaults are correctly detected.
 
-**Validate before evaluate (PF-004 parity)** — `process_module_messages` calls `validator::validate(&final_body, ...)` before the `has_message_block` guard and before `evaluate_messages`, mirroring text-mode `process_module_extends` and the standalone messages path. This closes the parallel-path gap: a base-default block referencing an undefined variable now produces `mds::undefined_var` in messages mode, identical to text mode. Test: `pf004_messages_mode_extends_validates_final_body_parity`.
+**Validate before evaluate (PF-004 parity)** — `process_module_messages` calls `validate_extends_components` (region-aware, via `spliced_regions`) before the `has_message_block` guard and before `evaluate_messages`, mirroring text-mode `process_module_extends`. Both modes share one `validate_extends_components` implementation — divergence is structurally impossible. Test: `pf004_messages_mode_span_parity_with_text_mode` (verifies both text and messages mode report the same span file/offset for a base-default undefined var).
 
 **No-`@message`-blocks hard error** — `process_module_messages` returns `mds::syntax` if no `@message` block is found in the assembled final body. This is a compile error, not a silent fallback.
 
@@ -257,7 +294,7 @@ Full error code set for the inheritance subsystem: `mds::extends`, `mds::name_co
 
 **`FrontmatterImport` enum** with three variants: `Alias { path, alias }`, `Merge { path }`, `Selective { path, names }`. Functions: `parse_frontmatter_imports_from_yaml` (from a YAML value), `parse_frontmatter_imports` (from raw YAML string, used by `scan_imports`).
 
-**Resolution order**: frontmatter imports before body `@import` directives. Per-file resolution in inheritance: base FM imports resolve relative to the base key; child FM imports resolve relative to the child key. A duplicate alias across base and child → `mds::name_collision`.
+**Resolution order**: frontmatter imports before body `@import` directives. Per-file resolution in inheritance: base FM imports resolve relative to the base key (using `base.skeleton_origin.source` so spans attribute correctly); child FM imports resolve relative to the child key. A duplicate alias across base and child → `mds::name_collision`.
 
 ### Public API: `compile_messages` family
 
@@ -302,10 +339,10 @@ The data flow is: lexer → parser → resolver → validator → evaluator → 
 **Template inheritance interactions**:
 - `ast.rs`: `ExtendsDirective`, `BlockNode`, `Module.extends` — parsed by parser, carried into resolver
 - `parser.rs`: `parse_extends_if_present` (leading only), `parse_block` with `BlockGuard`; `inside_block` flag prevents nesting
-- `resolver.rs`: `resolve_by_key_skeleton` → `process_module_skeleton` builds the skeleton cache entry; `resolve_extends_components` (shared text+messages pipeline) assembles `final_body` and `scope`; `validator::validate` + `evaluate` run ONCE at the leaf on `final_body`
+- `resolver.rs`: `resolve_by_key_skeleton` → `process_module_skeleton` builds the skeleton cache entry (with `skeleton_origin`); `resolve_extends_components` (shared text+messages pipeline) assembles `final_body`, `effective_blocks` (with `Origin` per entry), and `skeleton_origin`; `validate_extends_components` walks `spliced_regions` per-region with correct origins; `evaluate` runs ONCE at the leaf on `final_body`
 - `evaluator.rs`: `Node::Block` arm in `evaluate_nodes` calls `evaluate_block` (transparent in both standalone and post-splice modes); `Node::Block` arm in `collect_messages` descends into block bodies
-- `validator.rs`: `validate_block_node` recurses into block body; runs against `final_body` at the leaf (ADR-016)
-- `error.rs`: `MdsError::Extends` with constructor `extends_error_at` (span-carrying; no-span `extends_error()` was removed)
+- `validator.rs`: `validate_block_node` recurses into block body; runs against per-region slices (via `validate_extends_components`) at the leaf (ADR-016)
+- `error.rs`: `MdsError::Extends` with constructor `extends_error_at` (span-carrying; no-span `extends_error()` was removed); `fn at()` defense-in-depth guard prevents miette `OutOfBounds` across all error variants
 
 **Cross-cutting interactions** (unchanged):
 - `parser_helpers.rs`: `parse_expr_inner` is the shared grammar for interpolation, directives, and `@message` role expressions
@@ -318,7 +355,7 @@ The data flow is: lexer → parser → resolver → validator → evaluator → 
 
 `@block` nodes are transparent to the evaluator after inheritance resolution. The resolver's `splice_skeleton` replaces all `Node::Block` placeholders with their effective bodies before `validate` and `evaluate` are called. You do not need to add special block handling in the evaluator for features that work on body content — they automatically see the spliced-in content.
 
-For features that need to operate on block structure before splicing (e.g., tooling that introspects block names), read from `ResolvedModule::effective_blocks` (an `IndexMap<String, Arc<BlockNode>>`).
+For features that need to operate on block structure before splicing (e.g., tooling that introspects block names), read from `ResolvedModule::effective_blocks` (an `IndexMap<String, EffectiveBlock>`).
 
 ### Adding a New Directive (Updated for Inheritance)
 
@@ -400,9 +437,13 @@ Follow the pattern used by `type: mds` and `imports`:
 - **Expecting `scan_imports` to return `@extends` path anywhere except first position** — it is always prepended as the leading dependency.
 - **Calling `compile_all_dir` in `watch.rs`** — this function was removed. Use `compile_one_source`.
 - **Calling `extends_error()` (no-span variant)** — it was removed; always use `extends_error_at()`. Both E3 (stray child content) and E4 (unknown block override) carry span context.
-- **Skipping `validator::validate` in the messages-mode `@extends` branch** — the validate call must precede `evaluate_messages`; omitting it allows undefined-variable references in base `@block` defaults to silently pass (PF-004 parallel-path bypass). Covered by test `pf004_messages_mode_extends_validates_final_body_parity`.
+- **Skipping `validate_extends_components` in the messages-mode `@extends` branch** — both text and messages mode must call this helper (not `validator::validate(&final_body, ..., ctx.file_str, ctx.source)`); omitting it allows undefined-variable references in base `@block` defaults to silently pass (PF-004 parallel-path bypass) AND restores the cross-source `OutOfBounds` bug.
+- **Calling `validator::validate(&final_body, ..., ctx.file_str, ctx.source)` in an `@extends` code path** — use `validate_extends_components` instead. Passing `ctx.source` (child source) with a `final_body` that may contain nodes from the base means spans will index the wrong source string, causing miette `OutOfBounds` in the CLI human render (this was the original bug fixed by ADR-022).
 - **Accessing the `extends_path` field on `ResolvedModule`** — it was removed (dead code, never read). Use `module.extends` on the parsed AST module if you need the path.
-- **Duplicating the `seed_effective_blocks` loop** — the extracted `seed_effective_blocks(body, block_names)` helper eliminates the two former duplicated seeding loops; add new call sites rather than reimplementing the logic inline.
+- **Duplicating the `seed_effective_blocks` loop** — the extracted `seed_effective_blocks(body, block_names, origin)` helper eliminates the two former duplicated seeding loops; add new call sites rather than reimplementing the logic inline.
+- **Adding a second, separate walk over the skeleton for validation or eval** — both must consume `spliced_regions` so they cannot drift. A separate walk that reconstructs the node list independently can silently diverge from what the evaluator sees (PF-004 lesson).
+- **Allocating `Arc::from(ctx.source)` inside a per-block loop in `apply_block_overrides` or `seed_effective_blocks`** — the `override_origin` / `origin` is built ONCE outside the loop and `Arc::clone`d per entry. O(blocks×source) allocation would break the `p2_wide_base_200_blocks_under_1s` guard. Verified by `p_block_sources_share_one_arc` (`Arc::ptr_eq` assertion).
+- **Printing source bytes in `Debug` output for `Origin`, `EffectiveBlock`, or `ResolvedModule`** — the `debug-panics` no-leak rule forbids source text in panic messages or debug output. All three types have manual `Debug` impls that elide source content; never add `#[derive(Debug)]` to them.
 
 ## Gotchas
 
@@ -425,14 +466,15 @@ Follow the pattern used by `type: mds` and `imports`:
 - **`OutputFormat` derives `clap::ValueEnum`** — adding a variant automatically adds a valid `--format` value; ensure intentional.
 - **`is_skeleton = true` means prompt_body is always None** — but `prompt_body = None` does NOT imply `is_skeleton = true`. Check `is_skeleton` explicitly.
 - **`effective_skeleton` is `Arc<[Node]>`, not `Arc<Vec<Node>>`** — constructed via `Arc::from(slice)`. The Arcs are cloned (not the nodes) across the inheritance chain. Total cost of an N-level chain is O(1) for skeleton sharing.
-- **`effective_blocks` is cloned per child, but `BlockNode` bodies are cloned only when override is written** — `apply_block_overrides` clones the whole `IndexMap` (key+`Arc<BlockNode>`) but `Arc::clone` on unmodified blocks is O(1).
+- **`effective_blocks` is `IndexMap<String, EffectiveBlock>` (not `IndexMap<String, Arc<BlockNode>>`)** — each entry now carries `EffectiveBlock { node: Arc<BlockNode>, origin: Origin }`. `Arc::clone` on unmodified blocks is O(1); `Origin` carries two `Arc<str>` so a clone is three refcount bumps total.
 - **`deep_merge_yaml` arrays replace wholesale** — `[1, 2]` in base + `[3]` in child = `[3]` in merged, not `[1, 2, 3]`. This is intentional (decision #7).
 - **`@block` names share the namespace with `@define` names** — a `@block foo:` and a `@define foo()` in the same module → `mds::name_collision`.
 - **A child may only override blocks declared by the root base** — intermediate bases can add overrides but cannot introduce new block names. Only the root base declares `@block` placeholders. Attempting to override a name not in the root base → `mds::extends` (E4).
-- **`process_module_skeleton` does NOT call validate/evaluate** — it is collect-only. A syntax error in the base template body is deferred to the leaf's `validator::validate(&final_body, ...)` call (ADR-016: validate at the leaf, not at intermediate bases).
+- **`process_module_skeleton` does NOT call validate/evaluate** — it is collect-only. A syntax error in the base template body is deferred to the leaf's `validate_extends_components` call (ADR-016: validate at the leaf, not at intermediate bases).
 - **Diamond inheritance is safe** — `apply_block_overrides` always clones before mutating, so two children of the same base each get independent `effective_blocks` maps. The `Arc<BlockNode>` body pointers are shared but bodies are never mutated after construction.
 - **`@extends` must be the first directive after frontmatter** — `parse_extends_if_present` only recognizes it in the leading position (after blank lines). A stray `@extends` mid-body → `mds::extends` error from `parse_directive`.
-- **`compute_line_column` handles UTF-8 boundaries safely** — returns `None` for offsets that land mid-character or beyond `source.len()`. `offset == source.len()` (exclusive-end) returns `Some`. This prevents panics when spans from multi-byte sources (e.g., a base template containing emoji or accented characters) are used to build error diagnostics in the messages-mode `@extends` path.
+- **`compute_line_column` is character-based and boundary-safe** — returns `None` for offsets that land mid-character or beyond `source.len()`. `offset == source.len()` (exclusive-end) returns `Some`. Column counts Unicode scalar values, not bytes — `SerializedSpan.column` reflects visual column on multibyte lines (e.g., CJK 3-byte chars: byte-col 7 vs char-col 3). This prevents panics on multi-byte sources and ensures correct column reporting in the JSON error path.
+- **`MdsError::at()` defense-in-depth guard** — when an offset+len pair is out-of-bounds for the source string passed to any `*_at` constructor, `src` is set to `None` (span offset/length are preserved). Miette never renders `OutOfBounds` in any path (CLI human or JSON). A `debug_assert!` fires in debug/test builds for the non-empty-source case, surfacing cross-source offset bugs loudly during development. The empty-source escape prevents false-fires on unit tests.
 - **FM-carrying deep chains are O(N^2) in the merge path** — `deep_merge_yaml` is called at each level of `process_module_skeleton`, so a 32-level chain where every level adds FM keys accumulates merge work quadratically. The current implementation is correct and passes the `p5b_deep_chain_32_levels_with_frontmatter_under_2s` guard (< 2 s on typical hardware), but fixing the O(N^2) behaviour is tracked as tech debt.
 - **Test name convention** — resolver test functions use domain-descriptive names throughout: UTF-8 boundary regression tests are `utf8_boundary_*`; PF-004 parity tests are `pf004_*`. These were originally named `task1_*` and `task2_*` but were renamed for consistency with the existing `f*/e*/a*/p*` convention. Do not search for the old task-prefixed names.
 - **P2 perf bound is 1s** — the `p2_wide_base_200_blocks_under_1s` test (CLI integration, `inheritance.rs`) uses a 1-second wall-clock bound, relaxed from the original 200ms to avoid CI flakiness. The guard still catches O(N²) blowup; it is intentionally generous for CI variability.
@@ -442,15 +484,16 @@ Follow the pattern used by `type: mds` and `imports`:
 - `crates/mds-core/src/limits.rs` — all cross-pipeline resource limits; `MAX_BLOCKS_PER_MODULE = 256` and `MAX_FRONTMATTER_MERGE_DEPTH = 64` added for inheritance
 - `crates/mds-core/src/ast.rs` — all AST types; `ExtendsDirective`, `BlockNode`, `Node::Block`, `Module.extends` added; `Node::Message(MessageBlock)`; `Condition` variants; `required_param_count`
 - `crates/mds-core/src/parser.rs` — `parse_extends_if_present`; `parse_block` with `BlockGuard` RAII; `inside_block` flag; `parse_message_block` with `MessageGuard`
-- `crates/mds-core/src/resolver.rs` — orchestrator; `ResolvedModule` with inheritance fields (no `extends_path` — removed); `resolve_by_key_skeleton`; `process_module_skeleton`; `resolve_extends_components`; `ExtendsComponents`; `splice_skeleton`; `deep_merge_yaml`; `build_scope_from_merged_mapping`; `apply_block_overrides`; `check_child_only_blocks`; `seed_effective_blocks` (extracted helper); `ModuleCache`; `FrontmatterImport`
+- `crates/mds-core/src/resolver.rs` — orchestrator; `Origin` struct (file+source ride-along, manual Debug); `EffectiveBlock` struct (node+origin); `ResolvedModule` with `skeleton_origin` field; `spliced_regions` (single shared walk); `splice_skeleton` (thin adapter); `validate_extends_components` (region-aware validation helper); `resolve_by_key_skeleton`; `process_module_skeleton`; `resolve_extends_components`; `ExtendsComponents`; `deep_merge_yaml`; `build_scope_from_merged_mapping`; `apply_block_overrides`; `check_child_only_blocks`; `seed_effective_blocks`; `ModuleCache`; `FrontmatterImport`
 - `crates/mds-core/src/evaluator.rs` — `Node::Block` arm (evaluate_block); `Node::Block` arm in collect_messages; `EvalContext`; `evaluate_messages` / `collect_messages`
 - `crates/mds-core/src/validator.rs` — `validate_block_node`; `Node::Block` arm; `validate_message_node`; `validate_condition`
-- `crates/mds-core/src/error.rs` — `MdsError::Extends` with `mds::extends` code; `extends_error_at` constructor (only span-carrying variant; no-span `extends_error` removed); `compute_line_column` (UTF-8 boundary safe)
+- `crates/mds-core/src/error.rs` — `fn at()` (defense-in-depth OOB guard, used by all `*_at` constructors); `MdsError::Extends` with `extends_error_at`; `compute_line_column` (character-based column, UTF-8 boundary safe); `SerializedSpan` (offset/length in bytes, column in Unicode scalar values)
+- `crates/mds-core/src/error_tests.rs` — `compute_line_column_is_char_based` (CJK char-vs-byte column test); `line_col_out_of_bounds` (OOB returns None)
 - `crates/mds-core/src/builtins.rs` — 18 built-in functions; `BuiltinMeta`; `get_builtin` / `call_builtin`
 - `crates/mds-core/src/lib.rs` — public API; `scan_imports` (prepends `@extends` path first); `Message`; `CompileMessagesOutput`; `compile_messages*` family
 - `crates/mds-cli/src/build.rs` — `OutputFormat`; `BuildArgs`; `compile_to_content`; `compile_and_write`; `read_build_input`
 - `crates/mds-cli/src/watch.rs` — watch subcommand; reverse-dep graph; `compile_one_source`
-- `crates/mds-cli/tests/inheritance.rs` — CLI integration tests for template inheritance (F1/F11 worked example, F2 standalone base, F6/F7 FM merge + --set, F8 @if/@interp in block body, F9/E13 messages mode, F13 watch partials, E5 circular, A2 dep order, P2 wide-base perf bound of 1s)
+- `crates/mds-cli/tests/inheritance.rs` — CLI integration tests for template inheritance; E12 diagnostic attribution tests: `e12_base_default_undefined_var_render_points_at_base` (asserts stderr names base.mds, contains "not defined", no `OutOfBounds`/`Failed to read contents`), `e12_check_and_build_diagnostics_match` (check and build agree on error code and base file)
 - `crates/mds-core/tests/messages.rs` — integration tests for `@message` / messages mode
 - `crates/mds-cli/tests/format_messages.rs` — CLI integration tests for `--format messages`
 - `crates/mds-core/tests/api_surface.rs` — public API regression tests
@@ -460,11 +503,12 @@ Follow the pattern used by `type: mds` and `imports`:
 - ADR-008: bundles related language features in single PR (template inheritance shipped as Issue #58/PR #95)
 - ADR-010: reuse `parse_expr_inner` across interpolation and directive parsing — `@message` role expressions follow this; `@extends`/`@block` parsing uses the same tokenizer infrastructure
 - ADR-014: frontmatter imports resolve before body `@import`; per-file base-vs-child import resolution in inheritance
-- ADR-016: re-validate dynamically-assembled final_body at the leaf — `process_module_extends` calls `validator::validate(&final_body, ...)` and `evaluate(&final_body, ...)`, NOT on `module.body`; same in `process_module_messages` (now also validates before evaluate in the `@extends` branch)
-- PF-004: base reads go ONLY through `resolve_by_key_skeleton` / `FileSystem` trait — never `std::fs` — so `MAX_FILE_SIZE`, cycle detection, and `MAX_IMPORT_DEPTH` all apply to `@extends` bases in both text and messages mode; messages-mode `@extends` branch now also runs `validator::validate` before `evaluate_messages` (parallel-path parity)
-- `crates/mds-core/src/resolver.rs` — canonical reference for module system, inheritance pipeline, `ResolvedModule` inheritance fields, `ExtendsComponents`, `splice_skeleton`, `deep_merge_yaml`
+- ADR-016: re-validate dynamically-assembled final_body at the leaf — `process_module_extends` and `process_module_messages` call `validate_extends_components` (not `validator::validate` directly with `ctx.source`), operating on per-region slices from `spliced_regions` rather than `module.body`
+- ADR-022: diagnostic source-origin rides along the data (`Origin { file, source }` on each spliced block + `skeleton_origin` on the module) via `Arc::clone`, rather than being looked up from a path→source cache map at error time. The cache-map alternative was rejected because it cannot serve in-memory `<source>` entries and would flip the displayed filename. This fixes the cross-source-offset class (where a base-template AST offset was paired with the child's `NamedSource`, causing miette `OutOfBounds` in the CLI human render path). The JSON path's `compute_line_column` OOB guard (introduced in commit `b95a0ed`) provided degraded protection before; ADR-022 makes the human-render path equally robust via the `fn at()` defense-in-depth guard.
+- PF-004: base reads go ONLY through `resolve_by_key_skeleton` / `FileSystem` trait — never `std::fs` — so `MAX_FILE_SIZE`, cycle detection, and `MAX_IMPORT_DEPTH` all apply to `@extends` bases in both text and messages mode; both modes now call `validate_extends_components` (sharing one `spliced_regions` walk) preventing parallel-path divergence
+- `crates/mds-core/src/resolver.rs` — canonical reference for module system, inheritance pipeline, `ResolvedModule` inheritance fields, `Origin`, `EffectiveBlock`, `ExtendsComponents`, `spliced_regions`, `splice_skeleton`, `validate_extends_components`, `deep_merge_yaml`
 - `crates/mds-core/src/evaluator.rs` — canonical reference for `EvalContext`, `evaluate_expr`, `evaluate_messages`, `collect_messages`, `evaluate_block`
 - `crates/mds-core/src/scope.rs` — canonical reference for `CapturedScope`, `Arc<FunctionDef>`, closure capture API
 - `crates/mds-core/src/ast.rs` — canonical reference for all AST types including `BlockNode`, `ExtendsDirective`; start here for new directive forms
 - `crates/mds-cli/tests/` — end-to-end tests across 12+ categorized files including `inheritance.rs`
-- Tech debt: issue #77 (ScanState extraction), #78 (CondValue/Expr unification), #79 (parse_interpolation_expr delegation), #80 (parse_simple_condition complexity); O(N^2) FM merge in deep chains (untracked, documented in p5b test)
+- Tech debt: issue #77 (ScanState extraction), #78 (CondValue/Expr unification), #79 (parse_interpolation_expr delegation), #80 (parse_simple_condition complexity); O(N^2) FM merge in deep chains (untracked, documented in p5b test); `SkeletonEntry`/`StandaloneEntry` enum split to replace `is_skeleton` flag (untracked)
