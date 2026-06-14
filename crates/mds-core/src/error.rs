@@ -7,9 +7,10 @@ use thiserror::Error;
 
 /// A serializable representation of a source span.
 ///
-/// Offsets and lengths are in bytes from the start of the source string,
-/// matching `miette::SourceSpan`. Line and column are 1-indexed byte offsets
-/// from the start of the respective line (NOT UTF-16 code units).
+/// `offset` and `length` are in bytes from the start of the source string,
+/// matching `miette::SourceSpan`. `line` is 1-indexed; `column` is the
+/// 1-indexed character position (Unicode scalar values) from the start of the
+/// line — NOT a byte offset and NOT UTF-16 code units.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SerializedSpan {
     pub offset: usize,
