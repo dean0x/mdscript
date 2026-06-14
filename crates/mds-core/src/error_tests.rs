@@ -529,32 +529,9 @@ fn line_col_at_end_of_source() {
 
 #[test]
 fn compute_line_column_is_char_based() {
-    // "café\nworld": café = 4 chars (5 bytes: c=0,a=1,f=2,é=3..4), \n=5, w=6
-    // Offset 6 points to 'w' on line 2 — this is correctly handled (same result).
-    // The NEW test: offset pointing INTO the "café" line verifies char-based column.
-    //
-    // "héllo" has 5 chars (6 bytes: h=0, é=1..2, l=3, l=4, o=5).
-    // Offset 3 is byte 3, pointing to 'l' (the second char after é).
-    // Byte-based col would be: 'h'(1 byte) + 'é'(2 bytes) + col=4 (byte 3 → 4th byte).
-    // Char-based col: 'h'(1) + 'é'(2) + 'l'(3) → col=4 for the 'l' at byte 3.
-    // Wait, both are 4 here. Let's use a longer multibyte prefix.
-    //
-    // "日本語\n!" — "日"=3bytes, "本"=3bytes, "語"=3bytes, \n=1byte, "!"=1byte.
-    // Offset 10 points to '!' on line 2. Byte-based col=1, char-based col=1. Same.
-    //
-    // On line 1, offset 6 points to '語' (the 3rd character).
-    // Byte-based: 6 bytes in → col=7 (byte index 6+1? no, col counts from 1: 6 bytes → col = 6+1?
-    //   actually: starting col=1, increment per byte: byte0→col2,...,byte5→col7? )
-    //   Wait: each byte increments col by 1, starting from col=1.
-    //   bytes 0,1,2 = '日', bytes 3,4,5 = '本', byte 6 starts '語'.
-    //   Before byte 6: 6 bytes processed → col = 1+6 = 7.
-    // Char-based: 2 chars before byte 6 ('日', '本') → col = 1+2 = 3.
-    //
-    // So at byte offset 6 in "日本語\n!": byte-based col=7, char-based col=3.
+    // "日本語\n!" — each CJK char is 3 bytes; offset 6 points to '語' (the 3rd char).
+    // Byte-based col would be 7 (6 bytes consumed + 1); char-based col is 3 (2 chars before).
     let src = "日本語\n!";
-    // '語' is at byte 6 (each CJK char = 3 bytes).
-    assert_eq!(src.as_bytes()[6], b'\xe8'); // first byte of '語'
-    assert!(src.is_char_boundary(6));
     let (line, col) = compute_line_column(src, 6).expect("offset 6 should be valid");
     assert_eq!(line, 1, "char-based: line should be 1");
     assert_eq!(
@@ -562,10 +539,9 @@ fn compute_line_column_is_char_based() {
         "char-based: col should be 3 (two chars before: 日, 本), not 7 (byte-based)"
     );
 
-    // Also confirm the existing multibyte test still passes:
-    // "café\nworld" — offset 6 = 'w' on line 2, col 1 (unchanged by char/byte since start of line).
+    // Start-of-line after multibyte: col is 1 regardless of byte/char mode.
     assert_eq!(compute_line_column("café\nworld", 6), Some((2, 1)));
 
-    // And out-of-bounds still returns None:
+    // Out-of-bounds still returns None.
     assert_eq!(compute_line_column("short", 100), None);
 }
