@@ -15,6 +15,67 @@ use crate::scope::{FunctionDef, NamespaceScope, Scope};
 use crate::validator;
 use crate::value::Value;
 
+/// The display name and source bytes that a set of AST node offsets index into.
+///
+/// Each spliced region (skeleton non-block nodes, or a block's effective body) carries
+/// the `Origin` of the file whose source bytes those AST offsets are relative to.
+/// Validation runs per region against `origin.source` so span construction is always
+/// in-bounds (fixing the cross-source-offset `OutOfBounds` diagnostic bug).
+///
+/// `Clone` = two refcount bumps (O(1)).
+///
+/// # Debug output
+///
+/// The manual `Debug` impl prints `file` + `source.len()` bytes — NEVER the raw source
+/// text. This aligns with the `debug-panics` no-leak rule (source bytes must not appear
+/// in panic messages or debug output).
+#[derive(Clone)]
+pub(crate) struct Origin {
+    /// Display name of the file (shown in error messages / source labels).
+    pub(crate) file: Arc<str>,
+    /// Raw source bytes; AST node offsets in this region are relative to this string.
+    pub(crate) source: Arc<str>,
+}
+
+impl std::fmt::Debug for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Origin")
+            .field("file", &self.file)
+            .field("source_len", &self.source.len())
+            .finish()
+    }
+}
+
+/// An effective block together with the origin (file + source) its offsets index into.
+///
+/// The origin follows the **winning override**: if a child file overrides the block,
+/// the origin is the child's file; if the base default is used, the origin is the
+/// base's file. This is stamped at the last-wins insertion in `apply_block_overrides`.
+///
+/// `Clone` = three refcount bumps (one `Arc<BlockNode>` + two `Arc<str>` inside `Origin`).
+pub(crate) struct EffectiveBlock {
+    pub(crate) node: Arc<BlockNode>,
+    pub(crate) origin: Origin,
+}
+
+impl std::fmt::Debug for EffectiveBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffectiveBlock")
+            .field("name", &self.node.name)
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for EffectiveBlock {
+    fn clone(&self) -> Self {
+        Self {
+            node: Arc::clone(&self.node),
+            origin: self.origin.clone(),
+        }
+    }
+}
+
 /// A resolved module with its AST, exports, and prompt body.
 ///
 /// Fields are `pub(crate)` — all external access must go through the methods
@@ -28,10 +89,15 @@ use crate::value::Value;
 ///   all extending descendants). For an extending module it is `Arc::clone` of the
 ///   base's skeleton — never a deep-clone of the `Vec<Node>` (DoS guard, P1).
 ///
-/// - `effective_blocks`: name → fully-overridden `BlockNode`. For non-extending modules
-///   it is seeded from the module's own `@block` declarations. For extending modules it
-///   is a clone of `base.effective_blocks` with the child's overrides applied (most-
-///   derived wins, diamond-inheritance safe — NEVER mutate the cached base map).
+/// - `effective_blocks`: name → fully-overridden `EffectiveBlock` (block + origin).
+///   For non-extending modules it is seeded from the module's own `@block` declarations.
+///   For extending modules it is a clone of `base.effective_blocks` with the child's
+///   overrides applied (most-derived wins, diamond-inheritance safe — NEVER mutate the
+///   cached base map). Each block's `origin` follows the winning override file.
+///
+/// - `skeleton_origin`: the `Origin` (file + source) for skeleton non-block nodes —
+///   i.e. the root-base file. Used by `spliced_regions` to validate non-block skeleton
+///   content against the correct source.
 ///
 /// - `frontmatter_values`: the module's parsed YAML mapping. For intermediate bases in a
 ///   chain this is the transitive accumulated deep-merge of all ancestors' FM, so a leaf
@@ -56,9 +122,8 @@ use crate::value::Value;
 /// - Skeleton-first then standalone: returning the skeleton entry would yield EMPTY output
 ///   for the base (it was never evaluated). `resolve_by_key` detects `is_skeleton` on the
 ///   cache hit, performs the full compile, and upgrades the entry in place — reusing the
-///   skeleton's `effective_skeleton` / `effective_blocks` Arcs so descendants that already
-///   `Arc::clone`'d them keep pointer-identity.
-#[derive(Debug, Clone)]
+///   skeleton's `effective_skeleton` / `effective_blocks` / `skeleton_origin` Arcs so
+///   descendants that already `Arc::clone`'d them keep pointer-identity.
 pub struct ResolvedModule {
     pub(crate) functions: HashMap<String, Arc<FunctionDef>>,
     pub(crate) prompt_body: Option<String>,
@@ -70,7 +135,14 @@ pub struct ResolvedModule {
     pub(crate) effective_skeleton: Arc<[Node]>,
     /// Fully-overridden block map for this subtree. Seeded from own @block declarations
     /// (non-extending) or clone(base.effective_blocks)+child overrides (extending).
-    pub(crate) effective_blocks: IndexMap<String, Arc<BlockNode>>,
+    /// Each entry carries its `Origin` (file + source) so validation can attribute
+    /// diagnostics to the correct source file (fixes the cross-source OutOfBounds bug).
+    pub(crate) effective_blocks: IndexMap<String, EffectiveBlock>,
+    /// Origin of the root-ancestor skeleton: used to validate non-block skeleton nodes
+    /// (top-level text / interpolations / @if / @for between @block placeholders) against
+    /// the correct file. Arc::clone'd down the chain so deep multi-level chains have
+    /// zero extra allocations.
+    pub(crate) skeleton_origin: Origin,
     /// Parsed YAML frontmatter mapping. Reserved-key splitting deferred to future refactor.
     pub(crate) frontmatter_values: Option<serde_yaml_ng::Mapping>,
     /// `true` when this entry was produced by `process_module_skeleton` (resolved as an
@@ -83,6 +155,40 @@ pub struct ResolvedModule {
     /// never caches its entry module — `resolve_key_messages` always re-computes — so the
     /// poisoning window only exists on the text/`resolve_by_key` path.)
     pub(crate) is_skeleton: bool,
+}
+
+impl std::fmt::Debug for ResolvedModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedModule")
+            .field("functions_count", &self.functions.len())
+            .field(
+                "prompt_body_len",
+                &self.prompt_body.as_ref().map(|s| s.len()),
+            )
+            .field("has_explicit_exports", &self.has_explicit_exports)
+            .field("effective_skeleton_len", &self.effective_skeleton.len())
+            .field("effective_blocks_count", &self.effective_blocks.len())
+            .field("skeleton_origin", &self.skeleton_origin)
+            .field("is_skeleton", &self.is_skeleton)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for ResolvedModule {
+    fn clone(&self) -> Self {
+        Self {
+            functions: self.functions.clone(),
+            prompt_body: self.prompt_body.clone(),
+            raw_frontmatter: self.raw_frontmatter.clone(),
+            has_explicit_exports: self.has_explicit_exports,
+            explicit_exports: self.explicit_exports.clone(),
+            effective_skeleton: Arc::clone(&self.effective_skeleton),
+            effective_blocks: self.effective_blocks.clone(),
+            skeleton_origin: self.skeleton_origin.clone(),
+            frontmatter_values: self.frontmatter_values.clone(),
+            is_skeleton: self.is_skeleton,
+        }
+    }
 }
 
 /// Maximum import depth to prevent stack overflow from deeply chained imports.
@@ -248,13 +354,14 @@ impl ModuleCache {
         let mut resolved = Self::check_lifo_pop(resolved, popped, key)?;
 
         // A1 upgrade: if a skeleton entry was previously cached for this key, reuse its
-        // Arc-shared skeleton/blocks so descendants that already Arc::clone'd them keep
-        // pointer-identity. The freshly compiled `resolved` carries the correct
+        // Arc-shared skeleton/blocks/origin so descendants that already Arc::clone'd them
+        // keep pointer-identity. The freshly compiled `resolved` carries the correct
         // prompt_body (the skeleton-vs-standalone difference is solely validate/evaluate).
         if let Some(prev) = self.modules.get(key) {
             if prev.is_skeleton {
                 resolved.effective_skeleton = Arc::clone(&prev.effective_skeleton);
                 resolved.effective_blocks = prev.effective_blocks.clone();
+                resolved.skeleton_origin = prev.skeleton_origin.clone();
             }
         }
 
@@ -431,18 +538,25 @@ impl ModuleCache {
         // - Scope and final_body are assembled identically to text mode (no drift).
         if let Some(ext) = module.extends.clone() {
             let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
+            let components =
+                self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+
+            // ── Step 3f (messages): validate per-region before evaluate ──────
+            // Uses the shared validate_extends_components helper (PF-004: single shared
+            // implementation for both text and messages modes — they can never drift).
+            // Validates each region against its own origin source so span construction
+            // is always in-bounds (fixes the cross-source OutOfBounds diagnostic bug).
+            // ADR-016: re-validate dynamically-assembled content at the leaf.
+            {
+                let mut scope = components.scope.clone();
+                Self::validate_extends_components(&components, &mut scope)?;
+            }
+
             let ExtendsComponents {
                 final_body,
                 mut scope,
                 ..
-            } =
-                self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
-
-            // ── Step 3f (messages): validate final_body before evaluate ──────
-            // Mirrors text-mode process_module_extends and the standalone messages path —
-            // both call validator::validate before evaluate (avoids PF-004: alternate-path
-            // bypass of a check present on the primary path).
-            validator::validate(&final_body, &mut scope, ctx.file_str, ctx.source)?;
+            } = components;
 
             // Check @message presence against final_body (NOT module.body): a base whose
             // @message blocks live inside @block defaults is correctly detected after splice.
@@ -578,8 +692,14 @@ impl ModuleCache {
         let prompt_body = evaluate(&module.body, &mut scope, warnings)?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
+        // Build Origin once for this module — Arc::clone'd into each EffectiveBlock (P3).
+        let origin = Origin {
+            file: Arc::from(ctx.file_str),
+            source: Arc::from(ctx.source),
+        };
+
         // Build effective_blocks first so module.body can be moved into the Arc below.
-        let effective_blocks = seed_effective_blocks(&module.body, &block_names);
+        let effective_blocks = seed_effective_blocks(&module.body, &block_names, &origin);
 
         // Move module.body into Arc<[Node]> (reuses the Vec allocation, no element clones, P1).
         let effective_skeleton: Arc<[Node]> = Arc::from(module.body);
@@ -592,6 +712,7 @@ impl ModuleCache {
             explicit_exports,
             effective_skeleton,
             effective_blocks,
+            skeleton_origin: origin,
             frontmatter_values,
             is_skeleton: false,
         })
@@ -646,6 +767,10 @@ impl ModuleCache {
         // effective_skeleton is the root ancestor's body (Arc::clone — O(1), no deep-copy, P1).
         let effective_skeleton = Arc::clone(&base.effective_skeleton);
 
+        // skeleton_origin is the root base's Origin — Arc::clone'd (O(1)), never re-allocated.
+        // This is how the base file's source bytes "ride along" to the leaf for span attribution.
+        let skeleton_origin = base.skeleton_origin.clone();
+
         // ── Step 3d: build merged scope (Phase 3: deep merge + per-file FM imports) ──
         // Applies decision #3 (base < child < runtime) and decision #7 (reserved-key
         // exclusion, array wholesale replace, both sets of FM imports resolved per-file).
@@ -686,10 +811,14 @@ impl ModuleCache {
 
         // 3d-iv: Resolve base frontmatter imports against base_key (ADR-014 ordering,
         // PF-004 safe via resolve_frontmatter_imports → resolve_import_from).
-        // Use a minimal ctx pointing to the base file.
+        // Use a ctx pointing to the base file with its REAL source bytes so that any
+        // span-carrying error here attributes correctly AND the at() debug_assert can't
+        // false-fire. The skeleton_origin already carries these bytes; we use them here
+        // for consistency.
+        let base_source_ref: &str = &base.skeleton_origin.source;
         let base_ctx = ModuleCtx {
             file_str: &base_key,
-            source: "",
+            source: base_source_ref,
             base_key: &base_key,
             runtime_vars: ctx.runtime_vars,
         };
@@ -729,7 +858,7 @@ impl ModuleCache {
         // Linear O(S+B) pass over the skeleton. Each Block in the skeleton is replaced
         // by its effective body from effective_blocks (O(1) lookup). Non-Block nodes
         // pass through verbatim. Between-block spacing (Text nodes) is preserved (decision #9, F11).
-        let final_body = splice_skeleton(&effective_skeleton, &effective_blocks);
+        let final_body = splice_skeleton(&effective_skeleton, &effective_blocks, &skeleton_origin);
 
         Ok(ExtendsComponents {
             final_body,
@@ -737,15 +866,42 @@ impl ModuleCache {
             functions,
             effective_skeleton,
             effective_blocks,
+            skeleton_origin,
             has_explicit_exports,
             explicit_exports,
         })
     }
 
+    /// Validate an extends pipeline's spliced regions, each against its own origin source.
+    ///
+    /// Walks `spliced_regions` and calls `validator::validate` per region so each region's
+    /// AST node offsets are paired with the correct source string (fixing the cross-source
+    /// OutOfBounds diagnostic bug). The scope is threaded through all regions so `@define`
+    /// / `@for` scope push/pop behaves identically to a whole-slice validate.
+    ///
+    /// This single helper is called by BOTH `process_module_extends` (text) and
+    /// `process_module_messages` (@extends branch) — enforcing PF-004 parity: the two
+    /// parallel paths can never drift because they share one implementation.
+    ///
+    /// ADR-016: re-validate at the leaf (on `final_body` regions), not at intermediate bases.
+    fn validate_extends_components(
+        components: &ExtendsComponents,
+        scope: &mut Scope,
+    ) -> Result<(), MdsError> {
+        for (nodes, origin) in spliced_regions(
+            &components.effective_skeleton,
+            &components.effective_blocks,
+            &components.skeleton_origin,
+        ) {
+            validator::validate(nodes, scope, &origin.file, &origin.source)?;
+        }
+        Ok(())
+    }
+
     /// Evaluate an extending child template in text mode.
     ///
     /// Delegates the shared pipeline (steps 3a-3e) to `resolve_extends_components`,
-    /// then runs `validator::validate` + `evaluate` on `final_body` (step 3f).
+    /// then runs `validate_extends_components` + `evaluate` on `final_body` (step 3f).
     ///
     /// Decision #2: base is NEVER validated/evaluated standalone — deferred to leaf.
     /// PF-004: base is read via resolve_by_key_skeleton (FileSystem trait, never std::fs).
@@ -758,21 +914,29 @@ impl ModuleCache {
         frontmatter_values: Option<serde_yaml_ng::Mapping>,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
+        let components =
+            self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
+
+        // ── Step 3f: validate + evaluate on final_body ────────────────────────
+        // Validate per-region so each region's offsets are checked against the correct
+        // source (fixes the cross-source OutOfBounds diagnostic bug). This is what makes
+        // E12 work: a base default block referencing an undefined var is caught HERE
+        // against the merged leaf scope. (ADR-016: re-validate dynamically-assembled content.)
+        {
+            let mut scope = components.scope.clone();
+            Self::validate_extends_components(&components, &mut scope)?;
+        }
+
         let ExtendsComponents {
             final_body,
             mut scope,
             functions,
             effective_skeleton,
             effective_blocks,
+            skeleton_origin,
             has_explicit_exports,
             explicit_exports,
-        } = self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
-
-        // ── Step 3f: validate + evaluate on final_body ────────────────────────
-        // Operates on final_body, NOT module.body. This is what makes E12 work:
-        // a base default block referencing an undefined var is caught HERE against
-        // the merged leaf scope. (ADR-016: re-validate dynamically-assembled content.)
-        validator::validate(&final_body, &mut scope, ctx.file_str, ctx.source)?;
+        } = components;
 
         let prompt_body = evaluate(&final_body, &mut scope, warnings)?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
@@ -785,6 +949,7 @@ impl ModuleCache {
             explicit_exports,
             effective_skeleton,
             effective_blocks,
+            skeleton_origin,
             frontmatter_values,
             is_skeleton: false,
         })
@@ -873,10 +1038,11 @@ impl ModuleCache {
         // Multi-level chain (A←B←C): B may itself extend A.
         // B's effective_skeleton = A's effective_skeleton (Arc::clone, O(1) fold).
         // B's effective_blocks = clone(A.effective_blocks) + B's overrides (most-derived wins, F3).
+        // B's skeleton_origin = A's skeleton_origin (Arc::clone — root source rides down the chain).
         //
         // Phase 3: B's frontmatter_values must be the transitive deep-merge of A's accumulated FM
         // with B's own FM (A < B), so that when C later merges against B, it gets A+B+C.
-        let (effective_skeleton, effective_blocks, frontmatter_values) =
+        let (effective_skeleton, effective_blocks, skeleton_origin, frontmatter_values) =
             if let Some(ext) = module.extends.as_ref() {
                 validate_import_path(&ext.path).map_err(|e| {
                     attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset)
@@ -896,6 +1062,11 @@ impl ModuleCache {
                 let eff_blocks =
                     apply_block_overrides(&grandparent.effective_blocks, &module.body, ctx)?;
 
+                // skeleton_origin Arc::clone'd from grandparent — the root base's source bytes
+                // ride down the chain so the leaf's validate_extends_components can attribute
+                // non-block skeleton node diagnostics to the root file (Risk #2).
+                let skel_origin = grandparent.skeleton_origin.clone();
+
                 // Phase 3: transitive FM merge: grandparent.frontmatter_values < own_fm_values.
                 // This produces the accumulated FM for this intermediate base, so a leaf
                 // descending from it gets the full transitive chain without re-traversing.
@@ -912,15 +1083,21 @@ impl ModuleCache {
                 (
                     Arc::clone(&grandparent.effective_skeleton),
                     eff_blocks,
+                    skel_origin,
                     accumulated_fm,
                 )
             } else {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
+                // Build Origin once — Arc::clone'd into each seeded EffectiveBlock (P3).
+                let root_origin = Origin {
+                    file: Arc::from(ctx.file_str),
+                    source: Arc::from(ctx.source),
+                };
                 // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
-                let eff_blocks = seed_effective_blocks(&module.body, &block_names);
+                let eff_blocks = seed_effective_blocks(&module.body, &block_names, &root_origin);
                 let eff_skeleton: Arc<[Node]> = Arc::from(module.body);
                 // Root base: frontmatter_values is its own raw FM (no ancestors).
-                (eff_skeleton, eff_blocks, own_fm_values)
+                (eff_skeleton, eff_blocks, root_origin, own_fm_values)
             };
 
         // A1 invariant: is_skeleton=true implies prompt_body=None (evaluate was never called).
@@ -940,6 +1117,7 @@ impl ModuleCache {
             explicit_exports,
             effective_skeleton,
             effective_blocks,
+            skeleton_origin,
             frontmatter_values,
             is_skeleton: true,
         })
@@ -1318,8 +1496,10 @@ struct ExtendsComponents {
     functions: HashMap<String, Arc<FunctionDef>>,
     /// Root ancestor skeleton, Arc-shared (O(1), no deep-clone).
     effective_skeleton: Arc<[Node]>,
-    /// Fully-overridden block map for this subtree.
-    effective_blocks: IndexMap<String, Arc<BlockNode>>,
+    /// Fully-overridden block map for this subtree, each entry carrying its `Origin`.
+    effective_blocks: IndexMap<String, EffectiveBlock>,
+    /// Origin of the root-ancestor skeleton (file + source for non-block skeleton nodes).
+    skeleton_origin: Origin,
     /// Whether the child declared any `@export` directives.
     has_explicit_exports: bool,
     /// Named exports from the child.
@@ -1407,18 +1587,32 @@ fn collect_define(
 /// `block_names`.  Output order follows body declaration order (IndexMap preserves
 /// insertion order, giving deterministic diamond-inheritance merges downstream).
 ///
+/// Each entry carries `origin` (Arc::clone — O(1)), so validation can attribute
+/// diagnostics to the correct file. For a root base the origin is the base's own
+/// file and source.
+///
+/// **Perf rule:** `origin` is built ONCE per module resolution (outside any loop)
+/// and `Arc::clone`d here — never `Arc::from(source)` inside the loop (P3).
+///
 /// Called from both `process_module` (standalone) and `process_module_skeleton`
 /// (root-base arm) to eliminate the duplicated seeding loop.
 fn seed_effective_blocks(
     body: &[Node],
     block_names: &HashSet<String>,
-) -> IndexMap<String, Arc<BlockNode>> {
+    origin: &Origin,
+) -> IndexMap<String, EffectiveBlock> {
     body.iter()
         .filter_map(|n| {
             if let Node::Block(b) = n {
-                block_names
-                    .contains(&b.name)
-                    .then(|| (b.name.clone(), Arc::new(b.clone())))
+                block_names.contains(&b.name).then(|| {
+                    (
+                        b.name.clone(),
+                        EffectiveBlock {
+                            node: Arc::new(b.clone()),
+                            origin: origin.clone(),
+                        },
+                    )
+                })
             } else {
                 None
             }
@@ -1903,12 +2097,27 @@ fn check_child_only_blocks(body: &[Node], ctx: &ModuleCtx<'_>) -> Result<(), Mds
 /// Clones the parent map first so the cached parent entry is never mutated
 /// (diamond-inheritance correctness, F5).  Returns `Err(mds::extends)` if a
 /// child block name is not present in the parent map (E4: unknown override).
+///
+/// Each override entry is stamped with the CURRENT `ctx`'s `Origin` (the overriding
+/// file). Inherited entries keep their existing origin (the file where the winning
+/// definition last came from). This ensures diagnostics attribute to the correct file
+/// (Risk #1 from the plan: origin must follow the winning override).
+///
+/// **Perf rule:** `override_origin` is built ONCE outside the loop and `Arc::clone`d
+/// into each stamped entry — never `Arc::from(ctx.source)` inside the loop (P3).
 fn apply_block_overrides(
-    parent_blocks: &IndexMap<String, Arc<BlockNode>>,
+    parent_blocks: &IndexMap<String, EffectiveBlock>,
     body: &[Node],
     ctx: &ModuleCtx<'_>,
-) -> Result<IndexMap<String, Arc<BlockNode>>, MdsError> {
+) -> Result<IndexMap<String, EffectiveBlock>, MdsError> {
     let mut blocks = parent_blocks.clone();
+
+    // Build the override origin ONCE — O(1) Arc bumps per override node.
+    let override_origin = Origin {
+        file: Arc::from(ctx.file_str),
+        source: Arc::from(ctx.source),
+    };
+
     for node in body {
         if let Node::Block(b) = node {
             // Decision #6 / F4/E4: child may only override blocks declared by the root base.
@@ -1921,45 +2130,70 @@ fn apply_block_overrides(
                     b.name.len(),
                 ));
             }
-            // Most-derived wins.
-            blocks.insert(b.name.clone(), Arc::new(b.clone()));
+            // Most-derived wins; stamp with current file's origin.
+            blocks.insert(
+                b.name.clone(),
+                EffectiveBlock {
+                    node: Arc::new(b.clone()),
+                    origin: override_origin.clone(),
+                },
+            );
         }
     }
     Ok(blocks)
 }
 
-fn splice_skeleton(
-    skeleton: &[Node],
-    effective_blocks: &IndexMap<String, Arc<BlockNode>>,
-) -> Vec<Node> {
-    let mut result = Vec::with_capacity(skeleton.len());
+/// Iterate over spliced regions of the skeleton, each paired with its `Origin`.
+///
+/// A `Node::Block` placeholder in the skeleton yields the effective block's body
+/// nodes and the block's own `Origin` (the file whose offsets those nodes index into).
+/// Any other skeleton node yields a single-element slice and the `skeleton_origin`
+/// (the root-base file).
+///
+/// Mirrors the missing-block `debug_assert!`/fallback from `splice_skeleton` so both
+/// consumers (splice + validate) have identical coverage. This is the single shared
+/// walk that prevents text/messages mode validate paths from drifting (PF-004).
+fn spliced_regions<'a>(
+    skeleton: &'a [Node],
+    effective_blocks: &'a IndexMap<String, EffectiveBlock>,
+    skeleton_origin: &'a Origin,
+) -> Vec<(&'a [Node], &'a Origin)> {
+    let mut regions = Vec::with_capacity(skeleton.len());
     for node in skeleton {
         if let Node::Block(skeleton_block) = node {
-            // Look up the effective block (override or base default) — O(1).
             if let Some(eff_block) = effective_blocks.get(&skeleton_block.name) {
-                // Inline the effective body (edges already stripped at parse time).
-                result.extend(eff_block.body.clone());
+                // Block body with its own origin (the winning override file's source).
+                regions.push((eff_block.node.body.as_slice(), &eff_block.origin));
             } else {
-                // Every block name in the skeleton must be present in effective_blocks:
-                // apply_block_overrides starts from base.effective_blocks which is seeded
-                // from the root base's own @block declarations — the same skeleton we're
-                // iterating here.  A missing name is a compiler bug, not user error.
+                // Every block in the skeleton must have an effective_blocks entry.
+                // A missing entry is a compiler bug (apply_block_overrides was not called).
                 debug_assert!(
                     false,
-                    "splice_skeleton: block '{}' in skeleton has no effective_blocks entry — \
+                    "spliced_regions: block '{}' in skeleton has no effective_blocks entry — \
                      this is a compiler bug (apply_block_overrides was not called for this skeleton)",
                     skeleton_block.name
                 );
-                // Release build: fall back to the skeleton's own default body so output is
-                // never silently empty (silent fallback is better than a panic in production).
-                result.extend(skeleton_block.body.clone());
+                // Release build: fall back to the skeleton's own default body (same origin
+                // as the skeleton since this is the base's own node).
+                regions.push((skeleton_block.body.as_slice(), skeleton_origin));
             }
         } else {
-            // Non-block skeleton nodes pass through verbatim.
-            result.push(node.clone());
+            // Non-block skeleton nodes: validated against the skeleton origin.
+            regions.push((std::slice::from_ref(node), skeleton_origin));
         }
     }
-    result
+    regions
+}
+
+fn splice_skeleton(
+    skeleton: &[Node],
+    effective_blocks: &IndexMap<String, EffectiveBlock>,
+    skeleton_origin: &Origin,
+) -> Vec<Node> {
+    spliced_regions(skeleton, effective_blocks, skeleton_origin)
+        .into_iter()
+        .flat_map(|(nodes, _)| nodes.iter().cloned())
+        .collect()
 }
 
 // ── Frontmatter imports ───────────────────────────────────────────────────────
@@ -4548,5 +4782,391 @@ mod tests {
                 err.serialize()
             );
         }
+    }
+
+    // ── E12 (strengthened): span attributes to base source ───────────────────
+    //
+    // Previously: compile_virtual produced mds::undefined_var but the diagnostic
+    // rendered as miette OutOfBounds because the base node offset was paired with
+    // the child's NamedSource. After the fix, span.is_some() AND line/column are
+    // populated (the span is now validated against the base source).
+
+    #[test]
+    fn e12_base_default_undefined_var_span_attributes_to_base() {
+        // base = "@block content:\n{undefined_var}\n@end\n"
+        // bytes: "@block content:\n" = 16 bytes, then "{undefined_var}" starts at 16.
+        let base = "@block content:\n{undefined_var}\n@end\n";
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+
+        // compile_virtual (text mode)
+        let err = compile_virtual(&files, "child.mds")
+            .expect_err("E12: undefined var in base default should error");
+        let s = err.serialize();
+        assert_eq!(
+            s.code, "mds::undefined_var",
+            "E12 text: code mismatch: {s:?}"
+        );
+        let span = s
+            .span
+            .expect("E12 text: span must be Some (base offset in base source)");
+        assert!(
+            span.line.is_some(),
+            "E12 text: line must be Some (offset is in-bounds for base source): {span:?}"
+        );
+        assert!(
+            span.column.is_some(),
+            "E12 text: column must be Some: {span:?}"
+        );
+        assert!(
+            span.offset + span.length <= base.len(),
+            "E12 text: span offset+length must be in-bounds for base source: {span:?}"
+        );
+
+        // check_virtual (A5 parity) — same assertions
+        let check_err = check_virtual(&files, "child.mds")
+            .expect_err("E12 A5: check must also reject undefined var in base default");
+        let cs = check_err.serialize();
+        assert_eq!(
+            cs.code, "mds::undefined_var",
+            "E12 A5 check: code mismatch: {cs:?}"
+        );
+        let cspan = cs.span.expect("E12 A5 check: span must be Some");
+        assert!(
+            cspan.line.is_some(),
+            "E12 A5 check: line must be Some: {cspan:?}"
+        );
+        assert!(
+            cspan.column.is_some(),
+            "E12 A5 check: column must be Some: {cspan:?}"
+        );
+        assert!(
+            cspan.offset + cspan.length <= base.len(),
+            "E12 A5 check: span in-bounds for base: {cspan:?}"
+        );
+    }
+
+    // ── PF-004 (strengthened): text and messages span parity ─────────────────
+
+    #[test]
+    fn pf004_messages_mode_span_parity_with_text_mode() {
+        // Base: @block with @message inside, and an undefined variable.
+        let base = concat!(
+            "@block content:\n",
+            "@message user:\n",
+            "Hello {undefined_var}.\n",
+            "@end\n",
+            "@end\n",
+        );
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+
+        let text_err =
+            compile_virtual(&files, "child.mds").expect_err("pf004 span: text must error");
+        let text_s = text_err.serialize();
+        assert_eq!(
+            text_s.code, "mds::undefined_var",
+            "pf004 span text: {text_s:?}"
+        );
+        let text_span = text_s
+            .span
+            .as_ref()
+            .expect("pf004 span text: span must be Some");
+        assert!(
+            text_span.line.is_some(),
+            "pf004 span text: line must be Some: {text_span:?}"
+        );
+        assert!(
+            text_span.column.is_some(),
+            "pf004 span text: column must be Some: {text_span:?}"
+        );
+
+        let msg_err = compile_messages_virtual_helper(&files, "child.mds")
+            .expect_err("pf004 span: messages must error");
+        let msg_s = msg_err.serialize();
+        assert_eq!(
+            msg_s.code, "mds::undefined_var",
+            "pf004 span messages: {msg_s:?}"
+        );
+        let msg_span = msg_s
+            .span
+            .as_ref()
+            .expect("pf004 span messages: span must be Some");
+        assert!(
+            msg_span.line.is_some(),
+            "pf004 span messages: line must be Some: {msg_span:?}"
+        );
+        assert!(
+            msg_span.column.is_some(),
+            "pf004 span messages: column must be Some: {msg_span:?}"
+        );
+
+        // Text and messages must point to the same location.
+        assert_eq!(
+            text_span.offset, msg_span.offset,
+            "pf004 span: text and messages offsets must match"
+        );
+        assert_eq!(
+            text_span.line, msg_span.line,
+            "pf004 span: text and messages lines must match"
+        );
+        assert_eq!(
+            text_span.column, msg_span.column,
+            "pf004 span: text and messages columns must match"
+        );
+    }
+
+    // ── UTF-8 boundary (strengthened): code + span ───────────────────────────
+
+    #[test]
+    fn utf8_boundary_span_attributes_to_base() {
+        // Base has an ASCII body so the offset is valid in the base source;
+        // the child key contains multibyte chars (the old panic scenario).
+        let (base, child, base_key) = utf8_boundary_extends_fixture();
+        let files = [(base_key, base), ("child.mds", child)];
+
+        // compile_virtual
+        let err =
+            compile_virtual(&files, "child.mds").expect_err("utf8_boundary span: should error");
+        let s = err.serialize();
+        assert_eq!(
+            s.code, "mds::undefined_var",
+            "utf8_boundary span compile: expected mds::undefined_var, got: {s:?}"
+        );
+        let span = s
+            .span
+            .expect("utf8_boundary span: span must be Some (base is ASCII)");
+        assert!(
+            span.line.is_some(),
+            "utf8_boundary span: line must be Some (base source is ASCII, offset is in-bounds): {span:?}"
+        );
+        assert!(
+            span.column.is_some(),
+            "utf8_boundary span: column must be Some: {span:?}"
+        );
+
+        // check_virtual
+        let check_err =
+            check_virtual(&files, "child.mds").expect_err("utf8_boundary span check: should error");
+        let cs = check_err.serialize();
+        assert_eq!(
+            cs.code, "mds::undefined_var",
+            "utf8_boundary span check: expected mds::undefined_var, got: {cs:?}"
+        );
+        let cspan = cs
+            .span
+            .expect("utf8_boundary span check: span must be Some");
+        assert!(
+            cspan.line.is_some(),
+            "utf8_boundary span check: line Some: {cspan:?}"
+        );
+        assert!(
+            cspan.column.is_some(),
+            "utf8_boundary span check: column Some: {cspan:?}"
+        );
+    }
+
+    // ── E12: child override error attributes to child ─────────────────────────
+    //
+    // When the error is in the CHILD's own override body, the span attributes
+    // to the child file (the winning override's source), not the base.
+
+    #[test]
+    fn e12_child_override_undefined_var_attributes_to_child() {
+        let base = "@block content:\nDefault.\n@end\n";
+        // child extends base, "@extends \"./base.mds\"\n" = 21 bytes
+        let child = "@extends \"./base.mds\"\n@block content:\n{undefined_var}\n@end\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+
+        let err = compile_virtual(&files, "child.mds")
+            .expect_err("e12 child: undefined var in child override should error");
+        let s = err.serialize();
+        assert_eq!(s.code, "mds::undefined_var", "e12 child: code: {s:?}");
+        let span = s.span.expect("e12 child: span must be Some");
+        assert!(span.line.is_some(), "e12 child: line Some: {span:?}");
+        assert!(span.column.is_some(), "e12 child: column Some: {span:?}");
+        // The error is INSIDE the child's override body, which starts after
+        // "@extends \"./base.mds\"\n" (21 bytes). The offset must be >= 21.
+        assert!(
+            span.offset >= "@extends \"./base.mds\"\n".len(),
+            "e12 child: span offset must be in child's body (>= 21), got offset={}: {span:?}",
+            span.offset
+        );
+        // Offset must be in-bounds for the child source.
+        assert!(
+            span.offset + span.length <= child.len(),
+            "e12 child: span must be in-bounds for child source: {span:?}"
+        );
+    }
+
+    // ── E12: multi-level chain A←B←C, error in root A's default ─────────────
+    //
+    // A←B←C: undefined var in A's never-overridden default block.
+    // The diagnostic must attribute to A (skeleton_origin rides down the chain).
+
+    #[test]
+    fn e12_multilevel_undefined_var_attributes_to_root_base() {
+        // A: root base with two blocks, one has an undefined var (never overridden).
+        let a = concat!(
+            "@block safe:\nSafe content.\n@end\n",
+            "@block danger:\n{undefined_var}\n@end\n",
+        );
+        // B: extends A, overrides `safe`, leaves `danger` to A's default.
+        let b = "@extends \"./a.mds\"\n@block safe:\nB override.\n@end\n";
+        // C: extends B, also leaves `danger` to A's default.
+        let c = "@extends \"./b.mds\"\n@block safe:\nC override.\n@end\n";
+        let files = [("a.mds", a), ("b.mds", b), ("c.mds", c)];
+
+        let err = compile_virtual(&files, "c.mds")
+            .expect_err("e12 multilevel: undefined var in A default should error at C");
+        let s = err.serialize();
+        assert_eq!(s.code, "mds::undefined_var", "e12 multilevel: code: {s:?}");
+        let span = s.span.expect("e12 multilevel: span must be Some");
+        assert!(
+            span.line.is_some(),
+            "e12 multilevel: line Some (A source is ASCII): {span:?}"
+        );
+        assert!(
+            span.column.is_some(),
+            "e12 multilevel: column Some: {span:?}"
+        );
+        // Span offset must be in-bounds for A's source (NOT c's).
+        assert!(
+            span.offset + span.length <= a.len(),
+            "e12 multilevel: span in-bounds for A's source (len={}): {span:?}",
+            a.len()
+        );
+    }
+
+    // ── E12: top-level non-block base node attributes to base ─────────────────
+    //
+    // A top-level interpolation in the BASE skeleton (between block declarations)
+    // is a non-block skeleton node — validated against skeleton_origin (base).
+
+    #[test]
+    fn e12_base_toplevel_nonblock_node_attributes_to_base() {
+        // Base: a top-level interpolation between blocks — {customer_name} is not defined.
+        let base = concat!(
+            "@block header:\nHello.\n@end\n",
+            "Hello {customer_name}!\n", // top-level interpolation in skeleton
+            "@block footer:\nBye.\n@end\n",
+        );
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+
+        let err = compile_virtual(&files, "child.mds")
+            .expect_err("e12 nonblock: undefined var in base top-level node should error");
+        let s = err.serialize();
+        assert_eq!(
+            s.code, "mds::undefined_var",
+            "e12 nonblock: code must be undefined_var: {s:?}"
+        );
+        let span = s.span.expect("e12 nonblock: span must be Some");
+        assert!(span.line.is_some(), "e12 nonblock: line Some: {span:?}");
+        // Span in-bounds for base source.
+        assert!(
+            span.offset + span.length <= base.len(),
+            "e12 nonblock: span in-bounds for base: {span:?} (base len={})",
+            base.len()
+        );
+    }
+
+    // ── F: empty override compiles cleanly ────────────────────────────────────
+
+    #[test]
+    fn f_extends_empty_override_compiles_clean() {
+        let base = "@block content:\nDefault.\n@end\n";
+        // Child overrides block to empty body (valid — just erases the content).
+        let child = "@extends \"./base.mds\"\n@block content:\n@end\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+        let result = compile_virtual(&files, "child.mds");
+        assert!(
+            result.is_ok(),
+            "f_extends_empty_override: empty block override should compile cleanly: {:?}",
+            result.err()
+        );
+    }
+
+    // ── A1: skeleton-then-standalone upgrade preserves span attribution ───────
+
+    #[test]
+    fn a_skeleton_then_standalone_upgrade_preserves_attribution() {
+        // The base is resolved as a skeleton (via the child compile), then resolved
+        // again as a standalone. After the upgrade, compiling a second child that
+        // extends the base must still attribute errors to the base (not the child).
+        let base = "@block content:\n{undefined_var}\n@end\n";
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base), ("child.mds", child)];
+        let mut cache = virtual_cache(&files);
+        let mut warnings = vec![];
+
+        // First: compile child — base gets resolved as skeleton.
+        let child_err = cache
+            .resolve_key("child.mds", &Default::default(), &mut warnings)
+            .expect_err("A1 upgrade: child should error on undefined_var");
+        let cs = child_err.serialize();
+        assert_eq!(cs.code, "mds::undefined_var", "A1 upgrade child: {cs:?}");
+        let cspan = cs.span.expect("A1 upgrade child: span must be Some");
+        assert!(
+            cspan.line.is_some(),
+            "A1 upgrade child: line Some: {cspan:?}"
+        );
+
+        // Second: compile base standalone (A1 upgrade path).
+        // (The base compiles fine standalone since {undefined_var} would be provided.)
+        let base_with_var = "@block content:\n{x}\n@end\n";
+        let base_def = "@block content:\nHello.\n@end\n";
+        let files2 = [("base.mds", base_def), ("child.mds", child)];
+        let mut cache2 = virtual_cache(&files2);
+        let mut w2 = vec![];
+        // Resolve child first (caches base as skeleton), then resolve base standalone.
+        let _ = cache2.resolve_key("child.mds", &Default::default(), &mut w2);
+        let base_standalone = cache2
+            .resolve_key("base.mds", &Default::default(), &mut w2)
+            .expect("A1 upgrade: base standalone after skeleton-cache must succeed");
+        // skeleton_origin of the upgraded entry should still be the base's own file.
+        assert_eq!(
+            base_standalone.skeleton_origin.file.as_ref(),
+            "base.mds",
+            "A1 upgrade: skeleton_origin.file must be base.mds after upgrade"
+        );
+        let _ = base_with_var; // suppress unused variable warning
+    }
+
+    // ── P3: blocks from one file share one Arc<str> source ───────────────────
+
+    #[test]
+    fn p_block_sources_share_one_arc() {
+        // Wide base: all blocks come from one file → all EffectiveBlocks share the
+        // same Arc<str> source (Arc::ptr_eq). This confirms O(1) per block, not O(N).
+        let mut base_src = String::new();
+        for i in 0..10usize {
+            base_src.push_str(&format!("@block blk{i}:\nDefault {i}.\n@end\n"));
+        }
+        let child = "@extends \"./base.mds\"\n";
+        let files = [("base.mds", base_src.as_str()), ("child.mds", child)];
+        let mut cache = virtual_cache(&files);
+        let mut warnings = vec![];
+
+        let result = cache
+            .resolve_key("child.mds", &Default::default(), &mut warnings)
+            .expect("P3: wide base should compile");
+
+        // All effective block origins should share the same Arc<str> (Arc::ptr_eq).
+        let mut origins: Vec<Arc<str>> = result
+            .effective_blocks
+            .values()
+            .map(|eb| Arc::clone(&eb.origin.source))
+            .collect();
+        if origins.len() >= 2 {
+            let first = &origins[0];
+            for other in &origins[1..] {
+                assert!(
+                    Arc::ptr_eq(first, other),
+                    "P3: all blocks from same file must share one Arc<str> source"
+                );
+            }
+        }
+        let _ = origins.pop(); // suppress unused warning
     }
 }

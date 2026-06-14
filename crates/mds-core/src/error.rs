@@ -29,7 +29,7 @@ pub struct SerializedError {
     pub span: Option<SerializedSpan>,
 }
 
-/// Compute the 1-indexed line and column (byte-based) for a byte offset in source.
+/// Compute the 1-indexed line and column (character-based) for a byte offset in source.
 ///
 /// Returns `None` if `offset` exceeds `source.len()` OR if `offset` does not fall
 /// on a UTF-8 character boundary. A foreign or stale offset (e.g. one computed
@@ -37,19 +37,19 @@ pub struct SerializedError {
 /// reported against a child source in `@extends` validation) will yield `None`
 /// rather than panicking with "byte index N is not a char boundary".
 ///
-/// Both line and column are 1-indexed: the very first byte is (1, 1).
+/// Both line and column are 1-indexed: the very first character is (1, 1).
 ///
-/// Column counts bytes from the start of the current line (NOT UTF-16 code units
-/// and NOT Unicode scalar values). This matches the convention used by most
-/// command-line tools and language servers when operating in byte mode.
+/// Column counts Unicode scalar values (characters) from the start of the current
+/// line, not bytes. This matches the convention used by editors and language
+/// servers that report character-based positions.
 fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
     if offset > source.len() || !source.is_char_boundary(offset) {
         return None;
     }
     let mut line = 1usize;
     let mut col = 1usize;
-    for byte in source[..offset].bytes() {
-        if byte == b'\n' {
+    for ch in source[..offset].chars() {
+        if ch == '\n' {
             line += 1;
             col = 1;
         } else {
@@ -77,12 +77,47 @@ fn format_arity(min: usize, max: usize) -> String {
 }
 
 /// Build the `(span, src)` pair shared by all `_at` constructors.
+///
+/// Defense-in-depth guard: if `offset` or `offset + len` is out of bounds for
+/// `source`, or if either boundary is not a UTF-8 character boundary, `src` is
+/// set to `None` so miette never tries to read outside the source string (which
+/// would produce a raw `OutOfBounds` render). The span offset/length are still
+/// preserved in the `Some(SourceSpan)` so that `serialize()` can emit them and
+/// callers that only check `span.is_some()` are unaffected.
+///
+/// In debug/test builds a `debug_assert!` fires for the cross-source case (where
+/// `source` is non-empty — deliberate empty-source unit test shorthands are excluded)
+/// so mismatches surface loudly during development.
 fn at(
     file: &str,
     source: &str,
     offset: usize,
     len: usize,
 ) -> (Option<SourceSpan>, Option<Arc<miette::NamedSource<String>>>) {
+    let end = offset.saturating_add(len);
+    let in_bounds =
+        end <= source.len() && source.is_char_boundary(offset) && source.is_char_boundary(end);
+
+    // Fire only when source is non-empty: an empty source is a deliberate simplification
+    // used in some unit tests (passing "" when the exact source text isn't needed). The
+    // real cross-source bug always involves a non-empty base source paired with a child
+    // context — that case must be caught loudly in debug/test builds.
+    debug_assert!(
+        in_bounds || source.is_empty(),
+        "MdsError::at(): cross-source offset mismatch — offset {offset}+len {len} is out of \
+         bounds or not a char boundary for source of length {} (file: {file}). This means an \
+         AST node's offset (relative to its own file) was paired with a different source string. \
+         Check span construction at the @extends validation site.",
+        source.len()
+    );
+
+    if !in_bounds {
+        // Out-of-bounds or non-char-boundary: keep the span's offset/length so
+        // serialize() can still emit numeric values, but drop the source so miette
+        // never tries to highlight outside the source string (avoids OutOfBounds).
+        return (Some(SourceSpan::new(offset.into(), len)), None);
+    }
+
     (
         Some(SourceSpan::new(offset.into(), len)),
         Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
