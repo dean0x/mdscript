@@ -144,7 +144,7 @@ shared partial rebuilds **all transitive importers** automatically.
 
 ## Bundler Integration
 
-Import `.mds` templates directly in Vite, Rollup, and Webpack projects:
+Import `.mds` templates directly in Vite, Rollup, Webpack, and Rspack projects:
 
 ```ts
 import systemPrompt from './prompts/system.mds';
@@ -156,6 +156,7 @@ import systemPrompt from './prompts/system.mds';
 | [`@mdscript/vite-plugin`](packages/vite-plugin/README.md) | Vite | ^5 \|\| ^6 \|\| ^7 \|\| ^8 |
 | [`@mdscript/rollup-plugin`](packages/rollup-plugin/README.md) | Rollup | ^3 \|\| ^4 |
 | [`@mdscript/webpack-loader`](packages/webpack-loader/README.md) | Webpack | ^5 |
+| [`@mdscript/rspack-loader`](packages/rspack-loader/README.md) | Rspack | ^1 |
 
 All plugins require `@mdscript/mds` as a peer dependency and accept `{ vars?: Record<string, unknown> }` for runtime template variables. See each package README for configuration details.
 
@@ -202,7 +203,7 @@ let output = mds::compile_str("---\nname: World\n---\nHello {name}!\n")?;
 
 ## Examples
 
-Runnable templates, a Node.js API demo, and Vite/Rollup/Webpack integration apps
+Runnable templates, a Node.js API demo, and Vite/Rollup/Webpack/Rspack integration apps
 live in [`examples/`](examples/).
 
 ## Language Reference
