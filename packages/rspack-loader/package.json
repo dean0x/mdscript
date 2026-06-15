@@ -1,0 +1,59 @@
+{
+  "name": "@mdscript/rspack-loader",
+  "version": "0.2.0",
+  "description": "Rspack loader for importing MDS templates as ES modules",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dean0x/mdscript.git",
+    "directory": "packages/rspack-loader"
+  },
+  "homepage": "https://github.com/dean0x/mdscript#readme",
+  "bugs": "https://github.com/dean0x/mdscript/issues",
+  "keywords": [
+    "mds",
+    "rspack",
+    "rspack-loader",
+    "markdown",
+    "template",
+    "llm",
+    "prompt"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "main": "./dist-cjs/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist-cjs/index.js",
+      "default": "./dist-cjs/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "dist-cjs/"
+  ],
+  "scripts": {
+    "clean:cjs": "node -e \"require('fs').rmSync('dist-cjs', { recursive: true, force: true })\"",
+    "prebuild": "npm run clean:cjs",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json && node ../../scripts/write-cjs-package.cjs dist-cjs",
+    "test": "node --test __test__/*.spec.mjs"
+  },
+  "dependencies": {
+    "@mdscript/bundler-utils": "^0.2.0"
+  },
+  "peerDependencies": {
+    "@mdscript/mds": "^0.2.0",
+    "@rspack/core": "^1.0.0"
+  },
+  "devDependencies": {
+    "@mdscript/bundler-utils": "file:../bundler-utils",
+    "@mdscript/mds": "file:../mds",
+    "@rspack/core": "1.7.11",
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3"
+  }
+}
