@@ -4,8 +4,13 @@
  * Verifies that the CJS build (dist-cjs/) can be loaded via require() and
  * exports the default loader function with all three required symbols.
  * Rspack resolves loaders using require() just like Webpack.
+ *
+ * T-C3 mitigation: the real-import test below exercises the
+ * `new Function('return import("@mdscript/mds")')` ESM-import shim end-to-end
+ * WITHOUT any injected mock transformer. This proves the shim resolves
+ * @mdscript/mds and compiles a real .mds file in a CommonJS context.
  */
-import { test, describe } from 'node:test';
+import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -18,9 +23,15 @@ const require = createRequire(import.meta.url);
 const cjsPath = resolve(__dirname, '../dist-cjs/index.js');
 const hasCjsBuild = existsSync(cjsPath);
 
+// Fixture — exists in this package's own __test__/fixtures/ directory.
+const SIMPLE_MDS = resolve(__dirname, 'fixtures/simple.mds');
+
 describe('rspack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
   const cjsBuild = require(cjsPath);
   const { default: mdsLoader, _resetForTesting, _setTransformerForTesting } = cjsBuild;
+
+  beforeEach(() => { _resetForTesting(); });
+  afterEach(() => { _resetForTesting(); });
 
   test('loads without error via require()', () => {
     assert.ok(cjsBuild, 'CJS build should load successfully');
@@ -53,5 +64,41 @@ describe('rspack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built
 
   test('exports _setTransformerForTesting helper', () => {
     assert.equal(typeof _setTransformerForTesting, 'function', '_setTransformerForTesting should be a function');
+  });
+
+  // T-C3: Real end-to-end CJS compile test — NO mock transformer.
+  // Exercises the `new Function('return import("@mdscript/mds")')` shim path
+  // through the actual @mdscript/mds compiler. Cross-platform: no file watchers.
+  test('CJS real-import shim: compiles a .mds file end-to-end without mock transformer', async () => {
+    let callbackResult = null;
+
+    const ctx = {
+      resourcePath: SIMPLE_MDS,
+      getOptions() { return {}; },
+      addDependency() {},
+      emitWarning(err) { throw err; },
+      async() {
+        return (err, content) => {
+          callbackResult = { err, content };
+        };
+      },
+    };
+
+    await mdsLoader.call(ctx);
+
+    assert.ok(callbackResult !== null, 'loader callback must have been called');
+    assert.equal(
+      callbackResult.err,
+      null,
+      `CJS shim must resolve @mdscript/mds and compile without error (got: ${callbackResult.err?.message})`,
+    );
+    assert.ok(
+      typeof callbackResult.content === 'string' && callbackResult.content.length > 0,
+      'compiled output must be a non-empty string',
+    );
+    assert.ok(
+      callbackResult.content.includes('export default'),
+      'compiled output must contain "export default" (the compiled prompt)',
+    );
   });
 });
