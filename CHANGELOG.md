@@ -73,11 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Ecosystem
 
-- New package `@mdscript/rspack-loader`: Rspack 1.x loader for importing `.mds` templates
+- New package `@mdscript/rspack-loader`: Rspack loader for importing `.mds` templates
   as ES modules. Mirrors `@mdscript/webpack-loader` — delegates to the shared
   `createMdsLoader()` factory in `@mdscript/bundler-utils`, peer-depends on
-  `@rspack/core ^1.0.0`, and ships dual ESM + CJS builds. Published as the 8th
-  coordinated package in the `@mdscript` release.
+  `@rspack/core ^1.0.0 || ^2.0.0` (verified against Rspack 1.x and 2.x), and ships
+  dual ESM + CJS builds. Published as the 8th coordinated package in the
+  `@mdscript` release.
 - Verified and hardened HMR behaviour across all four bundler integrations
   (Vite, Rollup, Webpack, Rspack). Each integration now has a documented HMR contract,
   known-limitation notes (AC-E1/E2/E3), and spec-level tests.
