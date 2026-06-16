@@ -188,25 +188,14 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
         () => bundleCount > bundleCountBeforeRecovery,
         { timeoutMs: 10_000, label: 'recovery build after error' },
       );
-      const finalCode = await (async () => {
-        const w = watch({
-          input: paths['entry.mds'],
-          plugins: [mdsPlugin()],
-          output: { format: 'es' },
-          watch: { skipWrite: true, chokidar: { usePolling: true, interval: 50 } },
-        });
-        return new Promise((resolve) => {
-          w.on('event', async (e) => {
-            if (e.code === 'BUNDLE_END') {
-              const { output } = await e.result.generate({ format: 'es' });
-              e.result.close();
-              await w.close();
-              resolve(output[0].code);
-            }
-          });
-        });
-      })();
-      assert.ok(finalCode.includes('MARKER_FIXED'), 'recovery build has MARKER_FIXED');
+      // lastGoodCode is updated by the live watcher's BUNDLE_END handler above.
+      // Assert recovery on the already-running watcher — no need for a throwaway
+      // watcher instance (which would have no timeout bound on its BUNDLE_END).
+      await waitFor(
+        () => lastGoodCode !== null && lastGoodCode.includes('MARKER_FIXED'),
+        { timeoutMs: 5_000, label: 'MARKER_FIXED in lastGoodCode from live watcher' },
+      );
+      assert.ok(lastGoodCode.includes('MARKER_FIXED'), 'recovery build has MARKER_FIXED');
     } finally {
       await watcher.close();
       cleanup();

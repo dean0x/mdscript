@@ -169,4 +169,37 @@ describe('mdsRspackLoader', () => {
       'emitted module must not contain HMR runtime code',
     );
   });
+
+  test('emitWarning called when options differ on subsequent invocation', async () => {
+    // createMdsLoader captures options on the first call. Subsequent calls with
+    // different options must emit a warning (shared behavior via createMdsLoader).
+    const ctx1 = createLoaderContext(SIMPLE_MDS, {
+      getOptions() { return { vars: { env: 'prod' } }; },
+    });
+    await mdsLoader.call(ctx1);
+    assert.equal(ctx1.callbackResult.err, null);
+    assert.equal(ctx1.emittedWarnings.length, 0, 'no warning on first call');
+
+    // Second invocation with different options should emit a warning.
+    const ctx2 = createLoaderContext(SIMPLE_MDS, {
+      getOptions() { return { vars: { env: 'dev' } }; },
+    });
+    await mdsLoader.call(ctx2);
+    assert.equal(ctx2.callbackResult.err, null);
+    assert.equal(ctx2.emittedWarnings.length, 1, 'should warn when options differ');
+    assert.ok(
+      ctx2.emittedWarnings[0].message.includes('options changed between invocations'),
+      'warning message should describe the problem',
+    );
+  });
+
+  test('no warning when options are identical on subsequent invocation', async () => {
+    const makeCtx = () => createLoaderContext(SIMPLE_MDS, {
+      getOptions() { return { vars: { env: 'prod' } }; },
+    });
+    await mdsLoader.call(makeCtx());
+    const ctx2 = makeCtx();
+    await mdsLoader.call(ctx2);
+    assert.equal(ctx2.emittedWarnings.length, 0, 'identical options should not warn');
+  });
 });

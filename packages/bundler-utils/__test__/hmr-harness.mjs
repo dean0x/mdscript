@@ -27,7 +27,7 @@
  * @module hmr-harness
  */
 
-import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -61,8 +61,10 @@ export const HMR_ENABLED =
  *   - `cleanup`: call in afterEach / finally to remove the temp directory
  */
 export function createTempMdsProject(files) {
-  const dir = join(tmpdir(), `mds-hmr-${process.pid}-${Date.now()}`);
-  mkdirSync(dir, { recursive: true });
+  // mkdtempSync guarantees a unique directory atomically, removing the PID+Date.now()
+  // collision risk documented in KNOWLEDGE.md gotchas (same-PID parallel run within 1ms).
+  // mkdtempSync creates the directory itself — no follow-up mkdirSync needed.
+  const dir = mkdtempSync(join(tmpdir(), 'mds-hmr-'));
 
   /** @type {Record<string, string>} */
   const paths = {};
@@ -96,6 +98,23 @@ export function createTempMdsProject(files) {
  */
 export function editFile(filePath, content) {
   writeFileSync(filePath, content, 'utf8');
+}
+
+// ---------------------------------------------------------------------------
+// readBundleFile
+// ---------------------------------------------------------------------------
+
+/**
+ * Read bundle.js from a bundler output directory.
+ *
+ * Shared helper used by webpack-loader and rspack-loader e2e specs.
+ * Both bundlers write to `{outDir}/bundle.js` with identical output.path config.
+ *
+ * @param {string} outDir - Absolute path to the webpack/rspack output directory.
+ * @returns {string} Raw bundle source text.
+ */
+export function readBundleFile(outDir) {
+  return readFileSync(join(outDir, 'bundle.js'), 'utf8');
 }
 
 // ---------------------------------------------------------------------------

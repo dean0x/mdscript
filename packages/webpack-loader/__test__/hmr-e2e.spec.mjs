@@ -24,13 +24,15 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { readFileSync, existsSync, unlinkSync } from 'node:fs';
+import { unlinkSync } from 'node:fs';
 import webpack from 'webpack';
 import {
   HMR_ENABLED,
   createTempMdsProject,
   editFile,
   waitFor,
+  waitForContent,
+  readBundleFile,
 } from '../../bundler-utils/__test__/hmr-harness.mjs';
 
 process.env.NODE_ENV = 'test';
@@ -59,16 +61,6 @@ function buildConfig(entryPath, outDir) {
       rules: [{ test: /\.mds$/, use: LOADER_PATH }],
     },
   };
-}
-
-/**
- * Read the bundle source from disk.
- *
- * @param {string} outDir
- * @returns {string}
- */
-function readBundle(outDir) {
-  return readFileSync(join(outDir, 'bundle.js'), 'utf8');
 }
 
 /**
@@ -105,7 +97,7 @@ async function startWebpackWatcher(config) {
   );
 
   function getBundle() {
-    return readBundle(outDir);
+    return readBundleFile(outDir);
   }
 
   function hasErrorState() {
@@ -183,7 +175,7 @@ describe('webpack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABL
       // Wait for initial good build
       await waitFor(() => latestStats !== null && !latestStats.hasErrors(),
         { timeoutMs: 30_000, label: 'initial good build' });
-      assert.ok(readBundle(outDir).includes('MARKER_A'), 'initial MARKER_A');
+      assert.ok(readBundleFile(outDir).includes('MARKER_A'), 'initial MARKER_A');
 
       // Inject a compile error
       editFile(paths['entry.mds'], '{undefined_var_xyz_bad_syntax!!!}');
@@ -204,7 +196,7 @@ describe('webpack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABL
         { timeoutMs: 10_000, label: 'recovery build after error' });
 
       assert.ok(!latestStats.hasErrors(), 'error cleared after fix');
-      assert.ok(readBundle(outDir).includes('MARKER_FIXED'), 'recovery bundle has MARKER_FIXED');
+      assert.ok(readBundleFile(outDir).includes('MARKER_FIXED'), 'recovery bundle has MARKER_FIXED');
     } finally {
       await new Promise((resolve) => watching.close(resolve));
       cleanup();
@@ -229,15 +221,22 @@ describe('webpack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABL
         { timeoutMs: 30_000, label: 'initial error build' });
       assert.ok(latestStats.hasErrors(), 'initial build has errors');
 
-      // Fix the file
+      // Fix the file — wait for stats to clear first, then assert fresh content.
+      // Using waitForContent (not existsSync + inline read) prevents early-pass on a
+      // stale on-disk bundle that hasn't been overwritten by the recovery compile yet.
       editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
       await waitFor(
-        () => latestStats !== null && !latestStats.hasErrors() && existsSync(join(outDir, 'bundle.js')) && readBundle(outDir).includes('MARKER_FIXED'),
-        { timeoutMs: 10_000, label: 'MARKER_FIXED and hasErrors()===false' },
+        () => latestStats !== null && !latestStats.hasErrors(),
+        { timeoutMs: 10_000, label: 'hasErrors()===false after fix' },
+      );
+      await waitForContent(
+        join(outDir, 'bundle.js'),
+        (c) => c.includes('MARKER_FIXED'),
+        { timeoutMs: 5_000, label: 'MARKER_FIXED in recovered bundle' },
       );
 
       assert.ok(!latestStats.hasErrors(), 'hasErrors()===false after fix');
-      assert.ok(readBundle(outDir).includes('MARKER_FIXED'), 'fixed bundle content');
+      assert.ok(readBundleFile(outDir).includes('MARKER_FIXED'), 'fixed bundle content');
     } finally {
       await new Promise((resolve) => watching.close(resolve));
       cleanup();
@@ -288,15 +287,11 @@ describe('webpack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABL
     try {
       assert.ok(getBundle().includes('MARKER_A'), 'initial build ok');
 
-      const startMs = Date.now();
       editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      // Liveness is enforced by the waitFor timeout (10s). The wall-clock assertion
+      // was redundant (waitFor throws first on slow runners) and flaky under CI load.
       await waitFor(() => getBundle().includes('MARKER_B'), { timeoutMs: 10_000 });
-      const elapsedMs = Date.now() - startMs;
-
-      assert.ok(
-        elapsedMs < 10_000,
-        `Edit→fresh took ${elapsedMs}ms, must be < 10000ms (T-P1 budget)`,
-      );
+      assert.ok(getBundle().includes('MARKER_B'), 'fresh bundle within 10s window');
     } finally {
       await new Promise((resolve) => watching.close(resolve));
       cleanup();
@@ -348,7 +343,7 @@ describe('webpack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &
     try {
       await waitFor(() => latestStats !== null && !latestStats.hasErrors(),
         { timeoutMs: 30_000, label: 'initial good build' });
-      assert.ok(readBundle(outDir).includes('DEP_MARKER'), 'initial DEP_MARKER');
+      assert.ok(readBundleFile(outDir).includes('DEP_MARKER'), 'initial DEP_MARKER');
 
       // Delete the dep
       unlinkSync(paths['dep.mds']);
@@ -363,10 +358,10 @@ describe('webpack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &
       editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{greet("World")}');
 
       await waitFor(
-        () => latestStats !== null && !latestStats.hasErrors() && readBundle(outDir).includes('DEP_RECREATED'),
+        () => latestStats !== null && !latestStats.hasErrors() && readBundleFile(outDir).includes('DEP_RECREATED'),
         { timeoutMs: 10_000, label: 'DEP_RECREATED after restore' },
       );
-      assert.ok(readBundle(outDir).includes('DEP_RECREATED'), 'recovered after dep recreated');
+      assert.ok(readBundleFile(outDir).includes('DEP_RECREATED'), 'recovered after dep recreated');
     } finally {
       await new Promise((resolve) => watching.close(resolve));
       cleanup();
@@ -394,11 +389,18 @@ describe('webpack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &
       editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {who}! CREATED_MARKER\n@end\n\n@export greet');
       editFile(paths['entry.mds'], '@import { greet } from "./missing.mds"\n\n{greet("World")}');
 
+      // Wait for stats to clear, then verify fresh content via waitForContent to avoid
+      // early-pass on a stale on-disk bundle (avoids the existsSync + inline read pattern).
       await waitFor(
-        () => latestStats !== null && !latestStats.hasErrors() && existsSync(join(outDir, 'bundle.js')) && readBundle(outDir).includes('CREATED_MARKER'),
-        { timeoutMs: 10_000, label: 'CREATED_MARKER after dep creation' },
+        () => latestStats !== null && !latestStats.hasErrors(),
+        { timeoutMs: 10_000, label: 'error cleared after dep creation' },
       );
-      assert.ok(readBundle(outDir).includes('CREATED_MARKER'), 'recovered after dep created');
+      await waitForContent(
+        join(outDir, 'bundle.js'),
+        (c) => c.includes('CREATED_MARKER'),
+        { timeoutMs: 5_000, label: 'CREATED_MARKER in recovered bundle' },
+      );
+      assert.ok(readBundleFile(outDir).includes('CREATED_MARKER'), 'recovered after dep created');
     } finally {
       await new Promise((resolve) => watching.close(resolve));
       cleanup();

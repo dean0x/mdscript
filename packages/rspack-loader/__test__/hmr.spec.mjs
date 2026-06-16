@@ -172,36 +172,31 @@ describe('mdsRspackLoader HMR contract (rspack)', () => {
   });
 
   test('HMR edge case: md-flip — shouldTransform=false then true recovers correctly', async () => {
-    // A .md file without type:mds frontmatter is not compiled (shouldTransform=false).
-    // After frontmatter is added, rspack re-invokes the loader and it should compile.
-    const noTransformerTransformer = {
+    // D7 documented LIMIT: the .md → type:mds frontmatter flip follows native
+    // watcher semantics. createMdsLoader does NOT check shouldTransform internally
+    // — it always calls transform(). When the injected transformer throws on the
+    // false arm, the loader catches it and calls back with an Error (no crash).
+    // After rspack re-invokes with a type:mds-aware transformer, compilation
+    // succeeds. This is the documented behavior, not a pass-through / early-return.
+
+    // False arm: transformer that signals "not an MDS file" by throwing.
+    // The loader catches the throw and calls back with an Error.
+    const noCompileTransformer = {
       shouldTransform(_id) { return false; },
-      async transform(_id) { throw new Error('should not be called'); },
+      async transform(_id) { throw new Error('not an mds file'); },
     };
-    await _setTransformerForTesting(noTransformerTransformer);
+    await _setTransformerForTesting(noCompileTransformer);
 
-    // First call: shouldTransform=false → loader signals "not my file" via
-    // calling back with (null, null) or similar — in practice the loader
-    // does early return. Let's verify the behavior.
-    // In createMdsLoader: if shouldTransform returns false, the loader calls
-    // callback(null, null) or equivalent (pass-through).
-    // The rspack-loader is a thin wrapper, so we test the actual behavior.
-    _resetForTesting();
-
-    // Use a path that would match shouldTransform but with our injected mock
     const md_path = resolve(__dirname, '../../mds/__test__/fixtures/simple.mds');
     const ctx1 = createLoaderContext(md_path);
-
-    // Verify with shouldTransform=false
-    await _setTransformerForTesting(noTransformerTransformer);
     await mdsLoader.call(ctx1);
-    // The loader should have called back without error but with null/empty content
-    // (or may have errored — document the actual behavior)
-    // Note: depending on createMdsLoader implementation, this may vary.
-    // The key invariant: no throw/crash, callback was called.
-    assert.ok(ctx1.callbackResult !== null, 'callback must be called even when shouldTransform=false');
 
-    // Now with shouldTransform=true (type:mds added)
+    // D7: loader does not crash; callback is always called.
+    // When transform throws, the loader calls back with an Error (no export default).
+    assert.ok(ctx1.callbackResult !== null, 'callback must be called even when transform throws');
+    assert.ok(ctx1.callbackResult.err instanceof Error, 'shouldTransform=false path calls back with Error, not null');
+
+    // True arm: type:mds frontmatter added — rspack re-invokes with a working transformer.
     _resetForTesting();
     const okTransformer = {
       shouldTransform(_id) { return true; },
@@ -215,5 +210,9 @@ describe('mdsRspackLoader HMR contract (rspack)', () => {
     await mdsLoader.call(ctx2);
     assert.equal(ctx2.callbackResult.err, null, 'after type:mds added, compile should succeed');
     assert.ok(ctx2.callbackResult.content.includes('export default'), 'result is valid ESM');
+    assert.ok(
+      !ctx2.callbackResult.content.includes('not an mds file'),
+      'compiled output does not contain the pass-through error message',
+    );
   });
 });

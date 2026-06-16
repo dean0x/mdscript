@@ -4,7 +4,7 @@
  * These tests drive an ACTUAL Vite dev server in middlewareMode and assert on
  * freshly transformed module content — not mocked plugin calls. They verify:
  *   1. server.transformRequest() returns updated code after file edits.
- *   2. server.watcher emit 'change' triggers handleHotUpdate → full-reload.
+ *   2. server.watcher.emit('change', path) triggers handleHotUpdate → full-reload.
  *
  * Platform gating (decision D5 / Gate0-2):
  *   Gated by HMR_ENABLED (Linux inotify reference platform, or MDS_HMR=1 override).
@@ -14,8 +14,19 @@
  * Implementation notes:
  *   - Vite approach: middlewareMode=true (no browser needed, no HTTP server).
  *   - Freshness: after editing, call server.moduleGraph.invalidateAll() then
- *     server.transformRequest() — returns fresh compiled output.
- *   - HMR signal: spy on server.ws.send, emit 'change' event on server.watcher.
+ *     server.transformRequest() — returns fresh compiled output. This bypasses
+ *     the filesystem watcher entirely and is intentional for DETERMINISM: real
+ *     polling-watcher delivery in middlewareMode is unreliable across platforms.
+ *   - HMR signal: spy on server.ws.send; inject watcher events via
+ *     server.watcher.emit('change', absPath) SYNTHETICALLY. This tests that
+ *     handleHotUpdate correctly sends full-reload given a change event, but does
+ *     NOT test that a real file write causes the polling watcher to deliver that
+ *     event. The webpack/rspack/rollup suites cover real polling-driven rebuilds.
+ *   - NOTE: the server.watch config (usePolling etc.) is present for completeness
+ *     but is NOT relied upon by these tests — all watcher events are injected
+ *     synthetically. This is a deliberate design for determinism; a real-watcher
+ *     test was considered but deferred because Vite middlewareMode watcher
+ *     delivery is timing-flaky outside Linux inotify even with MDS_HMR=1.
  *   - root must use realpath to avoid macOS /tmp → /private/tmp mismatch.
  *   - Teardown: server.close() — no SIGINT.
  *   - Each test creates an independent temp project via createTempMdsProject().
@@ -53,11 +64,14 @@ process.env.NODE_ENV = 'test';
 
 /**
  * Create a Vite dev server for the given project root.
- * Uses polling so tests are deterministic across platforms.
  *
  * realpathSync is applied to root to resolve macOS /tmp → /private/tmp symlink.
  * Vite resolves files with realpathSync internally; if the root doesn't match,
  * file lookups fail with "Does the file exist?" even when the file is on disk.
+ *
+ * Note: these tests inject watcher events synthetically via server.watcher.emit()
+ * rather than relying on the polling watcher to deliver real fs events. See the
+ * module-level comment for rationale (determinism, middlewareMode watcher limits).
  *
  * @param {string} root - Absolute path to the project root.
  * @returns {Promise<import('vite').ViteDevServer>}
@@ -70,6 +84,10 @@ async function createViteServer(root) {
     plugins: [mdsPlugin()],
     server: {
       middlewareMode: true,
+      // NOTE: usePolling is configured here but these tests do NOT wait for the
+      // polling watcher to fire — all change events are injected synthetically
+      // (server.watcher.emit). This tests handleHotUpdate logic in isolation,
+      // not the fs-watch → event-delivery path. See module-level comment.
       watch: { usePolling: true, interval: 50 },
     },
     appType: 'custom',
@@ -429,14 +447,12 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
     const server = await createViteServer(dir);
 
     try {
-      // Initial transform — no type:mds, plugin returns null → Vite serves as-is
-      const codeA = await server.transformRequest('/doc.md');
-      // Plugin returns null for non-mds .md → Vite may handle it differently.
-      // Document: code may be null or a Vite-default transform (raw text or error).
-      // The key invariant: no throw (server stays alive).
-      // (Vite may return the raw file, or null depending on version)
-      assert.ok(codeA === null || typeof codeA?.code === 'string',
-        'transform of plain .md without type:mds does not throw');
+      // Initial transform — no type:mds, plugin returns null → Vite serves as-is.
+      // The mds plugin's transform() hook returns null (shouldTransform is false),
+      // so the file is not compiled. We do not assert on the transformRequest result
+      // here because Vite may return the raw source or null depending on version;
+      // the contract for this test is only that no Error is thrown (server alive).
+      await server.transformRequest('/doc.md');
 
       // Add type:mds frontmatter
       editFile(paths['doc.md'], '---\ntype: mds\nname: World\n---\n\nHello {name}! MD_FLIP_MARKER');
@@ -458,19 +474,15 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
     const server = await createViteServer(dir);
 
     try {
-      let cycleError = null;
+      // Circular import behavior is implementation-defined: the compiler may
+      // error or produce partial output. Either outcome is acceptable; we swallow
+      // the error (if any) because the only load-bearing invariant is that the
+      // server stays alive after the circular attempt.
       try {
         await server.transformRequest('/entry.mds');
-      } catch (err) {
-        cycleError = err;
+      } catch {
+        // swallowed intentionally — see comment above
       }
-      // Circular import may error or produce partial output — document what happens.
-      // The key invariant: server stays alive (can transform a valid file after).
-      // We don't assert on cycleError being non-null because the compiler may handle cycles.
-      assert.ok(
-        cycleError === null || cycleError instanceof Error,
-        'circular @import either produces output or throws a proper Error',
-      );
 
       // Server must still be alive — transform a fresh unrelated file
       editFile(join(dir, 'health.mds'), '---\nname: World\n---\n\nHealth check ALIVE_MARKER');
