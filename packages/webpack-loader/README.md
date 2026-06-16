@@ -2,8 +2,6 @@
 
 Webpack 5 loader for importing `.mds` templates as ES modules.
 
-> **Note:** This package is pre-release and not yet published to npm.
-
 ## Installation
 
 ```sh
@@ -75,17 +73,18 @@ interface MdsPluginOptions {
 
 ## HMR / dev server
 
-When running webpack-dev-server with `hot: true` (the default), the loader enables HMR
-in the webpack module graph. Because the emitted module has **no `module.hot.accept()`
-self-accept footer**, webpack bubbles the HMR event up to the root entry. The result is a
-**full page reload** whenever an `.mds` file or any of its `@import` dependencies changes.
-This is correct behaviour: MDS files export plain strings, not stateful components.
+When running webpack-dev-server with `hot: true` (the default), changes to `.mds` files
+participate in HMR via webpack's module graph. Because the emitted module has **no
+`module.hot.accept()` self-accept footer**, webpack bubbles the HMR event up to the root
+entry. The result is a **full page reload** whenever an `.mds` file or any of its `@import`
+dependencies changes. This is correct behaviour: MDS files export plain strings, not
+stateful components.
 
 > **`hot: 'only'` is a footgun.** If you set `devServer: { hot: 'only' }`, webpack will
 > suppress the full page reload rather than falling back to it. The compiled-string change
 > will not appear without a manual browser refresh. Leave `hot: true` (the default).
 
-No `module.hot` or `import.meta.webpackHot` footer is injected into the emitted module.
+No `module.hot.accept()` footer is injected into the emitted module.
 HMR event propagation is webpack's responsibility via its module graph and `addDependency()`
 calls made by the loader.
 

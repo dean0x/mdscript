@@ -8,43 +8,83 @@ Rspack loader for importing MDS templates as ES modules.
 npm install @mdscript/rspack-loader @mdscript/mds
 ```
 
-## Usage
+## Peer dependencies
+
+```sh
+npm install @mdscript/mds @rspack/core
+```
+
+Supported: `@rspack/core ^1.0.0`.
+
+## Configuration
 
 ```js
 // rspack.config.js
-module.exports = {
+export default {
   module: {
     rules: [
       {
         test: /\.mds$/,
-        use: ['@mdscript/rspack-loader'],
+        use: {
+          loader: '@mdscript/rspack-loader',
+          options: {
+            // optional
+            vars: { env: 'production' },
+          },
+        },
       },
     ],
   },
 };
 ```
 
-Importing an `.mds` file yields two exports:
+## Usage
 
-```js
-import template, { metadata } from './prompt.mds';
-// template  — compiled string output
-// metadata  — { warnings: string[], dependencies: string[] }
+```ts
+import content from './system-prompt.mds';
+// content is a compiled Markdown string
+
+import content, { metadata } from './system-prompt.mds';
+// metadata.warnings     - string[]
+// metadata.dependencies - string[] of imported file paths
+```
+
+## TypeScript setup
+
+Add the module declaration to your `tsconfig.json` so TypeScript recognises
+`.mds` imports:
+
+```json
+{
+  "compilerOptions": {
+    "types": ["@mdscript/bundler-utils/mds"]
+  }
+}
+```
+
+## Options
+
+```ts
+interface MdsPluginOptions {
+  /** Variables available for interpolation in .mds templates. */
+  vars?: Record<string, unknown>;
+}
 ```
 
 ## HMR / dev server
 
-When running rspack's dev server with `hot: true` (the default), the loader enables HMR
-in the rspack module graph. Because the emitted module has **no `import.meta.webpackHot`
-self-accept footer**, rspack bubbles the HMR event up to the root entry. The result is a
-**full page reload** whenever an `.mds` file or any of its `@import` dependencies changes.
-This is correct behaviour: MDS files export plain strings, not stateful components.
+When running rspack's dev server with `hot: true` (the default), changes to `.mds` files
+participate in HMR via rspack's module graph. Because the emitted module has **no
+`import.meta.webpackHot` self-accept footer**, rspack bubbles the HMR event up to the root
+entry. The result is a **full page reload** whenever an `.mds` file or any of its `@import`
+dependencies changes. This is correct behaviour: MDS files export plain strings, not
+stateful components.
 
 > **`hot: 'only'` is a footgun.** If you set `devServer: { hot: 'only' }`, rspack will
 > suppress the full page reload rather than falling back to it. The compiled-string change
 > will not appear without a manual browser refresh. Leave `hot: true` (the default).
 
-No `module.hot` or `import.meta.webpackHot` footer is injected into the emitted module.
+No `import.meta.webpackHot` footer is injected into the emitted module.
 HMR event propagation is rspack's responsibility via its module graph and `addDependency()`
 calls made by the loader. rspack 1.x uses the same HMR API shape as webpack 5.
 
