@@ -285,6 +285,7 @@ jobs:
           npm publish -w @mdscript/vite-plugin --access public
           npm publish -w @mdscript/rollup-plugin --access public
           npm publish -w @mdscript/webpack-loader --access public
+          npm publish -w @mdscript/rspack-loader --access public
 
   # ---------------------------------------------------------------------------
   # GitHub Release — cut last, after crates + npm succeed.

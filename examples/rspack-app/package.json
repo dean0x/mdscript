@@ -1,0 +1,17 @@
+{
+  "name": "mds-rspack-test-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@mdscript/bundler-utils": "file:../../packages/bundler-utils",
+    "@mdscript/mds": "file:../../packages/mds",
+    "@mdscript/rspack-loader": "file:../../packages/rspack-loader"
+  },
+  "devDependencies": {
+    "@rspack/core": "2.0.3"
+  }
+}

@@ -39,6 +39,7 @@ the MDS packages from this monorepo (`file:` dependencies):
 | [`vite-app/`](vite-app/) | `@mdscript/vite-plugin` |
 | [`rollup-app/`](rollup-app/) | `@mdscript/rollup-plugin` |
 | [`webpack-app/`](webpack-app/) | `@mdscript/webpack-loader` |
+| [`rspack-app/`](rspack-app/) | `@mdscript/rspack-loader` |
 
 To run one (after building the workspace packages from the repo root with
 `npm install && npm run build --workspaces`):

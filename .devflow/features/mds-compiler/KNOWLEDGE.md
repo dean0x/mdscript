@@ -1,7 +1,7 @@
 ---
 feature: mds-compiler
 name: MDS Compiler
-description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, the compile_messages API family, or template inheritance (@extends/@block). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, And, Or, logical operators, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch, extends, block, skeleton, ExtendsDirective, BlockNode, effective_skeleton, effective_blocks, frontmatter_values, process_module_skeleton, resolve_by_key_skeleton, resolve_extends_components, ExtendsComponents, splice_skeleton, spliced_regions, validate_extends_components, deep_merge_yaml, build_scope_from_merged_mapping, apply_block_overrides, check_child_only_blocks, MAX_BLOCKS_PER_MODULE, MAX_FRONTMATTER_MERGE_DEPTH, mds::extends, template inheritance, diamond inheritance, seed_effective_blocks, pf004_messages_mode_extends_validates_final_body_parity, utf8_boundary, compute_line_column, extends_error_at, p5b_deep_chain, Origin, EffectiveBlock, skeleton_origin, region-aware validation, ride-along, spliced_regions, ADR-022, diagnostic attribution, cross-source offset, OutOfBounds, SerializedSpan, character-based column."
+description: "Use when working on the MDS compilation pipeline, adding directives, modifying scope/variable handling, extending the module system, debugging output rendering, modifying CLI output behavior, using the virtual filesystem / dependency tracking API, working with @message blocks, messages output mode, the compile_messages API family, or template inheritance (@extends/@block). Keywords: lexer, parser, evaluator, resolver, validator, scope, frontmatter, interpolation, directive, import, export, include, define, for, if, elseif, negation, equality, Condition, CondValue, And, Or, logical operators, Param, default arguments, ArityMismatch, BuiltinError, call_function, required_param_count, condvalue_to_value, MAX_LOGICAL_OPERANDS, message, @message, messages mode, compile_messages, compile_messages_str, compile_messages_virtual, CompileMessagesOutput, Message, evaluate_messages, collect_messages, EvalMessage, OutputFormat, --format messages, injection safety, bare-word role, dynamic role, inside_message, total_message_bytes, MAX_MESSAGE_COUNT, MAX_MESSAGES_TOTAL_SIZE, MAX_ARRAY_ELEMENTS, scan_imports, load_vars_file, load_vars_str, check_virtual, compile_file, read_build_input, compile_to_content, compile_and_write, watch, extends, block, skeleton, ExtendsDirective, BlockNode, effective_skeleton, effective_blocks, frontmatter_values, process_module_skeleton, resolve_by_key_skeleton, resolve_extends_components, ExtendsComponents, splice_skeleton, spliced_regions, validate_extends_components, deep_merge_yaml, build_scope_from_merged_mapping, apply_block_overrides, check_child_only_blocks, MAX_BLOCKS_PER_MODULE, MAX_FRONTMATTER_MERGE_DEPTH, mds::extends, template inheritance, diamond inheritance, seed_effective_blocks, Origin, EffectiveBlock, skeleton_origin, region-aware validation, ride-along, ADR-022, diagnostic attribution, cross-source offset, OutOfBounds, SerializedSpan, character-based column, compute_line_column."
 category: architecture
 directories: [crates/mds-core/src/, crates/mds-cli/src/, crates/mds-cli/tests/]
 referencedFiles:
@@ -27,7 +27,7 @@ referencedFiles:
   - crates/mds-cli/tests/format_messages.rs
   - crates/mds-cli/tests/inheritance.rs
 created: 2026-05-12
-updated: 2026-06-14
+updated: 2026-06-15
 ---
 
 # MDS Compiler
@@ -50,7 +50,7 @@ The library exposes public `compile*` / `check*` / `compile_messages*` functions
 - `pub fn compile_file(path: &str) -> Result<String, MdsError>` — thin wrapper over `compile(Path::new(path), None)`.
 - `pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError>` — parses the AST and returns all dependency paths in resolution order: `@extends` base path FIRST, then frontmatter `imports:` paths, then body `@import`/`@export ... from` paths. Deduplicated in insertion order. Returns a compile error on syntax error.
 - `pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError>` — reads a JSON file as vars; enforces `MAX_FILE_SIZE`.
-- `pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError>` — parses a JSON string as vars.
+- `pub fn load_vars_str(json: &str) -> Result<HashMap<String, Value>, MdsError>` — parses a JSON string as vars; enforces `MAX_FILE_SIZE`.
 - `pub fn check_virtual(modules, entry, vars) -> Result<(), MdsError>` — validates a virtual-filesystem module.
 - `pub fn check_virtual_collecting_warnings(modules, entry, vars) -> Result<((), Vec<String>), MdsError>` — same but returns warnings.
 
@@ -68,8 +68,8 @@ All cross-pipeline defense-in-depth constants:
 - `pub(crate) const MAX_NESTING_DEPTH: usize = 64`
 - `pub(crate) const MAX_ELSEIF_BRANCHES: usize = 256`
 - `pub(crate) const MAX_LOGICAL_OPERANDS: usize = 16`
-- `pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024`
-- `pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256`
+- `pub(crate) const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024` — re-exported as `pub const` from `lib.rs`
+- `pub(crate) const MAX_TRAVERSAL_DEPTH: usize = 256` — re-exported as `pub const` from `lib.rs`
 - `pub(crate) const MAX_OUTPUT_SIZE: usize = 50 * 1024 * 1024`
 - `pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000`
 - `pub(crate) const MAX_FRONTMATTER_IMPORTS: usize = 256`
@@ -78,7 +78,7 @@ All cross-pipeline defense-in-depth constants:
 - `pub(crate) const MAX_BLOCKS_PER_MODULE: usize = 256` — caps `@block` declarations per module; enforced in `collect_block`
 - `pub(crate) const MAX_FRONTMATTER_MERGE_DEPTH: usize = 64` — caps `deep_merge_yaml` recursion depth; exceeding returns `mds::resource_limit`
 
-`MAX_FILE_SIZE` and `MAX_TRAVERSAL_DEPTH` are re-exported as `pub const` from `lib.rs`.
+`MAX_FILE_SIZE` and `MAX_TRAVERSAL_DEPTH` are re-exported as `pub const` from `lib.rs`. All others are `pub(crate)`.
 
 ### Evaluator Constants (`crates/mds-core/src/evaluator.rs`)
 
@@ -260,13 +260,15 @@ Precedence: **base < child < runtime** (decision #3 / F7).
 
 #### `scan_imports` Update
 
-`scan_imports` prepends the `@extends` base path FIRST (before frontmatter imports and body imports), matching the resolution order: `extends → fm_imports → body_imports`. This ensures dependency scanners (e.g. the watch loop) see the base as the leading dependency.
+`scan_imports` prepends the `@extends` base path FIRST (before frontmatter imports and body imports), matching the resolution order: `extends → fm_imports → body_imports`. This ensures dependency scanners (e.g. the watch loop) see the base as the leading dependency. The implementation uses `indexmap::IndexSet` for deduplication with insertion-order preservation.
 
 ### Error System (`crates/mds-core/src/error.rs`)
 
 **`fn at(file, source, offset, len) -> (Option<SourceSpan>, Option<Arc<NamedSource<String>>>)`** — private shared constructor called by all `*_at` error constructors. Computes `end = offset.saturating_add(len)` and `in_bounds = end <= source.len() && source.is_char_boundary(offset) && source.is_char_boundary(end)`. When `!in_bounds`, returns `(Some(SourceSpan::new(offset, len)), None)` — keeps the raw offset/length for `serialize()` but drops `src` so miette never reads outside the source string (eliminates `OutOfBounds` in ALL render paths: CLI human AND JSON). A `debug_assert!(in_bounds || source.is_empty(), "cross-source offset mismatch…")` fires in debug/test builds for the cross-source bug case; the empty-source escape prevents false-fires on unit tests that pass `""` as source.
 
 **`compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)>`** — private helper that converts a byte offset into a 1-based (line, column) pair. Boundary-safe: returns `None` for `offset > source.len()` or when `offset` is not a valid UTF-8 char boundary (guards against panic on multi-byte UTF-8). `offset == source.len()` (exclusive-end) returns `Some`. Column is **character-based** (Unicode scalar values via `source[..offset].chars()`), not byte-based — so `SerializedSpan.column` equals the visual column on multibyte lines; ASCII is unchanged. `SerializedSpan` doc was corrected to state "character position (Unicode scalar values)". Test: `compute_line_column_is_char_based` in `error_tests.rs` (CJK 3-byte chars: byte-col would be 7, char-col is 3).
+
+**`error_tests.rs`** is the test module for `error.rs`, declared via `#[cfg(test)] #[path = "error_tests.rs"] mod tests;`. Contains `compute_line_column_is_char_based` (char-vs-byte column test), `line_col_out_of_bounds` (OOB returns None), and full serialization tests for all `MdsError` variants.
 
 **`MdsError::Extends { message, span, src }`** — code `mds::extends`. Used for:
 - Child-only-blocks violations (stray top-level content in a child body).
@@ -314,7 +316,7 @@ Three-tier API mirroring `compile*`:
 ### CLI Module Layout (`crates/mds-cli/src/`)
 
 - **`main.rs`** — CLI entry point: `Cli` struct, `Commands` enum (Build/Check/Init/Watch), `main()`, `run()`, `run_check()`, `run_init()`.
-- **`build.rs`** — all shared build logic: `OutputFormat`, `BuildArgs`, `CompileOutput` (CLI-internal), `compile_to_content`, `compile_and_write`, `run_build`/`run_build_messages`/`run_build_markdown`, `read_build_input`, `read_stdin`, `write_output`, `load_config`, `resolve_output_path`, `build_runtime_vars`, `exit_code`, `auto_detect_mds_file`, `reject_directory_input`, `parse_key_value`, `parse_cli_value`.
+- **`build.rs`** — all shared build logic: `OutputFormat`, `BuildArgs`, `CompileOutput` (CLI-internal, struct with `content: String, dependencies: Vec<String>`), `MdsConfig`, `BuildConfig`, `compile_to_content`, `compile_and_write`, `run_build`, `read_build_input`, `read_stdin`, `write_output`, `load_config`, `resolve_output_path`, `compute_output_dir_path`, `prepare_output_dir`, `derive_output_filename`, `build_runtime_vars`, `exit_code`, `auto_detect_mds_file`, `reject_directory_input`, `parse_key_value`, `parse_cli_value`, `load_optional_vars_file`, `resolve_input`.
 - **`watch.rs`** — watch subcommand: `WatchArgs`, `run_watch`, `run_watch_file`, `run_watch_dir`, `dir_watch_startup`; context structs; extracted helpers.
 
 **Important naming distinction**: `build::CompileOutput { content: String, dependencies: Vec<String> }` (CLI-internal, pre-serialized content) ≠ `mds::CompileOutput { output: String, warnings: Vec<String>, dependencies: Vec<String> }` (core library type).
@@ -331,6 +333,10 @@ Three-tier API mirroring `compile*`:
 ### CLI: `watch` subcommand
 
 Recompiles on save using `notify` + `ctrlc`. `run_watch_dir` tracks a reverse-dependency graph; editing a shared partial recompiles all transitive importers. `_`-prefixed partials are tracked but never emit their own `.md` output. `--format messages` not supported in directory mode.
+
+### CLI: `mds.json` Config
+
+`load_config` walks up from the input file looking for `mds.json`. `MdsConfig { build: BuildConfig { output_dir: Option<String> } }`. `resolve_output_path` uses `mds.json`'s `output_dir` (relative to the config directory) when no explicit `--output` flag is given. Path traversal (`..'` components) in `output_dir` is rejected with a miette error.
 
 ## Component Interactions
 
@@ -478,6 +484,7 @@ Follow the pattern used by `type: mds` and `imports`:
 - **FM-carrying deep chains are O(N^2) in the merge path** — `deep_merge_yaml` is called at each level of `process_module_skeleton`, so a 32-level chain where every level adds FM keys accumulates merge work quadratically. The current implementation is correct and passes the `p5b_deep_chain_32_levels_with_frontmatter_under_2s` guard (< 2 s on typical hardware), but fixing the O(N^2) behaviour is tracked as tech debt.
 - **Test name convention** — resolver test functions use domain-descriptive names throughout: UTF-8 boundary regression tests are `utf8_boundary_*`; PF-004 parity tests are `pf004_*`. These were originally named `task1_*` and `task2_*` but were renamed for consistency with the existing `f*/e*/a*/p*` convention. Do not search for the old task-prefixed names.
 - **P2 perf bound is 1s** — the `p2_wide_base_200_blocks_under_1s` test (CLI integration, `inheritance.rs`) uses a 1-second wall-clock bound, relaxed from the original 200ms to avoid CI flakiness. The guard still catches O(N²) blowup; it is intentionally generous for CI variability.
+- **`load_vars_str` enforces `MAX_FILE_SIZE`** — callers passing large JSON strings should expect `mds::resource_limit` if the string exceeds 10 MiB. Test: `load_vars_str_rejects_oversized_input` in `lib.rs` tests.
 
 ## Key Files
 
@@ -488,10 +495,10 @@ Follow the pattern used by `type: mds` and `imports`:
 - `crates/mds-core/src/evaluator.rs` — `Node::Block` arm (evaluate_block); `Node::Block` arm in collect_messages; `EvalContext`; `evaluate_messages` / `collect_messages`
 - `crates/mds-core/src/validator.rs` — `validate_block_node`; `Node::Block` arm; `validate_message_node`; `validate_condition`
 - `crates/mds-core/src/error.rs` — `fn at()` (defense-in-depth OOB guard, used by all `*_at` constructors); `MdsError::Extends` with `extends_error_at`; `compute_line_column` (character-based column, UTF-8 boundary safe); `SerializedSpan` (offset/length in bytes, column in Unicode scalar values)
-- `crates/mds-core/src/error_tests.rs` — `compute_line_column_is_char_based` (CJK char-vs-byte column test); `line_col_out_of_bounds` (OOB returns None)
+- `crates/mds-core/src/error_tests.rs` — `compute_line_column_is_char_based` (CJK char-vs-byte column test); `line_col_out_of_bounds` (OOB returns None); serialization tests for all error variants
 - `crates/mds-core/src/builtins.rs` — 18 built-in functions; `BuiltinMeta`; `get_builtin` / `call_builtin`
-- `crates/mds-core/src/lib.rs` — public API; `scan_imports` (prepends `@extends` path first); `Message`; `CompileMessagesOutput`; `compile_messages*` family
-- `crates/mds-cli/src/build.rs` — `OutputFormat`; `BuildArgs`; `compile_to_content`; `compile_and_write`; `read_build_input`
+- `crates/mds-core/src/lib.rs` — public API; `scan_imports` (prepends `@extends` path first, uses `IndexSet` for dedup+order); `Message`; `CompileMessagesOutput`; `compile_messages*` family; `load_vars_str` (enforces `MAX_FILE_SIZE`); `strip_reserved_keys` / `prepend_frontmatter` / `clean_output` (output rendering)
+- `crates/mds-cli/src/build.rs` — `OutputFormat`; `BuildArgs`; `compile_to_content`; `compile_and_write`; `read_build_input`; `MdsConfig`; `load_config`; `resolve_output_path`
 - `crates/mds-cli/src/watch.rs` — watch subcommand; reverse-dep graph; `compile_one_source`
 - `crates/mds-cli/tests/inheritance.rs` — CLI integration tests for template inheritance; E12 diagnostic attribution tests: `e12_base_default_undefined_var_render_points_at_base` (asserts stderr names base.mds, contains "not defined", no `OutOfBounds`/`Failed to read contents`), `e12_check_and_build_diagnostics_match` (check and build agree on error code and base file)
 - `crates/mds-core/tests/messages.rs` — integration tests for `@message` / messages mode

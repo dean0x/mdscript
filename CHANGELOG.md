@@ -71,6 +71,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cumulative message-content size cap (50 MB): enforced per-compile across all
   `@message` blocks.
 
+### Ecosystem
+
+- New package `@mdscript/rspack-loader`: Rspack loader for importing `.mds` templates
+  as ES modules. Mirrors `@mdscript/webpack-loader` — delegates to the shared
+  `createMdsLoader()` factory in `@mdscript/bundler-utils`, peer-depends on
+  `@rspack/core ^1.0.0 || ^2.0.0` (verified against Rspack 1.x and 2.x), and ships
+  dual ESM + CJS builds. Published as the 8th coordinated package in the
+  `@mdscript` release.
+- Verified and hardened HMR behaviour across all four bundler integrations
+  (Vite, Rollup, Webpack, Rspack). Each integration now has a documented HMR contract,
+  known-limitation notes (AC-E1/E2/E3), and spec-level tests.
+- **Vite fix**: `handleHotUpdate` now correctly triggers a full-page reload for `.md`
+  files with `type: mds` frontmatter and for files tracked only as transitive `@import`
+  dependencies. Previously only bare `.mds` extension files were detected. The fix adds
+  a closure-level `transformed` Set with a `canon()` path-normalization helper that
+  resolves symlinks (macOS `/tmp` → `/private/tmp`) and strips Vite query suffixes.
+
 ## [0.2.0] — 2026-06-06
 
 ### Language features

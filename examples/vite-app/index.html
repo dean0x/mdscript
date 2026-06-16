@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MDS × Vite — live HMR demo</title>
+    <style>
+      body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; color: #1a1a1a; }
+      h1 { font-size: 1.15rem; }
+      .hint { color: #555; max-width: 60ch; }
+      code { background: #f0f0f0; padding: 0 .25em; border-radius: 3px; }
+      pre { background: #0d1117; color: #e6edf3; padding: 1rem; border-radius: 8px; white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>MDS × Vite — live HMR demo</h1>
+    <p class="hint">
+      Edit <code>src/prompts/reviewer.mds</code> or its <code>@import</code> dependency
+      <code>src/prompts/rules.mds</code> and save — this page hot-reloads with the
+      recompiled prompt. The <code>rules.mds</code> case exercises transitive
+      <code>@import</code> dependency tracking.
+    </p>
+    <pre id="out">loading…</pre>
+    <script type="module" src="/src/dev.ts"></script>
+  </body>
+</html>

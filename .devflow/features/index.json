@@ -33,13 +33,14 @@
         "crates/mds-napi/package.json",
         "crates/mds-napi/__test__/index.spec.mjs",
         "crates/mds-napi/__test__/fixtures/simple.mds",
+        "crates/mds-napi/__test__/fixtures/var.mds",
         "crates/mds-napi/__test__/fixtures/import_consumer.mds",
         "crates/mds-napi/__test__/fixtures/import_provider.mds",
         "crates/mds-core/src/lib.rs",
         "crates/mds-core/src/options.rs",
         "Cargo.toml"
       ],
-      "lastUpdated": "2026-06-14T21:17:50.764Z",
+      "lastUpdated": "2026-06-15T19:35:21.587Z",
       "createdBy": "implement"
     },
     "mds-compiler": {
@@ -73,7 +74,7 @@
         "crates/mds-cli/tests/format_messages.rs",
         "crates/mds-cli/tests/inheritance.rs"
       ],
-      "lastUpdated": "2026-06-14T20:28:17.546Z",
+      "lastUpdated": "2026-06-15T19:35:40.421Z",
       "createdBy": "implement"
     },
     "mds-js": {
@@ -95,6 +96,31 @@
         "packages/mds/__test__/compile-messages.spec.mjs"
       ],
       "lastUpdated": "2026-06-08T05:01:55.885Z",
+      "createdBy": "implement"
+    },
+    "bundler-plugins": {
+      "name": "MDS Bundler Plugins & Loaders",
+      "description": "Use when adding a new bundler integration, modifying the emitted-module contract, debugging HMR behavior, working on the CJS compatibility shim, updating the transformer/loader factory, registering a new package in the release pipeline, or investigating why a .md file with type:mds frontmatter doesn't hot-reload. Keywords: createMdsTransformer, createMdsLoader, bundler-utils, vite-plugin, rollup-plugin, webpack-loader, rspack-loader, addWatchFile, addDependency, handleHotUpdate, canon, transformed Set, HMR_ENABLED, MDS_HMR, new Function CJS shim, dual ESM+CJS build, D1 no HMR self-accept, D3 createMdsLoader factory, D5 Linux-gated HMR e2e, D7 native watcher semantics, G1 fix, ADR-014 deps-before-entry, PF-003 provenance directory, 8-package release gate.",
+      "directories": [
+        "packages/bundler-utils/",
+        "packages/vite-plugin/",
+        "packages/rollup-plugin/",
+        "packages/webpack-loader/",
+        "packages/rspack-loader/"
+      ],
+      "referencedFiles": [
+        "packages/bundler-utils/src/transform.ts",
+        "packages/bundler-utils/src/loader.ts",
+        "packages/bundler-utils/src/types.ts",
+        "packages/bundler-utils/src/frontmatter.ts",
+        "packages/bundler-utils/src/lazy-init.ts",
+        "packages/vite-plugin/src/index.ts",
+        "packages/rollup-plugin/src/index.ts",
+        "packages/webpack-loader/src/index.ts",
+        "packages/rspack-loader/src/index.ts",
+        "packages/bundler-utils/__test__/hmr-harness.mjs"
+      ],
+      "lastUpdated": "2026-06-16T09:52:22.055Z",
       "createdBy": "implement"
     }
   }

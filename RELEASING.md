@@ -15,7 +15,7 @@ asserts these are all equal before anything publishes:
   `mds-core`, `mds-cli`, `mds-wasm`, `mds-napi`)
 - Every publishable `package.json`: `@mdscript/mds-napi`, `@mdscript/mds`,
   `@mdscript/mds-wasm`, `@mdscript/bundler-utils`, `@mdscript/vite-plugin`,
-  `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`
+  `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`, `@mdscript/rspack-loader`
 - All internal `@mdscript/*` dependency ranges are `^<version>` (no `file:`)
 
 ## One-time prerequisites (maintainer / repo owner)

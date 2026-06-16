@@ -65,6 +65,7 @@ const PKG_PATHS = [
   'packages/vite-plugin/package.json',
   'packages/rollup-plugin/package.json',
   'packages/webpack-loader/package.json',
+  'packages/rspack-loader/package.json',
 ];
 
 const DEP_SETS = ['dependencies', 'optionalDependencies', 'peerDependencies'];

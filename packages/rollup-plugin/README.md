@@ -66,6 +66,31 @@ interface MdsPluginOptions {
 }
 ```
 
+## HMR / dev server
+
+Rollup's plugin API does not expose an `handleHotUpdate` hook (that is Vite-specific).
+In **watch mode** (`rollup --watch`), the plugin registers each `@import` dependency via
+`this.addWatchFile()`. When any watched file changes, Rollup triggers a full rebuild of
+the bundle — no runtime HMR injection is performed.
+
+No `module.hot` or `import.meta.webpackHot` footer is appended to the emitted module.
+The rebuild is Rollup's responsibility via its own file-watch graph.
+
+### Known limitations
+
+**AC-E1 — delete/recreate and new `@import` targets follow native Rollup watch semantics.**
+Deleting and recreating an `@import`-ed dependency file, or adding an `@import` pointing
+to a not-yet-created file, may require touching a watched file to recover. These are native
+Rollup watch limits, not bugs in the plugin.
+
+**AC-E2 — adding `type: mds` frontmatter to an existing `.md` file mid-watch.**
+Rollup re-invokes `transform` on the next rebuild, so `shouldTransform` returning `true`
+after frontmatter is added will compile the file correctly on the next watch cycle.
+
+**AC-E3 — error overlay points at compiled JS, not the `.mds` source.**
+The plugin returns `map: null`. Error positions refer to the generated JavaScript, not the
+original `.mds` source line.
+
 ## License
 
 MIT

@@ -1,9 +1,9 @@
 /**
- * CJS compatibility tests for @mdscript/webpack-loader.
+ * CJS compatibility tests for @mdscript/rspack-loader.
  *
  * Verifies that the CJS build (dist-cjs/) can be loaded via require() and
- * exports the default loader function. This is the primary condition for
- * Webpack 5 interoperability — Webpack resolves loaders using require().
+ * exports the default loader function with all three required symbols.
+ * Rspack resolves loaders using require() just like Webpack.
  *
  * T-C3 mitigation: the real-import test below exercises the
  * `new Function('return import("@mdscript/mds")')` ESM-import shim end-to-end
@@ -26,7 +26,7 @@ const hasCjsBuild = existsSync(cjsPath);
 // Fixture — exists in this package's own __test__/fixtures/ directory.
 const SIMPLE_MDS = resolve(__dirname, 'fixtures/simple.mds');
 
-describe('webpack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
+describe('rspack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not built — run build first' }, () => {
   const cjsBuild = require(cjsPath);
   const { default: mdsLoader, _resetForTesting, _setTransformerForTesting } = cjsBuild;
 
@@ -39,10 +39,9 @@ describe('webpack-loader CJS build', { skip: !hasCjsBuild && 'dist-cjs/ not buil
 
   test('exports default as an async function (the loader)', () => {
     assert.equal(typeof mdsLoader, 'function', 'default export should be a function');
-    // Webpack loaders must return a Promise. Verify the behavioral contract by
+    // Rspack loaders must return a Promise. Verify the behavioral contract by
     // invoking the loader with a minimal mock context that satisfies its
     // interface: async() returns a no-op callback, getOptions() returns {}.
-    // We only check the return type — we do not assert on side effects.
     const mockContext = {
       resourcePath: '/dev/null/nonexistent.mds',
       async() { return () => {}; },
