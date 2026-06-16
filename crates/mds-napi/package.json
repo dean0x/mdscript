@@ -44,6 +44,6 @@
     "README.md"
   ],
   "devDependencies": {
-    "@napi-rs/cli": "^3.0.0"
+    "@napi-rs/cli": "^3.7.2"
   }
 }
