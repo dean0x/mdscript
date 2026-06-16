@@ -3,6 +3,18 @@ import { LazyInit } from './lazy-init.js';
 import { createMdsTransformer } from './transform.js';
 import { formatMdsError } from './errors.js';
 
+/**
+ * Type guard that narrows `unknown` to `MdsApi` by checking the presence and
+ * type of the two required functions. Existence checks are sufficient here —
+ * full arity/return-shape probing has diminishing returns for an internal peer
+ * dep whose contract is documented in types.ts.
+ */
+function isMdsApi(m: unknown): m is MdsApi {
+  if (m === null || typeof m !== 'object') return false;
+  const r = m as Record<string, unknown>;
+  return typeof r['compileFile'] === 'function' && typeof r['init'] === 'function';
+}
+
 // WORKAROUND: When compiled to CJS, TypeScript rewrites `import()` to
 // `require()`, breaking ESM-only packages like `@mdscript/mds`. This wrapper
 // preserves native `import()` by creating a new Function at runtime — the
@@ -79,20 +91,27 @@ export interface MdsLoaderApi {
 export function createMdsLoader(): MdsLoaderApi {
   // Per-instance state — independent for each createMdsLoader() call.
   let lazy: LazyInit<Transformer> | null = null;
-  let capturedOptions: MdsPluginOptions | null = null;
+  // Serialized form of the first-seen options. Set once when lazy is first
+  // created so the options-drift check only needs to stringify the incoming
+  // options once per invocation rather than serializing both objects.
+  let capturedOptionsJson: string | null = null;
 
   function getLazy(
     options: MdsPluginOptions,
     emitWarning: (err: Error) => void,
   ): LazyInit<Transformer> {
     if (lazy === null) {
-      capturedOptions = options;
+      // Capture the serialized options BEFORE starting the async factory. If
+      // the factory rejects, lazy.pending is cleared but lazy itself stays
+      // non-null and capturedOptionsJson stays set, so a subsequent invocation
+      // correctly detects option drift even on a retry path.
+      capturedOptionsJson = JSON.stringify(options);
       lazy = new LazyInit(async () => {
         const importResult = esmImport();
         // Runtime validation: esmImport() must return a thenable (Promise-like).
         // new Function() bypasses TypeScript's type checker, so the return type
         // annotation is not enforced at runtime. A non-thenable here would cause
-        // a silent hang rather than a clear error.
+        // a silent hang rather than a clear error. (applies ADR-016)
         if (
           importResult === null ||
           typeof importResult !== 'object' ||
@@ -102,22 +121,20 @@ export function createMdsLoader(): MdsLoaderApi {
             'esmImport() did not return a thenable. The new Function() wrapper is broken in this environment.',
           );
         }
-        const mds = (await importResult) as unknown as MdsApi;
-        const mdsAny = mds as unknown as Record<string, unknown>;
-        if (
-          typeof mdsAny['compileFile'] !== 'function' ||
-          typeof mdsAny['init'] !== 'function'
-        ) {
+        const mod = await importResult;
+        if (!isMdsApi(mod)) {
           throw new Error(
             '@mdscript/mds module shape is unexpected: compileFile and init must both be functions. ' +
               'Check that the installed version is compatible.',
           );
         }
-        return createMdsTransformer(mds, options);
+        return createMdsTransformer(mod, options);
       });
     } else if (
-      capturedOptions !== null &&
-      JSON.stringify(options) !== JSON.stringify(capturedOptions)
+      // capturedOptionsJson is non-null whenever lazy is non-null (set together
+      // above). The null guard is a type-system formality.
+      capturedOptionsJson !== null &&
+      JSON.stringify(options) !== capturedOptionsJson
     ) {
       emitWarning(
         new Error(
@@ -127,6 +144,11 @@ export function createMdsLoader(): MdsLoaderApi {
         ),
       );
     }
+    // LazyInit retries the factory on each getLazy().get() call after a
+    // rejection — there is no internal attempt cap. This is intentional:
+    // retry-on-reject lets a transient @mdscript/mds import failure self-heal
+    // on the next bundler invocation. The bound is external (one retry per
+    // .mds/.md file per build), not an internal tight loop.
     return lazy;
   }
 
@@ -152,16 +174,21 @@ export function createMdsLoader(): MdsLoaderApi {
   function _resetForTesting(): void {
     lazy?.reset();
     lazy = null;
-    capturedOptions = null;
+    capturedOptionsJson = null;
   }
 
   function _setTransformerForTesting(t: Transformer | null): void {
     if (t === null) {
-      lazy?.reset();
-      lazy = null;
-      capturedOptions = null;
+      // Delegate to the single teardown source of truth so both paths stay
+      // in sync if new per-instance state is added in the future.
+      _resetForTesting();
       return;
     }
+    // Inject a pre-built transformer without going through esmImport().
+    // capturedOptionsJson is intentionally left as-is: if a transformer was
+    // already live, its serialized options remain; if the instance is fresh,
+    // capturedOptionsJson stays null (no real loader invocation yet). Call
+    // _resetForTesting() first if you need a clean slate before injection.
     lazy = new LazyInit(async () => t);
   }
 
