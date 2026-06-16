@@ -36,6 +36,17 @@ interface VitePlugin {
 type Transformer = ReturnType<typeof createMdsTransformer>;
 
 /**
+ * Module-level memo for canon() realpath results. Keyed on the post-cleanId
+ * cleaned path (before separator normalisation). Only successful realpathSync
+ * results are cached — the catch/fallback is intentionally NOT cached so that
+ * a deleted-then-recreated file (D7 delete/recreate) re-resolves on the next
+ * call rather than returning a stale absolute path. Growth is bounded by the
+ * same universe of distinct MDS files + deps as the `transformed` Set —
+ * no eviction is needed.
+ */
+const canonCache = new Map<string, string>();
+
+/**
  * Canonicalize a path for insertion into and lookup from the MDS-watched-paths
  * Set. Canonicalization is required because:
  *   - macOS symlinks: /tmp is a symlink to /private/tmp, so the same physical
@@ -48,20 +59,37 @@ type Transformer = ReturnType<typeof createMdsTransformer>;
  * (gap D / edge E-norm). This mirrors crates/mds-cli/src/watch.rs
  * event_is_relevant 3-layer matching (symlink resolution).
  *
- * Falls back to path.resolve when realpathSync throws (e.g. deleted file).
+ * Falls back to path.resolve when realpathSync throws (e.g. deleted file, D7).
+ * Never throws — a malformed input degrades to "no match" instead of propagating
+ * into Vite's HMR dispatch (applies ADR-016: re-validate inputs at runtime).
  */
 function canon(p: string): string {
-  // 1. Strip query/hash suffixes (Vite appends ?t=xxx, #xxx etc.)
-  const clean = cleanId(p);
-  // 2. Normalize OS separators to forward-slash so paths are comparable
-  //    across platforms (especially relevant on Windows).
-  const normalized = clean.split(sep).join('/');
   try {
-    // 3. Resolve symlinks — handles /tmp → /private/tmp on macOS.
-    return realpathSync(normalized).split(sep).join('/');
+    // 1. Strip query/hash suffixes (Vite appends ?t=xxx, #xxx etc.)
+    const clean = cleanId(p);
+    // 2. Check memo before issuing any syscall.
+    const cached = canonCache.get(clean);
+    if (cached !== undefined) return cached;
+    // 3. Normalize OS separators to forward-slash so paths are comparable
+    //    across platforms (especially relevant on Windows).
+    const normalized = clean.split(sep).join('/');
+    try {
+      // 4. Resolve symlinks — handles /tmp → /private/tmp on macOS.
+      const resolved = realpathSync(normalized).split(sep).join('/');
+      // Cache only the success path. The fallback (file deleted) is NOT cached
+      // so a recreated file will re-resolve via realpathSync next time (D7).
+      canonCache.set(clean, resolved);
+      return resolved;
+    } catch {
+      // File was deleted or doesn't exist yet; fall back to absolute resolve.
+      // Do NOT cache — the file may appear/disappear again (D7 semantics).
+      return resolvePath(normalized).split(sep).join('/');
+    }
   } catch {
-    // File was deleted or doesn't exist yet; fall back to absolute resolve.
-    return resolvePath(normalized).split(sep).join('/');
+    // Outer guard: catches any failure in cleanId / split / other string ops
+    // on a malformed input. Returns the raw input so a bad path degrades to
+    // "no match" in the transformed Set rather than throwing into handleHotUpdate.
+    return p;
   }
 }
 
