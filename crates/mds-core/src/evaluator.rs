@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::arity::check_arity;
 use crate::ast::{
     required_param_count, Arg, BlockNode, CondValue, Condition, Expr, ForBlock, IfBlock,
     IncludeDirective, MessageBlock, Node,
@@ -330,7 +330,7 @@ fn invoke_function(
     }
     let required = required_param_count(&func.params);
     let total = func.params.len();
-    if args.len() < required || args.len() > total {
+    if !check_arity(args.len(), required, total) {
         return Err(MdsError::arity(call_key, required, total, args.len()));
     }
     scope.push();
@@ -391,7 +391,7 @@ fn call_function(
         // Defense-in-depth arity check: the validator enforces this at compile
         // time, but we guard here too so the evaluator is safe when called
         // without prior validation (e.g. in unit tests or future API consumers).
-        if args.len() < meta.min_args || args.len() > meta.max_args {
+        if !check_arity(args.len(), meta.min_args, meta.max_args) {
             return Err(MdsError::arity(
                 name,
                 meta.min_args,
@@ -541,75 +541,72 @@ fn evaluate_if(
     }
 }
 
-/// Execute one loop body iteration: push a scope frame, bind variables, render, pop.
+/// Generic `@for` driver shared by text mode and messages mode.
 ///
-/// `bindings` is a `Vec` of `(name, value)` pairs to set in the pushed scope frame.
-/// Values are moved into scope directly, avoiding a clone per iteration.
-/// On double-fault (render error + pop error), the render error is preferred.
-fn run_loop_body(
+/// Owns: iterable dispatch (key-value vs array), per-loop and cumulative
+/// iteration cap enforcement, and scope push/bind/pop for each iteration.
+/// The caller supplies a closure that is called once per iteration with the
+/// scope already bound; the closure accumulates results into whatever output
+/// type each mode needs.
+///
+/// The closure signature is `FnMut(&mut Scope, &mut EvalContext) ->
+/// Result<(), MdsError>`. Using `impl FnMut` (not `Box<dyn FnMut>`) keeps
+/// both call sites monomorphized so there is no heap allocation or virtual
+/// dispatch on the hot loop-body path.
+fn drive_for<F>(
+    block: &ForBlock,
     scope: &mut Scope,
     ctx: &mut EvalContext,
-    body: &[Node],
-    bindings: Vec<(&str, Value)>,
-) -> Result<String, MdsError> {
-    scope.push();
-    for (name, val) in bindings {
-        scope.set_var(name, val);
-    }
-    let rendered = evaluate_nodes(body, scope, ctx);
-    let pop_result = scope.pop();
-    prefer_first_error(rendered, pop_result)
-}
+    mut body: F,
+) -> Result<(), MdsError>
+where
+    F: FnMut(&mut Scope, &mut EvalContext) -> Result<(), MdsError>,
+{
+    let iterable = evaluate_expr(&block.iterable, scope, ctx)?;
 
-/// Key-value iteration path for `@for key, value in obj:`.
-fn evaluate_for_key_value(
-    key_var: &str,
-    val_var: &str,
-    map: HashMap<String, Value>,
-    body: &[Node],
-    scope: &mut Scope,
-    ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
-    if map.len() > MAX_LOOP_ITERATIONS {
-        return Err(MdsError::resource_limit(format!(
-            "object has {} entries, exceeding maximum loop iteration limit of {}",
-            map.len(),
-            MAX_LOOP_ITERATIONS
-        )));
-    }
+    if let Some(ref key_var) = block.key_var {
+        // Key-value iteration: @for key, value in obj:
+        let map = match iterable {
+            Value::Object(m) => m,
+            _ => {
+                return Err(MdsError::syntax(format!(
+                    "key-value iteration requires an object, but got {}",
+                    iterable.type_name()
+                )));
+            }
+        };
 
-    // Sort keys alphabetically for deterministic output
-    let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    let mut output = String::new();
-    for (key, val) in entries {
-        ctx.total_iterations += 1;
-        if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
+        if map.len() > MAX_LOOP_ITERATIONS {
             return Err(MdsError::resource_limit(format!(
-                "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                MAX_TOTAL_ITERATIONS
+                "object has {} entries, exceeding maximum loop iteration limit of {}",
+                map.len(),
+                MAX_LOOP_ITERATIONS
             )));
         }
-        let rendered = run_loop_body(
-            scope,
-            ctx,
-            body,
-            vec![(key_var, Value::String(key)), (val_var, val)],
-        )?;
-        output.push_str(&rendered);
-    }
-    Ok(output)
-}
 
-/// Array iteration path for `@for item in array:`.
-fn evaluate_for_array(
-    loop_var: &str,
-    iterable: Value,
-    body: &[Node],
-    scope: &mut Scope,
-    ctx: &mut EvalContext,
-) -> Result<String, MdsError> {
+        // Sort keys alphabetically for deterministic output.
+        let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (key, val) in entries {
+            ctx.total_iterations += 1;
+            if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
+                return Err(MdsError::resource_limit(format!(
+                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
+                    MAX_TOTAL_ITERATIONS
+                )));
+            }
+            scope.push();
+            scope.set_var(key_var, Value::String(key));
+            scope.set_var(&block.var, val);
+            let result = body(scope, ctx);
+            prefer_first_error(result, scope.pop())?;
+        }
+        return Ok(());
+    }
+
+    // Standard array iteration: @for item in iterable:
+    // Objects are rejected here with a hint to use key-value syntax.
     if let Value::Object(_) = &iterable {
         return Err(MdsError::syntax(
             "to iterate over an object's entries, use `@for key, value in obj:` syntax",
@@ -630,11 +627,9 @@ fn evaluate_for_array(
         )));
     }
 
-    // Clone the array items to release the shared borrow on `scope` so the
-    // loop body can call `scope.set_var` without a borrow conflict.
+    // Clone items to release the borrow on scope before iterating.
     let items = array.to_vec();
 
-    let mut output = String::new();
     for item in items {
         ctx.total_iterations += 1;
         if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
@@ -643,10 +638,12 @@ fn evaluate_for_array(
                 MAX_TOTAL_ITERATIONS
             )));
         }
-        output.push_str(&run_loop_body(scope, ctx, body, vec![(loop_var, item)])?);
+        scope.push();
+        scope.set_var(&block.var, item);
+        let result = body(scope, ctx);
+        prefer_first_error(result, scope.pop())?;
     }
-
-    Ok(output)
+    Ok(())
 }
 
 fn evaluate_for(
@@ -654,24 +651,13 @@ fn evaluate_for(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    let iterable = evaluate_expr(&block.iterable, scope, ctx)?;
-
-    if let Some(ref key_var) = block.key_var {
-        // Key-value iteration: @for key, value in obj:
-        let map = match iterable {
-            Value::Object(m) => m,
-            _ => {
-                return Err(MdsError::syntax(format!(
-                    "key-value iteration requires an object, but got {}",
-                    iterable.type_name()
-                )));
-            }
-        };
-        return evaluate_for_key_value(key_var, &block.var, map, &block.body, scope, ctx);
-    }
-
-    // Standard array iteration: @for item in iterable:
-    evaluate_for_array(&block.var, iterable, &block.body, scope, ctx)
+    let mut output = String::new();
+    drive_for(block, scope, ctx, |scope, ctx| {
+        let rendered = evaluate_nodes(&block.body, scope, ctx)?;
+        output.push_str(&rendered);
+        Ok(())
+    })?;
+    Ok(output)
 }
 
 fn evaluate_include(
@@ -878,89 +864,9 @@ fn collect_messages_from_for(
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
-    let iterable = evaluate_expr(&block.iterable, scope, ctx)?;
-
-    // Mirror text-mode dispatch exactly (evaluate_for):
-    //   - key_var present → key-value iteration over an Object only
-    //   - key_var absent  → array iteration (Objects rejected with a hint)
-    if let Some(ref key_var) = block.key_var {
-        // Key-value iteration: @for key, value in obj:
-        let map = match iterable {
-            Value::Object(m) => m,
-            _ => {
-                return Err(MdsError::syntax(format!(
-                    "key-value iteration requires an object, but got {}",
-                    iterable.type_name()
-                )));
-            }
-        };
-
-        if map.len() > MAX_LOOP_ITERATIONS {
-            return Err(MdsError::resource_limit(format!(
-                "object has {} entries, exceeding maximum loop iteration limit of {}",
-                map.len(),
-                MAX_LOOP_ITERATIONS
-            )));
-        }
-
-        // Sort keys alphabetically for deterministic output (matches text-mode behaviour).
-        let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        for (key, val) in entries {
-            ctx.total_iterations += 1;
-            if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
-                return Err(MdsError::resource_limit(format!(
-                    "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                    MAX_TOTAL_ITERATIONS
-                )));
-            }
-            scope.push();
-            scope.set_var(key_var, Value::String(key));
-            scope.set_var(&block.var, val);
-            let result = collect_messages(&block.body, scope, ctx, out);
-            prefer_first_error(result, scope.pop())?;
-        }
-        return Ok(());
-    }
-
-    // Standard array iteration: @for item in iterable:
-    // Objects are rejected here with a hint to use key-value syntax (matches text-mode).
-    if let Value::Object(_) = &iterable {
-        return Err(MdsError::syntax(
-            "to iterate over an object's entries, use `@for key, value in obj:` syntax",
-        ));
-    }
-
-    let array = iterable
-        .as_array()
-        .ok_or_else(|| MdsError::type_error(iterable.type_name()))?;
-
-    if array.len() > MAX_LOOP_ITERATIONS {
-        return Err(MdsError::resource_limit(format!(
-            "array has {} elements, exceeding maximum loop iteration limit of {}",
-            array.len(),
-            MAX_LOOP_ITERATIONS
-        )));
-    }
-
-    // Clone items to release the borrow on scope before iterating.
-    let items = array.to_vec();
-
-    for item in items {
-        ctx.total_iterations += 1;
-        if ctx.total_iterations > MAX_TOTAL_ITERATIONS {
-            return Err(MdsError::resource_limit(format!(
-                "total loop iterations exceeded maximum of {} across all loops in this compilation",
-                MAX_TOTAL_ITERATIONS
-            )));
-        }
-        scope.push();
-        scope.set_var(&block.var, item);
-        let result = collect_messages(&block.body, scope, ctx, out);
-        prefer_first_error(result, scope.pop())?;
-    }
-    Ok(())
+    drive_for(block, scope, ctx, |scope, ctx| {
+        collect_messages(&block.body, scope, ctx, out)
+    })
 }
 
 #[cfg(test)]
@@ -1497,5 +1403,361 @@ mod tests {
         );
         assert_eq!(output.messages[0].role, "system");
         assert!(output.messages[0].content.contains("System prompt."));
+    }
+
+    // ── Arity span-divergence tests (#71) ─────────────────────────────────────
+    //
+    // Pin the deliberate divergence: evaluator errors have NO span (no source
+    // context available at runtime); validator errors HAVE a span (source text
+    // is present at compile time).
+
+    #[test]
+    fn arity_error_evaluator_has_no_span() {
+        // Bypass the validator so only the evaluator's arity check fires.
+        // compile_str runs validator then evaluator; we call evaluate directly
+        // to isolate the evaluator path.
+        use crate::ast::{Interpolation, Param};
+        use crate::scope::FunctionDef;
+
+        let define = crate::ast::DefineBlock {
+            name: "requires_one".to_string(),
+            params: vec![Param::required("x")],
+            body: vec![text("ok")],
+            offset: 0,
+        };
+        let mut scope = Scope::new();
+        scope.set_function("requires_one", Arc::new(FunctionDef::from(&define)));
+
+        // Call with 0 args → arity error from invoke_function (evaluator path).
+        let nodes = vec![Node::Interpolation(Interpolation {
+            expr: Expr::Call {
+                name: "requires_one".to_string(),
+                args: vec![],
+            },
+            offset: 0,
+            len: 12,
+        })];
+        let mut warnings = vec![];
+        let err = evaluate(&nodes, &mut scope, &mut warnings)
+            .expect_err("should fail with arity mismatch");
+
+        // Assert the span is None on the evaluator path (no source text available).
+        match err {
+            crate::error::MdsError::ArityMismatch { span, .. } => {
+                assert!(
+                    span.is_none(),
+                    "evaluator arity error must carry no span, got {span:?}"
+                );
+            }
+            other => panic!("expected ArityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arity_error_evaluator_builtin_has_no_span() {
+        // Evaluator builtin arity check (defense-in-depth path): call_function
+        // for a builtin with wrong arg count also uses MdsError::arity (no span).
+        // We call evaluate directly with a pre-built AST node to bypass the validator.
+        use crate::ast::{Arg, Interpolation};
+
+        // upper() requires exactly 1 arg; call it with 2.
+        let nodes = vec![Node::Interpolation(Interpolation {
+            expr: Expr::Call {
+                name: "upper".to_string(),
+                args: vec![
+                    Arg::StringLiteral("a".to_string()),
+                    Arg::StringLiteral("b".to_string()),
+                ],
+            },
+            offset: 0,
+            len: 5,
+        })];
+        let mut scope = Scope::new();
+        let mut warnings = vec![];
+        let err = evaluate(&nodes, &mut scope, &mut warnings)
+            .expect_err("upper() with 2 args should fail");
+
+        match err {
+            crate::error::MdsError::ArityMismatch { span, .. } => {
+                assert!(
+                    span.is_none(),
+                    "evaluator builtin arity error must carry no span, got {span:?}"
+                );
+            }
+            other => panic!("expected ArityMismatch, got {other:?}"),
+        }
+    }
+
+    // ── @for parity tests (#88) ────────────────────────────────────────────────
+    //
+    // Each invariant is verified in BOTH text mode (compile_str) and messages
+    // mode (compile_messages_str) to confirm the shared driver preserves
+    // identical semantics in both paths.
+
+    #[test]
+    fn for_array_loop_text_mode() {
+        let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n{item}\n@end\n";
+        let result = crate::compile_str(src).unwrap();
+        assert!(result.contains("alpha"), "text: alpha missing");
+        assert!(result.contains("beta"), "text: beta missing");
+    }
+
+    #[test]
+    fn for_array_loop_messages_mode() {
+        // Each @message is emitted once per iteration.
+        let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n@message user:\n{item}\n@end\n@end\n";
+        let output = crate::compile_messages_str(src).unwrap();
+        assert_eq!(
+            output.messages.len(),
+            2,
+            "messages mode: expected 2 messages, got {}",
+            output.messages.len()
+        );
+        assert_eq!(output.messages[0].content, "alpha");
+        assert_eq!(output.messages[1].content, "beta");
+    }
+
+    #[test]
+    fn for_key_value_alpha_sort_text_mode() {
+        // Object keys must appear in alphabetical order regardless of insertion order.
+        // Use a run-time vars injection so keys don't appear in the source/frontmatter
+        // and we only find them in the loop body output.
+        let src = "@for k, v in obj:\n{k}\n@end\n";
+        use std::collections::HashMap;
+        let obj = crate::value::Value::Object(HashMap::from([
+            ("zebra".to_string(), crate::value::Value::Number(1.0)),
+            ("apple".to_string(), crate::value::Value::Number(2.0)),
+            ("mango".to_string(), crate::value::Value::Number(3.0)),
+        ]));
+        let vars: HashMap<String, crate::value::Value> = HashMap::from([("obj".to_string(), obj)]);
+        let result = crate::compile_str_with(src, None, Some(vars)).unwrap();
+        let positions = ["apple", "mango", "zebra"].map(|k| {
+            result
+                .find(k)
+                .unwrap_or_else(|| panic!("text: key '{k}' missing from output; got: {result:?}"))
+        });
+        assert!(
+            positions[0] < positions[1] && positions[1] < positions[2],
+            "text: expected alphabetical order apple < mango < zebra, got positions {positions:?}"
+        );
+    }
+
+    #[test]
+    fn for_key_value_alpha_sort_messages_mode() {
+        // Same alpha-sort requirement applies in messages mode.
+        let src = "---\nobj:\n  zebra: 1\n  apple: 2\n  mango: 3\n---\n@for k, v in obj:\n@message user:\n{k}\n@end\n@end\n";
+        let output = crate::compile_messages_str(src).unwrap();
+        assert_eq!(
+            output.messages.len(),
+            3,
+            "messages mode: expected 3 messages"
+        );
+        let keys: Vec<&str> = output.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["apple", "mango", "zebra"],
+            "messages mode: keys not in alphabetical order"
+        );
+    }
+
+    #[test]
+    fn for_max_loop_iterations_text_mode() {
+        // An array larger than MAX_LOOP_ITERATIONS must error in text mode.
+        let items: Vec<String> = (0..=MAX_LOOP_ITERATIONS)
+            .map(|i| format!("  - {i}"))
+            .collect();
+        let src = format!(
+            "---\nitems:\n{}\n---\n@for item in items:\n{{item}}\n@end\n",
+            items.join("\n")
+        );
+        let err = crate::compile_str(&src).expect_err("should error on oversized array");
+        assert!(
+            format!("{err}").contains("exceeding maximum loop iteration limit"),
+            "text: expected resource_limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn for_max_loop_iterations_messages_mode() {
+        // Same limit fires identically in messages mode.
+        let items: Vec<String> = (0..=MAX_LOOP_ITERATIONS)
+            .map(|i| format!("  - {i}"))
+            .collect();
+        let src = format!(
+            "---\nitems:\n{}\n---\n@for item in items:\n@message user:\n{{item}}\n@end\n@end\n",
+            items.join("\n")
+        );
+        let err = crate::compile_messages_str(&src).expect_err("should error on oversized array");
+        assert!(
+            format!("{err}").contains("exceeding maximum loop iteration limit"),
+            "messages: expected resource_limit error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn for_max_total_iterations_nested_text_mode() {
+        // Nested loops that multiply iterations past MAX_TOTAL_ITERATIONS must error.
+        // Use a moderately large outer × inner that stays below per-loop cap but
+        // exceeds cumulative cap.  MAX_TOTAL_ITERATIONS = 1_000_000, MAX_LOOP_ITERATIONS = 100_000.
+        // outer=1001, inner=1000 → 1_001_000 total iterations > 1_000_000.
+        let outer: Vec<String> = (0..1001usize).map(|i| format!("  - {i}")).collect();
+        let inner: Vec<String> = (0..1000usize).map(|i| format!("  - {i}")).collect();
+        let src = format!(
+            "---\nouter:\n{}\ninner:\n{}\n---\n@for o in outer:\n@for i in inner:\n{{o}}{{i}}\n@end\n@end\n",
+            outer.join("\n"),
+            inner.join("\n")
+        );
+        let err = crate::compile_str(&src).expect_err("should error on cumulative limit");
+        assert!(
+            format!("{err}").contains("total loop iterations exceeded maximum"),
+            "text: expected total-iterations error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn for_max_total_iterations_nested_messages_mode() {
+        // Identical nested-loop scenario fires the same cumulative cap in messages mode.
+        // The inner loop body contains no @message (just orphan text that is warned/ignored),
+        // so MAX_MESSAGE_COUNT (10_000) cannot fire before MAX_TOTAL_ITERATIONS (1_000_000).
+        // outer=1001, inner=1000 → 1_001_000 total iterations > MAX_TOTAL_ITERATIONS.
+        // Messages produced = 0 from the inner loop, 0 from the outer (orphan text only).
+        // compile_messages_str requires at least one @message, so we put one before the loops.
+        let outer: Vec<String> = (0..1001usize).map(|i| format!("  - {i}")).collect();
+        let inner: Vec<String> = (0..1000usize).map(|i| format!("  - {i}")).collect();
+        let src = format!(
+            "---\nouter:\n{outer}\ninner:\n{inner}\n---\n@message system:\nsetup\n@end\n@for o in outer:\n@for i in inner:\norphan\n@end\n@end\n",
+            outer = outer.join("\n"),
+            inner = inner.join("\n")
+        );
+        let err = crate::compile_messages_str(&src).expect_err("should error on cumulative limit");
+        assert!(
+            format!("{err}").contains("total loop iterations exceeded maximum"),
+            "messages: expected total-iterations error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn for_empty_iterable_text_mode() {
+        // An empty array produces empty output (just frontmatter passthrough), no error.
+        // Use a sentinel body string that cannot appear in the frontmatter.
+        let src = "---\nitems: []\n---\n@for item in items:\nSENTINEL_BODY\n@end\n";
+        let result = crate::compile_str(src).unwrap();
+        assert!(
+            !result.contains("SENTINEL_BODY"),
+            "text: empty iterable should produce no loop-body output, got: {result}"
+        );
+    }
+
+    #[test]
+    fn for_empty_iterable_messages_mode() {
+        // An empty array in messages mode produces zero messages, no error.
+        let src = "---\nitems: []\n---\n@for item in items:\n@message user:\n{item}\n@end\n@end\n";
+        let output = crate::compile_messages_str(src).unwrap();
+        assert_eq!(
+            output.messages.len(),
+            0,
+            "messages: empty iterable should produce 0 messages"
+        );
+    }
+
+    #[test]
+    fn for_loop_var_shadows_outer_var_text_mode() {
+        // A loop variable with the same name as an outer variable shadows it
+        // for the duration of the loop body, then the outer value is restored.
+        let src = "---\nitem: outer\nitems:\n  - inner\n---\nbefore:{item}\n@for item in items:\nduring:{item}\n@end\nafter:{item}\n";
+        let result = crate::compile_str(src).unwrap();
+        assert!(
+            result.contains("before:outer"),
+            "text: outer var should be 'outer' before loop, got: {result}"
+        );
+        assert!(
+            result.contains("during:inner"),
+            "text: loop var should shadow with 'inner' inside loop, got: {result}"
+        );
+        assert!(
+            result.contains("after:outer"),
+            "text: outer var should be restored after loop, got: {result}"
+        );
+    }
+
+    #[test]
+    fn for_loop_var_shadows_outer_var_messages_mode() {
+        // Same shadowing behaviour in messages mode.
+        let src = "---\nitem: outer\nitems:\n  - inner\n---\n@message system:\nbefore:{item}\n@end\n@for item in items:\n@message user:\nduring:{item}\n@end\n@end\n@message system:\nafter:{item}\n@end\n";
+        let output = crate::compile_messages_str(src).unwrap();
+        assert_eq!(output.messages.len(), 3, "expected 3 messages");
+        assert_eq!(
+            output.messages[0].content, "before:outer",
+            "messages: outer var before loop"
+        );
+        assert_eq!(
+            output.messages[1].content, "during:inner",
+            "messages: shadow var inside loop"
+        );
+        assert_eq!(
+            output.messages[2].content, "after:outer",
+            "messages: outer var restored after loop"
+        );
+    }
+
+    #[test]
+    fn for_messages_mode_max_message_count_enforced() {
+        // MAX_MESSAGE_COUNT fires in messages mode when a loop generates too many messages.
+        // 10_001 messages > MAX_MESSAGE_COUNT (10_000).
+        let items: Vec<String> = (0..10_001usize).map(|i| format!("  - msg{i}")).collect();
+        let src = format!(
+            "---\nitems:\n{}\n---\n@for item in items:\n@message user:\n{{item}}\n@end\n@end\n",
+            items.join("\n")
+        );
+        let err = crate::compile_messages_str(&src).expect_err("should error on message count");
+        assert!(
+            format!("{err}").contains("message count exceeded maximum"),
+            "expected MAX_MESSAGE_COUNT error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn for_messages_mode_total_size_enforced() {
+        // MAX_MESSAGES_TOTAL_SIZE = MAX_OUTPUT_SIZE = 50 MiB = 52_428_800 bytes.
+        // 1_000 messages × 52_429 bytes each = 52_429_000 > 52_428_800 → fires.
+        // Each individual body (52_429 bytes) is well below the per-body cap (50 MiB).
+        let body = "x".repeat(52_429);
+        let items: Vec<String> = (0..1_000usize).map(|i| format!("  - item{i}")).collect();
+        let src = format!(
+            "---\nitems:\n{items}\n---\n@for item in items:\n@message user:\n{body}\n@end\n@end\n",
+            items = items.join("\n"),
+            body = body
+        );
+        let err = crate::compile_messages_str(&src).expect_err("should error on total size");
+        assert!(
+            format!("{err}").contains("total message content exceeds maximum cumulative size"),
+            "expected MAX_MESSAGES_TOTAL_SIZE error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn for_object_in_array_mode_errors() {
+        // Iterating an object with array syntax (@for x in obj:) must error in both modes.
+        // The validator fires first with a static-analysis hint; the evaluator would fire
+        // at runtime. Either way, the error message tells users to use key-value syntax.
+        let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n{x}\n@end\n";
+        let err = crate::compile_str(src).expect_err("object in array syntax should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("key, value") || msg.contains("key-value"),
+            "text: wrong error for object-in-array syntax: {err}"
+        );
+    }
+
+    #[test]
+    fn for_object_in_array_mode_errors_messages() {
+        let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n@message user:\n{x}\n@end\n@end\n";
+        let err =
+            crate::compile_messages_str(src).expect_err("object in array syntax should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("key, value") || msg.contains("key-value"),
+            "messages: wrong error for object-in-array syntax: {err}"
+        );
     }
 }

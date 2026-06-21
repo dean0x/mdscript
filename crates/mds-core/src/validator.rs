@@ -1,3 +1,4 @@
+use crate::arity::check_arity;
 use crate::ast::{
     required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock, MessageBlock, Node,
 };
@@ -272,14 +273,14 @@ fn validate_call_arity(
     if let Some(func) = scope.get_function(name) {
         let required = required_param_count(&func.params);
         let total = func.params.len();
-        if arg_count < required || arg_count > total {
+        if !check_arity(arg_count, required, total) {
             return Err(MdsError::arity_at(
                 name, required, total, arg_count, file, source, offset, len,
             ));
         }
         Ok(())
     } else if let Some(meta) = crate::builtins::get_builtin(name) {
-        if arg_count < meta.min_args || arg_count > meta.max_args {
+        if !check_arity(arg_count, meta.min_args, meta.max_args) {
             return Err(MdsError::arity_at(
                 name,
                 meta.min_args,
@@ -339,7 +340,7 @@ fn validate_expr(
                 .ok_or_else(|| MdsError::undefined_fn_at(&qualified, file, source, offset, len))?;
             let required = required_param_count(&func.params);
             let total = func.params.len();
-            if args.len() < required || args.len() > total {
+            if !check_arity(args.len(), required, total) {
                 return Err(MdsError::arity_at(
                     &qualified,
                     required,
@@ -547,5 +548,32 @@ mod tests {
             result.is_ok(),
             "param reference inside @define must pass: {result:?}"
         );
+    }
+
+    // ── Arity span-divergence test (#71) ──────────────────────────────────────
+    //
+    // Validator arity errors MUST carry a span (they have source text available).
+    // This pins the intentional divergence from the evaluator path.
+
+    #[test]
+    fn arity_error_validator_has_span() {
+        // upper() requires exactly 1 arg; call it with 0 → arity error from the validator.
+        // Provide non-empty source so the span can be computed from the offset.
+        let node = call_node("upper", vec![]);
+        let mut scope = Scope::new();
+        // Pass a non-empty source string so the validator can compute a real span.
+        let source = "{upper()}";
+        let err = validate(&[node], &mut scope, "test.mds", source)
+            .expect_err("upper() with 0 args must fail");
+
+        match err {
+            crate::error::MdsError::ArityMismatch { span, .. } => {
+                assert!(
+                    span.is_some(),
+                    "validator arity error must carry a span, got None"
+                );
+            }
+            other => panic!("expected ArityMismatch, got {other:?}"),
+        }
     }
 }

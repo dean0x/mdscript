@@ -37,6 +37,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub(crate) mod arity;
 pub(crate) mod ast;
 pub(crate) mod builtins;
 pub(crate) mod error;
