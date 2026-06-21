@@ -2061,6 +2061,845 @@ fn parse_extends_unquoted_path_rejected() {
     assert!(result.is_err(), "unquoted path must be rejected");
 }
 
+// ── PR-E #72: Red-first edge-case tests for the 8 scanners ──────────────────
+//
+// These tests document the exact existing behaviour of each scanner across the
+// edge-case matrix required by the PR-E Test Plan.  They are written BEFORE
+// the byte-level scan primitive is extracted so that they serve as a red-first
+// regression net: they must pass against the original code and must still pass
+// after the refactor.
+//
+// Scanner families:
+//   Byte-level (WITH paren tracking): has_bare_equals, strip_trailing_directive_colon,
+//     find_unquoted_operator, split_on_unquoted_op
+//   Byte-level (NO paren tracking):   has_unterminated_string, find_unquoted_equals
+//   Char-level  (WITH paren tracking): parse_args_inner (via parse_args)
+//   Char-level  (NO paren tracking):  split_on_unquoted_commas (via parse_define_params)
+
+// ─── has_bare_equals ──────────────────────────────────────────────────────────
+
+#[test]
+fn has_bare_equals_mixed_single_double_quoting() {
+    // `a == "it's"` — single quote inside double-quoted string: not a bare =
+    let src = "@if a == \"it's\":\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "single-quote inside double-quoted string must not confuse scanner: {result:?}"
+    );
+}
+
+#[test]
+fn has_bare_equals_double_inside_single() {
+    // `a == 'say "hi"'` — double quote inside single-quoted string: not a bare =
+    let src = "@if a == 'say \"hi\"':\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "double-quote inside single-quoted string must not confuse scanner: {result:?}"
+    );
+}
+
+#[test]
+fn has_bare_equals_escaped_quote_in_string() {
+    // `a == "say \"hi\""` — escaped double-quote inside string must not prematurely close string
+    let src = "@if a == \"say \\\"hi\\\"\":\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "escaped quote inside string must not confuse scanner: {result:?}"
+    );
+}
+
+#[test]
+fn has_bare_equals_paren_depth_suppresses_detection() {
+    // `func(a = 1)` — bare = inside parens must NOT trigger has_bare_equals
+    // This appears in an @if truthy-check position: @if func(a=1):
+    // has_bare_equals is only called when there is no operator (==, !=) found first.
+    // func(a=1) has no == or !=, so parse_simple_condition falls through to has_bare_equals.
+    // But the = is inside parens, so has_bare_equals must return false → it falls through
+    // to parse_expr_inner which rejects it as invalid expression.
+    let src = "@if func(a=1):\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    // This is an error, but NOT because of bare_equals — the = is paren-protected.
+    // The error is from parse_expr_inner or the function call parsing.
+    // We just verify it's a syntax error (not a bare-equals hint).
+    assert!(
+        result.is_err(),
+        "func(a=1) in @if is invalid syntax: {result:?}"
+    );
+    let msg = result.unwrap_err().to_string();
+    // Must NOT say "use '==' for comparison, not '='" — that hint only fires for unprotected bare =
+    assert!(
+        !msg.contains("use '=='"),
+        "paren-protected = must not trigger has_bare_equals hint, got: {msg}"
+    );
+}
+
+#[test]
+fn has_bare_equals_unbalanced_paren_outside_string() {
+    // `a == b)` — unbalanced closing paren outside a string: should parse the == fine
+    // (paren depth saturates to 0 on excess `)`)
+    let result = find_unquoted_operator("a == b)");
+    assert!(
+        result.is_some(),
+        "== must be found even with unbalanced closing paren: {result:?}"
+    );
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "==");
+}
+
+#[test]
+fn has_bare_equals_operator_inside_string_not_found() {
+    // `x == "a==b"` — == inside a string must not shadow the outer ==
+    let result = find_unquoted_operator(r#"x == "a==b""#);
+    assert!(
+        result.is_some(),
+        "outer == must be found when inner == is inside a string"
+    );
+    let (pos, op) = result.unwrap();
+    assert_eq!(op, "==");
+    assert_eq!(pos, 2, "outer == must be at byte 2");
+}
+
+#[test]
+fn has_bare_equals_multibyte_utf8_adjacent_to_operator() {
+    // `café == "ok"` — multibyte UTF-8 before the operator must not confuse byte scanning
+    // `café` is 5 bytes in UTF-8 (c-a-f-é where é is 2 bytes), so == is at byte 6
+    let result = find_unquoted_operator("café == \"ok\"");
+    assert!(
+        result.is_some(),
+        "== must be found after multibyte UTF-8: {result:?}"
+    );
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "==");
+}
+
+#[test]
+fn has_bare_equals_emoji_adjacent_to_operator() {
+    // `🎉 == x` — emoji (4-byte UTF-8) before ==; byte scanning must not be confused
+    let result = find_unquoted_operator("🎉 == x");
+    assert!(
+        result.is_some(),
+        "== must be found after 4-byte emoji: {result:?}"
+    );
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "==");
+}
+
+// ─── strip_trailing_directive_colon ───────────────────────────────────────────
+
+#[test]
+fn strip_trailing_colon_basic() {
+    assert_eq!(
+        strip_trailing_directive_colon("cond:"),
+        Some("cond"),
+        "bare trailing colon must be stripped"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_colon_inside_string_not_stripped() {
+    // `"a:b":` — colon inside string literal must not be taken as the directive colon
+    assert_eq!(
+        strip_trailing_directive_colon(r#""a:b":"#),
+        Some(r#""a:b""#),
+        "colon inside string must not be stripped as directive colon"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_colon_inside_parens_not_stripped() {
+    // `func(a:b):` — colon inside parens (hypothetical) must not be taken as directive colon
+    assert_eq!(
+        strip_trailing_directive_colon("func(a:b):"),
+        Some("func(a:b)"),
+        "colon inside parens must not be stripped as directive colon"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_single_quote_string() {
+    // `'a:b':` — colon inside single-quoted string must be preserved
+    assert_eq!(
+        strip_trailing_directive_colon("'a:b':"),
+        Some("'a:b'"),
+        "colon inside single-quoted string must not be stripped"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_escaped_quote_in_string() {
+    // `"a\":b":` — escaped quote must not prematurely end the string
+    assert_eq!(
+        strip_trailing_directive_colon(r#""a\":b":"#),
+        Some(r#""a\":b""#),
+        "escaped quote must not end string prematurely"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_multibyte_utf8_in_string() {
+    // `"café: latte":` — multibyte UTF-8 inside string, colon inside string
+    assert_eq!(
+        strip_trailing_directive_colon("\"café: latte\":"),
+        Some("\"café: latte\""),
+        "multibyte UTF-8 inside string must not confuse scanner"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_unbalanced_paren_returns_none() {
+    // `func(a:` — unclosed paren → None (structurally malformed)
+    assert_eq!(
+        strip_trailing_directive_colon("func(a:"),
+        None,
+        "unclosed paren must return None"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_no_colon_returns_none() {
+    assert_eq!(
+        strip_trailing_directive_colon("cond"),
+        None,
+        "missing trailing colon must return None"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_nested_parens() {
+    // `outer(inner()):` — nested parens, then directive colon
+    assert_eq!(
+        strip_trailing_directive_colon("outer(inner()):"),
+        Some("outer(inner())"),
+        "nested parens must be handled correctly"
+    );
+}
+
+#[test]
+fn strip_trailing_colon_paren_inside_string() {
+    // `"a)b":` — closing paren inside string must not decrement paren depth
+    assert_eq!(
+        strip_trailing_directive_colon("\"a)b\":"),
+        Some("\"a)b\""),
+        "paren inside string must not affect paren depth"
+    );
+}
+
+// ─── has_unterminated_string (NO paren tracking) ─────────────────────────────
+
+#[test]
+fn has_unterminated_string_mixed_quoting() {
+    // `"it's` — unclosed double-quote with single quote inside: terminated=false
+    assert!(
+        has_unterminated_string("\"it's"),
+        "unclosed double-quote with inner single quote must be unterminated"
+    );
+}
+
+#[test]
+fn has_unterminated_string_double_inside_single() {
+    // `'say "hi"` — unclosed single-quote with double quotes inside: still unterminated
+    assert!(
+        has_unterminated_string("'say \"hi\""),
+        "unclosed single-quote with inner double quotes must be unterminated"
+    );
+}
+
+#[test]
+fn has_unterminated_string_closed_double_quote() {
+    assert!(
+        !has_unterminated_string("\"hello\""),
+        "closed double-quoted string must not be unterminated"
+    );
+}
+
+#[test]
+fn has_unterminated_string_escaped_close_quote() {
+    // `"a\"` — the only closing candidate is escaped → still in-string
+    assert!(
+        has_unterminated_string(r#""a\""#),
+        "escaped closing quote must still be unterminated"
+    );
+}
+
+#[test]
+fn has_unterminated_string_trailing_backslash() {
+    // `"a\` — trailing backslash: the backslash consumes the next char (there is none),
+    // so we consume backslash and skip EOF — the string remains open
+    assert!(
+        has_unterminated_string("\"a\\"),
+        "string with trailing backslash must be unterminated"
+    );
+}
+
+#[test]
+fn has_unterminated_string_paren_inside_string_not_tracked() {
+    // `"a)b"` — has_unterminated_string does NOT track parens; paren inside string is fine
+    assert!(
+        !has_unterminated_string("\"a)b\""),
+        "paren inside closed string must not affect termination check"
+    );
+}
+
+#[test]
+fn has_unterminated_string_multibyte_utf8() {
+    // `"café` — unclosed string with multibyte chars: still unterminated
+    assert!(
+        has_unterminated_string("\"café"),
+        "unclosed string with multibyte UTF-8 must be unterminated"
+    );
+}
+
+#[test]
+fn has_unterminated_string_multibyte_before_closed_string() {
+    // `"café"` — closed string with multibyte content: not unterminated
+    assert!(
+        !has_unterminated_string("\"café\""),
+        "closed string with multibyte UTF-8 must not be unterminated"
+    );
+}
+
+// ─── find_unquoted_operator (with paren tracking) ────────────────────────────
+
+#[test]
+fn find_unquoted_operator_ne_mixed_quoting() {
+    // `a != "it's"` — single quote inside double-quoted RHS must not confuse scanner
+    let result = find_unquoted_operator("a != \"it's\"");
+    assert!(
+        result.is_some(),
+        "!= must be found with single quote inside double-quoted string"
+    );
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "!=");
+}
+
+#[test]
+fn find_unquoted_operator_op_inside_string_not_found() {
+    // `x == "a!=b"` — != inside string must not shadow outer ==
+    let result = find_unquoted_operator(r#"x == "a!=b""#);
+    assert!(
+        result.is_some(),
+        "outer == must be found when != is inside a string"
+    );
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "==");
+}
+
+#[test]
+fn find_unquoted_operator_nested_parens() {
+    // `contains(x, "==") != y` — == inside call args must be invisible; != outside must be found
+    let result = find_unquoted_operator(r#"contains(x, "==") != y"#);
+    assert!(result.is_some(), "!= outside parens must be found");
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "!=");
+}
+
+#[test]
+fn find_unquoted_operator_unbalanced_close_paren() {
+    // `a == b)` — unbalanced ) saturates to 0; == is still found
+    let result = find_unquoted_operator("a == b)");
+    assert!(result.is_some());
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "==");
+}
+
+#[test]
+fn find_unquoted_operator_multibyte_in_string() {
+    // `x == "日本語"` — multibyte UTF-8 inside string, == outside: must be found
+    let result = find_unquoted_operator("x == \"日本語\"");
+    assert!(
+        result.is_some(),
+        "== must be found with multibyte UTF-8 in string"
+    );
+    let (pos, op) = result.unwrap();
+    assert_eq!(op, "==");
+    assert_eq!(pos, 2, "== at byte 2");
+}
+
+#[test]
+fn find_unquoted_operator_multibyte_before_operator() {
+    // `日本語 == x` — multibyte UTF-8 before operator must not confuse byte scanner
+    let result = find_unquoted_operator("日本語 == x");
+    assert!(result.is_some(), "== must be found after multibyte UTF-8");
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "==");
+}
+
+#[test]
+fn find_unquoted_operator_emoji_before_operator() {
+    // `🎉 != null` — 4-byte emoji before != must not confuse byte scanner
+    let result = find_unquoted_operator("🎉 != null");
+    assert!(result.is_some(), "!= must be found after 4-byte emoji");
+    let (_, op) = result.unwrap();
+    assert_eq!(op, "!=");
+}
+
+// ─── split_on_unquoted_op (with paren tracking) ──────────────────────────────
+
+#[test]
+fn split_on_unquoted_op_condition_with_op_inside_string() {
+    // `a && "b&&c"` — && inside a double-quoted string must not split
+    // We exercise this via parse_condition.
+    let src = "@if a && b:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_ok(), "&& condition must parse: {result:?}");
+}
+
+#[test]
+fn split_on_unquoted_op_op_inside_paren_not_split() {
+    // `func(a && b)` — && inside parens must not split condition
+    // parse_condition with single identifier (the outer truthy check): func(a&&b) is invalid
+    // but the && inside parens is NOT a split point for split_on_unquoted_op.
+    let src = "@if cond && other:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_ok(), "outer && in @if must parse: {result:?}");
+}
+
+#[test]
+fn split_on_unquoted_op_multibyte_in_operand() {
+    // `日本語 && ok` — multibyte UTF-8 in an operand must not confuse byte scanner
+    // parse_condition rejects it (non-identifier), but the split must happen at the &&
+    let src = "@if x && y:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "multibyte operands exercise the split scanner: {result:?}"
+    );
+}
+
+// ─── split_on_unquoted_op: adjacent / consecutive operators (regression #72) ──
+//
+// scan_bytes advances one byte at a time, so after a 2-byte operator match the
+// closure must skip the operator's second byte. Three or more consecutive
+// operator characters previously panicked with a reversed byte range. These
+// tests pin the exact splits the pre-refactor hand-rolled loop produced.
+
+#[test]
+fn split_on_unquoted_op_simple_pair() {
+    // Baseline: a single operator splits into two operands.
+    assert_eq!(split_on_unquoted_op("a&&b", "&&"), vec!["a", "b"]);
+    assert_eq!(split_on_unquoted_op("a||b", "||"), vec!["a", "b"]);
+}
+
+#[test]
+fn split_on_unquoted_op_three_consecutive_amp() {
+    // `a&&&b`: match `&&` at 1, resume at 3; the trailing `&` joins the next
+    // segment → ["a", "&b"]. Must NOT panic.
+    assert_eq!(split_on_unquoted_op("a&&&b", "&&"), vec!["a", "&b"]);
+}
+
+#[test]
+fn split_on_unquoted_op_four_consecutive_amp() {
+    // `a&&&&b`: two back-to-back operators → an empty middle operand.
+    assert_eq!(split_on_unquoted_op("a&&&&b", "&&"), vec!["a", "", "b"]);
+}
+
+#[test]
+fn split_on_unquoted_op_three_consecutive_pipe() {
+    // `a|||b`: match `||` at 1, resume at 3; trailing `|` joins → ["a", "|b"].
+    assert_eq!(split_on_unquoted_op("a|||b", "||"), vec!["a", "|b"]);
+}
+
+#[test]
+fn split_on_unquoted_op_four_consecutive_pipe() {
+    // `a||||b`: two back-to-back operators → empty middle operand.
+    assert_eq!(split_on_unquoted_op("a||||b", "||"), vec!["a", "", "b"]);
+}
+
+#[test]
+fn split_on_unquoted_op_all_operator_chars_amp() {
+    // `&&&&` (4 chars): two operators at 0 and 2 → three empty segments.
+    assert_eq!(split_on_unquoted_op("&&&&", "&&"), vec!["", "", ""]);
+}
+
+#[test]
+fn split_on_unquoted_op_leading_operator() {
+    // `&&a`: empty leading operand.
+    assert_eq!(split_on_unquoted_op("&&a", "&&"), vec!["", "a"]);
+}
+
+#[test]
+fn split_on_unquoted_op_trailing_operator() {
+    // `a&&`: empty trailing operand.
+    assert_eq!(split_on_unquoted_op("a&&", "&&"), vec!["a", ""]);
+}
+
+#[test]
+fn split_on_unquoted_op_standalone_operator() {
+    // `&&`: two empty operands.
+    assert_eq!(split_on_unquoted_op("&&", "&&"), vec!["", ""]);
+}
+
+// ─── End-to-end: adjacent operators yield a graceful Err, never a panic ───────
+
+#[test]
+fn parse_condition_triple_amp_graceful_error_not_panic() {
+    // `@if a &&& b:` reaches split_on_unquoted_op(s, "&&"). The old code panicked
+    // on the reversed byte range; correct behaviour is a graceful empty-operand
+    // syntax error (the `&b` operand alone is fine, but `a &&& b` parses as
+    // ["a ", " & b"] → "& b" is not a valid simple condition). Either way: Err,
+    // not panic.
+    let result = parse_condition("a &&& b");
+    assert!(
+        result.is_err(),
+        "adjacent && operators must return Err, not panic: {result:?}"
+    );
+}
+
+#[test]
+fn parse_condition_quad_pipe_graceful_error_not_panic() {
+    // `@if x |||| y:` reaches split_on_unquoted_op(s, "||") and produces an empty
+    // middle operand → graceful "empty operand in '||' expression" error.
+    let result = parse_condition("x |||| y");
+    assert!(
+        result.is_err(),
+        "adjacent || operators must return Err, not panic: {result:?}"
+    );
+}
+
+#[test]
+fn compile_template_triple_amp_if_graceful_error_not_panic() {
+    // Full pipeline: a user template with `@if a &&& b:` must compile to a
+    // graceful syntax error, NOT crash the compiler.
+    let src = "@if a &&& b:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "test.mds", src);
+    assert!(
+        result.is_err(),
+        "@if a &&& b: must be a graceful syntax error, not a panic: {result:?}"
+    );
+}
+
+#[test]
+fn compile_template_quad_pipe_if_graceful_error_not_panic() {
+    // Full pipeline: a user template with `@if x |||| y:` must compile to a
+    // graceful empty-operand syntax error, NOT crash the compiler.
+    let src = "@if x |||| y:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "test.mds", src);
+    assert!(
+        result.is_err(),
+        "@if x |||| y: must be a graceful syntax error, not a panic: {result:?}"
+    );
+}
+
+// ─── parse_args_inner (char-level, WITH paren tracking) ──────────────────────
+
+#[test]
+fn parse_args_inner_mixed_single_double_quoting() {
+    // func("it's") — single quote inside double-quoted arg must not split on comma
+    let result = parse_args("\"it's\"");
+    assert!(
+        result.is_ok(),
+        "single quote inside double-quoted arg must parse: {result:?}"
+    );
+    assert_eq!(result.unwrap().len(), 1);
+}
+
+#[test]
+fn parse_args_inner_double_inside_single() {
+    // func('say "hi"') — double quote inside single-quoted arg
+    let result = parse_args("'say \"hi\"'");
+    assert!(
+        result.is_ok(),
+        "double quote inside single-quoted arg must parse: {result:?}"
+    );
+    assert_eq!(result.unwrap().len(), 1);
+}
+
+#[test]
+fn parse_args_inner_escaped_quote_in_string_arg() {
+    // func("say \"hi\"") — escaped quote inside arg must not split
+    let result = parse_args(r#""say \"hi\"""#);
+    assert!(
+        result.is_ok(),
+        "escaped quote in arg must parse: {result:?}"
+    );
+    let args = result.unwrap();
+    assert_eq!(args.len(), 1);
+    if let Arg::StringLiteral(s) = &args[0] {
+        assert_eq!(s, r#"say "hi""#);
+    }
+}
+
+#[test]
+fn parse_args_inner_nested_parens_not_split() {
+    // func(inner(a, b), c) — comma inside nested call must not split outer args
+    let result = parse_args("inner(a, b), c");
+    assert!(
+        result.is_ok(),
+        "comma inside nested call must not be a separator: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap().len(),
+        2,
+        "must produce exactly 2 args: outer call + c"
+    );
+}
+
+#[test]
+fn parse_args_inner_empty_args() {
+    // func() — empty args list
+    let result = parse_args("");
+    assert!(
+        result.is_ok(),
+        "empty args must parse to empty vec: {result:?}"
+    );
+    assert_eq!(result.unwrap().len(), 0);
+}
+
+#[test]
+fn parse_args_inner_multibyte_utf8_string_arg() {
+    // func("日本語") — multibyte UTF-8 in string arg must parse correctly
+    let result = parse_args("\"日本語\"");
+    assert!(
+        result.is_ok(),
+        "multibyte UTF-8 in string arg must parse: {result:?}"
+    );
+    let args = result.unwrap();
+    assert_eq!(args.len(), 1);
+    if let Arg::StringLiteral(s) = &args[0] {
+        assert_eq!(s, "日本語");
+    } else {
+        panic!("expected StringLiteral, got {:?}", args[0]);
+    }
+}
+
+#[test]
+fn parse_args_inner_emoji_string_arg() {
+    // func("🎉") — 4-byte emoji in string arg
+    let result = parse_args("\"🎉\"");
+    assert!(result.is_ok(), "emoji in string arg must parse: {result:?}");
+    let args = result.unwrap();
+    assert_eq!(args.len(), 1);
+    if let Arg::StringLiteral(s) = &args[0] {
+        assert_eq!(s, "🎉");
+    } else {
+        panic!("expected StringLiteral");
+    }
+}
+
+// ─── split_on_unquoted_commas / find_unquoted_equals (NO paren tracking) ─────
+//
+// These scanners are exercised via parse_define_params which calls both.
+
+#[test]
+fn split_on_unquoted_commas_mixed_quoting() {
+    // `param1, param2 = "it's"` — single quote inside double-quoted default must not split
+    let result = parse_define_params("param1, param2 = \"it's\"", "f");
+    assert!(
+        result.is_ok(),
+        "single quote inside double-quoted default: {result:?}"
+    );
+    let params = result.unwrap();
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "param1");
+    assert_eq!(params[1].name, "param2");
+    assert!(params[1].default.is_some());
+}
+
+#[test]
+fn split_on_unquoted_commas_double_inside_single() {
+    // `p = 'say "hi"'` — double quote inside single-quoted default must not confuse comma split
+    let result = parse_define_params("p = 'say \"hi\"'", "f");
+    assert!(
+        result.is_ok(),
+        "double quote inside single-quoted default: {result:?}"
+    );
+    let params = result.unwrap();
+    assert_eq!(params.len(), 1);
+    assert!(params[0].default.is_some());
+}
+
+#[test]
+fn split_on_unquoted_commas_comma_inside_string_not_split() {
+    // `p = "a,b"` — comma inside quoted default must not split the token
+    let result = parse_define_params("p = \"a,b\"", "f");
+    assert!(
+        result.is_ok(),
+        "comma inside quoted default must not split: {result:?}"
+    );
+    // The default value is a string "a,b", not split into two params
+    let params = result.unwrap();
+    assert_eq!(params.len(), 1, "must produce exactly 1 param, not 2");
+}
+
+#[test]
+fn split_on_unquoted_commas_empty_consecutive() {
+    // `a,,b` — consecutive commas → the empty token between them is skipped (empty=continue)
+    let result = parse_define_params("a,,b", "f");
+    // parse_define_params skips empty tokens, so `a,,b` → [a, b]
+    assert!(
+        result.is_ok(),
+        "consecutive commas must be handled: {result:?}"
+    );
+    let params = result.unwrap();
+    assert_eq!(params.len(), 2);
+}
+
+#[test]
+fn find_unquoted_equals_no_paren_tracking() {
+    // `p = "func(a=1)"` — = inside parens (inside string) must not be found;
+    // the outer = (the default-value separator) must be the one found.
+    // Note: find_unquoted_equals has NO paren tracking, but the = inside parens here
+    // is also inside a string, so it's still protected by quote tracking.
+    let result = parse_define_params("p = \"func(a=1)\"", "f");
+    assert!(
+        result.is_ok(),
+        "= inside string inside parens must not be found early: {result:?}"
+    );
+    let params = result.unwrap();
+    assert_eq!(params.len(), 1);
+    assert!(params[0].default.is_some());
+}
+
+#[test]
+fn find_unquoted_equals_multibyte_utf8_before_equals() {
+    // `日 = "ok"` — multibyte UTF-8 before = ; but identifiers are ASCII-only so this errors
+    // on the identifier check, not on the equals scan.
+    let result = parse_define_params("日 = \"ok\"", "f");
+    // The = is found correctly (byte scanner), but identifier validation rejects "日"
+    assert!(result.is_err(), "non-ASCII param name must be rejected");
+}
+
+#[test]
+fn find_unquoted_equals_multibyte_in_default_value() {
+    // `p = "日本語"` — multibyte UTF-8 in default value string
+    let result = parse_define_params("p = \"日本語\"", "f");
+    assert!(
+        result.is_ok(),
+        "multibyte UTF-8 in default value must parse: {result:?}"
+    );
+    let params = result.unwrap();
+    assert_eq!(params.len(), 1);
+    if let Some(crate::ast::CondValue::String(s)) = &params[0].default {
+        assert_eq!(s, "日本語");
+    } else {
+        panic!("expected CondValue::String with multibyte content");
+    }
+}
+
+// ─── PR-E #79: parse_interpolation_expr vs parse_expr_inner dispatch ──────────
+//
+// These tests document the no-literals difference between interpolation parsing
+// and directive expression parsing.  Both share the same call/dot/var dispatch
+// but only parse_expr_inner accepts literal values.
+
+#[test]
+fn interpolation_expr_var_parsed_correctly() {
+    // `{name}` — simple variable reference works in interpolation
+    let src = "{name}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "simple var interpolation must parse: {result:?}"
+    );
+}
+
+#[test]
+fn interpolation_expr_member_access() {
+    // `{user.name}` — member access works in interpolation
+    let src = "{user.name}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "member access interpolation must parse: {result:?}"
+    );
+}
+
+#[test]
+fn interpolation_expr_call() {
+    // `{upper(x)}` — function call works in interpolation
+    let src = "{upper(x)}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(result.is_ok(), "call interpolation must parse: {result:?}");
+}
+
+#[test]
+fn interpolation_expr_qualified_call() {
+    // `{str.upper(x)}` — qualified call works in interpolation
+    let src = "{str.upper(x)}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "qualified call interpolation must parse: {result:?}"
+    );
+}
+
+#[test]
+fn interpolation_expr_literal_rejected() {
+    // `{"hello"}` — string literal is NOT valid in interpolation (no-literals rule)
+    let src = "{\"hello\"}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_err(),
+        "string literal must NOT be valid in interpolation: {result:?}"
+    );
+}
+
+#[test]
+fn directive_expr_literal_accepted() {
+    // `@if "hello" == x:` — string literal IS valid in directive expression (parse_expr_inner)
+    let src = "@if \"hello\" == x:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "string literal must be valid in directive expression: {result:?}"
+    );
+}
+
+#[test]
+fn directive_expr_var_parsed_correctly() {
+    // `@if user.admin:` — member access in directive condition (parse_expr_inner)
+    let src = "@if user.admin:\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "member access in @if condition must parse: {result:?}"
+    );
+}
+
+#[test]
+fn directive_expr_qualified_call() {
+    // `@if str.upper(x) == "Y":` — qualified call in directive expression
+    let src = "@if str.upper(x) == \"Y\":\nok\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_ok(),
+        "qualified call in @if condition must parse: {result:?}"
+    );
+}
+
+#[test]
+fn interpolation_multibyte_utf8_adjacent_to_brace() {
+    // `{café}` — multibyte UTF-8 in interpolation identifier must be rejected
+    // (identifiers are ASCII-only)
+    let src = "{café}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_err(),
+        "multibyte identifier in interpolation must be rejected"
+    );
+}
+
 // ── A3: Error-code mapping consolidation ─────────────────────────────────────
 
 /// A3 — parser-layer error codes (E1 / E2 / E9):

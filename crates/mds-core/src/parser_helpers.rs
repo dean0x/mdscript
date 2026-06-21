@@ -3,9 +3,11 @@
 //! This module contains the low-level parsing primitives used by the main
 //! [`super::parser`] module. Responsibilities are organised by concern:
 //!
+//! - **Scan primitive** — [`scan_bytes`]: shared quote+escape+optional-paren state machine
+//!   used by the 6 byte-level scanners.
 //! - **Directive string utilities** — `strip_trailing_directive_colon`,
 //!   `has_unterminated_string`
-//! - **Expression parsing** — `parse_expr_inner`
+//! - **Expression parsing** — `parse_expr_inner`, `expr_dispatch` (shared dispatch)
 //! - **Condition parsing** — `parse_condition`, `parse_negation_condition`,
 //!   `find_unquoted_operator`, `parse_cond_value`
 //! - **Directive parsing** — `parse_import_directive`, `parse_export_directive`,
@@ -23,6 +25,106 @@ use crate::ast::{
 };
 use crate::error::MdsError;
 use crate::limits::{MAX_DOT_SEGMENTS, MAX_LOGICAL_OPERANDS, MAX_NESTING_DEPTH};
+
+// ── Byte-level scan primitive ─────────────────────────────────────────────────
+
+/// Shared byte-level state machine for scanning a `&str` with quote and
+/// optional paren tracking.
+///
+/// Iterates over `bytes` maintaining escape-aware quote state.  For each byte
+/// that lies **outside** a string literal the closure `on_unquoted` is called
+/// with `(byte_index, byte, paren_depth)`.  `paren_depth` is always `0` when
+/// `track_parens` is `false`.
+///
+/// Early termination: the closure returns `true` to stop scanning immediately.
+///
+/// # Safety (UTF-8)
+///
+/// All bytes that the closure acts on (`!`, `=`, `(`, `)`, `:`, etc.) are
+/// single-byte ASCII (≤ 0x7F).  UTF-8 continuation bytes always have the high
+/// bit set (≥ 0x80), so they cannot alias any ASCII sentinel.  Byte indices
+/// returned by callers therefore always fall on valid `str` boundaries.
+#[inline]
+fn scan_bytes<F>(bytes: &[u8], track_parens: bool, mut on_unquoted: F)
+where
+    F: FnMut(usize, u8, usize) -> bool,
+{
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut string_char = b'"';
+    let mut paren_depth: usize = 0;
+
+    while i < len {
+        let ch = bytes[i];
+
+        if in_string {
+            // A backslash inside a string always consumes the next byte.
+            if ch == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if ch == string_char {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Outside a string: check for quote open, parens (optional), then dispatch.
+        match ch {
+            b'"' | b'\'' => {
+                in_string = true;
+                string_char = ch;
+            }
+            b'(' if track_parens => paren_depth += 1,
+            b')' if track_parens => paren_depth = paren_depth.saturating_sub(1),
+            _ => {
+                if on_unquoted(i, ch, paren_depth) {
+                    return;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+// ── Expression dispatch ────────────────────────────────────────────────────────
+
+/// Result of the shared dot/paren dispatch used by both `parse_expr_inner` and
+/// `parse_interpolation_expr`.
+///
+/// Both functions inspect the first `.` and first `(` in the trimmed input to
+/// decide which expression form to parse.  This type captures that decision so
+/// the two callers can share the dispatch logic without sharing their error
+/// messages or return types.
+enum ExprDispatch {
+    /// A `.` appears before any `(` (or without any `(`).  `dot_pos` is the
+    /// byte index of the first `.` in the trimmed string.
+    DotFirst { dot_pos: usize },
+    /// A `(` appears with no `.` before it (or with no `.` at all).
+    /// `paren_pos` is the byte index of the first `(`.
+    ParenFirst { paren_pos: usize },
+    /// Neither `.` nor `(` — simple identifier or literal.
+    Neither,
+}
+
+/// Classify the trimmed expression string into one of three dispatch branches.
+///
+/// Shared by [`parse_expr_inner`] (directives) and [`parse_interpolation_expr`]
+/// (interpolations).  Applying ADR-010: a single grammar for call/dot/var
+/// dispatch that both callers specialise for their output type and error style.
+#[inline]
+fn expr_dispatch(s: &str) -> ExprDispatch {
+    let first_dot = s.find('.');
+    let first_paren = s.find('(');
+    match (first_dot, first_paren) {
+        (Some(d), Some(p)) if d < p => ExprDispatch::DotFirst { dot_pos: d },
+        (Some(d), None) => ExprDispatch::DotFirst { dot_pos: d },
+        (_, Some(p)) => ExprDispatch::ParenFirst { paren_pos: p },
+        (None, None) => ExprDispatch::Neither,
+    }
+}
 
 /// Return `true` if `s` is a complete, properly-terminated quoted string literal.
 ///
@@ -73,41 +175,18 @@ fn is_complete_string_literal(s: &str) -> bool {
 /// writes `var = "value"` instead of `var == "value"`.
 fn has_bare_equals(s: &str) -> bool {
     let bytes = s.as_bytes();
-    let mut in_string = false;
-    let mut string_char = b'"';
-    let mut paren_depth: usize = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let ch = bytes[i];
-        if in_string {
-            if ch == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
+    let mut found = false;
+    scan_bytes(bytes, true, |i, ch, depth| {
+        if ch == b'=' && depth == 0 {
+            let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
+            if next != b'=' && !(i > 0 && bytes[i - 1] == b'!') {
+                found = true;
+                return true; // stop
             }
-            if ch == string_char {
-                in_string = false;
-            }
-            i += 1;
-            continue;
         }
-        match ch {
-            b'"' | b'\'' => {
-                in_string = true;
-                string_char = ch;
-            }
-            b'(' => paren_depth += 1,
-            b')' => paren_depth = paren_depth.saturating_sub(1),
-            b'=' if paren_depth == 0 => {
-                let next = if i + 1 < bytes.len() { bytes[i + 1] } else { 0 };
-                if next != b'=' && !(i > 0 && bytes[i - 1] == b'!') {
-                    return true;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    false
+        false
+    });
+    found
 }
 
 /// Strip the trailing `:` from a directive condition/iterable string, respecting
@@ -118,56 +197,44 @@ fn has_bare_equals(s: &str) -> bool {
 /// is `:`, or `None` if no such colon exists (indicating a malformed directive).
 pub(super) fn strip_trailing_directive_colon(s: &str) -> Option<&str> {
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    if len == 0 {
+    if bytes.is_empty() {
         return None;
     }
 
-    let mut in_string = false;
-    let mut string_char = b'"';
-    let mut paren_depth: usize = 0;
-    // Track the position of the last colon that was outside any quote or parens.
+    // Track the last bare colon and final paren depth separately so we can
+    // detect unclosed parens after the scan.
     let mut last_bare_colon: Option<usize> = None;
-    let mut i = 0;
+    let mut final_paren_depth: usize = 0;
 
-    while i < len {
-        let ch = bytes[i];
-        if in_string {
-            if ch == b'\\' && i + 1 < len {
-                i += 2;
-                continue;
-            }
-            if ch == string_char {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        // Outside a string
+    // scan_bytes does not expose the paren depth after the loop, so we track
+    // it ourselves by mirroring the paren logic through the closure.
+    //
+    // Note: scan_bytes does NOT call the closure for `(` / `)` when
+    // track_parens=true — they are consumed by the inner paren tracking.
+    // We need the final depth, so we run a short second pass only for parens,
+    // or we replicate the paren tracking inside the closure via a cell.
+    //
+    // The simplest approach: use `track_parens=false` and handle all bytes in
+    // the closure, maintaining our own paren depth.  This keeps the closure
+    // fully in control of paren state while still benefiting from
+    // scan_bytes' quote+escape handling.
+    scan_bytes(bytes, false, |i, ch, _depth| {
         match ch {
-            b'"' | b'\'' => {
-                in_string = true;
-                string_char = ch;
-            }
-            b'(' => {
-                paren_depth += 1;
-            }
-            b')' => {
-                paren_depth = paren_depth.saturating_sub(1);
-            }
-            b':' if paren_depth == 0 => {
+            b'(' => final_paren_depth += 1,
+            b')' => final_paren_depth = final_paren_depth.saturating_sub(1),
+            b':' if final_paren_depth == 0 => {
                 last_bare_colon = Some(i);
             }
             _ => {}
         }
-        i += 1;
-    }
+        false // never stop early
+    });
 
     // An unclosed parenthesis group means the directive string is structurally
     // malformed (e.g. `func(a:`). Treat it the same as a missing colon so the
     // caller reports a parse error rather than silently using a colon that was
     // inside an argument list.
-    if paren_depth > 0 {
+    if final_paren_depth > 0 {
         return None;
     }
 
@@ -187,7 +254,24 @@ pub(super) fn strip_trailing_directive_colon(s: &str) -> Option<&str> {
 ///
 /// Used to give targeted error messages when a directive appears to be missing
 /// its trailing colon due to an unterminated string literal inside it.
+///
+/// Note: this scanner intentionally does **not** track paren depth — only
+/// quote state matters for its purpose.
 pub(super) fn has_unterminated_string(s: &str) -> bool {
+    // scan_bytes tracks quote state for us; if any byte is reached that is
+    // "outside a string" (i.e. the quote was closed), we do nothing.
+    // After the scan, we cannot directly query "are we in_string?" from
+    // scan_bytes.  Instead we exploit the invariant: scan_bytes processes bytes
+    // INSIDE strings internally (skipping them) and only calls the closure for
+    // bytes OUTSIDE strings.  The final quote state is implicit: if we never
+    // see the closing quote byte through the string-tracking machinery, the
+    // string remains open.
+    //
+    // Easier: replicate the minimal state machine directly.  scan_bytes handles
+    // the common case but `has_unterminated_string` is uniquely about the
+    // FINAL state of in_string, which scan_bytes does not expose.  We
+    // therefore run it without scan_bytes to keep the logic transparent and to
+    // avoid a mutable capture smuggled through a closure.
     let bytes = s.as_bytes();
     let mut in_string = false;
     let mut string_char = b'"';
@@ -294,6 +378,10 @@ fn parse_qualified_call_expr(
 /// - `ns.func(args)` → `Expr::QualifiedCall`
 /// - `func(args)` → `Expr::Call`
 /// - `obj.field` → `Expr::MemberAccess`
+///
+/// The call/dot/var dispatch is shared with [`parse_interpolation_expr`] via
+/// [`expr_dispatch`] (ADR-010).  This function adds literal handling on top —
+/// interpolations intentionally do **not** accept literals.
 pub(super) fn parse_expr_inner(s: &str) -> Result<Expr, MdsError> {
     let s = s.trim();
     if s.is_empty() {
@@ -338,27 +426,37 @@ pub(super) fn parse_expr_inner(s: &str) -> Result<Expr, MdsError> {
         }
     }
 
-    // Function call or qualified call: look for '(' before any dot.
-    let first_dot = s.find('.');
-    let first_paren = s.find('(');
-
-    if let Some(paren_pos) = first_paren {
-        if let Some(result) = parse_call_expr(s, first_dot, paren_pos) {
-            return result;
+    // Shared call/dot/var dispatch (ADR-010).
+    match expr_dispatch(s) {
+        ExprDispatch::ParenFirst { paren_pos } => {
+            // `(` without a prior dot: simple call, or qualified-call falls through.
+            if let Some(result) = parse_call_expr(s, s.find('.'), paren_pos) {
+                return result;
+            }
+            // parse_call_expr returns None only when dot-before-paren → member access.
+            // That case is handled by DotFirst below; we shouldn't reach here.
         }
-    }
-
-    // Member access or simple variable: check for dot
-    if s.contains('.') {
-        let parts: Vec<&str> = s.split('.').collect();
-        validate_dot_path_parts(&parts).map_err(|reason| {
-            MdsError::syntax(format!(
-                "invalid dot-path in directive expression: '{s}' — {reason}"
-            ))
-        })?;
-        let object = parts[0].trim().to_string();
-        let fields: Vec<String> = parts[1..].iter().map(|p| p.trim().to_string()).collect();
-        return Ok(Expr::MemberAccess { object, fields });
+        ExprDispatch::DotFirst { dot_pos } => {
+            // dot before any `(`: could be qualified call or member access.
+            // Delegate to parse_call_expr which handles both.
+            let first_paren = s.find('(');
+            if let Some(paren_pos) = first_paren {
+                if let Some(result) = parse_call_expr(s, Some(dot_pos), paren_pos) {
+                    return result;
+                }
+            }
+            // No `(` after the dot — pure member access.
+            let parts: Vec<&str> = s.split('.').collect();
+            validate_dot_path_parts(&parts).map_err(|reason| {
+                MdsError::syntax(format!(
+                    "invalid dot-path in directive expression: '{s}' — {reason}"
+                ))
+            })?;
+            let object = parts[0].trim().to_string();
+            let fields: Vec<String> = parts[1..].iter().map(|p| p.trim().to_string()).collect();
+            return Ok(Expr::MemberAccess { object, fields });
+        }
+        ExprDispatch::Neither => {}
     }
 
     // Simple identifier
@@ -451,66 +549,22 @@ pub(super) fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
 /// `str` boundary.
 pub(super) fn find_unquoted_operator(s: &str) -> Option<(usize, &'static str)> {
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut string_char = b'"';
-    let mut paren_depth: usize = 0;
-
-    while i < len {
-        let ch = bytes[i];
-
-        if in_string {
-            // Check escape before close-quote: a backslash always consumes the
-            // next character, so the close-quote check must never run for the
-            // escaped character.
-            if ch == b'\\' && i + 1 < len {
-                i += 2;
-                continue;
+    let mut result: Option<(usize, &'static str)> = None;
+    scan_bytes(bytes, true, |i, ch, depth| {
+        if depth == 0 {
+            // Check for != (must precede == check to avoid `!` consuming `=`)
+            if ch == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                result = Some((i, "!="));
+                return true; // stop
             }
-            if ch == string_char {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        // Outside a string
-        if ch == b'"' || ch == b'\'' {
-            in_string = true;
-            string_char = ch;
-            i += 1;
-            continue;
-        }
-
-        if ch == b'(' {
-            paren_depth += 1;
-            i += 1;
-            continue;
-        }
-        if ch == b')' {
-            paren_depth = paren_depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-
-        // Only report operators at paren depth 0
-        if paren_depth == 0 {
-            // Check for != (must check before single = check)
-            if ch == b'!' && i + 1 < len && bytes[i + 1] == b'=' {
-                return Some((i, "!="));
-            }
-
-            // Check for == (two consecutive '=', not just one)
-            if ch == b'=' && i + 1 < len && bytes[i + 1] == b'=' {
-                return Some((i, "=="));
+            if ch == b'=' && i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                result = Some((i, "=="));
+                return true; // stop
             }
         }
-
-        i += 1;
-    }
-
-    None
+        false
+    });
+    result
 }
 
 /// Parse the body of a negation condition (everything after the leading `!`).
@@ -557,57 +611,40 @@ pub(super) fn parse_negation_condition(rest: &str) -> Result<Condition, MdsError
 ///
 /// `&&` and `||` are both ASCII (single-byte), so byte-level scanning is sound
 /// for the same reason as `find_unquoted_operator`.
-fn split_on_unquoted_op<'a>(s: &'a str, op: &str) -> Vec<&'a str> {
+///
+/// # Two-byte advance
+///
+/// [`scan_bytes`] advances one byte at a time, so after matching a 2-byte
+/// operator at index `i` the closure is re-entered on the operator's *second*
+/// byte (`i + 1`). The `skip_next` flag suppresses that re-entry: the byte right
+/// after a matched operator is never examined as a potential match start or
+/// segment boundary. This reproduces the pre-`scan_bytes` hand-rolled loop,
+/// which advanced by 2 after a match. Without it, three or more consecutive
+/// operator characters would let `segment_start` (`= i + 2`) exceed the current
+/// index and produce a reversed `&s[segment_start..i]` byte range — a panic.
+pub(super) fn split_on_unquoted_op<'a>(s: &'a str, op: &str) -> Vec<&'a str> {
     debug_assert_eq!(op.len(), 2, "op must be a 2-byte ASCII operator");
     let op_bytes = op.as_bytes();
     let bytes = s.as_bytes();
-    let len = bytes.len();
     let mut parts: Vec<&'a str> = Vec::new();
-    let mut in_string = false;
-    let mut string_char = b'"';
-    let mut paren_depth: usize = 0;
     let mut segment_start = 0;
-    let mut i = 0;
+    let mut skip_next = false;
 
-    while i < len {
-        let ch = bytes[i];
-        if in_string {
-            if ch == b'\\' && i + 1 < len {
-                i += 2;
-                continue;
-            }
-            if ch == string_char {
-                in_string = false;
-            }
-            i += 1;
-            continue;
+    scan_bytes(bytes, true, |i, ch, depth| {
+        // Skip the operator's second byte: scan_bytes re-enters on it, but it is
+        // part of the operator already consumed, never a new boundary.
+        if skip_next {
+            skip_next = false;
+            return false;
         }
-        if ch == b'"' || ch == b'\'' {
-            in_string = true;
-            string_char = ch;
-            i += 1;
-            continue;
-        }
-        if ch == b'(' {
-            paren_depth += 1;
-            i += 1;
-            continue;
-        }
-        if ch == b')' {
-            paren_depth = paren_depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-        // Check for the operator at position i — only outside parens
-        if paren_depth == 0 && i + 1 < len && bytes[i] == op_bytes[0] && bytes[i + 1] == op_bytes[1]
-        {
+        if depth == 0 && i + 1 < bytes.len() && ch == op_bytes[0] && bytes[i + 1] == op_bytes[1] {
             parts.push(&s[segment_start..i]);
             segment_start = i + 2;
-            i += 2;
-            continue;
+            skip_next = true;
         }
-        i += 1;
-    }
+        false // never stop early — collect all occurrences
+    });
+
     parts.push(&s[segment_start..]);
     parts
 }
@@ -990,13 +1027,17 @@ pub(super) fn parse_dot_expr(
     })
 }
 
-/// Parse the expression inside `{ }` into an Expr.
+/// Parse the expression inside `{ }` into an Interpolation.
 ///
-/// Dispatches across four expression types by examining the positions of the
-/// first `.` and first `(`:
+/// Dispatches across three expression types using the shared [`expr_dispatch`]
+/// helper (ADR-010):
 ///   dot before `(`  → [`parse_dot_expr`] (QualifiedCall or MemberAccess)
 ///   `(` without dot → Call
 ///   neither         → Var
+///
+/// Unlike [`parse_expr_inner`] (used for directive conditions), this function
+/// intentionally does **not** accept literal values (strings, numbers, booleans,
+/// null).  `{42}` or `{"hello"}` in interpolation position is a syntax error.
 pub(super) fn parse_interpolation_expr(
     content: &str,
     offset: usize,
@@ -1006,36 +1047,36 @@ pub(super) fn parse_interpolation_expr(
     let content = content.trim();
     let len = content.len();
 
-    // Dot before any `(`: QualifiedCall or MemberAccess.
-    let first_dot = content.find('.');
-    let first_paren = content.find('(');
-    if let (Some(dot_pos), paren_opt) = (first_dot, first_paren) {
-        if paren_opt.is_none_or(|p| dot_pos < p) {
+    // Shared call/dot/var dispatch (ADR-010).
+    // No literal handling here — that is the deliberate no-literals difference.
+    match expr_dispatch(content) {
+        ExprDispatch::DotFirst { dot_pos } => {
+            // dot before any `(`: QualifiedCall or MemberAccess.
             return parse_dot_expr(content, dot_pos, offset, len, file, source);
         }
-    }
-
-    // Paren without prior dot: simple Call.
-    if let Some(paren_pos) = first_paren {
-        let name = content[..paren_pos].trim().to_string();
-        let args_str = content[paren_pos + 1..]
-            .trim()
-            .strip_suffix(')')
-            .ok_or_else(|| {
-                MdsError::syntax_at(
-                    "unclosed parenthesis in function call",
-                    file,
-                    source,
-                    offset,
-                    len,
-                )
-            })?;
-        let args = parse_args(args_str)?;
-        return Ok(Interpolation {
-            expr: Expr::Call { name, args },
-            offset,
-            len,
-        });
+        ExprDispatch::ParenFirst { paren_pos } => {
+            // `(` without a prior dot: simple Call.
+            let name = content[..paren_pos].trim().to_string();
+            let args_str = content[paren_pos + 1..]
+                .trim()
+                .strip_suffix(')')
+                .ok_or_else(|| {
+                    MdsError::syntax_at(
+                        "unclosed parenthesis in function call",
+                        file,
+                        source,
+                        offset,
+                        len,
+                    )
+                })?;
+            let args = parse_args(args_str)?;
+            return Ok(Interpolation {
+                expr: Expr::Call { name, args },
+                offset,
+                len,
+            });
+        }
+        ExprDispatch::Neither => {}
     }
 
     // Simple variable reference.
@@ -1277,39 +1318,22 @@ fn split_on_unquoted_commas(s: &str) -> Vec<String> {
 /// Find the first `=` that is not inside a quoted string and not part of `==`.
 ///
 /// Returns the byte index of the `=`, or `None` if not found.
+///
+/// Note: this scanner intentionally does **not** track paren depth.  A bare `=`
+/// inside parentheses (e.g. a function argument default) is still found — callers
+/// rely on this to detect default-value separators in `@define` parameter lists.
 fn find_unquoted_equals(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut string_char = b'"';
-
-    while i < len {
-        let ch = bytes[i];
-        if in_string {
-            if ch == b'\\' && i + 1 < len {
-                i += 2;
-                continue;
-            }
-            if ch == string_char {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if ch == b'"' || ch == b'\'' {
-            in_string = true;
-            string_char = ch;
-            i += 1;
-            continue;
-        }
+    let mut result: Option<usize> = None;
+    scan_bytes(bytes, false, |i, ch, _depth| {
         // Single `=` not followed by `=`
-        if ch == b'=' && (i + 1 >= len || bytes[i + 1] != b'=') {
-            return Some(i);
+        if ch == b'=' && (i + 1 >= bytes.len() || bytes[i + 1] != b'=') {
+            result = Some(i);
+            return true; // stop at first match
         }
-        i += 1;
-    }
-    None
+        false
+    });
+    result
 }
 
 /// Parse a `@define` parameter list string into a `Vec<Param>`.
