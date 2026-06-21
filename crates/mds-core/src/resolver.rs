@@ -734,6 +734,103 @@ impl ModuleCache {
         })
     }
 
+    /// Build the merged scope for an `@extends` child (step 3d of `resolve_extends_components`).
+    ///
+    /// Covers steps 3d-i through 3d-vi:
+    /// - Parse FM imports from base and child frontmatter (3d-i).
+    /// - Deep-merge base and child FM mappings (3d-ii).
+    /// - Build scope from the merged mapping with runtime vars (3d-iii).
+    /// - Resolve base FM imports against the base file (3d-iv, ADR-014 ordering).
+    /// - Resolve child FM imports against the child file (3d-v).
+    /// - Merge base functions into scope (3d-vi).
+    ///
+    /// # Borrow note
+    /// `base` is taken as an explicit `&ResolvedModule` (not via `self`) so that the
+    /// borrow of `base.skeleton_origin.source` (needed for `base_ctx.source`) is
+    /// independent of `&mut self`. The caller passes `&*arc` to deref from `Arc`.
+    ///
+    /// # Invariants preserved
+    /// - Base FM imports resolved BEFORE child FM imports (ADR-014).
+    /// - `deep_merge_yaml` applies `MAX_FRONTMATTER_MERGE_DEPTH` cap.
+    /// - `resolve_frontmatter_imports` → `resolve_import_from` → `resolve_by_key_skeleton`
+    ///   preserves PF-004 safety (cycle detection, `check_import_depth`, file-size cap).
+    fn build_merged_extends_scope(
+        &mut self,
+        base: &ResolvedModule,
+        child_fm: &Option<serde_yaml_ng::Mapping>,
+        base_key: &str,
+        ctx: &ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Scope, MdsError> {
+        // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
+        //
+        // Base imports resolve relative to the BASE file (using base_key as ctx.base_key).
+        // Child imports resolve relative to the CHILD file (using ctx.base_key as usual).
+        // Both sets are resolved; a duplicate alias across base+child → mds::name_collision
+        // (ADR-014; consistent with the existing namespace-collision handling).
+        let base_fm_imports: Vec<FrontmatterImport> = base
+            .frontmatter_values
+            .as_ref()
+            .and_then(|m| m.get("imports"))
+            .map(parse_frontmatter_imports_from_yaml)
+            .transpose()?
+            .unwrap_or_default();
+
+        let child_fm_imports: Vec<FrontmatterImport> = child_fm
+            .as_ref()
+            .and_then(|m| m.get("imports"))
+            .map(parse_frontmatter_imports_from_yaml)
+            .transpose()?
+            .unwrap_or_default();
+
+        // 3d-ii: Deep-merge base and child frontmatter value Mappings.
+        // Empty mapping used when either side has no frontmatter.
+        // Reserved keys (imports, type, extends) are excluded by deep_merge_yaml.
+        // Precedence: base < child (child overrides base on collision).
+        let empty_mapping = serde_yaml_ng::Mapping::new();
+        let base_mapping = base.frontmatter_values.as_ref().unwrap_or(&empty_mapping);
+        let child_mapping = child_fm.as_ref().unwrap_or(&empty_mapping);
+        let merged_mapping = deep_merge_yaml(base_mapping, child_mapping, 0)?;
+
+        // 3d-iii: Build scope from the merged mapping. Runtime vars applied LAST
+        // (base < child < runtime, F7, decision #3).
+        let mut scope = build_scope_from_merged_mapping(&merged_mapping, ctx.runtime_vars)?;
+
+        // 3d-iv: Resolve base frontmatter imports against base_key (ADR-014 ordering,
+        // PF-004 safe via resolve_frontmatter_imports → resolve_import_from).
+        // Use a ctx pointing to the base file with its REAL source bytes so that any
+        // span-carrying error here attributes correctly AND the at() debug_assert can't
+        // false-fire. The skeleton_origin already carries these bytes; we use them here
+        // for consistency.
+        //
+        // `base` is an explicit `&ResolvedModule` param (not from `self`) so the borrow
+        // of `base.skeleton_origin.source` is independent of the `&mut self` receiver
+        // used by `resolve_frontmatter_imports` below.
+        let base_source_ref: &str = &base.skeleton_origin.source;
+        let base_ctx = ModuleCtx {
+            file_str: base_key,
+            source: base_source_ref,
+            base_key,
+            runtime_vars: ctx.runtime_vars,
+        };
+        self.resolve_frontmatter_imports(&base_fm_imports, &mut scope, &base_ctx, warnings)?;
+
+        // 3d-v: Resolve child frontmatter imports against child key (ctx.base_key).
+        // Duplicate alias across base+child → mds::name_collision (same error as today).
+        self.resolve_frontmatter_imports(&child_fm_imports, &mut scope, ctx, warnings)?;
+
+        // 3d-vi: Merge base functions into scope (F12: base default block calling a base @define).
+        // Collision with child frontmatter-imported functions → name_collision.
+        for (name, func) in &base.functions {
+            if scope.get_function(name).is_some() {
+                return Err(MdsError::name_collision(name.clone()));
+            }
+            scope.set_function(name, Arc::clone(func));
+        }
+
+        Ok(scope)
+    }
+
     /// Shared extends-pipeline: steps 3a-3e are identical for text and messages modes.
     ///
     /// Builds the `final_body` (splice of base skeleton with effective block overrides)
@@ -790,68 +887,8 @@ impl ModuleCache {
         // ── Step 3d: build merged scope (Phase 3: deep merge + per-file FM imports) ──
         // Applies decision #3 (base < child < runtime) and decision #7 (reserved-key
         // exclusion, array wholesale replace, both sets of FM imports resolved per-file).
-
-        // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
-        //
-        // Base imports resolve relative to the BASE file (using base_key as ctx.base_key).
-        // Child imports resolve relative to the CHILD file (using ctx.base_key as usual).
-        // Both sets are resolved; a duplicate alias across base+child → mds::name_collision
-        // (ADR-014; consistent with the existing namespace-collision handling).
-        let base_fm_imports: Vec<FrontmatterImport> = base
-            .frontmatter_values
-            .as_ref()
-            .and_then(|m| m.get("imports"))
-            .map(parse_frontmatter_imports_from_yaml)
-            .transpose()?
-            .unwrap_or_default();
-
-        let child_fm_imports: Vec<FrontmatterImport> = frontmatter_values
-            .as_ref()
-            .and_then(|m| m.get("imports"))
-            .map(parse_frontmatter_imports_from_yaml)
-            .transpose()?
-            .unwrap_or_default();
-
-        // 3d-ii: Deep-merge base and child frontmatter value Mappings.
-        // Empty mapping used when either side has no frontmatter.
-        // Reserved keys (imports, type, extends) are excluded by deep_merge_yaml.
-        // Precedence: base < child (child overrides base on collision).
-        let empty_mapping = serde_yaml_ng::Mapping::new();
-        let base_mapping = base.frontmatter_values.as_ref().unwrap_or(&empty_mapping);
-        let child_mapping = frontmatter_values.as_ref().unwrap_or(&empty_mapping);
-        let merged_mapping = deep_merge_yaml(base_mapping, child_mapping, 0)?;
-
-        // 3d-iii: Build scope from the merged mapping. Runtime vars applied LAST
-        // (base < child < runtime, F7, decision #3).
-        let mut scope = build_scope_from_merged_mapping(&merged_mapping, ctx.runtime_vars)?;
-
-        // 3d-iv: Resolve base frontmatter imports against base_key (ADR-014 ordering,
-        // PF-004 safe via resolve_frontmatter_imports → resolve_import_from).
-        // Use a ctx pointing to the base file with its REAL source bytes so that any
-        // span-carrying error here attributes correctly AND the at() debug_assert can't
-        // false-fire. The skeleton_origin already carries these bytes; we use them here
-        // for consistency.
-        let base_source_ref: &str = &base.skeleton_origin.source;
-        let base_ctx = ModuleCtx {
-            file_str: &base_key,
-            source: base_source_ref,
-            base_key: &base_key,
-            runtime_vars: ctx.runtime_vars,
-        };
-        self.resolve_frontmatter_imports(&base_fm_imports, &mut scope, &base_ctx, warnings)?;
-
-        // 3d-v: Resolve child frontmatter imports against child key (ctx.base_key).
-        // Duplicate alias across base+child → mds::name_collision (same error as today).
-        self.resolve_frontmatter_imports(&child_fm_imports, &mut scope, ctx, warnings)?;
-
-        // 3d-vi: Merge base functions into scope (F12: base default block calling a base @define).
-        // Collision with child frontmatter-imported functions → name_collision.
-        for (name, func) in &base.functions {
-            if scope.get_function(name).is_some() {
-                return Err(MdsError::name_collision(name.clone()));
-            }
-            scope.set_function(name, Arc::clone(func));
-        }
+        let mut scope =
+            self.build_merged_extends_scope(&base, frontmatter_values, &base_key, ctx, warnings)?;
 
         // Collect child's own definitions from its body (currently zero @define after
         // child-only-blocks check, but structurally correct).
@@ -1022,6 +1059,78 @@ impl ModuleCache {
         Ok(arc)
     }
 
+    /// Handle the intermediate-base arm of `process_module_skeleton`.
+    ///
+    /// Called when a module being resolved as a skeleton itself extends a grandparent.
+    /// Resolves the grandparent in skeleton mode, applies block overrides from the
+    /// intermediate base's body, Arc::clone's the skeleton_origin, and computes the
+    /// transitive frontmatter merge (grandparent FM < own FM) so that a leaf descending
+    /// from this intermediate base gets the full chain without re-traversal.
+    ///
+    /// # Invariants preserved
+    /// - `resolve_by_key_skeleton` (never `resolve_by_key`) — skeleton-only evaluation.
+    /// - `check_import_depth` + cycle detection (`self.resolving`) apply via
+    ///   `resolve_by_key_skeleton`.
+    /// - `deep_merge_yaml` depth cap (`MAX_FRONTMATTER_MERGE_DEPTH`) applies transitively.
+    /// - `skeleton_origin` Arc is cloned from the grandparent (ADR-022 ride-along).
+    #[allow(clippy::type_complexity)]
+    fn resolve_intermediate_base(
+        &mut self,
+        ext: &crate::ast::ExtendsDirective,
+        own_fm: &Option<serde_yaml_ng::Mapping>,
+        module_body: &[Node],
+        ctx: &ModuleCtx<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<
+        (
+            Arc<[Node]>,
+            IndexMap<String, EffectiveBlock>,
+            Origin,
+            Option<serde_yaml_ng::Mapping>,
+        ),
+        MdsError,
+    > {
+        validate_import_path(&ext.path)
+            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+        let grandparent_key = self
+            .fs
+            .normalize(ctx.base_key, &ext.path)
+            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+        let grandparent = self
+            .resolve_by_key_skeleton(&grandparent_key, ctx.runtime_vars, warnings)
+            .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
+
+        // Child-only-blocks check for this intermediate base (3b).
+        check_child_only_blocks(module_body, ctx)?;
+
+        let eff_blocks = apply_block_overrides(&grandparent.effective_blocks, module_body, ctx)?;
+
+        // skeleton_origin Arc::clone'd from grandparent — the root base's source bytes
+        // ride down the chain so the leaf's validate_extends_components can attribute
+        // non-block skeleton node diagnostics to the root file (Risk #2, ADR-022).
+        let skel_origin = grandparent.skeleton_origin.clone();
+
+        // Phase 3: transitive FM merge: grandparent.frontmatter_values < own_fm_values.
+        // This produces the accumulated FM for this intermediate base, so a leaf
+        // descending from it gets the full transitive chain without re-traversing.
+        let empty = serde_yaml_ng::Mapping::new();
+        let gp_fm = grandparent.frontmatter_values.as_ref().unwrap_or(&empty);
+        let own_fm_ref = own_fm.as_ref().unwrap_or(&empty);
+        let merged_fm = deep_merge_yaml(gp_fm, own_fm_ref, 0)?;
+        let accumulated_fm = if merged_fm.is_empty() {
+            None
+        } else {
+            Some(merged_fm)
+        };
+
+        Ok((
+            Arc::clone(&grandparent.effective_skeleton),
+            eff_blocks,
+            skel_origin,
+            accumulated_fm,
+        ))
+    }
+
     /// Tokenize → parse → collect (functions/blocks/frontmatter), NO validate/evaluate.
     ///
     /// Called when this file is a base for @extends. The resulting ResolvedModule has
@@ -1060,48 +1169,7 @@ impl ModuleCache {
         // with B's own FM (A < B), so that when C later merges against B, it gets A+B+C.
         let (effective_skeleton, effective_blocks, skeleton_origin, frontmatter_values) =
             if let Some(ext) = module.extends.as_ref() {
-                validate_import_path(&ext.path).map_err(|e| {
-                    attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset)
-                })?;
-                let grandparent_key = self.fs.normalize(ctx.base_key, &ext.path).map_err(|e| {
-                    attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset)
-                })?;
-                let grandparent = self
-                    .resolve_by_key_skeleton(&grandparent_key, ctx.runtime_vars, warnings)
-                    .map_err(|e| {
-                        attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset)
-                    })?;
-
-                // Child-only-blocks check for this intermediate base (3b).
-                check_child_only_blocks(&module.body, ctx)?;
-
-                let eff_blocks =
-                    apply_block_overrides(&grandparent.effective_blocks, &module.body, ctx)?;
-
-                // skeleton_origin Arc::clone'd from grandparent — the root base's source bytes
-                // ride down the chain so the leaf's validate_extends_components can attribute
-                // non-block skeleton node diagnostics to the root file (Risk #2).
-                let skel_origin = grandparent.skeleton_origin.clone();
-
-                // Phase 3: transitive FM merge: grandparent.frontmatter_values < own_fm_values.
-                // This produces the accumulated FM for this intermediate base, so a leaf
-                // descending from it gets the full transitive chain without re-traversing.
-                let empty = serde_yaml_ng::Mapping::new();
-                let gp_fm = grandparent.frontmatter_values.as_ref().unwrap_or(&empty);
-                let own_fm = own_fm_values.as_ref().unwrap_or(&empty);
-                let merged_fm = deep_merge_yaml(gp_fm, own_fm, 0)?;
-                let accumulated_fm = if merged_fm.is_empty() {
-                    None
-                } else {
-                    Some(merged_fm)
-                };
-
-                (
-                    Arc::clone(&grandparent.effective_skeleton),
-                    eff_blocks,
-                    skel_origin,
-                    accumulated_fm,
-                )
+                self.resolve_intermediate_base(ext, &own_fm_values, &module.body, ctx, warnings)?
             } else {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
                 // Build Origin once — Arc::clone'd into each seeded EffectiveBlock (P3).
