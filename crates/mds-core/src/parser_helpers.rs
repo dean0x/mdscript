@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 
 use crate::ast::{
-    Arg, CondValue, Condition, ExportDirective, Expr, ImportDirective, Interpolation, Node, Param,
+    Arg, Condition, ExportDirective, Expr, ImportDirective, Interpolation, Node, Param,
 };
 use crate::error::MdsError;
 use crate::limits::{MAX_DOT_SEGMENTS, MAX_LOGICAL_OPERANDS, MAX_NESTING_DEPTH};
@@ -469,14 +469,30 @@ pub(super) fn parse_expr_inner(s: &str) -> Result<Expr, MdsError> {
     )))
 }
 
-/// Parse a literal value for the RHS of a comparison condition.
+/// Parse a **literal** default value for a `@define` parameter.
 ///
-/// Accepts:
-/// - Quoted strings: `"admin"` or `'admin'`
-/// - Numbers: `42`, `-5`, `3.14`
-/// - Booleans: `true`, `false`
-/// - Null: `null`
-pub(super) fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
+/// Accepts exactly four forms, returning the matching literal `Expr` variant:
+/// - Quoted strings: `"admin"` or `'admin'` → [`Expr::StringLiteral`]
+/// - Numbers: `42`, `-5`, `3.14` → [`Expr::NumberLiteral`]
+/// - Booleans: `true`, `false` → [`Expr::BooleanLiteral`]
+/// - Null: `null` → [`Expr::NullLiteral`]
+///
+/// # Literal-only guard (zero-behaviour-change)
+///
+/// `Param.default` is typed as `Option<Expr>`, so the type *could* represent any
+/// expression (a function call, a variable reference, an interpolation). It must
+/// not: a non-literal default such as `@define f(x = upper("a"))` has always been
+/// rejected and must stay rejected. This function never constructs a non-literal
+/// variant — anything that is not one of the four literal forms above falls
+/// through to the trailing `Err` ("comparison values must be string, number,
+/// boolean, or null"), which [`parse_define_params`] surfaces as the
+/// "invalid default value for parameter" diagnostic. There is therefore no path
+/// by which a non-literal `Expr` reaches `Param.default`.
+///
+/// The accepted forms and the exact error strings are preserved verbatim from the
+/// pre-unification dedicated default-literal parser so that retyping the result
+/// to `Expr` is byte-for-byte behaviour-preserving.
+pub(super) fn parse_cond_value(s: &str) -> Result<Expr, MdsError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(MdsError::syntax(
@@ -487,7 +503,7 @@ pub(super) fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
     // Quoted string (single or double) — only accept when the closing quote is not escaped.
     if is_complete_string_literal(s) {
         let inner = &s[1..s.len() - 1];
-        return Ok(CondValue::String(unescape_string(inner)));
+        return Ok(Expr::StringLiteral(unescape_string(inner)));
     }
 
     // Unterminated string
@@ -499,15 +515,15 @@ pub(super) fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
 
     // Boolean literals
     if s == "true" {
-        return Ok(CondValue::Boolean(true));
+        return Ok(Expr::BooleanLiteral(true));
     }
     if s == "false" {
-        return Ok(CondValue::Boolean(false));
+        return Ok(Expr::BooleanLiteral(false));
     }
 
     // Null literal
     if s == "null" {
-        return Ok(CondValue::Null);
+        return Ok(Expr::NullLiteral);
     }
 
     // Numeric (integer or float, including negative)
@@ -517,7 +533,7 @@ pub(super) fn parse_cond_value(s: &str) -> Result<CondValue, MdsError> {
                 "NaN and infinity are not valid condition values",
             ));
         }
-        return Ok(CondValue::Number(n));
+        return Ok(Expr::NumberLiteral(n));
     }
 
     Err(MdsError::syntax(
@@ -1340,7 +1356,8 @@ fn find_unquoted_equals(s: &str) -> Option<usize> {
 ///
 /// Supports:
 /// - `name` — required parameter
-/// - `name = value` — parameter with default value (any `CondValue` literal)
+/// - `name = value` — parameter with default value (any literal `Expr`:
+///   string, number, boolean, or null; non-literal defaults are rejected)
 ///
 /// Enforces:
 /// - Required parameters must come before optional (defaulted) parameters

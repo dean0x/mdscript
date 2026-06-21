@@ -31,47 +31,6 @@ pub struct ExtendsDirective {
     pub offset: usize,
 }
 
-/// A literal value for a default parameter in `@define` blocks.
-///
-/// Only string, number, boolean, and null literals are supported.
-///
-/// # TODO: Type Duplication
-///
-/// `CondValue` (String, Number, Boolean, Null) is structurally identical to the
-/// literal variants of `Expr` (StringLiteral, NumberLiteral, BooleanLiteral, NullLiteral),
-/// and `Arg` has the same four literal variants as well — creating three parallel hierarchies.
-///
-/// The correct fix is:
-/// - Replace `Param.default: Option<CondValue>` with `Param.default: Option<Expr>`
-/// - Remove `CondValue` and `condvalue_to_value` from the evaluator
-/// - Change `parse_cond_value` to call `parse_expr_inner` and return `Expr`
-///
-/// This was deferred because it is cross-cutting (touches `Param`, `parse_define_params`,
-/// `condvalue_to_value`, and all test code that pattern-matches on `CondValue`), and
-/// the current PR scope is expression directives in `@for`/`@if`. Address in a dedicated
-/// cleanup PR — no behaviour change, pure type unification.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CondValue {
-    /// A string literal: `"admin"` or `'admin'`
-    String(String),
-    /// A numeric literal: `42`, `3.14`, `-5`
-    ///
-    /// # Invariant
-    ///
-    /// The parser rejects non-finite values (`NaN`, `+Inf`, `-Inf`) via
-    /// `is_finite()` before constructing this variant, so any `Number` in a
-    /// well-formed AST holds a finite `f64`. `PartialEq` is derived for
-    /// convenience; callers must not compare two `Number` values expecting
-    /// IEEE 754 NaN-equality — the invariant guarantees NaN is never stored,
-    /// but the derive means two `NaN` values would compare unequal if the
-    /// invariant were ever violated.
-    Number(f64),
-    /// A boolean literal: `true` or `false`
-    Boolean(bool),
-    /// The null literal
-    Null,
-}
-
 /// A condition in an `@if` or `@elseif` directive.
 ///
 /// # Why no `PartialEq`
@@ -253,8 +212,15 @@ pub struct ForBlock {
 pub struct Param {
     /// The parameter name (a valid identifier).
     pub name: String,
-    /// Optional default value, parsed as a `CondValue` at definition time.
-    pub default: Option<CondValue>,
+    /// Optional default value, parsed at definition time.
+    ///
+    /// When present, the `Expr` is guaranteed by the parser to be a *literal*
+    /// variant (`StringLiteral`, `NumberLiteral`, `BooleanLiteral`, or
+    /// `NullLiteral`) — `parse_define_params` rejects non-literal defaults such
+    /// as function calls or variable references. The evaluator converts it to a
+    /// runtime `Value` via `literal_expr_to_value` when the caller omits the
+    /// argument.
+    pub default: Option<Expr>,
 }
 
 impl Param {
@@ -270,8 +236,8 @@ impl Param {
 /// Count the number of required (no-default) parameters in a param list.
 ///
 /// A parameter is required when its `default` field is `None`. Optional parameters
-/// (those with `Some(CondValue)`) may be omitted at call sites and receive their
-/// default value at runtime via `condvalue_to_value`.
+/// (those with `Some(Expr)`) may be omitted at call sites and receive their
+/// default value at runtime via `literal_expr_to_value`.
 ///
 /// Defined here alongside `Param` because it is purely a property of the AST
 /// type — both the validator and evaluator import it from this module.

@@ -2,7 +2,7 @@
 
 use super::helpers::*;
 use super::*;
-use crate::ast::{Arg, CondValue, ExportDirective, Expr, ImportDirective};
+use crate::ast::{Arg, ExportDirective, Expr, ImportDirective};
 use crate::lexer::tokenize;
 use crate::limits::MAX_DOT_SEGMENTS;
 
@@ -605,10 +605,10 @@ fn condition_value_escaped_quote_in_string() {
         result.is_ok(),
         "escaped quote in condition value must parse"
     );
-    if let Ok(CondValue::String(s)) = result {
+    if let Ok(Expr::StringLiteral(s)) = result {
         assert_eq!(s, r#"say "hi""#, "escaped quote must be unescaped");
     } else {
-        panic!("expected CondValue::String");
+        panic!("expected Expr::StringLiteral");
     }
 }
 
@@ -617,10 +617,10 @@ fn condition_value_unescaped_string_unchanged() {
     // Plain strings with no escapes must pass through unchanged
     let result = parse_cond_value(r#""hello world""#);
     assert!(result.is_ok());
-    if let Ok(CondValue::String(s)) = result {
+    if let Ok(Expr::StringLiteral(s)) = result {
         assert_eq!(s, "hello world");
     } else {
-        panic!("expected CondValue::String");
+        panic!("expected Expr::StringLiteral");
     }
 }
 
@@ -762,7 +762,7 @@ fn parse_define_default_string() {
         assert_eq!(def.params[0].name, "name");
         assert!(matches!(
             &def.params[0].default,
-            Some(crate::ast::CondValue::String(s)) if s == "World"
+            Some(Expr::StringLiteral(s)) if s == "World"
         ));
     } else {
         panic!("expected Define node");
@@ -776,9 +776,7 @@ fn parse_define_default_number() {
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
         assert_eq!(def.params.len(), 1);
-        assert!(
-            matches!(&def.params[0].default, Some(crate::ast::CondValue::Number(n)) if *n == 3.0)
-        );
+        assert!(matches!(&def.params[0].default, Some(Expr::NumberLiteral(n)) if *n == 3.0));
     } else {
         panic!("expected Define node");
     }
@@ -790,9 +788,7 @@ fn parse_define_default_negative_number() {
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
-        assert!(
-            matches!(&def.params[0].default, Some(crate::ast::CondValue::Number(n)) if *n == -1.0)
-        );
+        assert!(matches!(&def.params[0].default, Some(Expr::NumberLiteral(n)) if *n == -1.0));
     } else {
         panic!("expected Define node");
     }
@@ -806,7 +802,7 @@ fn parse_define_default_bool() {
     if let Node::Define(def) = &module.body[0] {
         assert!(matches!(
             &def.params[0].default,
-            Some(crate::ast::CondValue::Boolean(true))
+            Some(Expr::BooleanLiteral(true))
         ));
     } else {
         panic!("expected Define node");
@@ -819,10 +815,7 @@ fn parse_define_default_null() {
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
-        assert!(matches!(
-            &def.params[0].default,
-            Some(crate::ast::CondValue::Null)
-        ));
+        assert!(matches!(&def.params[0].default, Some(Expr::NullLiteral)));
     } else {
         panic!("expected Define node");
     }
@@ -836,7 +829,7 @@ fn parse_define_default_string_with_comma() {
     if let Node::Define(def) = &module.body[0] {
         assert!(matches!(
             &def.params[0].default,
-            Some(crate::ast::CondValue::String(s)) if s == "a, b"
+            Some(Expr::StringLiteral(s)) if s == "a, b"
         ));
     } else {
         panic!("expected Define node");
@@ -890,6 +883,163 @@ fn parse_define_mixed_required_and_optional() {
     } else {
         panic!("expected Define node");
     }
+}
+
+// ── #78 literal-only default guard ────────────────────────────────────────────
+//
+// `Param.default` is typed `Option<Expr>`, which *could* represent a function
+// call, a variable reference, or a member access. The parser must keep rejecting
+// every non-literal default exactly as it did before the type unification —
+// only string/number/boolean/null literals are admissible. These tests pin that
+// guard and the preserved rejection error so the type unification stays
+// zero-behaviour-change (AC-2).
+
+/// The exact rejection diagnostic emitted by `parse_define_params` for any
+/// non-literal (or otherwise invalid) default value. Centralised so every guard
+/// test asserts the identical preserved string.
+const NON_LITERAL_DEFAULT_ERR: &str = "must be a string, number, boolean, or null";
+
+#[test]
+fn parse_define_default_function_call_rejected() {
+    // `@define f(x = upper("a"))` — a function-call Expr in default position.
+    // The type can now represent it, but the parser must still reject it.
+    let src = "@define f(x = upper(\"a\")):\n{x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_err(),
+        "a function-call default must be rejected, got: {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(NON_LITERAL_DEFAULT_ERR),
+        "function-call default must produce the preserved literal-only error, got: {err}"
+    );
+}
+
+#[test]
+fn parse_define_default_variable_reference_rejected() {
+    // `@define f(x = y)` — a bare identifier (variable reference) is not a literal.
+    let src = "@define f(x = y):\n{x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_err(),
+        "a variable-reference default must be rejected, got: {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(NON_LITERAL_DEFAULT_ERR),
+        "variable-reference default must produce the preserved literal-only error, got: {err}"
+    );
+}
+
+#[test]
+fn parse_define_default_member_access_rejected() {
+    // `@define f(x = config.key)` — a member-access Expr is not a literal.
+    let src = "@define f(x = config.key):\n{x}\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "", "");
+    assert!(
+        result.is_err(),
+        "a member-access default must be rejected, got: {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains(NON_LITERAL_DEFAULT_ERR),
+        "member-access default must produce the preserved literal-only error, got: {err}"
+    );
+}
+
+#[test]
+fn parse_define_params_non_literal_default_rejected_directly() {
+    // Same guard at the `parse_define_params` level (no full-pipeline wrapping):
+    // every non-literal default form returns the preserved rejection error and
+    // never yields a non-literal `Expr` in `Param.default`.
+    for rhs in ["upper(\"a\")", "y", "config.key", "ns.f(1)"] {
+        let token = format!("x = {rhs}");
+        let result = parse_define_params(&token, "f");
+        assert!(
+            result.is_err(),
+            "non-literal default `{rhs}` must be rejected, got: {result:?}"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(NON_LITERAL_DEFAULT_ERR),
+            "non-literal default `{rhs}` must produce the preserved error, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn parse_cond_value_only_admits_literals() {
+    // Direct proof that the default-value parser never constructs a non-literal
+    // Expr variant: literals succeed; calls/vars/member-access fall through to the
+    // preserved trailing error.
+    assert!(matches!(
+        parse_cond_value("\"hi\""),
+        Ok(Expr::StringLiteral(_))
+    ));
+    assert!(matches!(parse_cond_value("42"), Ok(Expr::NumberLiteral(_))));
+    assert!(matches!(
+        parse_cond_value("true"),
+        Ok(Expr::BooleanLiteral(true))
+    ));
+    assert!(matches!(parse_cond_value("null"), Ok(Expr::NullLiteral)));
+    for non_literal in ["upper(\"a\")", "y", "config.key"] {
+        let result = parse_cond_value(non_literal);
+        assert!(
+            result.is_err(),
+            "`{non_literal}` must not parse as a default literal, got: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("comparison values must be string, number, boolean, or null"),
+            "`{non_literal}` must hit the preserved trailing literal-only error"
+        );
+    }
+}
+
+// ── #78 literal-default → Value parity ─────────────────────────────────────────
+//
+// `literal_expr_to_value` (evaluator) replaced `condvalue_to_value`. These tests
+// pin that each literal default `Expr` produces exactly the `Value` the old
+// conversion produced, end-to-end through `compile_str`.
+
+#[test]
+fn default_string_value_parity() {
+    // Expr::StringLiteral → Value::String, rendered verbatim.
+    let out = crate::compile_str("@define f(x = \"hi\"):\n{x}\n@end\n{f()}\n").unwrap();
+    assert_eq!(out, "hi\n");
+}
+
+#[test]
+fn default_number_value_parity() {
+    // Expr::NumberLiteral → Value::Number; integral floats render without a decimal.
+    let out = crate::compile_str("@define f(x = 42):\n{x}\n@end\n{f()}\n").unwrap();
+    assert_eq!(out, "42\n");
+    let out_neg = crate::compile_str("@define f(x = -1):\n{x}\n@end\n{f()}\n").unwrap();
+    assert_eq!(out_neg, "-1\n");
+    let out_frac = crate::compile_str("@define f(x = 3.14):\n{x}\n@end\n{f()}\n").unwrap();
+    assert_eq!(out_frac, "3.14\n");
+}
+
+#[test]
+fn default_boolean_value_parity() {
+    // Expr::BooleanLiteral → Value::Boolean, rendered as `true`/`false`.
+    let out_true = crate::compile_str("@define f(x = true):\n{x}\n@end\n{f()}\n").unwrap();
+    assert_eq!(out_true, "true\n");
+    let out_false = crate::compile_str("@define f(x = false):\n{x}\n@end\n{f()}\n").unwrap();
+    assert_eq!(out_false, "false\n");
+}
+
+#[test]
+fn default_null_value_parity() {
+    // Expr::NullLiteral → Value::Null, rendered as the empty string in interpolation.
+    let out = crate::compile_str("@define f(x = null):\n[{x}]\n@end\n{f()}\n").unwrap();
+    assert_eq!(out, "[]\n");
 }
 
 // ── Logical operators ─────────────────────────────────────────────────────────
@@ -2781,10 +2931,10 @@ fn find_unquoted_equals_multibyte_in_default_value() {
     );
     let params = result.unwrap();
     assert_eq!(params.len(), 1);
-    if let Some(crate::ast::CondValue::String(s)) = &params[0].default {
+    if let Some(Expr::StringLiteral(s)) = &params[0].default {
         assert_eq!(s, "日本語");
     } else {
-        panic!("expected CondValue::String with multibyte content");
+        panic!("expected Expr::StringLiteral with multibyte content");
     }
 }
 

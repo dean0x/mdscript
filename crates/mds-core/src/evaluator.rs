@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::arity::check_arity;
 use crate::ast::{
-    required_param_count, Arg, BlockNode, CondValue, Condition, Expr, ForBlock, IfBlock,
-    IncludeDirective, MessageBlock, Node,
+    required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock, IncludeDirective,
+    MessageBlock, Node,
 };
 use crate::error::MdsError;
 use crate::limits::{
@@ -284,13 +284,30 @@ fn prefer_first_error<T>(
     }
 }
 
-/// Convert a `CondValue` (compile-time literal) to a runtime `Value`.
-pub(crate) fn condvalue_to_value(cv: &CondValue) -> Value {
-    match cv {
-        CondValue::String(s) => Value::String(s.clone()),
-        CondValue::Number(n) => Value::Number(*n),
-        CondValue::Boolean(b) => Value::Boolean(*b),
-        CondValue::Null => Value::Null,
+/// Convert a literal `Expr` (a compile-time `@define` parameter default) to a
+/// runtime `Value`.
+///
+/// `Param.default` is always one of the four literal `Expr` variants —
+/// `parse_define_params` rejects non-literal defaults at parse time (see
+/// `parse_cond_value`). The non-literal arms therefore encode that parser
+/// invariant as a defensive boundary assertion: rather than evaluating an
+/// arbitrary expression (which would need a `Scope`/`EvalContext` and could
+/// resolve a variable or call a function — semantics defaults must never have),
+/// a non-literal default is reported as an internal error. This keeps the
+/// produced `Value`s byte-identical to the prior dedicated literal-to-value
+/// conversion for every well-formed AST.
+pub(crate) fn literal_expr_to_value(expr: &Expr) -> Result<Value, MdsError> {
+    match expr {
+        Expr::StringLiteral(s) => Ok(Value::String(s.clone())),
+        Expr::NumberLiteral(n) => Ok(Value::Number(*n)),
+        Expr::BooleanLiteral(b) => Ok(Value::Boolean(*b)),
+        Expr::NullLiteral => Ok(Value::Null),
+        Expr::Var(_)
+        | Expr::Call { .. }
+        | Expr::QualifiedCall { .. }
+        | Expr::MemberAccess { .. } => Err(MdsError::syntax(
+            "internal error: non-literal expression in parameter default position",
+        )),
     }
 }
 
@@ -351,7 +368,7 @@ fn invoke_function(
                     param.name
                 ))
             })?;
-            condvalue_to_value(default)
+            literal_expr_to_value(default)?
         };
         scope.set_var(&param.name, value);
     }
@@ -1227,7 +1244,7 @@ mod tests {
 
     #[test]
     fn evaluate_default_param_number() {
-        // condvalue_to_value: CondValue::Number → Value::Number
+        // literal_expr_to_value: Expr::NumberLiteral → Value::Number
         let result = crate::compile_str("@define show(x = 42):\n{x}\n@end\n{show()}\n").unwrap();
         assert!(
             result.contains("42"),
@@ -1237,7 +1254,7 @@ mod tests {
 
     #[test]
     fn evaluate_default_param_boolean_true() {
-        // condvalue_to_value: CondValue::Boolean(true) → Value::Boolean(true)
+        // literal_expr_to_value: Expr::BooleanLiteral(true) → Value::Boolean(true)
         let result = crate::compile_str(
             "@define show(flag = true):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{show()}\n",
         )
@@ -1250,7 +1267,7 @@ mod tests {
 
     #[test]
     fn evaluate_default_param_boolean_false() {
-        // condvalue_to_value: CondValue::Boolean(false) → Value::Boolean(false)
+        // literal_expr_to_value: Expr::BooleanLiteral(false) → Value::Boolean(false)
         let result = crate::compile_str(
             "@define show(flag = false):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{show()}\n",
         )
@@ -1263,7 +1280,7 @@ mod tests {
 
     #[test]
     fn evaluate_default_param_null() {
-        // condvalue_to_value: CondValue::Null → Value::Null (falsy)
+        // literal_expr_to_value: Expr::NullLiteral → Value::Null (falsy)
         let result = crate::compile_str(
             "@define show(x = null):\n@if x:\nset\n@else:\nnull_branch\n@end\n@end\n{show()}\n",
         )
