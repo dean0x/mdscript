@@ -29,10 +29,10 @@ describe('backend contract — method manifest', () => {
     );
   });
 
-  test('U-BC2: NODE_METHODS contains compileFile, checkFile', () => {
+  test('U-BC2: NODE_METHODS contains compileFile, checkFile, compileMessagesFile', () => {
     assert.deepEqual(
       [...NODE_METHODS].sort(),
-      ['checkFile', 'compileFile'],
+      ['checkFile', 'compileFile', 'compileMessagesFile'],
     );
   });
 
@@ -343,6 +343,7 @@ describe('backend contract — parity: native backend exposes BASE_METHODS + NOD
     compileMessages: () => validCompileMessagesResult,
     compileFile: () => validCompileResult,
     checkFile: () => validCheckResult,
+    compileMessagesFile: () => validCompileMessagesResult,
   };
 
   const nativeBackend = createNativeBackend(stubAddon);
@@ -395,5 +396,10 @@ describe('backend contract — parity: native backend exposes BASE_METHODS + NOD
   test('U-BC14d: native backend compileFile returns valid result from stub', async () => {
     const result = await nativeBackend.compileFile('path/to/file.mds');
     assertResultShape(result, 'compile');
+  });
+
+  test('U-BC14e: native backend compileMessagesFile returns valid result from stub (PR-A2)', async () => {
+    const result = await nativeBackend.compileMessagesFile('path/to/chat.mds');
+    assertResultShape(result, 'compileMessages');
   });
 });

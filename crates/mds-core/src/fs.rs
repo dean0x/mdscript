@@ -205,7 +205,10 @@ impl NativeFs {
     ///
     /// Strategy: canonicalize parent dir (resolves dir-level symlinks), then
     /// canonicalize the full path. If they differ, the final component is a symlink.
-    fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
+    ///
+    /// `pub(crate)` so that `lib.rs` can apply the same guard to the `--vars`
+    /// file path (PF-004: every sibling read path through the same guard).
+    pub(crate) fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
         let file_name = path
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;

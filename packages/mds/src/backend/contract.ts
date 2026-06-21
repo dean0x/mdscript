@@ -27,9 +27,10 @@ export const BASE_METHODS = ['compile', 'check', 'compileMessages'] as const;
  * Node-only file-based methods. These extend BASE_METHODS on MdsNodeBackend
  * and on the native addon (NapiAddon).
  *
- * PR-A2 will add 'compileMessagesFile' here in exactly one place.
+ * 'compileMessagesFile' added by PR-A2: routes the entry path through the
+ * resolver so symlinks are rejected (full parity with compileFile).
  */
-export const NODE_METHODS = ['compileFile', 'checkFile'] as const;
+export const NODE_METHODS = ['compileFile', 'checkFile', 'compileMessagesFile'] as const;
 
 /**
  * WASM module exports — BASE_METHODS plus the import scanner needed for

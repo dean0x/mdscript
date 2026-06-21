@@ -293,6 +293,22 @@ impl ModuleCache {
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
+    /// Resolve a module from a filesystem path string in messages mode.
+    ///
+    /// Like [`resolve_path`] but runs `evaluate_messages` instead of `evaluate`.
+    /// Routes the entry through the filesystem normalizer (so `check_symlink` and
+    /// `MAX_FILE_SIZE` are enforced on the entry), then delegates to
+    /// [`resolve_key_messages`].
+    pub fn resolve_path_messages(
+        &mut self,
+        path: &str,
+        runtime_vars: &HashMap<String, Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<EvalMessage>, MdsError> {
+        let key = self.fs.normalize("", path)?;
+        self.resolve_key_messages(&key, runtime_vars, warnings)
+    }
+
     /// Resolve a module by its normalized key.
     ///
     /// This is the core resolution loop: cache check → depth check →

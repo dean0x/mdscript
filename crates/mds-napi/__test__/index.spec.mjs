@@ -18,7 +18,7 @@ const require = createRequire(import.meta.url);
 
 // Load the native addon from the built .node file.
 const addon = require('../mds-napi.node');
-const { compile, compileFile, check, checkFile, compileMessages } = addon;
+const { compile, compileFile, check, checkFile, compileMessages, compileMessagesFile } = addon;
 
 // Fixture directory.
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -692,5 +692,146 @@ describe('template inheritance', () => {
         },
       );
     });
+  });
+});
+
+// ── compileMessagesFile tests (PR-A2) ────────────────────────────────────────
+
+describe('compileMessagesFile', () => {
+  // CMF-1: basic happy path — file with @message blocks succeeds
+  test('CMF-1: basic compileMessagesFile returns messages/warnings/dependencies arrays', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
+    try {
+      const entry = path.join(dir, 'chat.mds');
+      fs.writeFileSync(entry, '@message system:\nYou are helpful.\n@end\n@message user:\nHello!\n@end\n');
+      const result = compileMessagesFile(entry);
+      assert.ok(Array.isArray(result.messages), 'messages must be an array');
+      assert.ok(Array.isArray(result.warnings), 'warnings must be an array');
+      assert.ok(Array.isArray(result.dependencies), 'dependencies must be an array');
+      assert.equal(result.messages.length, 2);
+      assert.equal(result.messages[0].role, 'system');
+      assert.equal(result.messages[1].role, 'user');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // CMF-2: entry key excluded from dependencies (parity with compileFile)
+  test('CMF-2: entry file is excluded from dependencies', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
+    try {
+      const provider = path.join(dir, 'helper.mds');
+      fs.writeFileSync(provider, '@define greet(name):\nHi {name}!\n@end\n');
+      const entry = path.join(dir, 'chat.mds');
+      fs.writeFileSync(entry, '@import { greet } from "./helper.mds"\n@message user:\n{greet("World")}\n@end\n');
+      const result = compileMessagesFile(entry);
+      // helper.mds must appear in deps; chat.mds must not
+      const entryReal = fs.realpathSync(entry);
+      assert.ok(
+        !result.dependencies.includes(entryReal) && !result.dependencies.includes(entry),
+        `entry must not be in dependencies; got: ${JSON.stringify(result.dependencies)}`,
+      );
+      assert.ok(result.dependencies.some((d) => d.includes('helper.mds')), 'helper must be in deps');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // CMF-3: nonexistent file throws mds::file_not_found
+  test('CMF-3: nonexistent file throws mds::file_not_found', () => {
+    assert.throws(
+      () => compileMessagesFile('/no/such/file.mds'),
+      (err) => {
+        assert.ok(err instanceof Error, 'should be Error');
+        assert.equal(err.code, 'mds::file_not_found', `got code: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // CMF-4: symlinked entry is rejected (PR-A2 security fix)
+  // Mechanism: Rust resolver calls NativeFs::check_symlink (canonicalize comparison,
+  // fs.rs) which returns ImportError "symlinks are not allowed".
+  test('CMF-4: symlinked entry is rejected', { skip: process.platform === 'win32' }, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
+    try {
+      const real = path.join(dir, 'real.mds');
+      fs.writeFileSync(real, '@message user:\nHello!\n@end\n');
+      const link = path.join(dir, 'link.mds');
+      fs.symlinkSync(real, link);
+      assert.throws(
+        () => compileMessagesFile(link),
+        (err) => {
+          assert.ok(err instanceof Error, 'should be Error');
+          assert.ok(
+            err.message.includes('symlink') || err.message.includes('not allowed'),
+            `error must mention symlinks; got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // CMF-5: basePath option is rejected for file paths
+  test('CMF-5: basePath option throws mds::invalid_options for compileMessagesFile', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
+    try {
+      const entry = path.join(dir, 'chat.mds');
+      fs.writeFileSync(entry, '@message user:\nHello!\n@end\n');
+      assert.throws(
+        () => compileMessagesFile(entry, { basePath: dir }),
+        (err) => {
+          assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+          return true;
+        },
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ── #90 NAPI marshaling fidelity tests ───────────────────────────────────────
+//
+// Content JSON-escaping is already covered at the core level
+// (crates/mds-core/tests/messages.rs:448) — this section covers FFI marshaling:
+// vars with special chars survive the JS→Rust→JS round-trip byte-identical.
+
+describe('NAPI marshaling fidelity (#90)', () => {
+  // MF-1: vars containing special JSON chars — content bytes are preserved
+  test('MF-1: vars with double-quote, backslash, newline, multibyte round-trip byte-identical', () => {
+    // Use a template where the var is used in the message content (not the role),
+    // so we can assert the content field rather than relying on role evaluation.
+    const source = '@message user:\n{data}\n@end\n';
+    // Value contains: double-quote, backslash, embedded newline, multibyte (emoji)
+    const specialValue = 'say "hello"\\ here\nnewline\u{1F600}';
+    const result = compileMessages(source, { vars: { data: specialValue } });
+    assert.equal(result.messages.length, 1, 'should produce 1 message');
+    assert.equal(
+      result.messages[0].content,
+      specialValue,
+      `content must be byte-identical to the input value after FFI round-trip; got: ${JSON.stringify(result.messages[0].content)}`,
+    );
+  });
+
+  // MF-2: empty dynamic role via FFI must throw (ADR-016 runtime check survives marshaling)
+  // An empty role string is invalid per the evaluator — this proves the ADR-016
+  // check fires correctly even after the JS→napi→Rust boundary crossing.
+  test('MF-2: empty dynamic role via FFI throws (ADR-016 survives marshaling)', () => {
+    const source = '@message {role}:\nHello!\n@end\n';
+    assert.throws(
+      () => compileMessages(source, { vars: { role: '' } }),
+      (err) => {
+        assert.ok(err instanceof Error, 'should be Error');
+        assert.ok(
+          err.code.startsWith('mds::'),
+          `error code must start with mds::; got: ${err.code}`,
+        );
+        return true;
+      },
+    );
   });
 });

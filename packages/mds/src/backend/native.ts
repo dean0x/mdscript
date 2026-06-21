@@ -13,7 +13,7 @@ import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS }
 /**
  * Shape of the napi addon exports.
  * compile/check/compileMessages accept { basePath?, vars? } for string sources.
- * compileFile/checkFile accept { vars? } for file paths.
+ * compileFile/checkFile/compileMessagesFile accept { vars? } for file paths.
  */
 interface NapiAddon {
   compile(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): CompileResult;
@@ -21,6 +21,7 @@ interface NapiAddon {
   compileMessages(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): CompileMessagesResult;
   compileFile(path: string, opts?: { vars?: Record<string, unknown> }): CompileResult;
   checkFile(path: string, opts?: { vars?: Record<string, unknown> }): CheckResult;
+  compileMessagesFile(path: string, opts?: { vars?: Record<string, unknown> }): CompileMessagesResult;
 }
 
 /**
@@ -67,6 +68,12 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
       const result: unknown = await addon.checkFile(path, varsOpt(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
+    },
+
+    async compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult> {
+      const result: unknown = await addon.compileMessagesFile(path, varsOpt(options));
+      assertResultShape(result, 'compileMessages');
+      return result as CompileMessagesResult;
     },
 
     getBackend(): BackendType {

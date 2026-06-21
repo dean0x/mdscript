@@ -286,6 +286,134 @@ fn format_messages_from_stdin_produces_valid_json() {
     assert_eq!(arr[1]["role"].as_str().unwrap(), "user");
 }
 
+// ── AC-1: symlinked entry rejected in --format messages ───────────────────────
+
+/// Symlinked entry path in messages mode must be rejected with a symlink error
+/// (proves the PR-A2 fix: entry now routes through resolve_path_messages →
+/// NativeFs::check_symlink, the same canonicalize-comparison gate used by
+/// compile_with_deps for markdown mode).
+#[test]
+#[cfg(unix)]
+fn format_messages_rejects_symlinked_entry() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Real file with valid @message content
+    let real_file = dir.path().join("real.mds");
+    std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
+
+    // Symlink pointing to real.mds
+    let link_file = dir.path().join("link.mds");
+    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            link_file.to_str().unwrap(),
+            "--format",
+            "messages",
+            "-o",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "build --format messages with a symlinked entry must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("symlink") || stderr.contains("not allowed"),
+        "error must mention symlink restriction; got: {stderr}"
+    );
+}
+
+// ── AC-2: symlinked --vars file rejected ──────────────────────────────────────
+
+#[test]
+#[cfg(unix)]
+fn format_messages_rejects_symlinked_vars_file() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // A valid .mds file (entry is not symlinked)
+    let entry = dir.path().join("chat.mds");
+    std::fs::write(&entry, "@message user:\n{greeting}\n@end\n").unwrap();
+
+    // A real vars.json
+    let real_vars = dir.path().join("real_vars.json");
+    std::fs::write(&real_vars, r#"{"greeting": "Hello!"}"#).unwrap();
+
+    // A symlink pointing to the vars file
+    let link_vars = dir.path().join("link_vars.json");
+    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            entry.to_str().unwrap(),
+            "--format",
+            "messages",
+            "--vars",
+            link_vars.to_str().unwrap(),
+            "-o",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "build --vars with a symlinked vars file must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("symlink") || stderr.contains("not allowed"),
+        "error must mention symlink restriction for vars file; got: {stderr}"
+    );
+}
+
+// ── AC-6: directory rejected in messages mode ─────────────────────────────────
+
+#[test]
+fn format_messages_rejects_directory_input() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            dir.path().to_str().unwrap(),
+            "--format",
+            "messages",
+            "-o",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "build --format messages on a directory must fail; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("directory") || stderr.contains("expected a file"),
+        "error must mention directory restriction; got: {stderr}"
+    );
+}
+
+// ── AC-6: stdin still works in messages mode ──────────────────────────────────
+// (already covered by format_messages_from_stdin_produces_valid_json above,
+//  but we add an explicit AC-6 label here for traceability)
+
 // ── I11: oversized file → non-zero exit with clear error message ──────────────
 
 #[test]
@@ -327,4 +455,71 @@ fn format_messages_rejects_oversized_file() {
         stderr.contains("too large") || stderr.contains("max") || stderr.contains("bytes"),
         "error should mention file-size limit; got: {stderr}"
     );
+}
+
+// ── #90 boundary: dynamic role with special characters (CLI process layer) ────
+//
+// Content escaping is already covered at the core level (crates/mds-core/tests/messages.rs:448).
+// This test covers the CLI-process layer boundary: the dynamic role with special chars
+// survives the compile → JSON serialization → stdout → parse round-trip intact with
+// correct message count and role content.
+
+#[test]
+fn format_messages_dynamic_role_special_chars_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Use a vars file to inject the role with special JSON characters.
+    // The role contains characters that are significant to JSON: double-quote and backslash.
+    let vars_file = dir.path().join("vars.json");
+    // Note: the role value in JSON must have these chars escaped; the compiled role should be
+    // the literal string: ad"min\nuser
+    std::fs::write(&vars_file, r#"{"role": "ad\"min\nuser"}"#).unwrap();
+
+    let entry = dir.path().join("chat.mds");
+    std::fs::write(&entry, "@message {role}:\nRequest received.\n@end\n").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            entry.to_str().unwrap(),
+            "--format",
+            "messages",
+            "--vars",
+            vars_file.to_str().unwrap(),
+            "-o",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dynamic role with special chars must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("output must be valid JSON");
+    let arr = parsed.as_array().expect("output must be a JSON array");
+
+    // Message count must be exactly 1, unchanged by special characters in the role.
+    assert_eq!(arr.len(), 1, "expected exactly 1 message; got: {arr:#?}");
+
+    // The role value must round-trip exactly through JSON: the parsed string
+    // must equal the original Go-string-value from the vars, not the raw JSON escape.
+    // serde_json parses escape sequences, so we compare the decoded value.
+    let role = arr[0]["role"].as_str().expect("role must be a string");
+    assert_eq!(
+        role, "ad\"min\nuser",
+        "role must round-trip exactly with escaped chars; got: {role:?}"
+    );
+
+    // Content must be intact regardless of role special chars.
+    let content = arr[0]["content"]
+        .as_str()
+        .expect("content must be a string");
+    assert_eq!(content, "Request received.");
 }

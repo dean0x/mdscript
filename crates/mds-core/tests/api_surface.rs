@@ -870,3 +870,136 @@ fn compile_messages_output_to_json() {
         "missing dependencies key: {json}"
     );
 }
+
+// ── compile_messages_file / _with_deps (I8: new file-based messages API) ────────
+
+type CompileMessagesFileFn =
+    fn(&Path, Option<HashMap<String, Value>>) -> Result<mds::CompileMessagesOutput, MdsError>;
+
+#[test]
+fn compile_messages_file_exists() {
+    // compile_messages_file must be callable and return the right type.
+    // Using a nonexistent path is fine — the signature/existence check is what matters.
+    let _: CompileMessagesFileFn = |p, v| mds::compile_messages_file(p, v);
+}
+
+#[test]
+fn compile_messages_file_with_deps_exists() {
+    // compile_messages_file_with_deps must be callable and return the right type.
+    let _: CompileMessagesFileFn = |p, v| mds::compile_messages_file_with_deps(p, v);
+}
+
+#[test]
+fn compile_messages_file_with_deps_round_trip() {
+    // Write a minimal .mds file, compile via the new file API, verify result.
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("chat.mds");
+    std::fs::write(
+        &entry,
+        "@message system:\nYou are a helpful assistant.\n@end\n\
+         @message user:\nHello!\n@end\n",
+    )
+    .unwrap();
+
+    let result = mds::compile_messages_file_with_deps(&entry, None)
+        .expect("compile_messages_file_with_deps should succeed for a valid file");
+
+    assert_eq!(result.messages.len(), 2, "expected 2 messages");
+    assert_eq!(result.messages[0].role, "system");
+    assert_eq!(result.messages[0].content, "You are a helpful assistant.");
+    assert_eq!(result.messages[1].role, "user");
+    assert_eq!(result.messages[1].content, "Hello!");
+    assert!(result.warnings.is_empty(), "expected no warnings");
+    // Entry key must be excluded from dependencies.
+    assert!(result.dependencies.is_empty(), "no @import → empty deps");
+}
+
+#[test]
+fn compile_messages_file_excludes_entry_from_dependencies() {
+    // compile_messages_file_with_deps must exclude the entry key from dependencies
+    // (parity with compile_with_deps @636-641).
+    let dir = tempfile::tempdir().unwrap();
+
+    // Write a shared helper
+    let helper = dir.path().join("helper.mds");
+    std::fs::write(&helper, "@define greet(name):\nHello {name}!\n@end\n").unwrap();
+
+    // Write the entry that imports the helper
+    let entry = dir.path().join("chat.mds");
+    std::fs::write(
+        &entry,
+        "@import { greet } from \"./helper.mds\"\n\
+         @message user:\n{greet(\"World\")}\n@end\n",
+    )
+    .unwrap();
+
+    let result =
+        mds::compile_messages_file_with_deps(&entry, None).expect("compile should succeed");
+
+    // helper.mds must be in deps; entry (chat.mds) must NOT be.
+    let entry_key = entry.display().to_string();
+    let entry_canonical = std::fs::canonicalize(&entry).unwrap().display().to_string();
+    assert!(
+        !result
+            .dependencies
+            .iter()
+            .any(|d| d == &entry_key || d == &entry_canonical),
+        "entry key must be excluded from dependencies; got: {:?}",
+        result.dependencies
+    );
+    assert!(
+        result.dependencies.iter().any(|d| d.contains("helper.mds")),
+        "helper.mds must be in dependencies; got: {:?}",
+        result.dependencies
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn compile_messages_file_rejects_symlinked_entry() {
+    // Prove symlinked entry is rejected by compile_messages_file — the primary
+    // security fix of PR-A2. Rejection mechanism: NativeFs::check_symlink
+    // (canonicalize-comparison, fs.rs) returns ImportError.
+    let dir = tempfile::tempdir().unwrap();
+
+    let real_file = dir.path().join("real.mds");
+    std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
+
+    // Create a symlink pointing to real.mds
+    let link_file = dir.path().join("linked.mds");
+    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+    let result = mds::compile_messages_file(&link_file, None);
+    assert!(
+        result.is_err(),
+        "symlinked entry must be rejected by compile_messages_file"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("symlink") || err.contains("not allowed"),
+        "error should mention symlink restriction, got: {err}"
+    );
+}
+
+#[test]
+fn compile_messages_file_max_file_size_still_enforced() {
+    // MAX_FILE_SIZE enforcement must not regress on the new file-path API.
+    // The resolver reads the file and checks bytes.len() > MAX_FILE_SIZE.
+    // We create a file that is exactly MAX_FILE_SIZE + 1 bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.mds");
+    // Write MAX_FILE_SIZE + 1 bytes of valid-but-oversized content.
+    let content = "x".repeat((MAX_FILE_SIZE + 1) as usize);
+    std::fs::write(&big, &content).unwrap();
+
+    let result = mds::compile_messages_file(&big, None);
+    assert!(
+        result.is_err(),
+        "oversized entry must be rejected by compile_messages_file"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("too large") || err.contains("maximum size") || err.contains("resource"),
+        "error should mention size limit, got: {err}"
+    );
+}

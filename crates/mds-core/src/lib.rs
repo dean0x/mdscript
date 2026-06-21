@@ -881,6 +881,96 @@ pub fn compile_messages_virtual_with_deps(
     })
 }
 
+/// Compile an MDS file in messages mode, returning structured messages.
+///
+/// Like [`compile_messages_str`] but accepts a filesystem path. The entry path
+/// is routed through the resolver's normalizer (same as [`compile_with_deps`]),
+/// so symlinks and files exceeding `MAX_FILE_SIZE` are rejected before any
+/// content is read.
+///
+/// Warnings (e.g. orphan text outside `@message` blocks) are printed to stderr;
+/// use [`compile_messages_file_with_deps`] to capture them instead.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+///
+/// let result = mds::compile_messages_file(Path::new("chat.mds"), None)?;
+/// for m in &result.messages {
+///     println!("[{}]: {}", m.role, m.content);
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled messages output should be used"]
+pub fn compile_messages_file(
+    path: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileMessagesOutput, MdsError> {
+    let result = compile_messages_file_with_deps(path, runtime_vars)?;
+    emit_warnings(&result.warnings);
+    Ok(result)
+}
+
+/// Compile an MDS file in messages mode, returning structured messages with
+/// full dependency and warning information.
+///
+/// Like [`compile_messages_file`] but returns warnings in the output struct
+/// instead of printing to stderr. This is the file-based counterpart of
+/// [`compile_messages_str_with_deps`].
+///
+/// The entry path is normalised through the resolver — `check_symlink` and
+/// `MAX_FILE_SIZE` apply to the entry file exactly as they do in
+/// [`compile_with_deps`]. The entry key is excluded from `dependencies` to
+/// mirror [`compile_with_deps`].
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+///
+/// let result = mds::compile_messages_file_with_deps(Path::new("chat.mds"), None)?;
+/// for m in &result.messages {
+///     println!("[{}]: {}", m.role, m.content);
+/// }
+/// for dep in &result.dependencies {
+///     println!("dep: {dep}");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled messages output, warnings, and dependencies should be used"]
+pub fn compile_messages_file_with_deps(
+    path: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<CompileMessagesOutput, MdsError> {
+    let path = path.as_ref();
+    let path_str = path_to_str(path)?;
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    let eval_messages = cache.resolve_path_messages(path_str, &vars, &mut warnings)?;
+    // resolve_key_messages (called by resolve_path_messages) does NOT insert the
+    // entry module into the modules cache — only imported sub-modules are inserted
+    // via resolve_by_key. Compute the canonical entry key independently so we can
+    // filter it from `dependencies` without relying on last-in-cache position.
+    // NativeFs::check_symlink is pub(crate) and mirrors the normalize("", path)
+    // check that resolve_path_messages already performed — no extra I/O.
+    let canonical_entry = NativeFs::check_symlink(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path_str.to_owned());
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != &canonical_entry)
+        .collect();
+    let messages = eval_messages.into_iter().map(Message::from).collect();
+    Ok(CompileMessagesOutput {
+        messages,
+        warnings,
+        dependencies,
+    })
+}
+
 /// Check (validate) a module from an in-memory virtual filesystem without rendering output.
 ///
 /// `modules` is a map of key → source content. `entry` is the key of the
@@ -1050,6 +1140,16 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
     let path_str = path_to_str(path)?;
+    // PF-004: guard the vars-file path through the same symlink check that the
+    // resolver applies to every imported file — avoids a raw read that bypasses
+    // the security gate. check_symlink returns the canonical path; we use the
+    // original path for error messages (it names what the caller passed).
+    NativeFs::check_symlink(path).map_err(|e| match e {
+        MdsError::ImportError { .. } => MdsError::import_error(format!(
+            "symlinks are not allowed in vars file path: {path_str}"
+        )),
+        other => other,
+    })?;
     // Read bytes first, then check size (same TOCTOU-safe pattern as resolver.rs).
     let bytes = std::fs::read(path)
         .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?;

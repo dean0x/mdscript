@@ -93,6 +93,13 @@ function wrapWithFileOps(
       const { source, opts } = await prepareFileArgs(path, options);
       return wasmModule.check(source, opts);
     },
+
+    async compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult> {
+      // Symlink check is performed JS-side by buildModulesMap (O_NOFOLLOW / realpath)
+      // — same security path as compileFile on the WASM backend.
+      const { source, opts } = await prepareFileArgs(path, options);
+      return wasmModule.compileMessages(source, opts);
+    },
   };
 }
 
@@ -220,6 +227,11 @@ export function compileFile(path: string, options?: FileOptions): Promise<Compil
 /** Validate an MDS file without rendering, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
 export function checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
   return assertReady().checkFile(path, options);
+}
+
+/** Compile `@message` blocks from an MDS file to structured chat messages, resolving @import directives relative to the file. The entry path is symlink-checked. Requires init() to have been called and awaited first. */
+export function compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult> {
+  return assertReady().compileMessagesFile(path, options);
 }
 
 /** Returns which backend is currently active: 'native' or 'wasm'. Requires init() to have been called and awaited first. */

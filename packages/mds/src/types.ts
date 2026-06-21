@@ -99,6 +99,9 @@ export interface MdsBaseBackend {
 export interface MdsNodeBackend extends MdsBaseBackend {
   compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
   checkFile(path: string, options?: FileOptions): Promise<CheckResult>;
+  /** Compile `@message` blocks from a file to structured chat messages.
+   *  The entry path is symlink-checked (same security guard as compileFile). */
+  compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult>;
 }
 
 /**

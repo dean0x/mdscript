@@ -698,3 +698,55 @@ pub fn compile_messages(
         dependencies: result.dependencies,
     })
 }
+
+/// Compile an MDS template file in messages mode, returning structured chat messages.
+///
+/// Like `compileMessages` but accepts a filesystem path. The entry path is
+/// routed through the resolver's normalizer so symlinks and files exceeding
+/// the size limit are rejected before any content is read (same security path
+/// as `compileFile`).
+///
+/// ## Arguments
+///
+/// - `path`: path to the `.mds` file to compile in messages mode.
+/// - `opts`: optional configuration object:
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///
+/// `basePath` is not accepted — the base directory is derived from the file's
+/// own directory.
+///
+/// ## Returns
+///
+/// On success, `{ messages: [{ role: string, content: string }], warnings: string[], dependencies: string[] }`.
+/// The entry file itself is excluded from `dependencies`.
+///
+/// On failure, throws a JS `Error` with the same structure as `compileMessages`.
+#[napi(js_name = "compileMessagesFile")]
+pub fn compile_messages_file(
+    env: Env,
+    path: String,
+    opts: Option<Object>,
+) -> napi::Result<CompileMessagesResult> {
+    let vars = parse_file_opts(&env, opts)?;
+
+    let path_buf = PathBuf::from(path);
+    let result = run_catching(
+        &env,
+        AssertUnwindSafe(move || mds::compile_messages_file_with_deps(&path_buf, vars)),
+    )?;
+
+    let messages = result
+        .messages
+        .into_iter()
+        .map(|m| Message {
+            role: m.role,
+            content: m.content,
+        })
+        .collect();
+
+    Ok(CompileMessagesResult {
+        messages,
+        warnings: result.warnings,
+        dependencies: result.dependencies,
+    })
+}

@@ -488,22 +488,44 @@ pub(crate) fn compile_to_content(
             })
         }
         OutputFormat::Messages => {
-            let (source, base_dir) = read_build_input(input)?;
-            let result =
-                mds::compile_messages_str_with_deps(&source, Some(&base_dir), runtime_vars)
-                    .map_err(miette::Error::from)?;
-            if !quiet {
-                for w in &result.warnings {
-                    eprintln!("{w}");
+            if input == Path::new("-") {
+                // Stdin: symlink check is not applicable — stdin has no filesystem path.
+                // read_build_input handles "-" and enforces MAX_FILE_SIZE on the stream.
+                let (source, base_dir) = read_build_input(input)?;
+                let result =
+                    mds::compile_messages_str_with_deps(&source, Some(&base_dir), runtime_vars)
+                        .map_err(miette::Error::from)?;
+                if !quiet {
+                    for w in &result.warnings {
+                        eprintln!("{w}");
+                    }
                 }
+                let mut json = serde_json::to_string_pretty(&result.messages)
+                    .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
+                json.push('\n');
+                Ok(CompileOutput {
+                    content: json,
+                    dependencies: result.dependencies,
+                })
+            } else {
+                // File path: route through compile_messages_file_with_deps so the entry
+                // path passes through the resolver's check_symlink + MAX_FILE_SIZE guard
+                // (same security path as mds::compile_with_deps for markdown mode).
+                let result = mds::compile_messages_file_with_deps(input, runtime_vars)
+                    .map_err(miette::Error::from)?;
+                if !quiet {
+                    for w in &result.warnings {
+                        eprintln!("{w}");
+                    }
+                }
+                let mut json = serde_json::to_string_pretty(&result.messages)
+                    .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
+                json.push('\n');
+                Ok(CompileOutput {
+                    content: json,
+                    dependencies: result.dependencies,
+                })
             }
-            let mut json = serde_json::to_string_pretty(&result.messages)
-                .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
-            json.push('\n');
-            Ok(CompileOutput {
-                content: json,
-                dependencies: result.dependencies,
-            })
         }
     }
 }
@@ -605,6 +627,8 @@ fn run_build_messages(
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<()> {
+    // Directory check: mirrors run_build_markdown — a directory cannot be compiled.
+    reject_directory_input(&input)?;
     // Messages mode: output always goes to stdout (or -o); no output-dir / config logic.
     let output_path = match output.as_deref() {
         Some("-") | None => None,
