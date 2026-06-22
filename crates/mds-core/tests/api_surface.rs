@@ -1003,3 +1003,14 @@ fn compile_messages_file_max_file_size_still_enforced() {
         "error should mention size limit, got: {err}"
     );
 }
+
+// ── NativeFs::check_symlink public API pin ────────────────────────────────────
+
+#[test]
+fn native_fs_check_symlink_is_public() {
+    // Pin that NativeFs::check_symlink is part of the public API surface.
+    // This will fail to compile if the visibility is ever narrowed back to pub(crate).
+    use std::path::PathBuf;
+    type CheckSymlinkFn = fn(&Path) -> Result<PathBuf, MdsError>;
+    let _: CheckSymlinkFn = mds::NativeFs::check_symlink;
+}

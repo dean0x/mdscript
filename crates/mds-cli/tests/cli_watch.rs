@@ -3492,3 +3492,225 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
          (a spurious recompile would update it)"
     );
 }
+
+// ── AC-1/2/3/4: Symlink rejection at startup (parity with mds build) ─────────
+//
+// PF-004: an alternate code path (watch's up-front canonicalize) was silently
+// bypassing the symlink guard enforced by NativeFs in mds build. These tests
+// lock in the fix: mds watch now rejects symlinked entry / dir target / --vars
+// at startup, matching mds build behavior.
+
+/// AC-1: `mds watch <symlinked-file>` must reject at startup (non-zero exit;
+/// stderr names the symlink restriction).  Mirrors
+/// `format_messages_rejects_symlinked_entry` in format_messages.rs.
+#[test]
+#[cfg(unix)]
+fn watch_rejects_symlinked_entry() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Real file with valid content.
+    let real_file = dir.path().join("real.mds");
+    std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
+
+    // Symlink → real file.
+    let link_file = dir.path().join("link.mds");
+    std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+
+    let out = dir.path().join("out.md");
+
+    let output = mds_bin()
+        .args([
+            "watch",
+            link_file.to_str().unwrap(),
+            "--format",
+            "messages",
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "watch with a symlinked entry must fail at startup; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("symlink") || stderr.contains("not allowed"),
+        "error must mention symlink restriction; got: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "output file must not be created when entry is rejected at startup"
+    );
+}
+
+/// AC-2 (file mode): `mds watch <entry> --vars <symlinked-vars>` must reject at
+/// startup (non-zero; stderr mentions symlink).  Mirrors
+/// `format_messages_rejects_symlinked_vars_file` in format_messages.rs.
+#[test]
+#[cfg(unix)]
+fn watch_rejects_symlinked_vars_file() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Real entry and vars files.
+    let entry = dir.path().join("entry.mds");
+    std::fs::write(&entry, "---\nname: World\n---\nHello {name}!\n").unwrap();
+
+    let real_vars = dir.path().join("real_vars.json");
+    std::fs::write(&real_vars, r#"{"name": "World"}"#).unwrap();
+
+    // Symlink → real vars.
+    let link_vars = dir.path().join("link_vars.json");
+    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+
+    let out = dir.path().join("out.md");
+
+    let output = mds_bin()
+        .args([
+            "watch",
+            entry.to_str().unwrap(),
+            "--vars",
+            link_vars.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "watch with a symlinked --vars must fail at startup; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("symlink") || stderr.contains("not allowed"),
+        "error must mention symlink restriction for vars; got: {stderr}"
+    );
+}
+
+/// AC-3: `mds watch <symlinked-dir>` must reject at startup (non-zero; stderr names
+/// the symlink restriction; the symlinked dir is never traversed).
+#[test]
+#[cfg(unix)]
+fn watch_rejects_symlinked_dir_target() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Real source directory with a valid .mds file.
+    let real_src = dir.path().join("real_src");
+    std::fs::create_dir(&real_src).unwrap();
+    std::fs::write(
+        real_src.join("a.mds"),
+        "---\nname: A\n---\nFile A: {name}\n",
+    )
+    .unwrap();
+
+    // Symlink → the real source directory.
+    let link_dir = dir.path().join("link_src");
+    std::os::unix::fs::symlink(&real_src, &link_dir).unwrap();
+
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "watch",
+            link_dir.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "watch with a symlinked dir target must fail at startup; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("symlink") || stderr.contains("not allowed"),
+        "error must mention symlink restriction; got: {stderr}"
+    );
+    assert!(
+        !out_dir.join("a.md").exists(),
+        "symlinked dir must never be traversed; a.md must not be created"
+    );
+}
+
+/// AC-4: A symlinked `.mds` source file inside a watched real directory is NOT
+/// compiled, while a real sibling compiles normally.  This locks in the existing
+/// discovery-skip behavior in `collect_mds_files` (dir entries that are symlinks
+/// are already excluded by the follow-symlinks=false DirEntry filter).
+#[test]
+#[cfg(unix)]
+fn watch_dir_skips_symlinked_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Real source directory — the one we watch.
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+
+    // A real .mds file inside the watched dir — SHOULD compile.
+    std::fs::write(src.join("a.mds"), "---\nname: A\n---\nFile A: {name}\n").unwrap();
+
+    // An external .mds file to be pointed at by the symlink.
+    let external_dir = dir.path().join("external");
+    std::fs::create_dir(&external_dir).unwrap();
+    std::fs::write(
+        external_dir.join("external.mds"),
+        "---\nname: Ext\n---\nExternal: {name}\n",
+    )
+    .unwrap();
+
+    // A symlinked .mds file inside the watched dir — must NOT compile.
+    let link_mds = src.join("link.mds");
+    std::os::unix::fs::symlink(external_dir.join("external.mds"), &link_mds).unwrap();
+
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+
+    let child = ChildGuard(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Wait for the real file to compile.
+    assert!(
+        wait_for_file_contains(&out_dir.join("a.md"), "File A: A", TIMEOUT),
+        "a.md (real sibling) should be compiled"
+    );
+
+    // The symlinked source must never appear in the output.
+    // Poll briefly — if the watcher were to incorrectly process it, it would appear.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        assert!(
+            !out_dir.join("link.md").exists(),
+            "link.md must not be created — symlinked source files must be skipped"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    drop(child);
+}
