@@ -954,8 +954,8 @@ pub fn compile_messages_file_with_deps(
     // entry module into the modules cache — only imported sub-modules are inserted
     // via resolve_by_key. Compute the canonical entry key independently so we can
     // filter it from `dependencies` without relying on last-in-cache position.
-    // NativeFs::check_symlink is pub(crate) and mirrors the normalize("", path)
-    // check that resolve_path_messages already performed — no extra I/O.
+    // NativeFs::check_symlink mirrors the normalize("", path) check that
+    // resolve_path_messages already performed — no extra I/O.
     let canonical_entry = NativeFs::check_symlink(path)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| path_str.to_owned());

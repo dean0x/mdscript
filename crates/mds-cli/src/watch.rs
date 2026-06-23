@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 use miette::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use mds::MdsError;
+
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
     resolve_output_path, write_output, MdsConfig, OutputFormat,
@@ -490,15 +492,20 @@ pub(crate) fn external_recovery_decision(
 /// Canonicalize an optional vars path so it matches the canonical paths in notify
 /// events (e.g. resolves `/tmp` → `/private/tmp` on macOS).
 ///
-/// Falls back to the raw path when canonicalization fails (file may not exist yet).
-pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Option<PathBuf> {
-    vars.map(|p| {
-        if p.exists() {
-            p.canonicalize().unwrap_or(p)
-        } else {
-            p
+/// Rejects a symlinked vars file at startup (build parity — PF-004).
+/// Falls back to the raw path when the file does not yet exist (the user may create
+/// it later; the per-rebuild `load_vars_file` will catch it then).
+pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
+    match vars {
+        Some(p) if p.exists() => {
+            mds::NativeFs::check_symlink(&p)
+                .map(Some)
+                .map_err(|_| MdsError::Io {
+                    message: format!("--vars file must not be a symlink: {}", p.display()),
+                })
         }
-    })
+        other => Ok(other),
+    }
 }
 
 /// Write the ANSI clear-screen sequence to stderr if stderr is a TTY.
@@ -695,10 +702,11 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         }
     }
 
-    // Canonicalize the input path for stable comparisons.
-    let canonical_input = resolved_input
-        .canonicalize()
-        .map_err(|e| miette::miette!("cannot resolve path {}: {e}", resolved_input.display()))?;
+    // Reject a symlinked entry/target (build parity — PF-004); plain canonicalize
+    // would silently follow it. check_symlink returns the canonical path for
+    // non-symlinks, preserving FSEvents path-matching.
+    let canonical_input =
+        mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
 
     // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (ADR-021).
     let tick_opt: Option<Duration> = clamp_poll_interval(poll_interval);
@@ -1008,7 +1016,8 @@ fn run_watch_file(
     let config = load_config(&entry)?;
     let output_path = resolve_output_path(&Some(entry.clone()), &output, &out_dir, &config)?;
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    let vars_path = canonicalize_vars_path(vars);
+    // Also rejects a symlinked vars file at startup (build parity — PF-004).
+    let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
 
     // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
     let static_set_vars = set_vars;
@@ -1664,7 +1673,8 @@ fn dir_watch_startup(
     // Load config once from the root directory.
     let config = load_config(&root)?;
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    let vars_path = canonicalize_vars_path(vars);
+    // Also rejects a symlinked vars file at startup (build parity — PF-004).
+    let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
     let static_set_vars = set_vars;
 
     // Resolve the out_dir as absolute and canonicalized so that

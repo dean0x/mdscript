@@ -66,10 +66,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security & resource limits
 
+- `mds watch` now rejects a symlinked entry file, symlinked `--vars` file, or symlinked
+  directory target at startup (non-zero exit, symlink message on stderr) — parity with
+  `mds build`. Previously `mds watch` called `std::fs::canonicalize` up-front, silently
+  following symlinks that `mds build` would reject via the core `NativeFs::check_symlink`
+  guard (PF-004: alternate code path bypassing a security guard). The fix routes watch
+  startup through the same guard, replacing the prior `canonicalize()` call with
+  `NativeFs::check_symlink()`, which returns the canonical path for non-symlinks (FSEvents
+  path-matching unchanged) and rejects symlinked final components. Symlinked `.mds` source
+  files inside a watched directory continue to be skipped at discovery (locked in by test).
 - `MAX_MESSAGE_COUNT` (10,000) cap: templates exceeding this limit return a resource
   error rather than allocating unboundedly.
 - Cumulative message-content size cap (50 MB): enforced per-compile across all
   `@message` blocks.
+
+### Library API (additions)
+
+- `NativeFs::check_symlink(path: &Path) -> Result<PathBuf, MdsError>` is now `pub`
+  (was `pub(crate)`). Canonicalizes `path` and rejects a symlinked final component;
+  returns the canonical `PathBuf` for non-symlinks. Callable as
+  `mds::NativeFs::check_symlink(path)`.
 
 ### Ecosystem
 
