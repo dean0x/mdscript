@@ -4,6 +4,17 @@
 //! Node.js as native add-ons. All compilation runs against the real OS
 //! filesystem — no virtual FS layer.
 //!
+//! ## Canonical result object
+//!
+//! `compile` and `compileFile` return a discriminated union object:
+//!
+//! - Markdown: `{ kind: "markdown", output: <string>, warnings: string[], dependencies: string[] }`
+//! - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
+//!
+//! The **inactive payload field is ABSENT** — a markdown result has no `messages` key;
+//! a messages result has no `output` key. The object is constructed field-by-field using
+//! `serde_json::Value` so napi-rs's struct-derive path cannot inject an unwanted field.
+//!
 //! ## Error codes
 //!
 //! Errors thrown at the napi boundary carry a `code` property (set via
@@ -24,10 +35,12 @@
 //! const { compile, compileFile, check, checkFile } = require('./index');
 //!
 //! const result = compile('Hello {name}!\n', { vars: { name: 'World' } });
+//! console.log(result.kind);   // "markdown"
 //! console.log(result.output); // "Hello World!\n"
 //!
-//! const fileResult = compileFile('/path/to/template.mds');
-//! console.log(fileResult.output);
+//! const msgResult = compile('@message user:\nHi\n@end\n');
+//! console.log(msgResult.kind);            // "messages"
+//! console.log(msgResult.messages[0].role); // "user"
 //! ```
 
 #![allow(clippy::needless_pass_by_value)]
@@ -54,46 +67,11 @@ const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
 // ── Return types ──────────────────────────────────────────────────────────────
 
-/// Result returned by `compile` and `compileFile`.
-#[napi(object)]
-pub struct CompileResult {
-    /// The rendered Markdown output.
-    pub output: String,
-    /// Warnings emitted during compilation (e.g. empty `@include`).
-    pub warnings: Vec<String>,
-    /// Absolute paths of all files imported during compilation, in
-    /// depth-first resolution order. Excludes the entry file itself.
-    pub dependencies: Vec<String>,
-}
-
 /// Result returned by `check` and `checkFile`.
 #[napi(object)]
 pub struct CheckResult {
     /// Warnings emitted during validation (e.g. empty `@include`).
     pub warnings: Vec<String>,
-}
-
-/// A single structured message returned by `compileMessages`.
-///
-/// Mirrors a chat API message: `{ role: string, content: string }`.
-#[napi(object)]
-pub struct Message {
-    /// The role string (e.g. `"system"`, `"user"`, `"assistant"`).
-    pub role: String,
-    /// The rendered body text of the message (trimmed).
-    pub content: String,
-}
-
-/// Result returned by `compileMessages`.
-#[napi(object)]
-pub struct CompileMessagesResult {
-    /// Structured messages produced from `@message` blocks.
-    pub messages: Vec<Message>,
-    /// Warnings emitted during compilation (e.g. orphan text outside `@message`).
-    pub warnings: Vec<String>,
-    /// Absolute paths of all files imported during compilation, in
-    /// depth-first resolution order. Excludes the entry file itself.
-    pub dependencies: Vec<String>,
 }
 
 // ── Low-level error helpers ───────────────────────────────────────────────────
@@ -523,6 +501,60 @@ fn parse_file_opts(
     Ok(vars)
 }
 
+// ── Canonical result object builder ──────────────────────────────────────────
+
+/// Build the canonical `{ kind, <active-payload>, warnings, dependencies }` JS object
+/// from a [`mds::CompileResult`], as a `serde_json::Value`.
+///
+/// Shape:
+/// - Markdown: `{ kind: "markdown", output: <string>, warnings: string[], dependencies: string[] }`
+/// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
+///
+/// The **inactive payload field is ABSENT** from the returned value — a markdown result
+/// has no `messages` key and a messages result has no `output` key. Explicit field-by-field
+/// construction prevents napi-rs struct-derive from injecting unwanted fields.
+fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
+    let warnings: serde_json::Value = result
+        .warnings
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>()
+        .into();
+    let dependencies: serde_json::Value = result
+        .dependencies
+        .into_iter()
+        .map(serde_json::Value::String)
+        .collect::<Vec<_>>()
+        .into();
+
+    match result.output {
+        mds::CompiledOutput::Markdown(text) => serde_json::json!({
+            "kind": "markdown",
+            "output": text,
+            "warnings": warnings,
+            "dependencies": dependencies,
+        }),
+        mds::CompiledOutput::Messages(msgs) => {
+            let messages: serde_json::Value = msgs
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "role": m.role,
+                        "content": m.content,
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
+            serde_json::json!({
+                "kind": "messages",
+                "messages": messages,
+                "warnings": warnings,
+                "dependencies": dependencies,
+            })
+        }
+    }
+}
+
 // ── Public napi exports ───────────────────────────────────────────────────────
 
 /// Compile an MDS template source string and return a structured result.
@@ -537,14 +569,18 @@ fn parse_file_opts(
 ///
 /// ## Returns
 ///
-/// On success, `{ output: string, warnings: string[], dependencies: string[] }`.
+/// On success:
+/// - Markdown: `{ kind: "markdown", output: string, warnings: string[], dependencies: string[] }`
+/// - Messages: `{ kind: "messages", messages: [{role:string,content:string},...], warnings: string[], dependencies: string[] }`
+///
+/// The inactive payload field is absent from the returned object.
 ///
 /// On failure, throws a JS `Error` with additional properties:
 /// - `code`: diagnostic code (e.g. `"mds::syntax"`)
 /// - `help`: optional hint string
 /// - `span`: optional `{ offset, length, line?, column? }`
 #[napi]
-pub fn compile(env: Env, source: String, opts: Option<Object>) -> napi::Result<CompileResult> {
+pub fn compile(env: Env, source: String, opts: Option<Object>) -> napi::Result<serde_json::Value> {
     check_source_size(&env, &source)?;
 
     let (base_path, vars) = parse_compile_opts(&env, opts)?;
@@ -554,11 +590,7 @@ pub fn compile(env: Env, source: String, opts: Option<Object>) -> napi::Result<C
         AssertUnwindSafe(move || mds::compile_str_with_deps(&source, base_path.as_deref(), vars)),
     )?;
 
-    Ok(CompileResult {
-        output: result.output,
-        warnings: result.warnings,
-        dependencies: result.dependencies,
-    })
+    Ok(build_canonical_result(result))
 }
 
 /// Compile an MDS template file and return a structured result.
@@ -576,7 +608,11 @@ pub fn compile(env: Env, source: String, opts: Option<Object>) -> napi::Result<C
 ///
 /// Same shape as `compile`. Dependencies are absolute filesystem paths.
 #[napi(js_name = "compileFile")]
-pub fn compile_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<CompileResult> {
+pub fn compile_file(
+    env: Env,
+    path: String,
+    opts: Option<Object>,
+) -> napi::Result<serde_json::Value> {
     let vars = parse_file_opts(&env, opts)?;
 
     let path_buf = PathBuf::from(path);
@@ -585,11 +621,7 @@ pub fn compile_file(env: Env, path: String, opts: Option<Object>) -> napi::Resul
         AssertUnwindSafe(move || mds::compile_with_deps(&path_buf, vars)),
     )?;
 
-    Ok(CompileResult {
-        output: result.output,
-        warnings: result.warnings,
-        dependencies: result.dependencies,
-    })
+    Ok(build_canonical_result(result))
 }
 
 /// Check (validate) an MDS template source string without rendering output.
@@ -641,112 +673,4 @@ pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<
     )?;
 
     Ok(CheckResult { warnings })
-}
-
-/// Compile an MDS template source string in messages mode, returning structured chat messages.
-///
-/// Each `@message role:` ... `@end` block becomes one entry in `messages`.
-/// Orphan text outside `@message` blocks is ignored with a warning.
-/// Empty messages (after trimming) are silently skipped.
-///
-/// Returns an error when the template contains no `@message` blocks.
-///
-/// ## Arguments
-///
-/// - `source`: MDS template source text.
-/// - `opts`: optional configuration object:
-///   - `basePath` (string): base directory for resolving `@import` paths.
-///   - `vars` (`Record<string, any>`): runtime variable overrides.
-///
-/// ## Returns
-///
-/// On success, `{ messages: [{ role: string, content: string }], warnings: string[], dependencies: string[] }`.
-///
-/// On failure, throws a JS `Error` with additional properties:
-/// - `code`: diagnostic code (e.g. `"mds::syntax"`)
-/// - `help`: optional hint string
-/// - `span`: optional `{ offset, length, line?, column? }`
-#[napi(js_name = "compileMessages")]
-pub fn compile_messages(
-    env: Env,
-    source: String,
-    opts: Option<Object>,
-) -> napi::Result<CompileMessagesResult> {
-    check_source_size(&env, &source)?;
-
-    let (base_path, vars) = parse_compile_opts(&env, opts)?;
-
-    let result = run_catching(
-        &env,
-        AssertUnwindSafe(move || {
-            mds::compile_messages_str_with_deps(&source, base_path.as_deref(), vars)
-        }),
-    )?;
-
-    let messages = result
-        .messages
-        .into_iter()
-        .map(|m| Message {
-            role: m.role,
-            content: m.content,
-        })
-        .collect();
-
-    Ok(CompileMessagesResult {
-        messages,
-        warnings: result.warnings,
-        dependencies: result.dependencies,
-    })
-}
-
-/// Compile an MDS template file in messages mode, returning structured chat messages.
-///
-/// Like `compileMessages` but accepts a filesystem path. The entry path is
-/// routed through the resolver's normalizer so symlinks and files exceeding
-/// the size limit are rejected before any content is read (same security path
-/// as `compileFile`).
-///
-/// ## Arguments
-///
-/// - `path`: path to the `.mds` file to compile in messages mode.
-/// - `opts`: optional configuration object:
-///   - `vars` (`Record<string, any>`): runtime variable overrides.
-///
-/// `basePath` is not accepted — the base directory is derived from the file's
-/// own directory.
-///
-/// ## Returns
-///
-/// On success, `{ messages: [{ role: string, content: string }], warnings: string[], dependencies: string[] }`.
-/// The entry file itself is excluded from `dependencies`.
-///
-/// On failure, throws a JS `Error` with the same structure as `compileMessages`.
-#[napi(js_name = "compileMessagesFile")]
-pub fn compile_messages_file(
-    env: Env,
-    path: String,
-    opts: Option<Object>,
-) -> napi::Result<CompileMessagesResult> {
-    let vars = parse_file_opts(&env, opts)?;
-
-    let path_buf = PathBuf::from(path);
-    let result = run_catching(
-        &env,
-        AssertUnwindSafe(move || mds::compile_messages_file_with_deps(&path_buf, vars)),
-    )?;
-
-    let messages = result
-        .messages
-        .into_iter()
-        .map(|m| Message {
-            role: m.role,
-            content: m.content,
-        })
-        .collect();
-
-    Ok(CompileMessagesResult {
-        messages,
-        warnings: result.warnings,
-        dependencies: result.dependencies,
-    })
 }

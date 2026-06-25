@@ -499,11 +499,10 @@ fn scan_imports_handles_all_directive_forms() {
 
 /// Build a modules option for inheritance tests.
 ///
-/// `source` (child_src) is passed as the first argument to `compile` /
-/// `compile_messages` and is registered under `"filename"` by the binding.
-/// `modules` must therefore contain ONLY the *other* files (the base template),
-/// not the entry file — otherwise the binding rejects it with
-/// `mds::filename_collision`.
+/// `source` (child_src) is passed as the first argument to `compile` and is
+/// registered under `"filename"` by the binding. `modules` must therefore
+/// contain ONLY the *other* files (the base template), not the entry file —
+/// otherwise the binding rejects it with `mds::filename_collision`.
 fn inheritance_modules_opts(child_src: &str, base_src: &str) -> JsValue {
     let _ = child_src; // entry content is passed as `source`, not in modules
     to_js_object(&serde_json::json!({
@@ -555,18 +554,30 @@ fn compile_extends_text_mode_skeleton_and_override() {
 
 #[wasm_bindgen_test]
 fn compile_extends_dependencies_contains_base() {
-    // A4 (WASM): output shape must have {output, warnings, dependencies} — no new fields.
+    // A4 (WASM): compile() returns the canonical { kind, output|messages, warnings, dependencies }.
+    // Markdown results must have { kind:"markdown", output, warnings, dependencies }.
     // The base must appear in the dependencies list.
     let base_src = "@block body:\nBase default.\n@end\n";
     let child_src = "@extends \"./base.mds\"\n";
     let opts = inheritance_modules_opts(child_src, base_src);
     let result = mds_wasm::compile(child_src, opts).unwrap();
 
-    // A4: shape check — only {output, warnings, dependencies}.
+    // A4: shape check — kind is "markdown", output is a string.
+    let kind = get_str(&result, "kind");
+    assert_eq!(
+        kind, "markdown",
+        "WASM A4: kind must be 'markdown' for text output"
+    );
     let output = get_prop(&result, "output");
     assert!(
         output.as_string().is_some(),
         "WASM A4: output must be a string"
+    );
+    // messages field must be absent for markdown results.
+    let messages_field = get_prop(&result, "messages");
+    assert!(
+        messages_field.is_undefined(),
+        "WASM A4: messages field must be absent for markdown result"
     );
     let warnings = get_prop(&result, "warnings");
     assert!(
@@ -586,14 +597,14 @@ fn compile_extends_dependencies_contains_base() {
         .collect();
     assert!(
         dep_strings.iter().any(|s| s.contains("base.mds")),
-        "WASM F1: dependencies must contain base.mds; got: {dep_strings:?}"
+        "WASM A4: dependencies must contain base.mds; got: {dep_strings:?}"
     );
 }
 
 #[wasm_bindgen_test]
 fn compile_extends_messages_mode() {
-    // F9 (WASM): child overrides a block containing a @message; messages mode
-    // must return the correct {messages, warnings, dependencies} shape.
+    // F9 (WASM): child overrides a block containing a @message; compile() returns
+    // the canonical { kind: "messages", messages, warnings, dependencies } shape.
     let base_src = concat!(
         "---\nrole: assistant\n---\n",
         "@block system_msg:\n@message system:\nYou are a {role}.\n@end\n@end\n",
@@ -606,8 +617,18 @@ fn compile_extends_messages_mode() {
     );
     let opts = inheritance_modules_opts(child_src, base_src);
 
-    // The WASM binding exposes `compile_messages` as the messages-mode entry point.
-    let result = mds_wasm::compile_messages(child_src, opts).unwrap();
+    // compile() dispatches intrinsically: @message content → kind:"messages".
+    let result = mds_wasm::compile(child_src, opts).unwrap();
+
+    let kind = get_str(&result, "kind");
+    assert_eq!(kind, "messages", "WASM F9: kind must be 'messages'");
+
+    // output field must be absent for messages results.
+    let output_field = get_prop(&result, "output");
+    assert!(
+        output_field.is_undefined(),
+        "WASM F9: output field must be absent for messages result"
+    );
 
     let messages_val = get_prop(&result, "messages");
     assert!(
