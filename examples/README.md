@@ -11,10 +11,11 @@ mds build examples/ai-agent/system-prompt.mds -o -
 
 | Directory | What it shows |
 |-----------|---------------|
-| [`ai-agent/`](ai-agent/) | System prompts, multi-turn conversations, and tool instructions for LLM agents |
+| [`ai-agent/`](ai-agent/) | System prompts, multi-turn conversations, tool instructions, and structured `@message` chat output ([`chat-messages.mds`](ai-agent/chat-messages.mds)) for LLM agents |
 | [`api-docs/`](api-docs/) | Generating API documentation from endpoint and response-schema templates |
 | [`blog-generator/`](blog-generator/) | A blog post template driven by frontmatter variables |
 | [`prompt-library/`](prompt-library/) | A reusable prompt library using `@export`/`@import` (personas, formatting, guardrails) |
+| [`inheritance/`](inheritance/) | Template inheritance with `@extends`/`@block` — one base agent skeleton specialized into a data analyst and a code reviewer |
 | [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports |
 | [`stress-test/`](stress-test/) | A large, deeply-composed template tree exercising the resolver and evaluator |
 
@@ -23,6 +24,25 @@ Some examples take runtime variables — pass the accompanying `vars.json`:
 ```bash
 mds build examples/edge-cases/08_runtime_vars.mds --vars examples/edge-cases/vars.json -o -
 ```
+
+## Output formats
+
+By default `mds build` emits Markdown text. A template that declares `@message`
+blocks can additionally compile to a JSON array of chat messages with
+`--format messages` — ready to pass straight to a chat LLM API's `messages`
+parameter:
+
+```bash
+# Text mode (default): @message bodies render inline (backward compatible)
+mds build examples/ai-agent/chat-messages.mds -o -
+
+# Messages mode: JSON array of { "role", "content" } objects
+mds build examples/ai-agent/chat-messages.mds --format messages -o -
+```
+
+From JavaScript, the same two modes are `compile`/`compileFile` (text) and
+`compileMessages`/`compileMessagesFile` (messages array), exported from
+`@mdscript/mds`.
 
 ## Node.js API
 
