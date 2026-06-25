@@ -307,6 +307,30 @@ pub enum MdsError {
         #[source_code]
         src: Option<Arc<miette::NamedSource<String>>>,
     },
+
+    /// Mixed content in a messages template: non-whitespace `Text` or `Interpolation`
+    /// outside any `@message` block in a template that has `@message` blocks.
+    #[error("mixed content: non-message content found outside @message blocks")]
+    #[diagnostic(
+        code(mds::mixed_content),
+        help("move all text and interpolations inside @message blocks, or remove the @message blocks to use plain markdown mode")
+    )]
+    MixedContent {
+        #[label("non-message content here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
+
+    /// Attempted to extract Markdown output from a Messages result.
+    #[error("expected markdown output, but template produced messages")]
+    #[diagnostic(code(mds::expected_markdown))]
+    ExpectedMarkdown,
+
+    /// Attempted to extract Messages output from a Markdown result.
+    #[error("expected messages output, but template produced markdown")]
+    #[diagnostic(code(mds::expected_messages))]
+    ExpectedMessages,
 }
 
 impl MdsError {
@@ -647,6 +671,13 @@ impl MdsError {
         MdsError::NotMdsFile { path: path.into() }
     }
 
+    pub(crate) fn mixed_content() -> Self {
+        MdsError::MixedContent {
+            span: None,
+            src: None,
+        }
+    }
+
     /// Serialize this error into a [`SerializedError`] suitable for JSON output.
     ///
     /// - `code` is extracted via [`miette::Diagnostic::code`] (drift-proof).
@@ -678,7 +709,8 @@ impl MdsError {
             | MdsError::Recursion { span, src, .. }
             | MdsError::ExportError { span, src, .. }
             | MdsError::BuiltinError { span, src, .. }
-            | MdsError::Extends { span, src, .. } => {
+            | MdsError::Extends { span, src, .. }
+            | MdsError::MixedContent { span, src } => {
                 span.as_ref().map(|ss| {
                     let offset = ss.offset();
                     let length = ss.len();
@@ -701,7 +733,9 @@ impl MdsError {
             | MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
-            | MdsError::JsonError { .. } => None,
+            | MdsError::JsonError { .. }
+            | MdsError::ExpectedMarkdown
+            | MdsError::ExpectedMessages => None,
         };
 
         SerializedError {

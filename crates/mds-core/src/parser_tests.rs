@@ -1011,34 +1011,34 @@ fn parse_cond_value_only_admits_literals() {
 #[test]
 fn default_string_value_parity() {
     // Expr::StringLiteral → Value::String, rendered verbatim.
-    let out = crate::compile_str("@define f(x = \"hi\"):\n{x}\n@end\n{f()}\n").unwrap();
+    let out = crate::compile_str_md("@define f(x = \"hi\"):\n{x}\n@end\n{f()}\n").unwrap();
     assert_eq!(out, "hi\n");
 }
 
 #[test]
 fn default_number_value_parity() {
     // Expr::NumberLiteral → Value::Number; integral floats render without a decimal.
-    let out = crate::compile_str("@define f(x = 42):\n{x}\n@end\n{f()}\n").unwrap();
+    let out = crate::compile_str_md("@define f(x = 42):\n{x}\n@end\n{f()}\n").unwrap();
     assert_eq!(out, "42\n");
-    let out_neg = crate::compile_str("@define f(x = -1):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_neg = crate::compile_str_md("@define f(x = -1):\n{x}\n@end\n{f()}\n").unwrap();
     assert_eq!(out_neg, "-1\n");
-    let out_frac = crate::compile_str("@define f(x = 3.14):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_frac = crate::compile_str_md("@define f(x = 3.14):\n{x}\n@end\n{f()}\n").unwrap();
     assert_eq!(out_frac, "3.14\n");
 }
 
 #[test]
 fn default_boolean_value_parity() {
     // Expr::BooleanLiteral → Value::Boolean, rendered as `true`/`false`.
-    let out_true = crate::compile_str("@define f(x = true):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_true = crate::compile_str_md("@define f(x = true):\n{x}\n@end\n{f()}\n").unwrap();
     assert_eq!(out_true, "true\n");
-    let out_false = crate::compile_str("@define f(x = false):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_false = crate::compile_str_md("@define f(x = false):\n{x}\n@end\n{f()}\n").unwrap();
     assert_eq!(out_false, "false\n");
 }
 
 #[test]
 fn default_null_value_parity() {
     // Expr::NullLiteral → Value::Null, rendered as the empty string in interpolation.
-    let out = crate::compile_str("@define f(x = null):\n[{x}]\n@end\n{f()}\n").unwrap();
+    let out = crate::compile_str_md("@define f(x = null):\n[{x}]\n@end\n{f()}\n").unwrap();
     assert_eq!(out, "[]\n");
 }
 
@@ -1147,7 +1147,7 @@ fn parse_condition_max_operands_exceeded_rejected() {
 #[test]
 fn evaluate_and_condition_both_true() {
     let result =
-        crate::compile_str("---\na: true\nb: true\n---\n@if a && b:\nyes\n@end\n").unwrap();
+        crate::compile_str_md("---\na: true\nb: true\n---\n@if a && b:\nyes\n@end\n").unwrap();
     assert!(
         result.contains("yes"),
         "and with both true should render body, got: {result}"
@@ -1157,7 +1157,7 @@ fn evaluate_and_condition_both_true() {
 #[test]
 fn evaluate_and_condition_one_false() {
     let result =
-        crate::compile_str("---\na: true\nb: false\n---\n@if a && b:\nyes\n@else:\nno\n@end\n")
+        crate::compile_str_md("---\na: true\nb: false\n---\n@if a && b:\nyes\n@else:\nno\n@end\n")
             .unwrap();
     assert!(
         result.contains("no"),
@@ -1168,7 +1168,7 @@ fn evaluate_and_condition_one_false() {
 #[test]
 fn evaluate_or_condition_one_true() {
     let result =
-        crate::compile_str("---\na: false\nb: true\n---\n@if a || b:\nyes\n@else:\nno\n@end\n")
+        crate::compile_str_md("---\na: false\nb: true\n---\n@if a || b:\nyes\n@else:\nno\n@end\n")
             .unwrap();
     assert!(
         result.contains("yes"),
@@ -1179,7 +1179,7 @@ fn evaluate_or_condition_one_true() {
 #[test]
 fn evaluate_or_condition_both_false() {
     let result =
-        crate::compile_str("---\na: false\nb: false\n---\n@if a || b:\nyes\n@else:\nno\n@end\n")
+        crate::compile_str_md("---\na: false\nb: false\n---\n@if a || b:\nyes\n@else:\nno\n@end\n")
             .unwrap();
     assert!(
         result.contains("no"),
@@ -1193,7 +1193,7 @@ fn evaluate_elseif_with_logical_and_operator() {
     // work correctly in @elseif branches (b && c evaluates to BC when a=false, b=true, c=true).
     let src =
         "---\na: false\nb: true\nc: true\n---\n@if a:\nA\n@elseif b && c:\nBC\n@else:\nNO\n@end\n";
-    let result = crate::compile_str(src).unwrap();
+    let result = crate::compile_str_md(src).unwrap();
     assert!(
         result.contains("BC"),
         "@elseif with && should render branch when both operands are true, got: {result}"
@@ -1213,7 +1213,7 @@ fn evaluate_elseif_with_logical_or_operator() {
     // Verify @elseif with || takes the branch when at least one operand is true.
     let src =
         "---\na: false\nb: false\nc: true\n---\n@if a:\nA\n@elseif b || c:\nBC\n@else:\nNO\n@end\n";
-    let result = crate::compile_str(src).unwrap();
+    let result = crate::compile_str_md(src).unwrap();
     assert!(
         result.contains("BC"),
         "@elseif with || should render branch when one operand is true, got: {result}"
@@ -1573,7 +1573,7 @@ fn parse_backward_compat_for_var_iterable() {
 
 #[test]
 fn evaluate_if_call_truthy_contains() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\ntags:\n  - rust\n  - go\n---\n@if contains(tags, \"rust\"):\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1585,7 +1585,7 @@ fn evaluate_if_call_truthy_contains() {
 
 #[test]
 fn evaluate_if_not_call() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nname: abc\n---\n@if !starts_with(name, \"z\"):\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1597,7 +1597,7 @@ fn evaluate_if_not_call() {
 
 #[test]
 fn evaluate_if_lower_eq_literal() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nname: Alice\n---\n@if lower(name) == \"alice\":\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1609,7 +1609,7 @@ fn evaluate_if_lower_eq_literal() {
 
 #[test]
 fn evaluate_if_call_eq_call_match() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\na: Alice\nb: ALICE\n---\n@if lower(a) == lower(b):\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1621,7 +1621,7 @@ fn evaluate_if_call_eq_call_match() {
 
 #[test]
 fn evaluate_if_call_eq_call_no_match() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\na: Alice\nb: Bob\n---\n@if lower(a) == lower(b):\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1633,7 +1633,7 @@ fn evaluate_if_call_eq_call_no_match() {
 
 #[test]
 fn evaluate_if_and_with_calls() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nt: grunge\n---\n@if contains(t, \"r\") && contains(t, \"g\"):\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1645,9 +1645,10 @@ fn evaluate_if_and_with_calls() {
 
 #[test]
 fn evaluate_for_split_iterable() {
-    let result =
-        crate::compile_str("---\ncsv: \"a,b,c\"\n---\n@for x in split(csv, \",\"):\n- {x}\n@end\n")
-            .unwrap();
+    let result = crate::compile_str_md(
+        "---\ncsv: \"a,b,c\"\n---\n@for x in split(csv, \",\"):\n- {x}\n@end\n",
+    )
+    .unwrap();
     assert!(
         result.contains("- a") && result.contains("- b") && result.contains("- c"),
         "@for split iterable should iterate over parts, got: {result}"
@@ -1656,7 +1657,7 @@ fn evaluate_for_split_iterable() {
 
 #[test]
 fn evaluate_for_sort_unique_iterable() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\ntags:\n  - b\n  - a\n  - b\n---\n@for t in sort(unique(tags)):\n- {t}\n@end\n",
     )
     .unwrap();
@@ -1680,7 +1681,8 @@ fn evaluate_for_sort_unique_iterable() {
 
 #[test]
 fn evaluate_for_non_array_result_is_error() {
-    let result = crate::compile_str("---\nname: Alice\n---\n@for x in upper(name):\n- {x}\n@end\n");
+    let result =
+        crate::compile_str_md("---\nname: Alice\n---\n@for x in upper(name):\n- {x}\n@end\n");
     assert!(
         result.is_err(),
         "non-array result from @for expression should error"
@@ -1694,7 +1696,7 @@ fn evaluate_for_non_array_result_is_error() {
 
 #[test]
 fn evaluate_if_undefined_function_is_error() {
-    let result = crate::compile_str("@if notabuiltin(x):\nyes\n@end\n");
+    let result = crate::compile_str_md("@if notabuiltin(x):\nyes\n@end\n");
     assert!(result.is_err(), "undefined function in @if should error");
     let err = result.unwrap_err().to_string();
     assert!(
@@ -1705,7 +1707,7 @@ fn evaluate_if_undefined_function_is_error() {
 
 #[test]
 fn evaluate_elseif_with_expression() {
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nname: Alice\n---\n@if lower(name) == \"bob\":\nBob\n@elseif lower(name) == \"alice\":\nAlice\n@else:\nOther\n@end\n",
     )
     .unwrap();
@@ -1738,7 +1740,7 @@ fn parse_if_call_not_eq_literal() {
 #[test]
 fn evaluate_if_call_not_eq_truthy() {
     // @if lower(name) != "bob": with name:Alice → truthy branch taken
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nname: Alice\n---\n@if lower(name) != \"bob\":\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1751,7 +1753,7 @@ fn evaluate_if_call_not_eq_truthy() {
 #[test]
 fn evaluate_if_call_not_eq_falsy() {
     // @if lower(name) != "alice": with name:Alice → false branch taken
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nname: Alice\n---\n@if lower(name) != \"alice\":\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();
@@ -1788,7 +1790,7 @@ fn parse_if_or_with_calls() {
 #[test]
 fn evaluate_if_or_with_calls() {
     // first operand is false, second is true → truthy
-    let result = crate::compile_str(
+    let result = crate::compile_str_md(
         "---\nt: grunge\n---\n@if contains(t, \"z\") || contains(t, \"g\"):\nyes\n@else:\nno\n@end\n",
     )
     .unwrap();

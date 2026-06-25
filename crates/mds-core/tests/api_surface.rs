@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mds::{
-    CompileOutput, FileSystem, MdsError, ModuleCache, NativeFs, Value, VirtualFs, MAX_FILE_SIZE,
-    MAX_TRAVERSAL_DEPTH,
+    CompileResult, CompiledOutput, FileSystem, MdsError, ModuleCache, NativeFs, Value, VirtualFs,
+    MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
 };
 
 #[test]
@@ -205,8 +205,8 @@ fn value_methods() {
 
 #[test]
 fn cli_import_pattern_works() {
-    // Compile-time check that compile_str matches the fn(&str) -> Result<String, MdsError> shape.
-    let _: fn(&str) -> Result<String, MdsError> = |s| mds::compile_str(s);
+    // Compile-time check that compile_str matches the fn(&str) -> Result<CompileResult, MdsError> shape.
+    let _: fn(&str) -> Result<CompileResult, MdsError> = |s| mds::compile_str(s);
 }
 
 // ── New public types from Phase 2 ─────────────────────────────────────────────
@@ -250,13 +250,13 @@ fn module_cache_new_still_works() {
     let _cache = ModuleCache::new();
 }
 
-// ── CompileOutput / dependency graph API (Stage 2) ────────────────────────────
+// ── CompileResult / CompiledOutput / dependency graph API ─────────────────────
 
 #[test]
-fn compile_output_type_importable() {
-    // CompileOutput must be constructible and implement Debug + Clone + PartialEq.
-    let co = CompileOutput {
-        output: "hello\n".to_string(),
+fn compile_result_type_importable() {
+    // CompileResult must be constructible and implement Debug + Clone + PartialEq.
+    let co = CompileResult {
+        output: CompiledOutput::Markdown("hello\n".to_string()),
         warnings: vec!["warn".to_string()],
         dependencies: vec!["lib.mds".to_string()],
     };
@@ -266,10 +266,24 @@ fn compile_output_type_importable() {
 }
 
 #[test]
-fn compile_output_to_json() {
-    // CompileOutput must serialize to JSON with "output", "warnings", "dependencies" keys.
-    let co = CompileOutput {
-        output: "hello\n".to_string(),
+fn compiled_output_type_importable() {
+    // CompiledOutput must be constructible (both variants) + Debug + Clone + PartialEq.
+    let md = CompiledOutput::Markdown("hi\n".to_string());
+    let msgs = CompiledOutput::Messages(vec![mds::Message {
+        role: "user".to_string(),
+        content: "hi".to_string(),
+    }]);
+    assert_eq!(md.clone(), md);
+    assert_ne!(md, msgs);
+    let _ = format!("{md:?} {msgs:?}");
+}
+
+#[test]
+fn compile_result_to_json() {
+    // CompileResult must serialize to JSON with "output", "warnings", "dependencies" keys,
+    // and the output is the adjacently-tagged CompiledOutput shape.
+    let co = CompileResult {
+        output: CompiledOutput::Markdown("hello\n".to_string()),
         warnings: vec![],
         dependencies: vec!["dep.mds".to_string()],
     };
@@ -284,6 +298,14 @@ fn compile_output_to_json() {
         "missing dependencies key: {json}"
     );
     assert!(json.contains("\"dep.mds\""), "missing dep value: {json}");
+    assert!(
+        json.contains("\"kind\""),
+        "missing CompiledOutput kind: {json}"
+    );
+    assert!(
+        json.contains("\"markdown\""),
+        "missing markdown kind: {json}"
+    );
 }
 
 #[test]
@@ -297,8 +319,11 @@ fn compile_str_with_deps_exists() {
     // compile_str_with_deps compiles successfully.
     let result = mds::compile_str_with_deps("---\nname: World\n---\nHello {name}!\n", None, None)
         .expect("should compile");
-    assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
     assert_eq!(result.dependencies, Vec::<String>::new());
+    assert_eq!(
+        result.into_markdown().unwrap(),
+        "---\nname: World\n---\nHello World!\n"
+    );
 }
 
 #[test]
@@ -310,8 +335,11 @@ fn compile_virtual_with_deps_exists() {
         "---\nname: World\n---\nHello {name}!\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
-    assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
     assert_eq!(result.dependencies, Vec::<String>::new());
+    assert_eq!(
+        result.into_markdown().unwrap(),
+        "---\nname: World\n---\nHello World!\n"
+    );
 }
 
 #[test]
@@ -330,31 +358,37 @@ fn module_cache_dependencies_exists() {
 
 #[test]
 fn compile_with_deps_output_matches_compile() {
-    // Same input → same output string as compile_virtual.
+    // Same input → same Markdown output as compile_virtual.
     let modules = HashMap::from([(
         "main.mds".to_string(),
         "---\nname: World\n---\nHello {name}!\n".to_string(),
     )]);
-    let baseline = mds::compile_virtual(modules.clone(), "main.mds", None).expect("baseline");
-    let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("with deps");
-    assert_eq!(result.output, baseline);
+    let baseline = mds::compile_virtual(modules.clone(), "main.mds", None)
+        .expect("baseline")
+        .into_markdown()
+        .unwrap();
+    let result = mds::compile_virtual_with_deps(modules, "main.mds", None)
+        .expect("with deps")
+        .into_markdown()
+        .unwrap();
+    assert_eq!(result, baseline);
 }
 
-// ── Regression: existing functions unchanged ──────────────────────────────────
+// ── Public entry points return CompileResult ──────────────────────────────────
 
 #[test]
-fn compile_virtual_unchanged() {
-    // compile_virtual still returns Result<String, MdsError>, not CompileOutput.
+fn compile_virtual_returns_compile_result() {
+    // compile_virtual returns Result<CompileResult, MdsError>.
     let mut modules = HashMap::new();
     modules.insert("main.mds".to_string(), "Hello!\n".to_string());
-    let result: Result<String, MdsError> = mds::compile_virtual(modules, "main.mds", None);
+    let result: Result<CompileResult, MdsError> = mds::compile_virtual(modules, "main.mds", None);
     assert!(result.is_ok());
 }
 
 #[test]
-fn compile_str_unchanged() {
-    // compile_str still returns Result<String, MdsError>, not CompileOutput.
-    let result: Result<String, MdsError> = mds::compile_str("Hello!\n");
+fn compile_str_returns_compile_result() {
+    // compile_str returns Result<CompileResult, MdsError>.
+    let result: Result<CompileResult, MdsError> = mds::compile_str("Hello!\n");
     assert!(result.is_ok());
 }
 
@@ -365,13 +399,13 @@ fn compile_virtual_exists() {
     modules.insert("main.mds".to_string(), "Hello!\n".to_string());
     let result = mds::compile_virtual(modules, "main.mds", None);
     assert!(result.is_ok(), "compile_virtual should succeed: {result:?}");
-    assert_eq!(result.unwrap(), "Hello!\n");
+    assert_eq!(result.unwrap().into_markdown().unwrap(), "Hello!\n");
 }
 
 #[test]
 fn compile_virtual_collecting_warnings_direct() {
     // Direct call to compile_virtual_collecting_warnings: assert on both the
-    // output string and the warnings vector.
+    // output and the warnings vector.
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
@@ -382,14 +416,15 @@ fn compile_virtual_collecting_warnings_direct() {
         result.is_ok(),
         "compile_virtual_collecting_warnings should succeed: {result:?}"
     );
-    let (output, warnings) = result.unwrap();
+    let result = result.unwrap();
     assert!(
-        output.contains("Hello World!"),
-        "expected rendered output, got: {output}"
+        result.warnings.is_empty(),
+        "expected no warnings, got: {:?}",
+        result.warnings
     );
     assert!(
-        warnings.is_empty(),
-        "expected no warnings, got: {warnings:?}"
+        result.into_markdown().unwrap().contains("Hello World!"),
+        "expected rendered output"
     );
 }
 
@@ -464,11 +499,6 @@ fn compile_with_deps_native_fs_integration() {
     let result = mds::compile_with_deps(&entry_path, None)
         .expect("compile_with_deps should succeed with real files");
 
-    assert!(
-        result.output.contains("Hello World!"),
-        "expected rendered output, got: {}",
-        result.output
-    );
     // The imported lib must appear in deps.
     assert_eq!(
         result.dependencies.len(),
@@ -476,7 +506,7 @@ fn compile_with_deps_native_fs_integration() {
         "expected 1 dep, got: {:?}",
         result.dependencies
     );
-    let dep = &result.dependencies[0];
+    let dep = result.dependencies[0].clone();
     assert!(
         dep.ends_with("lib.mds"),
         "expected dep ending in lib.mds, got: {dep}"
@@ -487,16 +517,21 @@ fn compile_with_deps_native_fs_integration() {
         "entry file must be excluded from deps, got: {:?}",
         result.dependencies
     );
+    let md = result.into_markdown().unwrap();
+    assert!(
+        md.contains("Hello World!"),
+        "expected rendered output, got: {md}"
+    );
 }
 
-/// Test that compiler-emitted warnings surface in `CompileOutput::warnings`.
+/// Test that compiler-emitted warnings surface in `CompileResult::warnings`.
 ///
 /// The evaluator emits a warning when `@include` is used against a module that
 /// has no body text (only macro definitions). This test verifies that the warning
 /// makes it into `result.warnings` rather than being silently dropped or sent to
 /// stderr.
 #[test]
-fn compile_output_warnings_emitted_for_empty_include() {
+fn compile_result_warnings_emitted_for_empty_include() {
     // A definition-only module: has @define but no top-level body text.
     // @include of this module will produce no output, triggering the warning.
     let mut modules = std::collections::HashMap::new();
@@ -511,11 +546,6 @@ fn compile_output_warnings_emitted_for_empty_include() {
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
 
     assert!(
-        result.output.contains("Hello World!"),
-        "expected rendered output, got: {}",
-        result.output
-    );
-    assert!(
         !result.warnings.is_empty(),
         "expected at least one warning for @include of empty module, got none"
     );
@@ -527,6 +557,10 @@ fn compile_output_warnings_emitted_for_empty_include() {
         has_include_warning,
         "expected warning about empty @include, got: {:?}",
         result.warnings
+    );
+    assert!(
+        result.into_markdown().unwrap().contains("Hello World!"),
+        "expected rendered output"
     );
 }
 
@@ -549,7 +583,7 @@ fn compile_str_with_import_resolves_relative_to_base_dir() {
         result.is_ok(),
         "compile_str_with should succeed: {result:?}"
     );
-    let output = result.unwrap();
+    let output = result.unwrap().into_markdown().unwrap();
     assert!(
         output.contains("Hello World!"),
         "expected 'Hello World!' in output, got: {output}"
@@ -656,7 +690,10 @@ fn load_vars_str_feeds_compile_virtual() {
     let vars = mds::load_vars_str(r#"{"name": "Test"}"#).unwrap();
     let mut modules = HashMap::new();
     modules.insert("main.mds".to_string(), "Hello {name}!\n".to_string());
-    let output = mds::compile_virtual(modules, "main.mds", Some(vars)).unwrap();
+    let output = mds::compile_virtual(modules, "main.mds", Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert_eq!(output, "Hello Test!\n");
 }
 
@@ -744,61 +781,7 @@ fn module_cache_resolve_source_accepts_str() {
     assert!(result.is_ok(), "expected ok for valid source: {result:?}");
 }
 
-// ── Messages API surface (I7: pin new public symbols) ─────────────────────────
-
-#[test]
-fn compile_messages_str_exists() {
-    // compile_messages_str must be callable and return the right type.
-    let _: fn(&str) -> Result<mds::CompileMessagesOutput, MdsError> =
-        |s| mds::compile_messages_str(s);
-}
-
-#[test]
-fn compile_messages_str_with_deps_exists() {
-    // compile_messages_str_with_deps is callable and compiles successfully.
-    let result =
-        mds::compile_messages_str_with_deps("@message system:\nHello.\n@end\n", None, None)
-            .expect("should compile");
-    assert_eq!(result.messages[0].role, "system");
-    assert_eq!(result.messages[0].content, "Hello.");
-    assert!(result.warnings.is_empty());
-    assert!(result.dependencies.is_empty());
-}
-
-#[test]
-fn compile_messages_virtual_exists() {
-    // compile_messages_virtual is callable (errors on missing entry, which is fine
-    // for a signature/existence check).
-    let _ = mds::compile_messages_virtual(HashMap::new(), "main.mds", None);
-}
-
-#[test]
-fn compile_messages_virtual_with_deps_exists() {
-    // compile_messages_virtual_with_deps compiles a virtual module successfully.
-    let mut modules = HashMap::new();
-    modules.insert(
-        "main.mds".to_string(),
-        "@message user:\nAsk something.\n@end\n".to_string(),
-    );
-    let result =
-        mds::compile_messages_virtual_with_deps(modules, "main.mds", None).expect("should compile");
-    assert_eq!(result.messages[0].role, "user");
-    assert_eq!(result.messages[0].content, "Ask something.");
-    assert!(result.dependencies.is_empty());
-}
-
-#[test]
-fn compile_messages_output_type_exists() {
-    // CompileMessagesOutput must be constructible and implement Debug + Clone + PartialEq.
-    let co = mds::CompileMessagesOutput {
-        messages: vec![],
-        warnings: vec!["warn".to_string()],
-        dependencies: vec!["lib.mds".to_string()],
-    };
-    let cloned = co.clone();
-    assert_eq!(co, cloned);
-    let _ = format!("{co:?}");
-}
+// ── Intrinsic output API surface (pin public symbols) ─────────────────────────
 
 #[test]
 fn message_type_exists() {
@@ -814,31 +797,14 @@ fn message_type_exists() {
 
 #[test]
 fn message_serde_field_names_pinned() {
-    // CRITICAL: pin the serde field names "role" and "content" so that a future
-    // Rust rename cannot silently break the WASM/JS contract that depends on the
-    // JSON shape `[{"role":"...", "content":"..."}]`.
+    // CRITICAL: pin the serde field names "role" and "content" so a future Rust
+    // rename cannot silently break the WASM/JS contract that depends on the JSON
+    // shape `[{"role":"...", "content":"..."}]`.
     let msg = mds::Message {
         role: "system".to_string(),
         content: "You are helpful.".to_string(),
     };
     let json = serde_json::to_string(&msg).expect("Message must serialize to JSON");
-    assert!(
-        json.contains("\"role\""),
-        "Message JSON must contain 'role' key; got: {json}"
-    );
-    assert!(
-        json.contains("\"content\""),
-        "Message JSON must contain 'content' key; got: {json}"
-    );
-    assert!(
-        json.contains("\"system\""),
-        "role value must appear in JSON; got: {json}"
-    );
-    assert!(
-        json.contains("\"You are helpful.\""),
-        "content value must appear in JSON; got: {json}"
-    );
-    // Round-trip: deserialized value must reconstruct the original.
     let parsed: serde_json::Value =
         serde_json::from_str(&json).expect("Message JSON must be valid");
     assert_eq!(parsed["role"].as_str(), Some("system"));
@@ -846,52 +812,15 @@ fn message_serde_field_names_pinned() {
 }
 
 #[test]
-fn compile_messages_output_to_json() {
-    // CompileMessagesOutput must serialize with "messages", "warnings", "dependencies" keys.
-    let co = mds::CompileMessagesOutput {
-        messages: vec![mds::Message {
-            role: "user".to_string(),
-            content: "hi".to_string(),
-        }],
-        warnings: vec![],
-        dependencies: vec![],
-    };
-    let json = serde_json::to_string(&co).expect("should serialize");
-    assert!(
-        json.contains("\"messages\""),
-        "missing messages key: {json}"
-    );
-    assert!(
-        json.contains("\"warnings\""),
-        "missing warnings key: {json}"
-    );
-    assert!(
-        json.contains("\"dependencies\""),
-        "missing dependencies key: {json}"
-    );
-}
-
-// ── compile_messages_file / _with_deps (I8: new file-based messages API) ────────
-
-type CompileMessagesFileFn =
-    fn(&Path, Option<HashMap<String, Value>>) -> Result<mds::CompileMessagesOutput, MdsError>;
-
-#[test]
-fn compile_messages_file_exists() {
-    // compile_messages_file must be callable and return the right type.
-    // Using a nonexistent path is fine — the signature/existence check is what matters.
-    let _: CompileMessagesFileFn = |p, v| mds::compile_messages_file(p, v);
+fn into_markdown_and_into_messages_shapes() {
+    // Pin the extraction method signatures on CompileResult.
+    let _: fn(CompileResult) -> Result<String, MdsError> = CompileResult::into_markdown;
+    let _: fn(CompileResult) -> Result<Vec<mds::Message>, MdsError> = CompileResult::into_messages;
 }
 
 #[test]
-fn compile_messages_file_with_deps_exists() {
-    // compile_messages_file_with_deps must be callable and return the right type.
-    let _: CompileMessagesFileFn = |p, v| mds::compile_messages_file_with_deps(p, v);
-}
-
-#[test]
-fn compile_messages_file_with_deps_round_trip() {
-    // Write a minimal .mds file, compile via the new file API, verify result.
+fn compile_file_messages_round_trip() {
+    // A file containing @message blocks compiles (intrinsically) to Messages.
     let dir = tempfile::tempdir().unwrap();
     let entry = dir.path().join("chat.mds");
     std::fs::write(
@@ -901,30 +830,24 @@ fn compile_messages_file_with_deps_round_trip() {
     )
     .unwrap();
 
-    let result = mds::compile_messages_file_with_deps(&entry, None)
-        .expect("compile_messages_file_with_deps should succeed for a valid file");
-
-    assert_eq!(result.messages.len(), 2, "expected 2 messages");
-    assert_eq!(result.messages[0].role, "system");
-    assert_eq!(result.messages[0].content, "You are a helpful assistant.");
-    assert_eq!(result.messages[1].role, "user");
-    assert_eq!(result.messages[1].content, "Hello!");
-    assert!(result.warnings.is_empty(), "expected no warnings");
-    // Entry key must be excluded from dependencies.
-    assert!(result.dependencies.is_empty(), "no @import → empty deps");
+    let messages = mds::compile(&entry, None)
+        .expect("compile should succeed for a valid file")
+        .into_messages()
+        .expect("messages result");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[0].content, "You are a helpful assistant.");
+    assert_eq!(messages[1].role, "user");
+    assert_eq!(messages[1].content, "Hello!");
 }
 
 #[test]
-fn compile_messages_file_excludes_entry_from_dependencies() {
-    // compile_messages_file_with_deps must exclude the entry key from dependencies
-    // (parity with compile_with_deps @636-641).
+fn compile_with_deps_messages_excludes_entry_from_dependencies() {
+    // compile_with_deps on a messages template excludes the entry key from deps.
     let dir = tempfile::tempdir().unwrap();
-
-    // Write a shared helper
     let helper = dir.path().join("helper.mds");
     std::fs::write(&helper, "@define greet(name):\nHello {name}!\n@end\n").unwrap();
 
-    // Write the entry that imports the helper
     let entry = dir.path().join("chat.mds");
     std::fs::write(
         &entry,
@@ -933,10 +856,7 @@ fn compile_messages_file_excludes_entry_from_dependencies() {
     )
     .unwrap();
 
-    let result =
-        mds::compile_messages_file_with_deps(&entry, None).expect("compile should succeed");
-
-    // helper.mds must be in deps; entry (chat.mds) must NOT be.
+    let result = mds::compile_with_deps(&entry, None).expect("compile should succeed");
     let entry_key = entry.display().to_string();
     let entry_canonical = std::fs::canonicalize(&entry).unwrap().display().to_string();
     assert!(
@@ -956,24 +876,16 @@ fn compile_messages_file_excludes_entry_from_dependencies() {
 
 #[test]
 #[cfg(unix)]
-fn compile_messages_file_rejects_symlinked_entry() {
-    // Prove symlinked entry is rejected by compile_messages_file — the primary
-    // security fix of PR-A2. Rejection mechanism: NativeFs::check_symlink
-    // (canonicalize-comparison, fs.rs) returns ImportError.
+fn compile_rejects_symlinked_entry_for_messages_template() {
+    // Symlinked entry rejection applies regardless of output shape.
     let dir = tempfile::tempdir().unwrap();
-
     let real_file = dir.path().join("real.mds");
     std::fs::write(&real_file, "@message system:\nYou are helpful.\n@end\n").unwrap();
-
-    // Create a symlink pointing to real.mds
     let link_file = dir.path().join("linked.mds");
     std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
 
-    let result = mds::compile_messages_file(&link_file, None);
-    assert!(
-        result.is_err(),
-        "symlinked entry must be rejected by compile_messages_file"
-    );
+    let result = mds::compile(&link_file, None);
+    assert!(result.is_err(), "symlinked entry must be rejected");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("symlink") || err.contains("not allowed"),
@@ -982,21 +894,15 @@ fn compile_messages_file_rejects_symlinked_entry() {
 }
 
 #[test]
-fn compile_messages_file_max_file_size_still_enforced() {
-    // MAX_FILE_SIZE enforcement must not regress on the new file-path API.
-    // The resolver reads the file and checks bytes.len() > MAX_FILE_SIZE.
-    // We create a file that is exactly MAX_FILE_SIZE + 1 bytes.
+fn compile_max_file_size_still_enforced() {
+    // MAX_FILE_SIZE enforcement applies on the entry file regardless of output shape.
     let dir = tempfile::tempdir().unwrap();
     let big = dir.path().join("big.mds");
-    // Write MAX_FILE_SIZE + 1 bytes of valid-but-oversized content.
     let content = "x".repeat((MAX_FILE_SIZE + 1) as usize);
     std::fs::write(&big, &content).unwrap();
 
-    let result = mds::compile_messages_file(&big, None);
-    assert!(
-        result.is_err(),
-        "oversized entry must be rejected by compile_messages_file"
-    );
+    let result = mds::compile(&big, None);
+    assert!(result.is_err(), "oversized entry must be rejected");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("too large") || err.contains("maximum size") || err.contains("resource"),

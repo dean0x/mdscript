@@ -698,7 +698,7 @@ fn evaluate_include(
     Ok(String::new())
 }
 
-/// A single structured message produced by `evaluate_messages`.
+/// A single structured message produced by `evaluate_messages_intrinsic`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvalMessage {
     pub role: String,
@@ -708,10 +708,13 @@ pub struct EvalMessage {
 /// Evaluate a module body in messages mode, collecting `@message` blocks as
 /// structured `EvalMessage` values.
 ///
-/// Orphan text nodes (text outside any `@message` block) are ignored with a
-/// warning. Empty messages (after trimming) are silently skipped.
+/// Output shape is intrinsic to the template: a template that contains any
+/// `@message` block compiles to structured messages, so non-whitespace `Text`
+/// or `Interpolation` nodes that appear *outside* a `@message` block are a hard
+/// error ([`MdsError::MixedContent`]) rather than a silently-ignored warning.
+/// Empty messages (after trimming) are silently skipped.
 /// Returns an error when `MAX_MESSAGE_COUNT` would be exceeded.
-pub fn evaluate_messages(
+pub fn evaluate_messages_intrinsic(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
@@ -723,13 +726,17 @@ pub fn evaluate_messages(
         warnings,
     };
     let mut messages = Vec::new();
-    collect_messages(nodes, scope, &mut ctx, &mut messages)?;
+    collect_messages_strict(nodes, scope, &mut ctx, &mut messages)?;
     Ok(messages)
 }
 
 /// Recursive collector for messages mode. Descends into control-flow nodes
 /// (`@if`, `@for`) while collecting `@message` blocks into `out`.
-fn collect_messages(
+///
+/// Strict: non-whitespace `Text` or any `Interpolation` outside a `@message`
+/// block returns [`MdsError::MixedContent`] — mixed content is not silently
+/// dropped because the template's output shape (messages) is intrinsic.
+fn collect_messages_strict(
     nodes: &[Node],
     scope: &mut Scope,
     ctx: &mut EvalContext,
@@ -738,25 +745,19 @@ fn collect_messages(
     for node in nodes {
         match node {
             Node::Text(t) => {
-                // Orphan text outside any @message block: warn (once per non-whitespace occurrence).
-                if !t.text.trim().is_empty() && ctx.warnings.len() < MAX_WARNINGS {
-                    ctx.warnings.push(
-                        "warning: text content outside @message block is ignored in messages mode"
-                            .to_string(),
-                    );
+                // Non-whitespace text outside any @message block is mixed content.
+                // Whitespace-only text (blank lines between @message blocks) is fine.
+                if !t.text.trim().is_empty() {
+                    return Err(MdsError::mixed_content());
                 }
             }
             Node::EscapedBrace => {
-                // Orphan escaped brace — treated as orphan text; silently ignored.
+                // Orphan escaped brace — treated as orphan whitespace; silently ignored
+                // (mirrors the historical messages-mode treatment of escaped braces).
             }
             Node::Interpolation(_) => {
-                // Orphan interpolation outside @message block — warn.
-                if ctx.warnings.len() < MAX_WARNINGS {
-                    ctx.warnings.push(
-                        "warning: interpolation outside @message block is ignored in messages mode"
-                            .to_string(),
-                    );
-                }
+                // Interpolation outside a @message block is mixed content.
+                return Err(MdsError::mixed_content());
             }
             Node::Message(block) => {
                 collect_single_message(block, scope, ctx, out)?;
@@ -784,7 +785,7 @@ fn collect_messages(
                 // In standalone mode the block body is the default content; in inheritance
                 // mode the resolver has already spliced the final body before evaluation,
                 // so this arm is reached for both cases.
-                collect_messages(&block.body, scope, ctx, out)?;
+                collect_messages_strict(&block.body, scope, ctx, out)?;
             }
         }
     }
@@ -853,7 +854,7 @@ fn collect_messages_from_if(
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
     if evaluate_condition(&block.condition, scope, ctx)? {
-        return collect_messages(&block.then_body, scope, ctx, out);
+        return collect_messages_strict(&block.then_body, scope, ctx, out);
     }
     // Parser enforces MAX_ELSEIF_BRANCHES at construction time; assert the invariant
     // holds so messages-mode correctness cannot silently depend on the parser limit alone.
@@ -866,11 +867,11 @@ fn collect_messages_from_if(
     );
     for (cond, body) in &block.elseif_branches {
         if evaluate_condition(cond, scope, ctx)? {
-            return collect_messages(body, scope, ctx, out);
+            return collect_messages_strict(body, scope, ctx, out);
         }
     }
     if let Some(else_body) = &block.else_body {
-        return collect_messages(else_body, scope, ctx, out);
+        return collect_messages_strict(else_body, scope, ctx, out);
     }
     Ok(())
 }
@@ -882,7 +883,7 @@ fn collect_messages_from_for(
     out: &mut Vec<EvalMessage>,
 ) -> Result<(), MdsError> {
     drive_for(block, scope, ctx, |scope, ctx| {
-        collect_messages(&block.body, scope, ctx, out)
+        collect_messages_strict(&block.body, scope, ctx, out)
     })
 }
 
@@ -895,6 +896,7 @@ mod tests {
     fn text(s: &str) -> Node {
         Node::Text(TextNode {
             text: s.to_string(),
+            offset: 0,
         })
     }
 
@@ -1209,7 +1211,7 @@ mod tests {
 
     #[test]
     fn evaluate_default_param_used_when_not_provided() {
-        let result = crate::compile_str(
+        let result = crate::compile_str_md(
             "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet()}\n",
         )
         .unwrap();
@@ -1218,7 +1220,7 @@ mod tests {
 
     #[test]
     fn evaluate_default_param_overridden_when_provided() {
-        let result = crate::compile_str(
+        let result = crate::compile_str_md(
             "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet(\"Alice\")}\n",
         )
         .unwrap();
@@ -1228,14 +1230,14 @@ mod tests {
     #[test]
     fn evaluate_all_defaults_provided() {
         let result =
-            crate::compile_str("@define add(a = 1, b = 2):\n{a} {b}\n@end\n{add(10, 20)}\n")
+            crate::compile_str_md("@define add(a = 1, b = 2):\n{a} {b}\n@end\n{add(10, 20)}\n")
                 .unwrap();
         assert_eq!(result, "10 20\n");
     }
 
     #[test]
     fn evaluate_mixed_required_and_default() {
-        let result = crate::compile_str(
+        let result = crate::compile_str_md(
             "@define greet(name, greeting = \"Hello\"):\n{greeting} {name}!\n@end\n{greet(\"Bob\")}\n",
         )
         .unwrap();
@@ -1245,7 +1247,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_number() {
         // literal_expr_to_value: Expr::NumberLiteral → Value::Number
-        let result = crate::compile_str("@define show(x = 42):\n{x}\n@end\n{show()}\n").unwrap();
+        let result = crate::compile_str_md("@define show(x = 42):\n{x}\n@end\n{show()}\n").unwrap();
         assert!(
             result.contains("42"),
             "Number default should produce its numeric value, got: {result}"
@@ -1255,7 +1257,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_boolean_true() {
         // literal_expr_to_value: Expr::BooleanLiteral(true) → Value::Boolean(true)
-        let result = crate::compile_str(
+        let result = crate::compile_str_md(
             "@define show(flag = true):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{show()}\n",
         )
         .unwrap();
@@ -1268,7 +1270,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_boolean_false() {
         // literal_expr_to_value: Expr::BooleanLiteral(false) → Value::Boolean(false)
-        let result = crate::compile_str(
+        let result = crate::compile_str_md(
             "@define show(flag = false):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{show()}\n",
         )
         .unwrap();
@@ -1281,7 +1283,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_null() {
         // literal_expr_to_value: Expr::NullLiteral → Value::Null (falsy)
-        let result = crate::compile_str(
+        let result = crate::compile_str_md(
             "@define show(x = null):\n@if x:\nset\n@else:\nnull_branch\n@end\n@end\n{show()}\n",
         )
         .unwrap();
@@ -1293,7 +1295,7 @@ mod tests {
 
     #[test]
     fn evaluate_arity_error_on_too_few_required_args() {
-        let result = crate::compile_str("@define greet(name):\n{name}\n@end\n{greet()}\n");
+        let result = crate::compile_str_md("@define greet(name):\n{name}\n@end\n{greet()}\n");
         assert!(result.is_err(), "too few required args should fail");
     }
 
@@ -1301,7 +1303,7 @@ mod tests {
 
     #[test]
     fn builtin_upper_in_interpolation() {
-        let result = crate::compile_str("---\nword: hello\n---\n{upper(word)}\n").unwrap();
+        let result = crate::compile_str_md("---\nword: hello\n---\n{upper(word)}\n").unwrap();
         assert!(
             result.contains("HELLO"),
             "upper() should uppercase, got: {result}"
@@ -1310,7 +1312,7 @@ mod tests {
 
     #[test]
     fn builtin_lower_in_interpolation() {
-        let result = crate::compile_str("---\nword: HELLO\n---\n{lower(word)}\n").unwrap();
+        let result = crate::compile_str_md("---\nword: HELLO\n---\n{lower(word)}\n").unwrap();
         assert!(
             result.contains("hello"),
             "lower() should lowercase, got: {result}"
@@ -1319,7 +1321,7 @@ mod tests {
 
     #[test]
     fn builtin_length_string_in_interpolation() {
-        let result = crate::compile_str("---\nword: hello\n---\n{length(word)}\n").unwrap();
+        let result = crate::compile_str_md("---\nword: hello\n---\n{length(word)}\n").unwrap();
         assert!(
             result.contains('5'),
             "length of 'hello' should be 5, got: {result}"
@@ -1330,7 +1332,7 @@ mod tests {
     fn builtin_shadowed_by_user_function() {
         // A user-defined function named 'upper' should shadow the built-in.
         let src = "@define upper(x):\ncustom\n@end\n{upper(\"anything\")}\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         assert_eq!(
             result.trim(),
             "custom",
@@ -1341,7 +1343,7 @@ mod tests {
     #[test]
     fn builtin_compose_join_split() {
         let result =
-            crate::compile_str("---\ncsv: a,b,c\n---\n{join(split(csv, \",\"), \" | \")}\n")
+            crate::compile_str_md("---\ncsv: a,b,c\n---\n{join(split(csv, \",\"), \" | \")}\n")
                 .unwrap();
         assert!(
             result.contains("a | b | c"),
@@ -1351,7 +1353,7 @@ mod tests {
 
     #[test]
     fn builtin_string_with_number_literal_arg() {
-        let result = crate::compile_str("{string(42)}\n").unwrap();
+        let result = crate::compile_str_md("{string(42)}\n").unwrap();
         assert_eq!(result.trim(), "42");
     }
 
@@ -1361,7 +1363,7 @@ mod tests {
     fn block_standalone_renders_default_inline_text_mode() {
         // A standalone @block renders its default body inline in text mode.
         let src = "Before.\n@block content:\nDefault body.\n@end\nAfter.\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         assert!(
             result.contains("Default body."),
             "standalone @block default should render inline in text mode, got: {result}"
@@ -1380,7 +1382,7 @@ mod tests {
     fn block_standalone_renders_empty_body_in_text_mode() {
         // An empty @block renders nothing (no crash, no marker text).
         let src = "A\n@block empty:\n@end\nB\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         // Should produce "A\nB\n" — empty block body contributes nothing.
         assert!(
             !result.contains("@block") && !result.contains("@end"),
@@ -1396,7 +1398,7 @@ mod tests {
     fn block_with_interpolation_renders_inline() {
         // A @block body that contains interpolation resolves variables from scope.
         let src = "---\nname: Alice\n---\n@block greeting:\nHello {name}!\n@end\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         assert!(
             result.contains("Hello Alice!"),
             "block body interpolation should resolve, got: {result}"
@@ -1407,19 +1409,19 @@ mod tests {
     fn block_messages_mode_descends_into_block_body() {
         // In messages mode, @message inside a @block body should surface as a message.
         let src = "@block wrapper:\n@message system:\nSystem prompt.\n@end\n@end\n";
-        let result = crate::compile_messages_str(src);
+        let result = crate::compile_str(src);
         assert!(
             result.is_ok(),
-            "compile_messages should succeed for @block containing @message: {result:?}"
+            "compile should succeed for @block containing @message: {result:?}"
         );
-        let output = result.unwrap();
+        let messages = result.unwrap().into_messages().unwrap();
         assert_eq!(
-            output.messages.len(),
+            messages.len(),
             1,
             "@message inside @block should surface in messages mode"
         );
-        assert_eq!(output.messages[0].role, "system");
-        assert!(output.messages[0].content.contains("System prompt."));
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("System prompt."));
     }
 
     // ── Arity span-divergence tests (#71) ─────────────────────────────────────
@@ -1507,14 +1509,15 @@ mod tests {
 
     // ── @for parity tests (#88) ────────────────────────────────────────────────
     //
-    // Each invariant is verified in BOTH text mode (compile_str) and messages
-    // mode (compile_messages_str) to confirm the shared driver preserves
-    // identical semantics in both paths.
+    // Each invariant is verified in BOTH markdown mode (a plain template) and
+    // messages mode (a template with @message blocks, extracted via
+    // into_messages()) to confirm the shared driver preserves identical
+    // semantics in both paths.
 
     #[test]
     fn for_array_loop_text_mode() {
         let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n{item}\n@end\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         assert!(result.contains("alpha"), "text: alpha missing");
         assert!(result.contains("beta"), "text: beta missing");
     }
@@ -1523,15 +1526,15 @@ mod tests {
     fn for_array_loop_messages_mode() {
         // Each @message is emitted once per iteration.
         let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n@message user:\n{item}\n@end\n@end\n";
-        let output = crate::compile_messages_str(src).unwrap();
+        let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
         assert_eq!(
-            output.messages.len(),
+            messages.len(),
             2,
             "messages mode: expected 2 messages, got {}",
-            output.messages.len()
+            messages.len()
         );
-        assert_eq!(output.messages[0].content, "alpha");
-        assert_eq!(output.messages[1].content, "beta");
+        assert_eq!(messages[0].content, "alpha");
+        assert_eq!(messages[1].content, "beta");
     }
 
     #[test]
@@ -1547,7 +1550,7 @@ mod tests {
             ("mango".to_string(), crate::value::Value::Number(3.0)),
         ]));
         let vars: HashMap<String, crate::value::Value> = HashMap::from([("obj".to_string(), obj)]);
-        let result = crate::compile_str_with(src, None, Some(vars)).unwrap();
+        let result = crate::compile_str_with_md(src, None, Some(vars)).unwrap();
         let positions = ["apple", "mango", "zebra"].map(|k| {
             result
                 .find(k)
@@ -1563,13 +1566,9 @@ mod tests {
     fn for_key_value_alpha_sort_messages_mode() {
         // Same alpha-sort requirement applies in messages mode.
         let src = "---\nobj:\n  zebra: 1\n  apple: 2\n  mango: 3\n---\n@for k, v in obj:\n@message user:\n{k}\n@end\n@end\n";
-        let output = crate::compile_messages_str(src).unwrap();
-        assert_eq!(
-            output.messages.len(),
-            3,
-            "messages mode: expected 3 messages"
-        );
-        let keys: Vec<&str> = output.messages.iter().map(|m| m.content.as_str()).collect();
+        let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
+        assert_eq!(messages.len(), 3, "messages mode: expected 3 messages");
+        let keys: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(
             keys,
             vec!["apple", "mango", "zebra"],
@@ -1587,7 +1586,7 @@ mod tests {
             "---\nitems:\n{}\n---\n@for item in items:\n{{item}}\n@end\n",
             items.join("\n")
         );
-        let err = crate::compile_str(&src).expect_err("should error on oversized array");
+        let err = crate::compile_str_md(&src).expect_err("should error on oversized array");
         assert!(
             format!("{err}").contains("exceeding maximum loop iteration limit"),
             "text: expected resource_limit error, got: {err}"
@@ -1604,7 +1603,7 @@ mod tests {
             "---\nitems:\n{}\n---\n@for item in items:\n@message user:\n{{item}}\n@end\n@end\n",
             items.join("\n")
         );
-        let err = crate::compile_messages_str(&src).expect_err("should error on oversized array");
+        let err = crate::compile_str_md(&src).expect_err("should error on oversized array");
         assert!(
             format!("{err}").contains("exceeding maximum loop iteration limit"),
             "messages: expected resource_limit error, got: {err}"
@@ -1624,7 +1623,7 @@ mod tests {
             outer.join("\n"),
             inner.join("\n")
         );
-        let err = crate::compile_str(&src).expect_err("should error on cumulative limit");
+        let err = crate::compile_str_md(&src).expect_err("should error on cumulative limit");
         assert!(
             format!("{err}").contains("total loop iterations exceeded maximum"),
             "text: expected total-iterations error, got: {err}"
@@ -1634,19 +1633,19 @@ mod tests {
     #[test]
     fn for_max_total_iterations_nested_messages_mode() {
         // Identical nested-loop scenario fires the same cumulative cap in messages mode.
-        // The inner loop body contains no @message (just orphan text that is warned/ignored),
-        // so MAX_MESSAGE_COUNT (10_000) cannot fire before MAX_TOTAL_ITERATIONS (1_000_000).
+        // The inner loop body is whitespace-only (no @message, no mixed content), so the
+        // iteration counter drives the failure: MAX_TOTAL_ITERATIONS (1_000_000) trips
+        // before MAX_MESSAGE_COUNT (10_000) — zero messages are produced inside the loops.
         // outer=1001, inner=1000 → 1_001_000 total iterations > MAX_TOTAL_ITERATIONS.
-        // Messages produced = 0 from the inner loop, 0 from the outer (orphan text only).
-        // compile_messages_str requires at least one @message, so we put one before the loops.
+        // A messages template needs at least one @message, so we put one before the loops.
         let outer: Vec<String> = (0..1001usize).map(|i| format!("  - {i}")).collect();
         let inner: Vec<String> = (0..1000usize).map(|i| format!("  - {i}")).collect();
         let src = format!(
-            "---\nouter:\n{outer}\ninner:\n{inner}\n---\n@message system:\nsetup\n@end\n@for o in outer:\n@for i in inner:\norphan\n@end\n@end\n",
+            "---\nouter:\n{outer}\ninner:\n{inner}\n---\n@message system:\nsetup\n@end\n@for o in outer:\n@for i in inner:\n@end\n@end\n",
             outer = outer.join("\n"),
             inner = inner.join("\n")
         );
-        let err = crate::compile_messages_str(&src).expect_err("should error on cumulative limit");
+        let err = crate::compile_str_md(&src).expect_err("should error on cumulative limit");
         assert!(
             format!("{err}").contains("total loop iterations exceeded maximum"),
             "messages: expected total-iterations error, got: {err}"
@@ -1658,7 +1657,7 @@ mod tests {
         // An empty array produces empty output (just frontmatter passthrough), no error.
         // Use a sentinel body string that cannot appear in the frontmatter.
         let src = "---\nitems: []\n---\n@for item in items:\nSENTINEL_BODY\n@end\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         assert!(
             !result.contains("SENTINEL_BODY"),
             "text: empty iterable should produce no loop-body output, got: {result}"
@@ -1669,9 +1668,9 @@ mod tests {
     fn for_empty_iterable_messages_mode() {
         // An empty array in messages mode produces zero messages, no error.
         let src = "---\nitems: []\n---\n@for item in items:\n@message user:\n{item}\n@end\n@end\n";
-        let output = crate::compile_messages_str(src).unwrap();
+        let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
         assert_eq!(
-            output.messages.len(),
+            messages.len(),
             0,
             "messages: empty iterable should produce 0 messages"
         );
@@ -1682,7 +1681,7 @@ mod tests {
         // A loop variable with the same name as an outer variable shadows it
         // for the duration of the loop body, then the outer value is restored.
         let src = "---\nitem: outer\nitems:\n  - inner\n---\nbefore:{item}\n@for item in items:\nduring:{item}\n@end\nafter:{item}\n";
-        let result = crate::compile_str(src).unwrap();
+        let result = crate::compile_str_md(src).unwrap();
         assert!(
             result.contains("before:outer"),
             "text: outer var should be 'outer' before loop, got: {result}"
@@ -1701,18 +1700,18 @@ mod tests {
     fn for_loop_var_shadows_outer_var_messages_mode() {
         // Same shadowing behaviour in messages mode.
         let src = "---\nitem: outer\nitems:\n  - inner\n---\n@message system:\nbefore:{item}\n@end\n@for item in items:\n@message user:\nduring:{item}\n@end\n@end\n@message system:\nafter:{item}\n@end\n";
-        let output = crate::compile_messages_str(src).unwrap();
-        assert_eq!(output.messages.len(), 3, "expected 3 messages");
+        let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
+        assert_eq!(messages.len(), 3, "expected 3 messages");
         assert_eq!(
-            output.messages[0].content, "before:outer",
+            messages[0].content, "before:outer",
             "messages: outer var before loop"
         );
         assert_eq!(
-            output.messages[1].content, "during:inner",
+            messages[1].content, "during:inner",
             "messages: shadow var inside loop"
         );
         assert_eq!(
-            output.messages[2].content, "after:outer",
+            messages[2].content, "after:outer",
             "messages: outer var restored after loop"
         );
     }
@@ -1726,7 +1725,7 @@ mod tests {
             "---\nitems:\n{}\n---\n@for item in items:\n@message user:\n{{item}}\n@end\n@end\n",
             items.join("\n")
         );
-        let err = crate::compile_messages_str(&src).expect_err("should error on message count");
+        let err = crate::compile_str_md(&src).expect_err("should error on message count");
         assert!(
             format!("{err}").contains("message count exceeded maximum"),
             "expected MAX_MESSAGE_COUNT error, got: {err}"
@@ -1745,7 +1744,7 @@ mod tests {
             items = items.join("\n"),
             body = body
         );
-        let err = crate::compile_messages_str(&src).expect_err("should error on total size");
+        let err = crate::compile_str_md(&src).expect_err("should error on total size");
         assert!(
             format!("{err}").contains("total message content exceeds maximum cumulative size"),
             "expected MAX_MESSAGES_TOTAL_SIZE error, got: {err}"
@@ -1758,7 +1757,7 @@ mod tests {
         // The validator fires first with a static-analysis hint; the evaluator would fire
         // at runtime. Either way, the error message tells users to use key-value syntax.
         let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n{x}\n@end\n";
-        let err = crate::compile_str(src).expect_err("object in array syntax should error");
+        let err = crate::compile_str_md(src).expect_err("object in array syntax should error");
         let msg = format!("{err}");
         assert!(
             msg.contains("key, value") || msg.contains("key-value"),
@@ -1769,8 +1768,7 @@ mod tests {
     #[test]
     fn for_object_in_array_mode_errors_messages() {
         let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n@message user:\n{x}\n@end\n@end\n";
-        let err =
-            crate::compile_messages_str(src).expect_err("object in array syntax should error");
+        let err = crate::compile_str_md(src).expect_err("object in array syntax should error");
         let msg = format!("{err}");
         assert!(
             msg.contains("key, value") || msg.contains("key-value"),
