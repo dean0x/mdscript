@@ -496,3 +496,138 @@ fn compile_result_is_debug_clone_partialeq() {
 fn compile_str_returns_compile_result() {
     let _: fn(&str) -> Result<CompileResult, MdsError> = |s| mds::compile_str(s);
 }
+
+// ── AC-FUNC-06: top-level EscapedBrace in a messages template is NOT an error ─
+
+#[test]
+fn escaped_brace_in_messages_template_is_ok() {
+    // AC-FUNC-06: `\{` (EscapedBrace) at top level alongside @message is allowed.
+    // It is inert — not a mixed-content error.
+    let src = "\\{\n@message system:\nSys.\n@end\n";
+    let msgs = mds::compile_str(src)
+        .expect("AC-FUNC-06: escaped brace must not produce mixed-content error")
+        .into_messages()
+        .expect("messages result");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, "system");
+}
+
+// ── AC-FUNC-07: @include in messages template → warning, not error ────────────
+
+#[test]
+fn include_in_messages_template_warns_not_errors() {
+    // AC-FUNC-07: @include at the top level of a messages template must warn,
+    // not produce a mixed-content error. It is a different "not meaningful here"
+    // concern from orphan text/interpolation.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "lib.mds".to_string(),
+        "@define greet(x):\nHi {x}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./lib.mds\" as lib\n@include lib\n@message user:\nHello.\n@end\n".to_string(),
+    );
+    let result = mds::compile_virtual(modules, "main.mds", None)
+        .expect("AC-FUNC-07: @include in messages template must not error");
+    let msgs = result.into_messages().expect("should be messages result");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "Hello.");
+}
+
+// ── AC-FUNC-08: messages template that evaluates to zero messages is ok ────────
+
+#[test]
+fn messages_template_zero_runtime_messages_is_ok() {
+    // AC-FUNC-08: a template with @message inside @if false: evaluates to zero
+    // messages at runtime. has_message_block detects the static @message, so the
+    // output is CompiledOutput::Messages(vec![]) — valid, not an error.
+    let src = concat!(
+        "---\nenabled: false\n---\n",
+        "@if enabled:\n",
+        "@message system:\nNever emitted.\n@end\n",
+        "@end\n",
+    );
+    let msgs = mds::compile_str(src)
+        .expect("AC-FUNC-08: zero-message runtime result must compile")
+        .into_messages()
+        .expect("messages result (possibly empty)");
+    assert!(
+        msgs.is_empty(),
+        "AC-FUNC-08: expected zero messages, got: {msgs:?}"
+    );
+}
+
+// ── AC-FUNC-22: non-message template markdown output is byte-exact ────────────
+
+#[test]
+fn markdown_output_is_byte_exact_through_dispatch() {
+    // AC-FUNC-22: the intrinsic dispatch must not alter markdown rendering.
+    // The output from a non-@message template via compile_str (new API) must be
+    // identical to the resolved + cleaned markdown, including frontmatter.
+    let src = "---\nname: World\n---\nHello {name}!\n";
+    let result = mds::compile_str(src).expect("should compile");
+    let md = result.into_markdown().expect("markdown");
+    assert_eq!(
+        md, "---\nname: World\n---\nHello World!\n",
+        "AC-FUNC-22: markdown output must be byte-exact"
+    );
+}
+
+// ── AC-FUNC-25 (core half): check_* raises mds::mixed_content on mixed files ──
+
+#[test]
+fn check_raises_mixed_content_on_mixed_template() {
+    // AC-FUNC-25: the core check_str (and by extension check_virtual) must raise
+    // mds::mixed_content when a template has @message blocks AND orphan text.
+    let src = "Orphan text.\n@message user:\nQuestion.\n@end\n";
+    let err = mds::check_str(src).expect_err("AC-FUNC-25: check_str must raise mixed_content");
+    assert_eq!(
+        err.serialize().code,
+        "mds::mixed_content",
+        "AC-FUNC-25: expected mds::mixed_content, got: {err}"
+    );
+}
+
+#[test]
+fn check_virtual_raises_mixed_content_on_mixed_template() {
+    // AC-FUNC-25 (virtual path): check_virtual raises mds::mixed_content too.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "main.mds".to_string(),
+        "Orphan text.\n@message user:\nQ.\n@end\n".to_string(),
+    );
+    let err = mds::check_virtual(modules, "main.mds", None)
+        .expect_err("AC-FUNC-25: check_virtual must raise mixed_content");
+    assert_eq!(err.serialize().code, "mds::mixed_content");
+}
+
+// ── AC-FUNC-03: @extends child — @message in base @block detected post-splice ─
+
+#[test]
+fn extends_base_with_message_in_block_compiles_to_messages() {
+    // AC-FUNC-03: child @extends a base whose @message lives inside a @block.
+    // The child has no literal @message in its own body. After splice, the
+    // has_message_block check on final_body must find the @message from the base
+    // @block default and produce Messages output.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "@block content:\n@message user:\nBase content.\n@end\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "@extends \"./base.mds\"\n".to_string(),
+    );
+    let msgs = mds::compile_virtual(modules, "child.mds", None)
+        .expect("AC-FUNC-03: child with @extends base with @message in @block must compile")
+        .into_messages()
+        .expect("messages result");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "AC-FUNC-03: expected 1 message, got: {msgs:?}"
+    );
+    assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[0].content, "Base content.");
+}
