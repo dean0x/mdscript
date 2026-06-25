@@ -16,9 +16,10 @@ const JS_ESCAPE_MAP: Record<string, string> = {
   '\n': '\\n',
   '\r': '\\r',
   '\0': '\\0',
-  ' ': '\\u2028',
-  ' ': '\\u2029',
 };
+// Computed keys avoid literal U+2028/U+2029 in source — JS parser treats them as line terminators.
+JS_ESCAPE_MAP[String.fromCodePoint(0x2028)] = '\\u2028';
+JS_ESCAPE_MAP[String.fromCodePoint(0x2029)] = '\\u2029';
 
 function escapeForJs(str: string): string {
   return str.replace(JS_ESCAPE_RE, (ch) => JS_ESCAPE_MAP[ch] ?? ch);
@@ -31,9 +32,9 @@ function escapeForJs(str: string): string {
 const SAFE_JSON_RE = new RegExp('[<\\u2028\\u2029]', 'g');
 const SAFE_JSON_MAP: Record<string, string> = {
   '<': '\\u003c',
-  ' ': '\\u2028',
-  ' ': '\\u2029',
 };
+SAFE_JSON_MAP[String.fromCodePoint(0x2028)] = '\\u2028';
+SAFE_JSON_MAP[String.fromCodePoint(0x2029)] = '\\u2029';
 
 /**
  * JSON-serialize a value for safe inline embedding in a JS script context.
@@ -42,7 +43,7 @@ const SAFE_JSON_MAP: Record<string, string> = {
  * be treated as JS line terminators. Escaping them to their Unicode escape
  * sequences is harmless for JSON consumers but safe for script contexts.
  */
-function safeJsonForJs(value: unknown): string {
+export function safeJsonForJs(value: unknown): string {
   return JSON.stringify(value).replace(SAFE_JSON_RE, (ch) => SAFE_JSON_MAP[ch] ?? ch);
 }
 
@@ -79,9 +80,25 @@ export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
         id,
         options?.vars !== undefined ? { vars: options.vars } : undefined,
       );
+
+      // Branch on the intrinsic kind to emit the correct default export.
+      // kind='markdown' → export default "<escaped string>"
+      // kind='messages' → export default [ {role, content}, … ] (array literal)
+      // Metadata (warnings, dependencies) is emitted identically for both kinds.
+      let defaultExport: string;
+      if (result.kind === 'markdown') {
+        defaultExport = `export default "${escapeForJs(result.output)}";\n`;
+      } else {
+        // kind === 'messages' — emit the messages array as a JSON literal.
+        // safeJsonForJs is used (not escapeForJs) because the value is serialized
+        // as JSON, not embedded in a double-quoted JS string.
+        defaultExport = `export default ${safeJsonForJs(result.messages)};\n`;
+      }
+
       const code =
-        `export default "${escapeForJs(result.output)}";\n` +
+        defaultExport +
         `export const metadata = ${safeJsonForJs({ warnings: result.warnings, dependencies: result.dependencies })};\n`;
+
       return {
         code,
         dependencies: result.dependencies,

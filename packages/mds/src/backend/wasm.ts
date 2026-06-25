@@ -1,7 +1,6 @@
 import type {
   BackendType,
   CheckResult,
-  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   FileOptions,
@@ -20,9 +19,8 @@ import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contr
  * createWasmBackend().
  */
 export interface WasmModule {
-  compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileResult;
-  check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CheckResult;
-  compileMessages(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileMessagesResult;
+  compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
+  check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
   scanImports(source: string): string[];
   default?: (input?: unknown) => Promise<void>;
 }
@@ -351,12 +349,6 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       const result: unknown = wasmModule.check(source, compileOpts(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
-    },
-
-    compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
-      const result: unknown = wasmModule.compileMessages(source, compileOpts(options));
-      assertResultShape(result, 'compileMessages');
-      return result as CompileMessagesResult;
     },
 
     getBackend(): BackendType {

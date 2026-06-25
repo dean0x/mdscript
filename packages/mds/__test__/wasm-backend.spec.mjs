@@ -87,11 +87,13 @@ describe('wasm backend — circuit breaker', () => {
   // New tests for the split API
   // ---------------------------------------------------------------------------
 
-  test('U-WB5: initWasmNode() returns WasmModule with compile, check, and scanImports', async () => {
+  test('U-WB5: initWasmNode() returns WasmModule with compile, check, and scanImports (no compileMessages)', async () => {
     const mod = await initWasmNode();
     assert.equal(typeof mod.compile, 'function', 'WasmModule must have compile');
     assert.equal(typeof mod.check, 'function', 'WasmModule must have check');
     assert.equal(typeof mod.scanImports, 'function', 'WasmModule must have scanImports');
+    // compileMessages was removed in PR-2/PR-3 — output kind is intrinsic
+    assert.equal(typeof mod.compileMessages, 'undefined', 'WasmModule must NOT have compileMessages');
   });
 
   test('U-WB6: concurrent initWasmNode() calls share single promise', async () => {
@@ -119,10 +121,11 @@ describe('wasm backend — circuit breaker', () => {
     assert.equal(typeof backend.getBackend, 'function', 'must have getBackend');
   });
 
-  test('U-WB10: createWasmBackend(mod).compile("Hello!\\n") returns correct output', async () => {
+  test('U-WB10: createWasmBackend(mod).compile("Hello!\\n") returns kind:markdown with correct output', async () => {
     const mod = await initWasmNode();
     const backend = createWasmBackend(mod);
     const result = backend.compile('Hello!\n');
+    assert.equal(result.kind, 'markdown', `expected kind "markdown", got: ${result.kind}`);
     assert.equal(result.output, 'Hello!\n', `expected "Hello!\\n", got: ${result.output}`);
     assert.ok(Array.isArray(result.warnings));
     assert.ok(Array.isArray(result.dependencies));
@@ -266,11 +269,10 @@ describe('wasm backend — browser shape validation', () => {
     _resetForTesting(0);
   });
 
-  test('U-WB17: validateWasmShape accepts a well-formed module', () => {
+  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, scanImports)', () => {
     const validMod = {
       compile: () => {},
       check: () => {},
-      compileMessages: () => {},
       scanImports: () => [],
     };
     assert.doesNotThrow(
@@ -280,7 +282,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB18: validateWasmShape throws when compile is missing', () => {
-    const mod = { check: () => {}, compileMessages: () => {}, scanImports: () => [] };
+    const mod = { check: () => {}, scanImports: () => [] };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -295,7 +297,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB19: validateWasmShape throws when check is missing', () => {
-    const mod = { compile: () => {}, compileMessages: () => {}, scanImports: () => [] };
+    const mod = { compile: () => {}, scanImports: () => [] };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -310,7 +312,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB20: validateWasmShape throws when scanImports is missing', () => {
-    const mod = { compile: () => {}, check: () => {}, compileMessages: () => {} };
+    const mod = { compile: () => {}, check: () => {} };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {
@@ -318,21 +320,6 @@ describe('wasm backend — browser shape validation', () => {
         assert.ok(
           err.message.includes('scanImports'),
           `error must mention missing function "scanImports", got: ${err.message}`,
-        );
-        return true;
-      },
-    );
-  });
-
-  test('U-WB22: validateWasmShape throws when compileMessages is missing', () => {
-    const mod = { compile: () => {}, check: () => {}, scanImports: () => [] };
-    assert.throws(
-      () => validateWasmShape(mod),
-      (err) => {
-        assert.ok(err instanceof Error);
-        assert.ok(
-          err.message.includes('compileMessages'),
-          `error must mention missing function "compileMessages", got: ${err.message}`,
         );
         return true;
       },
