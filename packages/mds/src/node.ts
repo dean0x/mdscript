@@ -8,6 +8,7 @@ import type {
   FileOptions,
   InitOptions,
 } from './types.js';
+import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
 import { buildModulesMap } from './util/module-scanner.js';
@@ -86,12 +87,14 @@ function wrapWithFileOps(
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
       const { source, opts } = await prepareFileArgs(path, options);
       const result: unknown = wasmModule.compile(source, opts);
+      assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
       const { source, opts } = await prepareFileArgs(path, options);
       const result: unknown = wasmModule.check(source, opts);
+      assertResultShape(result, 'check');
       return result as CheckResult;
     },
   };
