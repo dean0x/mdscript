@@ -899,8 +899,10 @@ fn run_watch_file(
     // Load project config (for output_dir) — used if no explicit -o / --out-dir.
     let config = load_config(&entry)?;
 
-    // Initial compile: returns (output_path, deps).
-    let (output_path, initial_deps) =
+    // Initial compile: returns (output_path, deps, content).
+    // content is captured here so the baseline block below can reuse it without
+    // recompiling (issue 3 — avoids a redundant second compile at startup).
+    let (output_path, initial_deps, initial_content) =
         match compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet) {
             Ok(result) => result,
             Err(e) => {
@@ -918,7 +920,7 @@ fn run_watch_file(
                     quiet,
                 )
                 .unwrap_or(None);
-                (fallback_path, vec![])
+                (fallback_path, vec![], String::new())
             }
         };
 
@@ -966,17 +968,12 @@ fn run_watch_file(
 
     // Record baseline content AFTER setting up watches to suppress the first
     // synthetic FSEvent from macOS (baseline taken from the same state the watcher sees).
+    // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
     let mut last_written: HashMap<String, String> = HashMap::new();
-    {
-        let baseline_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
-        match compile_to_content(&entry, baseline_vars, true /* quiet for baseline */) {
-            Ok(out) => {
-                last_written.insert(output_key.clone(), out.content);
-            }
-            Err(_) => {
-                // Baseline compile failed — leave last_written empty so next rebuild always writes.
-            }
-        }
+    if !initial_content.is_empty() {
+        // initial_content is empty only when the initial compile failed (error path above).
+        // In that case leave last_written empty so the next successful rebuild always writes.
+        last_written.insert(output_key.clone(), initial_content);
     }
 
     let foi = files_of_interest(&entry, &initial_deps, vars_path.as_deref());
@@ -1214,7 +1211,12 @@ fn compile_one_source(
                             );
                         }
                         // AC-FUNC-23 (stale-output cleanup on format-flip in watch mode):
-                        // probe for the wrong-extension sibling and unlink it.
+                        // probe for the wrong-extension sibling and unlink it — but ONLY
+                        // when the tool itself wrote that sibling this session (gate on
+                        // last_written membership). This prevents clobbering a hand-authored
+                        // file that happens to share the stem (e.g. notes.md kept next to
+                        // notes.mds which now compiles to notes.json). Issue 1.
+                        //
                         // This unlink must NOT trigger the watcher: `out` is the NEW
                         // output path we just wrote; the stale sibling has a DIFFERENT
                         // extension, so it is outside the `last_written` map and the
@@ -1223,12 +1225,15 @@ fn compile_one_source(
                         // also covers the freshly written `out` — the next event for that
                         // path will find identical content and skip the write.
                         let base_no_ext = output_base_no_ext(src, root, output_base);
-                        // Remove the stale-extension sibling from last_written so the key
-                        // doesn't accumulate stale entries (memory hygiene).
                         let stale_path =
                             base_no_ext.with_extension(compiled.kind.stale_extension());
-                        state.last_written.remove(&stale_path);
-                        probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        // Remove the stale-extension sibling from last_written so the key
+                        // doesn't accumulate stale entries (memory hygiene). The remove()
+                        // return value tells us whether this tool wrote the stale path.
+                        let tool_wrote_stale = state.last_written.remove(&stale_path).is_some();
+                        if tool_wrote_stale {
+                            probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        }
 
                         state.record_success(
                             src,
@@ -2649,7 +2654,7 @@ mod tests {
         // Use -o <out> style to direct output to a specific path.
         let out = dir.path().join("entry.md");
         let out_str = out.display().to_string();
-        let (_written_path, deps) =
+        let (_written_path, deps, _content) =
             compile_and_write(&entry, &Some(out_str), &None, &None, None, true).unwrap();
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");

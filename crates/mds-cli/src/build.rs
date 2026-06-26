@@ -549,7 +549,11 @@ pub(crate) fn compile_to_content(
 
 /// Compile `input`, derive the output path from the compiled kind, and write.
 ///
-/// Returns the resolved output path and the list of transitive deps.
+/// Returns `(output_path, deps, content)`:
+/// - `output_path`: the resolved output path (None for stdout).
+/// - `deps`: transitive dependency paths.
+/// - `content`: the compiled string (issue 3 — reused by the watch baseline block
+///   so startup does not compile twice).
 ///
 /// The output path is derived AFTER compiling (compile-then-route) so the kind
 /// (and thus extension: `.json` for messages, `.md` for markdown) is known before
@@ -570,7 +574,7 @@ pub(crate) fn compile_and_write(
     config: &Option<(MdsConfig, PathBuf)>,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
-) -> Result<(Option<PathBuf>, Vec<String>)> {
+) -> Result<(Option<PathBuf>, Vec<String>, String)> {
     let compiled = compile_to_content(input, runtime_vars, quiet)?;
     let output_path = resolve_output_path_for_kind(
         &Some(input.to_path_buf()),
@@ -581,7 +585,7 @@ pub(crate) fn compile_and_write(
         quiet,
     )?;
     write_output(output_path.clone(), &compiled.content, quiet, true)?;
-    Ok((output_path, compiled.dependencies))
+    Ok((output_path, compiled.dependencies, compiled.content))
 }
 
 // ── Build args struct ─────────────────────────────────────────────────────────
@@ -705,9 +709,17 @@ fn run_build_directory(
     let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
     let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
 
+    // Canonicalize dir for the starts_with comparison (issue 4): abs_out_dir (d) is already
+    // canonical, but `dir` may be a raw relative or pre-resolved-but-not-canonical path.
+    // Mismatch (e.g. /private/tmp vs /tmp on macOS) causes the exclusion to silently fail
+    // and includes the out-dir in the collection — not a security issue (only .mds are
+    // gathered) but causes redundant scanning. Fall back to raw dir when canonicalize fails
+    // (dir may not exist yet in unusual configurations).
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
     // Exclude the out-dir from collection when it is nested inside the source root.
     let exclude_prefix: Option<PathBuf> = match &output_base {
-        OutputBase::Dir(d) if d.starts_with(dir) => Some(d.clone()),
+        OutputBase::Dir(d) if d.starts_with(&canonical_dir) => Some(d.clone()),
         _ => None,
     };
 
@@ -722,6 +734,14 @@ fn run_build_directory(
 
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
+    // Track paths successfully written in this build run so the stale-cleanup
+    // step can verify it was tool-produced before deleting (issue 1 guard):
+    // prevents clobbering a hand-authored file that shares a stem with a .mds
+    // (e.g. notes.md kept next to notes.mds that now compiles to notes.json).
+    // Same-stem .md/.json files adjacent to a .mds in NextToSource mode are
+    // considered tool-owned; if a collision is a concern use --out-dir to
+    // separate source and output trees.
+    let mut written_this_run: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for file in &files {
         // Skip partials: they contribute to imports but produce no standalone output.
@@ -754,9 +774,27 @@ fn run_build_directory(
                         if !quiet {
                             eprintln!("Compiled to {}", out_path.display());
                         }
-                        // Stale-output cleanup: remove the wrong-extension sibling if it exists.
+                        written_this_run.insert(out_path.clone());
+                        // Stale-output cleanup: remove the wrong-extension sibling only
+                        // if this tool wrote it (i.e. it appears in written_this_run from
+                        // a previous iteration, or matches a prior build's output).
+                        // For a kind-flip (template switched markdown↔messages between
+                        // two runs), the stale sibling won't be in written_this_run yet.
+                        // We still want to clean it up in that case — the legitimate
+                        // format-flip cleanup. Gate: the stale path must either be in
+                        // written_this_run (already written this run — shouldn't happen
+                        // but safe), OR the output_base is Dir (separate output tree,
+                        // no hand-authored sibling risk). In NextToSource mode and the
+                        // stale path was not written by us this run, skip to protect
+                        // hand-authored files.
                         let base_no_ext = output_base_no_ext(file, dir, &output_base);
-                        probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        let stale_path =
+                            base_no_ext.with_extension(compiled.kind.stale_extension());
+                        let safe_to_delete = matches!(output_base, OutputBase::Dir(_))
+                            || written_this_run.contains(&stale_path);
+                        if safe_to_delete {
+                            probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        }
                         ok_count += 1;
                     }
                     Err(e) => {
