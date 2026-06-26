@@ -248,6 +248,28 @@ describe('createMdsTransformer', () => {
     assert.ok(!metaLine.includes(u2029), 'U+2029 must be escaped in metadata');
   });
 
+  test('markdown default export is safe for inline script embedding (no </script>)', async () => {
+    const mds = createMockMds({
+      async compileFile() {
+        return {
+          kind: 'markdown',
+          output: 'Before </script><script>alert(1)</script> after',
+          warnings: [],
+          dependencies: [],
+        };
+      },
+    });
+    const transformer = createMdsTransformer(mds);
+    const result = await transformer.transform('/file.mds');
+
+    const exportLine = result.code.split('\n').find(l => l.startsWith('export default'));
+    assert.ok(exportLine, 'should have export default line');
+    // '</script>' must not appear verbatim — it would close an enclosing <script> block.
+    // '<' is escaped to '<' so '</script>' becomes '</script>'.
+    assert.ok(!exportLine.includes('</script>'), '</script> must not appear verbatim in markdown default export');
+    assert.ok(exportLine.includes('\\u003c'), '< must be escaped as \\u003c in markdown default export');
+  });
+
   test('concurrent transforms call init() exactly once', async () => {
     const mds = createMockMds();
     const transformer = createMdsTransformer(mds);

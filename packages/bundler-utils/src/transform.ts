@@ -7,12 +7,15 @@ import { LazyInit } from './lazy-init.js';
 // line terminators in JS source and must be escaped even though JSON.stringify
 // does not escape them. U+0000 (null byte) must be escaped to avoid truncation
 // in C-style string handling downstream.
+// '<' is escaped to '<' so that '</script>' in markdown content cannot
+// close an enclosing <script> block when the module is inlined into HTML.
 // Note: literal U+2028/U+2029 cannot appear in a regex literal (the parser treats
 // them as line terminators), so the pattern is constructed via new RegExp().
-const JS_ESCAPE_RE = new RegExp('[\\\\\"\\n\\r\\0\\u2028\\u2029]', 'g');
+const JS_ESCAPE_RE = new RegExp('[\\\\\"<\\n\\r\\0\\u2028\\u2029]', 'g');
 const JS_ESCAPE_MAP: Record<string, string> = {
   '\\': '\\\\',
   '"': '\\"',
+  '<': '\\u003c',
   '\n': '\\n',
   '\r': '\\r',
   '\0': '\\0',
@@ -86,13 +89,22 @@ export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
       // kind='messages' → export default [ {role, content}, … ] (array literal)
       // Metadata (warnings, dependencies) is emitted identically for both kinds.
       let defaultExport: string;
-      if (result.kind === 'markdown') {
-        defaultExport = `export default "${escapeForJs(result.output)}";\n`;
-      } else {
-        // kind === 'messages' — emit the messages array as a JSON literal.
-        // safeJsonForJs is used (not escapeForJs) because the value is serialized
-        // as JSON, not embedded in a double-quoted JS string.
-        defaultExport = `export default ${safeJsonForJs(result.messages)};\n`;
+      switch (result.kind) {
+        case 'markdown':
+          defaultExport = `export default "${escapeForJs(result.output)}";\n`;
+          break;
+        case 'messages':
+          // Emit the messages array as a JSON literal.
+          // safeJsonForJs is used (not escapeForJs) because the value is serialized
+          // as JSON, not embedded in a double-quoted JS string.
+          defaultExport = `export default ${safeJsonForJs(result.messages)};\n`;
+          break;
+        default: {
+          const _exhaustive: never = result;
+          throw new Error(
+            `Unhandled compile result kind: ${String((_exhaustive as { kind?: unknown }).kind)}`,
+          );
+        }
       }
 
       const code =
