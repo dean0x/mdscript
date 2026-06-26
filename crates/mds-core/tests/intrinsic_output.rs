@@ -97,10 +97,100 @@ fn orphan_text_outside_message_blocks_is_mixed_content_error() {
 }
 
 #[test]
+fn mixed_content_text_span_points_at_orphan_not_zero() {
+    // D1: the diagnostic must underline the offending top-level prose, not emit a
+    // 0/0 span. Two leading blank lines push the orphan to a provably non-zero
+    // offset, and trailing whitespace on the orphan line confirms the span hugs
+    // the trimmed prose (leading/trailing whitespace excluded).
+    let src = "\n\nOrphan prose.   \n@message user:\nQ\n@end\n";
+    let err = mds::compile_str(src).expect_err("orphan text must error");
+    let serialized = err.serialize();
+    assert_eq!(serialized.code, "mds::mixed_content");
+    let span = serialized
+        .span
+        .expect("MixedContent must carry a span pointing at the orphan prose");
+
+    // The orphan begins at byte 2 (after the two leading '\n').
+    let expected_offset = src.find("Orphan").expect("orphan present in source");
+    assert_eq!(
+        span.offset, expected_offset,
+        "span must point at the first non-whitespace byte of the orphan text"
+    );
+    assert_ne!(span.offset, 0, "span must NOT be the old 0/0 stub");
+    // Length spans only the trimmed run "Orphan prose." (13 bytes) — not the
+    // trailing spaces.
+    assert_eq!(span.length, "Orphan prose.".len());
+    // The underlined slice is exactly the trimmed prose.
+    assert_eq!(
+        &src[span.offset..span.offset + span.length],
+        "Orphan prose."
+    );
+    // Source context is present, so line/column resolve (1-based).
+    assert_eq!(span.line, Some(3), "orphan is on the third line");
+    assert_eq!(span.column, Some(1));
+}
+
+#[test]
 fn orphan_interpolation_outside_message_blocks_is_mixed_content_error() {
     let src = "---\nname: Alice\n---\n{name}\n@message user:\nQ\n@end\n";
     let err = mds::compile_str(src).expect_err("orphan interpolation must error");
     assert_eq!(err.serialize().code, "mds::mixed_content");
+}
+
+#[test]
+fn mixed_content_interpolation_span_points_at_interpolation() {
+    // D1: an orphan interpolation outside @message blocks must underline the
+    // interpolated expression using the Interpolation node's own offset+len.
+    // The span covers the inner expression (`name`), consistent with how every
+    // other interpolation diagnostic (e.g. undefined-var) underlines the expr,
+    // not the surrounding braces.
+    let src = "---\nname: Alice\n---\n{name}\n@message user:\nQ\n@end\n";
+    let err = mds::compile_str(src).expect_err("orphan interpolation must error");
+    let serialized = err.serialize();
+    assert_eq!(serialized.code, "mds::mixed_content");
+    let span = serialized.span.expect("MixedContent must carry a span");
+
+    // The Interpolation node carries the lexer's `{` offset and the inner
+    // expression length — the same span every interpolation diagnostic uses.
+    // What matters for D1: the span points AT the orphan `{name}` region (after
+    // the `---\n...---\n` frontmatter), not at the old 0/0 stub.
+    let brace_offset = src.find("{name}").expect("interpolation present");
+    assert_eq!(
+        span.offset, brace_offset,
+        "span offset must land on the orphan interpolation token"
+    );
+    assert_ne!(span.offset, 0, "span must NOT be the old 0/0 stub");
+    assert_eq!(
+        span.length,
+        "name".len(),
+        "span covers the inner expression"
+    );
+    // The span stays within the `{name}` token (offset .. offset+6).
+    assert!(
+        span.offset + span.length <= brace_offset + "{name}".len(),
+        "span stays within the orphan interpolation token"
+    );
+}
+
+#[test]
+fn mixed_content_span_is_char_based_on_multibyte_prose() {
+    // D1 + character-based column (compute_line_column): a multibyte orphan line
+    // must report a character-based column, and the byte offset/length must land
+    // on UTF-8 boundaries so no panic / OutOfBounds occurs.
+    let src = "café ☕ orphan\n@message user:\nQ\n@end\n";
+    let err = mds::compile_str(src).expect_err("multibyte orphan must error");
+    let serialized = err.serialize();
+    assert_eq!(serialized.code, "mds::mixed_content");
+    let span = serialized.span.expect("span present");
+    assert_eq!(span.offset, 0, "orphan starts the file");
+    // Byte length of the trimmed multibyte run.
+    assert_eq!(span.length, "café ☕ orphan".len());
+    // The slice round-trips (UTF-8 boundaries respected — no panic).
+    assert_eq!(
+        &src[span.offset..span.offset + span.length],
+        "café ☕ orphan"
+    );
+    assert_eq!(span.column, Some(1));
 }
 
 #[test]

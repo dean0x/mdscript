@@ -714,10 +714,20 @@ pub struct EvalMessage {
 /// error ([`MdsError::MixedContent`]) rather than a silently-ignored warning.
 /// Empty messages (after trimming) are silently skipped.
 /// Returns an error when `MAX_MESSAGE_COUNT` would be exceeded.
+///
+/// `file`/`source` provide the diagnostic context for the [`MdsError::MixedContent`]
+/// span: when orphan content is found, the offending node's byte offset (already
+/// captured by the parser on every `TextNode`/`Interpolation`) is paired with
+/// `source` so the error underlines the prose (ADR-022). For the `@extends` path the
+/// offsets may originate in a base template rather than `source`; the shared `at()`
+/// guard drops the source in that out-of-bounds case so no miette `OutOfBounds`
+/// render can occur (the raw offset/length are still preserved in `serialize()`).
 pub fn evaluate_messages_intrinsic(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
+    file: &str,
+    source: &str,
 ) -> Result<Vec<EvalMessage>, MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
@@ -726,7 +736,7 @@ pub fn evaluate_messages_intrinsic(
         warnings,
     };
     let mut messages = Vec::new();
-    collect_messages_strict(nodes, scope, &mut ctx, &mut messages)?;
+    collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;
     Ok(messages)
 }
 
@@ -741,6 +751,8 @@ fn collect_messages_strict(
     scope: &mut Scope,
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
+    file: &str,
+    source: &str,
 ) -> Result<(), MdsError> {
     for node in nodes {
         match node {
@@ -748,25 +760,37 @@ fn collect_messages_strict(
                 // Non-whitespace text outside any @message block is mixed content.
                 // Whitespace-only text (blank lines between @message blocks) is fine.
                 if !t.text.trim().is_empty() {
-                    return Err(MdsError::mixed_content());
+                    // Point the span at the first non-whitespace byte of the orphan
+                    // text rather than at the node's leading blank lines, and span
+                    // only the trimmed run so the underline hugs the actual prose.
+                    let lead_ws = t.text.len() - t.text.trim_start().len();
+                    let offset = t.offset.saturating_add(lead_ws);
+                    let len = t.text.trim().len();
+                    return Err(MdsError::mixed_content_at(file, source, offset, len));
                 }
             }
             Node::EscapedBrace => {
                 // Orphan escaped brace — treated as orphan whitespace; silently ignored
                 // (mirrors the historical messages-mode treatment of escaped braces).
             }
-            Node::Interpolation(_) => {
-                // Interpolation outside a @message block is mixed content.
-                return Err(MdsError::mixed_content());
+            Node::Interpolation(interp) => {
+                // Interpolation outside a @message block is mixed content. The
+                // interpolation carries its own offset+len (the `{...}` span).
+                return Err(MdsError::mixed_content_at(
+                    file,
+                    source,
+                    interp.offset,
+                    interp.len,
+                ));
             }
             Node::Message(block) => {
                 collect_single_message(block, scope, ctx, out)?;
             }
             Node::If(block) => {
-                collect_messages_from_if(block, scope, ctx, out)?;
+                collect_messages_from_if(block, scope, ctx, out, file, source)?;
             }
             Node::For(block) => {
-                collect_messages_from_for(block, scope, ctx, out)?;
+                collect_messages_from_for(block, scope, ctx, out, file, source)?;
             }
             Node::Define(_) | Node::Import(_) | Node::Export(_) => {
                 // Already handled by the resolver before evaluation.
@@ -785,7 +809,7 @@ fn collect_messages_strict(
                 // In standalone mode the block body is the default content; in inheritance
                 // mode the resolver has already spliced the final body before evaluation,
                 // so this arm is reached for both cases.
-                collect_messages_strict(&block.body, scope, ctx, out)?;
+                collect_messages_strict(&block.body, scope, ctx, out, file, source)?;
             }
         }
     }
@@ -852,9 +876,11 @@ fn collect_messages_from_if(
     scope: &mut Scope,
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
+    file: &str,
+    source: &str,
 ) -> Result<(), MdsError> {
     if evaluate_condition(&block.condition, scope, ctx)? {
-        return collect_messages_strict(&block.then_body, scope, ctx, out);
+        return collect_messages_strict(&block.then_body, scope, ctx, out, file, source);
     }
     // Parser enforces MAX_ELSEIF_BRANCHES at construction time; assert the invariant
     // holds so messages-mode correctness cannot silently depend on the parser limit alone.
@@ -867,11 +893,11 @@ fn collect_messages_from_if(
     );
     for (cond, body) in &block.elseif_branches {
         if evaluate_condition(cond, scope, ctx)? {
-            return collect_messages_strict(body, scope, ctx, out);
+            return collect_messages_strict(body, scope, ctx, out, file, source);
         }
     }
     if let Some(else_body) = &block.else_body {
-        return collect_messages_strict(else_body, scope, ctx, out);
+        return collect_messages_strict(else_body, scope, ctx, out, file, source);
     }
     Ok(())
 }
@@ -881,9 +907,11 @@ fn collect_messages_from_for(
     scope: &mut Scope,
     ctx: &mut EvalContext,
     out: &mut Vec<EvalMessage>,
+    file: &str,
+    source: &str,
 ) -> Result<(), MdsError> {
     drive_for(block, scope, ctx, |scope, ctx| {
-        collect_messages_strict(&block.body, scope, ctx, out)
+        collect_messages_strict(&block.body, scope, ctx, out, file, source)
     })
 }
 

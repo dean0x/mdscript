@@ -331,10 +331,12 @@ fn stdin_messages_with_out_dir_creates_output_json() {
 fn mixed_content_template_build_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     let mixed = dir.path().join("mixed.mds");
-    // This template has both top-level text AND @message blocks — that is mixed content.
+    // Mixed content: orphan prose AFTER a @message block (non-zero offset) so the
+    // diagnostic span (D1) provably points at the prose, not byte 0. The leading
+    // @message ensures the orphan is not at the start of the file.
     std::fs::write(
         &mixed,
-        "Some top-level text\n@message user:\nHello!\n@end\n",
+        "@message user:\nHello!\n@end\nStray trailing prose\n",
     )
     .unwrap();
 
@@ -349,6 +351,22 @@ fn mixed_content_template_build_exits_nonzero() {
         !output.status.success(),
         "mixed-content template should fail; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::mixed_content"),
+        "stderr should name the mixed_content code; got: {stderr}"
+    );
+    // D1: the diagnostic must underline the offending prose — the miette human
+    // renderer prints the source line containing the span. A regressed 0/0 span
+    // (or a cross-source OutOfBounds) would NOT show the orphan line.
+    assert!(
+        stderr.contains("Stray trailing prose"),
+        "diagnostic should underline the orphan prose line; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("OutOfBounds") && !stderr.contains("Failed to read contents"),
+        "diagnostic must not regress to a cross-source OutOfBounds render; got: {stderr}"
     );
 }
 

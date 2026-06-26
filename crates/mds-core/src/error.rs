@@ -671,11 +671,21 @@ impl MdsError {
         MdsError::NotMdsFile { path: path.into() }
     }
 
-    pub(crate) fn mixed_content() -> Self {
-        MdsError::MixedContent {
-            span: None,
-            src: None,
-        }
+    /// Construct a `MixedContent` error whose span points at the offending
+    /// top-level prose / interpolation.
+    ///
+    /// Unlike most evaluator-path errors (which carry no span because the
+    /// evaluator runs without source context — see the arity span-divergence
+    /// note in `evaluator.rs`), `MixedContent` is a *structural* error about the
+    /// template's shape: the offending node's byte offset is known statically
+    /// from the AST, so the diagnostic underlines the orphan content (ADR-022).
+    ///
+    /// `offset`/`len` index into `source`; the shared [`at`] guard drops `src`
+    /// (keeping raw offset/length for `serialize()`) if they fall out of bounds,
+    /// so a cross-source offset can never cause a miette `OutOfBounds` render.
+    pub(crate) fn mixed_content_at(file: &str, source: &str, offset: usize, len: usize) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::MixedContent { span, src }
     }
 
     /// Serialize this error into a [`SerializedError`] suitable for JSON output.

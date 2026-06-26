@@ -616,7 +616,16 @@ impl ModuleCache {
             // whose @message blocks live inside @block defaults is correctly detected
             // after splice. (ADR-016: re-validate dynamically-assembled content at leaf.)
             if has_message_block(&final_body) {
-                let messages = evaluate_messages_intrinsic(&final_body, &mut scope, warnings)?;
+                // final_body may splice nodes from base templates whose offsets do
+                // not index ctx.source; the mixed_content span uses the at() guard,
+                // which drops src on out-of-bounds so no OutOfBounds render occurs.
+                let messages = evaluate_messages_intrinsic(
+                    &final_body,
+                    &mut scope,
+                    warnings,
+                    ctx.file_str,
+                    ctx.source,
+                )?;
                 return Ok(crate::CompiledOutput::Messages(
                     messages.into_iter().map(crate::Message::from).collect(),
                 ));
@@ -656,7 +665,15 @@ impl ModuleCache {
 
         // Dispatch on output shape: any @message block → Messages, else Markdown.
         if has_message_block(&module.body) {
-            let messages = evaluate_messages_intrinsic(&module.body, &mut scope, warnings)?;
+            // Standalone path: module.body offsets index ctx.source directly, so a
+            // mixed_content error underlines the orphan prose in the file's source.
+            let messages = evaluate_messages_intrinsic(
+                &module.body,
+                &mut scope,
+                warnings,
+                ctx.file_str,
+                ctx.source,
+            )?;
             return Ok(crate::CompiledOutput::Messages(
                 messages.into_iter().map(crate::Message::from).collect(),
             ));
