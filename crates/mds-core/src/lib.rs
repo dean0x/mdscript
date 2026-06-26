@@ -16,7 +16,8 @@
 //!
 //! ```rust,no_run
 //! use std::path::Path;
-//! let md = mds::compile(Path::new("template.mds"), None)?;
+//! let result = mds::compile(Path::new("template.mds"), None)?;
+//! let md = result.into_markdown()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -25,7 +26,8 @@
 //! ```rust,no_run
 //! use std::path::Path;
 //! let vars = mds::load_vars_file(Path::new("vars.json"))?;
-//! let md = mds::compile(Path::new("template.mds"), Some(vars))?;
+//! let result = mds::compile(Path::new("template.mds"), Some(vars))?;
+//! let md = result.into_markdown()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -134,6 +136,61 @@ impl CompileResult {
         match self.output {
             CompiledOutput::Messages(v) => Ok(v),
             CompiledOutput::Markdown(_) => Err(MdsError::ExpectedMessages),
+        }
+    }
+
+    /// Build the canonical discriminated-union JS object from this result.
+    ///
+    /// Produces the `{ kind, <active-payload>, warnings, dependencies }` shape
+    /// shared by the NAPI and WASM bindings — a single authoritative implementation
+    /// so both wire formats are guaranteed byte-identical.
+    ///
+    /// Shape:
+    /// - Markdown: `{ kind: "markdown", output: <string>, warnings: string[], dependencies: string[] }`
+    /// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
+    ///
+    /// The **inactive payload field is ABSENT** — a markdown result has no `messages`
+    /// key; a messages result has no `output` key. Explicit field-by-field construction
+    /// via `serde_json::json!()` prevents serde derive from injecting unwanted keys.
+    pub fn to_canonical_json(self) -> serde_json::Value {
+        let warnings: serde_json::Value = self
+            .warnings
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>()
+            .into();
+        let dependencies: serde_json::Value = self
+            .dependencies
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>()
+            .into();
+
+        match self.output {
+            CompiledOutput::Markdown(text) => serde_json::json!({
+                "kind": "markdown",
+                "output": text,
+                "warnings": warnings,
+                "dependencies": dependencies,
+            }),
+            CompiledOutput::Messages(msgs) => {
+                let messages: serde_json::Value = msgs
+                    .into_iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "role": m.role,
+                            "content": m.content,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                serde_json::json!({
+                    "kind": "messages",
+                    "messages": messages,
+                    "warnings": warnings,
+                    "dependencies": dependencies,
+                })
+            }
         }
     }
 }
@@ -932,7 +989,8 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// use std::path::Path;
 ///
 /// let vars = mds::load_vars_file(Path::new("vars.json"))?;
-/// let md = mds::compile(Path::new("template.mds"), Some(vars))?;
+/// let result = mds::compile(Path::new("template.mds"), Some(vars))?;
+/// let md = result.into_markdown()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "the loaded variables should be used"]

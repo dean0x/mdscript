@@ -491,6 +491,35 @@ fn message_count_at_limit_is_accepted() {
     assert_eq!(msgs.len(), 10_000);
 }
 
+#[test]
+fn cumulative_content_size_limit_rejects_runaway_aggregate() {
+    // MAX_MESSAGES_TOTAL_SIZE = MAX_OUTPUT_SIZE = 50 MB (52_428_800 bytes).
+    // Strategy: 1_000 messages × 52_429 bytes each = 52_429_000 bytes > cap.
+    // Message count (1_000) is well below MAX_MESSAGE_COUNT (10_000), so this
+    // test exclusively exercises the BYTE cap, not the count cap.
+    // Each individual body (52_429 bytes) is also well below the per-output cap.
+    let body = "x".repeat(52_429);
+    let mut items = String::from("---\nitems:\n");
+    for i in 0..1_000usize {
+        items.push_str(&format!("  - item{i}\n"));
+    }
+    items.push_str(&format!(
+        "---\n@for item in items:\n@message user:\n{body}\n@end\n@end\n"
+    ));
+    let err =
+        mds::compile_str(&items).expect_err("aggregate content exceeding 50 MB must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("total message content") || msg.contains("cumulative size"),
+        "expected MAX_MESSAGES_TOTAL_SIZE error; got: {msg}"
+    );
+    // Confirm this is the byte cap, not the count cap.
+    assert!(
+        !msg.contains("message count") && !msg.contains("10000"),
+        "error must be the byte cap, not the count cap; got: {msg}"
+    );
+}
+
 // ── Dependency tracking ───────────────────────────────────────────────────────
 
 #[test]

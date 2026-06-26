@@ -506,53 +506,11 @@ fn parse_file_opts(
 /// Build the canonical `{ kind, <active-payload>, warnings, dependencies }` JS object
 /// from a [`mds::CompileResult`], as a `serde_json::Value`.
 ///
-/// Shape:
-/// - Markdown: `{ kind: "markdown", output: <string>, warnings: string[], dependencies: string[] }`
-/// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
-///
-/// The **inactive payload field is ABSENT** from the returned value — a markdown result
-/// has no `messages` key and a messages result has no `output` key. Explicit field-by-field
-/// construction prevents napi-rs struct-derive from injecting unwanted fields.
+/// Delegates to [`mds::CompileResult::to_canonical_json`], which is the single
+/// authoritative implementation shared with the WASM binding (AC-API-13: both
+/// bindings must produce byte-identical wire output).
 fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
-    let warnings: serde_json::Value = result
-        .warnings
-        .into_iter()
-        .map(serde_json::Value::String)
-        .collect::<Vec<_>>()
-        .into();
-    let dependencies: serde_json::Value = result
-        .dependencies
-        .into_iter()
-        .map(serde_json::Value::String)
-        .collect::<Vec<_>>()
-        .into();
-
-    match result.output {
-        mds::CompiledOutput::Markdown(text) => serde_json::json!({
-            "kind": "markdown",
-            "output": text,
-            "warnings": warnings,
-            "dependencies": dependencies,
-        }),
-        mds::CompiledOutput::Messages(msgs) => {
-            let messages: serde_json::Value = msgs
-                .into_iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "role": m.role,
-                        "content": m.content,
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into();
-            serde_json::json!({
-                "kind": "messages",
-                "messages": messages,
-                "warnings": warnings,
-                "dependencies": dependencies,
-            })
-        }
-    }
+    result.to_canonical_json()
 }
 
 // ── Public napi exports ───────────────────────────────────────────────────────

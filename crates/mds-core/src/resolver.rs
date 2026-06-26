@@ -1688,7 +1688,17 @@ fn has_message_block(nodes: &[Node]) -> bool {
         Node::For(block) => has_message_block(&block.body),
         // A @block's default body may contain @message blocks.
         Node::Block(block) => has_message_block(&block.body),
-        _ => false,
+        // Leaf nodes that can never contain @message blocks. Enumerated
+        // explicitly so a future new Node variant fails to compile here
+        // and at the sibling match in evaluate_messages_intrinsic, rather
+        // than silently being misclassified as markdown.
+        Node::Text(_)
+        | Node::Interpolation(_)
+        | Node::EscapedBrace
+        | Node::Define(_)
+        | Node::Import(_)
+        | Node::Export(_)
+        | Node::Include(_) => false,
     })
 }
 

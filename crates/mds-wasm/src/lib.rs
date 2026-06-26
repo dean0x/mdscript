@@ -443,55 +443,12 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 /// Build the canonical `{ kind, <active-payload>, warnings, dependencies }` JS object
 /// from a [`mds::CompileResult`].
 ///
-/// Shape:
-/// - Markdown: `{ kind: "markdown", output: <string>, warnings: string[], dependencies: string[] }`
-/// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
-///
-/// The **inactive payload field is ABSENT** — a markdown result has no `messages` key and
-/// a messages result has no `output` key. Explicit field-by-field construction using
-/// `serde_json::Value` ensures napi-rs/serde-derive cannot inject an unwanted field,
-/// and that the shape is byte-for-byte identical to the napi binding (AC-API-13).
+/// Delegates to [`mds::CompileResult::to_canonical_json`], the single authoritative
+/// implementation shared with the NAPI binding (AC-API-13: both bindings must produce
+/// byte-identical wire output). The resulting `serde_json::Value` is then converted to
+/// a `JsValue` via the JSON-compatible serializer.
 fn build_canonical_js(result: mds::CompileResult) -> Result<JsValue, JsValue> {
-    let warnings: serde_json::Value = result
-        .warnings
-        .into_iter()
-        .map(serde_json::Value::String)
-        .collect::<Vec<_>>()
-        .into();
-    let dependencies: serde_json::Value = result
-        .dependencies
-        .into_iter()
-        .map(serde_json::Value::String)
-        .collect::<Vec<_>>()
-        .into();
-
-    let json_val = match result.output {
-        mds::CompiledOutput::Markdown(text) => serde_json::json!({
-            "kind": "markdown",
-            "output": text,
-            "warnings": warnings,
-            "dependencies": dependencies,
-        }),
-        mds::CompiledOutput::Messages(msgs) => {
-            let messages: serde_json::Value = msgs
-                .into_iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "role": m.role,
-                        "content": m.content,
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into();
-            serde_json::json!({
-                "kind": "messages",
-                "messages": messages,
-                "warnings": warnings,
-                "dependencies": dependencies,
-            })
-        }
-    };
-    to_js(&json_val)
+    to_js(&result.to_canonical_json())
 }
 
 // ── Public WASM exports ───────────────────────────────────────────────────────
