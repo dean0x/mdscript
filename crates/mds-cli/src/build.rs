@@ -96,6 +96,17 @@ impl OutputKind {
             OutputKind::Messages => "json",
         }
     }
+
+    /// Extension of the *other* kind — used to identify a stale sibling to remove
+    /// after a format flip (Markdown → remove stale `.json`; Messages → remove stale `.md`).
+    ///
+    /// Kept adjacent to `extension()` so the two stay in sync when a new kind is added.
+    pub(crate) fn stale_extension(self) -> &'static str {
+        match self {
+            OutputKind::Markdown => "json", // we just wrote .md → stale is .json
+            OutputKind::Messages => "md",   // we just wrote .json → stale is .md
+        }
+    }
 }
 
 impl From<&CompiledOutput> for OutputKind {
@@ -105,20 +116,6 @@ impl From<&CompiledOutput> for OutputKind {
             CompiledOutput::Messages(_) => OutputKind::Messages,
         }
     }
-}
-
-/// Derive the output filename by replacing the extension with `.md`.
-///
-/// Examples:
-/// - `foo.mds`     → `foo.md`
-/// - `foo.bar.mds` → `foo.bar.md`
-/// - `README`      → `README.md`
-/// - `foo.txt`     → `foo.md`
-pub(crate) fn derive_output_filename(input: &Path) -> OsString {
-    let stem = input.file_stem().unwrap_or(input.as_os_str());
-    let mut name = OsString::from(stem);
-    name.push(".md");
-    name
 }
 
 /// Derive the output filename by replacing the extension with the kind-appropriate extension.
@@ -155,19 +152,6 @@ pub(crate) fn compute_output_dir_path_for_kind(
     dir.join(filename)
 }
 
-/// Compute `dir/<derived-name>.md` WITHOUT creating the directory.
-///
-/// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
-/// if `None` (stdin), the fallback name `output.md` is used.
-///
-/// Use [`prepare_output_dir`] when the directory also needs to be created.
-pub(crate) fn compute_output_dir_path(dir: &Path, input_path: Option<&Path>) -> PathBuf {
-    let filename = input_path
-        .map(derive_output_filename)
-        .unwrap_or_else(|| OsString::from("output.md"));
-    dir.join(filename)
-}
-
 /// Create `dir` (if absent) and return `dir/<derived-name>.<ext>`.
 ///
 /// Extension is determined by `kind` (markdown → `.md`, messages → `.json`).
@@ -181,16 +165,6 @@ pub(crate) fn prepare_output_dir_for_kind(
     std::fs::create_dir_all(dir)
         .map_err(|e| miette::miette!("cannot create output directory {}: {e}", dir.display()))?;
     Ok(compute_output_dir_path_for_kind(dir, input_path, kind))
-}
-
-/// Create `dir` (if absent) and return `dir/<derived-name>.md`.
-///
-/// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
-/// if `None` (stdin), the fallback name `output.md` is used.
-pub(crate) fn prepare_output_dir(dir: &Path, input_path: Option<&Path>) -> Result<PathBuf> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| miette::miette!("cannot create output directory {}: {e}", dir.display()))?;
-    Ok(compute_output_dir_path(dir, input_path))
 }
 
 /// Resolve the output path according to the precedence chain (kind-aware variant).
@@ -282,78 +256,6 @@ pub(crate) fn resolve_output_path_for_kind(
     match input_path {
         Some(p) => {
             let filename = derive_output_filename_for_kind(p, kind);
-            let dir = p.parent().unwrap_or(Path::new("."));
-            Ok(Some(dir.join(filename)))
-        }
-        // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
-        None => Ok(None),
-    }
-}
-
-/// Resolve the output path according to the precedence chain.
-///
-/// Any required output directory is created via `create_dir_all`.
-///
-/// Precedence:
-/// 1. `-o -`                         → stdout (returns `None`)
-/// 2. `-o <path>`                    → that exact path
-/// 3. Stdin with no -o / --out-dir   → stdout (returns `None`)
-/// 4. `--out-dir <dir>`              → `<dir>/<name>.md`
-/// 5. `mds.json`                     → `<config_dir>/<output_dir>/<name>.md`
-/// 6. Default                        → source dir + `<name>.md`
-pub(crate) fn resolve_output_path(
-    input: &Option<PathBuf>,
-    output: &Option<String>,
-    out_dir: &Option<PathBuf>,
-    config: &Option<(MdsConfig, PathBuf)>,
-) -> Result<Option<PathBuf>> {
-    // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
-    match output.as_deref() {
-        Some("-") => return Ok(None),
-        Some(o) => return Ok(Some(PathBuf::from(o))),
-        None => {}
-    }
-
-    // Derive the output filename from the input path (needed for steps 3-6).
-    // Treat stdin ("-") as None so we fall back to "output.md" instead of "-.md".
-    let input_path = input.as_deref().filter(|p| *p != Path::new("-"));
-
-    // 3. Stdin input with no explicit output destination → stdout.
-    //    But if --out-dir is set, fall through so the user's explicit CLI flag
-    //    is honored (using "output.md" as the derived filename).
-    if input_path.is_none() && out_dir.is_none() {
-        return Ok(None);
-    }
-
-    // 4. `--out-dir <dir>`
-    if let Some(dir) = out_dir {
-        return Ok(Some(prepare_output_dir(dir, input_path)?));
-    }
-
-    // 5. `mds.json` output_dir
-    if let Some((cfg, config_dir)) = config {
-        if let Some(ref output_dir) = cfg.build.output_dir {
-            // Reject path traversal: `output_dir` must not contain `..` components.
-            // We check raw path components rather than canonicalizing because the
-            // directory may not exist yet (it gets created by create_dir_all below).
-            let traversal = Path::new(output_dir)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir);
-            if traversal {
-                return Err(miette::miette!(
-                    "mds.json output_dir '{}' must not contain '..' components",
-                    output_dir
-                ));
-            }
-            let dir = config_dir.join(output_dir);
-            return Ok(Some(prepare_output_dir(&dir, input_path)?));
-        }
-    }
-
-    // 6. Default: file next to source
-    match input_path {
-        Some(p) => {
-            let filename = derive_output_filename(p);
             let dir = p.parent().unwrap_or(Path::new("."));
             Ok(Some(dir.join(filename)))
         }
@@ -582,13 +484,15 @@ pub(crate) struct CompileOutput {
 
 /// Serialize `CompiledOutput` to the CLI wire format.
 ///
-/// - Markdown: the rendered string as-is.
+/// - Markdown: the rendered string as-is (moved, no copy).
 /// - Messages: pretty-printed JSON array of `{role,content}` with a trailing newline (AC-FUNC-09).
-fn serialize_output(output: &CompiledOutput) -> Result<String> {
+///
+/// Takes ownership so the markdown arm avoids an up-to-10 MiB clone (issue 2).
+fn serialize_output(output: CompiledOutput) -> Result<String> {
     match output {
-        CompiledOutput::Markdown(s) => Ok(s.clone()),
+        CompiledOutput::Markdown(s) => Ok(s),
         CompiledOutput::Messages(msgs) => {
-            let mut json = serde_json::to_string_pretty(msgs)
+            let mut json = serde_json::to_string_pretty(&msgs)
                 .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
             json.push('\n');
             Ok(json)
@@ -633,7 +537,9 @@ pub(crate) fn compile_to_content(
     }
 
     let kind = OutputKind::from(&result.output);
-    let content = serialize_output(&result.output)?;
+    // Move result.output into serialize_output so the Markdown arm avoids a clone
+    // (the kind was already derived from the borrow above — issue 2).
+    let content = serialize_output(result.output)?;
     Ok(CompileOutput {
         content,
         kind,
@@ -752,7 +658,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             }
         }
         let kind = OutputKind::from(&result.output);
-        let content = serialize_output(&result.output)?;
+        // Move result.output (issue 2 — avoids clone for Markdown arm).
+        let content = serialize_output(result.output)?;
         // Stdin: no project config; output path follows -o flag or defaults to stdout.
         let output_path =
             resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind, quiet)?;
@@ -921,7 +828,7 @@ mod tests {
     #[test]
     fn derive_output_filename_swaps_mds_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("foo.mds")),
+            derive_output_filename_for_kind(Path::new("foo.mds"), OutputKind::Markdown),
             OsString::from("foo.md")
         );
     }
@@ -929,7 +836,7 @@ mod tests {
     #[test]
     fn derive_output_filename_preserves_compound_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("foo.bar.mds")),
+            derive_output_filename_for_kind(Path::new("foo.bar.mds"), OutputKind::Markdown),
             OsString::from("foo.bar.md")
         );
     }
@@ -937,7 +844,7 @@ mod tests {
     #[test]
     fn derive_output_filename_no_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("README")),
+            derive_output_filename_for_kind(Path::new("README"), OutputKind::Markdown),
             OsString::from("README.md")
         );
     }
@@ -945,18 +852,20 @@ mod tests {
     #[test]
     fn derive_output_filename_other_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("foo.txt")),
+            derive_output_filename_for_kind(Path::new("foo.txt"), OutputKind::Markdown),
             OsString::from("foo.md")
         );
     }
 
     #[test]
     fn resolve_output_path_dash_o_dash_is_stdout() {
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("foo.mds")),
             &Some("-".to_string()),
             &None,
             &None,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(result, None, "-o - should resolve to stdout (None)");
@@ -964,7 +873,15 @@ mod tests {
 
     #[test]
     fn resolve_output_path_stdin_no_o_is_stdout() {
-        let result = resolve_output_path(&Some(PathBuf::from("-")), &None, &None, &None).unwrap();
+        let result = resolve_output_path_for_kind(
+            &Some(PathBuf::from("-")),
+            &None,
+            &None,
+            &None,
+            OutputKind::Markdown,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             result, None,
             "stdin input with no -o should resolve to stdout"
@@ -973,11 +890,13 @@ mod tests {
 
     #[test]
     fn resolve_output_path_default_file_next_to_source() {
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("/some/dir/hello.mds")),
             &None,
             &None,
             &None,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -991,11 +910,13 @@ mod tests {
     fn resolve_output_path_stdin_with_out_dir_uses_out_dir() {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path().join("out");
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("-")),
             &None,
             &Some(out_dir.clone()),
             &None,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -1015,11 +936,13 @@ mod tests {
             },
             PathBuf::from("/project"),
         ));
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("/project/hello.mds")),
             &Some("out.md".to_string()),
             &None,
             &config,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(

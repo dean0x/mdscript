@@ -83,6 +83,9 @@ pub(crate) fn resolve_output_base(
 ///
 /// Infallible — no directory creation.
 ///
+/// Defined in terms of [`output_base_no_ext`] so the strip_prefix / AC-M7
+/// path-escape logic is kept in one place (issue 5 — single source of truth).
+///
 /// - `Dir(base)`: mirrors `source` relative to `root` under `base`.
 ///   If `strip_prefix` fails (source not under root after canonicalization),
 ///   falls back to `base/stem.<ext>` — **never** joins an absolute path that
@@ -91,34 +94,20 @@ pub(crate) fn resolve_output_base(
 ///
 /// The `ext` parameter is the output extension without leading `.` (`"md"` or `"json"`).
 pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext: &str) -> PathBuf {
+    let no_ext = output_base_no_ext(source, root, base);
     match base {
         OutputBase::Dir(d) => {
-            // strip_prefix gives the relative path from root to source.
-            // If source is outside root (canonicalization edge case), fall
-            // back to just the filename to stay contained in the out-dir.
-            let rel = match source.strip_prefix(root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => {
-                    // Path-escape guard (AC-M7): use filename only.
-                    let stem = source.file_stem().unwrap_or(source.as_os_str());
-                    let mut name = std::ffi::OsString::from(stem);
-                    name.push(".");
-                    name.push(ext);
-                    return d.join(name);
-                }
-            };
-            // Replace the extension on the relative path.
-            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            let mut name = stem;
+            let mut name = no_ext
+                .file_name()
+                .unwrap_or(source.as_os_str())
+                .to_os_string();
             name.push(".");
             name.push(ext);
-            let out = d.join(rel.parent().unwrap_or(Path::new(""))).join(name);
+            let out = no_ext.parent().unwrap_or(d.as_path()).join(&name);
             // AC-M7 containment invariant: the output path must remain inside the out-dir.
-            // Enforced at runtime (not only in debug builds) so the path-escape boundary
-            // is guarded in production. If `strip_prefix` produced a relative path that
-            // somehow contains `..` or an absolute component, fall back to the flat
-            // `d/<stem>.<ext>` form which is guaranteed to be inside `d`
-            // (reliability.md / #5).
+            // `output_base_no_ext` already guards the strip_prefix escape case by returning
+            // `d/<stem>` for out-of-root sources; the with-extension step cannot escape.
+            // The check here is a defence-in-depth belt-and-suspenders assertion.
             if out.starts_with(d) {
                 out
             } else {
@@ -126,17 +115,19 @@ pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase, ext
                     false,
                     "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
                 );
-                let stem = source
-                    .file_stem()
-                    .unwrap_or(source.as_os_str())
-                    .to_os_string();
-                let mut flat_name = stem;
-                flat_name.push(".");
-                flat_name.push(ext);
+                let flat_name = {
+                    let mut n = source
+                        .file_stem()
+                        .unwrap_or(source.as_os_str())
+                        .to_os_string();
+                    n.push(".");
+                    n.push(ext);
+                    n
+                };
                 d.join(flat_name)
             }
         }
-        OutputBase::NextToSource => source.with_extension(ext),
+        OutputBase::NextToSource => no_ext.with_extension(ext),
     }
 }
 
@@ -231,10 +222,7 @@ pub(crate) fn is_partial(path: &Path) -> bool {
 /// AC-FUNC-23 (watch format-flip) and the equivalent dir-build stale-cleanup both
 /// call this function so the probe-and-unlink logic is shared.
 pub(crate) fn probe_and_remove_stale(base_no_ext: &Path, kind: OutputKind) {
-    let stale_ext = match kind {
-        OutputKind::Markdown => "json", // we just wrote .md → stale is .json
-        OutputKind::Messages => "md",   // we just wrote .json → stale is .md
-    };
+    let stale_ext = kind.stale_extension();
     let stale_path = base_no_ext.with_extension(stale_ext);
     if stale_path.exists() {
         match std::fs::remove_file(&stale_path) {

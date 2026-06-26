@@ -36,7 +36,7 @@ use mds::MdsError;
 
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
-    resolve_output_path, resolve_output_path_for_kind, write_output,
+    resolve_output_path_for_kind, write_output, OutputKind,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
@@ -906,12 +906,18 @@ fn run_watch_file(
             Err(e) => {
                 // Initial compile error: print and continue watching (entry dir still watched).
                 eprintln!("{e:?}");
-                // Fall back: resolve output path with markdown kind as a placeholder so we
+                // Fall back: resolve output path with Markdown kind as a placeholder so we
                 // know where to watch. This path may not match a later successful compile if
                 // the template has @message blocks, but it will correct on first successful rebuild.
-                let fallback_path =
-                    resolve_output_path(&Some(entry.clone()), &output, &out_dir, &config)
-                        .unwrap_or(None);
+                let fallback_path = resolve_output_path_for_kind(
+                    &Some(entry.clone()),
+                    &output,
+                    &out_dir,
+                    &config,
+                    OutputKind::Markdown,
+                    quiet,
+                )
+                .unwrap_or(None);
                 (fallback_path, vec![])
             }
         };
@@ -1219,11 +1225,8 @@ fn compile_one_source(
                         let base_no_ext = output_base_no_ext(src, root, output_base);
                         // Remove the stale-extension sibling from last_written so the key
                         // doesn't accumulate stale entries (memory hygiene).
-                        let stale_ext = match compiled.kind {
-                            crate::build::OutputKind::Markdown => "json",
-                            crate::build::OutputKind::Messages => "md",
-                        };
-                        let stale_path = base_no_ext.with_extension(stale_ext);
+                        let stale_path =
+                            base_no_ext.with_extension(compiled.kind.stale_extension());
                         state.last_written.remove(&stale_path);
                         probe_and_remove_stale(&base_no_ext, compiled.kind);
 
