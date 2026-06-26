@@ -22,7 +22,7 @@
 //! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
 //! - Compile errors during watching never terminate the watcher.
 //! - All loops have fixed upper bounds (ADR-021 / reliability.md).
-//! - All `.mds` reads go through `compile_to_content` / `read_build_input` (PF-004).
+//! - All `.mds` reads go through `compile_to_content` (PF-004).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ use mds::MdsError;
 
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
-    resolve_output_path, write_output, MdsConfig, OutputFormat,
+    resolve_output_path, resolve_output_path_for_kind, write_output, MdsConfig,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -47,7 +47,6 @@ pub(crate) struct WatchArgs {
     pub(crate) out_dir: Option<PathBuf>,
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
-    pub(crate) format: OutputFormat,
     pub(crate) clear: bool,
     pub(crate) debounce: u64,
     pub(crate) quiet: bool,
@@ -662,7 +661,6 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         out_dir,
         vars,
         set_vars,
-        format,
         clear,
         debounce,
         quiet,
@@ -687,19 +685,11 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
     let is_dir = resolved_input.is_dir();
 
     // Directory mode constraint checks.
-    if is_dir {
-        if output.is_some() {
-            return Err(miette::miette!(
-                "watch directory mode does not support -o/--output; \
-                 use --out-dir to specify an output directory"
-            ));
-        }
-        if format == OutputFormat::Messages {
-            return Err(miette::miette!(
-                "watch directory mode does not support --format messages; \
-                 multiple inputs cannot map to a single JSON document"
-            ));
-        }
+    if is_dir && output.is_some() {
+        return Err(miette::miette!(
+            "watch directory mode does not support -o/--output; \
+             use --out-dir to specify an output directory"
+        ));
     }
 
     // Reject a symlinked entry/target (build parity — PF-004); plain canonicalize
@@ -729,7 +719,6 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
             out_dir,
             vars,
             set_vars,
-            format,
             clear,
             debounce,
             quiet,
@@ -746,13 +735,22 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 /// rebuild — replaces the 6-7 individual constant args on `rebuild_file` and
 /// `liveness_probe_file`, removing the `#[allow(clippy::too_many_arguments)]`
 /// suppressions (issue #6 / zero-warnings policy).
+///
+/// `output_path` is the path resolved from the startup compile (intrinsic: kind
+/// derived from the first compile result). On each rebuild the same path is reused
+/// unless `-o` was specified explicitly, in which case that path is canonical.
+/// For the watch single-file case the path is stable across recompiles (the template
+/// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
     entry: PathBuf,
     vars_path: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
-    format: OutputFormat,
+    /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
+    /// Kept here so `rebuild_file` can reuse the same path-derivation logic for
+    /// the dynamic path case (where output_path itself stays None until after compile).
+    output_arg: Option<String>,
+    out_dir: Option<PathBuf>,
     output_path: Option<PathBuf>,
-    output_key: String,
     quiet: bool,
 }
 
@@ -942,12 +940,41 @@ fn rebuild_file(
     };
 
     let t0 = Instant::now();
-    match compile_to_content(&ctx.entry, runtime_vars, &ctx.format, ctx.quiet) {
+    match compile_to_content(&ctx.entry, runtime_vars, ctx.quiet) {
         Ok(compiled) => {
+            // Derive the output path from the compiled kind (intrinsic extension).
+            // If ctx.output_path is already set (startup succeeded), reuse it.
+            // If ctx.output_path is None: either output is stdout (output_arg == Some("-")
+            // or no flags) OR startup failed. In either case, re-derive from kind + args.
+            // We load project config lazily here only if output_path is None and we need
+            // to derive from mds.json — for the common "startup succeeded" path this is free.
+            let output_path = if ctx.output_path.is_some() {
+                ctx.output_path.clone()
+            } else {
+                // output_path is None: this means either stdout or startup failed.
+                // Re-derive using kind. If -o - or stdin fallback, this returns None (stdout).
+                let config = load_config(&ctx.entry).unwrap_or(None);
+                resolve_output_path_for_kind(
+                    &Some(ctx.entry.clone()),
+                    &ctx.output_arg,
+                    &ctx.out_dir,
+                    &config,
+                    compiled.kind,
+                    ctx.quiet,
+                )
+                .unwrap_or(None)
+            };
+
+            // Build the output_key for content-dedup.
+            let output_key: String = output_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<stdout>".to_string());
+
             // Content-based dedup: skip write + summary line when unchanged.
             let content_changed = state
                 .last_written
-                .get(&ctx.output_key)
+                .get(&output_key)
                 .is_none_or(|prev| *prev != compiled.content);
 
             // ADR-016: always recompute dep set from fresh output.
@@ -963,18 +990,15 @@ fn rebuild_file(
             state.last_mtimes = snapshot_state(&state.foi);
 
             if content_changed {
-                match write_output(ctx.output_path.clone(), &compiled.content, ctx.quiet, false) {
+                match write_output(output_path.clone(), &compiled.content, ctx.quiet, false) {
                     Ok(()) => {
                         let elapsed = t0.elapsed().as_millis();
                         let dep_count = compiled.dependencies.len();
-                        let out_display = ctx
-                            .output_path
+                        let out_display = output_path
                             .as_deref()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "<stdout>".to_string());
-                        state
-                            .last_written
-                            .insert(ctx.output_key.clone(), compiled.content);
+                        state.last_written.insert(output_key, compiled.content);
                         if !ctx.quiet {
                             eprintln!(
                                 "Recompiled {} ({} deps) in {}ms",
@@ -1006,15 +1030,11 @@ fn run_watch_file(
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
-    format: OutputFormat,
     clear: bool,
     debounce_ms: u64,
     quiet: bool,
     tick: Option<Duration>,
 ) -> Result<()> {
-    // Resolve output path ONCE at startup (before entering the watch loop).
-    let config = load_config(&entry)?;
-    let output_path = resolve_output_path(&Some(entry.clone()), &output, &out_dir, &config)?;
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
@@ -1022,26 +1042,40 @@ fn run_watch_file(
     // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
     let static_set_vars = set_vars;
 
-    // Initial compile.
+    // Initial compile: compile first, derive output path from kind (compile-then-route).
+    // For explicit -o / --out-dir the path is determined by the flag.
+    // For the default case (no explicit flag), the path depends on the output kind, which
+    // is only known after compilation — so we compile first, then derive.
     let runtime_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
     if !quiet {
         eprintln!("Watching {}", entry.display());
     }
+
+    // Load project config (for output_dir) — used if no explicit -o / --out-dir.
+    let config = load_config(&entry)?;
+
+    // Initial compile: returns (output_path, deps).
+    let (output_path, initial_deps) =
+        match compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet) {
+            Ok(result) => result,
+            Err(e) => {
+                // Initial compile error: print and continue watching (entry dir still watched).
+                eprintln!("{e:?}");
+                // Fall back: resolve output path with markdown kind as a placeholder so we
+                // know where to watch. This path may not match a later successful compile if
+                // the template has @message blocks, but it will correct on first successful rebuild.
+                let fallback_path =
+                    resolve_output_path(&Some(entry.clone()), &output, &out_dir, &config)
+                        .unwrap_or(None);
+                (fallback_path, vec![])
+            }
+        };
+
     // Key: resolved output path string, or the sentinel "<stdout>" when output_path is None.
     let output_key: String = output_path
         .as_deref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<stdout>".to_string());
-
-    let initial_deps =
-        match compile_and_write(&entry, output_path.clone(), runtime_vars, &format, quiet) {
-            Ok(deps) => deps,
-            Err(e) => {
-                // Initial compile error: print and continue watching (entry dir still watched).
-                eprintln!("{e:?}");
-                vec![]
-            }
-        };
 
     // Set up the watcher AFTER the initial compile so we can record the baseline
     // content in last_written before any FSEvents arrive.
@@ -1084,12 +1118,7 @@ fn run_watch_file(
     let mut last_written: HashMap<String, String> = HashMap::new();
     {
         let baseline_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
-        match compile_to_content(
-            &entry,
-            baseline_vars,
-            &format,
-            true, /* quiet for baseline */
-        ) {
+        match compile_to_content(&entry, baseline_vars, true /* quiet for baseline */) {
             Ok(out) => {
                 last_written.insert(output_key.clone(), out.content);
             }
@@ -1132,9 +1161,9 @@ fn run_watch_file(
         entry,
         vars_path,
         static_set_vars,
-        format,
+        output_arg: output,
+        out_dir,
         output_path,
-        output_key,
         quiet,
     };
 
@@ -1299,7 +1328,7 @@ fn compile_one_source(
 ) {
     let out = output_path_for(src, root, output_base);
     let t0 = Instant::now();
-    match compile_to_content(src, runtime_vars.clone(), &OutputFormat::Markdown, quiet) {
+    match compile_to_content(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths: Vec<PathBuf> = compiled.dependencies.iter().map(PathBuf::from).collect();
 
@@ -1724,7 +1753,7 @@ fn dir_watch_startup(
     for source in &all_files {
         let key = graph_key(source);
         let out = output_path_for(&key, &root, &output_base);
-        match compile_to_content(source, runtime_vars.clone(), &OutputFormat::Markdown, quiet) {
+        match compile_to_content(source, runtime_vars.clone(), quiet) {
             Ok(compiled) => {
                 // Collect dep paths (already canonical from mds-core).
                 let dep_paths: Vec<PathBuf> =
@@ -1838,7 +1867,6 @@ fn dir_watch_startup(
             match compile_to_content(
                 source,
                 baseline_vars.clone(),
-                &OutputFormat::Markdown,
                 true, /* quiet for baseline */
             ) {
                 Ok(compiled) => {
@@ -2094,7 +2122,7 @@ fn process_dir_batch_incremental(
         // External deps are graph nodes but never emit their own output (DD3).
         if !is_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match compile_to_content(src, runtime_vars.clone(), &OutputFormat::Markdown, true) {
+            match compile_to_content(src, runtime_vars.clone(), true) {
                 Ok(compiled) => {
                     let dep_paths: Vec<PathBuf> =
                         compiled.dependencies.iter().map(PathBuf::from).collect();
@@ -2735,15 +2763,11 @@ mod tests {
             "@import \"./helper.mds\" as h\n\n{h.greet(\"World\")}\n",
         )
         .unwrap();
+        // Use -o <out> style to direct output to a specific path.
         let out = dir.path().join("entry.md");
-        let deps = compile_and_write(
-            &entry,
-            Some(out.clone()),
-            None,
-            &OutputFormat::Markdown,
-            true,
-        )
-        .unwrap();
+        let out_str = out.display().to_string();
+        let (_written_path, deps) =
+            compile_and_write(&entry, &Some(out_str), &None, &None, None, true).unwrap();
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");
         assert!(

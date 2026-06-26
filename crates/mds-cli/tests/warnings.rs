@@ -57,8 +57,9 @@ fn warning_cap_at_max_warnings() {
     let main_path = dir.path().join("main.mds");
     std::fs::write(&main_path, &src).unwrap();
 
-    let (_, warnings) = mds::compile_collecting_warnings(&main_path, None)
+    let result = mds::compile_collecting_warnings(&main_path, None)
         .expect("template should compile successfully");
+    let warnings = result.warnings;
 
     assert_eq!(
         warnings.len(),

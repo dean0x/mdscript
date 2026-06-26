@@ -9,7 +9,7 @@ mod watch;
 
 use build::{
     build_runtime_vars, exit_code, parse_key_value, reject_directory_input, resolve_input,
-    run_build, BuildArgs, OutputFormat,
+    run_build, BuildArgs,
 };
 
 // ── CLI entry point ───────────────────────────────────────────────────────────
@@ -31,19 +31,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compile an MDS file to Markdown
+    /// Compile an MDS file to Markdown or JSON messages (output shape is intrinsic)
+    ///
+    /// Templates with `@message` blocks compile to a JSON array (.json).
+    /// All other templates compile to Markdown (.md).
+    /// The output extension is derived automatically from the compiled kind.
     #[command(
-        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  mds build template.mds --format messages  Compile @message blocks to JSON\n  echo \"Hello {name}!\" | mds build -         Compile from stdin (writes to stdout)"
+        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build chat.mds                         Compile @message template to chat.json\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md or dist/template.json\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  echo \"Hello {name}!\" | mds build -         Compile from stdin (writes to stdout)"
     )]
     Build {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
         input: Option<PathBuf>,
         /// Output destination: a file path, or "-" for stdout.
-        /// Defaults to `<name>.md` next to the source file.
+        /// Defaults to `<name>.md` or `<name>.json` next to the source file, based on output kind.
         /// Mutually exclusive with --out-dir.
         #[arg(short = 'o', long = "output", conflicts_with = "out_dir")]
         output: Option<String>,
-        /// Output directory. The output file is named `<input-stem>.md` inside this directory.
+        /// Output directory. The output file is named `<input-stem>.md` or `<input-stem>.json`
+        /// inside this directory, based on output kind.
         /// Directory is created if it does not exist.
         /// Mutually exclusive with -o/--output.
         #[arg(long = "out-dir", conflicts_with = "output")]
@@ -54,9 +59,6 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
-        /// Output format: "markdown" (default) or "messages" (JSON array of chat messages)
-        #[arg(long = "format", value_name = "FORMAT", default_value = "markdown")]
-        format: OutputFormat,
     },
     /// Validate an MDS file without rendering
     #[command(
@@ -90,11 +92,12 @@ enum Commands {
     /// Cross-root imports are watched NonRecursively.
     ///
     /// Output mirrors the source subtree under `--out-dir` / `mds.json output_dir`.
+    /// The output extension is determined by the compiled kind (.md or .json).
     ///
     /// A liveness-gated reconcile fallback re-arms watches each tick and does a full
     /// rescan only on watch loss/recovery. Use `--poll-interval 0` to disable.
     #[command(
-        after_help = "Examples:\n  mds watch template.mds              Watch a single file, write template.md\n  mds watch template.mds -o out.md    Watch to a specific output file\n  mds watch template.mds -o -         Watch, stream output to stdout\n  mds watch .                         Watch all .mds files in current directory\n  mds watch src/ --out-dir dist       Watch directory, mirror to dist/ subtree\n  mds watch template.mds --vars v.json  Watch with variable overrides\n  mds watch template.mds --clear      Clear terminal before each rebuild\n  mds watch src/ --poll-interval 500  Self-heal check every 500ms\n  mds watch src/ --poll-interval 0    Disable self-heal (native events only)"
+        after_help = "Examples:\n  mds watch template.mds              Watch a single file, write template.md\n  mds watch chat.mds                  Watch @message template, write chat.json\n  mds watch template.mds -o out.md    Watch to a specific output file\n  mds watch template.mds -o -         Watch, stream output to stdout\n  mds watch .                         Watch all .mds files in current directory\n  mds watch src/ --out-dir dist       Watch directory, mirror to dist/ subtree\n  mds watch template.mds --vars v.json  Watch with variable overrides\n  mds watch template.mds --clear      Clear terminal before each rebuild\n  mds watch src/ --poll-interval 500  Self-heal check every 500ms\n  mds watch src/ --poll-interval 0    Disable self-heal (native events only)"
     )]
     Watch {
         /// File or directory to watch. Omit to auto-detect a single .mds file.
@@ -115,10 +118,6 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
-        /// Output format: "markdown" (default) or "messages".
-        /// "messages" is only valid in single-file mode.
-        #[arg(long = "format", value_name = "FORMAT", default_value = "markdown")]
-        format: OutputFormat,
         /// Clear the terminal before each rebuild (only when stderr is a TTY)
         #[arg(long)]
         clear: bool,
@@ -232,7 +231,6 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
-            format,
         } => run_build(BuildArgs {
             input,
             output,
@@ -240,7 +238,6 @@ fn run(cli: Cli) -> Result<()> {
             vars,
             set_vars,
             quiet,
-            format,
         }),
         Commands::Check {
             input,
@@ -254,7 +251,6 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
-            format,
             clear,
             debounce,
             poll_interval,
@@ -264,7 +260,6 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
-            format,
             clear,
             debounce,
             quiet,

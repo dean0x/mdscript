@@ -646,10 +646,11 @@ impl ModuleCache {
         // both modes (avoids PF-004: alternate path bypassing a check).
         validate_exports(&explicit_exports, &functions)?;
 
-        // Register collected functions in scope for @define calls within bodies.
-        for (name, func) in &functions {
-            scope.set_function(name, Arc::clone(func));
-        }
+        // NOTE: @define functions are already inserted into scope directly by collect_define
+        // (via scope.set_function) during collect_definitions_and_imports. Re-inserting
+        // `functions` here would also bring re-exported symbols (@export foo from "…") into
+        // local scope, which violates the spec: "@export from does not make the symbol
+        // available in the current file's scope." No extra insertion is needed.
 
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
