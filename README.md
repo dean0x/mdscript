@@ -65,17 +65,17 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 - **Loops**: `@for item in list:` iteration over arrays and objects
 - **Functions**: `@define` reusable blocks with parameters
 - **Imports/Exports**: modular prompt libraries with alias, merge, and selective imports
-- **Messages**: `@message role: … @end` blocks compile to a JSON `[{role, content}]` array via `--format messages`
+- **Messages**: `@message role: … @end` blocks compile to a JSON `[{role, content}]` array (`.json`); all other templates compile to Markdown (`.md`) — output format is intrinsic to the template content
 - **Security**: path traversal guards, symlink rejection, file size limits
 - **Rich errors**: source-span diagnostics with line/column context
 
 ## CLI Reference
 
 ```
-mds build [FILE] [OPTIONS]    Compile an MDS template to Markdown
+mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown / JSON
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
-mds check [FILE] [OPTIONS]    Validate without rendering
-mds init [FILENAME]           Create a starter MDS file
+mds check [FILE|DIR] [OPTIONS]  Validate without rendering
+mds init [FILENAME]             Create a starter MDS file
 
 Global options:
   -q, --quiet                 Suppress status messages (applies to all commands)
@@ -83,11 +83,10 @@ Global options:
 Build/Watch options:
   -o, --output <PATH>         Output file, or "-" for stdout (build and single-file watch only;
                               rejected in directory watch mode — use --out-dir instead)
-  --out-dir <DIR>             Output directory (build/single-file watch: <stem>.md; dir-mode watch: mirrors source subtree)
+  --out-dir <DIR>             Output directory (build/single-file watch: <stem>.md or <stem>.json;
+                              dir-mode watch: mirrors source subtree)
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable)
-  --format <FORMAT>           markdown (default) or messages (JSON chat array;
-                              messages is single-file only — rejected in directory watch mode)
 
 Watch-only options:
   --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
@@ -103,6 +102,8 @@ Exit codes:
   2   I/O error (file not found, not an MDS file), or invalid CLI argument (clap parse error)
   3   Resource limit exceeded
 ```
+
+**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary is printed and the exit code is non-zero if any file fails. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 
 ### Live preview with `mds watch`
 
@@ -160,29 +161,35 @@ import systemPrompt from './prompts/system.mds';
 
 All plugins require `@mdscript/mds` as a peer dependency and accept `{ vars?: Record<string, unknown> }` for runtime template variables. See each package README for configuration details.
 
-TypeScript module declarations (`.mds` → `string`) are provided by `@mdscript/bundler-utils/mds`.
+TypeScript module declarations (`.mds` → `string | MdsMessage[]`) are provided by `@mdscript/bundler-utils/mds`. The kind is intrinsic to the template content: Markdown templates produce a `string`; templates with `@message` blocks produce an `MdsMessage[]`.
 
 ## Library Usage
 
 ### TypeScript / JavaScript
 
 ```ts
-import { init, compile, compileFile, compileMessages, isMdsError } from '@mdscript/mds';
+import { init, compile, compileFile, isMdsError } from '@mdscript/mds';
 
 await init();
 
-// Compile a string
-const { output } = compile('---\nname: World\n---\nHello {name}!\n');
+// Compile a string — result is a discriminated union based on template content
+const result = compile('---\nname: World\n---\nHello {name}!\n');
+if (result.kind === 'markdown') {
+  console.log(result.output);      // string
+} else {
+  console.log(result.messages);    // { role: string; content: string }[]
+}
 
 // Override variables at runtime
-const result = compile(source, { vars: { env: 'production' } });
+const result2 = compile(source, { vars: { env: 'production' } });
 
 // Compile a file (resolves @import directives)
-const { output, dependencies } = await compileFile('./prompts/system.mds');
-
-// Compile @message blocks to a structured chat array
-const { messages, warnings } = compileMessages(source);
-// messages: [{ role: 'system', content: '...' }, { role: 'user', content: '...' }]
+const fileResult = await compileFile('./prompts/system.mds');
+if (fileResult.kind === 'markdown') {
+  console.log(fileResult.output, fileResult.dependencies);
+} else {
+  console.log(fileResult.messages, fileResult.dependencies);
+}
 
 // Error handling
 try {

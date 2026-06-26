@@ -5,7 +5,7 @@
 MDS (Markdown Script) is a domain-specific language for composing, reusing, and compiling LLM prompts.
 
 - **Input**: `.mds` files (Markdown-native syntax with lightweight directives)
-- **Output**: Compiled Markdown/plain text strings
+- **Output**: Compiled Markdown (`.md`) or a JSON messages array (`.json`) — determined intrinsically by template content (see §4.10)
 - **Compiler**: Rust
 - **Audience**: Prompt engineers, AI developers
 
