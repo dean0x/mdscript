@@ -39,8 +39,8 @@ use crate::build::{
     resolve_output_path, resolve_output_path_for_kind, write_output,
 };
 use crate::output::{
-    collect_mds_files, is_partial, output_base_no_ext, output_path_for, probe_and_remove_stale,
-    resolve_output_base, OutputBase,
+    canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
+    probe_and_remove_stale, resolve_output_base, OutputBase,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -1575,21 +1575,9 @@ fn dir_watch_startup(
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
     let static_set_vars = set_vars;
 
-    // Resolve the out_dir as absolute and canonicalized so that
-    // the `starts_with(&root)` in-root exclusion check is reliable even when
-    // `cwd` contains symlinks (root is already canonical from run_watch, security #8).
-    let abs_out_dir: Option<PathBuf> = out_dir.as_ref().map(|d| {
-        let abs = if d.is_absolute() {
-            d.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(d)
-        };
-        // Best-effort: canonicalize when the path exists; fall back to absolute form when
-        // the out-dir doesn't yet exist (it will be created by write_output on first write).
-        abs.canonicalize().unwrap_or(abs)
-    });
+    // Canonicalize out_dir as absolute so the starts_with(&root) in-root exclusion check
+    // is reliable even when cwd contains symlinks (root is already canonical — security #8).
+    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
 
     // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup.
     let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;

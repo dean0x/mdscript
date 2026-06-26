@@ -786,27 +786,16 @@ fn run_build_directory(
     quiet: bool,
 ) -> Result<()> {
     use crate::output::{
-        collect_mds_files, is_partial, output_base_no_ext, output_path_for, probe_and_remove_stale,
-        resolve_output_base, OutputBase,
+        canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
+        probe_and_remove_stale, resolve_output_base, OutputBase,
     };
 
     const MAX_DEPTH: usize = 64;
 
-    // Resolve the output base (subtree mirroring or next-to-source).
-    // For --out-dir: canonicalize as absolute so starts_with checks work.
-    let abs_out_dir: Option<PathBuf> = out_dir.as_ref().map(|d| {
-        let abs = if d.is_absolute() {
-            d.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(d)
-        };
-        abs.canonicalize().unwrap_or(abs)
-    });
-
     // Load project config from the directory root.
     let config = load_config(dir)?;
+    // Canonicalize out_dir as absolute so starts_with checks are reliable.
+    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
     let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
 
     // Exclude the out-dir from collection when it is nested inside the source root.

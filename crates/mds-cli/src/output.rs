@@ -30,6 +30,24 @@ pub(crate) enum OutputBase {
     NextToSource,
 }
 
+/// Resolve `out_dir` to an absolute, canonicalized path for reliable `starts_with` checks.
+///
+/// Used by both `run_build_directory` and `dir_watch_startup` before calling
+/// [`resolve_output_base`]. Relative paths are resolved against `current_dir`; the result
+/// is then canonicalized (falls back to the absolute form when the directory does not yet exist).
+pub(crate) fn canonicalize_out_dir(out_dir: Option<&PathBuf>) -> Option<PathBuf> {
+    out_dir.map(|d| {
+        let abs = if d.is_absolute() {
+            d.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(d)
+        };
+        abs.canonicalize().unwrap_or(abs)
+    })
+}
+
 /// Compute the `OutputBase` for directory mode.
 ///
 /// Precedence (mirrors `resolve_output_path` for file mode):

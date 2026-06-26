@@ -1821,7 +1821,7 @@ fn f3_multilevel_deep_merge_transitive() {
 /// Output shape is intrinsic: a template containing any `@message` block compiles to
 /// `CompiledOutput::Messages`. `into_messages()` extracts the vector — or returns
 /// `Err(ExpectedMessages)` if the template produced Markdown (no `@message` block).
-fn compile_messages_virtual_helper(
+fn compile_virtual_messages_helper(
     files: &[(&str, &str)],
     entry: &str,
 ) -> Result<Vec<crate::Message>, MdsError> {
@@ -1857,7 +1857,7 @@ fn f9_messages_mode_block_override_compiles_to_message_array() {
         "@end\n",
     );
     let files = [("base.mds", base), ("child.mds", child)];
-    let messages = compile_messages_virtual_helper(&files, "child.mds")
+    let messages = compile_virtual_messages_helper(&files, "child.mds")
         .expect("F9: messages-mode inheritance should compile");
     assert_eq!(
         messages.len(),
@@ -1885,7 +1885,7 @@ fn f9_messages_mode_default_block_in_message_body() {
     );
     let child = "@extends \"./base.mds\"\n";
     let files = [("base.mds", base), ("child.mds", child)];
-    let messages = compile_messages_virtual_helper(&files, "child.mds")
+    let messages = compile_virtual_messages_helper(&files, "child.mds")
         .expect("F9: @message inside un-overridden base default block should surface");
     assert_eq!(
         messages.len(),
@@ -1930,7 +1930,7 @@ fn e13_extends_no_message_block_compiles_to_markdown() {
     );
 
     // Asking for messages on a Markdown result is the ExpectedMessages error.
-    let err = compile_messages_virtual_helper(&files, "child.mds")
+    let err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("E13: extracting messages from Markdown output must error");
     assert_eq!(
         err.serialize().code,
@@ -1962,7 +1962,7 @@ fn f10_messages_mode_empty_block_renders_empty() {
     // Child overrides the gap block with an empty body (same as default).
     let child = concat!("@extends \"./base.mds\"\n", "@block gap:\n", "@end\n",);
     let files = [("base.mds", base), ("child.mds", child)];
-    let messages = compile_messages_virtual_helper(&files, "child.mds")
+    let messages = compile_virtual_messages_helper(&files, "child.mds")
         .expect("F10 messages: empty block should not break compilation");
     // Two @message blocks: Before. and After.
     assert_eq!(
@@ -2034,7 +2034,7 @@ fn p5_deep_chain_32_levels_markdown_and_messages_under_2s() {
 
     let start = std::time::Instant::now();
     let markdown_result = compile_virtual(&md_refs, "file0.mds");
-    let messages_result = compile_messages_virtual_helper(&msg_refs, "file0.mds");
+    let messages_result = compile_virtual_messages_helper(&msg_refs, "file0.mds");
     let elapsed = start.elapsed();
 
     assert!(
@@ -2156,7 +2156,7 @@ fn p6_pf004_oversized_base_rejected_in_messages_mode() {
     let oversized = "x".repeat((MAX_FILE_SIZE + 1) as usize);
     let child = "@extends \"./base.mds\"\n";
     let files = [("base.mds", oversized.as_str()), ("child.mds", child)];
-    let err = compile_messages_virtual_helper(&files, "child.mds")
+    let err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("P6 messages: oversized base must be rejected");
     let code = err.serialize().code;
     assert_eq!(
@@ -2202,7 +2202,7 @@ fn f9_messages_mode_multilevel_chain() {
     );
     let files = [("a.mds", a), ("b.mds", b), ("c.mds", c)];
     let messages =
-        compile_messages_virtual_helper(&files, "c.mds").expect("F9 multilevel: should compile");
+        compile_virtual_messages_helper(&files, "c.mds").expect("F9 multilevel: should compile");
     assert_eq!(messages.len(), 1, "F9 multilevel: got {messages:?}");
     assert!(
         messages[0].content.contains("From C."),
@@ -2243,7 +2243,7 @@ fn pf004_messages_mode_extends_validates_final_body_parity() {
     );
 
     // Messages mode: must produce the SAME error (avoids PF-004 parallel-path divergence).
-    let messages_err = compile_messages_virtual_helper(&files, "child.mds")
+    let messages_err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("messages: undefined var must error");
     let messages_code = messages_err.serialize().code;
     assert_eq!(
@@ -2536,7 +2536,7 @@ fn pf004_messages_mode_span_parity_with_text_mode() {
         "pf004 span text: column must be Some: {text_span:?}"
     );
 
-    let msg_err = compile_messages_virtual_helper(&files, "child.mds")
+    let msg_err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("pf004 span: messages must error");
     let msg_s = msg_err.serialize();
     assert_eq!(
