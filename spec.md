@@ -467,24 +467,45 @@ This role comes from the variable.
 @end
 ```
 
-**Output modes:**
+**Intrinsic output shape:**
 
-| Mode | Invocation | Behaviour |
-|------|------------|-----------|
-| Text (default) | `compile_str` / `mds build` | `@message` body rendered inline; role markers ignored — backward compatible |
-| Messages | `compile_messages_str` / `compile_messages_virtual` / `mds build --format messages` | JSON array of `{role, content}` objects |
+Output format is decided by the template content, not a flag. A template containing
+any `@message` block compiles to a JSON array; all other templates compile to Markdown.
+Detection is **static**: the presence of a `@message` block anywhere in the parse tree
+(even inside an `@if` branch that is never taken at runtime) makes the template a
+messages template.
+
+| Kind | When | Output |
+|------|------|--------|
+| Markdown | No `@message` blocks anywhere in template | Plain text / Markdown string |
+| Messages | Any `@message` block present (anywhere, even dead-coded) | Pretty-printed `[{role, content}, …]` JSON array |
 
 ```mds
-# text mode output:
+# Source (messages template — contains @message blocks):
+@message system:
 You are a helpful assistant.
-Hello!
+@end
 
-# messages mode output:
+@message user:
+Hello!
+@end
+
+# Compiled output (messages kind):
 [
   { "role": "system", "content": "You are a helpful assistant." },
   { "role": "user",   "content": "Hello!" }
 ]
 ```
+
+A messages template that produces zero messages at runtime emits `[]` — this is
+valid, not an error.
+
+**Mixed content is a hard compile error:**
+
+Loose top-level prose or interpolations alongside `@message` blocks — content that
+would be rendered in the Markdown path — are rejected with `mds::mixed_content`
+rather than silently dropped or auto-wrapped. There is no "text mode" that renders
+`@message` bodies inline; the template kind is fixed at compile time.
 
 **Rules:**
 
@@ -498,10 +519,9 @@ Hello!
 - Empty bodies (trims to empty string) are silently skipped
 - Frontmatter is excluded from message content
 - Nested `@message` blocks are a parse error
-- In messages mode, text outside any `@message` block emits a warning and is ignored
-- A template with no `@message` blocks compiled in messages mode is a compile error
-- `@if` and `@for` around `@message` blocks work identically in both modes; the same iterable rules apply (see §4.4)
-- `@include` is silently ignored in messages mode and emits a warning; included module bodies are not surfaced as messages — compose with `@message` blocks directly
+- Top-level prose/interpolations alongside `@message` blocks → `mds::mixed_content` compile error
+- A top-level `@include` in a messages template emits a warning (included module bodies are not surfaced as messages — compose with `@message` blocks directly)
+- `@if` and `@for` around `@message` blocks work normally; the same iterable rules apply (see §4.4)
 
 **Control flow inside @message:**
 
@@ -618,14 +638,14 @@ Respond in plain text.
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
 - The child's raw frontmatter fence is the only one emitted in the output (base frontmatter is input to scope, not output)
 
-**Output modes:**
+**Intrinsic output with inheritance:**
 
-| Mode | Behaviour |
-|------|-----------|
-| Text (default) | `@block` bodies render inline where declared in the base skeleton |
-| Messages | `@message` blocks inside `@block` bodies participate in the messages array |
+Output kind follows the same intrinsic rule as §4.10: a template (or any base it
+extends) containing a `@message` block anywhere produces a messages array; otherwise
+the compiled output is Markdown. `@block` bodies render in the merged base skeleton;
+`@message` blocks inside `@block` bodies participate in the messages array.
 
-Messages mode example (base defines `@message` blocks inside `@block` bodies):
+Example — messages template via inheritance (base contains `@message` inside `@block`):
 
 ```mds
 # base.mds
@@ -651,7 +671,7 @@ Focus on peer-reviewed sources.
 @end
 ```
 
-Messages mode output (`mds build --format messages`):
+Compiled output (messages kind — intrinsic because `@message` is present):
 
 ```json
 [
@@ -743,43 +763,61 @@ Errors include a diagnostic code (`mds::*`), file path, line number, column, a v
 
 | Command | Purpose |
 |---------|---------|
-| `mds build [FILE]` | Compile an `.mds` template to Markdown |
-| `mds check [FILE]` | Validate a template without rendering |
+| `mds build [FILE\|DIR]` | Compile an `.mds` template (or a directory of templates) |
+| `mds check [FILE\|DIR]` | Validate a template or directory without rendering |
 | `mds init [FILENAME]` | Create a starter `.mds` file |
 
 ### 7.2 `mds build`
 
+Output extension is **intrinsic**: markdown templates → `.md`; messages templates → `.json`.
+
 ```bash
 mds build                                  # Auto-detect single .mds in current dir
-mds build template.mds                     # Compile to template.md (next to source)
-mds build template.mds -o output.md        # Compile to a specific file
-mds build template.mds -o -               # Compile to stdout
-mds build template.mds --out-dir dist      # Compile to dist/template.md
+mds build template.mds                     # Markdown → template.md; messages → template.json
+mds build template.mds -o output.md        # Compile to a specific path (warns if ext contradicts kind)
+mds build template.mds -o -               # Compile to stdout (kind-appropriate bytes)
+mds build template.mds --out-dir dist      # Markdown → dist/template.md; messages → dist/template.json
 mds build template.mds --vars vars.json    # With variable overrides from JSON file
 mds build template.mds --set name=Alice    # Set a single variable
 mds build template.mds --set name=Alice --set count=3  # Multiple variables
-echo "Hello {name}!" | mds build -         # Compile from stdin (writes to stdout)
+echo "Hello {name}!" | mds build -         # Compile from stdin → stdout
+mds build src/                             # Compile every non-partial .mds in the tree (next to source)
+mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dist/a/b.md (or .json)
 ```
+
+**Directory mode** (`mds build <dir>`):
+
+- Compiles every non-partial `.mds` file in the tree (recursively).
+- `_`-prefixed files are partials and are skipped (not compiled to output).
+- Symlinked files and symlinked directories inside the tree are skipped; a symlinked entry root is rejected at startup.
+- Output extension per file is intrinsic (`.md` or `.json`).
+- With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source.
+- `-o` is rejected for a directory input.
+- Continue-on-error: all compilable files are attempted; a summary and non-zero exit are produced if any file failed.
+- When the directory contains no `.mds` files, exits 0 with a "no files found" message.
+- **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
+- stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. |
-| `--out-dir <DIR>` | Output directory. Creates `<stem>.md` inside it. Created if absent. |
+| `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. Rejected for directory input. Warns if the extension contradicts the template kind. |
+| `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. |
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
-| `--format <FORMAT>` | Output format: `markdown` (default) or `messages` (JSON `[{role, content}]` array). In `messages` mode, output goes to stdout or `-o <path>`; `--out-dir` and `mds.json` `output_dir` are ignored. |
 | `-q, --quiet` | Suppress status messages and warnings on stderr. |
 
 **Output path resolution** (precedence order, highest first):
 
 1. `-o -` → stdout
-2. `-o <path>` → exact path
+2. `-o <path>` → exact path (extension determined by caller; compiler warns on mismatch)
 3. Stdin input with no `-o`/`--out-dir` → stdout
-4. `--out-dir <dir>` → `<dir>/<stem>.md`
-5. `mds.json` `build.output_dir` → `<config_dir>/<output_dir>/<stem>.md`
-6. Default → `<source_dir>/<stem>.md`
+4. `--out-dir <dir>` → `<dir>/<stem>.<ext>` (file mode) or `<dir>/<rel/path>.<ext>` (dir mode)
+5. `mds.json` `build.output_dir` → `<config_dir>/<output_dir>/<stem>.<ext>`
+6. Default → `<source_dir>/<stem>.<ext>`
+
+In all paths, `<ext>` is `md` for Markdown templates and `json` for messages templates.
 
 ### 7.3 `mds check`
 
@@ -788,9 +826,10 @@ mds check                                  # Auto-detect single .mds in current 
 mds check template.mds                     # Validate a specific file
 mds check template.mds --set name=Alice    # Validate with variable overrides
 echo "@if flag:" | mds check -             # Validate from stdin
+mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if the template is valid, non-zero on any error. Same `--vars`/`--set`/`--quiet` options as `mds build`.
+Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files.
 
 ### 7.4 `mds init`
 

@@ -27,27 +27,63 @@ mds build examples/edge-cases/08_runtime_vars.mds --vars examples/edge-cases/var
 
 ## Output formats
 
-By default `mds build` emits Markdown text. A template that declares `@message`
-blocks can additionally compile to a JSON array of chat messages with
-`--format messages` — ready to pass straight to a chat LLM API's `messages`
-parameter:
+**Output shape is intrinsic to the template — decided by content, not a flag.**
+
+A template containing any `@message` block compiles to a JSON messages array;
+all other templates compile to Markdown. The output extension reflects the kind:
+`.json` for messages templates, `.md` for Markdown templates.
 
 ```bash
-# Text mode (default): @message bodies render inline (backward compatible)
+# Markdown template → .md next to source
+mds build examples/ai-agent/system-prompt.mds
+
+# Messages template → .json next to source
+mds build examples/ai-agent/chat-messages.mds
+
+# Compile to stdout (kind-appropriate bytes)
 mds build examples/ai-agent/chat-messages.mds -o -
 
-# Messages mode: JSON array of { "role", "content" } objects
-mds build examples/ai-agent/chat-messages.mds --format messages -o -
+# Compile a whole directory (intrinsic extension per file)
+mds build examples/ --out-dir dist/
+
+# Check a whole directory without writing output
+mds check examples/
 ```
 
-From JavaScript, the same two modes are `compile`/`compileFile` (text) and
-`compileMessages`/`compileMessagesFile` (messages array), exported from
-`@mdscript/mds`.
+`@message` detection is **static**: a `@message` block anywhere in the template
+(even inside `@if false:`) makes it a messages template. **Mixed content** —
+loose top-level prose or interpolations alongside `@message` blocks — is a hard
+compile error (`mds::mixed_content`).
+
+A messages template that produces zero messages emits `[]`.
+
+From JavaScript, `compile`/`compileFile` return a **discriminated union**
+branched on `kind`:
+
+```js
+import { compile, compileFile } from '@mdscript/mds';
+
+// Markdown template
+const r1 = compile(markdownSource);
+if (r1.kind === 'markdown') {
+  console.log(r1.output); // string
+}
+
+// Messages template
+const r2 = await compileFile('chat-messages.mds');
+if (r2.kind === 'messages') {
+  console.log(r2.messages); // Array<{ role: string; content: string }>
+}
+```
+
+There is no `--format` flag and no `compileMessages`/`compileMessagesFile`
+function — the kind is determined by the template source.
 
 ## Node.js API
 
 [`node-api-test.mjs`](node-api-test.mjs) demonstrates compiling templates from
-JavaScript via `@mdscript/mds`.
+JavaScript via `@mdscript/mds`, including `kind` discrimination between Markdown
+and messages results.
 
 ## Bundler integrations
 

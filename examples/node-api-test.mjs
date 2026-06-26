@@ -22,6 +22,7 @@ function assert(condition, msg) {
 // ─── Test: compile simple string ─────────────────────────────────
 test('compile simple string', () => {
   const result = mds.compile('---\nname: World\n---\nHello {name}!\n');
+  assert(result.kind === 'markdown', `expected kind==='markdown', got ${result.kind}`);
   assert(result.output.includes('Hello World!'), 'should interpolate variable');
   assert(result.warnings.length === 0, 'should have no warnings');
   assert(result.dependencies.length === 0, 'string compile has no deps');
@@ -559,6 +560,71 @@ test('frontmatter imports: compile() rejects scalar imports key', () => {
     assert(mds.isMdsError(err), 'should be MDS error');
     assert(err.code === 'mds::import', `expected mds::import, got ${err.code}`);
   }
+});
+
+// ─── Tests: intrinsic output kind (discriminated union) ──────────
+
+test('kind: markdown template returns kind==="markdown"', () => {
+  const result = mds.compile('---\nname: World\n---\nHello {name}!\n');
+  assert(result.kind === 'markdown', `expected kind==='markdown', got ${result.kind}`);
+  assert(typeof result.output === 'string', 'markdown result must have string output');
+  assert(!('messages' in result), 'markdown result must not have messages field');
+});
+
+test('kind: compile() result has kind on every markdown call', () => {
+  const result = mds.compile('No frontmatter, just text.\n');
+  assert(result.kind === 'markdown', `expected kind==='markdown', got ${result.kind}`);
+  assert(result.output.includes('No frontmatter'), 'output should contain text');
+});
+
+test('kind: messages template returns kind==="messages"', async () => {
+  const result = await mds.compileFile(
+    resolve(__dirname, 'ai-agent/chat-messages.mds'),
+  );
+  assert(result.kind === 'messages', `expected kind==='messages', got ${result.kind}`);
+  assert(Array.isArray(result.messages), 'messages result must have array messages');
+  assert(!('output' in result), 'messages result must not have output field');
+  assert(result.messages.length > 0, 'chat-messages.mds should produce at least one message');
+  const first = result.messages[0];
+  assert(typeof first.role === 'string' && first.role.length > 0, 'each message must have a non-empty role');
+  assert(typeof first.content === 'string', 'each message must have string content');
+});
+
+test('kind: messages array elements are {role, content} objects', async () => {
+  const result = await mds.compileFile(
+    resolve(__dirname, 'ai-agent/chat-messages.mds'),
+  );
+  assert(result.kind === 'messages', 'must be messages kind');
+  for (const msg of result.messages) {
+    assert(typeof msg.role === 'string', `role must be string, got ${typeof msg.role}`);
+    assert(typeof msg.content === 'string', `content must be string, got ${typeof msg.content}`);
+    assert(Object.keys(msg).sort().join(',') === 'content,role', `message must only have role+content keys`);
+  }
+});
+
+test('kind: mixed content throws mds::mixed_content', () => {
+  // Loose top-level prose alongside @message is a hard compile error.
+  const source = 'This is loose prose.\n@message user:\nHello!\n@end\n';
+  try {
+    mds.compile(source);
+    assert(false, 'should have thrown mds::mixed_content');
+  } catch (err) {
+    assert(mds.isMdsError(err), `expected MDS error, got ${err}`);
+    assert(
+      err.code === 'mds::mixed_content',
+      `expected mds::mixed_content, got ${err.code}`,
+    );
+  }
+});
+
+test('kind: messages template with zero messages emits empty array', () => {
+  // A messages template where all @message blocks are gated by a falsy @if produces [].
+  // Detection is static: the @message block is seen by the parser, so kind==='messages'.
+  const source = '---\nenabled: false\n---\n@if enabled:\n@message user:\nSkipped.\n@end\n@end\n';
+  const result = mds.compile(source);
+  assert(result.kind === 'messages', `expected kind==='messages', got ${result.kind}`);
+  assert(Array.isArray(result.messages), 'should have messages array');
+  assert(result.messages.length === 0, `expected 0 messages, got ${result.messages.length}`);
 });
 
 // ─── Run all tests ───────────────────────────────────────────────
