@@ -383,8 +383,10 @@ fn exit_code_syntax_error() {
     );
 }
 
+// Directory input: an empty directory exits 0 (prints "No .mds files found").
+// Directory build is now supported — the old "must fail" test is updated to match new behavior.
 #[test]
-fn cli_build_rejects_directory_input() {
+fn cli_build_directory_empty_exits_zero() {
     let dir = tempfile::tempdir().unwrap();
 
     let output = mds_bin()
@@ -396,13 +398,14 @@ fn cli_build_rejects_directory_input() {
         .unwrap();
 
     assert!(
-        !output.status.success(),
-        "build with directory input must fail"
+        output.status.success(),
+        "build on an empty directory should succeed (no .mds files); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("expected a file") || stderr.contains("directory"),
-        "error should mention expected-a-file or directory, got: {stderr}"
+        stderr.contains("No .mds files") || stderr.contains("no .mds"),
+        "stderr should mention no .mds files found; got: {stderr}"
     );
 }
 

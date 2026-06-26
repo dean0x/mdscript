@@ -36,7 +36,11 @@ use mds::MdsError;
 
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
-    resolve_output_path, resolve_output_path_for_kind, write_output, MdsConfig,
+    resolve_output_path, resolve_output_path_for_kind, write_output,
+};
+use crate::output::{
+    collect_mds_files, is_partial, output_base_no_ext, output_path_for, probe_and_remove_stale,
+    resolve_output_base, OutputBase,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -60,104 +64,11 @@ enum Msg {
     Interrupt,
 }
 
-// ── Output base for directory mode ────────────────────────────────────────────
-
-/// Describes where directory-mode output files are written.
-///
-/// `Dir(base)` mirrors the source subtree under `base`:
-///   `source.strip_prefix(root)` → `base/rel/stem.md`
-/// `NextToSource` places the `.md` next to the source file.
-#[derive(Debug, Clone)]
-pub(crate) enum OutputBase {
-    Dir(PathBuf),
-    NextToSource,
-}
-
-/// Compute the `OutputBase` for directory mode.
-///
-/// Precedence (mirrors `resolve_output_path` for file mode):
-/// 1. `--out-dir` → `Dir(abs_out_dir)`
-/// 2. `mds.json build.output_dir` → `Dir(config_dir.join(output_dir))`
-///    — rejects `..` components at startup with a hard error.
-/// 3. Default → `NextToSource`
-pub(crate) fn resolve_output_base(
-    abs_out_dir: Option<&Path>,
-    config: &Option<(MdsConfig, PathBuf)>,
-) -> Result<OutputBase> {
-    if let Some(d) = abs_out_dir {
-        return Ok(OutputBase::Dir(d.to_path_buf()));
-    }
-    if let Some((cfg, config_dir)) = config {
-        if let Some(ref output_dir) = cfg.build.output_dir {
-            let traversal = Path::new(output_dir)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir);
-            if traversal {
-                return Err(miette::miette!(
-                    "mds.json output_dir '{}' must not contain '..' components",
-                    output_dir
-                ));
-            }
-            return Ok(OutputBase::Dir(config_dir.join(output_dir)));
-        }
-    }
-    Ok(OutputBase::NextToSource)
-}
-
-/// Compute the mirrored output path for a source file in directory mode.
-///
-/// Infallible — no directory creation.
-///
-/// - `Dir(base)`: mirrors `source` relative to `root` under `base`.
-///   If `strip_prefix` fails (source not under root after canonicalization),
-///   falls back to `base/stem.md` — **never** joins an absolute path that
-///   could escape the output directory (AC-M7 path-escape guard).
-/// - `NextToSource`: `source.with_extension("md")`.
-pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
-    match base {
-        OutputBase::Dir(d) => {
-            // strip_prefix gives the relative path from root to source.
-            // If source is outside root (canonicalization edge case), fall
-            // back to just the filename to stay contained in the out-dir.
-            let rel = match source.strip_prefix(root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => {
-                    // Path-escape guard (AC-M7): use filename only.
-                    let stem = source.file_stem().unwrap_or(source.as_os_str());
-                    let mut name = std::ffi::OsString::from(stem);
-                    name.push(".md");
-                    return d.join(name);
-                }
-            };
-            // Replace the extension on the relative path.
-            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            let mut name = stem;
-            name.push(".md");
-            let out = d.join(rel.parent().unwrap_or(Path::new(""))).join(name);
-            // AC-M7 containment invariant: the output path must remain inside the out-dir.
-            // Enforced at runtime (not only in debug builds) so the path-escape boundary
-            // is guarded in production. If `strip_prefix` produced a relative path that
-            // somehow contains `..` or an absolute component, fall back to the flat
-            // `d/<stem>.md` form which is guaranteed to be inside `d` (reliability.md / #5).
-            if out.starts_with(d) {
-                out
-            } else {
-                debug_assert!(
-                    false,
-                    "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
-                );
-                let stem = source
-                    .file_stem()
-                    .unwrap_or(source.as_os_str())
-                    .to_os_string();
-                let mut flat_name = stem;
-                flat_name.push(".md");
-                d.join(flat_name)
-            }
-        }
-        OutputBase::NextToSource => source.with_extension("md"),
-    }
-}
+// ── OutputBase re-exported from output.rs (moved for shared use) ─────────────
+//
+// `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`,
+// and `is_partial` are now defined in `output.rs` and imported above.
+// The doc comments there describe the contracts; no duplication needed here.
 
 // ── Pure helpers (unit-tested below) ─────────────────────────────────────────
 
@@ -278,73 +189,7 @@ pub(crate) fn event_is_relevant(event: &Event, watched: &HashSet<PathBuf>) -> bo
     false
 }
 
-/// Recursively collect all `.mds` files under `root`, bounded by `max_depth`.
-///
-/// Symlinked directories are skipped to avoid cycles.
-/// When `exclude_prefix` is `Some(p)`, any path that starts with `p` is skipped
-/// (used to exclude the out-dir when it is inside the watched root).
-pub(crate) fn collect_mds_files(
-    root: &Path,
-    max_depth: usize,
-    exclude_prefix: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    collect_mds_files_inner(root, 0, max_depth, exclude_prefix, &mut results);
-    results
-}
-
-fn collect_mds_files_inner(
-    dir: &Path,
-    depth: usize,
-    max_depth: usize,
-    exclude_prefix: Option<&Path>,
-    results: &mut Vec<PathBuf>,
-) {
-    if depth > max_depth {
-        eprintln!(
-            "warning: directory depth limit ({max_depth}) reached at {}; \
-             deeper files will not be watched",
-            dir.display()
-        );
-        return;
-    }
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-
-        // Skip the output directory when it is nested inside the root.
-        if let Some(excl) = exclude_prefix {
-            if path.starts_with(excl) {
-                continue;
-            }
-        }
-
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if file_type.is_symlink() {
-            // Symlinked dirs skipped to prevent cycles.
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_mds_files_inner(&path, depth + 1, max_depth, exclude_prefix, results);
-        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
-            results.push(path);
-        }
-    }
-}
-
-/// Return `true` if `path`'s file name starts with `_` (partial convention, DD2).
-pub(crate) fn is_partial(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.starts_with('_'))
-        .unwrap_or(false)
-}
+// collect_mds_files and is_partial are now in output.rs (imported above).
 
 /// Canonicalize a graph key: exists → `p.canonicalize()`; missing → canonicalize parent + rejoin.
 ///
@@ -1326,7 +1171,6 @@ fn compile_one_source(
     quiet: bool,
     state: &mut DirWatchState,
 ) {
-    let out = output_path_for(src, root, output_base);
     let t0 = Instant::now();
     match compile_to_content(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
@@ -1338,6 +1182,11 @@ fn compile_one_source(
                 settle_mtime(src, &mut state.last_mtimes);
                 return;
             }
+
+            // Derive the output path from the compiled kind (intrinsic extension).
+            // AC-FUNC-23: a @message template writes .json; a plain template writes .md.
+            let ext = compiled.kind.extension();
+            let out = output_path_for(src, root, output_base, ext);
 
             // Content-based dedup: skip write when content unchanged.
             let content_changed = state
@@ -1358,6 +1207,26 @@ fn compile_one_source(
                                 elapsed
                             );
                         }
+                        // AC-FUNC-23 (stale-output cleanup on format-flip in watch mode):
+                        // probe for the wrong-extension sibling and unlink it.
+                        // This unlink must NOT trigger the watcher: `out` is the NEW
+                        // output path we just wrote; the stale sibling has a DIFFERENT
+                        // extension, so it is outside the `last_written` map and the
+                        // `is_content_event` gate will drop any inotify events it causes.
+                        // The watcher self-trigger guard (content-dedup / last_written)
+                        // also covers the freshly written `out` — the next event for that
+                        // path will find identical content and skip the write.
+                        let base_no_ext = output_base_no_ext(src, root, output_base);
+                        // Remove the stale-extension sibling from last_written so the key
+                        // doesn't accumulate stale entries (memory hygiene).
+                        let stale_ext = match compiled.kind {
+                            crate::build::OutputKind::Markdown => "json",
+                            crate::build::OutputKind::Messages => "md",
+                        };
+                        let stale_path = base_no_ext.with_extension(stale_ext);
+                        state.last_written.remove(&stale_path);
+                        probe_and_remove_stale(&base_no_ext, compiled.kind);
+
                         state.record_success(
                             src,
                             dep_paths,
@@ -1752,7 +1621,6 @@ fn dir_watch_startup(
 
     for source in &all_files {
         let key = graph_key(source);
-        let out = output_path_for(&key, &root, &output_base);
         match compile_to_content(source, runtime_vars.clone(), quiet) {
             Ok(compiled) => {
                 // Collect dep paths (already canonical from mds-core).
@@ -1773,6 +1641,9 @@ fn dir_watch_startup(
 
                 // Partials (DD2): track in graph but don't emit their own output.
                 if !is_partial(source) {
+                    // Derive the output path from the compiled kind (intrinsic extension).
+                    let ext = compiled.kind.extension();
+                    let out = output_path_for(&key, &root, &output_base, ext);
                     if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
                     {
                         eprintln!("{e:?}");
@@ -1859,17 +1730,19 @@ fn dir_watch_startup(
             if is_partial(source) {
                 continue; // Partials have no output path in last_written.
             }
-            let out = output_path_for(&key, &root, &output_base);
-            if state.last_written.contains_key(&out) {
-                // Already recorded from startup compile — skip.
-                continue;
-            }
             match compile_to_content(
                 source,
                 baseline_vars.clone(),
                 true, /* quiet for baseline */
             ) {
                 Ok(compiled) => {
+                    // Derive output path from the compiled kind (intrinsic extension).
+                    let ext = compiled.kind.extension();
+                    let out = output_path_for(&key, &root, &output_base, ext);
+                    if state.last_written.contains_key(&out) {
+                        // Already recorded from startup compile — skip.
+                        continue;
+                    }
                     state.last_written.insert(out, compiled.content);
                 }
                 Err(_) => {
@@ -2021,23 +1894,30 @@ fn process_dir_batch_vars_changed(
     // removed just as in the incremental deletion step (step 5).
     let deleted: Vec<&PathBuf> = all_sources.iter().filter(|p| !p.exists()).collect();
     for del_src in &deleted {
-        let out = output_path_for(del_src, root, output_base);
-        if out.exists() {
-            match std::fs::remove_file(&out) {
-                Ok(()) => {
-                    if !quiet {
-                        eprintln!("Removed {} (source deleted)", out.display());
+        // Source is gone — we don't know the extension it used. Probe both.
+        let base_no_ext = output_base_no_ext(del_src, root, output_base);
+        for ext in &["md", "json"] {
+            let out = base_no_ext.with_extension(ext);
+            if out.exists() {
+                match std::fs::remove_file(&out) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("Removed {} (source deleted)", out.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: could not remove {}: {e}", out.display());
                     }
                 }
-                Err(e) => {
-                    eprintln!("warning: could not remove {}: {e}", out.display());
-                }
+                // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
+                // (forward_deps, errored, known_files, last_written).
+                state.forget(del_src, &out);
             }
         }
-        // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
-        // (forward_deps, errored, known_files, last_written) — the previous open-coded
-        // triple-remove inadvertently omitted known_files.remove (complexity.md / issue #4).
-        state.forget(del_src, &out);
+        // Ensure the source is cleaned from state even if neither sibling existed.
+        state.forward_deps.remove(*del_src);
+        state.errored.remove(*del_src);
+        state.known_files.remove(*del_src);
     }
 
     // Snapshot the old maps, clear them so compile_one_source's record_success
@@ -2113,8 +1993,12 @@ fn process_dir_batch_incremental(
             // `forward_deps`, and `known_files` now so it doesn't accumulate as a ghost
             // entry and waste per-batch allocation on every subsequent real-change event.
             if !deleted.contains(src) {
-                let out = output_path_for(src, root, output_base);
-                state.forget(src, &out);
+                // Source is gone — probe both .md and .json to clean up either sibling.
+                let base_no_ext = output_base_no_ext(src, root, output_base);
+                for ext in &["md", "json"] {
+                    let out = base_no_ext.with_extension(ext);
+                    state.forget(src, &out);
+                }
             }
             continue;
         }
@@ -2144,20 +2028,28 @@ fn process_dir_batch_incremental(
 
     // 5. Deletions: after importers recompiled, clean up graph + outputs.
     for del_src in &deleted {
-        let out = output_path_for(del_src, root, output_base);
-        if out.exists() {
-            match std::fs::remove_file(&out) {
-                Ok(()) => {
-                    if !quiet {
-                        eprintln!("Removed {} (source deleted)", out.display());
+        // Source is gone — we don't know the extension it used. Probe both.
+        let base_no_ext = output_base_no_ext(del_src, root, output_base);
+        for ext in &["md", "json"] {
+            let out = base_no_ext.with_extension(ext);
+            if out.exists() {
+                match std::fs::remove_file(&out) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("Removed {} (source deleted)", out.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: could not remove {}: {e}", out.display());
                     }
                 }
-                Err(e) => {
-                    eprintln!("warning: could not remove {}: {e}", out.display());
-                }
             }
+            state.forget(del_src, &out);
         }
-        state.forget(del_src, &out);
+        // Ensure source is cleaned even if no outputs were found.
+        state.forward_deps.remove(del_src);
+        state.errored.remove(del_src);
+        state.known_files.remove(del_src);
     }
 
     // 6. Prune external_dep_dirs to only dirs still referenced by live forward_deps.
@@ -2350,7 +2242,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         assert_eq!(result, PathBuf::from("/out/a/b/foo.md"));
     }
 
@@ -2362,16 +2254,16 @@ mod tests {
         let b = PathBuf::from("/root/b/x.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
         assert_ne!(
-            output_path_for(&a, &root, &base),
-            output_path_for(&b, &root, &base),
+            output_path_for(&a, &root, &base, "md"),
+            output_path_for(&b, &root, &base, "md"),
             "two files with the same stem in different subdirs must not collide"
         );
         assert_eq!(
-            output_path_for(&a, &root, &base),
+            output_path_for(&a, &root, &base, "md"),
             PathBuf::from("/out/a/x.md")
         );
         assert_eq!(
-            output_path_for(&b, &root, &base),
+            output_path_for(&b, &root, &base, "md"),
             PathBuf::from("/out/b/x.md")
         );
     }
@@ -2381,7 +2273,7 @@ mod tests {
     fn output_path_for_next_to_source() {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
-        let result = output_path_for(&source, &root, &OutputBase::NextToSource);
+        let result = output_path_for(&source, &root, &OutputBase::NextToSource, "md");
         assert_eq!(result, PathBuf::from("/root/a/b/foo.md"));
     }
 
@@ -2391,7 +2283,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/foo.bar.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         assert_eq!(result, PathBuf::from("/out/foo.bar.md"));
     }
 
@@ -2402,7 +2294,7 @@ mod tests {
         // Source is completely outside root — strip_prefix will fail.
         let source = PathBuf::from("/elsewhere/a/b/foo.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         // Must be inside /out, not escape to /elsewhere.
         assert!(
             result.starts_with("/out"),
@@ -2734,7 +2626,7 @@ mod tests {
 
         let source = root.join("template.mds");
         let base = OutputBase::Dir(new_subdir.clone());
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         assert_eq!(result, new_subdir.join("template.md"));
         assert!(
             !new_subdir.exists(),

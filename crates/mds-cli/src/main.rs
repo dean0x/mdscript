@@ -5,12 +5,10 @@ use clap::{Parser, Subcommand};
 use miette::Result;
 
 mod build;
+mod output;
 mod watch;
 
-use build::{
-    build_runtime_vars, exit_code, parse_key_value, reject_directory_input, resolve_input,
-    run_build, BuildArgs,
-};
+use build::{build_runtime_vars, exit_code, parse_key_value, resolve_input, run_build, BuildArgs};
 
 // ── CLI entry point ───────────────────────────────────────────────────────────
 
@@ -157,8 +155,23 @@ fn run_check(
     // run_check does not print a banner on auto-detect — check is a silent validation.
     let (input, _) = resolve_input(input)?;
 
-    reject_directory_input(&input)?;
+    // Directory mode: validate every non-partial .mds file in the tree.
+    if input != std::path::Path::new("-") && input.is_dir() {
+        // Reject a symlinked directory root for build parity (commit aa0c538).
+        if input
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(miette::miette!(
+                "directory argument must not be a symlink: {}",
+                input.display()
+            ));
+        }
+        return run_check_directory(&input, runtime_vars, quiet);
+    }
 
+    // Single-file / stdin path.
     if input == std::path::Path::new("-") {
         let (source, cwd) = read_stdin()?;
         let ((), warnings) = mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
@@ -178,6 +191,63 @@ fn run_check(
             }
             eprintln!("OK: {}", input.display());
         }
+    }
+    Ok(())
+}
+
+/// Validate every non-partial `.mds` file under `dir`.
+///
+/// Continue-on-error: a per-file error does not abort the run. Prints a summary and
+/// returns non-zero if any file fails (AC-FUNC-26).
+fn run_check_directory(
+    dir: &std::path::Path,
+    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
+    quiet: bool,
+) -> Result<()> {
+    use output::{collect_mds_files, is_partial};
+
+    const MAX_DEPTH: usize = 64;
+
+    let files = collect_mds_files(dir, MAX_DEPTH, None);
+
+    if files.is_empty() {
+        if !quiet {
+            eprintln!("No .mds files found in {}", dir.display());
+        }
+        return Ok(());
+    }
+
+    let mut ok_count: usize = 0;
+    let mut fail_count: usize = 0;
+
+    for file in &files {
+        if is_partial(file) {
+            continue;
+        }
+        match mds::check_collecting_warnings(file, runtime_vars.clone())
+            .map_err(miette::Error::from)
+        {
+            Ok(((), warnings)) => {
+                if !quiet {
+                    for w in &warnings {
+                        eprintln!("{w}");
+                    }
+                }
+                ok_count += 1;
+            }
+            Err(e) => {
+                eprintln!("{e:?}");
+                fail_count += 1;
+            }
+        }
+    }
+
+    if !quiet || fail_count > 0 {
+        eprintln!("{ok_count} checked, {fail_count} failed");
+    }
+
+    if fail_count > 0 {
+        std::process::exit(1);
     }
     Ok(())
 }

@@ -463,17 +463,6 @@ pub(crate) fn build_runtime_vars(
     Ok(runtime_vars)
 }
 
-/// Return an error if the input path is a directory (only file or stdin allowed).
-pub(crate) fn reject_directory_input(input: &Path) -> Result<()> {
-    if input != Path::new("-") && input.is_dir() {
-        return Err(miette::miette!(
-            "expected a file, got a directory: {}",
-            input.display()
-        ));
-    }
-    Ok(())
-}
-
 /// Read from stdin and return the source string along with the current working directory.
 ///
 /// Reads at most `MAX_FILE_SIZE + 1` bytes so we can detect over-sized input without
@@ -728,7 +717,28 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         eprintln!("Building {}", input.display());
     }
 
-    reject_directory_input(&input)?;
+    // Directory mode: compile every non-partial .mds file in the tree.
+    if input != Path::new("-") && input.is_dir() {
+        // Reject -o/--output in directory mode: output goes to files, not a single destination.
+        if output.is_some() {
+            return Err(miette::miette!(
+                "build directory mode does not support -o/--output; \
+                 use --out-dir to specify an output directory"
+            ));
+        }
+        // Reject a symlinked directory root for build parity (commit aa0c538).
+        if input
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(miette::miette!(
+                "directory argument must not be a symlink: {}",
+                input.display()
+            ));
+        }
+        return run_build_directory(&input, out_dir, runtime_vars, quiet);
+    }
 
     if input == Path::new("-") {
         // Stdin: compile from source string, route to stdout (or -o).
@@ -753,6 +763,124 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     // compile-then-route: compile first, derive output path from kind, then write.
     let config = load_config(&input)?;
     let _ = compile_and_write(&input, &output, &out_dir, &config, runtime_vars, quiet)?;
+    Ok(())
+}
+
+/// Compile every non-partial `.mds` file under `dir`, streaming one at a time
+/// (AC-PERF-02: peak RSS ≈ O(largest single file), not O(total)).
+///
+/// Continue-on-error: a per-file compile error does NOT abort the run.
+/// All valid files are written; a summary is printed; non-zero exit when any failed
+/// (AC-FUNC-18).
+///
+/// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
+/// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
+/// output is placed next to its source (AC-FUNC-19).
+///
+/// Stale-output cleanup: after writing, probes for the wrong-extension sibling and
+/// deletes it to handle format flips (md↔json) across builds.
+fn run_build_directory(
+    dir: &Path,
+    out_dir: Option<PathBuf>,
+    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
+    quiet: bool,
+) -> Result<()> {
+    use crate::output::{
+        collect_mds_files, is_partial, output_base_no_ext, output_path_for, probe_and_remove_stale,
+        resolve_output_base, OutputBase,
+    };
+
+    const MAX_DEPTH: usize = 64;
+
+    // Resolve the output base (subtree mirroring or next-to-source).
+    // For --out-dir: canonicalize as absolute so starts_with checks work.
+    let abs_out_dir: Option<PathBuf> = out_dir.as_ref().map(|d| {
+        let abs = if d.is_absolute() {
+            d.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(d)
+        };
+        abs.canonicalize().unwrap_or(abs)
+    });
+
+    // Load project config from the directory root.
+    let config = load_config(dir)?;
+    let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
+
+    // Exclude the out-dir from collection when it is nested inside the source root.
+    let exclude_prefix: Option<PathBuf> = match &output_base {
+        OutputBase::Dir(d) if d.starts_with(dir) => Some(d.clone()),
+        _ => None,
+    };
+
+    let files = collect_mds_files(dir, MAX_DEPTH, exclude_prefix.as_deref());
+
+    if files.is_empty() {
+        if !quiet {
+            eprintln!("No .mds files found in {}", dir.display());
+        }
+        return Ok(());
+    }
+
+    let mut ok_count: usize = 0;
+    let mut fail_count: usize = 0;
+
+    for file in &files {
+        // Skip partials: they contribute to imports but produce no standalone output.
+        if is_partial(file) {
+            continue;
+        }
+
+        // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
+        match compile_to_content(file, runtime_vars.clone(), quiet) {
+            Ok(compiled) => {
+                let ext = compiled.kind.extension();
+                let out_path = output_path_for(file, dir, &output_base, ext);
+
+                // Ensure parent directory exists.
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!(
+                                "error: cannot create output directory {}: {e}",
+                                parent.display()
+                            );
+                            fail_count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                match std::fs::write(&out_path, &compiled.content) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("Compiled to {}", out_path.display());
+                        }
+                        // Stale-output cleanup: remove the wrong-extension sibling if it exists.
+                        let base_no_ext = output_base_no_ext(file, dir, &output_base);
+                        probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        ok_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("error: cannot write {}: {e}", out_path.display());
+                        fail_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e:?}");
+                fail_count += 1;
+            }
+        }
+    }
+
+    eprintln!("{ok_count} built, {fail_count} failed");
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

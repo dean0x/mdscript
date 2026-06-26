@@ -520,12 +520,13 @@ fn symlinked_vars_file_exits_nonzero() {
     );
 }
 
-// ── Directory input → non-zero exit ──────────────────────────────────────────
+// ── Directory input + -o flag → non-zero exit (dir mode rejects -o) ──────────
 
 #[test]
-fn directory_input_exits_nonzero() {
+fn directory_input_with_output_flag_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
 
+    // Directory mode does not support -o/--output; must use --out-dir instead.
     let output = mds_bin()
         .args(["build", dir.path().to_str().unwrap(), "-o", "-"])
         .stdout(std::process::Stdio::piped())
@@ -535,13 +536,13 @@ fn directory_input_exits_nonzero() {
 
     assert!(
         !output.status.success(),
-        "build on a directory must fail; stderr: {}",
+        "build <dir> -o - must fail; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("directory") || stderr.contains("expected a file"),
-        "error must mention directory restriction; got: {stderr}"
+        stderr.contains("directory") || stderr.contains("out-dir"),
+        "error must mention directory mode restriction; got: {stderr}"
     );
 }
 
