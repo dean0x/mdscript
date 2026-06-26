@@ -2,7 +2,7 @@
 //!
 //! All helpers in this module are `pub(crate)` so that `watch.rs` can reuse them
 //! without duplicating logic or bypassing resource limits.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -693,7 +693,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 fn run_build_directory(
     dir: &Path,
     out_dir: Option<PathBuf>,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<()> {
     use crate::output::{
@@ -741,7 +741,7 @@ fn run_build_directory(
     // Same-stem .md/.json files adjacent to a .mds in NextToSource mode are
     // considered tool-owned; if a collision is a concern use --out-dir to
     // separate source and output trees.
-    let mut written_this_run: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut written_this_run: HashSet<PathBuf> = HashSet::new();
 
     for file in &files {
         // Skip partials: they contribute to imports but produce no standalone output.
