@@ -19,10 +19,34 @@ export interface MdsApi {
   init(): Promise<void>;
 }
 
-/** Result of a successful file compilation. */
-export interface CompileResult {
+/** A single structured message from a messages-mode compile result. */
+export interface Message {
+  role: string;
+  content: string;
+}
+
+/**
+ * Discriminated compile result returned by the MDS compiler.
+ * Branch on `kind` to access the appropriate payload.
+ */
+export type CompileResult = MarkdownResult | MessagesResult;
+
+/** Compile result for a file that compiled to Markdown output. */
+export interface MarkdownResult {
+  kind: 'markdown';
   /** Rendered Markdown output string. */
   output: string;
+  /** Non-fatal diagnostic messages produced during compilation. */
+  warnings: string[];
+  /** Absolute paths of every file transitively imported by the source. */
+  dependencies: string[];
+}
+
+/** Compile result for a file that compiled to structured chat messages. */
+export interface MessagesResult {
+  kind: 'messages';
+  /** Structured chat messages produced from `@message` blocks. */
+  messages: Message[];
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
   /** Absolute paths of every file transitively imported by the source. */

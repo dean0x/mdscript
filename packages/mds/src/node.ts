@@ -2,13 +2,13 @@ import type {
   BackendType,
   MdsBaseBackend,
   MdsNodeBackend,
-  CompileMessagesResult,
   CompileResult,
   CheckResult,
   CompileOptions,
   FileOptions,
   InitOptions,
 } from './types.js';
+import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
 import { buildModulesMap } from './util/module-scanner.js';
@@ -86,19 +86,16 @@ function wrapWithFileOps(
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
       const { source, opts } = await prepareFileArgs(path, options);
-      return wasmModule.compile(source, opts);
+      const result: unknown = wasmModule.compile(source, opts);
+      assertResultShape(result, 'compile');
+      return result as CompileResult;
     },
 
     async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
       const { source, opts } = await prepareFileArgs(path, options);
-      return wasmModule.check(source, opts);
-    },
-
-    async compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult> {
-      // Symlink check is performed JS-side by buildModulesMap (O_NOFOLLOW / realpath)
-      // — same security path as compileFile on the WASM backend.
-      const { source, opts } = await prepareFileArgs(path, options);
-      return wasmModule.compileMessages(source, opts);
+      const result: unknown = wasmModule.check(source, opts);
+      assertResultShape(result, 'check');
+      return result as CheckResult;
     },
   };
 }
@@ -198,13 +195,13 @@ export function init(options?: InitOptions): Promise<void> {
 function assertReady(): MdsNodeBackend {
   if (backend === undefined) {
     throw new Error(
-      '@mdscript/mds: call await init() before using compile/check/compileMessages/compileFile/checkFile/getBackend',
+      '@mdscript/mds: call await init() before using compile/check/compileFile/checkFile/getBackend',
     );
   }
   return backend;
 }
 
-/** Compile an MDS source string to Markdown. Requires init() to have been called and awaited first. */
+/** Compile an MDS source string. Returns a discriminated-union CompileResult (kind: 'markdown' | 'messages'). Requires init() to have been called and awaited first. */
 export function compile(source: string, options?: CompileOptions): CompileResult {
   return assertReady().compile(source, options);
 }
@@ -214,12 +211,7 @@ export function check(source: string, options?: CompileOptions): CheckResult {
   return assertReady().check(source, options);
 }
 
-/** Compile `@message` blocks in an MDS source string to structured chat messages. Requires init() to have been called and awaited first. */
-export function compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
-  return assertReady().compileMessages(source, options);
-}
-
-/** Compile an MDS file to Markdown, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
+/** Compile an MDS file, resolving @import directives relative to the file. Returns a discriminated-union CompileResult. Requires init() to have been called and awaited first. */
 export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
   return assertReady().compileFile(path, options);
 }
@@ -227,11 +219,6 @@ export function compileFile(path: string, options?: FileOptions): Promise<Compil
 /** Validate an MDS file without rendering, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
 export function checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
   return assertReady().checkFile(path, options);
-}
-
-/** Compile `@message` blocks from an MDS file to structured chat messages, resolving @import directives relative to the file. The entry path is symlink-checked. Requires init() to have been called and awaited first. */
-export function compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult> {
-  return assertReady().compileMessagesFile(path, options);
 }
 
 /** Returns which backend is currently active: 'native' or 'wasm'. Requires init() to have been called and awaited first. */
@@ -243,12 +230,13 @@ export { isMdsError } from './types.js';
 export type {
   BackendType,
   CheckResult,
-  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   FileOptions,
   InitOptions,
+  MarkdownResult,
   Message,
+  MessagesResult,
   MdsError,
   MdsErrorSpan,
 } from './types.js';

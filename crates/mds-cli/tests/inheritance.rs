@@ -222,17 +222,16 @@ fn f8_block_body_with_control_flow_and_interp() {
     );
 }
 
-// ── F9 / E13: messages mode ───────────────────────────────────────────────────
+// ── F9 / E13: intrinsic output for inheritance ───────────────────────────────
 
 #[test]
-fn f9_messages_mode_child_compiles_to_json_array() {
-    let (stdout, stderr, ok) = build_file_args(
-        fixture("inh_messages_child.mds").to_str().unwrap(),
-        &["--format", "messages"],
-    );
+fn f9_messages_child_compiles_to_json_array_intrinsically() {
+    // F9: a messages-template child (with @message blocks) compiles to JSON without
+    // any --format flag — the output shape is intrinsic.
+    let (stdout, stderr, ok) = build_file(fixture("inh_messages_child.mds").to_str().unwrap());
     assert!(
         ok,
-        "F9: messages mode child should compile; stderr: {stderr}"
+        "F9: messages child should compile to JSON; stderr: {stderr}"
     );
 
     let parsed: serde_json::Value =
@@ -257,19 +256,22 @@ fn f9_messages_mode_child_compiles_to_json_array() {
 }
 
 #[test]
-fn e13_messages_mode_base_no_message_exits_nonzero() {
-    // E13: base with no @message blocks in messages mode → non-zero exit.
-    let (_, stderr, ok) = build_file_args(
-        fixture("inh_analyst.mds").to_str().unwrap(),
-        &["--format", "messages"],
+fn t_i13_plain_markdown_child_compiles_to_markdown_intrinsically() {
+    // T-I13: a markdown-only child (no @message blocks) compiles to Markdown — not JSON.
+    // In the new intrinsic model there is no --format flag; the kind is derived from output.
+    let (stdout, stderr, ok) = build_file(fixture("inh_analyst.mds").to_str().unwrap());
+    assert!(
+        ok,
+        "T-I13: markdown child should compile successfully; stderr: {stderr}"
+    );
+    // Output must be plain Markdown, not a JSON array.
+    assert!(
+        !stdout.trim_start().starts_with('['),
+        "T-I13: markdown child output must not be JSON; got: {stdout:?}"
     );
     assert!(
-        !ok,
-        "E13: compile in messages mode without @message should fail"
-    );
-    assert!(
-        stderr.contains("@message") || stderr.contains("message") || stderr.contains("no "),
-        "E13: error should mention @message; got: {stderr}"
+        !stdout.is_empty(),
+        "T-I13: markdown child must produce non-empty output"
     );
 }
 

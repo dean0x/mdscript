@@ -3,40 +3,58 @@ use common::fixture;
 
 #[test]
 fn import_alias() {
-    let result = mds::compile(fixture("import_alias.mds"), None).unwrap();
+    let result = mds::compile(fixture("import_alias.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(result.contains("Hello Alice!"));
     assert!(result.contains("Goodbye Alice!"));
 }
 
 #[test]
 fn import_merge() {
-    let result = mds::compile(fixture("import_merge.mds"), None).unwrap();
+    let result = mds::compile(fixture("import_merge.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(result.contains("Hello Bob!"));
     assert!(result.contains("Goodbye Bob!"));
 }
 
 #[test]
 fn import_selective() {
-    let result = mds::compile(fixture("import_selective.mds"), None).unwrap();
+    let result = mds::compile(fixture("import_selective.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(result.contains("Hello Charlie!"));
 }
 
 #[test]
 fn include_directive() {
-    let result = mds::compile(fixture("include_test.mds"), None).unwrap();
+    let result = mds::compile(fixture("include_test.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(result.contains("Hello Alice!"));
     assert!(result.contains("Thank you for using our service."));
 }
 
 #[test]
 fn reexport() {
-    let result = mds::compile(fixture("reexport_consumer.mds"), None).unwrap();
+    let result = mds::compile(fixture("reexport_consumer.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(result.contains("Hello Dave!"));
 }
 
 #[test]
 fn wildcard_reexport_barrel() {
-    let result = mds::compile(fixture("barrel_consumer.mds"), None).unwrap();
+    let result = mds::compile(fixture("barrel_consumer.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(result.contains("Hello Alice!"));
     assert!(result.contains("- search"));
     assert!(result.contains("- code"));
@@ -92,7 +110,10 @@ fn merge_import_does_not_leak_vars() {
 
 #[test]
 fn selective_import_prompt_body() {
-    let result = mds::compile(fixture("prompt_consumer.mds"), None).unwrap();
+    let result = mds::compile(fixture("prompt_consumer.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("This is the module body text."),
         "selective import of 'prompt' should bring in the module's body text, got: {result}"
@@ -104,7 +125,10 @@ fn cross_module_function_preserves_lexical_scope() {
     // A function defined in module A that uses an alias import (u -> utils.mds)
     // must resolve that alias from its *definition* site (lexical scope) even when
     // called from module B, which has no knowledge of 'u'.
-    let result = mds::compile(fixture("lexical_scope_consumer.mds"), None).unwrap();
+    let result = mds::compile(fixture("lexical_scope_consumer.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("Hello Alice!"),
         "expected 'Hello Alice!' in output (lexical scope), got: {result}"
@@ -120,7 +144,10 @@ fn cross_module_frontmatter_var_in_function() {
     // A function defined in module A that references module A's frontmatter variable
     // must resolve that variable from its *definition* site (lexical scope) even when
     // called from module B, which has no knowledge of that variable.
-    let result = mds::compile(fixture("fm_var_consumer.mds"), None).unwrap();
+    let result = mds::compile(fixture("fm_var_consumer.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("Hello from module A"),
         "expected frontmatter variable to be accessible in cross-module function call, got: {result}"
@@ -187,7 +214,9 @@ fn include_respects_export_visibility_for_prompt() {
     .unwrap();
     std::fs::write(&consumer, "@import \"./provider.mds\" as p\n\n@include p\n").unwrap();
 
-    let (result, warnings) = mds::compile_collecting_warnings(&consumer, None).unwrap();
+    let cr = mds::compile_collecting_warnings(&consumer, None).unwrap();
+    let warnings = cr.warnings.clone();
+    let result = cr.into_markdown().unwrap();
     // The provider has explicit exports without "prompt", so @include should
     // produce empty output and a warning — not the provider's body text.
     assert!(
@@ -204,7 +233,10 @@ fn include_respects_export_visibility_for_prompt() {
 fn include_empty_body_no_crash() {
     // @include of a module with only function definitions (no body text) should
     // produce an empty string for the include, not crash.
-    let result = mds::compile(fixture("include_empty_body.mds"), None).unwrap();
+    let result = mds::compile(fixture("include_empty_body.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("Before"),
         "output should contain 'Before', got: {result}"
@@ -232,7 +264,10 @@ fn include_without_import_errors() {
 fn multilevel_imports() {
     // A imports B (as b), B imports C (as c). A calls b.midfn which calls c.deepfn.
     // Verifies that recursive import resolution works correctly.
-    let result = mds::compile(fixture("multilevel_a.mds"), None).unwrap();
+    let result = mds::compile(fixture("multilevel_a.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("Mid via Deep: Alice"),
         "multi-level import should resolve A→B→C, got: {result}"
@@ -259,7 +294,10 @@ fn wildcard_reexport_collision_errors() {
 fn export_prompt_selective_import() {
     // A module with body text uses @export prompt explicitly;
     // another module imports it via selective import and renders the body.
-    let result = mds::compile(fixture("export_prompt_consumer.mds"), None).unwrap();
+    let result = mds::compile(fixture("export_prompt_consumer.mds"), None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("compiler design"),
         "selective import of explicitly-exported 'prompt' should render provider body, got: {result}"
@@ -312,7 +350,10 @@ fn default_public_when_no_exports() {
     )
     .unwrap();
 
-    let result = mds::compile(&consumer, None).unwrap();
+    let result = mds::compile(&consumer, None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("Hello World!"),
         "default-public module should allow importing any symbol, got: {result}"

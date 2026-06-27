@@ -61,6 +61,7 @@ function createMockMdsApi(overrides = {}) {
     async compileFile(path, _options) {
       compileCalls++;
       return {
+        kind: 'markdown',
         output: `compiled:${path}`,
         warnings: [],
         dependencies: [],
@@ -182,7 +183,7 @@ describe('createMdsLoader — T-C5: options semantics', () => {
     const { mdsApi } = createMockMdsApi({
       async compileFile(_path, options) {
         capturedVars = options?.vars;
-        return { output: 'ok', warnings: [], dependencies: [] };
+        return { kind: 'markdown', output: 'ok', warnings: [], dependencies: [] };
       },
     });
 
@@ -205,7 +206,7 @@ describe('createMdsLoader — T-C5: options semantics', () => {
     const { mdsApi } = createMockMdsApi({
       async compileFile(_path, options) {
         capturedOptions = options;
-        return { output: 'ok', warnings: [], dependencies: [] };
+        return { kind: 'markdown', output: 'ok', warnings: [], dependencies: [] };
       },
     });
 

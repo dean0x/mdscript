@@ -2,12 +2,12 @@
 //!
 //! All helpers in this module are `pub(crate)` so that `watch.rs` can reuse them
 //! without duplicating logic or bypassing resource limits.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use mds::{MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use mds::{CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
 use miette::Result;
 use serde::Deserialize;
 
@@ -78,81 +78,158 @@ pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> 
 
 // ── Output path resolution ────────────────────────────────────────────────────
 
-/// Derive the output filename by replacing the extension with `.md`.
+/// The output kind, derived intrinsically from the compiled output variant.
 ///
-/// Examples:
-/// - `foo.mds`     → `foo.md`
-/// - `foo.bar.mds` → `foo.bar.md`
-/// - `README`      → `README.md`
-/// - `foo.txt`     → `foo.md`
-pub(crate) fn derive_output_filename(input: &Path) -> OsString {
+/// This is separate from `CompiledOutput` so callers can carry the kind
+/// through the single-file path-derivation pipeline without the actual content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputKind {
+    Markdown,
+    Messages,
+}
+
+impl OutputKind {
+    /// File extension for this kind (without leading `.`).
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            OutputKind::Markdown => "md",
+            OutputKind::Messages => "json",
+        }
+    }
+
+    /// Extension of the *other* kind — used to identify a stale sibling to remove
+    /// after a format flip (Markdown → remove stale `.json`; Messages → remove stale `.md`).
+    ///
+    /// Kept adjacent to `extension()` so the two stay in sync when a new kind is added.
+    pub(crate) fn stale_extension(self) -> &'static str {
+        match self {
+            OutputKind::Markdown => "json", // we just wrote .md → stale is .json
+            OutputKind::Messages => "md",   // we just wrote .json → stale is .md
+        }
+    }
+}
+
+impl From<&CompiledOutput> for OutputKind {
+    fn from(output: &CompiledOutput) -> Self {
+        match output {
+            CompiledOutput::Markdown(_) => OutputKind::Markdown,
+            CompiledOutput::Messages(_) => OutputKind::Messages,
+        }
+    }
+}
+
+/// Derive the output filename by replacing the extension with the kind-appropriate extension.
+///
+/// - Markdown: `foo.mds` → `foo.md`
+/// - Messages: `foo.mds` → `foo.json`
+pub(crate) fn derive_output_filename_for_kind(input: &Path, kind: OutputKind) -> OsString {
     let stem = input.file_stem().unwrap_or(input.as_os_str());
     let mut name = OsString::from(stem);
-    name.push(".md");
+    name.push(".");
+    name.push(kind.extension());
     name
 }
 
-/// Compute `dir/<derived-name>.md` WITHOUT creating the directory.
+/// Compute `dir/<derived-name>.<ext>` WITHOUT creating the directory.
 ///
 /// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
-/// if `None` (stdin), the fallback name `output.md` is used.
+/// if `None` (stdin), the fallback name is `output.md` for markdown, `output.json` for messages.
 ///
-/// Use [`prepare_output_dir`] when the directory also needs to be created.
-pub(crate) fn compute_output_dir_path(dir: &Path, input_path: Option<&Path>) -> PathBuf {
+/// Use [`prepare_output_dir_for_kind`] when the directory also needs to be created.
+pub(crate) fn compute_output_dir_path_for_kind(
+    dir: &Path,
+    input_path: Option<&Path>,
+    kind: OutputKind,
+) -> PathBuf {
     let filename = input_path
-        .map(derive_output_filename)
-        .unwrap_or_else(|| OsString::from("output.md"));
+        .map(|p| derive_output_filename_for_kind(p, kind))
+        .unwrap_or_else(|| {
+            OsString::from(match kind {
+                OutputKind::Markdown => "output.md",
+                OutputKind::Messages => "output.json",
+            })
+        });
     dir.join(filename)
 }
 
-/// Create `dir` (if absent) and return `dir/<derived-name>.md`.
+/// Create `dir` (if absent) and return `dir/<derived-name>.<ext>`.
 ///
-/// `input_path` drives the filename: if `Some`, the stem is reused (e.g. `foo.mds` → `foo.md`);
-/// if `None` (stdin), the fallback name `output.md` is used.
-pub(crate) fn prepare_output_dir(dir: &Path, input_path: Option<&Path>) -> Result<PathBuf> {
+/// Extension is determined by `kind` (markdown → `.md`, messages → `.json`).
+/// `input_path` drives the filename stem: if `Some`, the stem is reused;
+/// if `None` (stdin), the fallback is `output.md` / `output.json`.
+pub(crate) fn prepare_output_dir_for_kind(
+    dir: &Path,
+    input_path: Option<&Path>,
+    kind: OutputKind,
+) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .map_err(|e| miette::miette!("cannot create output directory {}: {e}", dir.display()))?;
-    Ok(compute_output_dir_path(dir, input_path))
+    Ok(compute_output_dir_path_for_kind(dir, input_path, kind))
 }
 
-/// Resolve the output path according to the precedence chain.
+/// Resolve the output path according to the precedence chain (kind-aware variant).
 ///
 /// Any required output directory is created via `create_dir_all`.
 ///
 /// Precedence:
 /// 1. `-o -`                         → stdout (returns `None`)
-/// 2. `-o <path>`                    → that exact path
+/// 2. `-o <path>`                    → that exact path (verbatim; warn on ext mismatch)
 /// 3. Stdin with no -o / --out-dir   → stdout (returns `None`)
-/// 4. `--out-dir <dir>`              → `<dir>/<name>.md`
-/// 5. `mds.json`                     → `<config_dir>/<output_dir>/<name>.md`
-/// 6. Default                        → source dir + `<name>.md`
-pub(crate) fn resolve_output_path(
+/// 4. `--out-dir <dir>`              → `<dir>/<name>.<ext>` (ext from kind)
+/// 5. `mds.json`                     → `<config_dir>/<output_dir>/<name>.<ext>` (ext from kind)
+/// 6. Default                        → source dir + `<name>.<ext>` (ext from kind)
+///
+/// For rules 4–6 the extension is derived from `kind` (markdown → `.md`, messages → `.json`).
+/// For rule 2 (`-o <path>`), the path is used verbatim; if its extension conflicts with `kind`
+/// a warning is emitted to stderr (AC-FUNC-11: write still proceeds to the requested path).
+pub(crate) fn resolve_output_path_for_kind(
     input: &Option<PathBuf>,
     output: &Option<String>,
     out_dir: &Option<PathBuf>,
     config: &Option<(MdsConfig, PathBuf)>,
+    kind: OutputKind,
+    quiet: bool,
 ) -> Result<Option<PathBuf>> {
     // 1 & 2. Explicit `-o` flag: `-` means stdout, anything else is a literal path.
     match output.as_deref() {
         Some("-") => return Ok(None),
-        Some(o) => return Ok(Some(PathBuf::from(o))),
+        Some(o) => {
+            let path = PathBuf::from(o);
+            // AC-FUNC-11: warn when the extension contradicts the kind.
+            if !quiet {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let expected = kind.extension();
+                    if ext != expected {
+                        eprintln!(
+                            "warning: output path '{o}' has extension '.{ext}' but compiled \
+                             output is {kind_name}; writing to '{o}' anyway",
+                            kind_name = match kind {
+                                OutputKind::Markdown => "markdown (.md)",
+                                OutputKind::Messages => "messages JSON (.json)",
+                            }
+                        );
+                    }
+                }
+            }
+            return Ok(Some(path));
+        }
         None => {}
     }
 
     // Derive the output filename from the input path (needed for steps 3-6).
-    // Treat stdin ("-") as None so we fall back to "output.md" instead of "-.md".
+    // Treat stdin ("-") as None so we fall back to "output.md/json" instead of "-.md".
     let input_path = input.as_deref().filter(|p| *p != Path::new("-"));
 
     // 3. Stdin input with no explicit output destination → stdout.
     //    But if --out-dir is set, fall through so the user's explicit CLI flag
-    //    is honored (using "output.md" as the derived filename).
+    //    is honored (using "output.md/json" as the derived filename).
     if input_path.is_none() && out_dir.is_none() {
         return Ok(None);
     }
 
     // 4. `--out-dir <dir>`
     if let Some(dir) = out_dir {
-        return Ok(Some(prepare_output_dir(dir, input_path)?));
+        return Ok(Some(prepare_output_dir_for_kind(dir, input_path, kind)?));
     }
 
     // 5. `mds.json` output_dir
@@ -171,32 +248,20 @@ pub(crate) fn resolve_output_path(
                 ));
             }
             let dir = config_dir.join(output_dir);
-            return Ok(Some(prepare_output_dir(&dir, input_path)?));
+            return Ok(Some(prepare_output_dir_for_kind(&dir, input_path, kind)?));
         }
     }
 
-    // 6. Default: file next to source
+    // 6. Default: file next to source, with kind-derived extension.
     match input_path {
         Some(p) => {
-            let filename = derive_output_filename(p);
+            let filename = derive_output_filename_for_kind(p, kind);
             let dir = p.parent().unwrap_or(Path::new("."));
             Ok(Some(dir.join(filename)))
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
         None => Ok(None),
     }
-}
-
-// ── Output format ─────────────────────────────────────────────────────────────
-
-/// Output format for the `build` and `watch` commands.
-#[derive(Debug, Default, Clone, PartialEq, clap::ValueEnum)]
-pub(crate) enum OutputFormat {
-    /// Render the template to Markdown text (default).
-    #[default]
-    Markdown,
-    /// Compile `@message` blocks to a pretty-printed JSON array.
-    Messages,
 }
 
 // ── Key-value parsing ─────────────────────────────────────────────────────────
@@ -300,17 +365,6 @@ pub(crate) fn build_runtime_vars(
     Ok(runtime_vars)
 }
 
-/// Return an error if the input path is a directory (only file or stdin allowed).
-pub(crate) fn reject_directory_input(input: &Path) -> Result<()> {
-    if input != Path::new("-") && input.is_dir() {
-        return Err(miette::miette!(
-            "expected a file, got a directory: {}",
-            input.display()
-        ));
-    }
-    Ok(())
-}
-
 /// Read from stdin and return the source string along with the current working directory.
 ///
 /// Reads at most `MAX_FILE_SIZE + 1` bytes so we can detect over-sized input without
@@ -327,37 +381,6 @@ pub(crate) fn read_stdin() -> Result<(String, PathBuf)> {
     let cwd = std::env::current_dir()
         .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
     Ok((source, cwd))
-}
-
-/// Read the source string for compilation, handling both stdin and file inputs.
-///
-/// Returns `(source, base_dir)` where:
-/// - `source` is the UTF-8 text of the input
-/// - `base_dir` is the directory used to resolve relative imports (cwd for stdin, parent
-///   dir of the file otherwise)
-///
-/// Enforces `MAX_FILE_SIZE` on file reads (PF-004: shared enforcement point — both
-/// markdown and messages modes route through this function so neither can bypass the cap).
-/// Stdin is already guarded by `read_stdin`.
-pub(crate) fn read_build_input(input: &Path) -> Result<(String, PathBuf)> {
-    if input == Path::new("-") {
-        return read_stdin();
-    }
-    let path_str = input
-        .to_str()
-        .ok_or_else(|| miette::miette!("input path is not valid UTF-8"))?;
-    let bytes = std::fs::read(input).map_err(|e| miette::miette!("cannot read {path_str}: {e}"))?;
-    if bytes.len() as u64 > MAX_FILE_SIZE {
-        return Err(miette::miette!(
-            "file too large ({} bytes, max {} bytes): {path_str}",
-            bytes.len(),
-            MAX_FILE_SIZE
-        ));
-    }
-    let source = String::from_utf8(bytes)
-        .map_err(|e| miette::miette!("invalid UTF-8 in {path_str}: {e}"))?;
-    let base_dir = input.parent().unwrap_or(Path::new(".")).to_path_buf();
-    Ok((source, base_dir))
 }
 
 /// Write compiled output to a file or stdout.
@@ -451,111 +474,118 @@ pub(crate) fn auto_detect_mds_file() -> Result<PathBuf> {
 /// Returned by [`compile_to_content`] so the watch loop can compare content before
 /// deciding whether to write (content-based dedup — see watch.rs).
 pub(crate) struct CompileOutput {
-    /// The compiled string ready to write (markdown or pretty JSON depending on format).
+    /// The compiled string ready to write (markdown or pretty JSON depending on kind).
     pub(crate) content: String,
+    /// The output kind (derived intrinsically from the compiled output).
+    pub(crate) kind: OutputKind,
     /// Transitive dependency paths (empty when no `@import`s).
     pub(crate) dependencies: Vec<String>,
 }
 
-/// Compile `input` and return the content + deps WITHOUT writing any output.
+/// Serialize `CompiledOutput` to the CLI wire format.
 ///
-/// This is the pure "compile" step used by the watch loop for content-based dedup.
-/// `build` and the initial watch compile use [`compile_and_write`], which calls
-/// this internally and then always writes.
+/// - Markdown: the rendered string as-is (moved, no copy).
+/// - Messages: pretty-printed JSON array of `{role,content}` with a trailing newline (AC-FUNC-09).
 ///
-/// # PF-004 compliance
-/// All file reads go through [`read_build_input`] or `mds::compile_with_deps`
-/// (which uses the resolver that enforces MAX_FILE_SIZE). There is no bare
-/// `std::fs::read_to_string` path here.
-pub(crate) fn compile_to_content(
-    input: &Path,
-    runtime_vars: Option<HashMap<String, mds::Value>>,
-    format: &OutputFormat,
-    quiet: bool,
-) -> Result<CompileOutput> {
-    match format {
-        OutputFormat::Markdown => {
-            let result =
-                mds::compile_with_deps(input, runtime_vars).map_err(miette::Error::from)?;
-            if !quiet {
-                for w in &result.warnings {
-                    eprintln!("{w}");
-                }
-            }
-            Ok(CompileOutput {
-                content: result.output,
-                dependencies: result.dependencies,
-            })
-        }
-        OutputFormat::Messages => {
-            if input == Path::new("-") {
-                // Stdin: symlink check is not applicable — stdin has no filesystem path.
-                // read_build_input handles "-" and enforces MAX_FILE_SIZE on the stream.
-                let (source, base_dir) = read_build_input(input)?;
-                let result =
-                    mds::compile_messages_str_with_deps(&source, Some(&base_dir), runtime_vars)
-                        .map_err(miette::Error::from)?;
-                if !quiet {
-                    for w in &result.warnings {
-                        eprintln!("{w}");
-                    }
-                }
-                let mut json = serde_json::to_string_pretty(&result.messages)
-                    .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
-                json.push('\n');
-                Ok(CompileOutput {
-                    content: json,
-                    dependencies: result.dependencies,
-                })
-            } else {
-                // File path: route through compile_messages_file_with_deps so the entry
-                // path passes through the resolver's check_symlink + MAX_FILE_SIZE guard
-                // (same security path as mds::compile_with_deps for markdown mode).
-                let result = mds::compile_messages_file_with_deps(input, runtime_vars)
-                    .map_err(miette::Error::from)?;
-                if !quiet {
-                    for w in &result.warnings {
-                        eprintln!("{w}");
-                    }
-                }
-                let mut json = serde_json::to_string_pretty(&result.messages)
-                    .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
-                json.push('\n');
-                Ok(CompileOutput {
-                    content: json,
-                    dependencies: result.dependencies,
-                })
-            }
+/// Takes ownership so the markdown arm avoids an up-to-10 MiB clone (issue 2).
+fn serialize_output(output: CompiledOutput) -> Result<String> {
+    match output {
+        CompiledOutput::Markdown(s) => Ok(s),
+        CompiledOutput::Messages(msgs) => {
+            let mut json = serde_json::to_string_pretty(&msgs)
+                .map_err(|e| miette::miette!("failed to serialize messages to JSON: {e}"))?;
+            json.push('\n');
+            Ok(json)
         }
     }
 }
 
-/// Compile `input` and write to `output_path`, returning the list of transitive deps.
+/// Compile `input` and return the content + kind + deps WITHOUT writing any output.
 ///
-/// - Markdown mode: `mds::compile_with_deps` → print warnings (unless quiet) →
-///   `write_output` → return deps.
-/// - Messages mode: `read_build_input` → `mds::compile_messages_str_with_deps` →
-///   pretty JSON + trailing `\n` → `write_output` → return deps.
+/// The output kind (Markdown vs Messages) is determined intrinsically from the compiled
+/// result — the caller does not specify it. This is the pure "compile" step used by the
+/// watch loop for content-based dedup.
 ///
-/// The returned `Vec<String>` contains canonical absolute dependency paths (empty
-/// for stdin and for templates with no `@import`s).  `build` ignores the return
-/// value; `watch` uses it to update the set of watched files (ADR-016: deps
-/// recomputed on every rebuild, never trusted from a stale set).
+/// `build` and the initial watch compile use [`compile_and_write`], which calls
+/// this internally and then always writes.
 ///
 /// # PF-004 compliance
-/// All file reads go through `compile_to_content` → [`read_build_input`] or
-/// `mds::compile_with_deps` (which uses the resolver that enforces MAX_FILE_SIZE).
+/// All file reads go through `mds::compile_with_deps` or `mds::compile_str_with_deps`
+/// (which use the resolver that enforces MAX_FILE_SIZE). Stdin input is read through
+/// `read_stdin` which enforces the same cap. There is no bare `std::fs::read_to_string`.
+pub(crate) fn compile_to_content(
+    input: &Path,
+    runtime_vars: Option<HashMap<String, mds::Value>>,
+    quiet: bool,
+) -> Result<CompileOutput> {
+    let result = if input == Path::new("-") {
+        // Stdin: compile from source string using cwd as base_dir.
+        // read_stdin enforces MAX_FILE_SIZE (PF-004).
+        let (source, cwd) = read_stdin()?;
+        mds::compile_str_with_deps(&source, Some(&cwd), runtime_vars)
+            .map_err(miette::Error::from)?
+    } else {
+        // File path: compile_with_deps routes through the resolver which enforces
+        // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
+        mds::compile_with_deps(input, runtime_vars).map_err(miette::Error::from)?
+    };
+
+    if !quiet {
+        for w in &result.warnings {
+            eprintln!("{w}");
+        }
+    }
+
+    let kind = OutputKind::from(&result.output);
+    // Move result.output into serialize_output so the Markdown arm avoids a clone
+    // (the kind was already derived from the borrow above — issue 2).
+    let content = serialize_output(result.output)?;
+    Ok(CompileOutput {
+        content,
+        kind,
+        dependencies: result.dependencies,
+    })
+}
+
+/// Compile `input`, derive the output path from the compiled kind, and write.
+///
+/// Returns `(output_path, deps, content)`:
+/// - `output_path`: the resolved output path (None for stdout).
+/// - `deps`: transitive dependency paths.
+/// - `content`: the compiled string (issue 3 — reused by the watch baseline block
+///   so startup does not compile twice).
+///
+/// The output path is derived AFTER compiling (compile-then-route) so the kind
+/// (and thus extension: `.json` for messages, `.md` for markdown) is known before
+/// the path is constructed. This is the single-file intrinsic extension path.
+///
+/// If `-o <path>` is given explicitly, that path is used verbatim and an ext-mismatch
+/// warning is emitted when the extension contradicts the kind (AC-FUNC-11).
+/// If `-o -` or stdin-with-no-flags, content is written to stdout.
+///
+/// # PF-004 compliance
+/// All file reads go through `compile_to_content` → `mds::compile_with_deps` or
+/// `mds::compile_str_with_deps` (which use the resolver that enforces MAX_FILE_SIZE).
 /// There is no bare `std::fs::read_to_string` path here.
 pub(crate) fn compile_and_write(
     input: &Path,
-    output_path: Option<PathBuf>,
+    output: &Option<String>,
+    out_dir: &Option<PathBuf>,
+    config: &Option<(MdsConfig, PathBuf)>,
     runtime_vars: Option<HashMap<String, mds::Value>>,
-    format: &OutputFormat,
     quiet: bool,
-) -> Result<Vec<String>> {
-    let out = compile_to_content(input, runtime_vars, format, quiet)?;
-    write_output(output_path, &out.content, quiet, true)?;
-    Ok(out.dependencies)
+) -> Result<(Option<PathBuf>, Vec<String>, String)> {
+    let compiled = compile_to_content(input, runtime_vars, quiet)?;
+    let output_path = resolve_output_path_for_kind(
+        &Some(input.to_path_buf()),
+        output,
+        out_dir,
+        config,
+        compiled.kind,
+        quiet,
+    )?;
+    write_output(output_path.clone(), &compiled.content, quiet, true)?;
+    Ok((output_path, compiled.dependencies, compiled.content))
 }
 
 // ── Build args struct ─────────────────────────────────────────────────────────
@@ -567,7 +597,6 @@ pub(crate) struct BuildArgs {
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
     pub(crate) quiet: bool,
-    pub(crate) format: OutputFormat,
 }
 
 /// Resolve the input path: use the explicit value, or auto-detect from cwd.
@@ -588,7 +617,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         vars,
         set_vars,
         quiet,
-        format,
     } = args;
     let runtime_vars = build_runtime_vars(vars, set_vars)?;
 
@@ -599,94 +627,194 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         eprintln!("Building {}", input.display());
     }
 
-    reject_directory_input(&input)?;
-
-    match format {
-        OutputFormat::Messages => {
-            // --out-dir is silently dropped in messages mode (output always goes to stdout
-            // or an explicit -o path).  Warn so the user knows their flag had no effect.
-            if out_dir.is_some() && !quiet {
-                eprintln!(
-                    "warning: --out-dir is ignored in --format messages mode; \
-                     use -o <file> to write to a file"
-                );
-            }
-            run_build_messages(input, output, runtime_vars, quiet)
+    // Directory mode: compile every non-partial .mds file in the tree.
+    if input != Path::new("-") && input.is_dir() {
+        // Reject -o/--output in directory mode: output goes to files, not a single destination.
+        if output.is_some() {
+            return Err(miette::miette!(
+                "build directory mode does not support -o/--output; \
+                 use --out-dir to specify an output directory"
+            ));
         }
-        OutputFormat::Markdown => run_build_markdown(input, output, out_dir, runtime_vars, quiet),
+        // Reject a symlinked directory root for build parity (commit aa0c538).
+        if input
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(miette::miette!(
+                "directory argument must not be a symlink: {}",
+                input.display()
+            ));
+        }
+        return run_build_directory(&input, out_dir, runtime_vars, quiet);
     }
-}
 
-/// Compile `@message` blocks to a JSON array and write to stdout or `-o`.
-///
-/// Skips the output-dir / `mds.json` project-config logic — output always goes
-/// to stdout or an explicit `-o` path.
-fn run_build_messages(
-    input: PathBuf,
-    output: Option<String>,
-    runtime_vars: Option<HashMap<String, mds::Value>>,
-    quiet: bool,
-) -> Result<()> {
-    // Directory check: mirrors run_build_markdown — a directory cannot be compiled.
-    reject_directory_input(&input)?;
-    // Messages mode: output always goes to stdout (or -o); no output-dir / config logic.
-    let output_path = match output.as_deref() {
-        Some("-") | None => None,
-        Some(o) => Some(PathBuf::from(o)),
-    };
-    // Route through compile_and_write to go through read_build_input (PF-004 compliance).
-    let _ = compile_and_write(
-        &input,
-        output_path,
-        runtime_vars,
-        &OutputFormat::Messages,
-        quiet,
-    )?;
+    if input == Path::new("-") {
+        // Stdin: compile from source string, route to stdout (or -o).
+        // No project config for stdin; output direction follows -o/-o-.
+        let (source, cwd) = read_stdin()?;
+        let result = mds::compile_str_with_deps(&source, Some(&cwd), runtime_vars)
+            .map_err(miette::Error::from)?;
+        if !quiet {
+            for w in &result.warnings {
+                eprintln!("{w}");
+            }
+        }
+        let kind = OutputKind::from(&result.output);
+        // Move result.output (issue 2 — avoids clone for Markdown arm).
+        let content = serialize_output(result.output)?;
+        // Stdin: no project config; output path follows -o flag or defaults to stdout.
+        let output_path =
+            resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind, quiet)?;
+        return write_output(output_path, &content, quiet, true);
+    }
+
+    // File input: load project config and compile.
+    // compile-then-route: compile first, derive output path from kind, then write.
+    let config = load_config(&input)?;
+    let _ = compile_and_write(&input, &output, &out_dir, &config, runtime_vars, quiet)?;
     Ok(())
 }
 
-/// Compile a template to Markdown and write to the resolved output destination.
+/// Compile every non-partial `.mds` file under `dir`, streaming one at a time
+/// (AC-PERF-02: peak RSS ≈ O(largest single file), not O(total)).
 ///
-/// Loads `mds.json` project config for output-dir resolution. Handles stdin
-/// (`-`) and file paths, emitting warnings to stderr unless `quiet` is set.
-fn run_build_markdown(
-    input: PathBuf,
-    output: Option<String>,
+/// Continue-on-error: a per-file compile error does NOT abort the run.
+/// All valid files are written; a summary is printed; non-zero exit when any failed
+/// (AC-FUNC-18).
+///
+/// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
+/// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
+/// output is placed next to its source (AC-FUNC-19).
+///
+/// Stale-output cleanup: after writing, probes for the wrong-extension sibling and
+/// deletes it to handle format flips (md↔json) across builds.
+fn run_build_directory(
+    dir: &Path,
     out_dir: Option<PathBuf>,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<()> {
-    if input == Path::new("-") {
-        // Stdin: can't use compile_with_deps (needs a path), so keep inline.
-        let config = None; // no project config for stdin
-        let output_path = resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
-        let (source, cwd) = read_stdin()?;
-        let (compiled, warnings) =
-            mds::compile_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-                .map_err(miette::Error::from)?;
+    use crate::output::{
+        canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
+        probe_and_remove_stale, resolve_output_base, OutputBase,
+    };
+
+    const MAX_DEPTH: usize = 64;
+
+    // Load project config from the directory root.
+    let config = load_config(dir)?;
+    // Canonicalize out_dir as absolute so starts_with checks are reliable.
+    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
+    let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
+
+    // Canonicalize dir for the starts_with comparison (issue 4): abs_out_dir (d) is already
+    // canonical, but `dir` may be a raw relative or pre-resolved-but-not-canonical path.
+    // Mismatch (e.g. /private/tmp vs /tmp on macOS) causes the exclusion to silently fail
+    // and includes the out-dir in the collection — not a security issue (only .mds are
+    // gathered) but causes redundant scanning. Fall back to raw dir when canonicalize fails
+    // (dir may not exist yet in unusual configurations).
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
+    // Exclude the out-dir from collection when it is nested inside the source root.
+    let exclude_prefix: Option<PathBuf> = match &output_base {
+        OutputBase::Dir(d) if d.starts_with(&canonical_dir) => Some(d.clone()),
+        _ => None,
+    };
+
+    let files = collect_mds_files(dir, MAX_DEPTH, exclude_prefix.as_deref());
+
+    if files.is_empty() {
         if !quiet {
-            for w in &warnings {
-                eprintln!("{w}");
-            }
+            eprintln!("No .mds files found in {}", dir.display());
         }
-        return write_output(output_path, &compiled, quiet, true);
+        return Ok(());
     }
 
-    // Load project config (mds.json), walking up from the input file.
-    let config = load_config(&input)?;
+    let mut ok_count: usize = 0;
+    let mut fail_count: usize = 0;
+    // Track paths successfully written in this build run so the stale-cleanup
+    // step can verify it was tool-produced before deleting (issue 1 guard):
+    // prevents clobbering a hand-authored file that shares a stem with a .mds
+    // (e.g. notes.md kept next to notes.mds that now compiles to notes.json).
+    // Same-stem .md/.json files adjacent to a .mds in NextToSource mode are
+    // considered tool-owned; if a collision is a concern use --out-dir to
+    // separate source and output trees.
+    let mut written_this_run: HashSet<PathBuf> = HashSet::new();
 
-    // Resolve output destination before compiling (config discovery happens once).
-    let output_path = resolve_output_path(&Some(input.clone()), &output, &out_dir, &config)?;
+    for file in &files {
+        // Skip partials: they contribute to imports but produce no standalone output.
+        if is_partial(file) {
+            continue;
+        }
 
-    // Route through compile_and_write (PF-004 compliance: uses compile_with_deps which
-    // enforces MAX_FILE_SIZE through the resolver).
-    let _ = compile_and_write(
-        &input,
-        output_path,
-        runtime_vars,
-        &OutputFormat::Markdown,
-        quiet,
-    )?;
+        // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
+        match compile_to_content(file, runtime_vars.clone(), quiet) {
+            Ok(compiled) => {
+                let ext = compiled.kind.extension();
+                let out_path = output_path_for(file, dir, &output_base, ext);
+
+                // Ensure parent directory exists.
+                if let Some(parent) = out_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!(
+                                "error: cannot create output directory {}: {e}",
+                                parent.display()
+                            );
+                            fail_count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                match std::fs::write(&out_path, &compiled.content) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("Compiled to {}", out_path.display());
+                        }
+                        written_this_run.insert(out_path.clone());
+                        // Stale-output cleanup: remove the wrong-extension sibling only
+                        // if this tool wrote it (i.e. it appears in written_this_run from
+                        // a previous iteration, or matches a prior build's output).
+                        // For a kind-flip (template switched markdown↔messages between
+                        // two runs), the stale sibling won't be in written_this_run yet.
+                        // We still want to clean it up in that case — the legitimate
+                        // format-flip cleanup. Gate: the stale path must either be in
+                        // written_this_run (already written this run — shouldn't happen
+                        // but safe), OR the output_base is Dir (separate output tree,
+                        // no hand-authored sibling risk). In NextToSource mode and the
+                        // stale path was not written by us this run, skip to protect
+                        // hand-authored files.
+                        let base_no_ext = output_base_no_ext(file, dir, &output_base);
+                        let stale_path =
+                            base_no_ext.with_extension(compiled.kind.stale_extension());
+                        let safe_to_delete = matches!(output_base, OutputBase::Dir(_))
+                            || written_this_run.contains(&stale_path);
+                        if safe_to_delete {
+                            probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        }
+                        ok_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("error: cannot write {}: {e}", out_path.display());
+                        fail_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{e:?}");
+                fail_count += 1;
+            }
+        }
+    }
+
+    eprintln!("{ok_count} built, {fail_count} failed");
+
+    if fail_count > 0 {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -738,7 +866,7 @@ mod tests {
     #[test]
     fn derive_output_filename_swaps_mds_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("foo.mds")),
+            derive_output_filename_for_kind(Path::new("foo.mds"), OutputKind::Markdown),
             OsString::from("foo.md")
         );
     }
@@ -746,7 +874,7 @@ mod tests {
     #[test]
     fn derive_output_filename_preserves_compound_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("foo.bar.mds")),
+            derive_output_filename_for_kind(Path::new("foo.bar.mds"), OutputKind::Markdown),
             OsString::from("foo.bar.md")
         );
     }
@@ -754,7 +882,7 @@ mod tests {
     #[test]
     fn derive_output_filename_no_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("README")),
+            derive_output_filename_for_kind(Path::new("README"), OutputKind::Markdown),
             OsString::from("README.md")
         );
     }
@@ -762,18 +890,20 @@ mod tests {
     #[test]
     fn derive_output_filename_other_extension() {
         assert_eq!(
-            derive_output_filename(Path::new("foo.txt")),
+            derive_output_filename_for_kind(Path::new("foo.txt"), OutputKind::Markdown),
             OsString::from("foo.md")
         );
     }
 
     #[test]
     fn resolve_output_path_dash_o_dash_is_stdout() {
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("foo.mds")),
             &Some("-".to_string()),
             &None,
             &None,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(result, None, "-o - should resolve to stdout (None)");
@@ -781,7 +911,15 @@ mod tests {
 
     #[test]
     fn resolve_output_path_stdin_no_o_is_stdout() {
-        let result = resolve_output_path(&Some(PathBuf::from("-")), &None, &None, &None).unwrap();
+        let result = resolve_output_path_for_kind(
+            &Some(PathBuf::from("-")),
+            &None,
+            &None,
+            &None,
+            OutputKind::Markdown,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             result, None,
             "stdin input with no -o should resolve to stdout"
@@ -790,11 +928,13 @@ mod tests {
 
     #[test]
     fn resolve_output_path_default_file_next_to_source() {
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("/some/dir/hello.mds")),
             &None,
             &None,
             &None,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -808,11 +948,13 @@ mod tests {
     fn resolve_output_path_stdin_with_out_dir_uses_out_dir() {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path().join("out");
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("-")),
             &None,
             &Some(out_dir.clone()),
             &None,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -832,11 +974,13 @@ mod tests {
             },
             PathBuf::from("/project"),
         ));
-        let result = resolve_output_path(
+        let result = resolve_output_path_for_kind(
             &Some(PathBuf::from("/project/hello.mds")),
             &Some("out.md".to_string()),
             &None,
             &config,
+            OutputKind::Markdown,
+            true,
         )
         .unwrap();
         assert_eq!(

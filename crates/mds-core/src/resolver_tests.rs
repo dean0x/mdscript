@@ -252,7 +252,7 @@ fn has_type_mds_frontmatter_ignores_indented() {
 fn block_duplicate_name_collision() {
     // Two @block declarations with the same name → mds::name_collision.
     let src = "@block foo:\nbody1\n@end\n@block foo:\nbody2\n@end\n";
-    let result = crate::compile_str(src);
+    let result = crate::compile_str_md(src);
     assert!(result.is_err(), "duplicate @block name must fail");
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -265,7 +265,7 @@ fn block_duplicate_name_collision() {
 fn block_vs_define_name_collision() {
     // @block and @define sharing the same name → mds::name_collision.
     let src = "@define foo():\ncontent\n@end\n@block foo:\nbody\n@end\n";
-    let result = crate::compile_str(src);
+    let result = crate::compile_str_md(src);
     assert!(result.is_err(), "@block vs @define collision must fail");
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -278,7 +278,7 @@ fn block_vs_define_name_collision() {
 fn define_vs_block_name_collision() {
     // @define declared after a @block with the same name → mds::name_collision.
     let src = "@block foo:\nbody\n@end\n@define foo():\ncontent\n@end\n";
-    let result = crate::compile_str(src);
+    let result = crate::compile_str_md(src);
     assert!(result.is_err(), "@define vs @block collision must fail");
     let msg = result.unwrap_err().to_string();
     assert!(
@@ -295,7 +295,7 @@ fn block_max_per_module_cap() {
     for i in 0..=256usize {
         src.push_str(&format!("@block blk{i}:\nbody\n@end\n"));
     }
-    let result = crate::compile_str(&src);
+    let result = crate::compile_str_md(&src);
     assert!(
         result.is_err(),
         "exceeding MAX_BLOCKS_PER_MODULE should fail with resource_limit"
@@ -314,7 +314,7 @@ fn block_exactly_at_max_allowed() {
     for i in 0..256usize {
         src.push_str(&format!("@block blk{i}:\nbody\n@end\n"));
     }
-    let result = crate::compile_str(&src);
+    let result = crate::compile_str_md(&src);
     assert!(
         result.is_ok(),
         "exactly 256 @blocks should succeed, got: {result:?}"
@@ -333,13 +333,13 @@ fn virtual_cache(files: &[(&str, &str)]) -> ModuleCache {
     )
 }
 
-/// Helper: compile a VirtualFs entry and return the output string.
+/// Helper: compile a VirtualFs entry and return the Markdown output string.
 fn compile_virtual(files: &[(&str, &str)], entry: &str) -> Result<String, MdsError> {
     let map: std::collections::HashMap<String, String> = files
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    crate::compile_virtual(map, entry, None)
+    crate::compile_virtual_md(map, entry, None)
 }
 
 /// Helper: check (validate only, no output) a VirtualFs entry.
@@ -1816,8 +1816,12 @@ fn f3_multilevel_deep_merge_transitive() {
 
 // ── Phase 4: messages-mode inheritance ───────────────────────────────────
 
-/// Helper: compile a VirtualFs entry in messages mode.
-fn compile_messages_virtual_helper(
+/// Helper: compile a VirtualFs entry and extract its messages.
+///
+/// Output shape is intrinsic: a template containing any `@message` block compiles to
+/// `CompiledOutput::Messages`. `into_messages()` extracts the vector — or returns
+/// `Err(ExpectedMessages)` if the template produced Markdown (no `@message` block).
+fn compile_virtual_messages_helper(
     files: &[(&str, &str)],
     entry: &str,
 ) -> Result<Vec<crate::Message>, MdsError> {
@@ -1825,7 +1829,7 @@ fn compile_messages_virtual_helper(
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    crate::compile_messages_virtual(map, entry, None).map(|output| output.messages)
+    crate::compile_virtual(map, entry, None).and_then(crate::CompileResult::into_messages)
 }
 
 // ── F9: messages mode — @message-structured base + child @block override ──
@@ -1853,7 +1857,7 @@ fn f9_messages_mode_block_override_compiles_to_message_array() {
         "@end\n",
     );
     let files = [("base.mds", base), ("child.mds", child)];
-    let messages = compile_messages_virtual_helper(&files, "child.mds")
+    let messages = compile_virtual_messages_helper(&files, "child.mds")
         .expect("F9: messages-mode inheritance should compile");
     assert_eq!(
         messages.len(),
@@ -1881,7 +1885,7 @@ fn f9_messages_mode_default_block_in_message_body() {
     );
     let child = "@extends \"./base.mds\"\n";
     let files = [("base.mds", base), ("child.mds", child)];
-    let messages = compile_messages_virtual_helper(&files, "child.mds")
+    let messages = compile_virtual_messages_helper(&files, "child.mds")
         .expect("F9: @message inside un-overridden base default block should surface");
     assert_eq!(
         messages.len(),
@@ -1896,12 +1900,13 @@ fn f9_messages_mode_default_block_in_message_body() {
     );
 }
 
-// ── E13: messages mode — base with no @message → clear error ─────────────
+// ── E13: intrinsic — base with no @message compiles to Markdown ──────────
 
 #[test]
-fn e13_messages_mode_base_no_message_block_clear_error() {
-    // Base has @block placeholders but no @message — compiling child in
-    // messages mode should return the existing "no @message block" guard error.
+fn e13_extends_no_message_block_compiles_to_markdown() {
+    // Base has @block placeholders but no @message. Output shape is intrinsic:
+    // with no @message anywhere in the spliced final_body, the child compiles to
+    // Markdown (not an error). Extracting messages from it yields ExpectedMessages.
     let base = concat!(
         "You are an assistant.\n",
         "@block instructions:\n",
@@ -1915,18 +1920,22 @@ fn e13_messages_mode_base_no_message_block_clear_error() {
         "@end\n",
     );
     let files = [("base.mds", base), ("child.mds", child)];
-    let err = compile_messages_virtual_helper(&files, "child.mds")
-        .expect_err("E13: no @message in final_body → should error");
-    let msg = err.to_string();
+
+    // It compiles to Markdown with the child's override spliced in.
+    let md = compile_virtual(&files, "child.mds")
+        .expect("E13: no @message → Markdown output, not an error");
     assert!(
-        msg.contains("@message") || msg.contains("message"),
-        "E13: error should mention @message: {msg}"
+        md.contains("You are an assistant.") && md.contains("Do things quickly."),
+        "E13: spliced Markdown output expected, got: {md:?}"
     );
-    // Must be mds::syntax (existing guard) not an internal panic.
-    let code = err.serialize().code;
+
+    // Asking for messages on a Markdown result is the ExpectedMessages error.
+    let err = compile_virtual_messages_helper(&files, "child.mds")
+        .expect_err("E13: extracting messages from Markdown output must error");
     assert_eq!(
-        code, "mds::syntax",
-        "E13: error code should be mds::syntax: {code}"
+        err.serialize().code,
+        "mds::expected_messages",
+        "E13: error code should be mds::expected_messages: {err}"
     );
 }
 
@@ -1953,7 +1962,7 @@ fn f10_messages_mode_empty_block_renders_empty() {
     // Child overrides the gap block with an empty body (same as default).
     let child = concat!("@extends \"./base.mds\"\n", "@block gap:\n", "@end\n",);
     let files = [("base.mds", base), ("child.mds", child)];
-    let messages = compile_messages_virtual_helper(&files, "child.mds")
+    let messages = compile_virtual_messages_helper(&files, "child.mds")
         .expect("F10 messages: empty block should not break compilation");
     // Two @message blocks: Before. and After.
     assert_eq!(
@@ -1973,48 +1982,65 @@ fn f10_messages_mode_empty_block_renders_empty() {
     );
 }
 
-// ── P5: deep-chain performance guard (TEXT + MESSAGES, < 2 s) ────────────
+// ── P5: deep-chain performance guard (Markdown + Messages, < 2 s) ────────
+
+/// Build a 32-level @extends chain whose root carries `root_src` in a @block, and
+/// return the (key, source) pairs. file0 @extends file1 @extends … @extends file31.
+fn deep_chain_files(depth: usize, root_src: String) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    files.push((format!("file{depth}.mds"), root_src));
+    for i in (0..depth).rev() {
+        files.push((
+            format!("file{i}.mds"),
+            format!("@extends \"./file{}.mds\"\n", i + 1),
+        ));
+    }
+    files
+}
 
 #[test]
-fn p5_deep_chain_32_levels_text_and_messages_under_2s() {
-    // Build a 32-level chain: file0 @extends file1 @extends ... @extends file31
-    // file31 is the root with @block + @message content.
-    // Both text and messages compilation must complete in < 2 s with no OOM.
+fn p5_deep_chain_32_levels_markdown_and_messages_under_2s() {
+    // Output shape is intrinsic, so the markdown and messages perf paths need
+    // different roots: a plain @block (Markdown) vs a @block holding a @message
+    // (Messages). Both 32-level chains must compile in < 2 s with no OOM.
     let depth = 32usize;
-    let mut files: Vec<(String, String)> = Vec::new();
 
-    // Root base: lightweight skeleton with @block containing @message — @block at
-    // top-level, @message inside it. Both text and messages modes work with this.
-    let root_src = concat!(
-        "@block content:\n",
-        "@message user:\n",
-        "Hello from root.\n",
-        "@end\n",
-        "@end\n",
-    )
-    .to_string();
-    files.push((format!("file{depth}.mds"), root_src));
+    // Markdown root: @block with plain default content (no @message).
+    let md_files = deep_chain_files(
+        depth,
+        "@block content:\nHello from root.\n@end\n".to_string(),
+    );
+    let md_refs: Vec<(&str, &str)> = md_files
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
-    // Each level just extends the next — no frontmatter, no overrides.
-    for i in (0..depth).rev() {
-        let src = format!("@extends \"./file{}.mds\"\n", i + 1);
-        files.push((format!("file{i}.mds"), src));
-    }
-
-    let file_refs: Vec<(&str, &str)> = files
+    // Messages root: @block at top level with a @message inside it.
+    let msg_files = deep_chain_files(
+        depth,
+        concat!(
+            "@block content:\n",
+            "@message user:\n",
+            "Hello from root.\n",
+            "@end\n",
+            "@end\n",
+        )
+        .to_string(),
+    );
+    let msg_refs: Vec<(&str, &str)> = msg_files
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
 
     let start = std::time::Instant::now();
-    let text_result = compile_virtual(&file_refs, "file0.mds");
-    let messages_result = compile_messages_virtual_helper(&file_refs, "file0.mds");
+    let markdown_result = compile_virtual(&md_refs, "file0.mds");
+    let messages_result = compile_virtual_messages_helper(&msg_refs, "file0.mds");
     let elapsed = start.elapsed();
 
     assert!(
-        text_result.is_ok(),
-        "P5: 32-level chain text compile failed: {:?}",
-        text_result.err()
+        markdown_result.is_ok(),
+        "P5: 32-level chain markdown compile failed: {:?}",
+        markdown_result.err()
     );
     assert!(
         messages_result.is_ok(),
@@ -2023,7 +2049,7 @@ fn p5_deep_chain_32_levels_text_and_messages_under_2s() {
     );
     assert!(
         elapsed.as_secs() < 2,
-        "P5: 32-level chain took {:?}, must be < 2 s",
+        "P5: 32-level chains took {:?}, must be < 2 s",
         elapsed
     );
 }
@@ -2130,7 +2156,7 @@ fn p6_pf004_oversized_base_rejected_in_messages_mode() {
     let oversized = "x".repeat((MAX_FILE_SIZE + 1) as usize);
     let child = "@extends \"./base.mds\"\n";
     let files = [("base.mds", oversized.as_str()), ("child.mds", child)];
-    let err = compile_messages_virtual_helper(&files, "child.mds")
+    let err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("P6 messages: oversized base must be rejected");
     let code = err.serialize().code;
     assert_eq!(
@@ -2176,7 +2202,7 @@ fn f9_messages_mode_multilevel_chain() {
     );
     let files = [("a.mds", a), ("b.mds", b), ("c.mds", c)];
     let messages =
-        compile_messages_virtual_helper(&files, "c.mds").expect("F9 multilevel: should compile");
+        compile_virtual_messages_helper(&files, "c.mds").expect("F9 multilevel: should compile");
     assert_eq!(messages.len(), 1, "F9 multilevel: got {messages:?}");
     assert!(
         messages[0].content.contains("From C."),
@@ -2217,7 +2243,7 @@ fn pf004_messages_mode_extends_validates_final_body_parity() {
     );
 
     // Messages mode: must produce the SAME error (avoids PF-004 parallel-path divergence).
-    let messages_err = compile_messages_virtual_helper(&files, "child.mds")
+    let messages_err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("messages: undefined var must error");
     let messages_code = messages_err.serialize().code;
     assert_eq!(
@@ -2392,7 +2418,7 @@ fn a3_resolver_error_code_table() {
     {
         let src = "@define body():\ncontent\n@end\n@block body:\nbody text\n@end\n";
         let err =
-            crate::compile_str(src).expect_err("A3 E7: @block/@define collision should error");
+            crate::compile_str_md(src).expect_err("A3 E7: @block/@define collision should error");
         assert_eq!(
             err.serialize().code,
             "mds::name_collision",
@@ -2404,7 +2430,7 @@ fn a3_resolver_error_code_table() {
     // E8: duplicate @block in same module → mds::name_collision
     {
         let src = "@block body:\nfirst\n@end\n@block body:\nsecond\n@end\n";
-        let err = crate::compile_str(src).expect_err("A3 E8: duplicate @block should error");
+        let err = crate::compile_str_md(src).expect_err("A3 E8: duplicate @block should error");
         assert_eq!(
             err.serialize().code,
             "mds::name_collision",
@@ -2510,7 +2536,7 @@ fn pf004_messages_mode_span_parity_with_text_mode() {
         "pf004 span text: column must be Some: {text_span:?}"
     );
 
-    let msg_err = compile_messages_virtual_helper(&files, "child.mds")
+    let msg_err = compile_virtual_messages_helper(&files, "child.mds")
         .expect_err("pf004 span: messages must error");
     let msg_s = msg_err.serialize();
     assert_eq!(

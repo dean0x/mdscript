@@ -1,6 +1,6 @@
 /**
  * Backend contract parity tests for @mdscript/mds.
- * Tests: U-BC1 through U-BC13
+ * Tests: U-BC1 through U-BC20
  *
  * All tests use STUB backend objects — no live wasm build required.
  * This file is env-independent and must pass in CI on every platform.
@@ -18,27 +18,34 @@ import { createWasmBackend } from '../dist/backend/wasm.js';
 import { createNativeBackend } from '../dist/backend/native.js';
 
 // ---------------------------------------------------------------------------
-// Method manifest assertions
+// Method manifest assertions (AC-API-09)
 // ---------------------------------------------------------------------------
 
 describe('backend contract — method manifest', () => {
-  test('U-BC1: BASE_METHODS contains compile, check, compileMessages', () => {
+  test('U-BC1: BASE_METHODS contains compile, check (no compileMessages)', () => {
     assert.deepEqual(
       [...BASE_METHODS].sort(),
-      ['check', 'compile', 'compileMessages'],
+      ['check', 'compile'],
     );
   });
 
-  test('U-BC2: NODE_METHODS contains compileFile, checkFile, compileMessagesFile', () => {
+  test('U-BC2: NODE_METHODS contains compileFile, checkFile (no compileMessagesFile)', () => {
     assert.deepEqual(
       [...NODE_METHODS].sort(),
-      ['checkFile', 'compileFile', 'compileMessagesFile'],
+      ['checkFile', 'compileFile'],
     );
   });
 
   test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus scanImports', () => {
     const expected = [...BASE_METHODS, 'scanImports'].sort();
     assert.deepEqual([...WASM_EXPORTS].sort(), expected);
+  });
+
+  test('U-BC3a: WASM_EXPORTS does NOT include compileMessages', () => {
+    assert.ok(
+      !WASM_EXPORTS.includes('compileMessages'),
+      'WASM_EXPORTS must not include compileMessages after intrinsic-output refactor',
+    );
   });
 });
 
@@ -51,19 +58,18 @@ describe('backend contract — validateBackendMethods', () => {
     const stub = {
       compile: () => {},
       check: () => {},
-      compileMessages: () => {},
     };
     assert.doesNotThrow(() => validateBackendMethods(stub, BASE_METHODS, 'test stub'));
   });
 
   test('U-BC5: validateBackendMethods throws when a method is missing', () => {
-    const stub = { compile: () => {}, check: () => {} }; // missing compileMessages
+    const stub = { compile: () => {} }; // missing check
     assert.throws(
       () => validateBackendMethods(stub, BASE_METHODS, 'test stub'),
       (err) => {
         assert.ok(err instanceof Error);
         assert.ok(
-          err.message.includes('compileMessages'),
+          err.message.includes('check'),
           `error must name the missing method, got: ${err.message}`,
         );
         assert.ok(
@@ -79,7 +85,6 @@ describe('backend contract — validateBackendMethods', () => {
     const stub = {
       compile: () => {},
       check: () => {},
-      compileMessages: () => {},
       extraMethod: () => {},
     };
     assert.doesNotThrow(() => validateBackendMethods(stub, BASE_METHODS, 'test stub'));
@@ -89,7 +94,6 @@ describe('backend contract — validateBackendMethods', () => {
     const stub = {
       compile: () => {},
       check: 42, // wrong type
-      compileMessages: () => {},
     };
     assert.throws(
       () => validateBackendMethods(stub, BASE_METHODS, 'test stub'),
@@ -103,28 +107,28 @@ describe('backend contract — validateBackendMethods', () => {
 });
 
 // ---------------------------------------------------------------------------
-// assertResultShape — compile
+// assertResultShape — compile / kind='markdown' (AC-API-10)
 // ---------------------------------------------------------------------------
 
-describe('backend contract — assertResultShape compile', () => {
-  test('U-BC8: compile — valid result passes', () => {
+describe('backend contract — assertResultShape compile kind=markdown', () => {
+  test('U-BC8: compile kind=markdown — valid result passes', () => {
     assert.doesNotThrow(() =>
-      assertResultShape({ output: 'hello', warnings: [], dependencies: [] }, 'compile'),
+      assertResultShape({ kind: 'markdown', output: 'hello', warnings: [], dependencies: [] }, 'compile'),
     );
   });
 
-  test('U-BC8a: compile — valid result with extra fields passes', () => {
+  test('U-BC8a: compile kind=markdown — valid result with extra fields passes', () => {
     assert.doesNotThrow(() =>
       assertResultShape(
-        { output: 'hello', warnings: [], dependencies: [], extra: 'ignored' },
+        { kind: 'markdown', output: 'hello', warnings: [], dependencies: [], extra: 'ignored' },
         'compile',
       ),
     );
   });
 
-  test('U-BC8b: compile — wrong-typed output (number) is rejected', () => {
+  test('U-BC8b: compile kind=markdown — wrong-typed output (number) is rejected (AC-API-11)', () => {
     assert.throws(
-      () => assertResultShape({ output: 42, warnings: [], dependencies: [] }, 'compile'),
+      () => assertResultShape({ kind: 'markdown', output: 42, warnings: [], dependencies: [] }, 'compile'),
       (err) => {
         assert.ok(err instanceof Error);
         assert.ok(err.message.includes('output'), `expected "output" in error, got: ${err.message}`);
@@ -135,9 +139,9 @@ describe('backend contract — assertResultShape compile', () => {
     );
   });
 
-  test('U-BC8c: compile — missing dependencies is rejected', () => {
+  test('U-BC8c: compile kind=markdown — missing dependencies is rejected', () => {
     assert.throws(
-      () => assertResultShape({ output: 'hello', warnings: [] }, 'compile'),
+      () => assertResultShape({ kind: 'markdown', output: 'hello', warnings: [] }, 'compile'),
       (err) => {
         assert.ok(err instanceof Error);
         assert.ok(
@@ -149,12 +153,100 @@ describe('backend contract — assertResultShape compile', () => {
     );
   });
 
-  test('U-BC8d: compile — missing warnings is rejected', () => {
+  test('U-BC8d: compile kind=markdown — missing warnings is rejected', () => {
     assert.throws(
-      () => assertResultShape({ output: 'hello', dependencies: [] }, 'compile'),
+      () => assertResultShape({ kind: 'markdown', output: 'hello', dependencies: [] }, 'compile'),
       (err) => {
         assert.ok(err instanceof Error);
         assert.ok(err.message.includes('warnings'), `expected "warnings" in error, got: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test('U-BC8e: compile kind=markdown — inactive field "messages" present is rejected (AC-API-10)', () => {
+    assert.throws(
+      () => assertResultShape(
+        { kind: 'markdown', output: 'hello', messages: [], warnings: [], dependencies: [] },
+        'compile',
+      ),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('messages') || err.message.includes('inactive'),
+          `expected inactive-field error, got: ${err.message}`,
+        );
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// assertResultShape — compile / kind='messages' (AC-API-10)
+// ---------------------------------------------------------------------------
+
+describe('backend contract — assertResultShape compile kind=messages', () => {
+  test('U-BC8f: compile kind=messages — valid result passes', () => {
+    assert.doesNotThrow(() =>
+      assertResultShape(
+        { kind: 'messages', messages: [{ role: 'user', content: 'hi' }], warnings: [], dependencies: [] },
+        'compile',
+      ),
+    );
+  });
+
+  test('U-BC8g: compile kind=messages — non-array messages is rejected (AC-API-11)', () => {
+    assert.throws(
+      () => assertResultShape(
+        { kind: 'messages', messages: 'not-an-array', warnings: [], dependencies: [] },
+        'compile',
+      ),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(err.message.includes('messages'));
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+
+  test('U-BC8h: compile kind=messages — inactive field "output" present is rejected (AC-API-10)', () => {
+    assert.throws(
+      () => assertResultShape(
+        { kind: 'messages', output: 'oops', messages: [], warnings: [], dependencies: [] },
+        'compile',
+      ),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('output') || err.message.includes('inactive'),
+          `expected inactive-field error, got: ${err.message}`,
+        );
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+
+  test('U-BC8i: compile — unknown kind is rejected (AC-API-10)', () => {
+    assert.throws(
+      () => assertResultShape({ kind: 'unknown', warnings: [], dependencies: [] }, 'compile'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+
+  test('U-BC8j: compile — missing kind field is rejected (AC-API-10)', () => {
+    assert.throws(
+      () => assertResultShape({ output: 'hello', warnings: [], dependencies: [] }, 'compile'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
         return true;
       },
     );
@@ -176,7 +268,7 @@ describe('backend contract — assertResultShape check', () => {
     );
   });
 
-  test('U-BC9b: check — missing warnings is rejected', () => {
+  test('U-BC9b: check — missing warnings is rejected (AC-API-11)', () => {
     assert.throws(
       () => assertResultShape({}, 'check'),
       (err) => {
@@ -190,67 +282,16 @@ describe('backend contract — assertResultShape check', () => {
 });
 
 // ---------------------------------------------------------------------------
-// assertResultShape — compileMessages
+// Performance: O(1) validation — no per-element array traversal (AC-PERF-04)
 // ---------------------------------------------------------------------------
 
-describe('backend contract — assertResultShape compileMessages', () => {
-  test('U-BC10: compileMessages — valid result passes', () => {
-    assert.doesNotThrow(() =>
-      assertResultShape({ messages: [], warnings: [], dependencies: [] }, 'compileMessages'),
-    );
-  });
-
-  test('U-BC10a: compileMessages — valid result with extra fields passes', () => {
-    assert.doesNotThrow(() =>
-      assertResultShape(
-        { messages: [], warnings: [], dependencies: [], meta: null },
-        'compileMessages',
-      ),
-    );
-  });
-
-  test('U-BC10b: compileMessages — missing messages is rejected', () => {
-    assert.throws(
-      () => assertResultShape({ warnings: [], dependencies: [] }, 'compileMessages'),
-      (err) => {
-        assert.ok(err instanceof Error);
-        assert.ok(err.message.includes('messages'), `expected "messages" in error, got: ${err.message}`);
-        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
-        return true;
-      },
-    );
-  });
-
-  test('U-BC10c: compileMessages — non-array messages is rejected', () => {
-    assert.throws(
-      () =>
-        assertResultShape(
-          { messages: 'not-an-array', warnings: [], dependencies: [] },
-          'compileMessages',
-        ),
-      (err) => {
-        assert.ok(err instanceof Error);
-        assert.ok(err.message.includes('messages'));
-        return true;
-      },
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Performance: O(1) validation — no per-element array traversal
-// ---------------------------------------------------------------------------
-
-describe('backend contract — O(1) array validation', () => {
-  test('U-BC11: assertResultShape does not iterate array elements (10k-element warnings array)', () => {
-    // Build a large warnings array. If assertResultShape iterates elements,
-    // this test would measurably slow down (and a proxy would catch element access).
-    // We use a Proxy to confirm no element index access occurs.
+describe('backend contract — O(1) array validation (AC-PERF-04)', () => {
+  test('U-BC11: assertResultShape does not iterate 10k-element warnings array', () => {
+    // Proxy wraps the large array. If assertResultShape accesses any element
+    // (numeric index), the counter increments. The requirement is zero accesses.
     let elementAccessCount = 0;
     const bigWarnings = new Proxy(new Array(10_000).fill('w'), {
       get(target, prop) {
-        // Allow Array.isArray, length, and prototype methods.
-        // Flag any numeric index access (element iteration).
         if (typeof prop === 'string' && /^\d+$/.test(prop)) {
           elementAccessCount += 1;
         }
@@ -258,7 +299,10 @@ describe('backend contract — O(1) array validation', () => {
       },
     });
 
-    assertResultShape({ output: 'ok', warnings: bigWarnings, dependencies: [] }, 'compile');
+    assertResultShape(
+      { kind: 'markdown', output: 'ok', warnings: bigWarnings, dependencies: [] },
+      'compile',
+    );
     assert.equal(
       elementAccessCount,
       0,
@@ -277,30 +321,53 @@ describe('backend contract — O(1) array validation', () => {
       },
     });
 
-    assertResultShape({ messages: bigMessages, warnings: [], dependencies: [] }, 'compileMessages');
+    assertResultShape(
+      { kind: 'messages', messages: bigMessages, warnings: [], dependencies: [] },
+      'compile',
+    );
     assert.equal(
       elementAccessCount,
       0,
       `assertResultShape must not access array elements; accessed ${elementAccessCount} element(s)`,
     );
   });
+
+  test('U-BC12a: assertResultShape does not iterate 10k-element dependencies array', () => {
+    let elementAccessCount = 0;
+    const bigDeps = new Proxy(new Array(10_000).fill('/path/dep.mds'), {
+      get(target, prop) {
+        if (typeof prop === 'string' && /^\d+$/.test(prop)) {
+          elementAccessCount += 1;
+        }
+        return Reflect.get(target, prop);
+      },
+    });
+
+    assertResultShape(
+      { kind: 'markdown', output: 'ok', warnings: [], dependencies: bigDeps },
+      'compile',
+    );
+    assert.equal(
+      elementAccessCount,
+      0,
+      `assertResultShape must not access array elements (deps); accessed ${elementAccessCount} element(s)`,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
-// Backend stub parity — both backends expose exactly the manifest method set
+// Backend stub parity — both backends expose exactly the manifest method set (AC-API-09)
 // ---------------------------------------------------------------------------
 
-describe('backend contract — parity: WASM backend exposes BASE_METHODS', () => {
+describe('backend contract — parity: WASM backend exposes BASE_METHODS (AC-API-09)', () => {
   // Build a minimal stub WasmModule that satisfies validateWasmShape.
-  // Stubs return valid result shapes so createWasmBackend's per-call validation passes.
-  const validCompileResult = { output: '', warnings: [], dependencies: [] };
+  // Stubs return valid discriminated-union shapes.
+  const validMarkdownResult = { kind: 'markdown', output: '', warnings: [], dependencies: [] };
   const validCheckResult = { warnings: [] };
-  const validCompileMessagesResult = { messages: [], warnings: [], dependencies: [] };
 
   const stubWasmModule = {
-    compile: () => validCompileResult,
+    compile: () => validMarkdownResult,
     check: () => validCheckResult,
-    compileMessages: () => validCompileMessagesResult,
     scanImports: () => [],
   };
 
@@ -326,24 +393,30 @@ describe('backend contract — parity: WASM backend exposes BASE_METHODS', () =>
     }
   });
 
-  test('U-BC13b: WASM backend compile returns valid result from stub', () => {
+  test('U-BC13b: WASM backend does NOT expose compileMessages (AC-API-12)', () => {
+    assert.notEqual(
+      typeof (/** @type {any} */ (wasmBackend))['compileMessages'],
+      'function',
+      'WASM backend must not have compileMessages after intrinsic-output refactor',
+    );
+  });
+
+  test('U-BC13c: WASM backend compile returns valid kind=markdown result from stub', () => {
     const result = wasmBackend.compile('');
+    assert.equal(result.kind, 'markdown');
     assertResultShape(result, 'compile');
   });
 });
 
-describe('backend contract — parity: native backend exposes BASE_METHODS + NODE_METHODS', () => {
-  const validCompileResult = { output: '', warnings: [], dependencies: [] };
+describe('backend contract — parity: native backend exposes BASE_METHODS + NODE_METHODS (AC-API-09)', () => {
+  const validMarkdownResult = { kind: 'markdown', output: '', warnings: [], dependencies: [] };
   const validCheckResult = { warnings: [] };
-  const validCompileMessagesResult = { messages: [], warnings: [], dependencies: [] };
 
   const stubAddon = {
-    compile: () => validCompileResult,
+    compile: () => validMarkdownResult,
     check: () => validCheckResult,
-    compileMessages: () => validCompileMessagesResult,
-    compileFile: () => validCompileResult,
+    compileFile: () => validMarkdownResult,
     checkFile: () => validCheckResult,
-    compileMessagesFile: () => validCompileMessagesResult,
   };
 
   const nativeBackend = createNativeBackend(stubAddon);
@@ -368,11 +441,10 @@ describe('backend contract — parity: native backend exposes BASE_METHODS + NOD
     }
   });
 
-  test('U-BC14b: createNativeBackend throws when a NODE_METHOD is missing from the addon', () => {
+  test('U-BC14b: createNativeBackend throws when a NODE_METHOD is missing from the addon (AC-API-09)', () => {
     const incompleteAddon = {
-      compile: () => validCompileResult,
+      compile: () => validMarkdownResult,
       check: () => validCheckResult,
-      compileMessages: () => validCompileMessagesResult,
       // missing compileFile and checkFile
     };
     assert.throws(
@@ -398,8 +470,16 @@ describe('backend contract — parity: native backend exposes BASE_METHODS + NOD
     assertResultShape(result, 'compile');
   });
 
-  test('U-BC14e: native backend compileMessagesFile returns valid result from stub (PR-A2)', async () => {
-    const result = await nativeBackend.compileMessagesFile('path/to/chat.mds');
-    assertResultShape(result, 'compileMessages');
+  test('U-BC14f: native backend does NOT expose compileMessages or compileMessagesFile (AC-API-12)', () => {
+    assert.notEqual(
+      typeof (/** @type {any} */ (nativeBackend))['compileMessages'],
+      'function',
+      'native backend must not have compileMessages',
+    );
+    assert.notEqual(
+      typeof (/** @type {any} */ (nativeBackend))['compileMessagesFile'],
+      'function',
+      'native backend must not have compileMessagesFile',
+    );
   });
 });

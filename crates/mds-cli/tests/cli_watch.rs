@@ -109,27 +109,6 @@ fn watch_rejects_dir_with_output_flag() {
     );
 }
 
-#[test]
-fn watch_rejects_dir_with_format_messages() {
-    let dir = tempfile::tempdir().unwrap();
-    let output = mds_bin()
-        .args([
-            "watch",
-            dir.path().to_str().unwrap(),
-            "--format",
-            "messages",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(
-        !output.status.success(),
-        "watch dir with --format messages should fail; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 // ── T-I1: Initial compile writes output ────────────────────────────────────
 
 #[test]
@@ -653,10 +632,13 @@ fn watch_set_vars_applied_on_rebuild() {
     drop(child);
 }
 
-// ── T-I13: Single-file --format messages → valid JSON array ───────────────
+// ── T-I13: Single-file @message template → intrinsic JSON output ──────────
+//
+// Output extension and format are derived from the compiled kind — no --format flag.
+// A messages template (chat.mds) watched in single-file mode produces chat.json.
 
 #[test]
-fn watch_messages_format_produces_valid_json() {
+fn watch_messages_template_produces_json_intrinsically() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("chat.mds");
     std::fs::write(&src, "@message user:\nWhat is 2+2?\n@end\n").unwrap();
@@ -669,8 +651,6 @@ fn watch_messages_format_produces_valid_json() {
                 src.to_str().unwrap(),
                 "-o",
                 out.to_str().unwrap(),
-                "--format",
-                "messages",
                 "--debounce",
                 "0",
                 "-q",
@@ -683,7 +663,7 @@ fn watch_messages_format_produces_valid_json() {
 
     assert!(
         wait_for_file_contains(&out, "What is 2+2?", TIMEOUT),
-        "messages format should write JSON containing the message"
+        "messages template should write JSON containing the message"
     );
 
     // Verify it's valid JSON.
@@ -3502,7 +3482,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
 
 /// AC-1: `mds watch <symlinked-file>` must reject at startup (non-zero exit;
 /// stderr names the symlink restriction).  Mirrors
-/// `format_messages_rejects_symlinked_entry` in format_messages.rs.
+/// `symlinked_entry_exits_nonzero` in intrinsic_output.rs.
 #[test]
 #[cfg(unix)]
 fn watch_rejects_symlinked_entry() {
@@ -3522,8 +3502,6 @@ fn watch_rejects_symlinked_entry() {
         .args([
             "watch",
             link_file.to_str().unwrap(),
-            "--format",
-            "messages",
             "-o",
             out.to_str().unwrap(),
         ])
@@ -3550,7 +3528,7 @@ fn watch_rejects_symlinked_entry() {
 
 /// AC-2 (file mode): `mds watch <entry> --vars <symlinked-vars>` must reject at
 /// startup (non-zero; stderr mentions symlink).  Mirrors
-/// `format_messages_rejects_symlinked_vars_file` in format_messages.rs.
+/// `symlinked_vars_file_exits_nonzero` in intrinsic_output.rs.
 #[test]
 #[cfg(unix)]
 fn watch_rejects_symlinked_vars_file() {

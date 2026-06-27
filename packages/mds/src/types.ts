@@ -1,5 +1,17 @@
-/** Result of a successful compile operation. */
-export interface CompileResult {
+/** A single structured message produced by a `@message` block. */
+export interface Message {
+  /** The role string (e.g. `"system"`, `"user"`, `"assistant"`). */
+  role: string;
+  /** The rendered body text of the message (trimmed). */
+  content: string;
+}
+
+/**
+ * Compile result when the source compiled to Markdown output.
+ * The `output` field carries the rendered string. The `messages` field is absent.
+ */
+export interface MarkdownResult {
+  kind: 'markdown';
   /** Rendered Markdown output. */
   output: string;
   /** Non-fatal diagnostic messages produced during compilation. */
@@ -8,28 +20,30 @@ export interface CompileResult {
   dependencies: string[];
 }
 
+/**
+ * Compile result when the source compiled to structured chat messages.
+ * The `messages` field carries the array. The `output` field is absent.
+ */
+export interface MessagesResult {
+  kind: 'messages';
+  /** Structured chat messages produced from `@message` blocks. */
+  messages: Message[];
+  /** Non-fatal diagnostic messages produced during compilation. */
+  warnings: string[];
+  /** Absolute paths of every file transitively imported by the source. */
+  dependencies: string[];
+}
+
+/**
+ * Discriminated union of all possible compile outputs.
+ * Branch on `result.kind` to narrow to `MarkdownResult` or `MessagesResult`.
+ */
+export type CompileResult = MarkdownResult | MessagesResult;
+
 /** Result of a successful check (validate-only) operation. */
 export interface CheckResult {
   /** Non-fatal diagnostic messages produced during validation. */
   warnings: string[];
-}
-
-/** A single structured message from a `compileMessages` call. */
-export interface Message {
-  /** The role string (e.g. `"system"`, `"user"`, `"assistant"`). */
-  role: string;
-  /** The rendered body text of the message (trimmed). */
-  content: string;
-}
-
-/** Result of a successful compileMessages operation. */
-export interface CompileMessagesResult {
-  /** Structured messages produced from `@message` blocks. */
-  messages: Message[];
-  /** Non-fatal diagnostic messages (e.g. orphan text outside `@message`). */
-  warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
-  dependencies: string[];
 }
 
 /** Options shared by compile and check operations. */
@@ -81,14 +95,12 @@ export interface InitOptions {
 }
 
 /**
- * Browser-safe backend interface — compile/check/compileMessages/getBackend only.
+ * Browser-safe backend interface — compile/check/getBackend only.
  * Does not include file operations (which require node:fs).
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;
   check(source: string, options?: CompileOptions): CheckResult;
-  /** Compile `@message` blocks to structured chat messages. */
-  compileMessages(source: string, options?: CompileOptions): CompileMessagesResult;
   getBackend(): BackendType;
 }
 
@@ -99,9 +111,6 @@ export interface MdsBaseBackend {
 export interface MdsNodeBackend extends MdsBaseBackend {
   compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
   checkFile(path: string, options?: FileOptions): Promise<CheckResult>;
-  /** Compile `@message` blocks from a file to structured chat messages.
-   *  The entry path is symlink-checked (same security guard as compileFile). */
-  compileMessagesFile(path: string, options?: FileOptions): Promise<CompileMessagesResult>;
 }
 
 /**

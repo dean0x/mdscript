@@ -124,6 +124,8 @@ pub struct MessageBlock {
 #[derive(Debug, Clone)]
 pub struct TextNode {
     pub text: String,
+    /// Byte offset of the first character of this text node in the source.
+    pub offset: usize,
 }
 
 /// An interpolation expression inside `{ }`.

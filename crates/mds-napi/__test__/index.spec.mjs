@@ -18,7 +18,7 @@ const require = createRequire(import.meta.url);
 
 // Load the native addon from the built .node file.
 const addon = require('../mds-napi.node');
-const { compile, compileFile, check, checkFile, compileMessages, compileMessagesFile } = addon;
+const { compile, compileFile, check, checkFile } = addon;
 
 // Fixture directory.
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -26,12 +26,15 @@ const SIMPLE_MDS = path.join(FIXTURES, 'simple.mds');
 const VAR_MDS = path.join(FIXTURES, 'var.mds');
 const IMPORT_PROVIDER_MDS = path.join(FIXTURES, 'import_provider.mds');
 const IMPORT_CONSUMER_MDS = path.join(FIXTURES, 'import_consumer.mds');
+const MESSAGES_MDS = path.join(FIXTURES, 'messages.mds');
+const MIXED_MDS = path.join(FIXTURES, 'mixed.mds');
 
 // ── Compile tests ─────────────────────────────────────────────────────────────
 
 describe('compile', () => {
   test('F-C1: basic compile, no options', () => {
     const result = compile('Hello World!\n');
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello World!\n');
     assert.ok(Array.isArray(result.warnings));
     assert.ok(Array.isArray(result.dependencies));
@@ -39,45 +42,53 @@ describe('compile', () => {
 
   test('F-C2: compile with null options', () => {
     const result = compile('Hello World!\n', null);
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello World!\n');
   });
 
   test('F-C3: compile with undefined options', () => {
     const result = compile('Hello World!\n', undefined);
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello World!\n');
   });
 
   test('F-C4: compile with empty options object', () => {
     const result = compile('Hello World!\n', {});
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello World!\n');
   });
 
   test('F-C5: compile with frontmatter vars', () => {
     const source = '---\nname: Alice\n---\nHello {name}!\n';
     const result = compile(source);
+    assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Alice!'), `expected "Hello Alice!" in: ${result.output}`);
   });
 
   test('F-C6: compile with runtime vars', () => {
     const source = 'Hello {name}!\n';
     const result = compile(source, { vars: { name: 'Bob' } });
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello Bob!\n');
   });
 
   test('F-C7: runtime vars override frontmatter', () => {
     const source = '---\nname: Alice\n---\nHello {name}!\n';
     const result = compile(source, { vars: { name: 'Override' } });
+    assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Override!'), `got: ${result.output}`);
   });
 
   test('F-C8: compile with basePath for import resolution', () => {
     const source = `@import { greet } from "./import_provider.mds"\n\n{greet("Test")}\n`;
     const result = compile(source, { basePath: FIXTURES });
+    assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Test!'), `got: ${result.output}`);
   });
 
   test('F-C9: empty source compiles successfully', () => {
     const result = compile('');
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, '');
     assert.deepEqual(result.warnings, []);
     assert.deepEqual(result.dependencies, []);
@@ -89,17 +100,20 @@ describe('compile', () => {
 describe('compileFile', () => {
   test('F-CF1: compile file', () => {
     const result = compileFile(SIMPLE_MDS);
+    assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Alice!'), `got: ${result.output}`);
     assert.ok(result.output.includes('3 items'), `got: ${result.output}`);
   });
 
   test('F-CF2: compile file with vars', () => {
     const result = compileFile(VAR_MDS, { vars: { name: 'World' } });
+    assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello World!\n');
   });
 
   test('F-CF3: compile file with imports', () => {
     const result = compileFile(IMPORT_CONSUMER_MDS);
+    assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello World!'), `got: ${result.output}`);
   });
 
@@ -144,6 +158,7 @@ describe('compileFile', () => {
       );
     } else {
       const result = compileFile(relativePath);
+      assert.equal(result.kind, 'markdown');
       assert.ok(result.output.includes('Hello Alice!'), `got: ${result.output}`);
     }
   });
@@ -479,6 +494,7 @@ describe('resource limits', () => {
 describe('compilation parity', () => {
   test('P-1: simple.mds compileFile output matches expected', () => {
     const result = compileFile(SIMPLE_MDS);
+    assert.equal(result.kind, 'markdown');
     // The simple.mds has frontmatter with name: Alice, count: 3.
     assert.ok(result.output.includes('Hello Alice!'), `expected "Hello Alice!" in: ${result.output}`);
     assert.ok(result.output.includes('3 items'), `expected "3 items" in: ${result.output}`);
@@ -488,109 +504,9 @@ describe('compilation parity', () => {
     const source = '---\nname: Alice\ncount: 3\n---\n\nHello {name}! You have {count} items.\n';
     const compileResult = compile(source, { basePath: FIXTURES });
     const fileResult = compileFile(SIMPLE_MDS);
+    assert.equal(compileResult.kind, 'markdown');
+    assert.equal(fileResult.kind, 'markdown');
     assert.equal(compileResult.output, fileResult.output);
-  });
-});
-
-// ── compileMessages tests ─────────────────────────────────────────────────────
-
-describe('compileMessages', () => {
-  // M-1: basic success path — result shape is correct
-  test('M-1: basic compileMessages returns messages/warnings/dependencies arrays', () => {
-    const source = '@message system:\nYou are helpful.\n@end\n';
-    const result = compileMessages(source);
-    assert.ok(Array.isArray(result.messages), 'messages should be an array');
-    assert.ok(Array.isArray(result.warnings), 'warnings should be an array');
-    assert.ok(Array.isArray(result.dependencies), 'dependencies should be an array');
-    assert.equal(result.messages.length, 1);
-    assert.equal(result.messages[0].role, 'system');
-    assert.ok(typeof result.messages[0].content === 'string', 'content should be a string');
-  });
-
-  // M-2: vars marshaling — dynamic role via { vars: { ... } } produces correct role
-  test('M-2: vars marshaling — { vars } produces dynamic role correctly', () => {
-    const source = '@message {role}:\nHello!\n@end\n';
-    const result = compileMessages(source, { vars: { role: 'assistant' } });
-    assert.equal(result.messages.length, 1);
-    assert.equal(result.messages[0].role, 'assistant');
-    assert.equal(result.messages[0].content, 'Hello!');
-  });
-
-  // M-3: no @message blocks throws a JS Error with code property
-  test('M-3: no @message blocks throws JS Error with code property', () => {
-    assert.throws(
-      () => compileMessages('Hello World\n'),
-      (err) => {
-        assert.ok(err instanceof Error, 'should be instanceof Error');
-        assert.ok('code' in err, 'should have code property');
-        assert.ok(typeof err.code === 'string', `code should be string, got ${typeof err.code}`);
-        assert.ok(err.code.startsWith('mds::'), `code should start with mds::, got: ${err.code}`);
-        return true;
-      },
-    );
-  });
-
-  // M-4: unknown option key throws mds::invalid_options (parse_compile_opts path)
-  test('M-4: unknown option key throws mds::invalid_options', () => {
-    assert.throws(
-      () => compileMessages('@message user:\nHi\n@end\n', { unknownKey: true }),
-      (err) => {
-        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
-        return true;
-      },
-    );
-  });
-
-  // M-5: basePath-relative @import resolves in messages mode; dependencies is non-empty
-  test('M-5: basePath-relative @import resolves; dependencies is non-empty', () => {
-    const source =
-      '@import { greet } from "./import_provider.mds"\n\n@message user:\n{greet("World")}\n@end\n';
-    const result = compileMessages(source, { basePath: FIXTURES });
-    assert.equal(result.messages.length, 1);
-    assert.equal(result.messages[0].role, 'user');
-    assert.ok(
-      result.messages[0].content.includes('Hello World!'),
-      `expected "Hello World!" in content: ${result.messages[0].content}`,
-    );
-    assert.ok(result.dependencies.length > 0, 'dependencies should be non-empty after @import');
-    for (const dep of result.dependencies) {
-      assert.ok(path.isAbsolute(dep), `dependency should be absolute path: ${dep}`);
-    }
-  });
-
-  // M-6: check_source_size rejects oversized source with mds::resource_limit (avoids PF-004)
-  test('M-6: oversized source throws mds::resource_limit', () => {
-    const MAX_SOURCE_SIZE = 10 * 1024 * 1024; // 10 MiB — mirrors R-1/R-2
-    const oversized = 'x'.repeat(MAX_SOURCE_SIZE + 1);
-    assert.throws(
-      () => compileMessages(oversized),
-      (err) => {
-        assert.equal(err.code, 'mds::resource_limit', `got: ${err.code}`);
-        return true;
-      },
-    );
-  });
-
-  // M-7: null and undefined opts are both accepted
-  test('M-7: null opts are accepted', () => {
-    const result = compileMessages('@message user:\nHi\n@end\n', null);
-    assert.equal(result.messages.length, 1);
-  });
-
-  test('M-8: undefined opts are accepted', () => {
-    const result = compileMessages('@message user:\nHi\n@end\n', undefined);
-    assert.equal(result.messages.length, 1);
-  });
-
-  // M-9: multiple messages, correct ordering
-  test('M-9: multiple @message blocks produce ordered messages array', () => {
-    const source =
-      '@message system:\nYou are helpful.\n@end\n@message user:\nWhat is 2+2?\n@end\n@message assistant:\n4\n@end\n';
-    const result = compileMessages(source);
-    assert.equal(result.messages.length, 3);
-    assert.equal(result.messages[0].role, 'system');
-    assert.equal(result.messages[1].role, 'user');
-    assert.equal(result.messages[2].role, 'assistant');
   });
 });
 
@@ -620,6 +536,8 @@ describe('template inheritance', () => {
     withInheritanceFixtures(baseContent, childContent, (childPath, dir) => {
       const result = compileFile(childPath);
 
+      assert.equal(result.kind, 'markdown', 'INH-1: kind must be "markdown"');
+
       // Output must contain the overridden block and the base skeleton text.
       assert.ok(
         result.output.includes('You are a specialist assistant.'),
@@ -634,15 +552,16 @@ describe('template inheritance', () => {
         `INH-1: base default body must not appear when overridden; got: ${result.output}`,
       );
 
-      // Base must appear in the dependencies list (A4: shape stable).
+      // Base must appear in the dependencies list.
       assert.ok(Array.isArray(result.dependencies), 'INH-1: dependencies must be an array');
       assert.ok(result.dependencies.length > 0, 'INH-1: dependencies must be non-empty');
       const hasBase = result.dependencies.some((d) => d.includes('base.mds'));
       assert.ok(hasBase, `INH-1: base.mds must be in dependencies; got: ${JSON.stringify(result.dependencies)}`);
 
-      // A4: output shape must be {output, warnings, dependencies} — no extra fields.
-      assert.ok(typeof result.output === 'string', 'INH-1 A4: output must be a string');
-      assert.ok(Array.isArray(result.warnings), 'INH-1 A4: warnings must be an array');
+      assert.ok(typeof result.output === 'string', 'INH-1: output must be a string');
+      assert.ok(Array.isArray(result.warnings), 'INH-1: warnings must be an array');
+      // messages field must be absent for markdown results (AC-API-13).
+      assert.equal(result.messages, undefined, 'INH-1: messages field must be absent for markdown result');
     });
   });
 
@@ -695,141 +614,145 @@ describe('template inheritance', () => {
   });
 });
 
-// ── compileMessagesFile tests (PR-A2) ────────────────────────────────────────
+// ── Intrinsic output shape tests (AC-API-04, AC-API-05, AC-API-13) ────────────
+//
+// These tests verify the canonical { kind, <active-payload>, warnings, dependencies }
+// discriminated-union object that compile/compileFile now return.
 
-describe('compileMessagesFile', () => {
-  // CMF-1: basic happy path — file with @message blocks succeeds
-  test('CMF-1: basic compileMessagesFile returns messages/warnings/dependencies arrays', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
-    try {
-      const entry = path.join(dir, 'chat.mds');
-      fs.writeFileSync(entry, '@message system:\nYou are helpful.\n@end\n@message user:\nHello!\n@end\n');
-      const result = compileMessagesFile(entry);
-      assert.ok(Array.isArray(result.messages), 'messages must be an array');
-      assert.ok(Array.isArray(result.warnings), 'warnings must be an array');
-      assert.ok(Array.isArray(result.dependencies), 'dependencies must be an array');
-      assert.equal(result.messages.length, 2);
-      assert.equal(result.messages[0].role, 'system');
-      assert.equal(result.messages[1].role, 'user');
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+describe('intrinsic output shape', () => {
+  // K-MD-1: markdown fixture → kind:"markdown", output present, messages absent
+  test('K-MD-1: compile on markdown source returns kind:"markdown" with output, no messages', () => {
+    const result = compile('Hello World!\n');
+    assert.equal(result.kind, 'markdown', 'kind must be "markdown"');
+    assert.ok(typeof result.output === 'string', 'output must be a string');
+    assert.equal(result.messages, undefined, 'messages key must be absent');
+    assert.ok(Array.isArray(result.warnings), 'warnings must be an array');
+    assert.ok(Array.isArray(result.dependencies), 'dependencies must be an array');
   });
 
-  // CMF-2: entry key excluded from dependencies (parity with compileFile)
-  test('CMF-2: entry file is excluded from dependencies', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
-    try {
-      const provider = path.join(dir, 'helper.mds');
-      fs.writeFileSync(provider, '@define greet(name):\nHi {name}!\n@end\n');
-      const entry = path.join(dir, 'chat.mds');
-      fs.writeFileSync(entry, '@import { greet } from "./helper.mds"\n@message user:\n{greet("World")}\n@end\n');
-      const result = compileMessagesFile(entry);
-      // helper.mds must appear in deps; chat.mds must not
-      const entryReal = fs.realpathSync(entry);
-      assert.ok(
-        !result.dependencies.includes(entryReal) && !result.dependencies.includes(entry),
-        `entry must not be in dependencies; got: ${JSON.stringify(result.dependencies)}`,
-      );
-      assert.ok(result.dependencies.some((d) => d.includes('helper.mds')), 'helper must be in deps');
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
+  // K-MD-2: markdown fixture file → kind:"markdown"
+  test('K-MD-2: compileFile on markdown fixture returns kind:"markdown"', () => {
+    const result = compileFile(SIMPLE_MDS);
+    assert.equal(result.kind, 'markdown');
+    assert.ok(typeof result.output === 'string');
+    assert.equal(result.messages, undefined, 'messages key must be absent');
   });
 
-  // CMF-3: nonexistent file throws mds::file_not_found
-  test('CMF-3: nonexistent file throws mds::file_not_found', () => {
+  // K-MSG-1: @message fixture string → kind:"messages", messages present, output absent
+  test('K-MSG-1: compile on @message source returns kind:"messages" with messages, no output', () => {
+    const source = '@message system:\nYou are helpful.\n@end\n@message user:\nHello!\n@end\n';
+    const result = compile(source);
+    assert.equal(result.kind, 'messages', 'kind must be "messages"');
+    assert.ok(Array.isArray(result.messages), 'messages must be an array');
+    assert.equal(result.output, undefined, 'output key must be absent');
+    assert.ok(Array.isArray(result.warnings), 'warnings must be an array');
+    assert.ok(Array.isArray(result.dependencies), 'dependencies must be an array');
+    assert.equal(result.messages.length, 2);
+    assert.equal(result.messages[0].role, 'system');
+    assert.ok(typeof result.messages[0].content === 'string', 'content must be string');
+    assert.equal(result.messages[1].role, 'user');
+  });
+
+  // K-MSG-2: @message fixture file → kind:"messages"
+  test('K-MSG-2: compileFile on @message fixture returns kind:"messages"', () => {
+    const result = compileFile(MESSAGES_MDS);
+    assert.equal(result.kind, 'messages');
+    assert.ok(Array.isArray(result.messages));
+    assert.equal(result.output, undefined, 'output key must be absent');
+    assert.equal(result.messages.length, 2);
+    assert.equal(result.messages[0].role, 'system');
+    assert.equal(result.messages[1].role, 'user');
+  });
+
+  // K-MSG-3: message objects have role and content, nothing else injected by binding
+  test('K-MSG-3: each message object has role and content as strings', () => {
+    const source = '@message assistant:\nHello there!\n@end\n';
+    const result = compile(source);
+    assert.equal(result.kind, 'messages');
+    assert.equal(result.messages.length, 1);
+    const msg = result.messages[0];
+    assert.equal(typeof msg.role, 'string');
+    assert.equal(typeof msg.content, 'string');
+    assert.equal(msg.role, 'assistant');
+    assert.ok(msg.content.includes('Hello there'), `got: ${msg.content}`);
+  });
+
+  // K-MIXED-1: mixed content (prose + @message) → mds::mixed_content from compile
+  test('K-MIXED-1: compile on mixed-content fixture throws mds::mixed_content', () => {
     assert.throws(
-      () => compileMessagesFile('/no/such/file.mds'),
+      () => compileFile(MIXED_MDS),
       (err) => {
-        assert.ok(err instanceof Error, 'should be Error');
-        assert.equal(err.code, 'mds::file_not_found', `got code: ${err.code}`);
+        assert.ok(err instanceof Error, 'should be an Error');
+        assert.equal(err.code, 'mds::mixed_content', `got: ${err.code}`);
         return true;
       },
     );
   });
 
-  // CMF-4: symlinked entry is rejected (PR-A2 security fix)
-  // Mechanism: Rust resolver calls NativeFs::check_symlink (canonicalize comparison,
-  // fs.rs) which returns ImportError "symlinks are not allowed".
-  test('CMF-4: symlinked entry is rejected', { skip: process.platform === 'win32' }, () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
-    try {
-      const real = path.join(dir, 'real.mds');
-      fs.writeFileSync(real, '@message user:\nHello!\n@end\n');
-      const link = path.join(dir, 'link.mds');
-      fs.symlinkSync(real, link);
-      assert.throws(
-        () => compileMessagesFile(link),
-        (err) => {
-          assert.ok(err instanceof Error, 'should be Error');
-          assert.ok(
-            err.message.includes('symlink') || err.message.includes('not allowed'),
-            `error must mention symlinks; got: ${err.message}`,
-          );
-          return true;
-        },
-      );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // CMF-5: basePath option is rejected for file paths
-  test('CMF-5: basePath option throws mds::invalid_options for compileMessagesFile', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-cmf-'));
-    try {
-      const entry = path.join(dir, 'chat.mds');
-      fs.writeFileSync(entry, '@message user:\nHello!\n@end\n');
-      assert.throws(
-        () => compileMessagesFile(entry, { basePath: dir }),
-        (err) => {
-          assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
-          return true;
-        },
-      );
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-// ── #90 NAPI marshaling fidelity tests ───────────────────────────────────────
-//
-// Content JSON-escaping is already covered at the core level
-// (crates/mds-core/tests/messages.rs:448) — this section covers FFI marshaling:
-// vars with special chars survive the JS→Rust→JS round-trip byte-identical.
-
-describe('NAPI marshaling fidelity (#90)', () => {
-  // MF-1: vars containing special JSON chars — content bytes are preserved
-  test('MF-1: vars with double-quote, backslash, newline, multibyte round-trip byte-identical', () => {
-    // Use a template where the var is used in the message content (not the role),
-    // so we can assert the content field rather than relying on role evaluation.
-    const source = '@message user:\n{data}\n@end\n';
-    // Value contains: double-quote, backslash, embedded newline, multibyte (emoji)
-    const specialValue = 'say "hello"\\ here\nnewline\u{1F600}';
-    const result = compileMessages(source, { vars: { data: specialValue } });
-    assert.equal(result.messages.length, 1, 'should produce 1 message');
-    assert.equal(
-      result.messages[0].content,
-      specialValue,
-      `content must be byte-identical to the input value after FFI round-trip; got: ${JSON.stringify(result.messages[0].content)}`,
+  // K-MIXED-2: compile (string) on mixed content → mds::mixed_content
+  test('K-MIXED-2: compile (string) on mixed content throws mds::mixed_content', () => {
+    const source = 'Some prose text.\n\n@message user:\nA message.\n@end\n';
+    assert.throws(
+      () => compile(source),
+      (err) => {
+        assert.ok(err instanceof Error, 'should be an Error');
+        assert.equal(err.code, 'mds::mixed_content', `got: ${err.code}`);
+        return true;
+      },
     );
   });
 
-  // MF-2: empty dynamic role via FFI must throw (ADR-016 runtime check survives marshaling)
-  // An empty role string is invalid per the evaluator — this proves the ADR-016
-  // check fires correctly even after the JS→napi→Rust boundary crossing.
-  test('MF-2: empty dynamic role via FFI throws (ADR-016 survives marshaling)', () => {
+  // K-MIXED-3: check on mixed content → mds::mixed_content
+  test('K-MIXED-3: check on mixed-content fixture throws mds::mixed_content', () => {
+    assert.throws(
+      () => checkFile(MIXED_MDS),
+      (err) => {
+        assert.ok(err instanceof Error, 'should be an Error');
+        assert.equal(err.code, 'mds::mixed_content', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // AC-API-05 (negative): compileMessages and compileMessagesFile must not exist
+  test('AC-API-05: compileMessages is absent from addon exports', () => {
+    assert.equal(
+      typeof addon.compileMessages,
+      'undefined',
+      'addon.compileMessages must not be exported',
+    );
+  });
+
+  test('AC-API-05: compileMessagesFile is absent from addon exports', () => {
+    assert.equal(
+      typeof addon.compileMessagesFile,
+      'undefined',
+      'addon.compileMessagesFile must not be exported',
+    );
+  });
+
+  // K-VARS-1: vars round-trip through @message content survives FFI
+  test('K-VARS-1: vars with special chars survive the FFI round-trip in messages mode', () => {
+    const source = '@message user:\n{data}\n@end\n';
+    const specialValue = 'say "hello"\\ here\nnewline\u{1F600}';
+    const result = compile(source, { vars: { data: specialValue } });
+    assert.equal(result.kind, 'messages');
+    assert.equal(result.messages.length, 1);
+    assert.equal(
+      result.messages[0].content,
+      specialValue,
+      `content must be byte-identical after FFI round-trip; got: ${JSON.stringify(result.messages[0].content)}`,
+    );
+  });
+
+  // K-VARS-2: empty dynamic role via FFI throws (evaluator rejects it)
+  test('K-VARS-2: empty dynamic role via FFI throws mds:: error', () => {
     const source = '@message {role}:\nHello!\n@end\n';
     assert.throws(
-      () => compileMessages(source, { vars: { role: '' } }),
+      () => compile(source, { vars: { role: '' } }),
       (err) => {
         assert.ok(err instanceof Error, 'should be Error');
-        assert.ok(
-          err.code.startsWith('mds::'),
-          `error code must start with mds::; got: ${err.code}`,
-        );
+        assert.ok(err.code.startsWith('mds::'), `error code must start with mds::; got: ${err.code}`);
         return true;
       },
     );

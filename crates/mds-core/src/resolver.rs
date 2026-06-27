@@ -8,7 +8,8 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node};
 use crate::error::MdsError;
-use crate::evaluator::{evaluate, evaluate_messages, EvalMessage};
+use crate::evaluator::evaluate;
+use crate::evaluator::evaluate_messages_intrinsic;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
 use crate::limits::MAX_BLOCKS_PER_MODULE;
@@ -162,9 +163,9 @@ pub struct ResolvedModule {
     /// Cache-poisoning guard (A1): a skeleton entry must NOT be returned to a caller that
     /// needs a fully-rendered standalone module. `resolve_by_key` detects this flag on a
     /// cache hit and upgrades the entry to a full compile, so the SAME file resolved first
-    /// as a base and later as a standalone target yields correct output. (Messages mode
-    /// never caches its entry module — `resolve_key_messages` always re-computes — so the
-    /// poisoning window only exists on the text/`resolve_by_key` path.)
+    /// as a base and later as a standalone target yields correct output. (The intrinsic
+    /// path never caches its entry module — `resolve_intrinsic_by_key` always re-computes —
+    /// so the poisoning window only exists on the `resolve_by_key` path.)
     pub(crate) is_skeleton: bool,
 }
 
@@ -304,20 +305,21 @@ impl ModuleCache {
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
-    /// Resolve a module from a filesystem path string in messages mode.
+    /// Resolve a module from a filesystem path string, dispatching on output shape.
     ///
-    /// Like [`resolve_path`] but runs `evaluate_messages` instead of `evaluate`.
-    /// Routes the entry through the filesystem normalizer (so `check_symlink` and
-    /// `MAX_FILE_SIZE` are enforced on the entry), then delegates to
-    /// [`resolve_key_messages`].
-    pub fn resolve_path_messages(
+    /// Output shape is intrinsic to the template: a template containing any `@message`
+    /// block resolves to [`crate::CompiledOutput::Messages`], otherwise to
+    /// [`crate::CompiledOutput::Markdown`]. Routes the entry through the filesystem
+    /// normalizer (so `check_symlink` and `MAX_FILE_SIZE` are enforced on the entry),
+    /// then resolves via `process_module_intrinsic`.
+    pub fn resolve_path_intrinsic(
         &mut self,
         path: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
-    ) -> Result<Vec<EvalMessage>, MdsError> {
+    ) -> Result<crate::CompiledOutput, MdsError> {
         let key = self.fs.normalize("", path)?;
-        self.resolve_key_messages(&key, runtime_vars, warnings)
+        self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
     /// Resolve a module by its normalized key.
@@ -473,21 +475,35 @@ impl ModuleCache {
         Self::check_lifo_pop(resolved, popped, &base_key).map(Arc::new)
     }
 
-    /// Resolve a module by its normalized virtual key in messages mode.
+    /// Resolve a virtual-filesystem entry by key, dispatching on output shape.
     ///
-    /// Like [`resolve_key`] but runs `evaluate_messages` instead of `evaluate`,
-    /// returning structured `EvalMessage` values from `@message` blocks.
+    /// Output shape is intrinsic to the template: a template containing any `@message`
+    /// block resolves to [`crate::CompiledOutput::Messages`], otherwise to
+    /// [`crate::CompiledOutput::Markdown`]. This is the entry point for virtual
+    /// filesystems (use with [`ModuleCache::virtual_fs`]); the entry source is read
+    /// from the cache's [`FileSystem`] backend.
+    pub fn resolve_virtual_intrinsic(
+        &mut self,
+        entry: &str,
+        runtime_vars: &HashMap<String, Value>,
+        warnings: &mut Vec<String>,
+    ) -> Result<crate::CompiledOutput, MdsError> {
+        self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
+    }
+
+    /// Resolve a module by its normalized key, dispatching on output shape.
     ///
-    /// Mirrors `resolve_source_messages`: a single `process_module_messages` pass
-    /// over the entry module (no prior text-mode evaluation).  Imported sub-modules
-    /// are resolved through the normal cache (`resolve_by_key`) inside
-    /// `collect_definitions_and_imports`, so they are evaluated only once.
-    pub fn resolve_key_messages(
+    /// Shared core of [`resolve_path_intrinsic`] and [`resolve_virtual_intrinsic`].
+    /// A single `process_module_intrinsic` pass over the entry module (no prior
+    /// text-mode evaluation). Imported sub-modules are resolved through the normal
+    /// cache (`resolve_by_key`) inside `collect_definitions_and_imports`, so they
+    /// are evaluated only once.
+    fn resolve_intrinsic_by_key(
         &mut self,
         key: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
-    ) -> Result<Vec<EvalMessage>, MdsError> {
+    ) -> Result<crate::CompiledOutput, MdsError> {
         // Cycle detection: if this key is already on the resolving stack it forms
         // a circular import that must be rejected.
         if self.resolving.contains(key) {
@@ -509,22 +525,23 @@ impl ModuleCache {
             base_key: key,
             runtime_vars,
         };
-        let result = self.process_module_messages(&ctx, is_md, warnings);
+        let result = self.process_module_intrinsic(&ctx, is_md, warnings);
 
         let popped = self.resolving.pop();
         Self::check_lifo_pop(result, popped, key)
     }
 
-    /// Resolve a module from an in-memory source string in messages mode.
+    /// Resolve a module from an in-memory source string, dispatching on output shape.
     ///
-    /// Like [`resolve_source`] but runs `evaluate_messages` instead of `evaluate`.
-    pub fn resolve_source_messages(
+    /// Like [`resolve_source`] but dispatches on `has_message_block`, returning a
+    /// [`crate::CompiledOutput`] (Markdown or Messages) instead of a rendered string.
+    pub fn resolve_source_intrinsic(
         &mut self,
         source: &str,
         base_dir: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
-    ) -> Result<Vec<EvalMessage>, MdsError> {
+    ) -> Result<crate::CompiledOutput, MdsError> {
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
         let base_key = format!("{canonical_str}/<source>");
@@ -536,43 +553,53 @@ impl ModuleCache {
             base_key: &base_key,
             runtime_vars,
         };
-        let result = self.process_module_messages(&ctx, false, warnings);
+        let result = self.process_module_intrinsic(&ctx, false, warnings);
         let popped = self.resolving.pop();
         Self::check_lifo_pop(result, popped, &base_key)
     }
 
-    /// Common messages-mode processing: tokenize, parse, build scope, collect messages.
+    /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
+    /// output shape.
     ///
-    /// Shares setup with `process_module` but calls `evaluate_messages` at the end.
+    /// Shares setup with `process_module` but dispatches on `has_message_block` at the
+    /// end: a body containing any `@message` block evaluates to
+    /// [`crate::CompiledOutput::Messages`] (via `evaluate_messages_intrinsic`), otherwise
+    /// to [`crate::CompiledOutput::Markdown`] (via `evaluate`, then `clean_output` +
+    /// `prepend_frontmatter`).
+    ///
     /// When the parsed module has an `@extends` directive the shared extends pipeline
     /// (`resolve_extends_components`) builds `final_body` and `scope` identically to
-    /// text mode — then the `has_message_block` guard and `evaluate_messages` are called
-    /// on `final_body` (NOT `module.body`), so @message blocks inside base @block
-    /// defaults are correctly detected (avoids PF-004 divergence, decision #8).
-    fn process_module_messages(
+    /// text mode — then the dispatch is performed on `final_body` (NOT `module.body`),
+    /// so @message blocks inside base @block defaults are correctly detected (avoids
+    /// PF-004 divergence, decision #8).
+    fn process_module_intrinsic(
         &mut self,
         ctx: &ModuleCtx<'_>,
         is_md: bool,
         warnings: &mut Vec<String>,
-    ) -> Result<Vec<EvalMessage>, MdsError> {
+    ) -> Result<crate::CompiledOutput, MdsError> {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
+
+        // The child's raw frontmatter is what gets re-emitted (after stripping reserved
+        // keys) in Markdown mode — captured before `module` is partially moved below.
+        let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
 
         // ── Extends branch (decision #8) ─────────────────────────────────────
         // When the child has @extends, delegate to the shared extends pipeline so that:
         // - PF-004 (avoids PF-004): oversized-base guard fires via resolve_by_key_skeleton.
-        // - has_message_block is checked against final_body (base+overrides spliced), not module.body.
+        // - dispatch is performed on final_body (base+overrides spliced), not module.body.
         // - Scope and final_body are assembled identically to text mode (no drift).
         if let Some(ext) = module.extends.clone() {
             let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
             let components =
                 self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
-            // ── Step 3f (messages): validate per-region before evaluate ──────
+            // ── Step 3f: validate per-region before evaluate ────────────────
             // Uses the shared validate_extends_components helper (PF-004: single shared
-            // implementation for both text and messages modes — they can never drift).
-            // Validates each region against its own origin source so span construction
-            // is always in-bounds (fixes the cross-source OutOfBounds diagnostic bug).
+            // implementation for both modes — they can never drift). Validates each
+            // region against its own origin source so span construction is always
+            // in-bounds (fixes the cross-source OutOfBounds diagnostic bug).
             // ADR-016: re-validate dynamically-assembled content at the leaf.
             {
                 let mut scope = components.scope.clone();
@@ -585,17 +612,29 @@ impl ModuleCache {
                 ..
             } = components;
 
-            // Check @message presence against final_body (NOT module.body): a base whose
-            // @message blocks live inside @block defaults is correctly detected after splice.
-            // (ADR-016: re-validate dynamically-assembled content at the leaf.)
-            if !has_message_block(&final_body) {
-                return Err(MdsError::syntax(
-                    "compile_messages requires at least one @message block, \
-                     but none were found in the template",
+            // Dispatch on @message presence against final_body (NOT module.body): a base
+            // whose @message blocks live inside @block defaults is correctly detected
+            // after splice. (ADR-016: re-validate dynamically-assembled content at leaf.)
+            if has_message_block(&final_body) {
+                // final_body may splice nodes from base templates whose offsets do
+                // not index ctx.source; the mixed_content span uses the at() guard,
+                // which drops src on out-of-bounds so no OutOfBounds render occurs.
+                let messages = evaluate_messages_intrinsic(
+                    &final_body,
+                    &mut scope,
+                    warnings,
+                    ctx.file_str,
+                    ctx.source,
+                )?;
+                return Ok(crate::CompiledOutput::Messages(
+                    messages.into_iter().map(crate::Message::from).collect(),
                 ));
             }
 
-            return evaluate_messages(&final_body, &mut scope, warnings);
+            let body = evaluate(&final_body, &mut scope, warnings)?;
+            let body_clean = crate::clean_output(&body);
+            let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
+            return Ok(crate::CompiledOutput::Markdown(final_str));
         }
 
         // ── Standalone (non-extending) path ──────────────────────────────────
@@ -612,26 +651,38 @@ impl ModuleCache {
         } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
 
         // Validate that all named exports refer to defined functions or "prompt" —
-        // mirrors process_module exactly so @export <undefined> errors in messages mode
-        // the same way it does in text mode (avoids PF-004: alternate path bypassing a check).
+        // mirrors process_module exactly so @export <undefined> errors identically in
+        // both modes (avoids PF-004: alternate path bypassing a check).
         validate_exports(&explicit_exports, &functions)?;
 
-        // Register collected functions in scope for @define calls within @message bodies.
-        for (name, func) in &functions {
-            scope.set_function(name, Arc::clone(func));
-        }
+        // NOTE: @define functions are already inserted into scope directly by collect_define
+        // (via scope.set_function) during collect_definitions_and_imports. Re-inserting
+        // `functions` here would also bring re-exported symbols (@export foo from "…") into
+        // local scope, which violates the spec: "@export from does not make the symbol
+        // available in the current file's scope." No extra insertion is needed.
 
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
-        // Check that at least one @message block exists before evaluating.
-        if !has_message_block(&module.body) {
-            return Err(MdsError::syntax(
-                "compile_messages requires at least one @message block, \
-                 but none were found in the template",
+        // Dispatch on output shape: any @message block → Messages, else Markdown.
+        if has_message_block(&module.body) {
+            // Standalone path: module.body offsets index ctx.source directly, so a
+            // mixed_content error underlines the orphan prose in the file's source.
+            let messages = evaluate_messages_intrinsic(
+                &module.body,
+                &mut scope,
+                warnings,
+                ctx.file_str,
+                ctx.source,
+            )?;
+            return Ok(crate::CompiledOutput::Messages(
+                messages.into_iter().map(crate::Message::from).collect(),
             ));
         }
 
-        evaluate_messages(&module.body, &mut scope, warnings)
+        let body = evaluate(&module.body, &mut scope, warnings)?;
+        let body_clean = crate::clean_output(&body);
+        let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
+        Ok(crate::CompiledOutput::Markdown(final_str))
     }
 
     /// Assert the LIFO pop invariant after `process_module`.
@@ -842,15 +893,17 @@ impl ModuleCache {
         Ok(scope)
     }
 
-    /// Shared extends-pipeline: steps 3a-3e are identical for text and messages modes.
+    /// Shared extends-pipeline: steps 3a-3e are identical for the text-cached and
+    /// intrinsic paths.
     ///
     /// Builds the `final_body` (splice of base skeleton with effective block overrides)
     /// and the `scope` (deep-merged frontmatter + FM imports + functions) needed by
-    /// both `process_module_extends` (text) and `process_module_messages` (messages).
+    /// both `process_module_extends` (cached text path) and `process_module_intrinsic`.
     ///
     /// Callers differ only in the terminal step (step 3f):
-    /// - Text mode:     `validate` → `evaluate(&final_body, …)`
-    /// - Messages mode: `has_message_block` guard → `evaluate_messages(&final_body, …)`
+    /// - Cached text path: `validate` → `evaluate(&final_body, …)`
+    /// - Intrinsic path:   `has_message_block` dispatch → `evaluate_messages_intrinsic`
+    ///   (Messages) or `evaluate` + clean/frontmatter (Markdown)
     ///
     /// Factoring here enforces that BOTH modes go through the same PF-004-safe
     /// `resolve_by_key_skeleton` path for the base, and share one copy of the
@@ -943,8 +996,8 @@ impl ModuleCache {
     /// OutOfBounds diagnostic bug). The scope is threaded through all regions so `@define`
     /// / `@for` scope push/pop behaves identically to a whole-slice validate.
     ///
-    /// This single helper is called by BOTH `process_module_extends` (text) and
-    /// `process_module_messages` (@extends branch) — enforcing PF-004 parity: the two
+    /// This single helper is called by BOTH `process_module_extends` (cached text path)
+    /// and `process_module_intrinsic` (@extends branch) — enforcing PF-004 parity: the two
     /// parallel paths can never drift because they share one implementation.
     ///
     /// ADR-016: re-validate at the leaf (on `final_body` regions), not at intermediate bases.
@@ -1580,8 +1633,9 @@ struct CollectedDefs {
 /// Steps 3a-3e (base resolution, child-only-blocks check, effective-blocks construction,
 /// scope merge, and skeleton splice) are identical for text and messages modes. This struct
 /// carries those results so the two terminal steps differ only in the final evaluate call:
-/// - Text mode:     `validator::validate` → `evaluate(&final_body, …)`
-/// - Messages mode: `has_message_block` guard → `evaluate_messages(&final_body, …)`
+/// - Cached text path: `validator::validate` → `evaluate(&final_body, …)`
+/// - Intrinsic path:   `has_message_block` dispatch → `evaluate_messages_intrinsic`
+///   (Messages) or `evaluate` + clean/frontmatter (Markdown)
 struct ExtendsComponents {
     /// Spliced final body: base skeleton with effective block bodies inlined.
     final_body: Vec<Node>,
@@ -1634,7 +1688,17 @@ fn has_message_block(nodes: &[Node]) -> bool {
         Node::For(block) => has_message_block(&block.body),
         // A @block's default body may contain @message blocks.
         Node::Block(block) => has_message_block(&block.body),
-        _ => false,
+        // Leaf nodes that can never contain @message blocks. Enumerated
+        // explicitly so a future new Node variant fails to compile here
+        // and at the sibling match in evaluate_messages_intrinsic, rather
+        // than silently being misclassified as markdown.
+        Node::Text(_)
+        | Node::Interpolation(_)
+        | Node::EscapedBrace
+        | Node::Define(_)
+        | Node::Import(_)
+        | Node::Export(_)
+        | Node::Include(_) => false,
     })
 }
 

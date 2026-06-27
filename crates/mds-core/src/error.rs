@@ -307,6 +307,30 @@ pub enum MdsError {
         #[source_code]
         src: Option<Arc<miette::NamedSource<String>>>,
     },
+
+    /// Mixed content in a messages template: non-whitespace `Text` or `Interpolation`
+    /// outside any `@message` block in a template that has `@message` blocks.
+    #[error("mixed content: non-message content found outside @message blocks")]
+    #[diagnostic(
+        code(mds::mixed_content),
+        help("move all text and interpolations inside @message blocks, or remove the @message blocks to use plain markdown mode")
+    )]
+    MixedContent {
+        #[label("non-message content here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
+
+    /// Attempted to extract Markdown output from a Messages result.
+    #[error("expected markdown output, but template produced messages")]
+    #[diagnostic(code(mds::expected_markdown))]
+    ExpectedMarkdown,
+
+    /// Attempted to extract Messages output from a Markdown result.
+    #[error("expected messages output, but template produced markdown")]
+    #[diagnostic(code(mds::expected_messages))]
+    ExpectedMessages,
 }
 
 impl MdsError {
@@ -647,6 +671,23 @@ impl MdsError {
         MdsError::NotMdsFile { path: path.into() }
     }
 
+    /// Construct a `MixedContent` error whose span points at the offending
+    /// top-level prose / interpolation.
+    ///
+    /// Unlike most evaluator-path errors (which carry no span because the
+    /// evaluator runs without source context — see the arity span-divergence
+    /// note in `evaluator.rs`), `MixedContent` is a *structural* error about the
+    /// template's shape: the offending node's byte offset is known statically
+    /// from the AST, so the diagnostic underlines the orphan content (ADR-022).
+    ///
+    /// `offset`/`len` index into `source`; the shared [`at`] guard drops `src`
+    /// (keeping raw offset/length for `serialize()`) if they fall out of bounds,
+    /// so a cross-source offset can never cause a miette `OutOfBounds` render.
+    pub(crate) fn mixed_content_at(file: &str, source: &str, offset: usize, len: usize) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::MixedContent { span, src }
+    }
+
     /// Serialize this error into a [`SerializedError`] suitable for JSON output.
     ///
     /// - `code` is extracted via [`miette::Diagnostic::code`] (drift-proof).
@@ -678,7 +719,8 @@ impl MdsError {
             | MdsError::Recursion { span, src, .. }
             | MdsError::ExportError { span, src, .. }
             | MdsError::BuiltinError { span, src, .. }
-            | MdsError::Extends { span, src, .. } => {
+            | MdsError::Extends { span, src, .. }
+            | MdsError::MixedContent { span, src } => {
                 span.as_ref().map(|ss| {
                     let offset = ss.offset();
                     let length = ss.len();
@@ -701,7 +743,9 @@ impl MdsError {
             | MdsError::Io { .. }
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
-            | MdsError::JsonError { .. } => None,
+            | MdsError::JsonError { .. }
+            | MdsError::ExpectedMarkdown
+            | MdsError::ExpectedMessages => None,
         };
 
         SerializedError {
