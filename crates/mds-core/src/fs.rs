@@ -205,7 +205,17 @@ impl NativeFs {
     ///
     /// Strategy: canonicalize parent dir (resolves dir-level symlinks), then
     /// canonicalize the full path. If they differ, the final component is a symlink.
-    fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
+    ///
+    /// Returns the canonical `PathBuf` for valid (non-symlinked) paths, or an error
+    /// if the final path component is a symlink. This makes it a drop-in replacement
+    /// for `std::fs::canonicalize` at security boundaries (PF-004).
+    ///
+    /// # Errors
+    ///
+    /// - `MdsError::ImportError` — the final path component is a symlink.
+    /// - `MdsError::FileNotFound` — the path does not exist or the parent cannot
+    ///   be resolved.
+    pub fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
         let file_name = path
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;

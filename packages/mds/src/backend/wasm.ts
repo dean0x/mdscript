@@ -1,13 +1,13 @@
 import type {
   BackendType,
   CheckResult,
-  CompileMessagesResult,
   CompileOptions,
   CompileResult,
   FileOptions,
   InitOptions,
   MdsBaseBackend,
 } from '../types.js';
+import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
@@ -19,9 +19,8 @@ import type {
  * createWasmBackend().
  */
 export interface WasmModule {
-  compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileResult;
-  check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CheckResult;
-  compileMessages(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): CompileMessagesResult;
+  compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
+  check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
   scanImports(source: string): string[];
   default?: (input?: unknown) => Promise<void>;
 }
@@ -115,23 +114,18 @@ function isModuleNotFound(err: unknown): boolean {
 /**
  * Validate that a dynamically loaded module matches the WasmModule shape.
  *
- * Checks compile, check, compileMessages, and scanImports are all present as functions.
- * Throws a descriptive error naming the first missing member so callers get
- * an actionable message instead of a silent runtime failure later.
+ * Delegates to the shared validateBackendMethods from contract.ts so the
+ * canonical method manifest (WASM_EXPORTS) is the single source of truth.
  *
  * Exported so tests can exercise shape validation directly without going
  * through the full WASM init path.
  */
 export function validateWasmShape(mod: unknown): asserts mod is WasmModule {
-  const m = mod as Record<string, unknown>;
-  for (const name of ['compile', 'check', 'compileMessages', 'scanImports'] as const) {
-    if (typeof m[name] !== 'function') {
-      throw new Error(
-        `@mdscript/mds: WASM module is missing required export "${name}". ` +
-        `Ensure the module is built with: wasm-pack build crates/mds-wasm --target web --out-dir pkg`,
-      );
-    }
-  }
+  validateBackendMethods(
+    mod,
+    WASM_EXPORTS,
+    'WASM module',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -346,15 +340,15 @@ export function fileOpts(
 export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      return wasmModule.compile(source, compileOpts(options));
+      const result: unknown = wasmModule.compile(source, compileOpts(options));
+      assertResultShape(result, 'compile');
+      return result as CompileResult;
     },
 
     check(source: string, options?: CompileOptions): CheckResult {
-      return wasmModule.check(source, compileOpts(options));
-    },
-
-    compileMessages(source: string, options?: CompileOptions): CompileMessagesResult {
-      return wasmModule.compileMessages(source, compileOpts(options));
+      const result: unknown = wasmModule.check(source, compileOpts(options));
+      assertResultShape(result, 'check');
+      return result as CheckResult;
     },
 
     getBackend(): BackendType {

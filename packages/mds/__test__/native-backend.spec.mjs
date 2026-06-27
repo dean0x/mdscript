@@ -24,8 +24,9 @@ const napiAddon = require(path.join(__dirname, '../../..', 'crates/mds-napi/inde
 const nativeBackend = createNativeBackend(napiAddon);
 
 describe('native backend', () => {
-  test('U-N1: compile plain text matches expected output', () => {
+  test('U-N1: compile plain text returns kind:markdown with expected output', () => {
     const result = nativeBackend.compile('Hello World!\n');
+    assert.equal(result.kind, 'markdown', `expected kind "markdown", got: ${result.kind}`);
     assert.equal(result.output, 'Hello World!\n');
     assert.deepEqual(result.warnings, []);
     assert.deepEqual(result.dependencies, []);
@@ -51,9 +52,10 @@ describe('native backend', () => {
     assert.throws(() => nativeBackend.compile('Hello {name\n'));
   });
 
-  test('U-N6: compileFile resolves with correct shape', async () => {
+  test('U-N6: compileFile resolves with kind:markdown shape', async () => {
     const simpleMds = path.join(FIXTURES, 'simple.mds');
     const result = await nativeBackend.compileFile(simpleMds);
+    assert.equal(result.kind, 'markdown', `expected kind "markdown", got: ${result.kind}`);
     assert.ok(typeof result.output === 'string');
     assert.ok(Array.isArray(result.warnings));
     assert.ok(Array.isArray(result.dependencies));

@@ -364,3 +364,31 @@ fn exit_code_resource_limit() {
         "expected exit code 3 for resource-limit error"
     );
 }
+
+// ── AC-2: load_vars_file rejects symlinked vars paths (PF-004 fix) ───────────
+
+#[test]
+#[cfg(unix)]
+fn load_vars_file_rejects_symlinked_path() {
+    // Proves the PF-004 fix: load_vars_file now routes the path through
+    // NativeFs::check_symlink before reading, the same guard applied to every
+    // other file read in the resolver.
+    let dir = tempfile::tempdir().unwrap();
+
+    let real_vars = dir.path().join("real_vars.json");
+    std::fs::write(&real_vars, r#"{"name": "Alice"}"#).unwrap();
+
+    let link_vars = dir.path().join("link_vars.json");
+    std::os::unix::fs::symlink(&real_vars, &link_vars).unwrap();
+
+    let result = mds::load_vars_file(&link_vars);
+    assert!(
+        result.is_err(),
+        "load_vars_file must reject a symlinked vars path"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("symlink") || err.contains("not allowed"),
+        "error must mention symlink restriction; got: {err}"
+    );
+}

@@ -112,11 +112,14 @@ describe('browser entry — post-init', () => {
     // Backend is already set by _initWithModuleForTesting; additional init() calls
     // resolve immediately (resolvedBackend guard). This verifies idempotency.
     // (Concurrent promise dedup is tested via U-BR11 below.)
-    assert.ok(compile('Hello!\n').output.includes('Hello'));
+    const result = compile('Hello!\n');
+    assert.equal(result.kind, 'markdown');
+    assert.ok(result.output.includes('Hello'));
   });
 
   test('U-BR7: compile returns output after init()', () => {
     const result = compile('Hello World!\n');
+    assert.equal(result.kind, 'markdown');
     assert.equal(typeof result.output, 'string');
     assert.ok(result.output.includes('Hello World!'));
     assert.ok(Array.isArray(result.warnings));
@@ -144,6 +147,7 @@ describe('browser entry — post-init', () => {
     // Re-injecting is not a real re-init but verifies the backend is stable.
     _initWithModuleForTesting(sharedWasmModule);
     const result = compile('Idempotent!\n');
+    assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Idempotent!'));
   });
 });
@@ -163,7 +167,9 @@ describe('browser entry — init() promise dedup and reset', () => {
   test('U-BR11: _resetForTesting() clears state so subsequent init needs a new module injection', () => {
     // Seed a backend.
     _initWithModuleForTesting(sharedWasmModule);
-    assert.ok(compile('After inject!\n').output.includes('After inject'));
+    const afterInject = compile('After inject!\n');
+    assert.equal(afterInject.kind, 'markdown');
+    assert.ok(afterInject.output.includes('After inject'));
 
     // Reset.
     browserReset();
@@ -179,6 +185,8 @@ describe('browser entry — init() promise dedup and reset', () => {
 
     // Re-inject and verify recovery.
     _initWithModuleForTesting(sharedWasmModule);
-    assert.ok(compile('Recovered!\n').output.includes('Recovered'));
+    const recovered = compile('Recovered!\n');
+    assert.equal(recovered.kind, 'markdown');
+    assert.ok(recovered.output.includes('Recovered'));
   });
 });

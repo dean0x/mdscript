@@ -7,8 +7,8 @@
 //! **In-memory compilation** — compile from a string with no files involved:
 //!
 //! ```rust
-//! let output = mds::compile_str("---\nname: World\n---\nHello {name}!\n")?;
-//! assert_eq!(output, "---\nname: World\n---\nHello World!\n");
+//! let result = mds::compile_str("---\nname: World\n---\nHello {name}!\n")?;
+//! assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -16,7 +16,8 @@
 //!
 //! ```rust,no_run
 //! use std::path::Path;
-//! let md = mds::compile(Path::new("template.mds"), None)?;
+//! let result = mds::compile(Path::new("template.mds"), None)?;
+//! let md = result.into_markdown()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -25,7 +26,8 @@
 //! ```rust,no_run
 //! use std::path::Path;
 //! let vars = mds::load_vars_file(Path::new("vars.json"))?;
-//! let md = mds::compile(Path::new("template.mds"), Some(vars))?;
+//! let result = mds::compile(Path::new("template.mds"), Some(vars))?;
+//! let md = result.into_markdown()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -37,6 +39,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub(crate) mod arity;
 pub(crate) mod ast;
 pub(crate) mod builtins;
 pub(crate) mod error;
@@ -57,7 +60,7 @@ pub use options::{
 };
 pub use resolver::ModuleCache;
 
-/// A single structured message produced by `compile_messages`.
+/// A single structured message produced by a template containing `@message` blocks.
 ///
 /// Mirrors a chat API message: `{ "role": "system", "content": "..." }`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -77,40 +80,150 @@ impl From<evaluator::EvalMessage> for Message {
     }
 }
 
-/// The result of compiling an MDS template in messages mode.
-///
-/// Returned by `compile_messages`, `compile_messages_str`, and variants.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct CompileMessagesOutput {
-    /// Structured messages produced from `@message` blocks.
-    pub messages: Vec<Message>,
-    /// Non-fatal diagnostic warnings (e.g. orphan text outside `@message` blocks).
-    pub warnings: Vec<String>,
-    /// Normalized keys of all modules imported during compilation, in depth-first order.
-    pub dependencies: Vec<String>,
-}
-
 use std::collections::HashMap;
 use std::path::Path;
 
 pub use error::{MdsError, SerializedError, SerializedSpan};
 pub use value::Value;
 
+/// The output of a compiled MDS template — either Markdown or structured messages.
+///
+/// Shape is intrinsic to the template: any `@message` block → Messages, otherwise Markdown.
+///
+/// # JSON shape
+/// Serializes as adjacently-tagged: `{"kind":"markdown","value":"..."}` or
+/// `{"kind":"messages","value":[...]}`. (Internal tagging cannot represent newtype
+/// variants wrapping `String`/`Vec`, so `content`/`value` field is required.)
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "lowercase")]
+pub enum CompiledOutput {
+    /// Plain Markdown — the template contained no `@message` blocks.
+    Markdown(String),
+    /// Structured messages — the template contained at least one `@message` block.
+    Messages(Vec<Message>),
+}
+
 /// The result of compiling an MDS template with full dependency tracking.
 ///
-/// Returned by `compile_with_deps`, `compile_str_with_deps`, and
-/// `compile_virtual_with_deps`. The `dependencies` list is in depth-first
+/// Returned by every `compile*` entry point. The `output` is intrinsic to the
+/// template (Markdown or Messages). The `dependencies` list is in depth-first
 /// resolution order and excludes the entry module itself — it contains only
 /// the files imported (transitively) by the entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct CompileOutput {
-    /// The rendered Markdown output.
-    pub output: String,
+pub struct CompileResult {
+    /// The compiled output: Markdown or structured messages, depending on the template.
+    pub output: CompiledOutput,
     /// Warnings emitted during compilation (e.g. empty `@include`).
     pub warnings: Vec<String>,
     /// Normalized keys of all modules imported during compilation, in
     /// first-resolution (depth-first) order. Excludes the entry module.
     pub dependencies: Vec<String>,
+}
+
+impl CompileResult {
+    /// Extract the Markdown string, consuming `self`.
+    /// Returns `Err(MdsError::ExpectedMarkdown)` when the output is `Messages`.
+    pub fn into_markdown(self) -> Result<String, MdsError> {
+        match self.output {
+            CompiledOutput::Markdown(s) => Ok(s),
+            CompiledOutput::Messages(_) => Err(MdsError::ExpectedMarkdown),
+        }
+    }
+
+    /// Extract the messages vector, consuming `self`.
+    /// Returns `Err(MdsError::ExpectedMessages)` when the output is `Markdown`.
+    pub fn into_messages(self) -> Result<Vec<Message>, MdsError> {
+        match self.output {
+            CompiledOutput::Messages(v) => Ok(v),
+            CompiledOutput::Markdown(_) => Err(MdsError::ExpectedMessages),
+        }
+    }
+
+    /// Build the canonical discriminated-union JS object from this result.
+    ///
+    /// Produces the `{ kind, <active-payload>, warnings, dependencies }` shape
+    /// shared by the NAPI and WASM bindings — a single authoritative implementation
+    /// so both wire formats are guaranteed byte-identical.
+    ///
+    /// Shape:
+    /// - Markdown: `{ kind: "markdown", output: <string>, warnings: string[], dependencies: string[] }`
+    /// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
+    ///
+    /// The **inactive payload field is ABSENT** — a markdown result has no `messages`
+    /// key; a messages result has no `output` key. Explicit field-by-field construction
+    /// via `serde_json::json!()` prevents serde derive from injecting unwanted keys.
+    pub fn to_canonical_json(self) -> serde_json::Value {
+        let warnings: serde_json::Value = self
+            .warnings
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>()
+            .into();
+        let dependencies: serde_json::Value = self
+            .dependencies
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect::<Vec<_>>()
+            .into();
+
+        match self.output {
+            CompiledOutput::Markdown(text) => serde_json::json!({
+                "kind": "markdown",
+                "output": text,
+                "warnings": warnings,
+                "dependencies": dependencies,
+            }),
+            CompiledOutput::Messages(msgs) => {
+                let messages: serde_json::Value = msgs
+                    .into_iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "role": m.role,
+                            "content": m.content,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+                serde_json::json!({
+                    "kind": "messages",
+                    "messages": messages,
+                    "warnings": warnings,
+                    "dependencies": dependencies,
+                })
+            }
+        }
+    }
+}
+
+// ── Test-only Markdown-extracting shims ───────────────────────────────────────
+//
+// The public `compile_*` entry points return a `CompileResult` whose `output` is
+// intrinsic (Markdown or Messages). The many markdown-mode unit tests in the
+// internal `#[cfg(test)]` modules (parser_tests, resolver_tests, …) predate the
+// intrinsic API and assert on a plain `String`. These thin shims preserve the old
+// `Result<String, MdsError>` shape — so a markdown template still surfaces compile
+// errors via `?`/`unwrap_err`, while `into_markdown()` extracts the rendered string.
+#[cfg(test)]
+pub(crate) fn compile_str_md(source: &str) -> Result<String, MdsError> {
+    compile_str(source).and_then(CompileResult::into_markdown)
+}
+
+#[cfg(test)]
+pub(crate) fn compile_str_with_md(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<String, MdsError> {
+    compile_str_with(source, base_dir, runtime_vars).and_then(CompileResult::into_markdown)
+}
+
+#[cfg(test)]
+pub(crate) fn compile_virtual_md(
+    modules: HashMap<String, String>,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+) -> Result<String, MdsError> {
+    compile_virtual(modules, entry, runtime_vars).and_then(CompileResult::into_markdown)
 }
 
 /// Maximum file size accepted for compilation (10 MB).
@@ -125,7 +238,12 @@ pub const MAX_FILE_SIZE: u64 = limits::MAX_FILE_SIZE;
 /// CLI binary — eliminating the duplicate definition.
 pub const MAX_TRAVERSAL_DEPTH: usize = limits::MAX_TRAVERSAL_DEPTH;
 
-/// Compile an MDS file to a final Markdown string.
+/// Compile an MDS file, returning a [`CompileResult`].
+///
+/// The output shape is intrinsic to the template: a template containing any
+/// `@message` block produces [`CompiledOutput::Messages`], otherwise
+/// [`CompiledOutput::Markdown`]. Use [`CompileResult::into_markdown`] /
+/// [`CompileResult::into_messages`] to extract the expected variant.
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr. Pass `runtime_vars`
 /// to override or supply variables that aren't defined in frontmatter.
@@ -134,36 +252,36 @@ pub const MAX_TRAVERSAL_DEPTH: usize = limits::MAX_TRAVERSAL_DEPTH;
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// let md = mds::compile(Path::new("template.mds"), None)?;
+/// let result = mds::compile(Path::new("template.mds"), None)?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output should be used"]
+#[must_use = "the compiled output should be used"]
 pub fn compile(
     path: impl AsRef<Path>,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<String, MdsError> {
-    let (output, warnings) = compile_collecting_warnings(path, runtime_vars)?;
-    emit_warnings(&warnings);
-    Ok(output)
+) -> Result<CompileResult, MdsError> {
+    let result = compile_collecting_warnings(path, runtime_vars)?;
+    emit_warnings(&result.warnings);
+    Ok(result)
 }
 
-/// Compile MDS source code from a string.
+/// Compile MDS source code from a string, returning a [`CompileResult`].
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr.
 ///
 /// # Examples
 ///
 /// ```rust
-/// let output = mds::compile_str("---\ngreeting: Hi\n---\n{greeting} there!\n")?;
-/// assert_eq!(output, "---\ngreeting: Hi\n---\nHi there!\n");
+/// let result = mds::compile_str("---\ngreeting: Hi\n---\n{greeting} there!\n")?;
+/// assert_eq!(result.into_markdown()?, "---\ngreeting: Hi\n---\nHi there!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output should be used"]
-pub fn compile_str(source: &str) -> Result<String, MdsError> {
+#[must_use = "the compiled output should be used"]
+pub fn compile_str(source: &str) -> Result<CompileResult, MdsError> {
     compile_str_with(source, None, None)
 }
 
-/// Compile MDS source code from a string with options.
+/// Compile MDS source code from a string with options, returning a [`CompileResult`].
 ///
 /// Warnings (e.g. empty `@include`) are printed to stderr. `base_dir` sets the
 /// root for resolving `@import` paths; defaults to the current directory.
@@ -175,22 +293,22 @@ pub fn compile_str(source: &str) -> Result<String, MdsError> {
 /// use std::collections::HashMap;
 ///
 /// let vars = HashMap::from([("lang".to_string(), mds::Value::String("Rust".to_string()))]);
-/// let md = mds::compile_str_with(
+/// let result = mds::compile_str_with(
 ///     "---\nlang: unknown\n---\nI love {lang}!\n",
 ///     Some(Path::new("templates/")),
 ///     Some(vars),
 /// )?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output should be used"]
+#[must_use = "the compiled output should be used"]
 pub fn compile_str_with(
     source: &str,
     base_dir: Option<&Path>,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<String, MdsError> {
-    let (output, warnings) = compile_str_collecting_warnings(source, base_dir, runtime_vars)?;
-    emit_warnings(&warnings);
-    Ok(output)
+) -> Result<CompileResult, MdsError> {
+    let result = compile_str_collecting_warnings(source, base_dir, runtime_vars)?;
+    emit_warnings(&result.warnings);
+    Ok(result)
 }
 
 /// Check (validate) an MDS file without rendering output.
@@ -215,7 +333,7 @@ pub fn check(
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    cache.resolve_path(path_str, &vars, &mut warnings)?;
+    cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
     emit_warnings(&warnings);
     Ok(())
 }
@@ -284,7 +402,7 @@ pub fn check_str_with(
     let dir = resolve_base_dir(base_dir)?;
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    cache.resolve_source(source, &dir, &vars, &mut warnings)?;
+    cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     emit_warnings(&warnings);
     Ok(())
 }
@@ -307,19 +425,7 @@ fn emit_warnings(warnings: &[String]) {
     }
 }
 
-/// Build the final output string from a resolved module.
-///
-/// Cleans the prompt body and prepends YAML frontmatter when present.
-fn build_output(resolved: &resolver::ResolvedModule) -> String {
-    let body = resolved
-        .prompt_body
-        .as_deref()
-        .map(clean_output)
-        .unwrap_or_default();
-    prepend_frontmatter(resolved.raw_frontmatter.as_deref(), body)
-}
-
-/// Compile an MDS file and return the output along with any collected warnings.
+/// Compile an MDS file and return a [`CompileResult`] (output, warnings, dependencies).
 ///
 /// Unlike [`compile`], this function does not print warnings to stderr. The caller
 /// is responsible for deciding whether to display them (e.g. based on a quiet flag).
@@ -328,40 +434,64 @@ fn build_output(resolved: &resolver::ResolvedModule) -> String {
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// let (md, warnings) = mds::compile_collecting_warnings(Path::new("template.mds"), None)?;
-/// for w in &warnings { eprintln!("warning: {w}"); }
+/// let result = mds::compile_collecting_warnings(Path::new("template.mds"), None)?;
+/// for w in &result.warnings { eprintln!("warning: {w}"); }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output and warnings should be used"]
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
 pub fn compile_collecting_warnings(
     path: impl AsRef<Path>,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<(String, Vec<String>), MdsError> {
+) -> Result<CompileResult, MdsError> {
     let path = path.as_ref();
     let path_str = path_to_str(path)?;
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    let resolved = cache.resolve_path(path_str, &vars, &mut warnings)?;
-    Ok((build_output(&resolved), warnings))
+    let output = cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
+    // The intrinsic resolver does NOT insert the entry module into the cache (only
+    // imported sub-modules are inserted), so `dependencies()` normally already
+    // excludes the entry. Filter the canonical entry key anyway to also drop it in
+    // the edge case where a transitive import re-imports the entry. check_symlink
+    // mirrors the normalize("", path) the resolver already performed — no extra I/O.
+    let canonical_entry = NativeFs::check_symlink(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path_str.to_owned());
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != &canonical_entry)
+        .collect();
+    Ok(CompileResult {
+        output,
+        warnings,
+        dependencies,
+    })
 }
 
-/// Compile MDS source from a string and return the output along with any collected warnings.
+/// Compile MDS source from a string and return a [`CompileResult`].
 ///
 /// Unlike [`compile_str_with`], this function does not print warnings to stderr. The caller
 /// is responsible for deciding whether to display them (e.g. based on a quiet flag).
-#[must_use = "the compiled Markdown output and warnings should be used"]
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
 pub fn compile_str_collecting_warnings(
     source: &str,
     base_dir: Option<&Path>,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<(String, Vec<String>), MdsError> {
+) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let dir = resolve_base_dir(base_dir)?;
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    let resolved = cache.resolve_source(source, &dir, &vars, &mut warnings)?;
-    Ok((build_output(&resolved), warnings))
+    let output = cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
+    // resolve_source_intrinsic does not insert the inline source into the modules cache,
+    // so cache.dependencies() contains only imported files — no entry-key filtering needed.
+    let dependencies = cache.dependencies();
+    Ok(CompileResult {
+        output,
+        warnings,
+        dependencies,
+    })
 }
 
 /// Check (validate) an MDS file and return any collected warnings without rendering output.
@@ -387,7 +517,9 @@ pub fn check_collecting_warnings(
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    cache.resolve_path(path_str, &vars, &mut warnings)?;
+    // Dispatch on output shape so a messages template's mixed-content check runs
+    // during validation; the CompiledOutput itself is discarded.
+    cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
     Ok(((), warnings))
 }
 
@@ -417,7 +549,7 @@ pub fn check_str_collecting_warnings(
     let dir = resolve_base_dir(base_dir)?;
     let mut cache = ModuleCache::new();
     let mut warnings = vec![];
-    cache.resolve_source(source, &dir, &vars, &mut warnings)?;
+    cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     Ok(((), warnings))
 }
 
@@ -492,7 +624,7 @@ fn strip_reserved_keys(raw: &str) -> Option<String> {
 ///
 /// If `raw` is `None`, or after stripping reserved keys the frontmatter is empty,
 /// the body is returned unchanged.
-fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
+pub(crate) fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
     let Some(raw) = raw else {
         return body;
     };
@@ -504,7 +636,7 @@ fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
 
 /// Clean up output whitespace: collapse 3+ consecutive newlines to 2 (one blank line),
 /// and trim leading/trailing blank lines.
-fn clean_output(s: &str) -> String {
+pub(crate) fn clean_output(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut newline_count = 0;
 
@@ -551,19 +683,19 @@ fn clean_output(s: &str) -> String {
 /// let mut modules = HashMap::new();
 /// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
 ///
-/// let output = mds::compile_virtual(modules, "main.mds", None)?;
-/// assert_eq!(output, "---\nname: World\n---\nHello World!\n");
+/// let result = mds::compile_virtual(modules, "main.mds", None)?;
+/// assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output should be used"]
+#[must_use = "the compiled output should be used"]
 pub fn compile_virtual(
     modules: HashMap<String, String>,
     entry: &str,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<String, MdsError> {
-    let (output, warnings) = compile_virtual_collecting_warnings(modules, entry, runtime_vars)?;
-    emit_warnings(&warnings);
-    Ok(output)
+) -> Result<CompileResult, MdsError> {
+    let result = compile_virtual_collecting_warnings(modules, entry, runtime_vars)?;
+    emit_warnings(&result.warnings);
+    Ok(result)
 }
 
 /// Compile a module from an in-memory virtual filesystem and return the output
@@ -583,31 +715,39 @@ pub fn compile_virtual(
 /// let mut modules = HashMap::new();
 /// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
 ///
-/// let (output, warnings) = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)?;
-/// assert_eq!(output, "---\nname: World\n---\nHello World!\n");
-/// assert!(warnings.is_empty());
+/// let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)?;
+/// assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output and warnings should be used"]
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
 pub fn compile_virtual_collecting_warnings(
     modules: HashMap<String, String>,
     entry: &str,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<(String, Vec<String>), MdsError> {
+) -> Result<CompileResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::virtual_fs(modules);
     let mut warnings = vec![];
-    let resolved = cache.resolve_key(entry, &vars, &mut warnings)?;
-    Ok((build_output(&resolved), warnings))
+    let output = cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != entry)
+        .collect();
+    Ok(CompileResult {
+        output,
+        warnings,
+        dependencies,
+    })
 }
 
-/// Compile an MDS file and return a [`CompileOutput`] with dependency tracking.
+/// Compile an MDS file and return a [`CompileResult`] with dependency tracking.
 ///
-/// Like [`compile_collecting_warnings`] but also returns the list of imported
-/// modules (direct and transitive) in depth-first resolution order. The entry
-/// file itself is excluded from `dependencies`.
+/// Like [`compile_collecting_warnings`] (and now identical to it): the result
+/// includes the list of imported modules (direct and transitive) in depth-first
+/// resolution order, with the entry file excluded from `dependencies`.
 ///
-/// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
+/// Warnings are not printed to stderr; they are returned in `CompileResult::warnings`.
 ///
 /// # Examples
 ///
@@ -615,7 +755,6 @@ pub fn compile_virtual_collecting_warnings(
 /// use std::path::Path;
 ///
 /// let result = mds::compile_with_deps(Path::new("template.mds"), None)?;
-/// println!("{}", result.output);
 /// for dep in &result.dependencies { println!("dep: {dep}"); }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -623,37 +762,18 @@ pub fn compile_virtual_collecting_warnings(
 pub fn compile_with_deps(
     path: impl AsRef<Path>,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<CompileOutput, MdsError> {
-    let path = path.as_ref();
-    let path_str = path_to_str(path)?;
-    let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::new();
-    let mut warnings = vec![];
-    let resolved = cache.resolve_path(path_str, &vars, &mut warnings)?;
-    let output = build_output(&resolved);
-    // Post-order DFS guarantees the entry module is last in the cache.
-    // Filter by value rather than position for explicitness.
-    let deps = cache.dependencies();
-    let entry_key = deps.last().cloned();
-    let dependencies = deps
-        .into_iter()
-        .filter(|k| Some(k) != entry_key.as_ref())
-        .collect();
-    Ok(CompileOutput {
-        output,
-        warnings,
-        dependencies,
-    })
+) -> Result<CompileResult, MdsError> {
+    compile_collecting_warnings(path, runtime_vars)
 }
 
-/// Compile MDS source code from a string and return a [`CompileOutput`] with
+/// Compile MDS source code from a string and return a [`CompileResult`] with
 /// dependency tracking.
 ///
-/// Like [`compile_str_collecting_warnings`] but also returns the list of imported
-/// modules in depth-first resolution order. Because the source is not a file,
-/// there is no entry key to exclude — all resolved imports appear in `dependencies`.
+/// Like [`compile_str_collecting_warnings`] (and now identical to it). Because the
+/// source is not a file, there is no entry key to exclude — all resolved imports
+/// appear in `dependencies`.
 ///
-/// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
+/// Warnings are not printed to stderr; they are returned in `CompileResult::warnings`.
 ///
 /// # Examples
 ///
@@ -663,8 +783,7 @@ pub fn compile_with_deps(
 ///     None,
 ///     None,
 /// )?;
-/// assert_eq!(result.output, "---\ngreeting: Hi\n---\nHi there!\n");
-/// assert!(result.dependencies.is_empty());
+/// assert_eq!(result.into_markdown()?, "---\ngreeting: Hi\n---\nHi there!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "the compiled output, warnings, and dependencies should be used"]
@@ -672,31 +791,18 @@ pub fn compile_str_with_deps(
     source: &str,
     base_dir: Option<&Path>,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<CompileOutput, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
-    let dir = resolve_base_dir(base_dir)?;
-    let mut cache = ModuleCache::new();
-    let mut warnings = vec![];
-    let resolved = cache.resolve_source(source, &dir, &vars, &mut warnings)?;
-    let output = build_output(&resolved);
-    // resolve_source does not insert the inline source into the modules cache,
-    // so cache.dependencies() contains only imported files — no filtering needed.
-    let dependencies = cache.dependencies();
-    Ok(CompileOutput {
-        output,
-        warnings,
-        dependencies,
-    })
+) -> Result<CompileResult, MdsError> {
+    compile_str_collecting_warnings(source, base_dir, runtime_vars)
 }
 
 /// Compile a module from an in-memory virtual filesystem and return a
-/// [`CompileOutput`] with dependency tracking.
+/// [`CompileResult`] with dependency tracking.
 ///
-/// Like [`compile_virtual_collecting_warnings`] but also returns the list of
-/// imported modules in depth-first resolution order. The entry module itself is
-/// excluded from `dependencies`.
+/// Like [`compile_virtual_collecting_warnings`] (and now identical to it): the
+/// result includes the list of imported modules in depth-first resolution order,
+/// with the entry module excluded from `dependencies`.
 ///
-/// Warnings are not printed to stderr; they are returned in `CompileOutput::warnings`.
+/// Warnings are not printed to stderr; they are returned in `CompileResult::warnings`.
 ///
 /// # Examples
 ///
@@ -707,8 +813,7 @@ pub fn compile_str_with_deps(
 /// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
 ///
 /// let result = mds::compile_virtual_with_deps(modules, "main.mds", None)?;
-/// assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
-/// assert!(result.dependencies.is_empty());
+/// assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "the compiled output, warnings, and dependencies should be used"]
@@ -716,169 +821,8 @@ pub fn compile_virtual_with_deps(
     modules: HashMap<String, String>,
     entry: &str,
     runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<CompileOutput, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::virtual_fs(modules);
-    let mut warnings = vec![];
-    let resolved = cache.resolve_key(entry, &vars, &mut warnings)?;
-    let output = build_output(&resolved);
-    let dependencies = cache
-        .dependencies()
-        .into_iter()
-        .filter(|k| k != entry)
-        .collect();
-    Ok(CompileOutput {
-        output,
-        warnings,
-        dependencies,
-    })
-}
-
-/// Compile an MDS source string in messages mode, returning structured messages.
-///
-/// Each `@message role:` ... `@end` block becomes a [`Message`] with the
-/// evaluated `role` string and `content` body. Orphan text outside `@message`
-/// blocks is ignored with a warning. Empty messages (after trimming) are skipped.
-///
-/// Returns an error when the source contains no `@message` blocks at all.
-/// Warnings are returned in [`CompileMessagesOutput::warnings`] and are not
-/// printed to stderr.
-///
-/// # Examples
-///
-/// ```rust
-/// let result = mds::compile_messages_str(
-///     "@message system:\nYou are a helpful assistant.\n@end\n"
-/// )?;
-/// assert_eq!(result.messages.len(), 1);
-/// assert_eq!(result.messages[0].role, "system");
-/// assert_eq!(result.messages[0].content, "You are a helpful assistant.");
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[must_use = "the compiled messages output should be used"]
-pub fn compile_messages_str(source: &str) -> Result<CompileMessagesOutput, MdsError> {
-    compile_messages_str_with_deps(source, None, None)
-}
-
-/// Compile an MDS source string in messages mode, returning structured messages
-/// with full dependency and warning information.
-///
-/// This is the lowest-level string-based messages API. Warnings are NOT printed
-/// to stderr — they are returned in [`CompileMessagesOutput::warnings`].
-///
-/// # Examples
-///
-/// ```rust
-/// let result = mds::compile_messages_str_with_deps(
-///     "@message user:\nWhat is 2+2?\n@end\n",
-///     None,
-///     None,
-/// )?;
-/// assert_eq!(result.messages[0].role, "user");
-/// assert!(result.warnings.is_empty());
-/// assert!(result.dependencies.is_empty());
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[must_use = "the compiled messages output, warnings, and dependencies should be used"]
-pub fn compile_messages_str_with_deps(
-    source: &str,
-    base_dir: Option<&Path>,
-    runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<CompileMessagesOutput, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
-    let dir = resolve_base_dir(base_dir)?;
-    let mut cache = ModuleCache::new();
-    let mut warnings = vec![];
-    let eval_messages = cache.resolve_source_messages(source, &dir, &vars, &mut warnings)?;
-    // resolve_source_messages does not insert the inline source into the module cache,
-    // so cache.dependencies() contains only imported files — no entry-key filtering needed.
-    // (compare: compile_messages_virtual_with_deps explicitly filters the entry key out.)
-    let dependencies = cache.dependencies();
-    let messages = eval_messages.into_iter().map(Message::from).collect();
-    Ok(CompileMessagesOutput {
-        messages,
-        warnings,
-        dependencies,
-    })
-}
-
-/// Compile a module from an in-memory virtual filesystem in messages mode.
-///
-/// Like [`compile_virtual`] but runs `evaluate_messages` instead of `evaluate`.
-/// Returns structured [`Message`] values from `@message` blocks.
-///
-/// Warnings are printed to stderr; use [`compile_messages_virtual_with_deps`]
-/// to capture them instead.
-///
-/// # Examples
-///
-/// ```rust
-/// use std::collections::HashMap;
-///
-/// let mut modules = HashMap::new();
-/// modules.insert(
-///     "main.mds".to_string(),
-///     "@message system:\nYou are helpful.\n@end\n".to_string(),
-/// );
-///
-/// let result = mds::compile_messages_virtual(modules, "main.mds", None)?;
-/// assert_eq!(result.messages[0].role, "system");
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[must_use = "the compiled messages output should be used"]
-pub fn compile_messages_virtual(
-    modules: HashMap<String, String>,
-    entry: &str,
-    runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<CompileMessagesOutput, MdsError> {
-    let result = compile_messages_virtual_with_deps(modules, entry, runtime_vars)?;
-    emit_warnings(&result.warnings);
-    Ok(result)
-}
-
-/// Compile a module from an in-memory virtual filesystem in messages mode, with
-/// full dependency and warning information.
-///
-/// This is the lowest-level virtual-filesystem messages API. Warnings are NOT
-/// printed to stderr — they are returned in [`CompileMessagesOutput::warnings`].
-///
-/// # Examples
-///
-/// ```rust
-/// use std::collections::HashMap;
-///
-/// let mut modules = HashMap::new();
-/// modules.insert(
-///     "main.mds".to_string(),
-///     "@message assistant:\nI am ready to help.\n@end\n".to_string(),
-/// );
-///
-/// let result = mds::compile_messages_virtual_with_deps(modules, "main.mds", None)?;
-/// assert_eq!(result.messages[0].role, "assistant");
-/// assert!(result.dependencies.is_empty());
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-#[must_use = "the compiled messages output, warnings, and dependencies should be used"]
-pub fn compile_messages_virtual_with_deps(
-    modules: HashMap<String, String>,
-    entry: &str,
-    runtime_vars: Option<HashMap<String, Value>>,
-) -> Result<CompileMessagesOutput, MdsError> {
-    let vars = runtime_vars.unwrap_or_default();
-    let mut cache = ModuleCache::virtual_fs(modules);
-    let mut warnings = vec![];
-    let eval_messages = cache.resolve_key_messages(entry, &vars, &mut warnings)?;
-    let dependencies = cache
-        .dependencies()
-        .into_iter()
-        .filter(|k| k != entry)
-        .collect();
-    let messages = eval_messages.into_iter().map(Message::from).collect();
-    Ok(CompileMessagesOutput {
-        messages,
-        warnings,
-        dependencies,
-    })
+) -> Result<CompileResult, MdsError> {
+    compile_virtual_collecting_warnings(modules, entry, runtime_vars)
 }
 
 /// Check (validate) a module from an in-memory virtual filesystem without rendering output.
@@ -944,7 +888,9 @@ pub fn check_virtual_collecting_warnings(
     let vars = runtime_vars.unwrap_or_default();
     let mut cache = ModuleCache::virtual_fs(modules);
     let mut warnings = vec![];
-    cache.resolve_key(entry, &vars, &mut warnings)?;
+    // Dispatch on output shape so a messages template's mixed-content check runs
+    // during validation; the CompiledOutput itself is discarded.
+    cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     Ok(((), warnings))
 }
 
@@ -955,12 +901,11 @@ pub fn check_virtual_collecting_warnings(
 /// # Examples
 ///
 /// ```rust,no_run
-/// let md = mds::compile_file("template.mds")?;
-/// println!("{md}");
+/// let result = mds::compile_file("template.mds")?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[must_use = "the compiled Markdown output should be used"]
-pub fn compile_file(path: &str) -> Result<String, MdsError> {
+#[must_use = "the compiled output should be used"]
+pub fn compile_file(path: &str) -> Result<CompileResult, MdsError> {
     compile(Path::new(path), None)
 }
 
@@ -1044,12 +989,23 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// use std::path::Path;
 ///
 /// let vars = mds::load_vars_file(Path::new("vars.json"))?;
-/// let md = mds::compile(Path::new("template.mds"), Some(vars))?;
+/// let result = mds::compile(Path::new("template.mds"), Some(vars))?;
+/// let md = result.into_markdown()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "the loaded variables should be used"]
 pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
     let path_str = path_to_str(path)?;
+    // PF-004: guard the vars-file path through the same symlink check that the
+    // resolver applies to every imported file — avoids a raw read that bypasses
+    // the security gate. check_symlink returns the canonical path; we use the
+    // original path for error messages (it names what the caller passed).
+    NativeFs::check_symlink(path).map_err(|e| match e {
+        MdsError::ImportError { .. } => MdsError::import_error(format!(
+            "symlinks are not allowed in vars file path: {path_str}"
+        )),
+        other => other,
+    })?;
     // Read bytes first, then check size (same TOCTOU-safe pattern as resolver.rs).
     let bytes = std::fs::read(path)
         .map_err(|e| MdsError::io(format!("cannot read vars file {path_str}: {e}")))?;
@@ -1081,14 +1037,14 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 ///
 /// ```rust
 /// let vars = mds::load_vars_str(r#"{"name": "World", "count": 42}"#)?;
-/// let output = mds::compile_virtual(
+/// let result = mds::compile_virtual(
 ///     std::collections::HashMap::from([
 ///         ("main.mds".to_string(), "Hello {name}!\n".to_string()),
 ///     ]),
 ///     "main.mds",
 ///     Some(vars),
 /// )?;
-/// assert_eq!(output, "Hello World!\n");
+/// assert_eq!(result.into_markdown()?, "Hello World!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "the loaded variables should be used"]

@@ -4,14 +4,14 @@ use std::collections::HashMap;
 fn dot_notation_object_access_works() {
     // {obj.key} now works as object field access (not an error).
     let source = "---\ndata:\n  name: Alice\n---\n{data.name}\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("Alice\n"), "got: {result}");
 }
 
 #[test]
 fn object_single_level_access() {
     let source = "---\nconfig:\n  key: val\n---\n{config.key}\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert_eq!(
         result, "---\nconfig:\n  key: val\n---\nval\n",
         "got: {result}"
@@ -21,7 +21,7 @@ fn object_single_level_access() {
 #[test]
 fn object_multi_level_access() {
     let source = "---\na:\n  b:\n    c: deep\n---\n{a.b.c}\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert_eq!(
         result, "---\na:\n  b:\n    c: deep\n---\ndeep\n",
         "got: {result}"
@@ -64,7 +64,7 @@ fn object_access_on_non_object() {
 #[test]
 fn if_dot_path_truthy() {
     let source = "---\nconfig:\n  debug: true\n---\n@if config.debug:\nDEBUG ON\n@end\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("DEBUG ON"), "got: {result}");
 }
 
@@ -72,14 +72,14 @@ fn if_dot_path_truthy() {
 fn if_dot_path_falsy() {
     let source =
         "---\nconfig:\n  debug: false\n---\n@if config.debug:\nDEBUG ON\n@else:\nDEBUG OFF\n@end\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("DEBUG OFF"), "got: {result}");
 }
 
 #[test]
 fn for_dot_path_iterable() {
     let source = "---\nconfig:\n  items:\n    - a\n    - b\n---\n@for item in config.items:\n- {item}\n@end\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("- a") && result.contains("- b"),
         "got: {result}"
@@ -90,7 +90,7 @@ fn for_dot_path_iterable() {
 fn for_key_value_object() {
     let source =
         "---\nobj:\n  alpha: 1\n  beta: 2\n---\n@for key, value in obj:\n{key}={value}\n@end\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("alpha=1") && result.contains("beta=2"),
         "got: {result}"
@@ -131,14 +131,14 @@ fn for_key_value_non_object_error() {
 #[test]
 fn func_arg_dot_path() {
     let source = "---\nconfig:\n  name: Alice\n---\n@define greet(who):\nHello {who}!\n@end\n{greet(config.name)}\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("Hello Alice!"), "got: {result}");
 }
 
 #[test]
 fn objects_inside_arrays() {
     let source = "---\nitems:\n  - name: Alice\n  - name: Bob\n---\n@for item in items:\n{item.name}\n@end\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("Alice") && result.contains("Bob"),
         "got: {result}"
@@ -150,7 +150,10 @@ fn empty_object_is_falsy() {
     let source = "@if obj:\nTRUTHY\n@else:\nFALSY\n@end\n";
     let mut vars = HashMap::new();
     vars.insert("obj".to_string(), mds::Value::Object(HashMap::new()));
-    let result = mds::compile_str_with(source, None, Some(vars)).unwrap();
+    let result = mds::compile_str_with(source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     assert!(
         result.contains("FALSY"),
         "empty object should be falsy, got: {result}"
@@ -161,7 +164,7 @@ fn empty_object_is_falsy() {
 fn namespace_and_object_coexist() {
     // Verify that {obj.key} (MemberAccess) works alongside the existing codebase features.
     let source = "---\nobj:\n  key: val\n---\n{obj.key}\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert_eq!(result, "---\nobj:\n  key: val\n---\nval\n", "got: {result}");
 }
 
@@ -188,7 +191,10 @@ fn runtime_vars_object_dot_access() {
     inner.insert("port".to_string(), mds::Value::String("8080".to_string()));
     let mut vars = HashMap::new();
     vars.insert("config".to_string(), mds::Value::Object(inner));
-    let result = mds::compile_str_with(source, None, Some(vars)).unwrap();
+    let result = mds::compile_str_with(source, None, Some(vars))
+        .unwrap()
+        .into_markdown()
+        .unwrap();
     // No frontmatter in source, so output is body only.
     assert_eq!(result, "localhost:8080\n", "got: {result}");
 }
@@ -198,7 +204,7 @@ fn for_key_value_dot_path_object() {
     // Key-value iteration and dot-path object access should work in combination:
     // @for key, value in config.settings should iterate the nested object.
     let source = "---\nconfig:\n  settings:\n    theme: dark\n    lang: en\n---\n@for k, v in config.settings:\n{k}={v}\n@end\n";
-    let result = mds::compile_str(source).unwrap();
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     // Entries appear in sorted key order (lang before theme alphabetically).
     // Frontmatter is preserved in output.
     assert_eq!(

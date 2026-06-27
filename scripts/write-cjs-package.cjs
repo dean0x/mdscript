@@ -7,7 +7,15 @@
 const fs = require('fs');
 const path = require('path');
 
-const outDir = process.argv[2] || 'dist-cjs';
+const rawArg = process.argv[2] || 'dist-cjs';
+// Resolve against cwd and validate the result stays within cwd to prevent
+// path-traversal (CWE-23) when the argument is supplied by a caller.
+const cwd = process.cwd();
+const outDir = path.resolve(cwd, rawArg);
+if (!outDir.startsWith(cwd + path.sep) && outDir !== cwd) {
+  console.error(`write-cjs-package: output path escapes cwd: ${outDir}`);
+  process.exit(1);
+}
 fs.mkdirSync(outDir, { recursive: true });
 const dest = path.join(outDir, 'package.json');
 fs.writeFileSync(dest, '{"type":"commonjs"}\n');

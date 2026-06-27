@@ -260,7 +260,11 @@ fn if_negation_supported() {
         result
     );
     assert!(
-        result.unwrap().contains("negated_no"),
+        result
+            .unwrap()
+            .into_markdown()
+            .unwrap()
+            .contains("negated_no"),
         "negation of true must take else branch"
     );
 }

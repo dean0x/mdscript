@@ -1,0 +1,12 @@
+---
+agent: Kendra
+task: code review
+---
+
+@message system:
+You are {agent}, ready to perform a {task}.
+@end
+
+@message user:
+Please review my code.
+@end

@@ -9,6 +9,7 @@
 import reviewerPrompt from './prompts/reviewer.mds';
 
 const out = document.getElementById('out');
-if (out) out.textContent = reviewerPrompt;
+const promptText = typeof reviewerPrompt === 'string' ? reviewerPrompt : JSON.stringify(reviewerPrompt, null, 2);
+if (out) out.textContent = promptText;
 
-console.log('[mds-demo] compiled prompt rendered (%d chars)', reviewerPrompt.length);
+console.log('[mds-demo] compiled prompt rendered (%d chars)', promptText.length);

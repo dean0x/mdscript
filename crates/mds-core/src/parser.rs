@@ -247,8 +247,11 @@ impl Parser<'_> {
                     let node = self.parse_directive()?;
                     nodes.push(node);
                 }
-                Token::Text(text, _offset) => {
-                    nodes.push(Node::Text(TextNode { text: text.clone() }));
+                Token::Text(text, offset) => {
+                    nodes.push(Node::Text(TextNode {
+                        text: text.clone(),
+                        offset: *offset,
+                    }));
                     self.pos += 1;
                 }
                 Token::Interpolation(expr, offset) => {
@@ -260,15 +263,17 @@ impl Parser<'_> {
                     nodes.push(Node::EscapedBrace);
                     self.pos += 1;
                 }
-                Token::CodeFence(fence, _offset) => {
+                Token::CodeFence(fence, offset) => {
                     nodes.push(Node::Text(TextNode {
                         text: format!("{fence}\n"),
+                        offset: *offset,
                     }));
                     self.pos += 1;
                 }
-                Token::CodeContent(content, _offset) => {
+                Token::CodeContent(content, offset) => {
                     nodes.push(Node::Text(TextNode {
                         text: content.clone(),
+                        offset: *offset,
                     }));
                     self.pos += 1;
                 }

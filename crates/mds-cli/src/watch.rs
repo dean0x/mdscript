@@ -22,7 +22,7 @@
 //! - Exit 0 on clean Ctrl+C; non-zero only on startup failure.
 //! - Compile errors during watching never terminate the watcher.
 //! - All loops have fixed upper bounds (ADR-021 / reliability.md).
-//! - All `.mds` reads go through `compile_to_content` / `read_build_input` (PF-004).
+//! - All `.mds` reads go through `compile_to_content` (PF-004).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,9 +32,15 @@ use std::time::{Duration, Instant};
 use miette::Result;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+use mds::MdsError;
+
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
-    resolve_output_path, write_output, MdsConfig, OutputFormat,
+    resolve_output_path_for_kind, write_output, OutputKind,
+};
+use crate::output::{
+    canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
+    probe_and_remove_stale, resolve_output_base, OutputBase,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -45,7 +51,6 @@ pub(crate) struct WatchArgs {
     pub(crate) out_dir: Option<PathBuf>,
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
-    pub(crate) format: OutputFormat,
     pub(crate) clear: bool,
     pub(crate) debounce: u64,
     pub(crate) quiet: bool,
@@ -59,104 +64,11 @@ enum Msg {
     Interrupt,
 }
 
-// ── Output base for directory mode ────────────────────────────────────────────
-
-/// Describes where directory-mode output files are written.
-///
-/// `Dir(base)` mirrors the source subtree under `base`:
-///   `source.strip_prefix(root)` → `base/rel/stem.md`
-/// `NextToSource` places the `.md` next to the source file.
-#[derive(Debug, Clone)]
-pub(crate) enum OutputBase {
-    Dir(PathBuf),
-    NextToSource,
-}
-
-/// Compute the `OutputBase` for directory mode.
-///
-/// Precedence (mirrors `resolve_output_path` for file mode):
-/// 1. `--out-dir` → `Dir(abs_out_dir)`
-/// 2. `mds.json build.output_dir` → `Dir(config_dir.join(output_dir))`
-///    — rejects `..` components at startup with a hard error.
-/// 3. Default → `NextToSource`
-pub(crate) fn resolve_output_base(
-    abs_out_dir: Option<&Path>,
-    config: &Option<(MdsConfig, PathBuf)>,
-) -> Result<OutputBase> {
-    if let Some(d) = abs_out_dir {
-        return Ok(OutputBase::Dir(d.to_path_buf()));
-    }
-    if let Some((cfg, config_dir)) = config {
-        if let Some(ref output_dir) = cfg.build.output_dir {
-            let traversal = Path::new(output_dir)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir);
-            if traversal {
-                return Err(miette::miette!(
-                    "mds.json output_dir '{}' must not contain '..' components",
-                    output_dir
-                ));
-            }
-            return Ok(OutputBase::Dir(config_dir.join(output_dir)));
-        }
-    }
-    Ok(OutputBase::NextToSource)
-}
-
-/// Compute the mirrored output path for a source file in directory mode.
-///
-/// Infallible — no directory creation.
-///
-/// - `Dir(base)`: mirrors `source` relative to `root` under `base`.
-///   If `strip_prefix` fails (source not under root after canonicalization),
-///   falls back to `base/stem.md` — **never** joins an absolute path that
-///   could escape the output directory (AC-M7 path-escape guard).
-/// - `NextToSource`: `source.with_extension("md")`.
-pub(crate) fn output_path_for(source: &Path, root: &Path, base: &OutputBase) -> PathBuf {
-    match base {
-        OutputBase::Dir(d) => {
-            // strip_prefix gives the relative path from root to source.
-            // If source is outside root (canonicalization edge case), fall
-            // back to just the filename to stay contained in the out-dir.
-            let rel = match source.strip_prefix(root) {
-                Ok(r) => r.to_path_buf(),
-                Err(_) => {
-                    // Path-escape guard (AC-M7): use filename only.
-                    let stem = source.file_stem().unwrap_or(source.as_os_str());
-                    let mut name = std::ffi::OsString::from(stem);
-                    name.push(".md");
-                    return d.join(name);
-                }
-            };
-            // Replace the extension on the relative path.
-            let stem = rel.file_stem().unwrap_or(rel.as_os_str()).to_os_string();
-            let mut name = stem;
-            name.push(".md");
-            let out = d.join(rel.parent().unwrap_or(Path::new(""))).join(name);
-            // AC-M7 containment invariant: the output path must remain inside the out-dir.
-            // Enforced at runtime (not only in debug builds) so the path-escape boundary
-            // is guarded in production. If `strip_prefix` produced a relative path that
-            // somehow contains `..` or an absolute component, fall back to the flat
-            // `d/<stem>.md` form which is guaranteed to be inside `d` (reliability.md / #5).
-            if out.starts_with(d) {
-                out
-            } else {
-                debug_assert!(
-                    false,
-                    "output_path_for: AC-M7 violated — output {out:?} escaped out-dir {d:?}"
-                );
-                let stem = source
-                    .file_stem()
-                    .unwrap_or(source.as_os_str())
-                    .to_os_string();
-                let mut flat_name = stem;
-                flat_name.push(".md");
-                d.join(flat_name)
-            }
-        }
-        OutputBase::NextToSource => source.with_extension("md"),
-    }
-}
+// ── OutputBase re-exported from output.rs (moved for shared use) ─────────────
+//
+// `OutputBase`, `resolve_output_base`, `output_path_for`, `collect_mds_files`,
+// and `is_partial` are now defined in `output.rs` and imported above.
+// The doc comments there describe the contracts; no duplication needed here.
 
 // ── Pure helpers (unit-tested below) ─────────────────────────────────────────
 
@@ -277,73 +189,7 @@ pub(crate) fn event_is_relevant(event: &Event, watched: &HashSet<PathBuf>) -> bo
     false
 }
 
-/// Recursively collect all `.mds` files under `root`, bounded by `max_depth`.
-///
-/// Symlinked directories are skipped to avoid cycles.
-/// When `exclude_prefix` is `Some(p)`, any path that starts with `p` is skipped
-/// (used to exclude the out-dir when it is inside the watched root).
-pub(crate) fn collect_mds_files(
-    root: &Path,
-    max_depth: usize,
-    exclude_prefix: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    collect_mds_files_inner(root, 0, max_depth, exclude_prefix, &mut results);
-    results
-}
-
-fn collect_mds_files_inner(
-    dir: &Path,
-    depth: usize,
-    max_depth: usize,
-    exclude_prefix: Option<&Path>,
-    results: &mut Vec<PathBuf>,
-) {
-    if depth > max_depth {
-        eprintln!(
-            "warning: directory depth limit ({max_depth}) reached at {}; \
-             deeper files will not be watched",
-            dir.display()
-        );
-        return;
-    }
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return,
-    };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-
-        // Skip the output directory when it is nested inside the root.
-        if let Some(excl) = exclude_prefix {
-            if path.starts_with(excl) {
-                continue;
-            }
-        }
-
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if file_type.is_symlink() {
-            // Symlinked dirs skipped to prevent cycles.
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_mds_files_inner(&path, depth + 1, max_depth, exclude_prefix, results);
-        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
-            results.push(path);
-        }
-    }
-}
-
-/// Return `true` if `path`'s file name starts with `_` (partial convention, DD2).
-pub(crate) fn is_partial(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.starts_with('_'))
-        .unwrap_or(false)
-}
+// collect_mds_files and is_partial are now in output.rs (imported above).
 
 /// Canonicalize a graph key: exists → `p.canonicalize()`; missing → canonicalize parent + rejoin.
 ///
@@ -490,15 +336,20 @@ pub(crate) fn external_recovery_decision(
 /// Canonicalize an optional vars path so it matches the canonical paths in notify
 /// events (e.g. resolves `/tmp` → `/private/tmp` on macOS).
 ///
-/// Falls back to the raw path when canonicalization fails (file may not exist yet).
-pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Option<PathBuf> {
-    vars.map(|p| {
-        if p.exists() {
-            p.canonicalize().unwrap_or(p)
-        } else {
-            p
+/// Rejects a symlinked vars file at startup (build parity — PF-004).
+/// Falls back to the raw path when the file does not yet exist (the user may create
+/// it later; the per-rebuild `load_vars_file` will catch it then).
+pub(crate) fn canonicalize_vars_path(vars: Option<PathBuf>) -> Result<Option<PathBuf>, MdsError> {
+    match vars {
+        Some(p) if p.exists() => {
+            mds::NativeFs::check_symlink(&p)
+                .map(Some)
+                .map_err(|_| MdsError::Io {
+                    message: format!("--vars file must not be a symlink: {}", p.display()),
+                })
         }
-    })
+        other => Ok(other),
+    }
 }
 
 /// Write the ANSI clear-screen sequence to stderr if stderr is a TTY.
@@ -655,7 +506,6 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         out_dir,
         vars,
         set_vars,
-        format,
         clear,
         debounce,
         quiet,
@@ -680,25 +530,18 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
     let is_dir = resolved_input.is_dir();
 
     // Directory mode constraint checks.
-    if is_dir {
-        if output.is_some() {
-            return Err(miette::miette!(
-                "watch directory mode does not support -o/--output; \
-                 use --out-dir to specify an output directory"
-            ));
-        }
-        if format == OutputFormat::Messages {
-            return Err(miette::miette!(
-                "watch directory mode does not support --format messages; \
-                 multiple inputs cannot map to a single JSON document"
-            ));
-        }
+    if is_dir && output.is_some() {
+        return Err(miette::miette!(
+            "watch directory mode does not support -o/--output; \
+             use --out-dir to specify an output directory"
+        ));
     }
 
-    // Canonicalize the input path for stable comparisons.
-    let canonical_input = resolved_input
-        .canonicalize()
-        .map_err(|e| miette::miette!("cannot resolve path {}: {e}", resolved_input.display()))?;
+    // Reject a symlinked entry/target (build parity — PF-004); plain canonicalize
+    // would silently follow it. check_symlink returns the canonical path for
+    // non-symlinks, preserving FSEvents path-matching.
+    let canonical_input =
+        mds::NativeFs::check_symlink(&resolved_input).map_err(miette::Error::from)?;
 
     // Clamp poll_interval: 0 = disable; nonzero ≥ 50ms floor (ADR-021).
     let tick_opt: Option<Duration> = clamp_poll_interval(poll_interval);
@@ -721,7 +564,6 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
             out_dir,
             vars,
             set_vars,
-            format,
             clear,
             debounce,
             quiet,
@@ -738,13 +580,22 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 /// rebuild — replaces the 6-7 individual constant args on `rebuild_file` and
 /// `liveness_probe_file`, removing the `#[allow(clippy::too_many_arguments)]`
 /// suppressions (issue #6 / zero-warnings policy).
+///
+/// `output_path` is the path resolved from the startup compile (intrinsic: kind
+/// derived from the first compile result). On each rebuild the same path is reused
+/// unless `-o` was specified explicitly, in which case that path is canonical.
+/// For the watch single-file case the path is stable across recompiles (the template
+/// kind cannot change without the template itself changing, which triggers a rebuild).
 struct FileCompileCtx {
     entry: PathBuf,
     vars_path: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
-    format: OutputFormat,
+    /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
+    /// Kept here so `rebuild_file` can reuse the same path-derivation logic for
+    /// the dynamic path case (where output_path itself stays None until after compile).
+    output_arg: Option<String>,
+    out_dir: Option<PathBuf>,
     output_path: Option<PathBuf>,
-    output_key: String,
     quiet: bool,
 }
 
@@ -934,12 +785,41 @@ fn rebuild_file(
     };
 
     let t0 = Instant::now();
-    match compile_to_content(&ctx.entry, runtime_vars, &ctx.format, ctx.quiet) {
+    match compile_to_content(&ctx.entry, runtime_vars, ctx.quiet) {
         Ok(compiled) => {
+            // Derive the output path from the compiled kind (intrinsic extension).
+            // If ctx.output_path is already set (startup succeeded), reuse it.
+            // If ctx.output_path is None: either output is stdout (output_arg == Some("-")
+            // or no flags) OR startup failed. In either case, re-derive from kind + args.
+            // We load project config lazily here only if output_path is None and we need
+            // to derive from mds.json — for the common "startup succeeded" path this is free.
+            let output_path = if ctx.output_path.is_some() {
+                ctx.output_path.clone()
+            } else {
+                // output_path is None: this means either stdout or startup failed.
+                // Re-derive using kind. If -o - or stdin fallback, this returns None (stdout).
+                let config = load_config(&ctx.entry).unwrap_or(None);
+                resolve_output_path_for_kind(
+                    &Some(ctx.entry.clone()),
+                    &ctx.output_arg,
+                    &ctx.out_dir,
+                    &config,
+                    compiled.kind,
+                    ctx.quiet,
+                )
+                .unwrap_or(None)
+            };
+
+            // Build the output_key for content-dedup.
+            let output_key: String = output_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<stdout>".to_string());
+
             // Content-based dedup: skip write + summary line when unchanged.
             let content_changed = state
                 .last_written
-                .get(&ctx.output_key)
+                .get(&output_key)
                 .is_none_or(|prev| *prev != compiled.content);
 
             // ADR-016: always recompute dep set from fresh output.
@@ -955,18 +835,15 @@ fn rebuild_file(
             state.last_mtimes = snapshot_state(&state.foi);
 
             if content_changed {
-                match write_output(ctx.output_path.clone(), &compiled.content, ctx.quiet, false) {
+                match write_output(output_path.clone(), &compiled.content, ctx.quiet, false) {
                     Ok(()) => {
                         let elapsed = t0.elapsed().as_millis();
                         let dep_count = compiled.dependencies.len();
-                        let out_display = ctx
-                            .output_path
+                        let out_display = output_path
                             .as_deref()
                             .map(|p| p.display().to_string())
                             .unwrap_or_else(|| "<stdout>".to_string());
-                        state
-                            .last_written
-                            .insert(ctx.output_key.clone(), compiled.content);
+                        state.last_written.insert(output_key, compiled.content);
                         if !ctx.quiet {
                             eprintln!(
                                 "Recompiled {} ({} deps) in {}ms",
@@ -998,41 +875,60 @@ fn run_watch_file(
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
-    format: OutputFormat,
     clear: bool,
     debounce_ms: u64,
     quiet: bool,
     tick: Option<Duration>,
 ) -> Result<()> {
-    // Resolve output path ONCE at startup (before entering the watch loop).
-    let config = load_config(&entry)?;
-    let output_path = resolve_output_path(&Some(entry.clone()), &output, &out_dir, &config)?;
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    let vars_path = canonicalize_vars_path(vars);
+    // Also rejects a symlinked vars file at startup (build parity — PF-004).
+    let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
 
     // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
     let static_set_vars = set_vars;
 
-    // Initial compile.
+    // Initial compile: compile first, derive output path from kind (compile-then-route).
+    // For explicit -o / --out-dir the path is determined by the flag.
+    // For the default case (no explicit flag), the path depends on the output kind, which
+    // is only known after compilation — so we compile first, then derive.
     let runtime_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
     if !quiet {
         eprintln!("Watching {}", entry.display());
     }
+
+    // Load project config (for output_dir) — used if no explicit -o / --out-dir.
+    let config = load_config(&entry)?;
+
+    // Initial compile: returns (output_path, deps, content).
+    // content is captured here so the baseline block below can reuse it without
+    // recompiling (issue 3 — avoids a redundant second compile at startup).
+    let (output_path, initial_deps, initial_content) =
+        match compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet) {
+            Ok(result) => result,
+            Err(e) => {
+                // Initial compile error: print and continue watching (entry dir still watched).
+                eprintln!("{e:?}");
+                // Fall back: resolve output path with Markdown kind as a placeholder so we
+                // know where to watch. This path may not match a later successful compile if
+                // the template has @message blocks, but it will correct on first successful rebuild.
+                let fallback_path = resolve_output_path_for_kind(
+                    &Some(entry.clone()),
+                    &output,
+                    &out_dir,
+                    &config,
+                    OutputKind::Markdown,
+                    quiet,
+                )
+                .unwrap_or(None);
+                (fallback_path, vec![], String::new())
+            }
+        };
+
     // Key: resolved output path string, or the sentinel "<stdout>" when output_path is None.
     let output_key: String = output_path
         .as_deref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<stdout>".to_string());
-
-    let initial_deps =
-        match compile_and_write(&entry, output_path.clone(), runtime_vars, &format, quiet) {
-            Ok(deps) => deps,
-            Err(e) => {
-                // Initial compile error: print and continue watching (entry dir still watched).
-                eprintln!("{e:?}");
-                vec![]
-            }
-        };
 
     // Set up the watcher AFTER the initial compile so we can record the baseline
     // content in last_written before any FSEvents arrive.
@@ -1072,22 +968,12 @@ fn run_watch_file(
 
     // Record baseline content AFTER setting up watches to suppress the first
     // synthetic FSEvent from macOS (baseline taken from the same state the watcher sees).
+    // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
     let mut last_written: HashMap<String, String> = HashMap::new();
-    {
-        let baseline_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
-        match compile_to_content(
-            &entry,
-            baseline_vars,
-            &format,
-            true, /* quiet for baseline */
-        ) {
-            Ok(out) => {
-                last_written.insert(output_key.clone(), out.content);
-            }
-            Err(_) => {
-                // Baseline compile failed — leave last_written empty so next rebuild always writes.
-            }
-        }
+    if !initial_content.is_empty() {
+        // initial_content is empty only when the initial compile failed (error path above).
+        // In that case leave last_written empty so the next successful rebuild always writes.
+        last_written.insert(output_key.clone(), initial_content);
     }
 
     let foi = files_of_interest(&entry, &initial_deps, vars_path.as_deref());
@@ -1123,9 +1009,9 @@ fn run_watch_file(
         entry,
         vars_path,
         static_set_vars,
-        format,
+        output_arg: output,
+        out_dir,
         output_path,
-        output_key,
         quiet,
     };
 
@@ -1288,9 +1174,8 @@ fn compile_one_source(
     quiet: bool,
     state: &mut DirWatchState,
 ) {
-    let out = output_path_for(src, root, output_base);
     let t0 = Instant::now();
-    match compile_to_content(src, runtime_vars.clone(), &OutputFormat::Markdown, quiet) {
+    match compile_to_content(src, runtime_vars.clone(), quiet) {
         Ok(compiled) => {
             let dep_paths: Vec<PathBuf> = compiled.dependencies.iter().map(PathBuf::from).collect();
 
@@ -1300,6 +1185,11 @@ fn compile_one_source(
                 settle_mtime(src, &mut state.last_mtimes);
                 return;
             }
+
+            // Derive the output path from the compiled kind (intrinsic extension).
+            // AC-FUNC-23: a @message template writes .json; a plain template writes .md.
+            let ext = compiled.kind.extension();
+            let out = output_path_for(src, root, output_base, ext);
 
             // Content-based dedup: skip write when content unchanged.
             let content_changed = state
@@ -1320,6 +1210,31 @@ fn compile_one_source(
                                 elapsed
                             );
                         }
+                        // AC-FUNC-23 (stale-output cleanup on format-flip in watch mode):
+                        // probe for the wrong-extension sibling and unlink it — but ONLY
+                        // when the tool itself wrote that sibling this session (gate on
+                        // last_written membership). This prevents clobbering a hand-authored
+                        // file that happens to share the stem (e.g. notes.md kept next to
+                        // notes.mds which now compiles to notes.json). Issue 1.
+                        //
+                        // This unlink must NOT trigger the watcher: `out` is the NEW
+                        // output path we just wrote; the stale sibling has a DIFFERENT
+                        // extension, so it is outside the `last_written` map and the
+                        // `is_content_event` gate will drop any inotify events it causes.
+                        // The watcher self-trigger guard (content-dedup / last_written)
+                        // also covers the freshly written `out` — the next event for that
+                        // path will find identical content and skip the write.
+                        let base_no_ext = output_base_no_ext(src, root, output_base);
+                        let stale_path =
+                            base_no_ext.with_extension(compiled.kind.stale_extension());
+                        // Remove the stale-extension sibling from last_written so the key
+                        // doesn't accumulate stale entries (memory hygiene). The remove()
+                        // return value tells us whether this tool wrote the stale path.
+                        let tool_wrote_stale = state.last_written.remove(&stale_path).is_some();
+                        if tool_wrote_stale {
+                            probe_and_remove_stale(&base_no_ext, compiled.kind);
+                        }
+
                         state.record_success(
                             src,
                             dep_paths,
@@ -1664,24 +1579,13 @@ fn dir_watch_startup(
     // Load config once from the root directory.
     let config = load_config(&root)?;
     // Canonicalize so path matches notify event paths (resolves /tmp → /private/tmp on macOS).
-    let vars_path = canonicalize_vars_path(vars);
+    // Also rejects a symlinked vars file at startup (build parity — PF-004).
+    let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
     let static_set_vars = set_vars;
 
-    // Resolve the out_dir as absolute and canonicalized so that
-    // the `starts_with(&root)` in-root exclusion check is reliable even when
-    // `cwd` contains symlinks (root is already canonical from run_watch, security #8).
-    let abs_out_dir: Option<PathBuf> = out_dir.as_ref().map(|d| {
-        let abs = if d.is_absolute() {
-            d.clone()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(d)
-        };
-        // Best-effort: canonicalize when the path exists; fall back to absolute form when
-        // the out-dir doesn't yet exist (it will be created by write_output on first write).
-        abs.canonicalize().unwrap_or(abs)
-    });
+    // Canonicalize out_dir as absolute so the starts_with(&root) in-root exclusion check
+    // is reliable even when cwd contains symlinks (root is already canonical — security #8).
+    let abs_out_dir = canonicalize_out_dir(out_dir.as_ref());
 
     // Compute the OutputBase (Fix 2 — subtree mirroring). Reject `..` at startup.
     let output_base = resolve_output_base(abs_out_dir.as_deref(), &config)?;
@@ -1713,8 +1617,7 @@ fn dir_watch_startup(
 
     for source in &all_files {
         let key = graph_key(source);
-        let out = output_path_for(&key, &root, &output_base);
-        match compile_to_content(source, runtime_vars.clone(), &OutputFormat::Markdown, quiet) {
+        match compile_to_content(source, runtime_vars.clone(), quiet) {
             Ok(compiled) => {
                 // Collect dep paths (already canonical from mds-core).
                 let dep_paths: Vec<PathBuf> =
@@ -1734,6 +1637,9 @@ fn dir_watch_startup(
 
                 // Partials (DD2): track in graph but don't emit their own output.
                 if !is_partial(source) {
+                    // Derive the output path from the compiled kind (intrinsic extension).
+                    let ext = compiled.kind.extension();
+                    let out = output_path_for(&key, &root, &output_base, ext);
                     if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
                     {
                         eprintln!("{e:?}");
@@ -1820,18 +1726,19 @@ fn dir_watch_startup(
             if is_partial(source) {
                 continue; // Partials have no output path in last_written.
             }
-            let out = output_path_for(&key, &root, &output_base);
-            if state.last_written.contains_key(&out) {
-                // Already recorded from startup compile — skip.
-                continue;
-            }
             match compile_to_content(
                 source,
                 baseline_vars.clone(),
-                &OutputFormat::Markdown,
                 true, /* quiet for baseline */
             ) {
                 Ok(compiled) => {
+                    // Derive output path from the compiled kind (intrinsic extension).
+                    let ext = compiled.kind.extension();
+                    let out = output_path_for(&key, &root, &output_base, ext);
+                    if state.last_written.contains_key(&out) {
+                        // Already recorded from startup compile — skip.
+                        continue;
+                    }
                     state.last_written.insert(out, compiled.content);
                 }
                 Err(_) => {
@@ -1983,23 +1890,30 @@ fn process_dir_batch_vars_changed(
     // removed just as in the incremental deletion step (step 5).
     let deleted: Vec<&PathBuf> = all_sources.iter().filter(|p| !p.exists()).collect();
     for del_src in &deleted {
-        let out = output_path_for(del_src, root, output_base);
-        if out.exists() {
-            match std::fs::remove_file(&out) {
-                Ok(()) => {
-                    if !quiet {
-                        eprintln!("Removed {} (source deleted)", out.display());
+        // Source is gone — we don't know the extension it used. Probe both.
+        let base_no_ext = output_base_no_ext(del_src, root, output_base);
+        for ext in &["md", "json"] {
+            let out = base_no_ext.with_extension(ext);
+            if out.exists() {
+                match std::fs::remove_file(&out) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("Removed {} (source deleted)", out.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: could not remove {}: {e}", out.display());
                     }
                 }
-                Err(e) => {
-                    eprintln!("warning: could not remove {}: {e}", out.display());
-                }
+                // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
+                // (forward_deps, errored, known_files, last_written).
+                state.forget(del_src, &out);
             }
         }
-        // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
-        // (forward_deps, errored, known_files, last_written) — the previous open-coded
-        // triple-remove inadvertently omitted known_files.remove (complexity.md / issue #4).
-        state.forget(del_src, &out);
+        // Ensure the source is cleaned from state even if neither sibling existed.
+        state.forward_deps.remove(*del_src);
+        state.errored.remove(*del_src);
+        state.known_files.remove(*del_src);
     }
 
     // Snapshot the old maps, clear them so compile_one_source's record_success
@@ -2075,8 +1989,12 @@ fn process_dir_batch_incremental(
             // `forward_deps`, and `known_files` now so it doesn't accumulate as a ghost
             // entry and waste per-batch allocation on every subsequent real-change event.
             if !deleted.contains(src) {
-                let out = output_path_for(src, root, output_base);
-                state.forget(src, &out);
+                // Source is gone — probe both .md and .json to clean up either sibling.
+                let base_no_ext = output_base_no_ext(src, root, output_base);
+                for ext in &["md", "json"] {
+                    let out = base_no_ext.with_extension(ext);
+                    state.forget(src, &out);
+                }
             }
             continue;
         }
@@ -2084,7 +2002,7 @@ fn process_dir_batch_incremental(
         // External deps are graph nodes but never emit their own output (DD3).
         if !is_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match compile_to_content(src, runtime_vars.clone(), &OutputFormat::Markdown, true) {
+            match compile_to_content(src, runtime_vars.clone(), true) {
                 Ok(compiled) => {
                     let dep_paths: Vec<PathBuf> =
                         compiled.dependencies.iter().map(PathBuf::from).collect();
@@ -2106,20 +2024,28 @@ fn process_dir_batch_incremental(
 
     // 5. Deletions: after importers recompiled, clean up graph + outputs.
     for del_src in &deleted {
-        let out = output_path_for(del_src, root, output_base);
-        if out.exists() {
-            match std::fs::remove_file(&out) {
-                Ok(()) => {
-                    if !quiet {
-                        eprintln!("Removed {} (source deleted)", out.display());
+        // Source is gone — we don't know the extension it used. Probe both.
+        let base_no_ext = output_base_no_ext(del_src, root, output_base);
+        for ext in &["md", "json"] {
+            let out = base_no_ext.with_extension(ext);
+            if out.exists() {
+                match std::fs::remove_file(&out) {
+                    Ok(()) => {
+                        if !quiet {
+                            eprintln!("Removed {} (source deleted)", out.display());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: could not remove {}: {e}", out.display());
                     }
                 }
-                Err(e) => {
-                    eprintln!("warning: could not remove {}: {e}", out.display());
-                }
             }
+            state.forget(del_src, &out);
         }
-        state.forget(del_src, &out);
+        // Ensure source is cleaned even if no outputs were found.
+        state.forward_deps.remove(del_src);
+        state.errored.remove(del_src);
+        state.known_files.remove(del_src);
     }
 
     // 6. Prune external_dep_dirs to only dirs still referenced by live forward_deps.
@@ -2312,7 +2238,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         assert_eq!(result, PathBuf::from("/out/a/b/foo.md"));
     }
 
@@ -2324,16 +2250,16 @@ mod tests {
         let b = PathBuf::from("/root/b/x.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
         assert_ne!(
-            output_path_for(&a, &root, &base),
-            output_path_for(&b, &root, &base),
+            output_path_for(&a, &root, &base, "md"),
+            output_path_for(&b, &root, &base, "md"),
             "two files with the same stem in different subdirs must not collide"
         );
         assert_eq!(
-            output_path_for(&a, &root, &base),
+            output_path_for(&a, &root, &base, "md"),
             PathBuf::from("/out/a/x.md")
         );
         assert_eq!(
-            output_path_for(&b, &root, &base),
+            output_path_for(&b, &root, &base, "md"),
             PathBuf::from("/out/b/x.md")
         );
     }
@@ -2343,7 +2269,7 @@ mod tests {
     fn output_path_for_next_to_source() {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/a/b/foo.mds");
-        let result = output_path_for(&source, &root, &OutputBase::NextToSource);
+        let result = output_path_for(&source, &root, &OutputBase::NextToSource, "md");
         assert_eq!(result, PathBuf::from("/root/a/b/foo.md"));
     }
 
@@ -2353,7 +2279,7 @@ mod tests {
         let root = PathBuf::from("/root");
         let source = PathBuf::from("/root/foo.bar.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         assert_eq!(result, PathBuf::from("/out/foo.bar.md"));
     }
 
@@ -2364,7 +2290,7 @@ mod tests {
         // Source is completely outside root — strip_prefix will fail.
         let source = PathBuf::from("/elsewhere/a/b/foo.mds");
         let base = OutputBase::Dir(PathBuf::from("/out"));
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         // Must be inside /out, not escape to /elsewhere.
         assert!(
             result.starts_with("/out"),
@@ -2696,7 +2622,7 @@ mod tests {
 
         let source = root.join("template.mds");
         let base = OutputBase::Dir(new_subdir.clone());
-        let result = output_path_for(&source, &root, &base);
+        let result = output_path_for(&source, &root, &base, "md");
         assert_eq!(result, new_subdir.join("template.md"));
         assert!(
             !new_subdir.exists(),
@@ -2725,15 +2651,11 @@ mod tests {
             "@import \"./helper.mds\" as h\n\n{h.greet(\"World\")}\n",
         )
         .unwrap();
+        // Use -o <out> style to direct output to a specific path.
         let out = dir.path().join("entry.md");
-        let deps = compile_and_write(
-            &entry,
-            Some(out.clone()),
-            None,
-            &OutputFormat::Markdown,
-            true,
-        )
-        .unwrap();
+        let out_str = out.display().to_string();
+        let (_written_path, deps, _content) =
+            compile_and_write(&entry, &Some(out_str), &None, &None, None, true).unwrap();
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");
         assert!(

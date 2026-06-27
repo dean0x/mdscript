@@ -9,12 +9,13 @@ use mds::{MdsError, ModuleCache, Value};
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
-/// Compile a virtual module set and return the output string.
+/// Compile a virtual module set and return the rendered Markdown string.
 ///
 /// Creates a `ModuleCache::virtual_fs` from `modules`, resolves `entry` by key,
-/// and returns the rendered output (prompt body with frontmatter prepended).
+/// and returns the rendered Markdown (prompt body with frontmatter prepended).
+/// These tests use plain (non-`@message`) templates, so the output is Markdown.
 fn compile_vfs(modules: HashMap<String, String>, entry: &str) -> Result<String, MdsError> {
-    mds::compile_virtual(modules, entry, None)
+    mds::compile_virtual(modules, entry, None).and_then(mds::CompileResult::into_markdown)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -302,8 +303,11 @@ fn deps_single_file() {
         "---\nname: World\n---\nHello {name}!\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
-    assert_eq!(result.output, "---\nname: World\n---\nHello World!\n");
     assert_eq!(result.dependencies, Vec::<String>::new());
+    assert_eq!(
+        result.into_markdown().unwrap(),
+        "---\nname: World\n---\nHello World!\n"
+    );
 }
 
 #[test]
@@ -319,12 +323,9 @@ fn deps_two_files() {
         "@import \"./lib.mds\"\n{greet(\"Alice\")}\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
-    assert!(
-        result.output.contains("Hello Alice!"),
-        "got: {}",
-        result.output
-    );
     assert_eq!(result.dependencies, vec!["lib.mds".to_string()]);
+    let md = result.into_markdown().unwrap();
+    assert!(md.contains("Hello Alice!"), "got: {md}");
 }
 
 #[test]
@@ -344,12 +345,13 @@ fn deps_three_file_chain() {
         "@import \"./b.mds\"\n{greet(\"World\")}\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "a.mds", None).expect("should compile");
-    assert!(result.output.contains("World!!!"), "got: {}", result.output);
     // Resolution is post-order DFS: c is inserted first (leaf), then b, then a (entry, excluded).
     assert_eq!(
         result.dependencies,
         vec!["c.mds".to_string(), "b.mds".to_string()]
     );
+    let md = result.into_markdown().unwrap();
+    assert!(md.contains("World!!!"), "got: {md}");
 }
 
 #[test]
@@ -379,7 +381,8 @@ fn deps_diamond_no_duplicates() {
         "@import \"./a.mds\"\n@import \"./b.mds\"\nhello\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
-    assert!(result.output.contains("hello"), "got: {}", result.output);
+    let md = result.clone().into_markdown().unwrap();
+    assert!(md.contains("hello"), "got: {md}");
     // shared must appear exactly once
     let shared_count = result
         .dependencies
@@ -424,13 +427,10 @@ fn deps_str_with_deps_basic() {
     // Instead test the no-import case:
     let result = mds::compile_str_with_deps("---\nname: Alice\n---\nHi {name}!\n", None, None)
         .expect("should compile");
-    assert!(
-        result.output.contains("Hi Alice!"),
-        "got: {}",
-        result.output
-    );
     // No imports → no deps
     assert_eq!(result.dependencies, Vec::<String>::new());
+    let md = result.into_markdown().unwrap();
+    assert!(md.contains("Hi Alice!"), "got: {md}");
 }
 
 #[test]
@@ -448,11 +448,6 @@ fn deps_str_with_deps_file_import() {
     let result = mds::compile_str_with_deps(source, Some(dir.path()), None)
         .expect("should compile with file import");
 
-    assert!(
-        result.output.contains("Hello World!"),
-        "expected rendered output, got: {}",
-        result.output
-    );
     // The lib file is an imported dependency; source string is not a file, so
     // only the imported lib appears in dependencies.
     assert_eq!(
@@ -461,10 +456,15 @@ fn deps_str_with_deps_file_import() {
         "expected 1 dep, got: {:?}",
         result.dependencies
     );
-    let dep = &result.dependencies[0];
+    let dep = result.dependencies[0].clone();
     assert!(
         dep.ends_with("lib.mds"),
         "expected dep ending in lib.mds, got: {dep}"
+    );
+    let md = result.into_markdown().unwrap();
+    assert!(
+        md.contains("Hello World!"),
+        "expected rendered output, got: {md}"
     );
 }
 

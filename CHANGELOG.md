@@ -7,22 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### CLI
+### **BREAKING** — Intrinsic output format (removes `--format` flag and `compileMessages` API)
 
-- `mds watch` subcommand: watches an `.mds` file (or directory) and auto-recompiles on
-  save. Single-file mode tracks transitive `@import` deps — editing any imported file
-  triggers a rebuild. Directory mode tracks a **reverse-dependency graph**: editing a
-  shared partial recompiles all transitive importers. Full flag parity with `mds build`:
-  `-o`, `--out-dir`, `--vars`, `--set`, `--format` (single-file only), `--clear`
-  (clears terminal before rebuild when stderr is a TTY), `--debounce` (milliseconds,
-  default 100), `--poll-interval` (self-heal tick in ms, default 1000; `0` disables).
-  Status/warnings/errors go to stderr; compiled content goes to stdout only when `-o -`.
-  Ctrl+C exits cleanly with code 0. Depends on `notify 8` and `ctrlc 3.5` (both
-  compatible with the workspace MSRV of 1.88).
-- Internal refactor: build logic extracted from `main.rs` into `build.rs` with
-  `pub(crate)` helpers; `compile_and_write` shared helper routes both markdown and
-  messages modes through `read_build_input` / `compile_with_deps`, preserving the
-  10 MiB file-size cap on all code paths (PF-004).
+Output shape is now **intrinsic to the template** — decided by content, never a flag:
+
+- A template containing any `@message` block → JSON messages array (`.json`).
+  Detection is static: a `@message` even inside an `@if` branch that is never taken at
+  runtime makes the template a messages template.
+- All other templates → Markdown string (`.md`).
+- **Mixed content** (loose top-level prose or interpolations alongside `@message` blocks)
+  is a hard compile error: `mds::mixed_content`. There is no silent drop or auto-wrap.
+- A messages template that yields zero messages at runtime emits `[]`.
+
+**Removed** (breaking):
+
+- CLI `--format` flag — passing it is now an unknown-argument error.
+- Rust `compile_messages_str`, `compile_messages_str_with_deps`,
+  `compile_messages_virtual`, `compile_messages_virtual_with_deps` (mds-core).
+- JS `compileMessages` / `compileMessagesFile` from `@mdscript/mds`, `@mdscript/mds-napi`,
+  and `@mdscript/mds-wasm`.
+- JS type `CompileMessagesResult` — superseded by the discriminated `CompileResult` union.
+
+**New API** (replacing the above):
+
+- `compile(src, opts?)` / `compileFile(path, opts?)` → discriminated union
+  `{ kind:'markdown', output:string, warnings, dependencies }` |
+  `{ kind:'messages', messages:Message[], warnings, dependencies }`.
+  The inactive payload field (`output` or `messages`) is absent — branch on `kind`.
+- Rust `compile_str` / `compile_virtual` / `compile_file` return `CompileResult` with the
+  same discriminated shape; use `.into_markdown()` / `.into_messages()` to extract.
+- Bundler plugins: importing a `.mds` (or `.md` with `type: mds` frontmatter)
+  default-exports a **string** for Markdown templates, a **`Message[]` array** for
+  messages templates. The ambient type declaration in `@mdscript/bundler-utils/mds` is
+  `string | MdsMessage[]`.
+
+### **BREAKING** — `mds build/check <dir>` directory mode
+
+`mds build` and `mds check` now accept a directory argument:
+
+- Compiles (or validates) every non-partial `.mds` file in the tree recursively.
+- Output extension is intrinsic per file (`.md` or `.json`).
+- With `--out-dir <out>`, mirrors the source subtree; without it, writes next to source.
+- `_`-prefixed files are partials: they are skipped (not compiled to output).
+- Symlinked files and symlinked directories inside the tree are skipped; a symlinked
+  entry root is rejected at startup with a non-zero exit.
+- `-o` is rejected for a directory input.
+- Continue-on-error: all files are attempted; summary + non-zero exit if any failed.
+- Empty directory: exits 0 with a "no .mds files found" message.
+- **Stale-flip cleanup**: when a file's kind changes (Markdown ↔ messages), the old
+  sibling output (`.md` or `.json`) is deleted automatically.
 
 ### **BREAKING** — `mds watch` output layout change (dir mode)
 
@@ -31,9 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Old flat outputs are orphaned on disk — no auto-migration. Users with `--out-dir`
   must delete stale flat outputs manually. Zero published users.
 - **`_`-prefixed files are now treated as partials**: they are tracked in the dependency
-  graph and trigger rebuilds of their importers, but they no longer emit their own `.md`
-  output file. Rename any `_`-prefixed files you previously wanted to compile to
-  a name without a leading underscore.
+  graph and trigger rebuilds of their importers, but they no longer emit their own output
+  file. Rename any `_`-prefixed files you previously wanted to compile to a name without
+  a leading underscore.
 
 ### Language features
 
@@ -44,32 +77,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MAX_FRONTMATTER_MERGE_DEPTH` (64). See spec §4.11.
 - `@message role: … @end` blocks for structured chat-message output. Roles may be
   bare words (literal strings) or `{expr}` (evaluated at runtime using the full
-  expression grammar). Templates without `@message` blocks compile identically to
-  before; in `markdown` mode `@message` body content renders inline.
+  expression grammar). Output kind is intrinsic — see above.
 
 ### CLI
 
-- `mds build --format messages` emits a pretty-printed JSON `[{role, content}]` array
-  to stdout or `-o <path>`; `--out-dir` and `mds.json` `output_dir` are ignored in
-  this mode.
-
-### Library API
-
-- `compile_messages_str`, `compile_messages_str_with_deps`,
-  `compile_messages_virtual`, `compile_messages_virtual_with_deps` (mds-core)
-- `compileMessages(source, options?)` exported from `@mdscript/mds` (both NAPI
-  and WASM backends)
-- `compileMessages` exported directly from `@mdscript/mds-napi` (native addon)
-- `compileMessages` exported from `@mdscript/mds-wasm` (WASM module)
-- New public types: `Message` (`{ role: string; content: string }`) and
-  `CompileMessagesResult` (`{ messages, warnings, dependencies }`)
+- `mds watch` subcommand: watches an `.mds` file (or directory) and auto-recompiles on
+  save. Single-file mode tracks transitive `@import` deps — editing any imported file
+  triggers a rebuild. Directory mode tracks a **reverse-dependency graph**: editing a
+  shared partial recompiles all transitive importers. Full flag parity with `mds build`:
+  `-o`, `--out-dir`, `--vars`, `--set`, `--clear` (clears terminal before rebuild when
+  stderr is a TTY), `--debounce` (milliseconds, default 100), `--poll-interval`
+  (self-heal tick in ms, default 1000; `0` disables). Status/warnings/errors go to
+  stderr; compiled content goes to stdout only when `-o -`. Ctrl+C exits cleanly with
+  code 0. Depends on `notify 8` and `ctrlc 3.5` (both compatible with MSRV 1.88).
+- Internal refactor: shared output-path and directory-traversal logic extracted to
+  `crates/mds-cli/src/output.rs` (`output_path_for`, `collect_mds_files`,
+  `probe_and_remove_stale`, etc.) to remove duplication across `build.rs` and `watch.rs`.
 
 ### Security & resource limits
 
+- `mds watch` now rejects a symlinked entry file, symlinked `--vars` file, or symlinked
+  directory target at startup (non-zero exit, symlink message on stderr) — parity with
+  `mds build`. Previously `mds watch` called `std::fs::canonicalize` up-front, silently
+  following symlinks that `mds build` would reject via the core `NativeFs::check_symlink`
+  guard. The fix routes watch startup through the same guard. Symlinked `.mds` source
+  files inside a watched directory continue to be skipped at discovery.
 - `MAX_MESSAGE_COUNT` (10,000) cap: templates exceeding this limit return a resource
   error rather than allocating unboundedly.
 - Cumulative message-content size cap (50 MB): enforced per-compile across all
   `@message` blocks.
+
+### Library API (additions)
+
+- `NativeFs::check_symlink(path: &Path) -> Result<PathBuf, MdsError>` is now `pub`
+  (was `pub(crate)`). Canonicalizes `path` and rejects a symlinked final component;
+  returns the canonical `PathBuf` for non-symlinks. Callable as
+  `mds::NativeFs::check_symlink(path)`.
 
 ### Ecosystem
 

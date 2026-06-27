@@ -1,6 +1,9 @@
 export type {
   MdsApi,
   CompileResult,
+  MarkdownResult,
+  MessagesResult,
+  Message,
   TransformResult,
   MdsPluginOptions,
   FormattedError,

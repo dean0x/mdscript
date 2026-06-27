@@ -440,6 +440,17 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
         .map_err(|e| js_error(&format!("failed to serialize result: {e}"), "mds::internal"))
 }
 
+/// Build the canonical `{ kind, <active-payload>, warnings, dependencies }` JS object
+/// from a [`mds::CompileResult`].
+///
+/// Delegates to [`mds::CompileResult::to_canonical_json`], the single authoritative
+/// implementation shared with the NAPI binding (AC-API-13: both bindings must produce
+/// byte-identical wire output). The resulting `serde_json::Value` is then converted to
+/// a `JsValue` via the JSON-compatible serializer.
+fn build_canonical_js(result: mds::CompileResult) -> Result<JsValue, JsValue> {
+    to_js(&result.to_canonical_json())
+}
+
 // ── Public WASM exports ───────────────────────────────────────────────────────
 
 /// Compile an MDS template source string and return a structured result object.
@@ -454,7 +465,12 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 ///
 /// ## Returns
 ///
-/// On success, a JS object `{ output: string, warnings: string[], dependencies: string[] }`.
+/// On success, a JS discriminated-union object:
+/// - Markdown: `{ kind: "markdown", output: string, warnings: string[], dependencies: string[] }`
+/// - Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
+///
+/// The inactive payload field is absent — a markdown result has no `messages` key;
+/// a messages result has no `output` key.
 ///
 /// On failure, throws a JS `Error` with additional properties:
 /// - `code`: diagnostic code (e.g. `"mds::syntax"`)
@@ -465,6 +481,7 @@ fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
 ///
 /// ```js
 /// const result = compile('Hello {name}!\n', { vars: { name: 'World' } });
+/// console.log(result.kind);   // "markdown"
 /// console.log(result.output); // "Hello World!\n"
 /// ```
 #[wasm_bindgen]
@@ -480,7 +497,7 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         let result = mds::compile_virtual_with_deps(modules, &opts.filename, opts.vars)
             .map_err(mds_error_to_js)?;
 
-        to_js(&result)
+        build_canonical_js(result)
     }))
 }
 
@@ -518,56 +535,6 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
                 .map_err(mds_error_to_js)?;
 
         to_js(&CheckOutput { warnings })
-    }))
-}
-
-/// Compile an MDS template in messages mode, returning structured chat messages.
-///
-/// Each `@message role:` ... `@end` block in the template becomes one entry in
-/// the returned `messages` array. Orphan text outside `@message` blocks is
-/// ignored with a warning. Empty messages (after trimming) are skipped.
-///
-/// Returns an error when the template contains no `@message` blocks.
-///
-/// ## Arguments
-///
-/// - `source`: MDS template source text.
-/// - `options`: optional configuration object (same fields as [`compile`]).
-///
-/// ## Returns
-///
-/// On success, a JS object:
-/// ```json
-/// {
-///   "messages": [{ "role": "system", "content": "..." }, ...],
-///   "warnings": [],
-///   "dependencies": []
-/// }
-/// ```
-///
-/// On failure, throws a JS `Error` with the same structure as [`compile`].
-///
-/// ## Example (JavaScript)
-///
-/// ```js
-/// const result = compileMessages('@message system:\nYou are helpful.\n@end\n');
-/// console.log(result.messages[0].role);    // "system"
-/// console.log(result.messages[0].content); // "You are helpful."
-/// ```
-#[wasm_bindgen(js_name = "compileMessages")]
-pub fn compile_messages(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
-    check_source_size(source)?;
-
-    // Owned String required so the closure satisfies UnwindSafe.
-    let source = source.to_string();
-
-    catch_panic(AssertUnwindSafe(move || {
-        let opts = parse_options(options)?;
-        let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
-        let result = mds::compile_messages_virtual_with_deps(modules, &opts.filename, opts.vars)
-            .map_err(mds_error_to_js)?;
-
-        to_js(&result)
     }))
 }
 

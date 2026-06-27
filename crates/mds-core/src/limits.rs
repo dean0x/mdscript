@@ -59,7 +59,7 @@ pub(crate) const MAX_ARRAY_ELEMENTS: usize = 100_000;
 /// 256 entries is generous for any real template.
 pub(crate) const MAX_FRONTMATTER_IMPORTS: usize = 256;
 
-/// Maximum number of messages that `compile_messages` may produce.
+/// Maximum number of messages a `@message`-bearing template may produce.
 ///
 /// Prevents runaway memory use from adversarial inputs that generate thousands
 /// of messages via `@for` loops or deeply nested conditionals.
@@ -82,7 +82,7 @@ pub(crate) const MAX_BLOCKS_PER_MODULE: usize = 256;
 /// Exceeding this limit surfaces as `mds::resource_limit` (P4).
 pub(crate) const MAX_FRONTMATTER_MERGE_DEPTH: usize = 64;
 
-/// Maximum cumulative byte size of all message content produced by `compile_messages`.
+/// Maximum cumulative byte size of all message content produced by a `@message`-bearing template.
 ///
 /// Caps the aggregate content across the entire message array at the same ceiling as
 /// a single text-mode output (MAX_OUTPUT_SIZE = 50 MB).  Without this, 10 000 messages
