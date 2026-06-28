@@ -82,28 +82,34 @@ runtime on the affected platform. Do not proceed past a failing gate.
 
 ## Release
 
-### Automated (recommended)
+### Tag-push (current working path)
 
-One command does everything: bumps all versions, stamps the CHANGELOG, commits,
-tags, and publishes:
-
-```bash
-gh workflow run release.yml -f version=X.Y.Z
-```
-
-The `prepare` job bumps all Cargo.toml and package.json files, stamps the
-CHANGELOG, commits to `main`, creates the `vX.Y.Z` tag, and pushes. The
-remaining jobs then build and publish.
-
-### Manual (alternative)
+The release is driven by pushing a `vX.Y.Z` tag. This is how v0.1.0–v0.3.0 shipped.
 
 1. **Bump versions:** `node scripts/bump-version.mjs X.Y.Z` (updates all
-   manifests and stamps the CHANGELOG). Commit and push to `main`.
-2. **Tag and push:**
+   manifests and stamps the CHANGELOG, opening a fresh `[Unreleased]`).
+2. **Land the bump on `main`:** open a PR (CI-gated). `main` is protected and the
+   sole code-owner can't self-approve, so the merge needs an admin override
+   (`enforce_admins=false` permits it). Squash-merge to keep linear history.
+3. **Tag the merged commit and push:**
    ```bash
-   git tag vX.Y.Z
+   git tag -a vX.Y.Z -m vX.Y.Z
    git push origin vX.Y.Z
    ```
+   The tag push triggers `release.yml`; the `prepare` job is skipped and the
+   build+publish jobs run from the tag.
+
+### Automated `workflow_dispatch` — currently BLOCKED (#127)
+
+```bash
+gh workflow run release.yml -f version=X.Y.Z   # DOES NOT WORK YET — see #127
+```
+
+Intended to do everything in one command, but its `prepare` job pushes the release
+commit directly to protected `main`, which branch protection rejects for the Actions
+bot (`GH006`). It leaves an orphaned tag and publishes nothing. Re-enable it by giving
+a release PAT/GitHub App branch-protection bypass, or by having `prepare` open a PR
+instead of pushing to `main` (#127). Until then, use tag-push above.
 
 ### What happens after tagging
 
