@@ -1,6 +1,6 @@
 {
   "name": "@mdscript/mds-napi",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MDS compiler native Node.js bindings (napi-rs)",
   "main": "index.js",
   "types": "index.d.ts",

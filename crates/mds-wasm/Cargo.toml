@@ -23,7 +23,7 @@ debug-panics = []
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mds = { package = "mds-core", path = "../mds-core", version = "0.2.0" }
+mds = { package = "mds-core", path = "../mds-core", version = "0.3.0" }
 wasm-bindgen = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
 serde = { workspace = true }
@@ -31,7 +31,7 @@ serde_json = { workspace = true }
 js-sys = { workspace = true }
 
 [dev-dependencies]
-mds = { package = "mds-core", path = "../mds-core", version = "0.2.0" }
+mds = { package = "mds-core", path = "../mds-core", version = "0.3.0" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]

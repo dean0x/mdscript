@@ -1,6 +1,6 @@
 {
   "name": "@mdscript/rspack-loader",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Rspack loader for importing MDS templates as ES modules",
   "license": "MIT",
   "repository": {
@@ -43,10 +43,10 @@
     "test": "node --test __test__/*.spec.mjs"
   },
   "dependencies": {
-    "@mdscript/bundler-utils": "^0.2.0"
+    "@mdscript/bundler-utils": "^0.3.0"
   },
   "peerDependencies": {
-    "@mdscript/mds": "^0.2.0",
+    "@mdscript/mds": "^0.3.0",
     "@rspack/core": "^1.0.0 || ^2.0.0"
   },
   "devDependencies": {
