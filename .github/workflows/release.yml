@@ -36,7 +36,7 @@ jobs:
     outputs:
       tag: v${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +64,7 @@ jobs:
     if: ${{ !cancelled() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: actions/setup-node@v6
@@ -118,7 +118,7 @@ jobs:
             build: napi build --platform --release --target x86_64-pc-windows-msvc --no-js
     runs-on: ${{ matrix.settings.host }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: actions/setup-node@v6
@@ -155,7 +155,7 @@ jobs:
     if: ${{ !cancelled() && needs.build-napi.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: actions/setup-node@v6
@@ -199,7 +199,7 @@ jobs:
     if: ${{ !cancelled() && needs.version-gate.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
@@ -242,7 +242,7 @@ jobs:
       NPM_CONFIG_ACCESS: "public"
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - uses: actions/setup-node@v6
@@ -298,7 +298,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
       - name: Create release
