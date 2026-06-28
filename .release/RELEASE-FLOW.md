@@ -42,10 +42,15 @@ Fully automated via GitHub Actions `release.yml` workflow dispatch.
 
 ## Publish
 
-- **Trigger**: `gh workflow run release.yml -f version=X.Y.Z`
-- **Dry run**: `gh workflow run release.yml` (no version input)
-- **Flow**: prepare (bump+commit+tag) → version-gate → build-napi (7 targets) →
-  stage+verify → publish-crates → publish-npm → github-release
+- **Trigger (working path — tag-push)**: bump on `main` via PR, then
+  `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`. The tag fires
+  `release.yml`; `prepare` is skipped and build+publish run from the tag.
+- **Dry run**: `gh workflow run release.yml` (no version input) — build + A3 gate,
+  publishes nothing.
+- **BLOCKED**: `gh workflow run release.yml -f version=X.Y.Z` fails GH006 (prepare
+  can't push to protected `main`) — see #127. Do not rely on it yet.
+- **Flow (tag-push)**: version-gate → build-napi (7 targets) → stage+verify →
+  publish-crates → publish-npm → github-release (prepare skipped)
 - **Critical gate**: A3 name↔loader verification (`scripts/verify-napi-names.mjs`)
 
 ## Post-release

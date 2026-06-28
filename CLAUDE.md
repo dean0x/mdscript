@@ -13,15 +13,24 @@ npm test --workspaces --if-present
 
 ## Release
 
-All packages ship as a single coordinated release at the same version. One command:
+All packages ship as a single coordinated release at the same version, driven by
+`release.yml`. **Release via tag-push** (the `workflow_dispatch -f version=` path is
+currently blocked by branch protection — see #127):
 
 ```bash
-gh workflow run release.yml -f version=X.Y.Z
+node scripts/bump-version.mjs X.Y.Z   # bump all manifests + stamp CHANGELOG
+# land the bump on main via PR (CI-gated), then:
+git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
 ```
 
-This bumps all manifests, stamps CHANGELOG, commits, tags, builds 7 native targets + WASM, publishes to crates.io and npm (with provenance), and creates a GitHub Release. Without the version input it runs a dry-run.
+Pushing the `vX.Y.Z` tag triggers `release.yml` (prepare is skipped): build 7 native
+targets + WASM, A3 name-gate, publish to crates.io and npm (with provenance), create a
+GitHub Release. Run `gh workflow run release.yml` (no version) first for a dry-run that
+validates the build + A3 gate and publishes nothing.
 
-Manual alternative: `node scripts/bump-version.mjs X.Y.Z`, commit, `git tag vX.Y.Z`, push.
+> The `workflow_dispatch -f version=X.Y.Z` "one command" path is **currently broken**
+> (#127): its prepare job can't push the release commit to protected `main` (GH006),
+> so it leaves an orphaned tag and publishes nothing. Use tag-push until #127 is fixed.
 
 See @RELEASING.md for the full runbook.
 
