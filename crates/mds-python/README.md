@@ -56,6 +56,11 @@ keyword-only; `scan_imports` takes its argument positionally.
   `MdsError(code="mds::invalid_options")`.
 - `compile_virtual` / `check_virtual` resolve imports against an in-memory map;
   `entry` must be a key in `modules` (no source injection occurs).
+- **Windows note:** `base_path` relative imports for *string* sources do not resolve on
+  Windows yet (a core path-canonicalization bug, [#133]) — use `compile_file` or
+  `compile_virtual` there. `compile_file` and virtual compilation work everywhere.
+
+[#133]: https://github.com/dean0x/mdscript/issues/133
 
 ### Result objects
 
