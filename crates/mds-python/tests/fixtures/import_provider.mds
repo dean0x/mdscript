@@ -1,0 +1,5 @@
+@define greet(who):
+Hello {who}!
+@end
+
+@export greet

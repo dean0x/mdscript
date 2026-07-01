@@ -1,0 +1,45 @@
+[package]
+name = "mds-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "MDS compiler native Python bindings via PyO3"
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories = ["api-bindings"]
+# Not published to crates.io: distribution is a PyPI wheel built by maturin, not a
+# source crate. (Publishing the wheel matrix is a deferred follow-up to #59.)
+publish = false
+
+[features]
+# `extension-module` (default): build the cdylib as a CPython extension. With it,
+# pyo3 does NOT link libpython — symbols are resolved by the interpreter that loads
+# the module. Kept as a toggleable default so `--no-default-features` can opt out.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+# Expose the raw Rust panic payload as `err.detail` on mds::internal errors. Enable
+# locally to diagnose unexpected panics. NEVER ship enabled — panic messages can
+# contain absolute filesystem paths (mirrors mds-napi / mds-wasm).
+debug-panics = []
+
+[lib]
+crate-type = ["cdylib"]
+# The compiled module is imported as `mdscript._mdscript`; the Rust symbol is
+# `PyInit__mdscript`, so the lib name must be `_mdscript` and match the
+# `#[pymodule] fn _mdscript` in src/lib.rs.
+name = "_mdscript"
+# No Rust unit tests and no doctests: `abi3-py311` is always on and this is a
+# cdylib, so `cargo build/clippy/test --workspace` compile the extension without
+# linking libpython. All coverage is the pytest suite (Decision 6). `test = false`
+# guarantees no test-harness binary is built on any platform, so there is never a
+# libpython link step to fail in the Rust/MSRV CI jobs.
+test = false
+doctest = false
+
+[dependencies]
+mds = { package = "mds-core", path = "../mds-core", version = "0.3.0" }
+pyo3 = { workspace = true }
+pythonize = { workspace = true }
+serde_json = { workspace = true }
