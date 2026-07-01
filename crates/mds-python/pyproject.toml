@@ -1,0 +1,57 @@
+[build-system]
+# maturin 1.14.0 introduced abi3 regressions fixed in 1.14.1 (~12d old at pin time);
+# soak on the 1.13 line. The range keeps the PEP 517 build reproducible while allowing
+# 1.13.x patch updates.
+requires = ["maturin>=1.13,<1.14"]
+build-backend = "maturin"
+
+[project]
+name = "mdscript"
+description = "Composable LLM prompt template compiler — native Python bindings for MDS (Markdown Script)"
+requires-python = ">=3.11"
+# PEP 639: an SPDX license expression as a plain string (NOT a `{ text = ... }`
+# table) so modern build backends emit `License-Expression: MIT` in wheel METADATA.
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Dean Sharon" }]
+keywords = ["markdown", "template", "llm", "prompt", "compiler"]
+readme = "README.md"
+# maturin stamps the version from the Cargo workspace `[workspace.package] version`,
+# keeping the PyPI package version equal to the crate/npm coordinated release version.
+dynamic = ["version"]
+# NOTE (PEP 639): do NOT add a `License :: ...` trove classifier — it is mutually
+# exclusive with the SPDX `license` expression above and some backends reject the pair.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Text Processing :: Markup :: Markdown",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/dean0x/mdscript"
+Repository = "https://github.com/dean0x/mdscript"
+Issues = "https://github.com/dean0x/mdscript/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "perf: performance / throughput smoke tests (deselect with -m 'not perf')",
+]
+
+[tool.maturin]
+# Mixed Rust/Python layout: the pure-Python package lives under python/mdscript/ and
+# the compiled extension is injected as the submodule `mdscript._mdscript`.
+python-source = "python"
+module-name = "mdscript._mdscript"
+# abi3-py311: emit a single `cp311-abi3` wheel usable on CPython 3.11+. Redundant with
+# the always-on workspace pyo3 feature, but stated explicitly for clarity.
+features = ["pyo3/abi3-py311"]
+strip = true

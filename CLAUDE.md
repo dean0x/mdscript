@@ -1,6 +1,6 @@
 # MDS (Markdown Script)
 
-Composable LLM prompt template compiler. Rust core (`crates/`) with WASM and native Node.js bindings, plus npm packages (`packages/`).
+Composable LLM prompt template compiler. Rust core (`crates/`) with WASM, native Node.js (napi-rs), and native Python (PyO3) bindings, plus npm packages (`packages/`).
 
 ## Build and test
 
@@ -9,6 +9,11 @@ cargo test --workspace                        # 590+ Rust tests
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 npm ci && npm run build -w @mdscript/mds-wasm && npm run build --workspaces --if-present
 npm test --workspaces --if-present
+
+# Python bindings (crates/mds-python) — 0 Rust tests by design; test via pytest:
+python -m venv .venv && . .venv/bin/activate     # maturin develop needs a venv
+pip install "maturin==1.13.3" pytest mypy pyright
+maturin develop -m crates/mds-python/Cargo.toml && pytest crates/mds-python/tests -q
 ```
 
 ## Release
@@ -42,5 +47,9 @@ See @RELEASING.md for the full runbook.
 - `cargo publish -p mds-cli --dry-run` fails locally because mds-cli has a path+version dep on mds-core — this is expected; CI publishes mds-core first
 - `scripts/verify-napi-names.mjs` (A3 gate) is critical — if the hand-written `crates/mds-napi/index.js` loader drifts from generated platform packages, the universal package silently fails to load native binaries at runtime
 - `NPM_CONFIG_ACCESS=public` is required for first-time publishes of scoped `@mdscript/*` packages with provenance
-- `debug-panics` Cargo feature must never ship enabled — it leaks filesystem paths in panic messages
+- `debug-panics` Cargo feature must never ship enabled (all three binding crates) — it attaches raw panic payloads (may contain filesystem paths) to errors
 - Local WASM builds require Binaryen v129+ for wasm-opt — `brew install binaryen` (macOS) or `apt install binaryen` (Linux)
+- `crates/mds-python` (PyO3): test with **pytest, not `cargo test`** — 0 Rust tests by design (`[lib] test = false`). `abi3-py311` is always-on and `extension-module` is the default feature, so `cargo build/clippy/test --workspace` compile the cdylib without linking libpython; pyo3's abi3 forward-compat tolerates an older `python3` on PATH (repo default is 3.9)
+- `crates/mds-python/build.rs` emits a cdylib-scoped `-undefined dynamic_lookup` so bare `cargo build` links the extension on macOS (Linux allows undefined cdylib symbols; maturin passes the flag itself when it builds the wheel)
+- Local Python dev: `maturin develop` needs an active **virtualenv** + `python3` on PATH; CI has no venv so it uses `pip install ./crates/mds-python` (the maturin PEP 517 backend). Wheels are `cp311-abi3` (one per platform)
+- `crates/mds-python` is free-threading ready (frozen result classes, `#[pymodule(gil_used = false)]`, GIL released around each compile); the `cp314t` free-threaded wheel is a separate ABI and is deferred with the wheel matrix + PyPI publishing (follow-up to #59)

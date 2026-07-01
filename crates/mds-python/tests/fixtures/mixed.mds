@@ -1,0 +1,5 @@
+Some prose text at the top level.
+
+@message user:
+A message block.
+@end

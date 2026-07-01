@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), distributed as
+  `mdscript` on PyPI. Seven functions — `compile`, `compile_file`, `compile_virtual`,
+  `check`, `check_file`, `check_virtual`, and `scan_imports` — with idiomatic
+  keyword-only signatures. Results are typed, frozen, and picklable
+  (`CompileResult` / `Message` / `Span` / `CheckResult`), and failures raise a native
+  `MdsError` carrying `.code` / `.message` / `.help` / `.span`. Ships `.pyi` stubs +
+  `py.typed` and exposes `__version__`. Output is byte-identical to the Rust, Node.js,
+  and WASM bindings (shared core serializer). Built as an `abi3-py311` (`cp311-abi3`)
+  extension; each compile releases the GIL (near-linear thread scaling) and the module
+  is free-threading ready. Cross-platform wheel matrix + PyPI publishing are a tracked
+  follow-up. (#59)
+
 ## [0.3.0] — 2026-06-28
 
 ### **BREAKING** — Intrinsic output format (removes `--format` flag and `compileMessages` API)

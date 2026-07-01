@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-napi"]
+members = ["crates/mds-core", "crates/mds-cli", "crates/mds-wasm", "crates/mds-napi", "crates/mds-python"]
 resolver = "2"
 
 [workspace.package]
@@ -27,6 +27,15 @@ js-sys = "0.3"
 napi = { version = "3.9.0", default-features = false, features = ["napi3", "serde-json"] }
 napi-derive = "3.5.6"
 napi-build = "2"
+# Python bindings (crates/mds-python). Pins are exact and soak-checked (2026-07-01):
+# pyo3 0.28.0 & 0.28.1 are YANKED → 0.28.3 is the newest good 0.28 patch; 0.29.0
+# (~20d old) is deferred for the ~30d soak. `abi3-py311` is ALWAYS on (not optional)
+# so `cargo build/clippy/test --workspace` compile the cdylib against the stable ABI
+# without linking libpython or needing a Python interpreter. `extension-module` is
+# gated behind the crate's own default feature so it can be toggled off. pyo3 default
+# features (incl. `macros`) are kept. pythonize's minor must track pyo3's (0.28 ↔ 0.28).
+pyo3 = { version = "=0.28.3", features = ["abi3-py311"] }
+pythonize = "=0.28.0"
 # notify is CC0-1.0 (public-domain dedication). CC0 is permissive and non-contaminating
 # with respect to the workspace MIT license. Explicitly accepted here.
 # notify and ctrlc also introduce additional transitive license families (platform-specific):
@@ -58,5 +67,10 @@ codegen-units = 1
 
 [profile.release.package.mds-napi]
 opt-level = 3
+strip = true
+codegen-units = 1
+
+[profile.release.package.mds-python]
+opt-level = "z"
 strip = true
 codegen-units = 1
