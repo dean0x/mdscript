@@ -53,6 +53,17 @@ def test_f3_vars_empty_and_none_equivalent() -> None:
     assert m.compile("Hi\n", vars={}).output == "Hi\n"
 
 
+def test_f4_empty_base_path_is_invalid_options() -> None:
+    # An empty string is not the same as omitting `base_path` (which defaults to
+    # the cwd) — it must be rejected at the boundary before any filesystem
+    # resolution occurs. Cross-platform: no OS path resolution is involved, so
+    # unlike test_f4_base_path_import this does not need a Windows skip. Mirrors
+    # mds-napi's identical `basePath=""` rejection.
+    with pytest.raises(m.MdsError) as ei:
+        m.compile("Hi\n", base_path="")
+    assert ei.value.code == "mds::invalid_options"
+
+
 # ── compile_file: str / PathLike, deps (F5) ─────────────────────────────────────
 
 
@@ -83,6 +94,14 @@ def test_f5_compile_file_deps_absolute_entry_excluded(fixtures: pathlib.Path) ->
 
 def test_f6_check_source() -> None:
     assert m.check("Hello {n}!\n", vars={"n": "x"}).warnings == []
+
+
+def test_f6_check_empty_base_path_is_invalid_options() -> None:
+    # Same boundary guard as test_f4_empty_base_path_is_invalid_options, for
+    # `check` (the other of the two functions accepting `base_path`).
+    with pytest.raises(m.MdsError) as ei:
+        m.check("Hi\n", base_path="")
+    assert ei.value.code == "mds::invalid_options"
 
 
 def test_f7_check_file(fixtures: pathlib.Path) -> None:

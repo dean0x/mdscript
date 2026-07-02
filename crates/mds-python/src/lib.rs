@@ -54,7 +54,7 @@ use mds::{json_type_name, parse_json_vars, Value, VarsError};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyType};
 use pythonize::{depythonize, pythonize};
 
 // ── Resource limits ───────────────────────────────────────────────────────────
@@ -545,6 +545,21 @@ fn check_source_size(py: Python<'_>, source: &str) -> PyResult<()> {
     Ok(())
 }
 
+/// Reject an empty `base_path`.
+///
+/// An empty string is not the same as `None`: `None` means "let the core default
+/// to the current working directory," but `Some("")` would otherwise reach the
+/// core as a real (invalid) path and surface a confusing resolver error instead
+/// of a precise boundary one. Mirrors `mds-napi`'s `extract_base_path_direct`
+/// empty-string rejection, so both bindings raise the same `mds::invalid_options`
+/// for the same input.
+fn check_base_path(py: Python<'_>, base_path: &Option<PathBuf>) -> PyResult<()> {
+    if matches!(base_path, Some(p) if p.as_os_str().is_empty()) {
+        return Err(options_error(py, "base_path must be a non-empty string"));
+    }
+    Ok(())
+}
+
 /// Convert the optional `vars` argument into runtime variables.
 ///
 /// `None`/absent → no vars. A non-mapping value (array, string, number, …) →
@@ -574,6 +589,29 @@ fn extract_vars(
 /// `mds::resource_limit`); non-mapping input and non-string values →
 /// `mds::invalid_options`. Mirrors the WASM binding's module parsing.
 fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap<String, String>> {
+    // Cheap pre-check against the live Python object: `dict.__len__` doesn't
+    // touch any key or value, so an oversized mapping is rejected *before*
+    // `depythonize` below copies every key/value into Rust. Scoped to `PyDict`
+    // specifically rather than the broader `PyMapping` protocol: CPython's
+    // `list` also satisfies `PyMapping_Check` (it fills `mp_subscript` for
+    // slicing), so downcasting to `PyMapping` would silently reinterpret an
+    // oversized `list` as a "mapping" and misreport it as `mds::resource_limit`
+    // instead of the `mds::invalid_options` the type check below raises for it.
+    // Non-`dict` mapping-like input (rare) skips this pre-check and falls
+    // through to the post-`depythonize` count check, which stays as a
+    // defense-in-depth backstop for that case.
+    if let Ok(dict) = modules.cast::<PyDict>() {
+        if dict.len() > MAX_MODULE_COUNT {
+            return Err(resource_limit_error(
+                py,
+                &format!(
+                    "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({} provided)",
+                    dict.len()
+                ),
+            ));
+        }
+    }
+
     let json: serde_json::Value =
         depythonize(modules).map_err(|e| options_error(py, &format!("invalid modules: {e}")))?;
     let serde_json::Value::Object(map) = json else {
@@ -636,7 +674,8 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
 ///
 /// `vars` is an optional mapping of runtime variable overrides; `base_path` (str or
 /// `os.PathLike`) sets the base directory for resolving `@import` paths (defaults to
-/// the current working directory). Both are keyword-only.
+/// the current working directory; an explicit empty string raises `mds::invalid_options`
+/// rather than silently resolving against an empty path). Both are keyword-only.
 #[pyfunction]
 #[pyo3(signature = (source, *, vars=None, base_path=None))]
 fn compile(
@@ -646,6 +685,7 @@ fn compile(
     base_path: Option<PathBuf>,
 ) -> PyResult<CompileResult> {
     check_source_size(py, &source)?;
+    check_base_path(py, &base_path)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let result = run_catching(py, move || {
         mds::compile_str_with_deps(&source, base_path.as_deref(), vars)
@@ -708,6 +748,7 @@ fn check(
     base_path: Option<PathBuf>,
 ) -> PyResult<CheckResult> {
     check_source_size(py, &source)?;
+    check_base_path(py, &base_path)?;
     let vars = extract_vars(py, vars.as_ref())?;
     let ((), warnings) = run_catching(py, move || {
         mds::check_str_collecting_warnings(&source, base_path.as_deref(), vars)
