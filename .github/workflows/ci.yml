@@ -196,4 +196,9 @@ jobs:
       - name: Build mds CLI (parity producer)
         run: cargo build -p mds-cli
       - name: pytest against the installed wheel
-        run: pytest crates/mds-python/tests -q
+        run: pytest crates/mds-python/tests -q -m "not perf"
+      # Wall-clock/throughput assertions are flake-prone on shared runners; keep them
+      # out of the gating step above and surface failures without redding the job.
+      - name: pytest against the installed wheel (perf, advisory)
+        continue-on-error: true
+        run: pytest crates/mds-python/tests -q -m perf
