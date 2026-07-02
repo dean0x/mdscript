@@ -375,25 +375,22 @@ fn mds_err_to_py(py: Python<'_>, err: &mds::MdsError) -> PyErr {
     let inst = pyerr.value(py);
     let _ = inst.setattr("code", &s.code);
     let _ = inst.setattr("message", &s.message);
-    match &s.help {
-        Some(h) => drop(inst.setattr("help", h)),
-        None => drop(inst.setattr("help", py.None())),
-    }
-    match &s.span {
-        Some(sp) => {
-            let span = Span {
+    // `help`/`span` may be absent; `Option<T>: IntoPyObject` maps `None` to Python
+    // `None`, so a single `setattr` per attribute covers both cases.
+    let _ = inst.setattr("help", s.help.as_deref());
+    let span = s.span.as_ref().and_then(|sp| {
+        Py::new(
+            py,
+            Span {
                 offset: sp.offset,
                 length: sp.length,
                 line: sp.line,
                 column: sp.column,
-            };
-            match Py::new(py, span) {
-                Ok(obj) => drop(inst.setattr("span", obj)),
-                Err(_) => drop(inst.setattr("span", py.None())),
-            }
-        }
-        None => drop(inst.setattr("span", py.None())),
-    }
+            },
+        )
+        .ok()
+    });
+    let _ = inst.setattr("span", span);
     pyerr
 }
 
@@ -499,6 +496,18 @@ fn map_outcome<T>(py: Python<'_>, outcome: Outcome<T>) -> PyResult<T> {
         Outcome::Mds(e) => Err(mds_err_to_py(py, &e)),
         Outcome::Panic(detail) => Err(internal_error(py, detail)),
     }
+}
+
+/// Release the GIL, run a fallible core closure while trapping panics, then
+/// re-acquire the GIL to map any failure to a raised `PyErr`. The single entry
+/// point for every public function's core call; mirrors `run_catching` in
+/// `crates/mds-napi`.
+fn run_catching<T: Send>(
+    py: Python<'_>,
+    f: impl FnOnce() -> Result<T, mds::MdsError> + Send,
+) -> PyResult<T> {
+    let outcome = py.detach(|| guard(f));
+    map_outcome(py, outcome)
 }
 
 /// Extract a human-readable panic detail — only under `debug-panics`.
@@ -638,9 +647,9 @@ fn compile(
 ) -> PyResult<CompileResult> {
     check_source_size(py, &source)?;
     let vars = extract_vars(py, vars.as_ref())?;
-    let outcome = py
-        .detach(|| guard(move || mds::compile_str_with_deps(&source, base_path.as_deref(), vars)));
-    let result = map_outcome(py, outcome)?;
+    let result = run_catching(py, move || {
+        mds::compile_str_with_deps(&source, base_path.as_deref(), vars)
+    })?;
     Ok(CompileResult {
         value: result.to_canonical_json(),
     })
@@ -658,8 +667,7 @@ fn compile_file(
     vars: Option<Bound<'_, PyAny>>,
 ) -> PyResult<CompileResult> {
     let vars = extract_vars(py, vars.as_ref())?;
-    let outcome = py.detach(|| guard(move || mds::compile_with_deps(&path, vars)));
-    let result = map_outcome(py, outcome)?;
+    let result = run_catching(py, move || mds::compile_with_deps(&path, vars))?;
     Ok(CompileResult {
         value: result.to_canonical_json(),
     })
@@ -680,9 +688,9 @@ fn compile_virtual(
 ) -> PyResult<CompileResult> {
     let modules = parse_modules(py, &modules)?;
     let vars = extract_vars(py, vars.as_ref())?;
-    let outcome =
-        py.detach(|| guard(move || mds::compile_virtual_with_deps(modules, &entry, vars)));
-    let result = map_outcome(py, outcome)?;
+    let result = run_catching(py, move || {
+        mds::compile_virtual_with_deps(modules, &entry, vars)
+    })?;
     Ok(CompileResult {
         value: result.to_canonical_json(),
     })
@@ -701,10 +709,9 @@ fn check(
 ) -> PyResult<CheckResult> {
     check_source_size(py, &source)?;
     let vars = extract_vars(py, vars.as_ref())?;
-    let outcome = py.detach(|| {
-        guard(move || mds::check_str_collecting_warnings(&source, base_path.as_deref(), vars))
-    });
-    let ((), warnings) = map_outcome(py, outcome)?;
+    let ((), warnings) = run_catching(py, move || {
+        mds::check_str_collecting_warnings(&source, base_path.as_deref(), vars)
+    })?;
     Ok(CheckResult { warnings })
 }
 
@@ -717,8 +724,7 @@ fn check_file(
     vars: Option<Bound<'_, PyAny>>,
 ) -> PyResult<CheckResult> {
     let vars = extract_vars(py, vars.as_ref())?;
-    let outcome = py.detach(|| guard(move || mds::check_collecting_warnings(&path, vars)));
-    let ((), warnings) = map_outcome(py, outcome)?;
+    let ((), warnings) = run_catching(py, move || mds::check_collecting_warnings(&path, vars))?;
     Ok(CheckResult { warnings })
 }
 
@@ -733,9 +739,9 @@ fn check_virtual(
 ) -> PyResult<CheckResult> {
     let modules = parse_modules(py, &modules)?;
     let vars = extract_vars(py, vars.as_ref())?;
-    let outcome =
-        py.detach(|| guard(move || mds::check_virtual_collecting_warnings(modules, &entry, vars)));
-    let ((), warnings) = map_outcome(py, outcome)?;
+    let ((), warnings) = run_catching(py, move || {
+        mds::check_virtual_collecting_warnings(modules, &entry, vars)
+    })?;
     Ok(CheckResult { warnings })
 }
 
@@ -747,8 +753,7 @@ fn check_virtual(
 #[pyo3(signature = (source, /))]
 fn scan_imports(py: Python<'_>, source: String) -> PyResult<Vec<String>> {
     check_source_size(py, &source)?;
-    let outcome = py.detach(|| guard(move || mds::scan_imports(&source)));
-    map_outcome(py, outcome)
+    run_catching(py, move || mds::scan_imports(&source))
 }
 
 // ── Module ──────────────────────────────────────────────────────────────────────
