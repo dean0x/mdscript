@@ -40,6 +40,7 @@ const CRATE_CARGO_PATHS = [
   'crates/mds-cli/Cargo.toml',
   'crates/mds-napi/Cargo.toml',
   'crates/mds-wasm/Cargo.toml',
+  'crates/mds-python/Cargo.toml',
 ];
 
 for (const rel of CRATE_CARGO_PATHS) {

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Python bindings
+
+- **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), to be distributed
+  as `mdscript` on PyPI. Seven functions — `compile`, `compile_file`,
+  `compile_virtual`, `check`, `check_file`, `check_virtual`, and `scan_imports` —
+  with idiomatic keyword-only signatures. Results are typed, frozen, and picklable
+  (`CompileResult` / `Message` / `Span` / `CheckResult`), and failures raise a native
+  `MdsError` carrying `.code` / `.message` / `.help` / `.span`. Ships `.pyi` stubs +
+  `py.typed` and exposes `__version__`. Output is byte-identical to the Rust,
+  Node.js, and WASM bindings (shared core serializer). Built as an `abi3-py311`
+  (`cp311-abi3`) extension; each compile releases the GIL and the module is
+  free-threading ready (`gil_used = false`), enabling multi-threaded use.
+  Cross-platform wheel matrix and PyPI publishing are a tracked follow-up (#132) —
+  for now, install from source: `pip install ./crates/mds-python`. (#59)
+
 ## [0.3.0] — 2026-06-28
 
 ### **BREAKING** — Intrinsic output format (removes `--format` flag and `compileMessages` API)
@@ -246,5 +261,5 @@ First public release of the MDS (Markdown Script) compiler.
 
 [Unreleased]: https://github.com/dean0x/mdscript/compare/v0.3.0...HEAD
 [0.2.0]: https://github.com/dean0x/mdscript/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.3.0
-[0.3.0]: https://github.com/dean0x/mdscript/releases/tag/v0.3.0
+[0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.1.0
+[0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0

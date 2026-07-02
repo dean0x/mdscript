@@ -7,6 +7,8 @@
 //   2. No `file:` specifiers leak into any published dependency set.
 //   3. Every internal `@mdscript/*` dependency is a caret range on that version
 //      (e.g. ^0.1.0), so installed consumers resolve the matching release.
+//   4. Every workspace crate's path+version dep on mds-core matches the
+//      workspace version (kept in lockstep by bump-version.mjs).
 //
 // Run locally and in CI before publishing. Exit 0 = consistent; 1 = drift.
 'use strict';
@@ -29,6 +31,15 @@ const PKG_PATHS = [
   'packages/rspack-loader/package.json',
 ];
 
+// Workspace crates with a path+version dep on mds-core (must stay in lockstep
+// with the workspace version — see scripts/bump-version.mjs CRATE_CARGO_PATHS).
+const CRATE_CARGO_PATHS = [
+  'crates/mds-cli/Cargo.toml',
+  'crates/mds-napi/Cargo.toml',
+  'crates/mds-wasm/Cargo.toml',
+  'crates/mds-python/Cargo.toml',
+];
+
 const DEP_SETS = ['dependencies', 'optionalDependencies', 'peerDependencies'];
 
 const errors = [];
@@ -42,6 +53,26 @@ if (!wsVerMatch) {
 }
 const canonical = wsVerMatch ? wsVerMatch[1] : null;
 const semverCaret = canonical ? `^${canonical}` : null;
+
+// --- Check every workspace crate's path+version dep on mds-core ---------------
+for (const rel of CRATE_CARGO_PATHS) {
+  const abs = join(ROOT, rel);
+  if (!existsSync(abs)) {
+    fail(`${rel}: missing (expected workspace crate)`);
+    continue;
+  }
+  const content = readFileSync(abs, 'utf8');
+  const matches = [...content.matchAll(/package\s*=\s*"mds-core".*?version\s*=\s*"([^"]+)"/g)];
+  if (matches.length === 0) {
+    fail(`${rel}: no path+version dep on mds-core found`);
+    continue;
+  }
+  for (const [, depVersion] of matches) {
+    if (depVersion !== canonical) {
+      fail(`${rel}: mds-core dep version "${depVersion}" != workspace version "${canonical}"`);
+    }
+  }
+}
 
 // --- Check every publishable package ------------------------------------------
 for (const rel of PKG_PATHS) {
@@ -76,4 +107,4 @@ if (errors.length > 0) {
   process.exit(1);
 }
 
-console.log(`✓ version gate: ${PKG_PATHS.length} packages + crates all at ${canonical}; no file: refs; internal deps pinned to ${semverCaret}`);
+console.log(`✓ version gate: ${PKG_PATHS.length} packages + ${CRATE_CARGO_PATHS.length} crates all at ${canonical}; no file: refs; internal deps pinned to ${semverCaret}`);

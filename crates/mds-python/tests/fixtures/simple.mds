@@ -1,0 +1,6 @@
+---
+name: Alice
+count: 3
+---
+
+Hello {name}! You have {count} items.

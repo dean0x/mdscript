@@ -15,5 +15,17 @@ packages/*/dist-cjs/
 examples/*/dist/
 examples/*/package-lock.json
 
+# Python bindings (crates/mds-python) build/test artifacts.
+# `maturin develop` drops the compiled extension into the source tree; caches and
+# venvs are local-only. Sources (.py/.pyi/py.typed) are tracked.
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+crates/mds-python/dist/
+
 # devflow local state — local-only, not shared via git (reverses ADR-019; see ADR-023)
 .devflow/
