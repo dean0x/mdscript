@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Python bindings
 
 - **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), distributed as
   `mdscript` on PyPI. Seven functions — `compile`, `compile_file`, `compile_virtual`,
@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and WASM bindings (shared core serializer). Built as an `abi3-py311` (`cp311-abi3`)
   extension; each compile releases the GIL (near-linear thread scaling) and the module
   is free-threading ready. Cross-platform wheel matrix + PyPI publishing are a tracked
-  follow-up. (#59)
+  follow-up (#132). (#59)
 
 ## [0.3.0] — 2026-06-28
 
@@ -260,5 +260,5 @@ First public release of the MDS (Markdown Script) compiler.
 
 [Unreleased]: https://github.com/dean0x/mdscript/compare/v0.3.0...HEAD
 [0.2.0]: https://github.com/dean0x/mdscript/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.3.0
-[0.3.0]: https://github.com/dean0x/mdscript/releases/tag/v0.3.0
+[0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.1.0
+[0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
