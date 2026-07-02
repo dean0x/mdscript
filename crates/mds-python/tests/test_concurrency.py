@@ -9,10 +9,16 @@ CPU operation).
 
 Timing-based tests here use loose bounds and best-of-N sampling; they can still be
 flaky on heavily-loaded or single-core runners — re-run before assuming a regression.
+
+The GIL-release tests above are `@pytest.mark.perf` (wall-clock, excluded from the
+blocking gate) and discard their compile results, so they prove nothing about
+result *correctness* under real parallelism. The deterministic test below has no
+timing assertions, so it is not perf-marked and always runs in the gating suite.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import threading
 import time
@@ -103,6 +109,35 @@ def test_perf1_long_compile_does_not_block_main_thread() -> None:
         f"main thread made only {main_iterations} iterations (<= the "
         f"{background_iterations} background call boundaries) — GIL may not be "
         "released during the native call"
+    )
+
+
+# ── Deterministic concurrent correctness (gate-safe: no @pytest.mark.perf) ───────
+
+
+def test_concurrent_compiles_match_single_threaded_reference() -> None:
+    # Proves result *correctness* under real thread parallelism — the axis the
+    # perf-marked GIL tests above can't cover (they measure wall-clock and
+    # discard their compile output). Deterministic and timing-free, so unlike
+    # those tests it belongs in the blocking (`-m "not perf"`) gate.
+    expected = m.compile(LOOP_SRC, vars={"items": ITEMS})
+
+    workers = min(8, (os.cpu_count() or 1) * 2)
+    iterations = 64
+
+    def _compile_once(_: int) -> m.CompileResult:
+        return m.compile(LOOP_SRC, vars={"items": ITEMS})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_compile_once, range(iterations)))
+
+    assert len(results) == iterations
+    # CompileResult.__eq__ is wire equality over the full canonical value (kind,
+    # output, warnings, dependencies) — so this also proves no torn/corrupted
+    # read of a frozen result's backing serde_json::Value under parallelism.
+    assert all(r == expected for r in results), (
+        "a concurrent compile diverged from the single-threaded reference result "
+        "— possible torn state under real thread parallelism"
     )
 
 

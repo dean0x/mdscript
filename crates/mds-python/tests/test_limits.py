@@ -47,6 +47,15 @@ def test_l2_too_many_modules() -> None:
     assert ei.value.code == "mds::resource_limit"
 
 
+def test_l2_check_virtual_too_many_modules() -> None:
+    # Boundary guards are shared via parse_modules, not forked per function —
+    # check_virtual must enforce the same module-count cap as compile_virtual.
+    mods = {f"m{i}.mds": "x" for i in range(257)}
+    with pytest.raises(m.MdsError) as ei:
+        m.check_virtual(mods, "m0.mds")
+    assert ei.value.code == "mds::resource_limit"
+
+
 def test_l2_single_module_over_size() -> None:
     with pytest.raises(m.MdsError) as ei:
         m.compile_virtual({"a.mds": "x" * (MAX + 1)}, "a.mds")

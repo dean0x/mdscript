@@ -83,6 +83,17 @@ def test_e3_mixed_content_on_check(fixtures: pathlib.Path) -> None:
     assert ei.value.code == "mds::mixed_content"
 
 
+def test_e3_mixed_content_on_check_virtual() -> None:
+    # check_virtual routes through the same intrinsic dispatch as check_file (per
+    # FEATURE_KNOWLEDGE: "check_* now routes through intrinsic dispatch: rejects
+    # mixed content") — same source used in test_e3_core_error_codes' mds::mixed_content
+    # case, just via the virtual-FS entrypoint instead of a plain string.
+    mods = {"a.mds": "Prose.\n\n@message user:\nHi\n@end\n"}
+    with pytest.raises(m.MdsError) as ei:
+        m.check_virtual(mods, "a.mds")
+    assert ei.value.code == "mds::mixed_content"
+
+
 # ── E4: boundary codes, no path leak ────────────────────────────────────────────
 
 

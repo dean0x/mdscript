@@ -128,6 +128,18 @@ def test_f9_check_virtual_mixed_content_ok() -> None:
     assert m.check_virtual(VIRTUAL, "main.mds").warnings == []
 
 
+def test_f9_check_virtual_returns_warnings() -> None:
+    # Same warning-producing virtual FS as test_f11 below (`@include` of a
+    # body-less module warns rather than errors) — check_virtual must surface
+    # the warning via `.warnings` (not raise, not swallow it).
+    mods = {
+        "main.mds": '@import "./lib.mds" as provider\n@include provider\n',
+        "lib.mds": "@define g(x):\nHi {x}!\n@end\n@export g\n",
+    }
+    r = m.check_virtual(mods, "main.mds")
+    assert any("empty output" in w for w in r.warnings), r.warnings
+
+
 def test_f8_compile_virtual_messages() -> None:
     mods = {"m.mds": "@message user:\nHi {who}\n@end\n"}
     r = m.compile_virtual(mods, "m.mds", vars={"who": "there"})
