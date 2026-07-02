@@ -32,7 +32,7 @@ crate-type = ["cdylib"]
 name = "_mdscript"
 # No Rust unit tests and no doctests: `abi3-py311` is always on and this is a
 # cdylib, so `cargo build/clippy/test --workspace` compile the extension without
-# linking libpython. All coverage is the pytest suite (Decision 6). `test = false`
+# linking libpython. All coverage is the pytest suite. `test = false`
 # guarantees no test-harness binary is built on any platform, so there is never a
 # libpython link step to fail in the Rust/MSRV CI jobs.
 test = false

@@ -564,7 +564,7 @@ fn check_base_path(py: Python<'_>, base_path: &Option<PathBuf>) -> PyResult<()> 
 ///
 /// `None`/absent → no vars. A non-mapping value (array, string, number, …) →
 /// `mds::invalid_options`. Conversion runs while the GIL is held, before the core
-/// call releases it (Decision 4).
+/// call releases it.
 fn extract_vars(
     py: Python<'_>,
     vars: Option<&Bound<'_, PyAny>>,
@@ -581,6 +581,18 @@ fn extract_vars(
         VarsError::InvalidType(msg) => options_error(py, &msg),
         VarsError::Conversion(mds_err) => mds_err_to_py(py, &mds_err),
     })
+}
+
+/// `mds::resource_limit` for an oversized `modules` mapping.
+///
+/// Shared by `parse_modules`'s pre-`depythonize` `PyDict` fast-path and its
+/// post-`depythonize` backstop so both independent checks raise a
+/// byte-identical message.
+fn module_count_error(py: Python<'_>, count: usize) -> PyErr {
+    resource_limit_error(
+        py,
+        &format!("modules exceeds maximum module count of {MAX_MODULE_COUNT} ({count} provided)"),
+    )
 }
 
 /// Parse and validate a virtual `modules` mapping (`str -> str`).
@@ -602,13 +614,7 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     // defense-in-depth backstop for that case.
     if let Ok(dict) = modules.cast::<PyDict>() {
         if dict.len() > MAX_MODULE_COUNT {
-            return Err(resource_limit_error(
-                py,
-                &format!(
-                    "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({} provided)",
-                    dict.len()
-                ),
-            ));
+            return Err(module_count_error(py, dict.len()));
         }
     }
 
@@ -624,13 +630,7 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
         ));
     };
     if map.len() > MAX_MODULE_COUNT {
-        return Err(resource_limit_error(
-            py,
-            &format!(
-                "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({} provided)",
-                map.len()
-            ),
-        ));
+        return Err(module_count_error(py, map.len()));
     }
 
     let mut result = HashMap::with_capacity(map.len());
