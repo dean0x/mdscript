@@ -9,8 +9,13 @@ the Node.js / WASM bindings. Output is byte-identical across every binding.
 pip install mdscript
 ```
 
-> Wheels ship as `cp311-abi3` (CPython 3.11+, one wheel per platform). Building from
-> source needs a Rust toolchain and `python3` on `PATH`.
+> **Not yet on PyPI** — publishing and the `mdscript` name registration are tracked in
+> [#132]. For now, build from source: `pip install ./crates/mds-python` (or `maturin
+> build -m crates/mds-python/Cargo.toml` to produce a wheel), with a Rust toolchain and
+> `python3` on `PATH`. Once published, wheels ship as `cp311-abi3` (CPython 3.11+, one
+> wheel per platform).
+
+[#132]: https://github.com/dean0x/mdscript/issues/132
 
 ## Quick start
 
