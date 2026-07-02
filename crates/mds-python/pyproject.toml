@@ -1,8 +1,8 @@
 [build-system]
 # maturin 1.14.0 introduced abi3 regressions fixed in 1.14.1 (~12d old at pin time);
-# soak on the 1.13 line. The range keeps the PEP 517 build reproducible while allowing
-# 1.13.x patch updates.
-requires = ["maturin>=1.13,<1.14"]
+# soak on the 1.13 line. >=1.13.3 matches the dev/CI pin (CLAUDE.md); the upper bound
+# keeps the PEP 517 build reproducible while allowing further 1.13.x patch updates.
+requires = ["maturin>=1.13.3,<1.14"]
 build-backend = "maturin"
 
 [project]

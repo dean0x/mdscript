@@ -37,6 +37,17 @@ def test_pk1_compile_result_fields_survive() -> None:
     assert back.messages[0].content == r.messages[0].content  # type: ignore[index]
 
 
+def test_pk1_compile_result_rejects_corrupt_state() -> None:
+    # `CompileResult.__new__` (src/lib.rs) is what `__reduce__` invokes on unpickle;
+    # a corrupt/foreign payload must surface a clean `mds::invalid_options` error
+    # rather than panicking or silently succeeding with garbage state. `object()`
+    # is a proven-unconvertible value for the same underlying `depythonize` path
+    # (see test_v3_unconvertible_scalar_values in test_errors.py).
+    with pytest.raises(m.MdsError) as ei:
+        m.CompileResult(object())  # type: ignore[arg-type]
+    assert ei.value.code == "mds::invalid_options"
+
+
 # ── PK2: MdsError round-trip (code / message / help / span) ──────────────────────
 
 

@@ -39,6 +39,7 @@ def _best_of(fn, rounds: int = 3) -> float:  # type: ignore[no-untyped-def]
     return best
 
 
+@pytest.mark.perf
 @pytest.mark.skipif((os.cpu_count() or 1) < 2, reason="needs >= 2 cores for parallelism")
 def test_perf1_gil_released_throughput_scaling() -> None:
     n = 32
@@ -69,14 +70,16 @@ def test_perf1_gil_released_throughput_scaling() -> None:
     )
 
 
+@pytest.mark.perf
 def test_perf1_long_compile_does_not_block_main_thread() -> None:
     # While a sustained batch of native compiles runs in a background thread, the
     # main thread must keep making progress — impossible if the GIL were held for
     # the whole native call.
     done = threading.Event()
+    background_iterations = 40
 
     def background() -> None:
-        for _ in range(40):
+        for _ in range(background_iterations):
             _work()
         done.set()
 
@@ -89,7 +92,18 @@ def test_perf1_long_compile_does_not_block_main_thread() -> None:
         main_iterations += 1
     t.join(timeout=5.0)
     assert not t.is_alive(), "background compiles did not finish in time"
-    assert main_iterations > 0, "main thread was starved — GIL not released"
+    # `main_iterations > 0` alone is near-vacuous: CPython interleaves threads at
+    # Python-level call/return boundaries regardless of `Python::detach`, so even a
+    # held-GIL bug yields one scheduling opportunity per background `_work()` call
+    # (~background_iterations chances total). Genuine GIL release lets the main
+    # thread's cheap compiles interleave far more densely than that ceiling, so
+    # this floor actually discriminates the two cases instead of only proving the
+    # main thread was not starved for the full 5-second deadline.
+    assert main_iterations > background_iterations, (
+        f"main thread made only {main_iterations} iterations (<= the "
+        f"{background_iterations} background call boundaries) — GIL may not be "
+        "released during the native call"
+    )
 
 
 # ── PERF4: the off-GIL panic path is reserved for true panics ────────────────────
