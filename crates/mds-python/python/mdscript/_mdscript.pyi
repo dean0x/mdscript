@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from os import PathLike
-from typing import Any, final
+from typing import Any, Literal, final
 
 # `str | os.PathLike[str]` — accepted for `path` and `base_path`.
 _StrPath = str | PathLike[str]
@@ -75,7 +75,7 @@ class CompileResult:
     """
 
     @property
-    def kind(self) -> str: ...
+    def kind(self) -> Literal["markdown", "messages"]: ...
     @property
     def output(self) -> str | None: ...
     @property
