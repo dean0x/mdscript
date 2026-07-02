@@ -10,7 +10,7 @@ repository.workspace = true
 keywords.workspace = true
 categories = ["api-bindings"]
 # Not published to crates.io: distribution is a PyPI wheel built by maturin, not a
-# source crate. (Publishing the wheel matrix is a deferred follow-up to #59.)
+# source crate. (Publishing the wheel matrix is a deferred follow-up to #132.)
 publish = false
 
 [features]
