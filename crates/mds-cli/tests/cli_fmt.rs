@@ -26,18 +26,12 @@ fn read_fixture(name: &str) -> String {
     fs::read_to_string(fixture(name)).expect("read fixture")
 }
 
-fn fmt_file(path: &Path, extra_args: &[&str]) -> std::process::Output {
-    mds_bin()
-        .arg("fmt")
-        .arg(path)
-        .args(extra_args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap()
-}
-
-fn fmt_dir(path: &Path, extra_args: &[&str]) -> std::process::Output {
+/// Run `mds fmt <path> <extra_args>`, capturing stdout/stderr separately.
+///
+/// `mds fmt` dispatches on the filesystem type of `path` (file, dir, or `-`
+/// for stdin — see the dedicated `fmt_stdin` helper below), so one helper
+/// covers both single-file and directory-mode invocations.
+fn fmt_path(path: &Path, extra_args: &[&str]) -> std::process::Output {
     mds_bin()
         .arg("fmt")
         .arg(path)
@@ -57,7 +51,7 @@ fn inplace_rewrites_only_when_changed() {
     fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
     let original = fs::read_to_string(&target).unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert!(
         output.status.success(),
         "fmt should succeed; stderr: {}",
@@ -85,7 +79,7 @@ fn inplace_unchanged_file_preserves_mtime_and_reports_unchanged() {
     // Ensure the filesystem clock would visibly move if the file were rewritten.
     std::thread::sleep(Duration::from_millis(1100));
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert!(
         output.status.success(),
         "fmt should succeed on an already-clean file"
@@ -111,10 +105,10 @@ fn format_then_check_is_idempotent() {
     let target = dir.path().join("idem.mds");
     fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
 
-    let first = fmt_file(&target, &[]);
+    let first = fmt_path(&target, &[]);
     assert!(first.status.success());
 
-    let check = fmt_file(&target, &["--check"]);
+    let check = fmt_path(&target, &["--check"]);
     assert!(
         check.status.success(),
         "second pass under --check should report clean; stderr: {}",
@@ -237,7 +231,7 @@ fn dir_recurse_formats_every_mds_including_partials() {
     )
     .unwrap();
 
-    let output = fmt_dir(dir.path(), &[]);
+    let output = fmt_path(dir.path(), &[]);
     assert!(
         output.status.success(),
         "dir fmt should succeed; stderr: {}",
@@ -283,7 +277,7 @@ fn dir_continue_on_error_summary_nonzero_exit() {
     fs::write(dir.path().join("good.mds"), "Hello, world!\n").unwrap();
     fs::write(dir.path().join("bad.mds"), "```\nunclosed fence\n").unwrap();
 
-    let output = fmt_dir(dir.path(), &[]);
+    let output = fmt_path(dir.path(), &[]);
     assert!(
         !output.status.success(),
         "dir fmt with a failing file must exit non-zero"
@@ -305,7 +299,7 @@ fn dir_already_formatted_tree_reports_all_unchanged_exit_zero() {
     )
     .unwrap();
 
-    let output = fmt_dir(dir.path(), &[]);
+    let output = fmt_path(dir.path(), &[]);
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -336,7 +330,7 @@ fn parent_that_includes_partial_compiles_unchanged_after_formatting_both() {
         .unwrap();
     assert!(before.status.success(), "pre-format build should succeed");
 
-    let output = fmt_dir(dir.path(), &[]);
+    let output = fmt_path(dir.path(), &[]);
     assert!(
         output.status.success(),
         "formatting the dir should succeed; stderr: {}",
@@ -367,7 +361,7 @@ fn check_clean_file_exits_zero_no_write() {
     let before = fs::read_to_string(&target).unwrap();
     let before_mtime = fs::metadata(&target).unwrap().modified().unwrap();
 
-    let output = fmt_file(&target, &["--check"]);
+    let output = fmt_path(&target, &["--check"]);
     assert!(output.status.success(), "check on clean file should exit 0");
 
     assert_eq!(
@@ -388,7 +382,7 @@ fn check_dirty_file_exits_nonzero_no_write() {
     fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
     let before = fs::read_to_string(&target).unwrap();
 
-    let output = fmt_file(&target, &["--check"]);
+    let output = fmt_path(&target, &["--check"]);
     assert!(
         !output.status.success(),
         "check on a file that would change must exit non-zero"
@@ -409,7 +403,7 @@ fn dir_check_reports_would_reformat_and_exits_nonzero() {
     )
     .unwrap();
 
-    let output = fmt_dir(dir.path(), &["--check"]);
+    let output = fmt_path(dir.path(), &["--check"]);
     assert!(
         !output.status.success(),
         "dir --check with dirty files must exit non-zero"
@@ -438,7 +432,7 @@ fn diff_prints_unified_diff_to_stdout_writes_nothing() {
     fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
     let before = fs::read_to_string(&target).unwrap();
 
-    let output = fmt_file(&target, &["--diff"]);
+    let output = fmt_path(&target, &["--diff"]);
     assert!(
         output.status.success(),
         "--diff alone should exit 0 even when changes exist"
@@ -471,7 +465,7 @@ fn diff_on_clean_file_prints_nothing_and_exits_zero() {
     let target = dir.path().join("clean.mds");
     fs::write(&target, read_fixture("fmt_formatted.mds")).unwrap();
 
-    let output = fmt_file(&target, &["--diff"]);
+    let output = fmt_path(&target, &["--diff"]);
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -486,7 +480,7 @@ fn diff_on_malformed_file_exits_nonzero() {
     let target = dir.path().join("bad.mds");
     fs::write(&target, read_fixture("fmt_malformed.mds")).unwrap();
 
-    let output = fmt_file(&target, &["--diff"]);
+    let output = fmt_path(&target, &["--diff"]);
     assert!(
         !output.status.success(),
         "--diff on unparseable input must exit non-zero"
@@ -501,7 +495,7 @@ fn check_and_diff_combined_prints_diff_and_exits_nonzero() {
     let target = dir.path().join("dirty.mds");
     fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
 
-    let output = fmt_file(&target, &["--check", "--diff"]);
+    let output = fmt_path(&target, &["--check", "--diff"]);
     assert!(
         !output.status.success(),
         "--check --diff must exit non-zero when changes exist"
@@ -634,7 +628,7 @@ fn malformed_single_file_exits_one_with_diagnostic() {
     let target = dir.path().join("bad.mds");
     fs::write(&target, read_fixture("fmt_malformed.mds")).unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert_eq!(
         output.status.code(),
         Some(1),
@@ -655,6 +649,39 @@ fn malformed_single_file_exits_one_with_diagnostic() {
 }
 
 #[test]
+fn unclosed_directive_block_exits_one_with_syntax_not_formatter_invariant() {
+    // An unclosed `@message` (parse-level malformation, unlike the unclosed
+    // code fence in fmt_malformed.mds which fails in the lexer) must be
+    // rejected with the real syntax error and leave the file untouched —
+    // not silently "formatted" nor reported as a formatter bug.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("unclosed.mds");
+    let src = "@message user:\nHi there\n";
+    fs::write(&target, src).unwrap();
+
+    let output = fmt_path(&target, &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unclosed block should map to exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("syntax") && stderr.contains("@end"),
+        "expected a syntax diagnostic about the missing @end, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("formatter_invariant") && !stderr.contains("file an issue"),
+        "author error must not be reported as a formatter bug, got: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        src,
+        "malformed file must be left untouched"
+    );
+}
+
+#[test]
 fn dir_malformed_file_continues_and_reports_one_failed() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -668,7 +695,7 @@ fn dir_malformed_file_continues_and_reports_one_failed() {
     )
     .unwrap();
 
-    let output = fmt_dir(dir.path(), &[]);
+    let output = fmt_path(dir.path(), &[]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -686,7 +713,7 @@ fn dir_malformed_file_continues_and_reports_one_failed() {
 
 #[test]
 fn missing_file_exits_two() {
-    let output = fmt_file(Path::new("/tmp/no_such_fmt_target_xyz.mds"), &[]);
+    let output = fmt_path(Path::new("/tmp/no_such_fmt_target_xyz.mds"), &[]);
     assert_eq!(output.status.code(), Some(2));
 }
 
@@ -696,7 +723,7 @@ fn non_mds_extension_rejected_exits_two() {
     let target = dir.path().join("notes.txt");
     fs::write(&target, "just some text\n").unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert_eq!(
         output.status.code(),
         Some(2),
@@ -718,7 +745,7 @@ fn symlinked_file_rejected() {
     let link = dir.path().join("link.mds");
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
-    let output = fmt_file(&link, &[]);
+    let output = fmt_path(&link, &[]);
     assert!(!output.status.success(), "symlinked file must be rejected");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -736,7 +763,7 @@ fn symlinked_directory_root_rejected() {
     let link_path = link_parent.path().join("linked");
     std::os::unix::fs::symlink(real_dir.path(), &link_path).unwrap();
 
-    let output = fmt_dir(&link_path, &[]);
+    let output = fmt_path(&link_path, &[]);
     assert!(
         !output.status.success(),
         "symlinked directory root must be rejected"
@@ -750,7 +777,7 @@ fn oversized_file_exits_three() {
     let content = "x".repeat(10 * 1024 * 1024 + 1);
     fs::write(&target, &content).unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert_eq!(
         output.status.code(),
         Some(3),
@@ -765,7 +792,7 @@ fn bad_utf8_exits_two() {
     let target = dir.path().join("bad_utf8.mds");
     std::fs::write(&target, [0xFF, 0xFE, b'\n']).unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert_eq!(
         output.status.code(),
         Some(2),
@@ -782,7 +809,7 @@ fn channels_stdout_only_content_stderr_only_status() {
     fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
 
     // Write mode: nothing on stdout, status on stderr.
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert!(
         output.stdout.is_empty(),
         "write mode must not print to stdout"
@@ -802,7 +829,7 @@ fn channels_diff_goes_to_stdout_summary_to_stderr_in_dir_mode() {
     )
     .unwrap();
 
-    let output = fmt_dir(dir.path(), &["--diff"]);
+    let output = fmt_path(dir.path(), &["--diff"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -828,7 +855,7 @@ fn fmt_config_section_parses_and_pre_existing_configs_still_load() {
     )
     .unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert!(
         output.status.success(),
         "fmt should succeed with a fmt-section config present; stderr: {}",
@@ -847,7 +874,7 @@ fn pre_existing_config_without_fmt_section_still_loads() {
     )
     .unwrap();
 
-    let output = fmt_file(&target, &[]);
+    let output = fmt_path(&target, &[]);
     assert!(
         output.status.success(),
         "fmt should succeed with a pre-existing (no fmt section) config; stderr: {}",
