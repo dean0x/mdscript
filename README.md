@@ -75,6 +75,7 @@ Unlike general-purpose template engines, MDS is Markdown-native: no delimiters t
 mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown / JSON
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
+mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
@@ -96,14 +97,23 @@ Watch-only options:
                               The watcher self-heals after a watched dir/root is deleted and
                               recreated; --poll-interval controls how quickly it detects recovery.
 
+Fmt options:
+  --check                     Read-only: exit non-zero if any file would change; never writes
+  --diff                      Read-only: print a unified diff of pending changes; never writes
+                              (colorized only when stdout is a terminal). Combines with --check —
+                              --diff controls what's printed, --check controls the exit code.
+
 Exit codes:
-  0   Success (or clean Ctrl+C in watch mode)
-  1   Template error (syntax, undefined variable, arity mismatch)
+  0   Success (or clean Ctrl+C in watch mode; or a clean `fmt --check` / `fmt --diff` preview)
+  1   Template error (syntax, undefined variable, arity mismatch), or `fmt --check` found a
+      file that would change
   2   I/O error (file not found, not an MDS file), or invalid CLI argument (clap parse error)
   3   Resource limit exceeded
 ```
 
 **Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary is printed and the exit code is non-zero if any file fails. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
+
+`mds fmt <dir>` follows the same directory-mode conventions (recursive, symlinks rejected, continue-on-error, non-zero exit summary) with one deliberate difference: it formats `_`-prefixed **partials too** — formatting rewrites source, not compiled output, and a partial's source is just as much a candidate for reformatting as any other file.
 
 ### Live preview with `mds watch`
 
@@ -142,6 +152,47 @@ shared partial rebuilds **all transitive importers** automatically.
 - `--quiet` suppresses status and warnings; compile errors still print and the watcher keeps running.
 - Ctrl+C exits with code 0 and prints `Stopped watching.`
 - `--vars` file is reloaded from disk on every rebuild; edits to it trigger a recompile.
+
+### Formatting with `mds fmt`
+
+An opinionated, safety-gated auto-formatter. Every rewrite is guaranteed **compile-equivalent**:
+before writing anything, `mds fmt` re-compiles the formatted source and refuses to write if it
+would change compiled output — a formatter bug surfaces as a clean error, never a silent
+corruption of your template.
+
+```bash
+mds fmt template.mds            # format a file in place
+mds fmt .                       # format every .mds file recursively (partials included)
+mds fmt --check template.mds    # exit 1 if the file would change; never writes — for CI
+mds fmt --diff template.mds     # print a unified diff of pending changes; never writes
+mds fmt --check --diff .        # show diffs for every file that would change; exit 1 if any would
+echo 'Hello   {name}!' | mds fmt -   # format from stdin, write to stdout; creates no file
+```
+
+What it normalizes:
+
+- CRLF → LF, everywhere (including inside frontmatter and code fences)
+- Runs of 3+ blank lines collapse to one; leading blank lines in the body are removed entirely
+- Trailing whitespace on `@if`/`@for`/`@define`/… directive lines is stripped
+- Exactly one final newline (empty or whitespace-only input formats to an empty file)
+
+What it deliberately leaves untouched:
+
+- Trailing whitespace on body-text content lines, including whitespace-only "blank" lines — two
+  trailing spaces are a Markdown hard line break, and stripping them (anywhere in body text,
+  including a stray blank line) can change rendered output
+- The byte-for-byte content of frontmatter, code fences, and `@message`/`@define` bodies (the
+  latter two can be consumed in a context that bypasses the compiler's own whitespace
+  normalization, so the formatter never touches them)
+
+Directory mode formats every `.mds` file recursively, **including `_`-prefixed partials**,
+continuing past per-file errors and printing a summary
+(`N formatted, M unchanged, K failed`, or `N would reformat, K failed` under `--check`). A file
+is only written (and its mtime touched) when its content actually changes. Status lines and
+summaries go to stderr; `--diff` output and stdin filter-mode content go to stdout; `--quiet`
+suppresses status but never errors. Reads a `fmt` section from `mds.json`
+(`{"fmt": {"sort_frontmatter_keys": true}}`) for forward compatibility — the field doesn't drive
+any formatting behavior yet; frontmatter key sorting is deferred to a future version.
 
 ## Bundler Integration
 

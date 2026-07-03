@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mds fmt`** — an opinionated, safety-gated auto-formatter for `.mds` templates. Every
+  rewrite is guaranteed compile-equivalent: a runtime safety gate re-compiles the formatted
+  source and refuses to write if it would change compiled output (`mds::formatter_invariant`)
+  rather than silently corrupting a template. Normalizes CRLF to LF (including inside
+  frontmatter and code fences), collapses runs of 3+ blank lines to one, strips trailing
+  whitespace on directive lines, and ensures exactly one final newline — while leaving
+  body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of
+  frontmatter / code fences / `@message` / `@define` bodies untouched. Supports a single file,
+  a directory (recursive, including `_`-prefixed partials), or stdin (`-`, as a filter);
+  `--check` exits non-zero without writing when anything would change, and `--diff` prints a
+  unified diff (colorized on a TTY) without writing. New public `mds-core` API:
+  `format_str` / `format_str_with`. (#60)
+
 - **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), to be distributed
   as `mdscript` on PyPI. Seven functions — `compile`, `compile_file`,
   `compile_virtual`, `check`, `check_file`, `check_virtual`, and `scan_imports` —
