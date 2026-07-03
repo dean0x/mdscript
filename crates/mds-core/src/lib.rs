@@ -44,6 +44,7 @@ pub(crate) mod ast;
 pub(crate) mod builtins;
 pub(crate) mod error;
 pub(crate) mod evaluator;
+pub(crate) mod formatter;
 pub(crate) mod fs;
 pub(crate) mod lexer;
 pub(crate) mod limits;
@@ -54,6 +55,7 @@ pub(crate) mod scope;
 pub(crate) mod validator;
 pub(crate) mod value;
 
+pub use formatter::{format_str, format_str_with};
 pub use fs::{FileSystem, NativeFs, VirtualFs};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
