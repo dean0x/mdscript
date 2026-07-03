@@ -1,0 +1,7 @@
+@define greet(x):   
+Hello {x}!
+@end
+
+
+
+@export greet

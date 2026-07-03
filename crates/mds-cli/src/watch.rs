@@ -2317,6 +2317,7 @@ mod tests {
                 build: BuildConfig {
                     output_dir: Some("dist".to_string()),
                 },
+                ..Default::default()
             },
             PathBuf::from("/project"),
         ));
@@ -2336,6 +2337,7 @@ mod tests {
                 build: BuildConfig {
                     output_dir: Some("../bad".to_string()),
                 },
+                ..Default::default()
             },
             PathBuf::from("/project"),
         ));

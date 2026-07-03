@@ -1,0 +1,2 @@
+@import { greet } from "./_fmt_partial.mds"
+{greet("World")}

@@ -383,6 +383,117 @@ fn exit_code_syntax_error() {
     );
 }
 
+// ── mds fmt exit codes (issue #60) ────────────────────────────────────────────
+
+#[test]
+fn exit_code_fmt_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("clean.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    let status = mds_bin()
+        .arg("fmt")
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert!(
+        status.success(),
+        "expected exit code 0 for an already-clean file"
+    );
+}
+
+#[test]
+fn exit_code_fmt_check_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("dirty.mds");
+    std::fs::write(&src, "Hello!\r\n\r\n\r\n\r\nBye.\r\n").unwrap();
+    let status = mds_bin()
+        .args(["fmt", "--check"])
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected exit code 1 when --check finds a file that would change"
+    );
+}
+
+#[test]
+fn exit_code_fmt_syntax_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bad.mds");
+    std::fs::write(&path, "```\nunclosed fence\n").unwrap();
+    let status = mds_bin()
+        .arg("fmt")
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected exit code 1 for a syntax error"
+    );
+}
+
+#[test]
+fn exit_code_fmt_file_not_found() {
+    let status = mds_bin()
+        .args(["fmt", "/tmp/no_such_fmt_file_98765.mds"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "expected exit code 2 for file-not-found"
+    );
+}
+
+#[test]
+fn exit_code_fmt_not_mds_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("notes.txt");
+    std::fs::write(&path, "plain text\n").unwrap();
+    let status = mds_bin()
+        .arg("fmt")
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "expected exit code 2 for a non-.mds explicit file"
+    );
+}
+
+#[test]
+fn exit_code_fmt_oversized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge.mds");
+    std::fs::write(&path, "x".repeat(10 * 1024 * 1024 + 1)).unwrap();
+    let status = mds_bin()
+        .arg("fmt")
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("failed to run mds");
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "expected exit code 3 for oversized source"
+    );
+}
+
 // Directory input: an empty directory exits 0 (prints "No .mds files found").
 // Directory build is now supported — the old "must fail" test is updated to match new behavior.
 #[test]

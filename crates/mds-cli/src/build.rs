@@ -17,11 +17,51 @@ use serde::Deserialize;
 pub(crate) struct MdsConfig {
     #[serde(default)]
     pub(crate) build: BuildConfig,
+    /// Loaded (and validated — a malformed `fmt` section still fails config
+    /// loading) for forward-compatibility, but not yet consulted by `mds fmt`
+    /// — see `FmtConfig`.
+    #[allow(
+        dead_code,
+        reason = "scaffolding for a rule not implemented until a future version"
+    )]
+    #[serde(default)]
+    pub(crate) fmt: FmtConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct BuildConfig {
     pub(crate) output_dir: Option<String>,
+}
+
+/// Forward-compatibility scaffolding for `mds fmt` configuration.
+///
+/// `sort_frontmatter_keys` is not wired into any formatting behavior yet — the
+/// v1 ruleset (R1-R4, see `mds-core`'s `formatter` module) deliberately defers
+/// frontmatter key sorting to a future version, and there is intentionally no
+/// matching CLI flag (a no-op flag would be a clippy/UX liability). The field
+/// exists now purely so `{"fmt": {"sort_frontmatter_keys": false}}` parses
+/// cleanly today and this won't need a breaking `mds.json` schema change once
+/// the rule ships.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FmtConfig {
+    #[allow(
+        dead_code,
+        reason = "scaffolding for a rule not implemented until a future version"
+    )]
+    #[serde(default = "default_sort_frontmatter_keys")]
+    pub(crate) sort_frontmatter_keys: bool,
+}
+
+impl Default for FmtConfig {
+    fn default() -> Self {
+        Self {
+            sort_frontmatter_keys: default_sort_frontmatter_keys(),
+        }
+    }
+}
+
+fn default_sort_frontmatter_keys() -> bool {
+    true
 }
 
 /// Maximum allowed size for `mds.json` (1 MB) to prevent runaway memory use.
@@ -971,6 +1011,7 @@ mod tests {
                 build: BuildConfig {
                     output_dir: Some("build".to_string()),
                 },
+                ..Default::default()
             },
             PathBuf::from("/project"),
         ));

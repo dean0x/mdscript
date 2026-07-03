@@ -52,6 +52,11 @@ pythonize = "=0.29.0"
 # would enforce this acceptance in CI (suggested follow-up, out of scope for this batch).
 notify = "8"
 ctrlc = "3.5"
+# similar: pure-Rust diffing (mds-cli `fmt --diff`). Apache-2.0 (MIT-compatible, no
+# copyleft). 3.1.1 released 2026-05-23 (~40d before this pin) — past the routine 30d
+# soak window. rust-version = "1.85" in its published Cargo.toml, within the workspace
+# MSRV (1.88). Only the default features ("std", "text") are used.
+similar = "3.1"
 
 # panic = "unwind" is required workspace-wide because mds-wasm and mds-napi use
 # catch_unwind at the JS boundary to convert panics into structured JS errors.
