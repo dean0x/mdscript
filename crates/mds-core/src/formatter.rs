@@ -495,11 +495,23 @@ fn rewrite_body(
 /// match. `compile_str_collecting_warnings` (not `compile_str_with`) is used
 /// so the gate never duplicates warnings to stderr on every format call.
 ///
-/// When `source` does NOT compile standalone (a minority case — typically an
-/// undefined runtime variable; imports still resolve via `base_dir`), falls
-/// back to a structural, rule-aware token comparison so the formatter can
-/// still succeed on templates that only work with runtime vars supplied at
-/// render time.
+/// When `source` does NOT compile standalone the reason matters:
+///
+/// - A [`MdsError::Syntax`] means the source is malformed at the lex/parse
+///   level — most notably an unclosed `@message`/`@if`/`@for`/`@define`/
+///   `@block` block, which (unlike an unclosed code fence or interpolation)
+///   tokenizes cleanly and only fails when the parser looks for the matching
+///   `@end`. There is no well-formed program to format, so the real syntax
+///   error is surfaced verbatim — matching `mds build` / `mds check` — instead
+///   of silently emitting a still-broken file or a misleading
+///   `FormatterInvariant` for what is ordinary author error.
+/// - Any OTHER compile error (a minority case — typically an undefined runtime
+///   variable or function; imports still resolve via `base_dir`) means the
+///   source parsed into a well-formed token stream and only failed later during
+///   name resolution / evaluation. Those templates are legitimately formattable,
+///   so the gate falls back to a structural, rule-aware token comparison and
+///   still succeeds on sources that only compile with runtime vars supplied at
+///   render time.
 fn assert_equivalent(
     source: &str,
     formatted: &str,
@@ -516,6 +528,14 @@ fn assert_equivalent(
                 "formatted source failed to compile though the original succeeded: {e}"
             ))),
         },
+        // A lex/parse `Syntax` error means the source is genuinely malformed
+        // (e.g. an unclosed `@message`/`@if`/`@for` block, which tokenizes but
+        // fails at parse time). There is nothing safe to format: surface the
+        // real error rather than papering over it with the structural check.
+        Err(e @ MdsError::Syntax { .. }) => Err(e),
+        // Any other compile failure (undefined var/fn, unresolved import, …)
+        // means the token stream is well-formed and only later analysis failed,
+        // so the rule-aware structural comparison is a meaningful fallback.
         Err(_) => {
             if structural_equivalent(source, formatted, raw_content) {
                 Ok(())

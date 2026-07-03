@@ -30,7 +30,7 @@ const CORPUS: &[&str] = &[
     "   \n",
     "No trailing newline",
     "---\nname: x\n---\n",
-    "---\npremium: true\n---\nBefore\n\n\n\nAfter @if premium: inline text {premium}\n@end\n",
+    "---\npremium: true\n---\nBefore\n\n\n\nAfter\n@if premium:\ninline text {premium}\n@end\n",
 ];
 
 fn compiled_markdown(src: &str) -> Option<String> {
@@ -285,6 +285,52 @@ fn syntax_error_unclosed_interpolation_is_err() {
 fn syntax_error_unclosed_frontmatter_is_err() {
     let err = format_str("---\nname: x\nHello\n").unwrap_err();
     assert!(matches!(err, MdsError::Syntax { .. }));
+}
+
+// ── AC-EF-8 (parse-level): unclosed directive blocks surface Syntax, never
+//    a silent format or a misleading FormatterInvariant ──────────────────────
+//
+// Unlike an unclosed code fence / interpolation / frontmatter (all of which
+// fail in the LEXER, so `format_str` errors before it ever rewrites), an
+// unclosed `@message`/`@if`/`@for`/`@define`/`@block` tokenizes cleanly and
+// only fails at PARSE time. Such malformed input must still be rejected with
+// the real syntax error — exactly like `mds build`/`mds check` — rather than
+// being silently accepted (when the rewrite is a no-op) or reported as a
+// `FormatterInvariant` "please file a bug" (when the whole-body trim happens
+// to touch the unclosed block's trailing whitespace).
+
+#[test]
+fn syntax_error_unclosed_directive_blocks_surface_syntax_not_formatter_invariant() {
+    // "Clean" variants (rewrite is a no-op): previously silently returned Ok.
+    for src in [
+        "@message user:\nHi\n",
+        "@if x:\nHi\n",
+        "@for a in items:\n- {a}\n",
+        "@define greet(x):\nHello {x}\n",
+        "@block b:\nStuff\n",
+    ] {
+        match format_str(src) {
+            Err(MdsError::Syntax { .. }) => {}
+            other => panic!("expected Syntax error for unclosed block {src:?}, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn syntax_error_unclosed_message_with_trailing_ws_is_syntax_not_formatter_invariant() {
+    // Trailing whitespace on the final body line makes the whole-body trim_end
+    // diverge from the byte-exact raw region -> this is the exact input that
+    // previously produced `FormatterInvariant`. It must now be a clean Syntax
+    // error (the source is simply missing an `@end`).
+    let err = format_str("@message user:\nHi  ").unwrap_err();
+    assert!(
+        matches!(err, MdsError::Syntax { .. }),
+        "expected Syntax error, got: {err:?}"
+    );
+    assert!(
+        !matches!(err, MdsError::FormatterInvariant { .. }),
+        "unclosed @message is author error, not a formatter bug"
+    );
 }
 
 // ── T1-gate-fallback: undefined-var source still formats; import source uses full gate ──
