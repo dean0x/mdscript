@@ -565,10 +565,9 @@ fn compile_result_warnings_emitted_for_empty_include() {
 }
 
 /// Verify that `compile_str_with` resolves `@import` paths relative to the
-/// supplied `base_dir`, not its parent, and that the reported `dependencies`
-/// list the real imported path and never leak the internal `<source>`
-/// base-key sentinel. Regression test for the base_key sentinel fix in
-/// `resolve_source` (PF-003 / #133).
+/// supplied `base_dir`. The reported `dependencies` must list the real imported
+/// path (ending with "lib.mds") with no spurious entries. Regression test for
+/// directory-anchored import resolution (PF-003 / #133, #146).
 #[test]
 fn compile_str_with_import_resolves_relative_to_base_dir() {
     use std::io::Write;
@@ -587,9 +586,7 @@ fn compile_str_with_import_resolves_relative_to_base_dir() {
     );
     let compiled = result.unwrap();
 
-    // dependencies() must list the real imported path and must never contain
-    // the internal `<source>` base-key sentinel — it is synthetic bookkeeping
-    // for the entry's own base_key, never a real dependency.
+    // dependencies() must list exactly one entry: the real imported lib.mds path.
     assert_eq!(
         compiled.dependencies.len(),
         1,
@@ -599,11 +596,6 @@ fn compile_str_with_import_resolves_relative_to_base_dir() {
     assert!(
         compiled.dependencies[0].ends_with("lib.mds"),
         "expected dependency to resolve to the real lib.mds path, got: {:?}",
-        compiled.dependencies
-    );
-    assert!(
-        !compiled.dependencies.iter().any(|d| d.contains("<source>")),
-        "dependencies must never contain the internal <source> base-key sentinel, got: {:?}",
         compiled.dependencies
     );
 

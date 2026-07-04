@@ -2824,27 +2824,73 @@ fn p_block_sources_share_one_arc() {
     let _ = origins.pop(); // suppress unused warning
 }
 
-// ── PF-003 / #133: Windows verbatim-path base_key sentinel stripping ─────────
+// ── PF-003 / #133: Windows verbatim-path parent_dir invariant ────────────────
 
-// Runs on every CI leg (not gated to Windows): the assertion holds on POSIX
-// too, since `Path::join` still inserts exactly one separator there and
-// `.parent()` strips it — so this guards `source_base_key`'s signature and
-// behavior against drift on the POSIX-gating CI. It remains the load-bearing
-// regression check only on Windows, where a `\\?\` verbatim path makes `/` a
-// literal character rather than a separator.
+// Guards that `NativeFs::parent_dir` uses `Path::new(key).parent()` — the same
+// OS-native path decomposition used everywhere in this codebase — rather than a
+// string split on `/`. On Windows, `std::fs::canonicalize` returns a `\\?\`
+// verbatim extended-length path where `/` is a LITERAL character, not a separator;
+// a string split on `/` would silently return the wrong directory. The Windows
+// assertion is gated to `#[cfg(windows)]`; a POSIX assertion runs on every CI
+// leg to keep the code path compiled and tested on all platforms.
 #[test]
-fn pf003_source_base_key_sentinel_strips_on_windows_verbatim_path() {
-    // `std::fs::canonicalize` on Windows returns a `\\?\` verbatim extended-length
-    // path, where `/` is a literal character rather than a path separator. This
-    // confirms `source_base_key` builds the key via `Path::join` (not
-    // `format!("{dir}/<source>")`), so `Path::parent()` correctly strips the
-    // `<source>` sentinel back to the original canonical directory.
-    let canonical_dir = r"\\?\C:\a\b";
-    let base_key = ModuleCache::source_base_key(canonical_dir);
-    let parent = Path::new(&base_key).parent();
-    assert_eq!(
-        parent,
-        Some(Path::new(canonical_dir)),
-        "source_base_key's sentinel must be stripped by Path::parent() on Windows verbatim paths"
+fn pf003_parent_dir_strips_on_windows_verbatim_path() {
+    use crate::fs::NativeFs;
+    let fs = NativeFs::new();
+
+    // On Windows: verbatim extended-length paths use `\` as the separator;
+    // `Path::parent()` correctly strips the filename back to the directory.
+    #[cfg(windows)]
+    {
+        let dir = fs.parent_dir(r"\\?\C:\a\b\c.mds");
+        assert_eq!(
+            dir, r"\\?\C:\a\b",
+            "parent_dir on Windows verbatim path must strip the filename (PF-003 guard)"
+        );
+    }
+
+    // Cross-platform (POSIX): regular OS-native path decomposition; keeps the
+    // code path compiled and exercised on every CI leg (Linux, macOS).
+    #[cfg(unix)]
+    {
+        let dir = fs.parent_dir("/abs/dir/file.mds");
+        assert_eq!(
+            dir, "/abs/dir",
+            "parent_dir on POSIX path must strip the filename"
+        );
+    }
+}
+
+// ── SOURCE_LABEL display-label lock ──────────────────────────────────────────
+
+// Ensures that string-source compile errors include `<source>` as the file
+// label in miette diagnostics. SOURCE_LABEL is the `ctx.file_str` for
+// string-source modules — it must appear in the rendered diagnostic.
+//
+// The source must trigger a SPAN-CARRYING error so that `MdsError::at()` sets
+// `src: Some(NamedSource::new("<source>", ...))`. Post-parse semantic errors
+// without a span (e.g. "cannot use literal in @if condition") have `src: None`
+// and will not surface `<source>` in the debug representation.
+// A plain `{undefined_var}` interpolation triggers `MdsError::undefined_var_at`
+// with a span pointing to the interpolation site — that IS a span-carrying error.
+#[test]
+fn source_label_appears_in_string_source_diagnostics() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+
+    // An undefined variable interpolation produces MdsError::UndefinedVariable
+    // with src: Some(NamedSource { name: "<source>", ... }) and a span pointing
+    // to the interpolation site — exactly the span-carrying error we need.
+    let bad_source = "{undefined_var}\n";
+    let result = crate::compile_str_with(bad_source, Some(dir.path()), None);
+
+    let err = result.unwrap_err();
+    // The Debug representation of MdsError::UndefinedVariable surfaces
+    // `NamedSource { name: "<source>", ... }` when src is Some.
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("<source>"),
+        "string-source diagnostic must contain '<source>' as the file label, got:\n{rendered}"
     );
 }
