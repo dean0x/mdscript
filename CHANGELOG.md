@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cross-platform wheel matrix and PyPI publishing are a tracked follow-up (#132) —
   for now, install from source: `pip install ./crates/mds-python`. (#59)
 
+### Fixed
+
+- **Windows: string-source `@import`/`@extends` now resolve relative imports
+  correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path
+  on Windows, and inside a `\\?\` prefix `/` is a literal character, not a path
+  separator — so building the in-memory-source base key with
+  `format!("{canonical}/<source>")` produced a key that `Path::parent()` could not
+  strip back to the base directory, silently resolving relative imports against the
+  wrong directory. Fixed by building the key with `Path::join` instead, mirroring the
+  existing safe join used for on-disk files. Fixes napi `compile`/`check(src, {
+  basePath })`, Python `compile`/`check(src, base_path=...)`, and CLI `mds build -` /
+  `mds check -` (stdin) — all share the same resolution path. POSIX behavior is
+  unchanged. (#133)
+
 ## [0.3.0] — 2026-06-28
 
 ### **BREAKING** — Intrinsic output format (removes `--format` flag and `compileMessages` API)

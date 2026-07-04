@@ -2823,3 +2823,23 @@ fn p_block_sources_share_one_arc() {
     }
     let _ = origins.pop(); // suppress unused warning
 }
+
+// ── PF-003 / #133: Windows verbatim-path base_key sentinel stripping ─────────
+
+#[cfg(windows)]
+#[test]
+fn source_base_key_sentinel_strips_on_windows_verbatim_path() {
+    // `std::fs::canonicalize` on Windows returns a `\\?\` verbatim extended-length
+    // path, where `/` is a literal character rather than a path separator. This
+    // confirms `source_base_key` builds the key via `Path::join` (not
+    // `format!("{dir}/<source>")`), so `Path::parent()` correctly strips the
+    // `<source>` sentinel back to the original canonical directory.
+    let canonical_dir = r"\\?\C:\a\b";
+    let base_key = ModuleCache::source_base_key(canonical_dir);
+    let parent = Path::new(&base_key).parent();
+    assert_eq!(
+        parent,
+        Some(Path::new(canonical_dir)),
+        "source_base_key's sentinel must be stripped by Path::parent() on Windows verbatim paths"
+    );
+}

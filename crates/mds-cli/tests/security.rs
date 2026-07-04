@@ -234,6 +234,34 @@ fn resolve_source_nonexistent_base_dir_errors() {
 }
 
 #[test]
+fn resolve_source_import_traversal_rejected() {
+    // Security invariant (AC-S2): the string + base_dir route must reject a
+    // relative `@import` that escapes `base_dir` via `../`, exactly like the
+    // file route (`path_traversal_import_rejected` above). Regression guard for
+    // the PF-003 / #133 base_key sentinel fix — the safer `Path::join`
+    // construction must still route through the same path-traversal check.
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    // Create a file outside the 'sub' base_dir.
+    let outside = dir.path().join("secret.mds");
+    std::fs::write(&outside, "Secret content").unwrap();
+
+    let source = "@import \"../secret.mds\" as s\n\n@include s\n";
+    let result = mds::compile_str_with(source, Some(sub.as_path()), None);
+    assert!(
+        result.is_err(),
+        "string-route traversal import should be rejected"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("escapes project directory") || err.contains("import"),
+        "Expected path traversal error, got: {err}"
+    );
+}
+
+#[test]
 fn parser_nesting_depth_limit_rejects_deep_nesting() {
     // Build a template with 65 nested @if blocks (just past MAX_NESTING_DEPTH=64).
     //

@@ -565,8 +565,10 @@ fn compile_result_warnings_emitted_for_empty_include() {
 }
 
 /// Verify that `compile_str_with` resolves `@import` paths relative to the
-/// supplied `base_dir`, not its parent. Regression test for the base_key
-/// sentinel fix in `resolve_source`.
+/// supplied `base_dir`, not its parent, and that the reported `dependencies`
+/// list the real imported path and never leak the internal `<source>`
+/// base-key sentinel. Regression test for the base_key sentinel fix in
+/// `resolve_source` (PF-003 / #133).
 #[test]
 fn compile_str_with_import_resolves_relative_to_base_dir() {
     use std::io::Write;
@@ -583,7 +585,29 @@ fn compile_str_with_import_resolves_relative_to_base_dir() {
         result.is_ok(),
         "compile_str_with should succeed: {result:?}"
     );
-    let output = result.unwrap().into_markdown().unwrap();
+    let compiled = result.unwrap();
+
+    // dependencies() must list the real imported path and must never contain
+    // the internal `<source>` base-key sentinel — it is synthetic bookkeeping
+    // for the entry's own base_key, never a real dependency.
+    assert_eq!(
+        compiled.dependencies.len(),
+        1,
+        "expected exactly one dependency, got: {:?}",
+        compiled.dependencies
+    );
+    assert!(
+        compiled.dependencies[0].ends_with("lib.mds"),
+        "expected dependency to resolve to the real lib.mds path, got: {:?}",
+        compiled.dependencies
+    );
+    assert!(
+        !compiled.dependencies.iter().any(|d| d.contains("<source>")),
+        "dependencies must never contain the internal <source> base-key sentinel, got: {:?}",
+        compiled.dependencies
+    );
+
+    let output = compiled.into_markdown().unwrap();
     assert!(
         output.contains("Hello World!"),
         "expected 'Hello World!' in output, got: {output}"

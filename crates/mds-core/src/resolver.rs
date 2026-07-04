@@ -2,6 +2,7 @@ mod frontmatter;
 mod inheritance;
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
@@ -205,6 +206,10 @@ impl Clone for ResolvedModule {
 
 /// Maximum import depth to prevent stack overflow from deeply chained imports.
 const MAX_IMPORT_DEPTH: usize = 64;
+
+/// Synthetic filename appended to a canonicalized base dir so a string source's
+/// `@import`/`@extends` resolve relative to that dir (not its parent).
+const SOURCE_SENTINEL: &str = "<source>";
 
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
@@ -451,10 +456,10 @@ impl ModuleCache {
         self.fs.set_root(&canonical_str)?;
 
         // The base_key must look like a file path so that normalize() can call
-        // parent() on it to get the directory. Append a synthetic filename to
-        // the canonical directory so imports resolve relative to that directory
-        // (not its parent).
-        let base_key = format!("{canonical_str}/<source>");
+        // parent() on it to get the directory; source_base_key() appends a
+        // synthetic filename to the canonical directory so imports resolve
+        // relative to that directory (not its parent).
+        let base_key = Self::source_base_key(&canonical_str);
 
         // Guard against re-entrant or cyclic calls that could form a cycle
         // back through this root module. Mirrors the resolving bookkeeping in
@@ -464,7 +469,7 @@ impl ModuleCache {
         self.resolving.insert(base_key.clone());
 
         let ctx = ModuleCtx {
-            file_str: "<source>",
+            file_str: SOURCE_SENTINEL,
             source,
             base_key: &base_key,
             runtime_vars,
@@ -544,11 +549,11 @@ impl ModuleCache {
     ) -> Result<crate::CompiledOutput, MdsError> {
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
-        let base_key = format!("{canonical_str}/<source>");
+        let base_key = Self::source_base_key(&canonical_str);
         self.check_import_depth()?;
         self.resolving.insert(base_key.clone());
         let ctx = ModuleCtx {
-            file_str: "<source>",
+            file_str: SOURCE_SENTINEL,
             source,
             base_key: &base_key,
             runtime_vars,
@@ -708,6 +713,18 @@ impl ModuleCache {
             (Ok(_), Err(lifo_err)) => Err(lifo_err),
             (Ok(resolved), Ok(())) => Ok(resolved),
         }
+    }
+
+    /// Build the base key for an in-memory source rooted at `canonical_dir`.
+    ///
+    /// Uses `Path::join` — NOT `format!("{dir}/<source>")` — so `normalize()`'s
+    /// `.parent()` strips the sentinel on Windows, where `canonicalize()` yields a
+    /// `\\?\` verbatim path in which `/` is literal, not a separator (PF-003 / #133).
+    fn source_base_key(canonical_dir: &str) -> String {
+        Path::new(canonical_dir)
+            .join(SOURCE_SENTINEL)
+            .display()
+            .to_string()
     }
 
     /// Common module processing: tokenize, parse, build scope, evaluate.
