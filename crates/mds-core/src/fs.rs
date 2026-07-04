@@ -30,12 +30,16 @@ const MAX_PATH_SEGMENTS: usize = 256;
 /// Custom implementations provided via [`crate::resolver::ModuleCache::with_fs`]
 /// MUST uphold the following minimum obligations:
 ///
-/// - **Path traversal prevention**: `normalize` must reject paths that escape
-///   the intended root (e.g., `../../../etc/passwd`).
-/// - **Null-byte rejection**: `normalize` must reject paths containing `\0`.
+/// - **Path traversal prevention**: `normalize` and `normalize_in_dir` must
+///   reject paths that escape the intended root (e.g., `../../../etc/passwd`).
+/// - **Null-byte rejection**: `normalize` and `normalize_in_dir` must reject
+///   paths containing `\0`.
 /// - **File size limits**: `read` must refuse content larger than
 ///   [`crate::MAX_FILE_SIZE`] bytes (10 MB) to prevent resource exhaustion.
-/// - **Input sanitization**: `normalize` must reject empty paths.
+/// - **Input sanitization**: `normalize` and `normalize_in_dir` must reject
+///   empty paths.
+/// - **`dir == ""`** (empty string) in `normalize_in_dir` means "virtual root" or
+///   "no directory prefix" — resolve `relative` from the root of the key-space.
 ///
 /// Failing to implement these controls silently bypasses the security enforced
 /// by [`NativeFs`] and may expose the host system to arbitrary file reads or
@@ -46,6 +50,24 @@ pub trait FileSystem: Send + Sync {
     /// - `base == ""` means entry point (root-level resolution)
     /// - `base != ""` means importing from within an already-resolved module
     fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError>;
+
+    /// Resolve `relative` directly within directory `dir`.
+    ///
+    /// Unlike `normalize`, which derives the directory by calling `parent()` on a
+    /// *file* key, this method receives the directory explicitly — no sentinel
+    /// filename, no `parent()` coupling, no Windows verbatim-path hazard (PF-003).
+    ///
+    /// `dir == ""` means resolve from the root of the key-space (the same as an
+    /// import from a top-level file). Implementations must enforce all traversal,
+    /// null-byte, and empty-path guards as described in the security contract above.
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError>;
+
+    /// Return the directory portion of a normalized file key.
+    ///
+    /// For `NativeFs` this is `Path::new(key).parent()` (verbatim-path-safe).
+    /// For `VirtualFs` this is everything before the last `/`, or `""` for a
+    /// top-level key.
+    fn parent_dir(&self, key: &str) -> String;
 
     /// Read the content of a normalized key.
     fn read(&self, normalized: &str) -> Result<String, MdsError>;
@@ -70,6 +92,57 @@ pub trait FileSystem: Send + Sync {
     fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
         Ok(path.to_string())
     }
+}
+
+// ── VirtualFs shared segment logic ───────────────────────────────────────────
+
+/// Resolve a relative path string against a pre-split directory segment stack.
+///
+/// `dir_segments` is a `Vec<String>` seeded from the importing directory.
+/// `relative` is the raw relative import path (may contain `.`, `..`, `/`).
+///
+/// Returns the resolved key (joined by `/`) or an error for:
+/// - traversal above root (`..` when segments is empty)
+/// - empty resolved key
+/// - exceeding [`MAX_PATH_SEGMENTS`]
+///
+/// Shared by [`VirtualFs::normalize`] and [`VirtualFs::normalize_in_dir`] so
+/// both can never silently drift in their path-resolution semantics.
+fn resolve_relative_segments(
+    mut dir_segments: Vec<String>,
+    relative: &str,
+) -> Result<String, MdsError> {
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {
+                // Skip empty parts (leading "./") and "." segments.
+            }
+            ".." => {
+                if dir_segments.is_empty() {
+                    return Err(MdsError::import_error(format!(
+                        "import path escapes project directory: \"{relative}\""
+                    )));
+                }
+                dir_segments.pop();
+            }
+            seg => {
+                if dir_segments.len() >= MAX_PATH_SEGMENTS {
+                    return Err(MdsError::resource_limit(format!(
+                        "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{relative}\""
+                    )));
+                }
+                dir_segments.push(seg.to_string());
+            }
+        }
+    }
+
+    if dir_segments.is_empty() {
+        return Err(MdsError::import_error(format!(
+            "import path resolves to empty key: \"{relative}\""
+        )));
+    }
+
+    Ok(dir_segments.join("/"))
 }
 
 // ── VirtualFs ────────────────────────────────────────────────────────────────
@@ -117,46 +190,36 @@ impl FileSystem for VirtualFs {
             return Ok(relative.to_string());
         }
 
-        // Resolve relative to the directory portion of base (split on '/').
-        // Build up a segment list, applying "." (noop) and ".." (pop) as we go.
-        let base_dir_segments: Vec<&str> = base
-            .rsplit_once('/')
-            .map(|(dir, _)| dir.split('/').filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
+        // Delegate to normalize_in_dir with the parent directory of `base`.
+        // `rsplit_once('/')` gives the directory part of the key, or "" for a
+        // top-level key (no directory component).
+        let base_dir = base.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        self.normalize_in_dir(base_dir, relative)
+    }
 
-        let mut segments: Vec<&str> = base_dir_segments;
-
-        for part in relative.split('/') {
-            match part {
-                "" | "." => {
-                    // Skip empty parts (leading "./") and "." segments.
-                }
-                ".." => {
-                    if segments.is_empty() {
-                        return Err(MdsError::import_error(format!(
-                            "import path escapes project directory: \"{relative}\""
-                        )));
-                    }
-                    segments.pop();
-                }
-                seg => {
-                    if segments.len() >= MAX_PATH_SEGMENTS {
-                        return Err(MdsError::resource_limit(format!(
-                            "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{relative}\""
-                        )));
-                    }
-                    segments.push(seg);
-                }
-            }
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        if relative.is_empty() {
+            return Err(MdsError::import_error("import path is empty"));
+        }
+        if relative.contains('\0') {
+            return Err(MdsError::import_error("import path contains null byte"));
         }
 
-        if segments.is_empty() {
-            return Err(MdsError::import_error(format!(
-                "import path resolves to empty key: \"{relative}\""
-            )));
-        }
+        // Seed segment stack from the explicit directory (not a file key — no parent() needed).
+        let dir_segments: Vec<String> = dir
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
 
-        Ok(segments.join("/"))
+        resolve_relative_segments(dir_segments, relative)
+    }
+
+    fn parent_dir(&self, key: &str) -> String {
+        key.rsplit_once('/')
+            .map(|(d, _)| d)
+            .unwrap_or("")
+            .to_string()
     }
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
@@ -271,6 +334,29 @@ impl NativeFs {
         Ok(())
     }
 
+    /// Resolve `relative` within `dir` (given as a `&Path`) using the established
+    /// security primitives — no `Path`→`String`→`Path` round-trip on the hot path.
+    ///
+    /// Validates `relative` (null-byte, empty), joins with `dir` via `Path::join`
+    /// (verbatim-path-safe on Windows; avoids PF-003 / #133), then runs
+    /// `check_symlink` and `check_path_traversal` before returning the canonical
+    /// key string.
+    ///
+    /// Does NOT call `init_root` — only entry-point resolution (the `base == ""`
+    /// branch in `normalize`) anchors the security root.
+    fn normalize_in_dir_impl(&self, dir: &Path, relative: &str) -> Result<String, MdsError> {
+        if relative.is_empty() {
+            return Err(MdsError::import_error("import path is empty"));
+        }
+        if relative.contains('\0') {
+            return Err(MdsError::import_error("import path contains null byte"));
+        }
+        let path = dir.join(relative);
+        let canonical = Self::check_symlink(&path)?;
+        self.check_path_traversal(&canonical)?;
+        Ok(canonical.display().to_string())
+    }
+
     /// Initialize root_dir from a canonical entry-point directory.
     fn init_root(&self, canonical_dir: &Path) {
         // Skip the up-to-256 exists() calls if the root is already established.
@@ -297,27 +383,34 @@ impl FileSystem for NativeFs {
         if relative.contains('\0') {
             return Err(MdsError::import_error("import path contains null byte"));
         }
-        let path = if base.is_empty() {
-            // Root entry point: treat `relative` as a filesystem path.
-            Path::new(relative).to_path_buf()
-        } else {
-            // Import from within a resolved module: resolve against base directory.
-            let base_path = Path::new(base);
-            let base_dir = base_path.parent().unwrap_or(Path::new("."));
-            base_dir.join(relative)
-        };
-
-        let canonical = Self::check_symlink(&path)?;
 
         if base.is_empty() {
-            // Set root_dir on first entry point resolution.
+            // Root entry point: treat `relative` as a filesystem path.
+            let path = Path::new(relative).to_path_buf();
+            let canonical = Self::check_symlink(&path)?;
+            // Anchor the security root on first entry-point resolution.
             let entry_dir = canonical.parent().unwrap_or(Path::new("."));
             self.init_root(entry_dir);
+            self.check_path_traversal(&canonical)?;
+            Ok(canonical.display().to_string())
+        } else {
+            // Import from within a resolved module: resolve against the parent
+            // directory of `base` via the Path-typed helper (no String round-trip).
+            let base_dir = Path::new(base).parent().unwrap_or(Path::new("."));
+            self.normalize_in_dir_impl(base_dir, relative)
         }
+    }
 
-        self.check_path_traversal(&canonical)?;
+    fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+        self.normalize_in_dir_impl(Path::new(dir), relative)
+    }
 
-        Ok(canonical.display().to_string())
+    fn parent_dir(&self, key: &str) -> String {
+        Path::new(key)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .display()
+            .to_string()
     }
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
@@ -894,6 +987,262 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected Ok for path at segment limit, got {result:?}"
+        );
+    }
+
+    // ── VirtualFs::parent_dir ─────────────────────────────────────────────────
+
+    #[test]
+    fn vfs_parent_dir_nested() {
+        assert_eq!(vfs().parent_dir("a/b/c.mds"), "a/b");
+    }
+
+    #[test]
+    fn vfs_parent_dir_top_level() {
+        // A top-level key has no directory component → empty string.
+        assert_eq!(vfs().parent_dir("main.mds"), "");
+    }
+
+    #[test]
+    fn vfs_parent_dir_single_slash() {
+        assert_eq!(vfs().parent_dir("a/b.mds"), "a");
+    }
+
+    // ── VirtualFs::normalize_in_dir ───────────────────────────────────────────
+
+    #[test]
+    fn vfs_normalize_in_dir_sibling() {
+        let result = vfs().normalize_in_dir("components", "./footer.mds");
+        assert_eq!(result.unwrap(), "components/footer.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_in_dir_parent_traversal() {
+        let result = vfs().normalize_in_dir("a/b", "../sibling.mds");
+        assert_eq!(result.unwrap(), "a/sibling.mds");
+    }
+
+    #[test]
+    fn vfs_normalize_in_dir_traversal_escape_errors() {
+        // Traversal above root must be rejected.
+        let result = vfs().normalize_in_dir("", "../escape.mds");
+        assert!(
+            result.is_err(),
+            "expected Err for traversal above root: {result:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_normalize_in_dir_null_byte_errors() {
+        let result = vfs().normalize_in_dir("a", "./\0evil.mds");
+        assert!(result.is_err(), "expected Err for null byte in path");
+    }
+
+    #[test]
+    fn vfs_normalize_in_dir_empty_relative_errors() {
+        let result = vfs().normalize_in_dir("a", "");
+        assert!(result.is_err(), "expected Err for empty relative path");
+    }
+
+    #[test]
+    fn vfs_normalize_in_dir_segment_cap_errors() {
+        // MAX_PATH_SEGMENTS + 1 segments in relative must be rejected.
+        let long_relative = (0..=MAX_PATH_SEGMENTS)
+            .map(|i| format!("seg{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let result = vfs().normalize_in_dir("", &long_relative);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_normalize_in_dir_empty_dir_is_root() {
+        // dir == "" means root; sibling resolves as a top-level key.
+        let result = vfs().normalize_in_dir("", "./main.mds");
+        assert_eq!(result.unwrap(), "main.mds");
+    }
+
+    // ── normalize_in_dir consistency: must match normalize for same inputs ────
+
+    #[test]
+    fn vfs_normalize_in_dir_matches_normalize() {
+        // For a non-empty base, normalize_in_dir(parent_dir(base), rel)
+        // must produce the same result as normalize(base, rel).
+        let base = "components/header.mds";
+        let rel = "./footer.mds";
+        let via_normalize = vfs().normalize(base, rel).unwrap();
+        let via_in_dir = vfs()
+            .normalize_in_dir(vfs().parent_dir(base).as_str(), rel)
+            .unwrap();
+        assert_eq!(
+            via_normalize, via_in_dir,
+            "normalize and normalize_in_dir must agree for same effective directory"
+        );
+    }
+
+    // ── NativeFs::parent_dir ──────────────────────────────────────────────────
+
+    #[test]
+    fn native_parent_dir_normal_path() {
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let key = file.display().to_string();
+        let parent = NativeFs::new().parent_dir(&key);
+        assert!(
+            parent.contains(dir.path().to_str().unwrap()),
+            "parent_dir should contain the temp dir path, got: {parent}"
+        );
+    }
+
+    // ── NativeFs::normalize_in_dir ────────────────────────────────────────────
+
+    #[test]
+    fn native_normalize_in_dir_sibling_resolve() {
+        let dir = TempDir::new().unwrap();
+        make_temp_file(&dir, "main.mds", "hello");
+        make_temp_file(&dir, "sibling.mds", "world");
+
+        let fs = NativeFs::new();
+        // Establish root first.
+        let entry = dir.path().join("main.mds").display().to_string();
+        fs.normalize("", &entry).expect("entry normalize");
+
+        let dir_str = dir.path().display().to_string();
+        let result = fs.normalize_in_dir(&dir_str, "./sibling.mds");
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        let key = result.unwrap();
+        assert!(
+            key.contains("sibling.mds"),
+            "expected sibling.mds in key, got: {key}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_in_dir_traversal_rejected() {
+        let project_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+
+        let entry = make_temp_file(&project_dir, "main.mds", "hello");
+        let outside = make_temp_file(&outside_dir, "secret.mds", "secret");
+
+        let fs = NativeFs::new();
+        fs.normalize("", &entry.display().to_string())
+            .expect("entry normalize");
+
+        let dir_str = project_dir.path().display().to_string();
+        let outside_str = outside.display().to_string();
+        let escape = "../".repeat(20) + outside_str.trim_start_matches('/');
+        let result = fs.normalize_in_dir(&dir_str, &escape);
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes project"),
+            "expected 'escapes project' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_in_dir_null_byte_errors() {
+        let dir = TempDir::new().unwrap();
+        let dir_str = dir.path().display().to_string();
+        let fs = NativeFs::new();
+        let result = fs.normalize_in_dir(&dir_str, "./\0evil.mds");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("null byte"),
+            "expected null byte in error, got: {msg}"
+        );
+    }
+
+    // ── External impl: clean-break contract for custom FileSystem ─────────────
+    //
+    // Verifies that a minimal custom FileSystem implementation satisfying all
+    // REQUIRED trait methods compiles and resolves an import correctly via
+    // `ModuleCache::with_fs`. Locks the D1 clean-break contract: zero external
+    // impls exist today, and the next release will be ≥0.4.0.
+
+    struct TestFs {
+        modules: std::collections::HashMap<String, String>,
+    }
+
+    impl TestFs {
+        fn new(modules: std::collections::HashMap<String, String>) -> Self {
+            Self { modules }
+        }
+    }
+
+    impl super::FileSystem for TestFs {
+        fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
+            if relative.is_empty() {
+                return Err(MdsError::import_error("empty path"));
+            }
+            if base.is_empty() {
+                return Ok(relative.to_string());
+            }
+            self.normalize_in_dir(&self.parent_dir(base), relative)
+        }
+
+        fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
+            if relative.is_empty() {
+                return Err(MdsError::import_error("empty path"));
+            }
+            let relative = relative.trim_start_matches("./");
+            if dir.is_empty() {
+                return Ok(relative.to_string());
+            }
+            Ok(format!("{dir}/{relative}"))
+        }
+
+        fn parent_dir(&self, key: &str) -> String {
+            key.rsplit_once('/')
+                .map(|(d, _)| d)
+                .unwrap_or("")
+                .to_string()
+        }
+
+        fn read(&self, normalized: &str) -> Result<String, MdsError> {
+            self.modules
+                .get(normalized)
+                .cloned()
+                .ok_or_else(|| MdsError::file_not_found(normalized.to_string()))
+        }
+
+        fn is_markdown(&self, normalized: &str) -> bool {
+            Path::new(normalized).extension().and_then(|e| e.to_str()) == Some("md")
+        }
+    }
+
+    #[test]
+    fn external_impl_resolves_import_via_with_fs() {
+        use crate::resolver::ModuleCache;
+        let modules = std::collections::HashMap::from([
+            (
+                "main.mds".to_string(),
+                "@import \"./lib.mds\" as lib\n{lib.greet(\"World\")}\n".to_string(),
+            ),
+            (
+                "lib.mds".to_string(),
+                "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+            ),
+        ]);
+        let fs = Box::new(TestFs::new(modules));
+        let mut cache = ModuleCache::with_fs(fs);
+        let mut warnings = vec![];
+        let result = cache.resolve_key("main.mds", &Default::default(), &mut warnings);
+        assert!(
+            result.is_ok(),
+            "custom FileSystem impl should resolve imports: {result:?}"
+        );
+        let resolved = result.unwrap();
+        let output = resolved.prompt_body.as_deref().unwrap_or("");
+        assert!(
+            output.contains("Hello World!"),
+            "expected 'Hello World!' from custom fs import, got: {output}"
         );
     }
 }
