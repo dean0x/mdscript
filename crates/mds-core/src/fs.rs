@@ -386,8 +386,7 @@ impl FileSystem for NativeFs {
 
         if base.is_empty() {
             // Root entry point: treat `relative` as a filesystem path.
-            let path = Path::new(relative).to_path_buf();
-            let canonical = Self::check_symlink(&path)?;
+            let canonical = Self::check_symlink(Path::new(relative))?;
             // Anchor the security root on first entry-point resolution.
             let entry_dir = canonical.parent().unwrap_or(Path::new("."));
             self.init_root(entry_dir);

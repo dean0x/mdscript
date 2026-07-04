@@ -211,9 +211,6 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// Used as `ctx.file_str` (shown in diagnostics) and as the cycle-detection key
 /// pushed onto `self.resolving` in `resolve_source`/`resolve_source_intrinsic`.
 /// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
-///
-/// NOT a path component: the resolver no longer appends this to any directory
-/// to form a file path. `ctx.base_dir` carries the canonical directory directly.
 const SOURCE_LABEL: &str = "<source>";
 
 /// Module cache to avoid re-resolving the same file or virtual key.
@@ -466,9 +463,6 @@ impl ModuleCache {
         // back through this root module. Mirrors the resolving bookkeeping in
         // resolve_by_key so that cycle detection and depth checks apply to the
         // root module as well.
-        //
-        // SOURCE_LABEL is the cycle-detection key and display label for string-source
-        // modules — not a path component. ctx.base_dir carries the directory directly.
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
 
@@ -554,8 +548,6 @@ impl ModuleCache {
     ) -> Result<crate::CompiledOutput, MdsError> {
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
-        // SOURCE_LABEL is the cycle-detection key and display label — not a path component.
-        // ctx.base_dir carries the canonical directory directly.
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
@@ -875,10 +867,6 @@ impl ModuleCache {
         // span-carrying error here attributes correctly AND the at() debug_assert can't
         // false-fire. The skeleton_origin already carries these bytes; we use them here
         // for consistency.
-        //
-        // `base` is an explicit `&ResolvedModule` param (not from `self`) so the borrow
-        // of `base.skeleton_origin.source` is independent of the `&mut self` receiver
-        // used by `resolve_frontmatter_imports` below.
         let base_source_ref: &str = &base.skeleton_origin.source;
         let base_base_dir = self.fs.parent_dir(base_key);
         let base_ctx = ModuleCtx {
@@ -1678,8 +1666,7 @@ struct ModuleCtx<'a> {
     ///
     /// For file-backed modules this is the parent directory of the normalized file key
     /// (computed via `FileSystem::parent_dir`). For string-source modules this is the
-    /// canonicalized `base_dir` supplied by the caller. This is always a *directory*,
-    /// never a file path — no sentinel filename, no `parent()` coupling.
+    /// canonicalized `base_dir` supplied by the caller.
     base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
     runtime_vars: &'a HashMap<String, Value>,
