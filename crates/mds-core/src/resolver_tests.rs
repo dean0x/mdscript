@@ -2826,9 +2826,14 @@ fn p_block_sources_share_one_arc() {
 
 // ── PF-003 / #133: Windows verbatim-path base_key sentinel stripping ─────────
 
-#[cfg(windows)]
+// Runs on every CI leg (not gated to Windows): the assertion holds on POSIX
+// too, since `Path::join` still inserts exactly one separator there and
+// `.parent()` strips it — so this guards `source_base_key`'s signature and
+// behavior against drift on the POSIX-gating CI. It remains the load-bearing
+// regression check only on Windows, where a `\\?\` verbatim path makes `/` a
+// literal character rather than a separator.
 #[test]
-fn source_base_key_sentinel_strips_on_windows_verbatim_path() {
+fn pf003_source_base_key_sentinel_strips_on_windows_verbatim_path() {
     // `std::fs::canonicalize` on Windows returns a `\\?\` verbatim extended-length
     // path, where `/` is a literal character rather than a path separator. This
     // confirms `source_base_key` builds the key via `Path::join` (not

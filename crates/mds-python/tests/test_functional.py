@@ -38,6 +38,7 @@ def test_f3_runtime_vars_override_frontmatter() -> None:
 def test_f4_base_path_import(fixtures: pathlib.Path) -> None:
     src = '@import { greet } from "./import_provider.mds"\n\n{greet("Test")}\n'
     r = m.compile(src, base_path=fixtures)
+    assert r.kind == "markdown"
     assert "Hello Test!" in (r.output or "")
 
 
