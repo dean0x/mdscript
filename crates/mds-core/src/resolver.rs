@@ -2,7 +2,6 @@ mod frontmatter;
 mod inheritance;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use indexmap::{IndexMap, IndexSet};
@@ -207,9 +206,15 @@ impl Clone for ResolvedModule {
 /// Maximum import depth to prevent stack overflow from deeply chained imports.
 const MAX_IMPORT_DEPTH: usize = 64;
 
-/// Synthetic filename appended to a canonicalized base dir so a string source's
-/// `@import`/`@extends` resolve relative to that dir (not its parent).
-const SOURCE_SENTINEL: &str = "<source>";
+/// Display label and cycle-detection key for in-memory string-source compilation.
+///
+/// Used as `ctx.file_str` (shown in diagnostics) and as the cycle-detection key
+/// pushed onto `self.resolving` in `resolve_source`/`resolve_source_intrinsic`.
+/// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
+///
+/// NOT a path component: the resolver no longer appends this to any directory
+/// to form a file path. `ctx.base_dir` carries the canonical directory directly.
+const SOURCE_LABEL: &str = "<source>";
 
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
@@ -372,10 +377,11 @@ impl ModuleCache {
         // and the ordered stack (for cycle path reconstruction).
         self.resolving.insert(key.to_string());
 
+        let base_dir_owned = self.fs.parent_dir(key);
         let ctx = ModuleCtx {
             file_str: key,
             source: &source,
-            base_key: key,
+            base_dir: &base_dir_owned,
             runtime_vars,
         };
         let resolved = self.process_module(&ctx, is_md, warnings);
@@ -407,19 +413,20 @@ impl ModuleCache {
         Ok(arc)
     }
 
-    /// Resolve an import from within a module identified by `base_key`.
+    /// Resolve an import relative to an explicit directory `base_dir`.
     ///
-    /// Validates the import path, normalizes it via the filesystem, then
-    /// delegates to [`ModuleCache::resolve_by_key`].
+    /// Validates the import path, resolves it via `FileSystem::normalize_in_dir`
+    /// (directory-anchored — no sentinel-path coupling), then delegates to
+    /// [`ModuleCache::resolve_by_key`].
     fn resolve_import_from(
         &mut self,
-        base_key: &str,
+        base_dir: &str,
         relative: &str,
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<Arc<ResolvedModule>, MdsError> {
         validate_import_path(relative)?;
-        let key = self.fs.normalize(base_key, relative)?;
+        let key = self.fs.normalize_in_dir(base_dir, relative)?;
         self.resolve_by_key(&key, runtime_vars, warnings)
     }
 
@@ -455,29 +462,26 @@ impl ModuleCache {
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
 
-        // The base_key must look like a file path so that normalize() can call
-        // parent() on it to get the directory; source_base_key() appends a
-        // synthetic filename to the canonical directory so imports resolve
-        // relative to that directory (not its parent).
-        let base_key = Self::source_base_key(&canonical_str);
-
         // Guard against re-entrant or cyclic calls that could form a cycle
         // back through this root module. Mirrors the resolving bookkeeping in
         // resolve_by_key so that cycle detection and depth checks apply to the
         // root module as well.
+        //
+        // SOURCE_LABEL is the cycle-detection key and display label for string-source
+        // modules — not a path component. ctx.base_dir carries the directory directly.
         self.check_import_depth()?;
-        self.resolving.insert(base_key.clone());
+        self.resolving.insert(SOURCE_LABEL.into());
 
         let ctx = ModuleCtx {
-            file_str: SOURCE_SENTINEL,
+            file_str: SOURCE_LABEL,
             source,
-            base_key: &base_key,
+            base_dir: &canonical_str,
             runtime_vars,
         };
         let resolved = self.process_module(&ctx, false, warnings);
 
         let popped = self.resolving.pop();
-        Self::check_lifo_pop(resolved, popped, &base_key).map(Arc::new)
+        Self::check_lifo_pop(resolved, popped, SOURCE_LABEL).map(Arc::new)
     }
 
     /// Resolve a virtual-filesystem entry by key, dispatching on output shape.
@@ -524,10 +528,11 @@ impl ModuleCache {
 
         self.resolving.insert(key.to_string());
 
+        let base_dir_owned = self.fs.parent_dir(key);
         let ctx = ModuleCtx {
             file_str: key,
             source: &source,
-            base_key: key,
+            base_dir: &base_dir_owned,
             runtime_vars,
         };
         let result = self.process_module_intrinsic(&ctx, is_md, warnings);
@@ -549,18 +554,19 @@ impl ModuleCache {
     ) -> Result<crate::CompiledOutput, MdsError> {
         let canonical_str = self.fs.canonicalize(base_dir)?;
         self.fs.set_root(&canonical_str)?;
-        let base_key = Self::source_base_key(&canonical_str);
+        // SOURCE_LABEL is the cycle-detection key and display label — not a path component.
+        // ctx.base_dir carries the canonical directory directly.
         self.check_import_depth()?;
-        self.resolving.insert(base_key.clone());
+        self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
-            file_str: SOURCE_SENTINEL,
+            file_str: SOURCE_LABEL,
             source,
-            base_key: &base_key,
+            base_dir: &canonical_str,
             runtime_vars,
         };
         let result = self.process_module_intrinsic(&ctx, false, warnings);
         let popped = self.resolving.pop();
-        Self::check_lifo_pop(result, popped, &base_key)
+        Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
 
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
@@ -715,22 +721,10 @@ impl ModuleCache {
         }
     }
 
-    /// Build the base key for an in-memory source rooted at `canonical_dir`.
-    ///
-    /// Uses `Path::join` — NOT `format!("{dir}/<source>")` — so `normalize()`'s
-    /// `.parent()` strips the sentinel on Windows, where `canonicalize()` yields a
-    /// `\\?\` verbatim path in which `/` is literal, not a separator (PF-003 / #133).
-    fn source_base_key(canonical_dir: &str) -> String {
-        Path::new(canonical_dir)
-            .join(SOURCE_SENTINEL)
-            .display()
-            .to_string()
-    }
-
     /// Common module processing: tokenize, parse, build scope, evaluate.
     ///
-    /// `ctx.file_str` is the display path for error messages (may be `"<source>"`).
-    /// `ctx.base_key` is the normalized key used to resolve relative imports.
+    /// `ctx.file_str` is the display path for error messages (may be `SOURCE_LABEL`).
+    /// `ctx.base_dir` is the directory used to resolve relative `@import`/`@extends`.
     /// `is_md` controls whether the `type` frontmatter key is treated as a file-type marker.
     fn process_module(
         &mut self,
@@ -843,10 +837,10 @@ impl ModuleCache {
     ) -> Result<Scope, MdsError> {
         // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
         //
-        // Base imports resolve relative to the BASE file (using base_key as ctx.base_key).
-        // Child imports resolve relative to the CHILD file (using ctx.base_key as usual).
-        // Both sets are resolved; a duplicate alias across base+child → mds::name_collision
-        // (ADR-014; consistent with the existing namespace-collision handling).
+        // Base imports resolve relative to the BASE file's directory (base_base_dir, derived
+        // from base_key via FileSystem::parent_dir). Child imports resolve relative to the
+        // CHILD file's directory (ctx.base_dir). Both sets are resolved; a duplicate alias
+        // across base+child → mds::name_collision (ADR-014).
         let base_fm_imports: Vec<FrontmatterImport> = base
             .frontmatter_values
             .as_ref()
@@ -886,15 +880,16 @@ impl ModuleCache {
         // of `base.skeleton_origin.source` is independent of the `&mut self` receiver
         // used by `resolve_frontmatter_imports` below.
         let base_source_ref: &str = &base.skeleton_origin.source;
+        let base_base_dir = self.fs.parent_dir(base_key);
         let base_ctx = ModuleCtx {
             file_str: base_key,
             source: base_source_ref,
-            base_key,
+            base_dir: &base_base_dir,
             runtime_vars: ctx.runtime_vars,
         };
         self.resolve_frontmatter_imports(&base_fm_imports, &mut scope, &base_ctx, warnings)?;
 
-        // 3d-v: Resolve child frontmatter imports against child key (ctx.base_key).
+        // 3d-v: Resolve child frontmatter imports against child directory (ctx.base_dir).
         // Duplicate alias across base+child → mds::name_collision (same error as today).
         self.resolve_frontmatter_imports(&child_fm_imports, &mut scope, ctx, warnings)?;
 
@@ -939,7 +934,7 @@ impl ModuleCache {
 
         let base_key = self
             .fs
-            .normalize(ctx.base_key, &ext.path)
+            .normalize_in_dir(ctx.base_dir, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
 
         // PF-004 (avoids PF-004): resolve through resolve_by_key_skeleton so cycle
@@ -1124,10 +1119,11 @@ impl ModuleCache {
 
         self.resolving.insert(key.to_string());
 
+        let base_dir_owned = self.fs.parent_dir(key);
         let ctx = ModuleCtx {
             file_str: key,
             source: &source,
-            base_key: key,
+            base_dir: &base_dir_owned,
             runtime_vars,
         };
         let resolved = self.process_module_skeleton(&ctx, is_md, warnings);
@@ -1175,7 +1171,7 @@ impl ModuleCache {
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent_key = self
             .fs
-            .normalize(ctx.base_key, &ext.path)
+            .normalize_in_dir(ctx.base_dir, &ext.path)
             .map_err(|e| attach_import_span(e, &ext.path, ctx.file_str, ctx.source, ext.offset))?;
         let grandparent = self
             .resolve_by_key_skeleton(&grandparent_key, ctx.runtime_vars, warnings)
@@ -1349,7 +1345,7 @@ impl ModuleCache {
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
                 let source_module = self.resolve_import_from(
-                    ctx.base_key,
+                    ctx.base_dir,
                     import_path,
                     ctx.runtime_vars,
                     warnings,
@@ -1368,7 +1364,7 @@ impl ModuleCache {
                 // Note: resolve_import_from calls validate_import_path internally,
                 // so path validation errors surface with correct messages automatically.
                 let source_module = self.resolve_import_from(
-                    ctx.base_key,
+                    ctx.base_dir,
                     import_path,
                     ctx.runtime_vars,
                     warnings,
@@ -1398,7 +1394,7 @@ impl ModuleCache {
             return Err(MdsError::name_collision(alias.to_string()));
         }
         let resolved = self
-            .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+            .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         scope.set_namespace(alias, resolved.to_namespace());
         Ok(())
@@ -1420,13 +1416,13 @@ impl ModuleCache {
                         return Err(MdsError::name_collision(alias.to_string()));
                     }
                     let resolved = self
-                        .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     scope.set_namespace(alias, resolved.to_namespace());
                 }
                 FrontmatterImport::Merge { path } => {
                     let resolved = self
-                        .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     for (name, func) in resolved.get_all_exports() {
                         if scope.get_function(&name).is_some() {
@@ -1440,7 +1436,7 @@ impl ModuleCache {
                 }
                 FrontmatterImport::Selective { path, names } => {
                     let resolved = self
-                        .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+                        .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
                         .map_err(|e| attach_frontmatter_index(e, i))?;
                     let not_exported = |name: &str| {
                         MdsError::import_error(format!(
@@ -1479,7 +1475,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         let resolved = self
-            .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+            .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
@@ -1505,7 +1501,7 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         let resolved = self
-            .resolve_import_from(ctx.base_key, path, ctx.runtime_vars, warnings)
+            .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         let line_len = ctx.source[offset..]
             .find('\n')
@@ -1678,8 +1674,13 @@ struct ModuleCtx<'a> {
     file_str: &'a str,
     /// Raw file content used for source-span diagnostics (offset → line/column lookup).
     source: &'a str,
-    /// Normalized key of the current module; used to resolve relative `@import` paths.
-    base_key: &'a str,
+    /// Directory from which relative `@import`/`@extends` paths are resolved.
+    ///
+    /// For file-backed modules this is the parent directory of the normalized file key
+    /// (computed via `FileSystem::parent_dir`). For string-source modules this is the
+    /// canonicalized `base_dir` supplied by the caller. This is always a *directory*,
+    /// never a file path — no sentinel filename, no `parent()` coupling.
+    base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
     runtime_vars: &'a HashMap<String, Value>,
 }
