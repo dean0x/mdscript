@@ -197,6 +197,79 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
 
 // ── directory mode ───────────────────────────────────────────────────────────
 
+/// Outcome of formatting a single file in directory mode; tallied by the caller.
+enum FileOutcome {
+    /// Normal mode: the file was reformatted and written.
+    Formatted,
+    /// Normal mode: the file was already formatted (no write needed).
+    Unchanged,
+    /// `--check` / `--diff` mode: the file would change.
+    WouldChange,
+    /// `--check` / `--diff` mode: the file is already formatted.
+    NoChange,
+    /// Any per-file error (read, format, diff-output, or write).
+    Failed,
+}
+
+/// Format one file in directory mode: read → format → (optional) diff → (optional) write.
+///
+/// All per-file error and status lines are printed as side effects so the
+/// directory loop only needs to tally the returned [`FileOutcome`].
+///
+/// A diff-output failure (non-broken-pipe stdout error) is returned as
+/// [`FileOutcome::Failed`] and counted in `fail_count` — consistent with how
+/// read and format errors are treated in the surrounding loop.
+fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
+    let FmtFlags { check, diff, quiet } = flags;
+    let source = match read_source_file(file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e:?}");
+            return FileOutcome::Failed;
+        }
+    };
+    let base_dir = file.parent();
+    let result = match format_source(&source, base_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e:?}");
+            return FileOutcome::Failed;
+        }
+    };
+
+    if diff && result.changed {
+        let label = file.display().to_string();
+        if let Err(e) = print_diff(&render_diff(&source, &result.formatted, &label)) {
+            eprintln!("{e:?}");
+            return FileOutcome::Failed;
+        }
+    }
+
+    let read_only = check || diff;
+    if read_only {
+        if result.changed {
+            FileOutcome::WouldChange
+        } else {
+            FileOutcome::NoChange
+        }
+    } else if !result.changed {
+        FileOutcome::Unchanged
+    } else {
+        match std::fs::write(file, &result.formatted) {
+            Ok(()) => {
+                if !quiet {
+                    eprintln!("Formatted: {}", file.display());
+                }
+                FileOutcome::Formatted
+            }
+            Err(e) => {
+                eprintln!("error: cannot write {}: {e}", file.display());
+                FileOutcome::Failed
+            }
+        }
+    }
+}
+
 /// Format every `.mds` file under `dir`, INCLUDING `_`-prefixed partials.
 ///
 /// Deliberate divergence from `run_build_directory` / `run_check_directory`:
@@ -211,7 +284,6 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // `run_check_directory` which also declare MAX_DEPTH as a function-local
     // constant (build.rs line ~744).
     const MAX_DEPTH: usize = 64;
-    let FmtFlags { check, diff, quiet } = flags;
 
     // Validate mds.json even though `fmt` doesn't act on its `fmt` section's
     // content yet — consistent with build/check, which also fail loudly on a
@@ -221,79 +293,34 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     let files = collect_mds_files(dir, MAX_DEPTH, None);
 
     if files.is_empty() {
-        if !quiet {
+        if !flags.quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }
         return Ok(());
     }
 
-    let read_only = check || diff;
+    let read_only = flags.check || flags.diff;
     let mut changed_count: usize = 0;
     let mut unchanged_count: usize = 0;
     let mut fail_count: usize = 0;
 
     for file in &files {
-        let source = match read_source_file(file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("{e:?}");
-                fail_count += 1;
-                continue;
-            }
-        };
-        let base_dir = file.parent();
-        let result = match format_source(&source, base_dir) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{e:?}");
-                fail_count += 1;
-                continue;
-            }
-        };
-
-        if diff && result.changed {
-            let label = file.display().to_string();
-            if let Err(e) = print_diff(&render_diff(&source, &result.formatted, &label)) {
-                eprintln!("{e:?}");
-            }
-        }
-
-        if read_only {
-            if result.changed {
-                changed_count += 1;
-            } else {
-                unchanged_count += 1;
-            }
-            continue;
-        }
-
-        if !result.changed {
-            unchanged_count += 1;
-            continue;
-        }
-        match std::fs::write(file, &result.formatted) {
-            Ok(()) => {
-                if !quiet {
-                    eprintln!("Formatted: {}", file.display());
-                }
-                changed_count += 1;
-            }
-            Err(e) => {
-                eprintln!("error: cannot write {}: {e}", file.display());
-                fail_count += 1;
-            }
+        match format_one_file(file, flags) {
+            FileOutcome::Formatted | FileOutcome::WouldChange => changed_count += 1,
+            FileOutcome::Unchanged | FileOutcome::NoChange => unchanged_count += 1,
+            FileOutcome::Failed => fail_count += 1,
         }
     }
 
     if read_only {
-        if !quiet || changed_count > 0 || fail_count > 0 {
+        if !flags.quiet || changed_count > 0 || fail_count > 0 {
             eprintln!("{changed_count} would reformat, {fail_count} failed");
         }
-    } else if !quiet || fail_count > 0 {
+    } else if !flags.quiet || fail_count > 0 {
         eprintln!("{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed");
     }
 
-    if fail_count > 0 || (check && changed_count > 0) {
+    if fail_count > 0 || (flags.check && changed_count > 0) {
         std::process::exit(1);
     }
     Ok(())
