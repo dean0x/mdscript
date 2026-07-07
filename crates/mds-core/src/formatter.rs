@@ -336,6 +336,10 @@ fn rewrite(
     // invisible to `clean_output`'s leading/trailing-trim and newline-run
     // capping, which only ever see the body.
     if body_start > 0 {
+        debug_assert!(
+            source.is_char_boundary(body_start),
+            "body_start ({body_start}) must be a char boundary in source"
+        );
         push_stripped_cr(&mut out, &source[..body_start]);
     }
 
@@ -382,6 +386,18 @@ fn rewrite_body(
     raw_content: &[Range<usize>],
     directives: &BTreeSet<usize>,
 ) -> String {
+    // Invariant: spans must be sorted and non-overlapping so the advancing
+    // cursors (pi / ri) never overshoot. A future lexer regression would cause
+    // silent mis-classification rather than a crash without these guards.
+    debug_assert!(
+        protected.windows(2).all(|w| w[0].end <= w[1].start),
+        "protected spans must be sorted and non-overlapping"
+    );
+    debug_assert!(
+        raw_content.windows(2).all(|w| w[0].end <= w[1].start),
+        "raw_content spans must be sorted and non-overlapping"
+    );
+
     let end = source.len();
     let mut out = String::with_capacity(end.saturating_sub(body_start));
 
@@ -404,6 +420,10 @@ fn rewrite_body(
     }
 
     while pos < end {
+        debug_assert!(
+            source.is_char_boundary(pos),
+            "byte offset {pos} is not a char boundary in source"
+        );
         let line_start = pos;
         let line_end = source[pos..].find('\n').map(|rel| pos + rel).unwrap_or(end);
         let had_newline = line_end < end;
@@ -549,6 +569,18 @@ fn assert_equivalent(
     }
 }
 
+/// Returns `true` when `offset` falls inside any span in `raw_content`.
+///
+/// Requires `raw_content` to be sorted by start offset and non-overlapping
+/// (as guaranteed by [`raw_content_spans`]), enabling O(log S) binary search
+/// rather than an O(S) linear scan per call.
+fn in_raw_content(raw_content: &[Range<usize>], offset: usize) -> bool {
+    // partition_point returns the first index where r.end > offset, i.e. the
+    // first span that has NOT already ended before our offset.
+    let idx = raw_content.partition_point(|r| r.end <= offset);
+    idx < raw_content.len() && raw_content[idx].start <= offset
+}
+
 /// Rule-aware structural comparison used when neither `source` nor
 /// `formatted` can be compiled standalone (e.g. an undefined runtime
 /// variable). Re-tokenizes both and compares token-for-token: `Directive`
@@ -564,6 +596,10 @@ fn assert_equivalent(
 /// incorrectly treat some byte differences as insignificant) keeps this
 /// fallback correct in its own right rather than merely accidentally correct
 /// because of that upstream guarantee.
+///
+/// The raw-content span lookup uses [`in_raw_content`] (binary search, O(log S))
+/// rather than a linear scan, since spans are sorted by [`raw_content_spans`]
+/// and token offsets from the source tokenization are monotonically increasing.
 fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usize>]) -> bool {
     let (Ok(src_tokens), Ok(fmt_tokens)) =
         (lexer::tokenize(source, ""), lexer::tokenize(formatted, ""))
@@ -580,7 +616,7 @@ fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usi
         .zip(fmt_tokens.iter())
         .all(|(a, b)| match (a, b) {
             (Token::Text(ta, oa), Token::Text(tb, _)) => {
-                if raw_content.iter().any(|r| r.contains(oa)) {
+                if in_raw_content(raw_content, *oa) {
                     ta == tb
                 } else {
                     crate::clean_output(ta) == crate::clean_output(tb)
@@ -595,7 +631,7 @@ fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usi
             }
             (Token::CodeFence(fa, _), Token::CodeFence(fb, _)) => fa == fb,
             (Token::CodeContent(ca, oa), Token::CodeContent(cb, _)) => {
-                if raw_content.iter().any(|r| r.contains(oa)) {
+                if in_raw_content(raw_content, *oa) {
                     ca == cb
                 } else {
                     ca.replace('\r', "") == cb.replace('\r', "")
@@ -748,5 +784,79 @@ mod tests {
     fn strip_cr_borrows_when_no_cr_present() {
         let s = "no carriage returns here";
         assert!(matches!(strip_cr(s), std::borrow::Cow::Borrowed(_)));
+    }
+
+    // ── in_raw_content ────────────────────────────────────────────────────────
+
+    #[test]
+    fn in_raw_content_empty_spans_always_false() {
+        assert!(!in_raw_content(&[], 0));
+        assert!(!in_raw_content(&[], 42));
+    }
+
+    #[test]
+    fn in_raw_content_inside_span() {
+        // span covers bytes 10..20
+        let span = 10_usize..20_usize;
+        let spans = std::slice::from_ref(&span);
+        assert!(in_raw_content(spans, 10), "start of span");
+        assert!(in_raw_content(spans, 15), "middle of span");
+        assert!(!in_raw_content(spans, 20), "end (exclusive) not inside");
+        assert!(!in_raw_content(spans, 9), "just before span");
+    }
+
+    #[test]
+    fn in_raw_content_multiple_sorted_spans() {
+        let spans = vec![5_usize..10_usize, 20_usize..30_usize];
+        assert!(!in_raw_content(&spans, 4));
+        assert!(in_raw_content(&spans, 5));
+        assert!(in_raw_content(&spans, 9));
+        assert!(!in_raw_content(&spans, 10)); // gap between spans
+        assert!(!in_raw_content(&spans, 19));
+        assert!(in_raw_content(&spans, 20));
+        assert!(in_raw_content(&spans, 29));
+        assert!(!in_raw_content(&spans, 30));
+    }
+
+    // ── structural_equivalent ─────────────────────────────────────────────────
+
+    #[test]
+    fn structural_equivalent_inside_raw_span_is_byte_exact_not_clean_output() {
+        // A @message body is raw content: blank-line runs are NOT normalised by
+        // clean_output there. structural_equivalent must compare those tokens
+        // byte-for-byte, NOT via clean_output.
+        let src = "@message user:\nHi\n\n\nthere\n@end\n";
+        // Same text -- must be considered equivalent.
+        let same = "@message user:\nHi\n\n\nthere\n@end\n";
+        // Collapsed blank lines inside the body -- must NOT be considered equivalent.
+        let collapsed = "@message user:\nHi\nthere\n@end\n";
+
+        let tokens = lexer::tokenize(src, "").unwrap();
+        let raw = raw_content_spans(&tokens, src);
+
+        assert!(
+            structural_equivalent(src, same, &raw),
+            "identical source should be structural_equivalent"
+        );
+        assert!(
+            !structural_equivalent(src, collapsed, &raw),
+            "collapsing blank lines inside a raw-content span must NOT be \
+             considered structural_equivalent"
+        );
+    }
+
+    #[test]
+    fn structural_equivalent_outside_raw_span_uses_clean_output() {
+        // Outside @message/@define bodies, clean_output normalisation is applied:
+        // three raw newlines vs two are structurally equivalent (R3 cap).
+        let src = "Hello\n\n\nworld\n";
+        let capped = "Hello\n\nworld\n";
+        let raw: Vec<Range<usize>> = vec![];
+
+        assert!(
+            structural_equivalent(src, capped, &raw),
+            "text outside raw spans is compared via clean_output; \
+             a 3-newline run and a 2-newline run should be equivalent"
+        );
     }
 }
