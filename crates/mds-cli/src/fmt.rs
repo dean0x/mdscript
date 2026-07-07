@@ -387,13 +387,23 @@ fn colorize_unified_diff(unified: &str) -> String {
     const RESET: &str = "\x1b[0m";
 
     let mut out = String::with_capacity(unified.len() + 64);
+    // `---`/`+++` file headers appear before the first `@@` hunk marker.
+    // Inside a hunk a removed line starts with `-` and an added line starts
+    // with `+` — but if that line's *content* itself starts with `-` or `+`,
+    // the rendered diff line looks like `---` or `+++`, which the old global
+    // prefix check mis-colored as CYAN (file header) instead of RED/GREEN.
+    // A state machine keyed on the first `@@` avoids the ambiguity.
+    let mut in_hunk = false;
     for line in unified.split_inclusive('\n') {
-        let color = if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@")
-        {
+        let color = if line.starts_with("@@") {
+            in_hunk = true;
             CYAN
-        } else if line.starts_with('+') {
+        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
+            // File header — always precedes the first @@ hunk.
+            CYAN
+        } else if in_hunk && line.starts_with('+') {
             GREEN
-        } else if line.starts_with('-') {
+        } else if in_hunk && line.starts_with('-') {
             RED
         } else {
             ""
@@ -471,5 +481,23 @@ mod tests {
         assert!(colorized.contains("\x1b[32m+new\x1b[0m"));
         assert!(colorized.contains("\x1b[31m-old\x1b[0m"));
         assert!(colorized.contains("\x1b[36m--- a\x1b[0m"));
+    }
+
+    #[test]
+    fn colorize_unified_diff_correctly_colors_content_starting_with_dashes_or_pluses() {
+        // Regression: a removed line whose content starts with "-- " produces
+        // "--- ..." in the rendered unified diff. The old global prefix check
+        // matched `starts_with("---")` and mis-colored it CYAN (file header)
+        // instead of RED (removal). Same defect for "++" content → "+++ " →
+        // mis-colored CYAN instead of GREEN.
+        let unified = "--- a\n+++ b\n@@ -1,2 +1,2 @@\n--- dashes content\n+++ plus content\n";
+        let colorized = colorize_unified_diff(unified);
+        // Inside the hunk: removal of a line whose content starts with "-- "
+        assert!(colorized.contains("\x1b[31m--- dashes content\x1b[0m"));
+        // Inside the hunk: addition of a line whose content starts with "++"
+        assert!(colorized.contains("\x1b[32m+++ plus content\x1b[0m"));
+        // File headers (before @@) must still be CYAN
+        assert!(colorized.contains("\x1b[36m--- a\x1b[0m"));
+        assert!(colorized.contains("\x1b[36m+++ b\x1b[0m"));
     }
 }
