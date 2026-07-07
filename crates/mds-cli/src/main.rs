@@ -77,11 +77,13 @@ enum Commands {
     ///
     /// Rewrites are guaranteed compile-equivalent: a safety gate re-compiles the
     /// formatted source and refuses to write if it would change compiled output.
-    /// Normalizes CRLF to LF, collapses runs of 3+ blank lines to one, strips
+    /// Normalizes CRLF to LF (including inside frontmatter and code fences),
+    /// collapses runs of 2+ consecutive blank lines to a single blank line, strips
     /// trailing whitespace on directive lines, and ensures exactly one final
     /// newline — never touches body-text trailing whitespace (Markdown hard
-    /// breaks, including on whitespace-only "blank" lines) or the byte-for-byte
-    /// content of frontmatter / code fences / `@message` / `@define` bodies.
+    /// breaks, including on whitespace-only "blank" lines), blank-line structure
+    /// within frontmatter / code fences, or the byte-for-byte content of
+    /// `@message` / `@define` bodies.
     #[command(
         after_help = "Examples:\n  mds fmt                             Auto-detect and format the .mds file in current dir\n  mds fmt template.mds                Format a file in place\n  mds fmt .                           Format every .mds file recursively (incl. partials)\n  mds fmt --check template.mds        Exit 1 if the file would change; writes nothing\n  mds fmt --diff template.mds         Print a unified diff of pending changes; writes nothing\n  mds fmt --check --diff .            Show diffs for every file that would change, exit 1 if any would\n  echo \"Hello   {name}!\" | mds fmt -  Format from stdin, write to stdout; creates no file"
     )]

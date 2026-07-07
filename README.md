@@ -172,7 +172,7 @@ echo 'Hello   {name}!' | mds fmt -   # format from stdin, write to stdout; creat
 What it normalizes:
 
 - CRLF → LF, everywhere (including inside frontmatter and code fences)
-- Runs of 3+ blank lines collapse to one; leading blank lines in the body are removed entirely
+- Two or more consecutive blank lines collapse to a single blank line; leading blank lines in the body are removed entirely
 - Trailing whitespace on `@if`/`@for`/`@define`/… directive lines is stripped
 - Exactly one final newline (empty or whitespace-only input formats to an empty file)
 
@@ -181,9 +181,11 @@ What it deliberately leaves untouched:
 - Trailing whitespace on body-text content lines, including whitespace-only "blank" lines — two
   trailing spaces are a Markdown hard line break, and stripping them (anywhere in body text,
   including a stray blank line) can change rendered output
-- The byte-for-byte content of frontmatter, code fences, and `@message`/`@define` bodies (the
-  latter two can be consumed in a context that bypasses the compiler's own whitespace
-  normalization, so the formatter never touches them)
+- Blank-line structure within frontmatter and code fences — CRLF is normalized there (the same
+  as everywhere else in the file), but blank lines are not collapsed inside these regions
+- The byte-for-byte content of `@message`/`@define` bodies — neither CRLF normalization nor
+  blank-line collapsing is applied inside them, because these bodies bypass the compiler's own
+  whitespace normalization and their content reaches compiled output verbatim
 
 Directory mode formats every `.mds` file recursively, **including `_`-prefixed partials**,
 continuing past per-file errors and printing a summary
@@ -257,6 +259,7 @@ try {
 ```rust
 let output = mds::compile(Path::new("template.mds"), None)?;
 let output = mds::compile_str("---\nname: World\n---\nHello {name}!\n")?;
+let formatted = mds::format_str("Hello   {name}!\n")?;
 ```
 
 ## Examples

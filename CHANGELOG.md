@@ -12,11 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`mds fmt`** — an opinionated, safety-gated auto-formatter for `.mds` templates. Every
   rewrite is guaranteed compile-equivalent: a runtime safety gate re-compiles the formatted
   source and refuses to write if it would change compiled output (`mds::formatter_invariant`)
-  rather than silently corrupting a template. Normalizes CRLF to LF (including inside
-  frontmatter and code fences), collapses runs of 3+ blank lines to one, strips trailing
-  whitespace on directive lines, and ensures exactly one final newline — while leaving
-  body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of
-  frontmatter / code fences / `@message` / `@define` bodies untouched. Supports a single file,
+  rather than silently corrupting a template. Normalizes CRLF to LF everywhere (including
+  inside frontmatter and code fences), collapses runs of two or more consecutive blank lines
+  to a single blank line, strips trailing whitespace on directive lines, and ensures exactly
+  one final newline — while leaving body-text trailing whitespace (Markdown hard breaks),
+  blank-line structure within frontmatter and code fences, and the byte-for-byte content of
+  `@message`/`@define` bodies untouched. Supports a single file,
   a directory (recursive, including `_`-prefixed partials), or stdin (`-`, as a filter);
   `--check` exits non-zero without writing when anything would change, and `--diff` prints a
   unified diff (colorized on a TTY) without writing. New public `mds-core` API:
