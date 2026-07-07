@@ -313,7 +313,13 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     }
 
     if read_only {
-        if !flags.quiet || changed_count > 0 || fail_count > 0 {
+        // The `changed_count > 0` disjunct was deliberately removed: --quiet
+        // suppresses status/summaries (including "N would reformat"), never
+        // errors. Only fail_count > 0 forces a summary under --quiet, matching
+        // the non-read_only branch's `!quiet || fail_count > 0` contract and
+        // the single-file --check path (which is fully silent under --quiet,
+        // exiting 1 with no message when a file would change).
+        if !flags.quiet || fail_count > 0 {
             eprintln!("{changed_count} would reformat, {fail_count} failed");
         }
     } else if !flags.quiet || fail_count > 0 {
