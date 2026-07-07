@@ -60,13 +60,28 @@ pub trait FileSystem: Send + Sync {
     /// `dir == ""` means resolve from the root of the key-space (the same as an
     /// import from a top-level file). Implementations must enforce all traversal,
     /// null-byte, and empty-path guards as described in the security contract above.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MdsError::ImportError`] when:
+    /// - `relative` is empty
+    /// - `relative` contains a null byte (`\0`)
+    /// - the resolved path traverses above the key-space root (`..` from root)
+    /// - the resolved path is a symlink ([`NativeFs`] only)
+    /// - the resolved path escapes the established project root ([`NativeFs`] only)
+    ///
+    /// Returns [`MdsError::ResourceLimit`] when the resolved path exceeds
+    /// [`MAX_PATH_SEGMENTS`] segments.
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError>;
 
     /// Return the directory portion of a normalized file key.
     ///
     /// For `NativeFs` this is `Path::new(key).parent()` (verbatim-path-safe).
-    /// For `VirtualFs` this is everything before the last `/`, or `""` for a
-    /// top-level key.
+    /// For `VirtualFs` this is everything before the last `/`.
+    ///
+    /// Returns `""` when `key` has no directory component (e.g., a top-level key
+    /// or a rootless path). An empty string here means "root of the key-space"
+    /// when passed to `normalize_in_dir`.
     fn parent_dir(&self, key: &str) -> String;
 
     /// Read the content of a normalized key.
@@ -96,9 +111,25 @@ pub trait FileSystem: Send + Sync {
 
 // ── VirtualFs shared segment logic ───────────────────────────────────────────
 
+/// Reject empty paths and paths containing null bytes.
+///
+/// Called at every normalization entry point; extracted to eliminate copy-paste
+/// and ensure the error strings remain consistent across `normalize` and
+/// `normalize_in_dir` on both `NativeFs` and `VirtualFs`.
+fn validate_relative_import(relative: &str) -> Result<(), MdsError> {
+    if relative.is_empty() {
+        return Err(MdsError::import_error("import path is empty"));
+    }
+    if relative.contains('\0') {
+        return Err(MdsError::import_error("import path contains null byte"));
+    }
+    Ok(())
+}
+
 /// Resolve a relative path string against a pre-split directory segment stack.
 ///
-/// `dir_segments` is a `Vec<String>` seeded from the importing directory.
+/// `dir_segments` is a `Vec<&str>` seeded from the importing directory — slices
+/// borrowed from the original `dir` string, no per-segment allocation.
 /// `relative` is the raw relative import path (may contain `.`, `..`, `/`).
 ///
 /// Returns the resolved key (joined by `/`) or an error for:
@@ -108,9 +139,9 @@ pub trait FileSystem: Send + Sync {
 ///
 /// Shared by [`VirtualFs::normalize`] and [`VirtualFs::normalize_in_dir`] so
 /// both can never silently drift in their path-resolution semantics.
-fn resolve_relative_segments(
-    mut dir_segments: Vec<String>,
-    relative: &str,
+fn resolve_relative_segments<'a>(
+    mut dir_segments: Vec<&'a str>,
+    relative: &'a str,
 ) -> Result<String, MdsError> {
     for part in relative.split('/') {
         match part {
@@ -131,7 +162,7 @@ fn resolve_relative_segments(
                         "import path exceeds maximum segment count ({MAX_PATH_SEGMENTS}): \"{relative}\""
                     )));
                 }
-                dir_segments.push(seg.to_string());
+                dir_segments.push(seg);
             }
         }
     }
@@ -169,12 +200,7 @@ impl FileSystem for VirtualFs {
     /// When `base == ""` the relative path is used as-is (root entry point).
     /// Rejects: empty paths, null bytes, traversal above the virtual root.
     fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
-        if relative.is_empty() {
-            return Err(MdsError::import_error("import path is empty"));
-        }
-        if relative.contains('\0') {
-            return Err(MdsError::import_error("import path contains null byte"));
-        }
+        validate_relative_import(relative)?;
 
         if base.is_empty() {
             // Root entry point — use key as-is, but still enforce the segment limit.
@@ -198,19 +224,12 @@ impl FileSystem for VirtualFs {
     }
 
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError> {
-        if relative.is_empty() {
-            return Err(MdsError::import_error("import path is empty"));
-        }
-        if relative.contains('\0') {
-            return Err(MdsError::import_error("import path contains null byte"));
-        }
+        validate_relative_import(relative)?;
 
         // Seed segment stack from the explicit directory (not a file key — no parent() needed).
-        let dir_segments: Vec<String> = dir
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        // Borrow slices from `dir` directly — no per-segment allocation; only the final
+        // `join("/")` inside `resolve_relative_segments` allocates.
+        let dir_segments: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
 
         resolve_relative_segments(dir_segments, relative)
     }
@@ -345,12 +364,7 @@ impl NativeFs {
     /// Does NOT call `init_root` — only entry-point resolution (the `base == ""`
     /// branch in `normalize`) anchors the security root.
     fn normalize_in_dir_impl(&self, dir: &Path, relative: &str) -> Result<String, MdsError> {
-        if relative.is_empty() {
-            return Err(MdsError::import_error("import path is empty"));
-        }
-        if relative.contains('\0') {
-            return Err(MdsError::import_error("import path contains null byte"));
-        }
+        validate_relative_import(relative)?;
         let path = dir.join(relative);
         let canonical = Self::check_symlink(&path)?;
         self.check_path_traversal(&canonical)?;
@@ -377,12 +391,7 @@ impl Default for NativeFs {
 
 impl FileSystem for NativeFs {
     fn normalize(&self, base: &str, relative: &str) -> Result<String, MdsError> {
-        if relative.is_empty() {
-            return Err(MdsError::import_error("import path is empty"));
-        }
-        if relative.contains('\0') {
-            return Err(MdsError::import_error("import path contains null byte"));
-        }
+        validate_relative_import(relative)?;
 
         if base.is_empty() {
             // Root entry point: treat `relative` as a filesystem path.
@@ -407,7 +416,7 @@ impl FileSystem for NativeFs {
     fn parent_dir(&self, key: &str) -> String {
         Path::new(key)
             .parent()
-            .unwrap_or(Path::new("."))
+            .unwrap_or(Path::new(""))
             .display()
             .to_string()
     }
@@ -636,6 +645,32 @@ mod tests {
         assert!(
             msg.contains("symlinks"),
             "expected symlinks in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_normalize_in_dir_symlink_rejected() {
+        // Security boundary: normalize_in_dir (the import branch) must reject symlinks
+        // via check_symlink inside normalize_in_dir_impl. A regression that dropped
+        // check_symlink from normalize_in_dir_impl would pass the entry-point symlink
+        // test above yet silently allow symlinks through all @import resolution.
+        let dir = TempDir::new().unwrap();
+        let target = make_temp_file(&dir, "target.mds", "hello");
+        let link_path = dir.path().join("link.mds");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        let fs = NativeFs::new();
+        // Establish root via a real (non-symlinked) entry point.
+        fs.normalize("", &target.display().to_string())
+            .expect("entry normalize should succeed");
+
+        let dir_str = dir.path().display().to_string();
+        let result = fs.normalize_in_dir(&dir_str, "./link.mds");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinks"),
+            "expected 'symlinks' in error when normalize_in_dir encounters a symlink, got: {msg}"
         );
     }
 
