@@ -2894,3 +2894,50 @@ fn source_label_appears_in_string_source_diagnostics() {
         "string-source diagnostic must contain '<source>' as the file label, got:\n{rendered}"
     );
 }
+
+// ── PF-003 / #146: parent_dir cross-platform integration test ─────────────────
+//
+// Verifies that `FileSystem::parent_dir` is correctly called and consumed during
+// real compilation on every CI leg (Linux, macOS). When an imported file (sub/lib.mds)
+// itself contains a relative `@import`, the resolver calls `parent_dir` on sub/lib.mds's
+// canonical key to locate sub/ before resolving the nested import. Without a correct
+// `parent_dir`, the nested `./helper.mds` import would resolve against the wrong
+// directory and fail with mds::file_not_found. Auto-covers Windows once #147 lands.
+#[test]
+fn parent_dir_drives_nested_file_import_resolution() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    // sub/helper.mds — exists on disk so the import resolves; contributes nothing to scope.
+    std::fs::write(sub.join("helper.mds"), "").unwrap();
+
+    // sub/lib.mds — imports ./helper.mds (relative: resolution forces parent_dir call
+    // on sub/lib.mds's canonical key) and defines greet(x) for main.mds to consume.
+    std::fs::write(
+        sub.join("lib.mds"),
+        "@import \"./helper.mds\"\n@define greet(x):\nHello {x}!\n@end\n",
+    )
+    .unwrap();
+
+    // main.mds — imports sub/lib.mds and calls greet
+    let main_path = dir.path().join("main.mds");
+    std::fs::write(
+        &main_path,
+        "@import \"./sub/lib.mds\"\n{greet(\"World\")}\n",
+    )
+    .unwrap();
+
+    let result = crate::compile_file(main_path.to_str().unwrap());
+    assert!(
+        result.is_ok(),
+        "nested file import chain must compile (parent_dir cross-platform guard, #146): {result:?}"
+    );
+    let output = result.unwrap().into_markdown().unwrap();
+    assert!(
+        output.contains("Hello World!"),
+        "nested import must produce expected output (parent_dir resolved sub/ correctly): {output}"
+    );
+}

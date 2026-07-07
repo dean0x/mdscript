@@ -598,6 +598,13 @@ fn compile_str_with_import_resolves_relative_to_base_dir() {
         "expected dependency to resolve to the real lib.mds path, got: {:?}",
         compiled.dependencies
     );
+    // Self-documenting: the '<source>' sentinel must never leak into the dependency list
+    // now that directory-anchored resolution (#146) replaced the synthetic key entirely.
+    assert!(
+        !compiled.dependencies.iter().any(|d| d.contains("<source>")),
+        "dependency list must not contain the '<source>' sentinel, got: {:?}",
+        compiled.dependencies
+    );
 
     let output = compiled.into_markdown().unwrap();
     assert!(

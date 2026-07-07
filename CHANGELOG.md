@@ -40,11 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separator — so building the in-memory-source base key with
   `format!("{canonical}/<source>")` produced a key that `Path::parent()` could not
   strip back to the base directory, silently resolving relative imports against the
-  wrong directory. Fixed by building the key with `Path::join` instead, mirroring the
-  existing safe join used for on-disk files. Fixes napi `compile`/`check(src, {
-  basePath })`, Python `compile`/`check(src, base_path=...)`, and CLI `mds build -` /
-  `mds check -` (stdin) — all share the same resolution path. POSIX behavior is
-  unchanged. (#133)
+  wrong directory. Fixed by eliminating the synthetic `<source>` key entirely: the
+  importing directory is now carried directly as `ctx.base_dir` and passed to
+  `FileSystem::normalize_in_dir`, so no synthetic path component is ever constructed
+  or decomposed. Fixes napi `compile`/`check(src, { basePath })`, Python
+  `compile`/`check(src, base_path=...)`, and CLI `mds build -` / `mds check -`
+  (stdin) — all share the same resolution path. POSIX behavior is unchanged. (#133,
+  #146)
 
 ## [0.3.0] — 2026-06-28
 

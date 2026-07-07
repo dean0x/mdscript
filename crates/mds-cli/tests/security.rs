@@ -238,8 +238,8 @@ fn resolve_source_import_traversal_rejected() {
     // Security invariant (AC-S2): the string + base_dir route must reject a
     // relative `@import` that escapes `base_dir` via `../`, exactly like the
     // file route (`path_traversal_import_rejected` above). Regression guard for
-    // the PF-003 / #133 base_key sentinel fix — the safer `Path::join`
-    // construction must still route through the same path-traversal check.
+    // PF-003 / #133 / #146 directory-anchored resolution — `ctx.base_dir` still
+    // routes through the same path-traversal check (`check_path_traversal`).
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
