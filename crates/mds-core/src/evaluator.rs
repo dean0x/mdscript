@@ -842,6 +842,13 @@ fn collect_single_message(
     }
 
     // Evaluate the body as plain text and trim surrounding whitespace.
+    // NOTE: this path uses only `.trim()`, NOT `clean_output` — `\r` characters
+    // and blank-line runs inside a @message body survive verbatim into the
+    // compiled JSON output. `mds fmt` relies on this: `raw_content_spans` in
+    // `formatter.rs` marks @message and @define bodies as raw content to prevent
+    // R1 (`\r` strip) and R3 (blank-line-run cap) from silently changing compiled
+    // output. Adding a `clean_output` call here would break the formatter's
+    // safety model without any corresponding formatter change.
     let content = evaluate_nodes(&block.body, scope, ctx)?.trim().to_string();
 
     // Skip empty messages.

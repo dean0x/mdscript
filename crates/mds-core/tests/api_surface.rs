@@ -8,6 +8,10 @@ use mds::{
 
 #[test]
 fn public_functions_exist() {
+    let _: fn(&str) -> Result<String, MdsError> = mds::format_str;
+    let _: fn(&str, Option<&Path>) -> Result<String, MdsError> = mds::format_str_with;
+    let _ = mds::format_str("Hello!\n");
+    let _ = mds::format_str_with("Hello!\n", None);
     let _ = mds::compile_str("---\nname: World\n---\nHello {name}!\n");
     let _ = mds::compile_str_with("Hello!\n", None, None);
     let _ = mds::compile_str_collecting_warnings("Hello!\n", None, None);
@@ -117,6 +121,9 @@ fn mds_error_variants_exist() {
         span: None,
         src: None,
     };
+    let _ = MdsError::FormatterInvariant {
+        message: "test".to_string(),
+    };
 
     #[allow(unreachable_patterns)]
     match (MdsError::Io {
@@ -138,9 +145,22 @@ fn mds_error_variants_exist() {
         | MdsError::JsonError { .. }
         | MdsError::Recursion { .. }
         | MdsError::ExportError { .. }
-        | MdsError::BuiltinError { .. } => {}
+        | MdsError::BuiltinError { .. }
+        | MdsError::FormatterInvariant { .. } => {}
         _ => {}
     }
+}
+
+#[test]
+fn formatter_invariant_has_diagnostic_code() {
+    let err = MdsError::FormatterInvariant {
+        message: "test detail".to_string(),
+    };
+    let code = miette::Diagnostic::code(&err)
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "mds::formatter_invariant");
+    assert!(format!("{err}").contains("test detail"));
 }
 
 #[test]

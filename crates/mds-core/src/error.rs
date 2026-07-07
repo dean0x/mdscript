@@ -331,6 +331,18 @@ pub enum MdsError {
     #[error("expected messages output, but template produced markdown")]
     #[diagnostic(code(mds::expected_messages))]
     ExpectedMessages,
+
+    /// The formatter's rewritten source failed the compile-equivalence safety
+    /// gate: either the formatted source failed to compile when the original
+    /// did, or the two compiled to different output. This signals a formatter
+    /// bug, not a problem with the input template — the CLI must not write the
+    /// file when this occurs.
+    #[error("formatter produced non-equivalent output: {message}")]
+    #[diagnostic(
+        code(mds::formatter_invariant),
+        help("this indicates a bug in `mds fmt` itself; please file an issue")
+    )]
+    FormatterInvariant { message: String },
 }
 
 impl MdsError {
@@ -671,6 +683,14 @@ impl MdsError {
         MdsError::NotMdsFile { path: path.into() }
     }
 
+    /// Construct a `FormatterInvariant` error, signaling that the formatter's
+    /// rewritten source failed the compile-equivalence safety gate.
+    pub(crate) fn formatter_invariant(message: impl Into<String>) -> Self {
+        MdsError::FormatterInvariant {
+            message: message.into(),
+        }
+    }
+
     /// Construct a `MixedContent` error whose span points at the offending
     /// top-level prose / interpolation.
     ///
@@ -745,7 +765,8 @@ impl MdsError {
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::ExpectedMarkdown
-            | MdsError::ExpectedMessages => None,
+            | MdsError::ExpectedMessages
+            | MdsError::FormatterInvariant { .. } => None,
         };
 
         SerializedError {

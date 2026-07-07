@@ -1,0 +1,6 @@
+---
+name: World
+---
+@if name:
+Hello {name}!
+@end

@@ -22,6 +22,7 @@ serde_json = { workspace = true }
 miette = { workspace = true, features = ["fancy"] }
 notify = { workspace = true }
 ctrlc = { workspace = true }
+similar = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

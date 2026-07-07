@@ -44,6 +44,7 @@ pub(crate) mod ast;
 pub(crate) mod builtins;
 pub(crate) mod error;
 pub(crate) mod evaluator;
+pub(crate) mod formatter;
 pub(crate) mod fs;
 pub(crate) mod lexer;
 pub(crate) mod limits;
@@ -54,6 +55,7 @@ pub(crate) mod scope;
 pub(crate) mod validator;
 pub(crate) mod value;
 
+pub use formatter::{format_str, format_str_with};
 pub use fs::{FileSystem, NativeFs, VirtualFs};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
@@ -636,6 +638,14 @@ pub(crate) fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
 
 /// Clean up output whitespace: collapse 3+ consecutive newlines to 2 (one blank line),
 /// and trim leading/trailing blank lines.
+///
+/// **Formatter dependency**: `mds fmt` (`formatter.rs`) treats this function as the
+/// ceiling of what it may safely change in markdown-mode content — any transform the
+/// formatter applies must produce output that survives this normalisation unchanged.
+/// Critically, `@message` and `@define` body content bypasses this function entirely
+/// (routed through `.trim()` only in `collect_single_message`, `evaluator.rs`), so
+/// the formatter protects those regions as raw content; see `raw_content_spans` in
+/// `formatter.rs` for the authoritative source of that distinction.
 pub(crate) fn clean_output(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut newline_count = 0;

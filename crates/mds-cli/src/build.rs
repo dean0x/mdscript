@@ -17,11 +17,51 @@ use serde::Deserialize;
 pub(crate) struct MdsConfig {
     #[serde(default)]
     pub(crate) build: BuildConfig,
+    /// Loaded (and validated — a malformed `fmt` section still fails config
+    /// loading) for forward-compatibility, but not yet consulted by `mds fmt`
+    /// — see `FmtConfig`.
+    #[allow(
+        dead_code,
+        reason = "scaffolding for a rule not implemented until a future version"
+    )]
+    #[serde(default)]
+    pub(crate) fmt: FmtConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct BuildConfig {
     pub(crate) output_dir: Option<String>,
+}
+
+/// Forward-compatibility scaffolding for `mds fmt` configuration.
+///
+/// `sort_frontmatter_keys` is not wired into any formatting behavior yet — the
+/// v1 ruleset (R1-R4, see `mds-core`'s `formatter` module) deliberately defers
+/// frontmatter key sorting to a future version, and there is intentionally no
+/// matching CLI flag (a no-op flag would be a clippy/UX liability). The field
+/// exists now purely so `{"fmt": {"sort_frontmatter_keys": false}}` parses
+/// cleanly today and this won't need a breaking `mds.json` schema change once
+/// the rule ships.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FmtConfig {
+    #[allow(
+        dead_code,
+        reason = "scaffolding for a rule not implemented until a future version"
+    )]
+    #[serde(default = "default_sort_frontmatter_keys")]
+    pub(crate) sort_frontmatter_keys: bool,
+}
+
+impl Default for FmtConfig {
+    fn default() -> Self {
+        Self {
+            sort_frontmatter_keys: default_sort_frontmatter_keys(),
+        }
+    }
+}
+
+fn default_sort_frontmatter_keys() -> bool {
+    true
 }
 
 /// Maximum allowed size for `mds.json` (1 MB) to prevent runaway memory use.
@@ -971,6 +1011,7 @@ mod tests {
                 build: BuildConfig {
                     output_dir: Some("build".to_string()),
                 },
+                ..Default::default()
             },
             PathBuf::from("/project"),
         ));
@@ -987,6 +1028,47 @@ mod tests {
             result,
             Some(PathBuf::from("out.md")),
             "-o should win over mds.json config"
+        );
+    }
+
+    // ── T5: malformed fmt config fails config loading ─────────────────────────
+
+    #[test]
+    fn fmt_config_malformed_bool_field_fails_loading() {
+        // `FmtConfig.sort_frontmatter_keys` is a `bool`. Supplying a string
+        // value must cause `serde_json` to reject the config, so `load_config`
+        // returns `Err` rather than silently using the default. This ensures a
+        // bad `mds.json` is reported loudly rather than quietly ignored.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mds.json"),
+            r#"{"fmt": {"sort_frontmatter_keys": "not-a-bool"}}"#,
+        )
+        .unwrap();
+
+        let result = load_config(dir.path());
+        assert!(
+            result.is_err(),
+            "a malformed fmt config (wrong type for sort_frontmatter_keys) must fail config loading"
+        );
+    }
+
+    #[test]
+    fn fmt_config_valid_section_loads_cleanly() {
+        // Complement to the malformed test: a well-typed fmt section must parse
+        // without error and produce the expected field value.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mds.json"),
+            r#"{"fmt": {"sort_frontmatter_keys": false}}"#,
+        )
+        .unwrap();
+
+        let result = load_config(dir.path()).expect("valid fmt config must load");
+        let (config, _) = result.expect("mds.json must be found");
+        assert!(
+            !config.fmt.sort_frontmatter_keys,
+            "sort_frontmatter_keys: false must deserialize correctly"
         );
     }
 }

@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use miette::Result;
 
 mod build;
+mod fmt;
 mod output;
 mod watch;
 
@@ -71,6 +72,31 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
+    },
+    /// Reformat MDS file(s) in place (opinionated, safety-gated)
+    ///
+    /// Rewrites are guaranteed compile-equivalent: a safety gate re-compiles the
+    /// formatted source and refuses to write if it would change compiled output.
+    /// Normalizes CRLF to LF (including inside frontmatter and code fences),
+    /// collapses runs of 2+ consecutive blank lines to a single blank line, strips
+    /// trailing whitespace on directive lines, and ensures exactly one final
+    /// newline — never touches body-text trailing whitespace (Markdown hard
+    /// breaks, including on whitespace-only "blank" lines), blank-line structure
+    /// within frontmatter / code fences, or the byte-for-byte content of
+    /// `@message` / `@define` bodies.
+    #[command(
+        after_help = "Examples:\n  mds fmt                             Auto-detect and format the .mds file in current dir\n  mds fmt template.mds                Format a file in place\n  mds fmt .                           Format every .mds file recursively (incl. partials)\n  mds fmt --check template.mds        Exit 1 if the file would change; writes nothing\n  mds fmt --diff template.mds         Print a unified diff of pending changes; writes nothing\n  mds fmt --check --diff .            Show diffs for every file that would change, exit 1 if any would\n  echo \"Hello   {name}!\" | mds fmt -  Format from stdin, write to stdout; creates no file"
+    )]
+    Fmt {
+        /// Input .mds file, directory, or "-" for stdin (omit to auto-detect in current directory)
+        input: Option<PathBuf>,
+        /// Read-only: exit non-zero if any file would change; never writes
+        #[arg(long)]
+        check: bool,
+        /// Read-only: print a unified diff of pending changes; never writes.
+        /// Combines with --check (diff is the rendering, check is the exit behavior).
+        #[arg(long)]
+        diff: bool,
     },
     /// Create a starter MDS file
     Init {
@@ -314,6 +340,12 @@ fn run(cli: Cli) -> Result<()> {
             vars,
             set_vars,
         } => run_check(input, vars, set_vars, quiet),
+        Commands::Fmt { input, check, diff } => fmt::run_fmt(fmt::FmtArgs {
+            input,
+            check,
+            diff,
+            quiet,
+        }),
         Commands::Init { filename, force } => run_init(filename, force, quiet),
         Commands::Watch {
             input,
@@ -338,5 +370,4 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-// The unit tests that were in main.rs have moved to build.rs.
 // This file only contains integration-level wiring that is covered by the integration tests.
