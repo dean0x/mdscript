@@ -122,7 +122,7 @@ fn mds_error_variants_exist() {
         src: None,
     };
     let _ = MdsError::FormatterInvariant {
-        detail: "test".to_string(),
+        message: "test".to_string(),
     };
 
     #[allow(unreachable_patterns)]
@@ -154,7 +154,7 @@ fn mds_error_variants_exist() {
 #[test]
 fn formatter_invariant_has_diagnostic_code() {
     let err = MdsError::FormatterInvariant {
-        detail: "test detail".to_string(),
+        message: "test detail".to_string(),
     };
     let code = miette::Diagnostic::code(&err)
         .map(|c| c.to_string())

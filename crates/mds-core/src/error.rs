@@ -337,12 +337,12 @@ pub enum MdsError {
     /// did, or the two compiled to different output. This signals a formatter
     /// bug, not a problem with the input template — the CLI must not write the
     /// file when this occurs.
-    #[error("formatter produced non-equivalent output: {detail}")]
+    #[error("formatter produced non-equivalent output: {message}")]
     #[diagnostic(
         code(mds::formatter_invariant),
         help("this indicates a bug in `mds fmt` itself; please file an issue")
     )]
-    FormatterInvariant { detail: String },
+    FormatterInvariant { message: String },
 }
 
 impl MdsError {
@@ -685,9 +685,9 @@ impl MdsError {
 
     /// Construct a `FormatterInvariant` error, signaling that the formatter's
     /// rewritten source failed the compile-equivalence safety gate.
-    pub(crate) fn formatter_invariant(detail: impl Into<String>) -> Self {
+    pub(crate) fn formatter_invariant(message: impl Into<String>) -> Self {
         MdsError::FormatterInvariant {
-            detail: detail.into(),
+            message: message.into(),
         }
     }
 
