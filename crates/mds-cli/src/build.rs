@@ -1030,4 +1030,45 @@ mod tests {
             "-o should win over mds.json config"
         );
     }
+
+    // ── T5: malformed fmt config fails config loading ─────────────────────────
+
+    #[test]
+    fn fmt_config_malformed_bool_field_fails_loading() {
+        // `FmtConfig.sort_frontmatter_keys` is a `bool`. Supplying a string
+        // value must cause `serde_json` to reject the config, so `load_config`
+        // returns `Err` rather than silently using the default. This ensures a
+        // bad `mds.json` is reported loudly rather than quietly ignored.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mds.json"),
+            r#"{"fmt": {"sort_frontmatter_keys": "not-a-bool"}}"#,
+        )
+        .unwrap();
+
+        let result = load_config(dir.path());
+        assert!(
+            result.is_err(),
+            "a malformed fmt config (wrong type for sort_frontmatter_keys) must fail config loading"
+        );
+    }
+
+    #[test]
+    fn fmt_config_valid_section_loads_cleanly() {
+        // Complement to the malformed test: a well-typed fmt section must parse
+        // without error and produce the expected field value.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mds.json"),
+            r#"{"fmt": {"sort_frontmatter_keys": false}}"#,
+        )
+        .unwrap();
+
+        let result = load_config(dir.path()).expect("valid fmt config must load");
+        let (config, _) = result.expect("mds.json must be found");
+        assert!(
+            !config.fmt.sort_frontmatter_keys,
+            "sort_frontmatter_keys: false must deserialize correctly"
+        );
+    }
 }

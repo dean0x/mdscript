@@ -75,6 +75,7 @@ fn inplace_unchanged_file_preserves_mtime_and_reports_unchanged() {
     let target = dir.path().join("clean.mds");
     fs::write(&target, read_fixture("fmt_formatted.mds")).unwrap();
 
+    let before_bytes = fs::read(&target).unwrap();
     let before_mtime = fs::metadata(&target).unwrap().modified().unwrap();
     // Ensure the filesystem clock would visibly move if the file were rewritten.
     std::thread::sleep(Duration::from_millis(1100));
@@ -83,6 +84,15 @@ fn inplace_unchanged_file_preserves_mtime_and_reports_unchanged() {
     assert!(
         output.status.success(),
         "fmt should succeed on an already-clean file"
+    );
+
+    // Assert both that the mtime is unchanged AND that the bytes are identical:
+    // the mtime check alone is not enough to distinguish "same content written"
+    // from "write skipped", because some filesystems may round mtime.
+    let after_bytes = fs::read(&target).unwrap();
+    assert_eq!(
+        before_bytes, after_bytes,
+        "file bytes must be identical for an already-clean file (no rewrite should occur)"
     );
 
     let after_mtime = fs::metadata(&target).unwrap().modified().unwrap();
@@ -113,6 +123,52 @@ fn format_then_check_is_idempotent() {
         check.status.success(),
         "second pass under --check should report clean; stderr: {}",
         String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+// ── T1: safety-gate path coverage (Syntax propagation + structural fallback) ──
+//
+// FormatterInvariant end-to-end is deliberately untested here: triggering it
+// requires a formatter bug (the gate fires only when the formatter itself
+// diverges from the original output). That cannot be induced without a test
+// hook inside formatter.rs, which falls outside the scope of test-only changes.
+// The white-box unit tests for `structural_equivalent` inside formatter.rs's
+// own `#[cfg(test)]` module cover both branches of that function directly.
+//
+// What we DO test here:
+//   - Syntax propagation: `unclosed_directive_block_exits_one_with_syntax_not_formatter_invariant`
+//     (already present above) proves the gate surfaces real syntax errors and
+//     leaves the file untouched.
+//   - structural_equivalent fallback: the test below proves that a source file
+//     referencing an undefined runtime variable (which doesn't compile standalone)
+//     is still formatted via the token-comparison fallback, not rejected.
+
+#[test]
+fn structural_fallback_formats_file_with_undefined_var() {
+    // A source with an undefined runtime variable does not compile standalone,
+    // so the safety gate cannot do a real recompile-and-diff. It must fall
+    // back to the structural_equivalent token comparison and succeed, because
+    // real template files are often written for runtime vars supplied at render
+    // time — refusing to format them would make `mds fmt` useless on templates.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("template.mds");
+    let src = "Hello {undefined_runtime_var}!\n\n\n\nBye.\n";
+    fs::write(&target, src).unwrap();
+
+    let output = fmt_path(&target, &[]);
+    assert!(
+        output.status.success(),
+        "fmt must succeed on a file with undefined runtime var (structural fallback); \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = fs::read_to_string(&target).unwrap();
+    // The blank-line run (4 newlines = 3 blank lines) must still be collapsed
+    // to a single blank line (2 newlines) even via the structural fallback.
+    assert_eq!(
+        after, "Hello {undefined_runtime_var}!\n\nBye.\n",
+        "blank-line collapse must happen even via the structural_equivalent fallback path"
     );
 }
 
@@ -439,13 +495,20 @@ fn diff_prints_unified_diff_to_stdout_writes_nothing() {
     );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
+    // `---`/`+++` are the unified diff file headers; `@@` is the hunk header.
+    // Checking `@@` is more discriminating than `---` alone, which could be
+    // satisfied by frontmatter content that starts with `---`.
     assert!(
         stdout.contains("---"),
-        "expected unified diff header, got: {stdout:?}"
+        "expected unified diff --- header, got: {stdout:?}"
     );
     assert!(
         stdout.contains("+++"),
-        "expected unified diff header, got: {stdout:?}"
+        "expected unified diff +++ header, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("@@"),
+        "expected unified diff @@ hunk header, got: {stdout:?}"
     );
     assert!(
         stdout.lines().any(|l| l.starts_with('-')) || stdout.lines().any(|l| l.starts_with('+')),
