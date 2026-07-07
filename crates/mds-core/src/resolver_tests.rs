@@ -2823,3 +2823,121 @@ fn p_block_sources_share_one_arc() {
     }
     let _ = origins.pop(); // suppress unused warning
 }
+
+// ── PF-003 / #133: Windows verbatim-path parent_dir invariant ────────────────
+
+// Guards that `NativeFs::parent_dir` uses `Path::new(key).parent()` — the same
+// OS-native path decomposition used everywhere in this codebase — rather than a
+// string split on `/`. On Windows, `std::fs::canonicalize` returns a `\\?\`
+// verbatim extended-length path where `/` is a LITERAL character, not a separator;
+// a string split on `/` would silently return the wrong directory. The Windows
+// assertion is gated to `#[cfg(windows)]`; a POSIX assertion runs on every CI
+// leg to keep the code path compiled and tested on all platforms.
+#[test]
+fn pf003_parent_dir_strips_on_windows_verbatim_path() {
+    use crate::fs::NativeFs;
+    let fs = NativeFs::new();
+
+    // On Windows: verbatim extended-length paths use `\` as the separator;
+    // `Path::parent()` correctly strips the filename back to the directory.
+    #[cfg(windows)]
+    {
+        let dir = fs.parent_dir(r"\\?\C:\a\b\c.mds");
+        assert_eq!(
+            dir, r"\\?\C:\a\b",
+            "parent_dir on Windows verbatim path must strip the filename (PF-003 guard)"
+        );
+    }
+
+    // Cross-platform (POSIX): regular OS-native path decomposition; keeps the
+    // code path compiled and exercised on every CI leg (Linux, macOS).
+    #[cfg(unix)]
+    {
+        let dir = fs.parent_dir("/abs/dir/file.mds");
+        assert_eq!(
+            dir, "/abs/dir",
+            "parent_dir on POSIX path must strip the filename"
+        );
+    }
+}
+
+// ── SOURCE_LABEL display-label lock ──────────────────────────────────────────
+
+// Ensures that string-source compile errors include `<source>` as the file
+// label in miette diagnostics. SOURCE_LABEL is the `ctx.file_str` for
+// string-source modules — it must appear in the rendered diagnostic.
+//
+// The source must trigger a SPAN-CARRYING error so that `MdsError::at()` sets
+// `src: Some(NamedSource::new("<source>", ...))`. Post-parse semantic errors
+// without a span (e.g. "cannot use literal in @if condition") have `src: None`
+// and will not surface `<source>` in the debug representation.
+// A plain `{undefined_var}` interpolation triggers `MdsError::undefined_var_at`
+// with a span pointing to the interpolation site — that IS a span-carrying error.
+#[test]
+fn source_label_appears_in_string_source_diagnostics() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+
+    // An undefined variable interpolation produces MdsError::UndefinedVariable
+    // with src: Some(NamedSource { name: "<source>", ... }) and a span pointing
+    // to the interpolation site — exactly the span-carrying error we need.
+    let bad_source = "{undefined_var}\n";
+    let result = crate::compile_str_with(bad_source, Some(dir.path()), None);
+
+    let err = result.unwrap_err();
+    // The Debug representation of MdsError::UndefinedVariable surfaces
+    // `NamedSource { name: "<source>", ... }` when src is Some.
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("<source>"),
+        "string-source diagnostic must contain '<source>' as the file label, got:\n{rendered}"
+    );
+}
+
+// ── PF-003 / #146: parent_dir cross-platform integration test ─────────────────
+//
+// Verifies that `FileSystem::parent_dir` is correctly called and consumed during
+// real compilation on every CI leg (Linux, macOS). When an imported file (sub/lib.mds)
+// itself contains a relative `@import`, the resolver calls `parent_dir` on sub/lib.mds's
+// canonical key to locate sub/ before resolving the nested import. Without a correct
+// `parent_dir`, the nested `./helper.mds` import would resolve against the wrong
+// directory and fail with mds::file_not_found. Auto-covers Windows once #147 lands.
+#[test]
+fn parent_dir_drives_nested_file_import_resolution() {
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    // sub/helper.mds — exists on disk so the import resolves; contributes nothing to scope.
+    std::fs::write(sub.join("helper.mds"), "").unwrap();
+
+    // sub/lib.mds — imports ./helper.mds (relative: resolution forces parent_dir call
+    // on sub/lib.mds's canonical key) and defines greet(x) for main.mds to consume.
+    std::fs::write(
+        sub.join("lib.mds"),
+        "@import \"./helper.mds\"\n@define greet(x):\nHello {x}!\n@end\n",
+    )
+    .unwrap();
+
+    // main.mds — imports sub/lib.mds and calls greet
+    let main_path = dir.path().join("main.mds");
+    std::fs::write(
+        &main_path,
+        "@import \"./sub/lib.mds\"\n{greet(\"World\")}\n",
+    )
+    .unwrap();
+
+    let result = crate::compile_file(main_path.to_str().unwrap());
+    assert!(
+        result.is_ok(),
+        "nested file import chain must compile (parent_dir cross-platform guard, #146): {result:?}"
+    );
+    let output = result.unwrap().into_markdown().unwrap();
+    assert!(
+        output.contains("Hello World!"),
+        "nested import must produce expected output (parent_dir resolved sub/ correctly): {output}"
+    );
+}

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Python bindings
+### Added
 
 - **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), to be distributed
   as `mdscript` on PyPI. Seven functions — `compile`, `compile_file`,
@@ -21,6 +21,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   free-threading ready (`gil_used = false`), enabling multi-threaded use.
   Cross-platform wheel matrix and PyPI publishing are a tracked follow-up (#132) —
   for now, install from source: `pip install ./crates/mds-python`. (#59)
+
+### Changed
+
+- **BREAKING:** `FileSystem` trait now requires two new methods — `normalize_in_dir`
+  and `parent_dir` — that replace the internal `<source>` path-sentinel pattern.
+  String-source `@import`/`@extends` resolution is now directly directory-anchored:
+  `ctx.base_dir` carries the importing directory explicitly, with no synthetic
+  filename appended. No behavior change for `compile`/`check` users; only affects
+  code that implements the `FileSystem` trait directly via `ModuleCache::with_fs`.
+  (#146)
+
+### Fixed
+
+- **Windows: string-source `@import`/`@extends` now resolve relative imports
+  correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path
+  on Windows, and inside a `\\?\` prefix `/` is a literal character, not a path
+  separator — so building the in-memory-source base key with
+  `format!("{canonical}/<source>")` produced a key that `Path::parent()` could not
+  strip back to the base directory, silently resolving relative imports against the
+  wrong directory. Fixed by eliminating the synthetic `<source>` key entirely: the
+  importing directory is now carried directly as `ctx.base_dir` and passed to
+  `FileSystem::normalize_in_dir`, so no synthetic path component is ever constructed
+  or decomposed. Fixes napi `compile`/`check(src, { basePath })`, Python
+  `compile`/`check(src, base_path=...)`, and CLI `mds build -` / `mds check -`
+  (stdin) — all share the same resolution path. POSIX behavior is unchanged. (#133,
+  #146)
 
 ## [0.3.0] — 2026-06-28
 
