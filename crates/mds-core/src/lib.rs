@@ -638,6 +638,14 @@ pub(crate) fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
 
 /// Clean up output whitespace: collapse 3+ consecutive newlines to 2 (one blank line),
 /// and trim leading/trailing blank lines.
+///
+/// **Formatter dependency**: `mds fmt` (`formatter.rs`) treats this function as the
+/// ceiling of what it may safely change in markdown-mode content — any transform the
+/// formatter applies must produce output that survives this normalisation unchanged.
+/// Critically, `@message` and `@define` body content bypasses this function entirely
+/// (routed through `.trim()` only in `collect_single_message`, `evaluator.rs`), so
+/// the formatter protects those regions as raw content; see `raw_content_spans` in
+/// `formatter.rs` for the authoritative source of that distinction.
 pub(crate) fn clean_output(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut newline_count = 0;
