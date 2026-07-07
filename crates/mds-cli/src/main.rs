@@ -370,5 +370,4 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-// The unit tests that were in main.rs have moved to build.rs.
 // This file only contains integration-level wiring that is covered by the integration tests.
