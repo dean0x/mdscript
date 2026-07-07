@@ -31,14 +31,20 @@ use miette::Result;
 use crate::build::{load_config, read_stdin, resolve_input};
 use crate::output::collect_mds_files;
 
-/// Directory recursion depth cap, matching `run_build_directory` / `run_check_directory`.
-const MAX_DEPTH: usize = 64;
-
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
     pub(crate) check: bool,
     pub(crate) diff: bool,
     pub(crate) quiet: bool,
+}
+
+/// Bundled mode flags passed to every per-input helper — avoids the silent
+/// transposition hazard of three consecutive positional `bool` parameters.
+#[derive(Clone, Copy)]
+struct FmtFlags {
+    check: bool,
+    diff: bool,
+    quiet: bool,
 }
 
 pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
@@ -54,8 +60,10 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
         eprintln!("Formatting {}", input.display());
     }
 
+    let flags = FmtFlags { check, diff, quiet };
+
     if input == Path::new("-") {
-        return run_fmt_stdin(check, diff, quiet);
+        return run_fmt_stdin(flags);
     }
 
     if input.is_dir() {
@@ -70,11 +78,11 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
                 input.display()
             ));
         }
-        return run_fmt_directory(&input, check, diff, quiet);
+        return run_fmt_directory(&input, flags);
     }
 
     ensure_mds_extension(&input)?;
-    run_fmt_file(&input, check, diff, quiet)
+    run_fmt_file(&input, flags)
 }
 
 /// Reject an explicit-file input whose extension isn't `.mds` (AC-CF, exit 2).
@@ -125,7 +133,8 @@ fn format_source(source: &str, base_dir: Option<&Path>) -> Result<FmtResult> {
 
 // ── stdin mode ───────────────────────────────────────────────────────────────
 
-fn run_fmt_stdin(check: bool, diff: bool, quiet: bool) -> Result<()> {
+fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
+    let FmtFlags { check, diff, quiet } = flags;
     let (source, cwd) = read_stdin()?;
     let result = format_source(&source, Some(&cwd))?;
 
@@ -147,7 +156,8 @@ fn run_fmt_stdin(check: bool, diff: bool, quiet: bool) -> Result<()> {
 
 // ── single-file mode ─────────────────────────────────────────────────────────
 
-fn run_fmt_file(path: &Path, check: bool, diff: bool, quiet: bool) -> Result<()> {
+fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
+    let FmtFlags { check, diff, quiet } = flags;
     let source = read_source_file(path)?;
     let base_dir = path.parent();
     let result = format_source(&source, base_dir)?;
@@ -196,7 +206,13 @@ fn run_fmt_file(path: &Path, check: bool, diff: bool, quiet: bool) -> Result<()>
 ///
 /// Continue-on-error: a per-file failure does not abort the run. Non-zero
 /// exit when any file failed, or (under `--check`) when any file would change.
-fn run_fmt_directory(dir: &Path, check: bool, diff: bool, quiet: bool) -> Result<()> {
+fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
+    // Directory recursion depth cap, matching `run_build_directory` /
+    // `run_check_directory` which also declare MAX_DEPTH as a function-local
+    // constant (build.rs line ~744).
+    const MAX_DEPTH: usize = 64;
+    let FmtFlags { check, diff, quiet } = flags;
+
     // Validate mds.json even though `fmt` doesn't act on its `fmt` section's
     // content yet — consistent with build/check, which also fail loudly on a
     // malformed config rather than silently ignoring it.
