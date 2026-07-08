@@ -1206,7 +1206,7 @@ mod tests {
         );
     }
 
-    // ── values_equal_runtime: NaN semantics ─────────────────────────────────
+    // ── values_equal_same_type: NaN semantics ───────────────────────────────
 
     #[test]
     fn values_equal_nan_is_not_equal_to_itself() {

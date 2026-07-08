@@ -2060,10 +2060,6 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
 
 // ── Template inheritance helpers ──────────────────────────────────────────────
 
-/// Parse the frontmatter YAML into a `serde_yaml_ng::Mapping` for storage.
-///
-/// Returns `None` when there is no frontmatter or when the YAML is not a mapping.
-/// Called once per module to avoid double-parsing.
 /// Serialize a deep-merged frontmatter `Mapping` into a YAML string suitable for
 /// `prepend_frontmatter`.
 ///
@@ -2093,6 +2089,10 @@ fn serialize_merged_frontmatter(mapping: &serde_yaml_ng::Mapping) -> Option<Stri
     }
 }
 
+/// Parse the frontmatter YAML into a `serde_yaml_ng::Mapping` for storage.
+///
+/// Returns `None` when there is no frontmatter or when the YAML is not a mapping.
+/// Called once per module to avoid double-parsing.
 fn parse_frontmatter_mapping(
     frontmatter: Option<&crate::ast::Frontmatter>,
 ) -> Result<Option<serde_yaml_ng::Mapping>, MdsError> {

@@ -126,7 +126,6 @@ impl<'a> Lexer<'a> {
 
     /// Scan a code fence (opening or closing) given the pre-parsed fence info.
     ///
-    /// `prefix_len`: number of `[ \t>]*` characters before the fence chars.
     /// `fence_char`: the repeated character (`` ` `` or `~`).
     /// `fence_count`: how many fence chars are present.
     /// `is_close`: whether the rest of the line is spaces/tabs only (close candidate).
@@ -134,31 +133,13 @@ impl<'a> Lexer<'a> {
     /// Returns `true` when the fence was consumed and the caller should `continue`.
     /// Returns `false` when we are inside a block but this line does not match the
     /// opener — the caller falls through to `scan_code_content`.
-    fn scan_code_fence(
-        &mut self,
-        _prefix_len: usize,
-        fence_char: char,
-        fence_count: usize,
-        is_close: bool,
-    ) -> bool {
+    fn scan_code_fence(&mut self, fence_char: char, fence_count: usize, is_close: bool) -> bool {
         let bp = self.byte_pos(self.pos);
 
-        if self.code_fence.is_none() {
-            // Opening fence: advance past prefix + fence chars, then capture verbatim
-            // up to (but not including) the first \r or \n (strips \r, matches R1).
-            let line_end = self.chars[self.pos..]
-                .iter()
-                .position(|&c| c == '\n' || c == '\r')
-                .map(|rel| self.pos + rel)
-                .unwrap_or(self.chars.len());
-            let fence = self.source[bp..self.byte_pos(line_end)].to_string();
-            self.pos = skip_newline(&self.chars, line_end);
-            self.code_fence = Some((fence_char, fence_count, bp));
-            self.tokens.push(Token::CodeFence(fence, bp));
-            true
-        } else if let Some((open_char, open_count, _)) = self.code_fence {
-            if is_close && fence_char == open_char && fence_count >= open_count {
-                // Closing fence: same char, at least as many, no info string.
+        match self.code_fence {
+            None => {
+                // Opening fence: capture verbatim up to (but not including) the first
+                // \r or \n (strips \r, matches R1).
                 let line_end = self.chars[self.pos..]
                     .iter()
                     .position(|&c| c == '\n' || c == '\r')
@@ -166,15 +147,28 @@ impl<'a> Lexer<'a> {
                     .unwrap_or(self.chars.len());
                 let fence = self.source[bp..self.byte_pos(line_end)].to_string();
                 self.pos = skip_newline(&self.chars, line_end);
-                self.code_fence = None;
+                self.code_fence = Some((fence_char, fence_count, bp));
                 self.tokens.push(Token::CodeFence(fence, bp));
                 true
-            } else {
-                // Inside a block but this line does not close it — fall through to CodeContent.
-                false
             }
-        } else {
-            false
+            Some((open_char, open_count, _)) => {
+                if is_close && fence_char == open_char && fence_count >= open_count {
+                    // Closing fence: same char, at least as many, no info string.
+                    let line_end = self.chars[self.pos..]
+                        .iter()
+                        .position(|&c| c == '\n' || c == '\r')
+                        .map(|rel| self.pos + rel)
+                        .unwrap_or(self.chars.len());
+                    let fence = self.source[bp..self.byte_pos(line_end)].to_string();
+                    self.pos = skip_newline(&self.chars, line_end);
+                    self.code_fence = None;
+                    self.tokens.push(Token::CodeFence(fence, bp));
+                    true
+                } else {
+                    // Inside a block but this line does not close it — fall through to CodeContent.
+                    false
+                }
+            }
         }
     }
 
@@ -339,10 +333,10 @@ impl<'a> Lexer<'a> {
             // `scan_code_fence` returns true when it consumed the fence; false means
             // we are inside a block but this line is not the closer — fall through to CodeContent.
             if at_line_start {
-                if let Some((prefix_len, fence_char, fence_count, is_close)) =
+                if let Some((_, fence_char, fence_count, is_close)) =
                     try_scan_fence_at(&self.chars, self.pos)
                 {
-                    if self.scan_code_fence(prefix_len, fence_char, fence_count, is_close) {
+                    if self.scan_code_fence(fence_char, fence_count, is_close) {
                         continue;
                     }
                 }
