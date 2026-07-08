@@ -1230,3 +1230,136 @@ fn issue_152_set_string_forces_string_type() {
         "#152: --set-string should make count a string so count == \"3\" is true"
     );
 }
+
+// ── Round-trip acceptance test (#150/#151) ────────────────────────────────────
+//
+// A realistic template with frontmatter, post-FM blank line, lists, an indented
+// code fence inside a list item, interior blank runs, and a trailing-space line
+// is compiled through the pass-through pipeline. The compiled output must be
+// byte-identical to the source modulo the two carve-outs mandated by the
+// interior-verbatim contract (#150/#151):
+//   1. Trailing-edge normalization: any trailing whitespace is stripped, exactly
+//      one final newline is appended.
+//   2. \r characters are stripped unconditionally.
+
+#[test]
+fn round_trip_interior_verbatim_byte_identical() {
+    // Source deliberately contains:
+    // - Frontmatter with two keys
+    // - Blank line after the closing ---
+    // - A list with an indented code fence inside a list item
+    // - Literal braces inside the fence (must not be interpolated)
+    // - Interior blank runs (must be preserved verbatim)
+    // - A trailing-space "blank" line (preserved: body-text trailing whitespace
+    //   is NOT stripped by `clean_output` — only the very trailing edge is)
+    let src = concat!(
+        "---\n",
+        "author: test\n",
+        "version: 1\n",
+        "---\n",
+        "\n",
+        "- First item\n",
+        "- Second item with fence:\n",
+        "\n",
+        "  ```json\n",
+        "  {\"key\": \"value\"}\n",
+        "  ```\n",
+        "\n",
+        "- Third item\n",
+        "\n",
+        "Interior blank run above is preserved.\n",
+        "  \n",
+        "Trailing-space line above; this is the last line.\n",
+    );
+
+    let out = mds::compile_str(src)
+        .expect("round-trip source must compile")
+        .into_markdown()
+        .expect("expected markdown");
+
+    // Apply the two permitted carve-outs to the source for the expected value.
+    // clean_output: strip \r, trim trailing whitespace, add one final \n.
+    let frontmatter_part = "---\nauthor: test\nversion: 1\n---\n";
+    let body_part = concat!(
+        "\n",
+        "- First item\n",
+        "- Second item with fence:\n",
+        "\n",
+        "  ```json\n",
+        "  {\"key\": \"value\"}\n",
+        "  ```\n",
+        "\n",
+        "- Third item\n",
+        "\n",
+        "Interior blank run above is preserved.\n",
+        "  \n",
+        "Trailing-space line above; this is the last line.\n",
+    );
+    // After clean_output: \r stripped (none here), trailing edge normalized to one \n.
+    // The body ends with "\n" already, so clean_output produces body_part as-is
+    // (trim_end removes the trailing \n-only sequence, then push_str adds one back).
+    let expected = format!("{frontmatter_part}{body_part}");
+
+    assert_eq!(
+        out, expected,
+        "compiled output must be byte-identical to source (modulo trailing-edge normalization)"
+    );
+}
+
+// ── Integration repro: #149 — indented fence with literal braces ──────────────
+
+#[test]
+fn issue_149_indented_fence_inside_list_item_with_braces() {
+    // An indented code fence inside a list item containing literal `{braces}`
+    // must compile successfully: braces inside the fence are NOT interpolated,
+    // and the fence lines are emitted verbatim.
+    let src = concat!(
+        "Here is a list:\n",
+        "\n",
+        "- Step 1: use the API\n",
+        "\n",
+        "  ```json\n",
+        "  {\"action\": \"query\", \"filter\": {\"type\": \"all\"}}\n",
+        "  ```\n",
+        "\n",
+        "- Step 2: done\n",
+    );
+    let out = mds::compile_str(src)
+        .expect("#149: indented fence in list item with braces must compile")
+        .into_markdown()
+        .expect("#149: expected markdown output");
+
+    // The braces inside the fence must appear literally in the output.
+    assert!(
+        out.contains("{\"action\": \"query\""),
+        "#149: literal braces inside indented fence must be preserved; got: {out}"
+    );
+    assert!(
+        out.contains("```json"),
+        "#149: fence opener must be verbatim; got: {out}"
+    );
+    assert!(
+        out.contains("```\n"),
+        "#149: fence closer must be verbatim; got: {out}"
+    );
+}
+
+// ── Integration repro: #153 — invalid interpolation hint says \{ not \{{ ───────
+
+#[test]
+fn issue_153_invalid_interpolation_hint_text() {
+    // Compiling a file with an invalid interpolation shape must produce an error
+    // whose hint text contains `\{` (single brace) and NOT `\{{` (double brace).
+    let src = "{123invalid}\n";
+    let err = mds::compile_str(src).expect_err("#153: invalid interpolation must fail to compile");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("\\{"),
+        "#153: error hint must mention \\{{ (single brace escape); got: {msg}"
+    );
+    // Guard the regression: must NOT say \{{ (double brace — old broken form).
+    assert!(
+        !msg.contains("\\{{"),
+        "#153: error hint must NOT say \\{{{{  (double brace); got: {msg}"
+    );
+}

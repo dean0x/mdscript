@@ -2948,6 +2948,186 @@ fn source_label_appears_in_string_source_diagnostics() {
     );
 }
 
+// ── Adversarial YAML-injection: core-level twin (#154) ───────────────────────
+//
+// These tests exercise the resolver's `raw_frontmatter` serialization path
+// (serialize_merged_frontmatter / serde_yaml_ng::to_string) to verify that values
+// containing fence-like sequences, YAML document-end markers, or block-scalar
+// `type: mds` lines cannot escape the emitted frontmatter block and smuggle
+// additional top-level keys into the compiled output.
+//
+// The CLI-level mirror lives in crates/mds-cli/tests/frontmatter.rs.
+
+#[test]
+fn adversarial_injection_fence_sequence_in_fm_value() {
+    // A frontmatter value containing a literal `\n---\n` YAML document separator
+    // must be serialized as a quoted/escaped YAML string and must NOT break the
+    // outer `---`/`---` fence structure.
+    let base = concat!(
+        "---\n",
+        "prompt: \"start\\n---\\ninjected: evil\\n---\\nend\"\n",
+        "---\n",
+        "@block body:\ndefault\n@end\n",
+    );
+    let child = concat!("---\nrole: system\n---\n", "@extends \"./base.mds\"\n");
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut vec![])
+        .expect("should compile despite adversarial FM value");
+
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+
+    // Extract ONLY the frontmatter section (between the first --- and second ---).
+    // Using the full raw_frontmatter string directly since it's already the inner YAML.
+    let has_injected = raw_fm.lines().any(|l| l == "injected: evil");
+    assert!(
+        !has_injected,
+        "adversarial 'injected: evil' must not appear as a top-level FM key; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("role: system"),
+        "role key must survive; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("prompt:"),
+        "prompt key must survive; raw_fm={raw_fm}"
+    );
+}
+
+#[test]
+fn adversarial_injection_yaml_end_marker_in_fm_value() {
+    // A frontmatter value containing `\n...\n` (YAML stream-end marker) must
+    // be serialized safely and must not close the document prematurely.
+    let base = concat!(
+        "---\n",
+        "note: \"before\\n...\\nafter\"\n",
+        "---\n",
+        "@block body:\ndefault\n@end\n",
+    );
+    let child = concat!("---\nrole: user\n---\n", "@extends \"./base.mds\"\n");
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut vec![])
+        .expect("should compile despite YAML end-marker in value");
+
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+
+    // The end-marker must not split the frontmatter YAML; both keys must appear.
+    assert!(
+        raw_fm.contains("role: user"),
+        "role key must be in raw_fm; got: {raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("note:"),
+        "note key must be in raw_fm; got: {raw_fm}"
+    );
+}
+
+#[test]
+fn adversarial_injection_block_scalar_type_mds_not_stripped() {
+    // A block-scalar FM value whose lines include `type: mds` must not be
+    // confused with the top-level `type: mds` directive — only an unindented
+    // top-level `type: mds` key should be stripped from the emitted output.
+    let base = concat!(
+        "---\n",
+        "description: |\n",
+        "  type: mds\n",
+        "  this is a block scalar\n",
+        "model: gpt-4\n",
+        "---\n",
+        "@block body:\ndefault\n@end\n",
+    );
+    let child = "@extends \"./base.mds\"\n";
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut vec![])
+        .expect("should compile");
+
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+
+    // No unindented `type: mds` key in the raw frontmatter.
+    let has_top_level_type = raw_fm.lines().any(|l| l == "type: mds");
+    assert!(
+        !has_top_level_type,
+        "unindented 'type: mds' must not appear as a top-level key; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("description:"),
+        "description key must be present; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("model:"),
+        "model key must be present; raw_fm={raw_fm}"
+    );
+}
+
+// ── f7 extension: emitted FM ignores --set (#154) ────────────────────────────
+
+#[test]
+fn f7_emitted_frontmatter_ignores_runtime_set() {
+    // Extending an extends test to pass a runtime var whose key collides with a
+    // frontmatter key: the emitted raw_frontmatter must NOT contain the runtime
+    // value. Runtime vars override the SCOPE (what the body renders) but must
+    // never alter the emitted raw frontmatter serialization.
+    let base = concat!(
+        "---\n",
+        "model: gpt-4\n",
+        "---\n",
+        "@block content:\n",
+        "Model: {model}\n",
+        "@end\n",
+    );
+    let child = concat!(
+        "---\n",
+        "role: assistant\n",
+        "---\n",
+        "@extends \"./base.mds\"\n",
+    );
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut runtime_vars = std::collections::HashMap::new();
+    runtime_vars.insert(
+        "model".to_string(),
+        Value::String("gpt-3.5-turbo".to_string()),
+    );
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &runtime_vars, &mut vec![])
+        .expect("F7 extension: should compile with runtime override");
+
+    // Body renders the runtime value (scope wins).
+    let body = resolved.prompt_body.as_deref().unwrap_or("");
+    assert!(
+        body.contains("gpt-3.5-turbo"),
+        "body must use runtime var value; body={body}"
+    );
+
+    // Emitted raw_frontmatter must show the MERGED FRONTMATTER value, not the runtime one.
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+    assert!(
+        !raw_fm.contains("gpt-3.5-turbo"),
+        "runtime value must NOT appear in emitted frontmatter; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("gpt-4"),
+        "frontmatter must show merged FM value (gpt-4); raw_fm={raw_fm}"
+    );
+}
+
 // ── PF-003 / #146: parent_dir cross-platform integration test ─────────────────
 //
 // Verifies that `FileSystem::parent_dir` is correctly called and consumed during
