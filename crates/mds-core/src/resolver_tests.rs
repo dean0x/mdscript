@@ -1457,6 +1457,52 @@ fn f6_base_only_key_visible_in_child() {
 }
 
 #[test]
+fn f6_nested_reserved_key_config_type_survives_merge() {
+    // F6 / depth-gating fix: a nested key named `type` inside a sub-mapping (e.g.
+    // `config.type: mds`) must survive the deep merge and appear in the compiled output.
+    // Previously deep_merge_yaml filtered all keys named "type" at every recursion depth,
+    // silently dropping user data inside nested objects.
+    let base = concat!(
+        "---\n",
+        "config:\n",
+        "  type: mds\n",
+        "  model: gpt-4\n",
+        "model: base-model\n",
+        "---\n",
+        "@block content:\n",
+        "{config.model}\n",
+        "@end\n",
+    );
+    let child = concat!(
+        "---\n",
+        "role: system\n",
+        "---\n",
+        "@extends \"./base.mds\"\n",
+    );
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let mut warnings = vec![];
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut warnings)
+        .expect("F6 nested reserved key: should compile");
+
+    // Compiled output (body) uses config.model from merged scope.
+    let body = resolved.prompt_body.as_deref().unwrap_or("");
+    assert!(
+        body.contains("gpt-4"),
+        "config.model must be in scope: {body}"
+    );
+
+    // Emitted frontmatter must contain `config.type: mds` — the nested `type` key
+    // must NOT be stripped by the reserved-key filter.
+    let fm = resolved.raw_frontmatter.as_deref().unwrap_or("");
+    assert!(
+        fm.contains("type: mds") || fm.contains("type: 'mds'") || fm.contains("\"type\": mds"),
+        "config.type nested key must survive into emitted frontmatter; got: {fm}"
+    );
+}
+
+#[test]
 fn f7_runtime_override_precedence() {
     // F7: runtime --set overrides merged frontmatter (base < child < runtime).
     // We test at the ResolvedModule level to check the rendered body directly,
