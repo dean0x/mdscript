@@ -43,7 +43,7 @@ GOLDENS: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
         {},
         {
             "kind": "markdown",
-            "output": "---\nname: Alice\ncount: 3\n---\nHello Alice! You have 3 items.\n",
+            "output": "---\nname: Alice\ncount: 3\n---\n\nHello Alice! You have 3 items.\n",
             "warnings": [],
             "dependencies": [],
         },
