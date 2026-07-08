@@ -1,4 +1,4 @@
-# MDS Language Specification (v0.2)
+# MDS Language Specification (v0.4)
 
 ## 1. Overview
 
@@ -66,7 +66,7 @@ Hello {name}!
 - Single braces: `{identifier}` or dot path `{obj.field}`
 - Valid interpolation: a valid identifier (`[a-zA-Z_][a-zA-Z0-9_]*`), dot path (`{config.key}`, `{a.b.c}`), or function call
 - Escaping: `\{` produces a literal `{` in output; `\}` produces a literal `}` in output
-- Inside fenced code blocks (triple backtick): no interpolation occurs (raw passthrough)
+- Inside fenced code blocks (triple backtick or tilde; also indented or blockquoted fences): no interpolation occurs (raw passthrough)
 - Undefined variable → compilation error (not silent empty string)
 
 ---
@@ -165,7 +165,7 @@ Free tier.
   - Maximum 16 leaf operands per logical expression
 - Falsy values: `false`, `null`, empty string `""`, empty array `[]`, empty object `{}`, `0`, `NaN`
 - Everything else is truthy
-- Equality is **strict**, no type coercion: `@if count == "3":` is false when count is the number 3
+- Equality is **strict**, no type coercion: comparing values of different types (e.g. `@if count == "3":` when `count` is the number `3`) is a **runtime error** (`mds::type_mismatch`). Convert explicitly: `@if str(count) == "3":` or `@if count == 3:`
 - `NaN == NaN` is false (IEEE 754)
 - `@elseif` branches are evaluated in order; first matching branch wins (short-circuit)
 - `@elseif` must appear before `@else:`; `@else:` cannot be followed by `@elseif`
@@ -636,7 +636,7 @@ Respond in plain text.
 - Nested mappings are merged key-by-key; arrays replace wholesale; scalars: child wins
 - Reserved keys (`imports`, `type`, `extends`) are excluded from the merged scope
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
-- The child's raw frontmatter fence is the only one emitted in the output (base frontmatter is input to scope, not output)
+- The **deep-merged** frontmatter (base < child, reserved keys excluded) is emitted in the compiled output — not just the child's raw frontmatter. Both base-only and child-only keys appear; child wins on collisions
 
 **Intrinsic output with inheritance:**
 
@@ -765,6 +765,7 @@ Errors include a diagnostic code (`mds::*`), file path, line number, column, a v
 |---------|---------|
 | `mds build [FILE\|DIR]` | Compile an `.mds` template (or a directory of templates) |
 | `mds check [FILE\|DIR]` | Validate a template or directory without rendering |
+| `mds fmt [FILE\|DIR]` | Auto-format `.mds` templates in place (safety-gated) |
 | `mds init [FILENAME]` | Create a starter `.mds` file |
 
 ### 7.2 `mds build`
@@ -806,6 +807,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. |
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
+| `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
 | `-q, --quiet` | Suppress status messages and warnings on stderr. |
 
 **Output path resolution** (precedence order, highest first):
@@ -829,9 +831,28 @@ echo "@if flag:" | mds check -             # Validate from stdin
 mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files.
+Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files.
 
-### 7.4 `mds init`
+### 7.4 `mds fmt`
+
+```bash
+mds fmt template.mds                       # Format a single file in place
+mds fmt src/                               # Format all .mds files under src/
+echo "template content" | mds fmt -       # Format from stdin, write to stdout
+mds fmt template.mds --check              # Exit non-zero if file would change
+mds fmt template.mds --diff               # Print unified diff without writing
+```
+
+Formats `.mds` templates: normalizes CRLF to LF, collapses multiple consecutive blank lines to one, strips trailing whitespace on directive lines, and ensures exactly one trailing newline. Body-text trailing whitespace (Markdown hard breaks) and the content of `@message`/`@define` bodies are left untouched.
+
+Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template.
+
+| Option | Description |
+|--------|-------------|
+| `--check` | Exit non-zero without writing if any file would change. |
+| `--diff` | Print a unified diff of proposed changes without writing. |
+
+### 7.5 `mds init`
 
 ```bash
 mds init                                   # Creates hello.mds in current directory
@@ -841,7 +862,7 @@ mds init my-prompt.mds --force             # Overwrite if file already exists
 
 Creates a compilable starter template. Path traversal (e.g. `../escaped.mds`) is rejected.
 
-### 7.5 Auto-Detection
+### 7.6 Auto-Detection
 
 When no `FILE` argument is given to `mds build` or `mds check`, the compiler scans the current directory for `.mds` files:
 
@@ -849,7 +870,7 @@ When no `FILE` argument is given to `mds build` or `mds check`, the compiler sca
 - **Zero found** → error with hint to run `mds init`.
 - **Multiple found** → error listing the files with a hint to specify one.
 
-### 7.6 `mds.json` Project Config
+### 7.7 `mds.json` Project Config
 
 Place `mds.json` in the project root (or any ancestor directory). The compiler walks up from the input file to find it.
 
@@ -867,7 +888,7 @@ Place `mds.json` in the project root (or any ancestor directory). The compiler w
 
 Maximum config file size: 1 MB.
 
-### 7.7 Exit Codes
+### 7.8 Exit Codes
 
 | Code | Meaning |
 |------|---------|
@@ -1104,6 +1125,10 @@ quoted_path     := "\"" path_chars "\""
 ---
 
 ## 12. Status
+
+v0.4.0 - Breaking fixes release. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion (#152). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154). Interpolation errors now suggest `\{` in the help text (#153).
+
+v0.3.0 - Auto-formatter (`mds fmt`), intrinsic output format (Markdown vs JSON messages decided by content not a flag), native Python bindings (PyO3).
 
 v0.2.0 - Language enrichment release. Adds built-in functions (18 functions for string, array, and type-conversion operations), default function arguments, and logical operators (`&&`, `||`) in `@if` conditions with short-circuit evaluation and operator-precedence semantics.
 

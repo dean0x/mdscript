@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — unreleased
+
+### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter
+
+These changes alter observable runtime behavior and compiled output. Templates relying
+on the previous (buggy) behavior must be updated.
+
+#### Cross-type comparisons are now errors (#152)
+
+`@if a == b:` or `@if a != b:` where `a` and `b` are different types (e.g. a number
+vs. a string, or a boolean vs. null) now raises `mds::type_mismatch` at runtime
+instead of silently returning `false` (for `==`) or `true` (for `!=`).
+
+**Migration:** add an explicit conversion before comparing:
+- `@if str(count) == "3":` — convert number to string
+- `@if count == 3:` — compare number to number literal
+
+#### `@extends` emits deep-merged frontmatter (#154)
+
+Compiled output for a child template now contains the **deep-merged** frontmatter
+(base keys + child keys, child wins on collision, reserved keys `imports`/`type`/`extends`
+excluded) rather than only the child's raw frontmatter. Base-only frontmatter keys
+now appear in the compiled output.
+
+**Migration:** if your pipeline depends on base frontmatter keys being absent from the
+compiled output, strip them downstream or move them to a non-frontmatter location.
+
 ### Added
+
+- **`--set-string KEY=VALUE`** CLI flag for `mds build`, `mds check`, and `mds fmt`.
+  Sets a variable as a string without type coercion — useful when a value is
+  numeric-looking but must stay a string (e.g. `mds build t.mds --set-string id=007`).
+  Repeatable. (#152)
 
 - **`mds fmt`** — an opinionated, safety-gated auto-formatter for `.mds` templates. Every
   rewrite is guaranteed compile-equivalent: a runtime safety gate re-compiles the formatted
@@ -47,6 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#146)
 
 ### Fixed
+
+- **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
+  as passthrough regions. Previously only `` ``` ``-fences that started at column 1
+  were treated as code — a `~~~` fence, a `` > ``` `` blockquote fence, or a fence
+  indented with spaces/tabs would allow interpolation and directive parsing inside,
+  silently corrupting output for affected templates. The lexer now matches any fence
+  that starts with `[ \t>]*` followed by three or more matching backticks or tildes.
+  (#149)
+
+- **Interpolation errors now suggest `\{`** in the help text when an opening brace
+  appears in a context where an interpolation was expected but failed (e.g. `{ invalid`
+  or an unclosed brace). Helps users writing literal brace characters. (#153)
 
 - **Windows: string-source `@import`/`@extends` now resolve relative imports
   correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path
