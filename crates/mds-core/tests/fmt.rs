@@ -152,23 +152,24 @@ fn r2_frontmatter_only_no_trailing_newline_still_gets_one() {
     );
 }
 
-// ── R3: 3+ blank lines collapse to one, except inside fences ────────────────
+// ── Interior-verbatim: blank lines preserved (R3 removed in v2) ──────────────
 
 #[test]
-fn r3_blank_line_run_collapses_matching_clean_output() {
-    // Verified empirically: clean_output("Hello\n\n\n\nWorld\n") == "Hello\n\nWorld\n".
+fn interior_blank_line_runs_preserved_verbatim() {
+    // Interior-verbatim contract (#150/#151): blank-line runs pass through
+    // byte-exact. clean_output no longer caps runs; the formatter must not either.
     let out = format_str("Hello\n\n\n\nWorld\n").unwrap();
-    assert_eq!(out, "Hello\n\nWorld\n");
+    assert_eq!(out, "Hello\n\n\n\nWorld\n");
 }
 
 #[test]
-fn r3_single_blank_line_unchanged() {
+fn interior_single_blank_line_unchanged() {
     let out = format_str("Hello\n\nWorld\n").unwrap();
     assert_eq!(out, "Hello\n\nWorld\n");
 }
 
 #[test]
-fn r3_never_collapses_blank_lines_inside_code_fence() {
+fn code_fence_blank_lines_preserved_verbatim() {
     let src = "```\ncode\n\n\n\nmore\n```\nAfter\n";
     let out = format_str(src).expect("should format");
     assert!(
@@ -178,15 +179,14 @@ fn r3_never_collapses_blank_lines_inside_code_fence() {
 }
 
 #[test]
-fn r3_leading_blank_lines_in_body_fully_stripped() {
-    // Verified empirically: clean_output of a body with leading blank lines
-    // removes them ENTIRELY (not capped at one) -- both with and without
-    // frontmatter present.
+fn leading_blank_lines_in_body_preserved_verbatim() {
+    // Interior-verbatim (#150/#151): leading blank lines are no longer stripped
+    // — both with and without frontmatter present.
     let out = format_str("\n\n\nHello\nWorld\n").unwrap();
-    assert_eq!(out, "Hello\nWorld\n");
+    assert_eq!(out, "\n\n\nHello\nWorld\n");
 
     let out_fm = format_str("---\nname: x\n---\n\n\n\nHello\n").unwrap();
-    assert_eq!(out_fm, "---\nname: x\n---\nHello\n");
+    assert_eq!(out_fm, "---\nname: x\n---\n\n\n\nHello\n");
 }
 
 // ── R4: trailing whitespace on directive lines; body content UNCHANGED ──────
@@ -353,7 +353,7 @@ fn gate_fallback_undefined_var_source_still_formats() {
         "sanity: source must not compile standalone"
     );
     let out = format_str(src).expect("format_str must still succeed via structural fallback");
-    assert_eq!(out, "Hello {undefined_var}!\n\nBye.\n");
+    assert_eq!(out, "Hello {undefined_var}!\n\n\n\nBye.\n");
 }
 
 #[test]
@@ -365,7 +365,10 @@ fn gate_full_check_runs_when_base_dir_resolves_imports() {
     let src = "@import \"./lib.mds\"\n{greet(\"World\")}\n\n\n\nBye.\n";
     let out =
         format_str_with(src, Some(dir.path())).expect("format_str_with should resolve imports");
-    assert_eq!(out, "@import \"./lib.mds\"\n{greet(\"World\")}\n\nBye.\n");
+    assert_eq!(
+        out,
+        "@import \"./lib.mds\"\n{greet(\"World\")}\n\n\n\nBye.\n"
+    );
 
     // Compile-equivalence via the REAL gate: compile both with the same base_dir.
     let before = mds::compile_str_with(src, Some(dir.path()), None)
@@ -465,53 +468,40 @@ fn ec_mixed_crlf_lf_all_become_lf() {
 }
 
 #[test]
-fn ec_blank_line_collapse_inside_define_message_block_bodies_is_safe() {
-    // R3 collapsing is safe to apply inside a standalone @block body (still
-    // ordinary markdown-mode content, subject to the normal clean_output
-    // pass) but is DELIBERATELY NOT applied inside @message or @define
-    // bodies. Verified empirically against the live evaluator/compiler (not
-    // just inferred): `@message` content is built via
-    // `evaluate_nodes(...).trim()` with NO clean_output pass, so an
-    // uncollapsed blank-line run survives verbatim in the compiled message
-    // JSON (`@message user:\nHi\n\n\n\nthere\n@end\n` compiles to content
-    // `"Hi\n\n\n\nthere"`, all 4 raw newlines intact). `@define` bodies get
-    // the same conservative treatment because a function's body can be
-    // called from EITHER a markdown-mode site (clean_output applies) or a
-    // @message-mode site (it does not) -- the formatter can't tell which
-    // without a full call-graph analysis, so it never collapses inside one.
-    // In all three cases the direct compile-equivalence assertion below is
-    // the thing that actually matters; the "contains" checks document
-    // exactly what the formatter chose to do (and, for the define/message
-    // cases, that it correctly chose NOT to touch the blank-line run).
+fn ec_blank_lines_inside_define_message_block_bodies_preserved() {
+    // Interior-verbatim contract (#150/#151): blank-line runs are left verbatim
+    // in ALL body kinds — @message, @define, and @block alike. The formatter
+    // no longer applies R3 collapsing anywhere; compile equivalence via the
+    // safety gate is the load-bearing check in every case below.
 
-    // @define body: collapsing must NOT happen (conservative exemption).
+    // @define body: blank-line runs pass through verbatim.
     let define_src = "@define greet(x):\nHello\n\n\n\n{x}!\n@end\n{greet(\"World\")}\n";
     let define_out = format_str(define_src).expect("should format");
     assert!(
         define_out.contains("Hello\n\n\n\n{x}!"),
-        "blank-line run inside @define body must NOT collapse, got: {define_out:?}"
+        "blank-line run inside @define body must be preserved, got: {define_out:?}"
     );
     let define_before = mds::compile_str(define_src).unwrap();
     let define_after = mds::compile_str(&define_out).unwrap();
     assert_eq!(define_before.output, define_after.output);
 
-    // @message body: collapsing must NOT happen (verified unsafe above).
+    // @message body: blank-line runs pass through verbatim (not even R1).
     let message_src = "@message user:\nHi\n\n\n\nthere\n@end\n";
     let message_out = format_str(message_src).expect("should format");
     assert!(
         message_out.contains("Hi\n\n\n\nthere"),
-        "blank-line run inside @message body must NOT collapse, got: {message_out:?}"
+        "blank-line run inside @message body must be preserved, got: {message_out:?}"
     );
     let message_before = mds::compile_str(message_src).unwrap();
     let message_after = mds::compile_str(&message_out).unwrap();
     assert_eq!(message_before.output, message_after.output);
 
-    // @block body (standalone mode: renders its default body inline).
+    // @block body: interior-verbatim applies here too.
     let block_src = "@block instructions:\nStep one\n\n\n\nStep two\n@end\n";
     let block_out = format_str(block_src).expect("should format");
     assert!(
-        block_out.contains("Step one\n\nStep two"),
-        "blank-line run inside @block body should collapse, got: {block_out:?}"
+        block_out.contains("Step one\n\n\n\nStep two"),
+        "blank-line run inside @block body must be preserved, got: {block_out:?}"
     );
     let block_before = mds::compile_str(block_src).unwrap();
     let block_after = mds::compile_str(&block_out).unwrap();
@@ -624,10 +614,10 @@ fn perf_formats_large_file_without_panic_or_catastrophic_slowdown() {
         elapsed2.as_secs() < 30,
         "formatting via structural_equivalent fallback took implausibly long: {elapsed2:?}"
     );
-    // Blank-line runs must be collapsed even in the fallback path.
+    // Interior blank-line runs are now preserved (interior-verbatim, #150/#151).
     assert!(
-        !fallback_out.contains("\n\n\n"),
-        "blank-line runs (3+) must be collapsed even via the structural fallback"
+        fallback_out.contains("\n\n\n"),
+        "interior blank-line runs must be preserved verbatim by the structural fallback"
     );
 }
 

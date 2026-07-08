@@ -373,7 +373,7 @@ fn invoke_function(
         scope.set_var(&param.name, value);
     }
     ctx.call_stack.push(call_key.to_string());
-    let result = evaluate_nodes(&func.body, scope, ctx);
+    let result = evaluate_nodes(&func.body, scope, ctx).map(|s| s.trim().to_string());
     // Safety-critical LIFO invariant: call_stack tracks recursion detection.
     // A mismatched pop would silently corrupt recursion state and allow
     // stack overflows. Return a structured error rather than panicking so

@@ -2030,23 +2030,22 @@ fn parse_block_empty_body() {
 }
 
 #[test]
-fn parse_block_body_edge_newlines_stripped() {
-    // Leading/trailing single newline stripped like @message/@define (decision #9).
-    // Input: @block intro:\n<body-starts-here-after-newline>\nHello world.\n\n@end\n
-    // strip_leading_newline removes the first \n; strip_trailing_newline removes the last \n.
-    // Result: text = "\nHello world.\n" — inner blank line preserved, outermost \n stripped.
+fn parse_block_body_verbatim() {
+    // Interior-verbatim whitespace contract (#150/#151): @block body bytes pass
+    // through exactly as authored. The directive lines (@block … :, @end) are
+    // consumed but everything else is preserved — the trailing \n before @end
+    // is now part of the body.
     let src = "@block intro:\nHello world.\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Block(b) = &module.body[0] {
         assert!(!b.body.is_empty(), "block body should not be empty");
-        // strip_leading_newline strips the newline immediately after the colon.
-        // strip_trailing_newline strips the newline before @end.
-        // Resulting text should be exactly "Hello world." with no surrounding newlines.
+        // The body text is the literal bytes between the directive line's newline
+        // and the @end line: "Hello world.\n".
         if let Node::Text(t) = &b.body[0] {
             assert_eq!(
-                t.text, "Hello world.",
-                "block body text should have leading/trailing newlines stripped"
+                t.text, "Hello world.\n",
+                "block body text must be verbatim (trailing \\n before @end preserved)"
             );
         } else {
             panic!("expected Text node in block body");

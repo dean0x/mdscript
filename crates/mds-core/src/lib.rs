@@ -636,39 +636,32 @@ pub(crate) fn prepend_frontmatter(raw: Option<&str>, body: String) -> String {
     format!("---\n{cleaned}---\n{body}")
 }
 
-/// Clean up output whitespace: collapse 3+ consecutive newlines to 2 (one blank line),
-/// and trim leading/trailing blank lines.
+/// Normalise output whitespace using the "interior-verbatim with trailing-edge
+/// normalisation" contract (#150/#151):
 ///
-/// **Formatter dependency**: `mds fmt` (`formatter.rs`) treats this function as the
-/// ceiling of what it may safely change in markdown-mode content — any transform the
-/// formatter applies must produce output that survives this normalisation unchanged.
-/// Critically, `@message` and `@define` body content bypasses this function entirely
-/// (routed through `.trim()` only in `collect_single_message`, `evaluator.rs`), so
-/// the formatter protects those regions as raw content; see `raw_content_spans` in
-/// `formatter.rs` for the authoritative source of that distinction.
+/// - Strip every `\r` character (Windows line endings — `\r\n` becomes `\n`).
+/// - Trim all trailing whitespace from the very end of the string.
+/// - If the result is non-empty, ensure exactly one final `\n`.
+/// - Whitespace-only / empty input returns `""`.
+///
+/// Interior blank-line runs, leading blank lines, and mid-document whitespace-only
+/// lines all pass through **verbatim** — only the trailing edge is normalised.
+///
+/// **Formatter dependency**: `mds fmt` (`formatter.rs`) mirrors these exact semantics.
+/// `@message` and `@define` body content bypasses this function entirely (evaluated
+/// via `.trim()` only — see `collect_single_message` and `invoke_function` in
+/// `evaluator.rs`); the formatter marks those as raw-content regions. See
+/// `raw_content_spans` in `formatter.rs` for the authoritative region boundary.
 pub(crate) fn clean_output(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut newline_count = 0;
+    // Strip \r unconditionally (Windows line endings).
+    let no_cr: std::borrow::Cow<str> = if s.as_bytes().contains(&b'\r') {
+        std::borrow::Cow::Owned(s.chars().filter(|&c| c != '\r').collect())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    };
 
-    // Trim leading newlines (any line ending style)
-    let s = s.trim_start_matches(['\n', '\r']);
-
-    for ch in s.chars() {
-        if ch == '\n' {
-            newline_count += 1;
-            if newline_count <= 2 {
-                result.push(ch);
-            }
-        } else if ch == '\r' {
-            // Skip \r, handled with \n
-        } else {
-            newline_count = 0;
-            result.push(ch);
-        }
-    }
-
-    // Trim trailing whitespace but keep one final newline
-    let trimmed = result.trim_end();
+    // Trailing-edge normalisation: trim all trailing whitespace, then add one \n.
+    let trimmed = no_cr.trim_end();
     if trimmed.is_empty() {
         return String::new();
     }
@@ -1080,13 +1073,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clean_output_collapses_excess_newlines() {
-        assert_eq!(clean_output("a\n\n\n\nb"), "a\n\nb\n");
+    fn clean_output_preserves_interior_blank_runs() {
+        // Interior blank-line runs pass through verbatim — no collapsing (#150/#151).
+        assert_eq!(clean_output("a\n\n\n\nb"), "a\n\n\n\nb\n");
     }
 
     #[test]
-    fn clean_output_trims_leading_newlines() {
-        assert_eq!(clean_output("\n\n\nhello"), "hello\n");
+    fn clean_output_preserves_leading_newlines() {
+        // Leading blank lines are no longer stripped — interior-verbatim contract (#150/#151).
+        assert_eq!(clean_output("\n\n\nhello"), "\n\n\nhello\n");
     }
 
     #[test]

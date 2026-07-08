@@ -164,11 +164,11 @@ fn structural_fallback_formats_file_with_undefined_var() {
     );
 
     let after = fs::read_to_string(&target).unwrap();
-    // The blank-line run (4 newlines = 3 blank lines) must still be collapsed
-    // to a single blank line (2 newlines) even via the structural fallback.
+    // Interior-verbatim (#150/#151): blank-line runs pass through verbatim
+    // even via the structural fallback; only trailing edge is normalised (R2).
     assert_eq!(
-        after, "Hello {undefined_runtime_var}!\n\nBye.\n",
-        "blank-line collapse must happen even via the structural_equivalent fallback path"
+        after, "Hello {undefined_runtime_var}!\n\n\n\nBye.\n",
+        "interior blank-line runs must be preserved verbatim (interior-verbatim contract)"
     );
 }
 
@@ -316,8 +316,8 @@ fn dir_recurse_formats_every_mds_including_partials() {
         "directive trailing ws/\\r should be stripped even in a partial, got: {partial_after:?}"
     );
     assert!(
-        partial_after.contains("@end\n\n@export"),
-        "blank-line run between @end and @export should collapse, got: {partial_after:?}"
+        partial_after.contains("@end\n\n\n\n@export"),
+        "blank-line run between @end and @export must be preserved verbatim (interior-verbatim), got: {partial_after:?}"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);

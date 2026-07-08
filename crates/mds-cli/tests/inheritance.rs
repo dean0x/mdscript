@@ -63,6 +63,9 @@ fn f1_analyst_compile_byte_exact() {
     let (stdout, stderr, ok) = build_file(fixture("inh_analyst.mds").to_str().unwrap());
     assert!(ok, "F1: compile should succeed; stderr: {stderr}");
 
+    // Interior-verbatim (#150/#151): each @block body ends with its trailing \n
+    // (no longer stripped at the parser level). The skeleton text node `\n`
+    // between blocks produces an extra blank line after each block body.
     let expected = concat!(
         "---\n",
         "role: data analysis\n",
@@ -70,7 +73,9 @@ fn f1_analyst_compile_byte_exact() {
         "You are a data analysis assistant.\n",
         "\n",
         "Perform statistical analysis.\n",
+        "\n",
         "You have access to: Python, R\n",
+        "\n",
         "Respond in plain text.\n",
     );
     assert_eq!(
@@ -118,6 +123,11 @@ fn f11_whitespace_contract_base_blank_lines_preserved() {
     assert!(
         first_pos < second_pos,
         "F11: first block must appear before second block in output; got:\n{stdout}"
+    );
+    // Byte-exact: body verbatim (trailing \n) + skeleton \n between blocks = one blank line.
+    assert_eq!(
+        stdout, "First override.\n\nSecond override.\n",
+        "F11: byte-exact output check — verbatim body trailing \\n + skeleton blank = blank line"
     );
 }
 

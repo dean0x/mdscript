@@ -16,62 +16,52 @@
 //!
 //! 1. Tokenize the source (surfaces syntax errors; reuses the lexer's fence /
 //!    frontmatter state machine rather than re-implementing it).
-//! 2. Compute *protected* byte ranges (frontmatter + code fence regions, derived
-//!    from consecutive token offsets) and the set of *directive line* start
-//!    offsets.
+//! 2. Compute *raw-content* byte ranges (`@message`/`@define` bodies) and the
+//!    set of *directive line* start offsets.
 //! 3. Rewrite the source in a single left-to-right, line-oriented pass, applying
-//!    only rules that are provably output-preserving (R1-R4 below).
+//!    only rules that are provably output-preserving (R1, R2, R4 below).
 //! 4. Run a runtime safety gate (`assert_equivalent`) that re-compiles both the
 //!    original and formatted source and hard-errors (`MdsError::FormatterInvariant`)
 //!    on any divergence, rather than silently returning a wrong result.
 //!
-//! # Ruleset (v1)
+//! # Ruleset (v2 — interior-verbatim)
 //!
-//! - **R1 (CRLF/CR removal)** — applied to the WHOLE file, including protected
-//!   regions. This is the one transform allowed to cross a protected boundary:
-//!   `clean_output` strips every `\r` from the final compiled string regardless
-//!   of where it came from, frontmatter lexing already filters `\r` out of its
-//!   captured content, and directive matching trims `\r` before comparison — so
-//!   no downstream consumer of a `\r` byte can ever observe it. Removing it from
-//!   the source up front cannot change compiled output.
-//! - **R2 (exactly one final newline)** — empty or whitespace-only input becomes
-//!   `""`, matching `clean_output`'s own leading/trailing-trim behavior (verified
-//!   against the live compiler: `clean_output("   \n") == ""`).
-//! - **R3 (blank-line run capping)** — mirrors `clean_output`'s own newline-run
-//!   cap *exactly* (verified empirically, not just inferred from its doc
-//!   comment): a run of `N` consecutive raw `\n` characters keeps only
-//!   `min(N, 2)` of them, and leading blank lines at the very start of the body
-//!   (immediately after frontmatter, or at offset 0 if there is none) are
-//!   elided entirely rather than merely capped — never applied inside protected
-//!   regions.
+//! - **R1 (CRLF/CR removal)** — applied everywhere *except* `@message`/`@define`
+//!   bodies (`raw_content_spans`). `clean_output` strips every `\r` from the
+//!   final compiled string; frontmatter lexing and directive matching also strip
+//!   `\r` before comparison. Only raw-content bodies bypass `clean_output` and
+//!   therefore must be left byte-exact.
+//! - **R2 (exactly one final newline)** — the whole body is trimmed to its last
+//!   non-whitespace byte, then a single `\n` is appended, matching
+//!   `clean_output`'s own trailing-edge normalisation.
 //! - **R4 (directive trailing-whitespace strip)** — safe because the parser
 //!   calls `dir.trim()` before matching, so trailing whitespace on a directive
-//!   line is discarded pre-parse and never reaches output.
+//!   line is discarded pre-parse and never reaches output. Applied even inside
+//!   `@message`/`@define` bodies since directive text is never part of compiled
+//!   output in either mode.
 //!
-//! R1 and R3 additionally exclude a THIRD region beyond frontmatter/code
-//! fences: `@message` and `@define` bodies (see `raw_content_spans`). This
-//! was discovered empirically, not anticipated up front — `@message` content
-//! is built by `evaluate_nodes(...).trim()` with NO `clean_output` pass (see
-//! `collect_single_message` in `evaluator.rs`), so a `\r` or an uncollapsed
-//! blank-line run inside one reaches the compiled message JSON verbatim.
-//! `@define` bodies get the same conservative treatment because a function
-//! can be called from a markdown-mode site OR from within a `@message` body,
-//! and the formatter cannot tell which without a full call-graph analysis.
-//! Directive lines (R4) remain safe inside both, since directive text is
-//! never part of compiled output in either mode.
+//! R3 (blank-line run capping) was present in v1 but **removed** in v2 (#150,
+//! #151). `clean_output` now passes interior content through verbatim — it only
+//! normalises the trailing edge — so capping blank-line runs in the formatter
+//! would *change* compiled output and violate the load-bearing constraint.
+//! Code-fence regions no longer need a special protection class: they receive
+//! the same treatment as ordinary body content (R1 only), because without R3
+//! there is nothing to gate on those boundaries.
+//!
+//! `@message`/`@define` bodies (see `raw_content_spans`) are a THIRD region
+//! that is copied completely verbatim — not even R1's `\r` removal is applied.
+//! This was discovered empirically: `@message` content is built by
+//! `evaluate_nodes(...).trim()` with NO `clean_output` pass (see
+//! `collect_single_message` in `evaluator.rs`), so a `\r` inside one reaches
+//! the compiled message JSON verbatim. `@define` bodies get the same
+//! conservative treatment because a function can be called from a markdown-mode
+//! site OR from within a `@message` body.
 //!
 //! ## Deliberately NOT implemented: blank-line whitespace stripping
 //!
-//! An earlier reading of this ruleset called for stripping trailing whitespace
-//! from *any* all-whitespace "blank" line. Verified against the live compiler,
-//! that is unsound in the general case: `clean_output`'s per-character loop
-//! treats a bare space as ordinary content — it resets the newline-run counter
-//! and is pushed through verbatim — so a whitespace-only line in the MIDDLE of
-//! a document (not the absolute start or end) survives compilation byte for
-//! byte (`printf 'Hello\n   \nWorld\n' | mds build -` preserves the three
-//! spaces). Stripping it in the formatter would silently break compile
-//! equivalence, which this module treats as the non-negotiable constraint that
-//! overrides any individual rule's literal description. See
+//! Stripping trailing whitespace from all-whitespace "blank" lines would break
+//! compile equivalence: `clean_output` passes a whitespace-only line through
+//! verbatim (the space is not a `\n`, so it resets no run counter). See
 //! `r4_whitespace_only_line_in_middle_of_document_is_preserved_verbatim` in
 //! `tests/fmt.rs` for the regression test that locks this in.
 //!
@@ -103,10 +93,10 @@ use crate::lexer::{self, Token};
 /// # Examples
 ///
 /// ```rust
-/// // CRLF -> LF, and a run of 3 raw newlines caps to 2 (one blank line
-/// // survives), exactly matching the compiler's own `clean_output` pass.
+/// // CRLF -> LF; interior blank lines are left verbatim (interior-verbatim
+/// // contract, #150/#151 — R3 blank-run capping was removed in v2).
 /// let formatted = mds::format_str("Hello   \r\n\r\n\r\nworld\r\n")?;
-/// assert_eq!(formatted, "Hello   \n\nworld\n");
+/// assert_eq!(formatted, "Hello   \n\n\nworld\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "the formatted source should be used"]
@@ -126,12 +116,11 @@ pub fn format_str(source: &str) -> Result<String, MdsError> {
 #[must_use = "the formatted source should be used"]
 pub fn format_str_with(source: &str, base_dir: Option<&Path>) -> Result<String, MdsError> {
     let tokens = lexer::tokenize(source, "")?;
-    let protected = protected_spans(&tokens, source);
     let raw_content = raw_content_spans(&tokens, source);
     let directives = directive_line_offsets(&tokens);
     let body_start = body_start_offset(&tokens, source);
 
-    let formatted = rewrite(source, body_start, &protected, &raw_content, &directives);
+    let formatted = rewrite(source, body_start, &raw_content, &directives);
     assert_equivalent(source, &formatted, base_dir, &raw_content)?;
     Ok(formatted)
 }
@@ -153,35 +142,6 @@ fn token_offset(t: &Token) -> usize {
 }
 
 // ── Region model ─────────────────────────────────────────────────────────────
-
-/// Compute the protected byte ranges: the union of Frontmatter* and Code*
-/// region ranges.
-///
-/// Each token's region runs from its own start offset to the next token's
-/// start offset (or `src.len()` for the last token) — the lexer already ran
-/// the fence/frontmatter state machine, so this reuses its offsets rather than
-/// re-detecting fences.
-fn protected_spans(tokens: &[Token], src: &str) -> Vec<Range<usize>> {
-    let mut spans = Vec::new();
-    for (i, t) in tokens.iter().enumerate() {
-        let is_protected = matches!(
-            t,
-            Token::FrontmatterFence(_)
-                | Token::FrontmatterContent(_, _)
-                | Token::CodeFence(_, _)
-                | Token::CodeContent(_, _)
-        );
-        if !is_protected {
-            continue;
-        }
-        let start = token_offset(t);
-        let end = tokens.get(i + 1).map(token_offset).unwrap_or(src.len());
-        if end > start {
-            spans.push(start..end);
-        }
-    }
-    spans
-}
 
 /// Compute the start byte offset of every directive line.
 ///
@@ -205,8 +165,7 @@ fn directive_line_offsets(tokens: &[Token]) -> BTreeSet<usize> {
 /// consecutive tokens (`FrontmatterFence(0)`, `FrontmatterContent`,
 /// `FrontmatterFence`), so the body starts at the fourth token when present.
 /// Returns `0` when there is no leading frontmatter (a leading code fence, if
-/// any, is ordinary body content — it participates in the same leading/middle
-/// blank-line handling as everything else).
+/// any, is ordinary body content subject to R1 only).
 fn body_start_offset(tokens: &[Token], src: &str) -> usize {
     let has_frontmatter = matches!(tokens.first(), Some(Token::FrontmatterFence(0)));
     if !has_frontmatter {
@@ -216,26 +175,19 @@ fn body_start_offset(tokens: &[Token], src: &str) -> usize {
 }
 
 /// Compute byte ranges within which content must be copied byte-for-byte:
-/// neither R1's `\r` removal nor R3's blank-line-run capping may apply. These
-/// are the bodies of `@message` and `@define` blocks.
+/// not even R1's `\r` removal may apply. These are the bodies of `@message`
+/// and `@define` blocks.
 ///
-/// VERIFIED against the live evaluator (not inferred from the doc comment on
-/// `clean_output`): `@message` content is produced by
+/// VERIFIED against the live evaluator: `@message` content is produced by
 /// `evaluate_nodes(&block.body, ...)?.trim()` — see `collect_single_message`
-/// in `evaluator.rs` — with NO `clean_output` pass. Unlike markdown-mode
-/// output, this means a `\r` or an uncollapsed blank-line run inside a
-/// message body reaches the compiled JSON verbatim. Confirmed empirically:
-/// `@message user:\r\nHi\r\nthere\r\n@end\r\n` compiles to message content
-/// `"Hi\r\nthere"` (the `\r` survives), and `@message user:\nHi\n\n\n\nthere\n@end\n`
-/// compiles to `"Hi\n\n\n\nthere"` (all 4 raw newlines survive uncapped,
-/// unlike markdown mode's `"Hi\n\nthere"`).
+/// in `evaluator.rs` — with NO `clean_output` pass. A `\r` inside a message
+/// body reaches the compiled JSON verbatim: `@message user:\r\nHi\r\n@end\r\n`
+/// compiles to `"Hi\r\n"` (the `\r` survives).
 ///
 /// `@define` bodies get the same conservative treatment: a defined function
-/// can be called from a markdown-mode site (where the surrounding
-/// `clean_output` pass makes pre-collapsing harmless) or from within a
-/// `@message` body (where it does not) — the formatter can't tell which
-/// without a full call-graph analysis, so every `@define` body is treated as
-/// raw. `@if`/`@for`/`@block` don't themselves bypass `clean_output`; they
+/// can be called from a markdown-mode site or from within a `@message` body,
+/// and the formatter can't tell which without a full call-graph analysis.
+/// `@if`/`@for`/`@block` don't themselves bypass `clean_output`; they
 /// only inherit raw-content status by virtue of being lexically nested inside
 /// a `@message`/`@define` span, which the stack below naturally captures
 /// (the outer span's byte range already covers everything nested within it).
@@ -309,20 +261,18 @@ fn strip_cr(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-// ── Rewrite (R1-R4) ──────────────────────────────────────────────────────────
+// ── Rewrite (R1, R2, R4) ─────────────────────────────────────────────────────
 
 /// Rewrite `source` into its formatted form.
 ///
 /// Single left-to-right pass over the original source (no per-line substring
 /// re-scans of already-visited bytes, so this stays linear). Idempotent by
-/// construction: R3's cap can't create a new collapsible run, trimming an
-/// already-trimmed directive line is a no-op, and every rule acts on a
-/// disjoint line classification (raw-content / protected / directive / blank
-/// / content, checked in that priority order — see `rewrite_body`).
+/// construction: trimming an already-trimmed directive line is a no-op,
+/// and every rule acts on a disjoint line classification (directive /
+/// raw-content / ordinary, checked in that priority order — see `rewrite_body`).
 fn rewrite(
     source: &str,
     body_start: usize,
-    protected: &[Range<usize>],
     raw_content: &[Range<usize>],
     directives: &BTreeSet<usize>,
 ) -> String {
@@ -333,8 +283,8 @@ fn rewrite(
     let mut out = String::with_capacity(source.len() + 1);
 
     // The leading frontmatter span (if any) is copied verbatim, mod \r — it is
-    // invisible to `clean_output`'s leading/trailing-trim and newline-run
-    // capping, which only ever see the body.
+    // invisible to `clean_output`'s trailing-edge normalisation, which only ever
+    // sees the body.
     if body_start > 0 {
         debug_assert!(
             source.is_char_boundary(body_start),
@@ -343,7 +293,7 @@ fn rewrite(
         push_stripped_cr(&mut out, &source[..body_start]);
     }
 
-    let body = rewrite_body(source, body_start, protected, raw_content, directives);
+    let body = rewrite_body(source, body_start, raw_content, directives);
     let trimmed = body.trim_end();
 
     if trimmed.is_empty() {
@@ -368,31 +318,21 @@ fn rewrite(
 /// Rewrite the body portion of `source` (from `body_start` to the end).
 ///
 /// Each line is classified in priority order:
-/// 1. **Directive** — R4 (trailing-whitespace strip) applies unconditionally;
-///    directive text is never part of any compiled output, in markdown OR
-///    messages mode, so trimming it is always safe.
+/// 1. **Directive** — R4 (trailing-whitespace strip) + R1 (\r strip); directive
+///    text is never part of any compiled output in any mode, so trimming it is
+///    always safe, even inside a raw-content span.
 /// 2. **Raw content** (`@message`/`@define` bodies) — copied byte-for-byte,
 ///    including any nested code-fence content: this content bypasses
-///    `clean_output` entirely (see `raw_content_spans`), so neither R1 nor R3
-///    may touch it.
-/// 3. **Protected** (frontmatter never reaches here; code-fence lines do) —
-///    R1 (\r strip) applies, R3 does not.
-/// 4. **Ordinary content** — R1 and R3 (leading-blank elision + blank-run
-///    capping) both apply.
+///    `clean_output` entirely (see `raw_content_spans`), so not even R1's \r
+///    removal may touch it.
+/// 3. **Everything else** (ordinary body, code-fence lines) — R1 (\r strip)
+///    only; interior content is left verbatim (interior-verbatim contract, #150).
 fn rewrite_body(
     source: &str,
     body_start: usize,
-    protected: &[Range<usize>],
     raw_content: &[Range<usize>],
     directives: &BTreeSet<usize>,
 ) -> String {
-    // Invariant: spans must be sorted and non-overlapping so the advancing
-    // cursors (pi / ri) never overshoot. A future lexer regression would cause
-    // silent mis-classification rather than a crash without these guards.
-    debug_assert!(
-        protected.windows(2).all(|w| w[0].end <= w[1].start),
-        "protected spans must be sorted and non-overlapping"
-    );
     debug_assert!(
         raw_content.windows(2).all(|w| w[0].end <= w[1].start),
         "raw_content spans must be sorted and non-overlapping"
@@ -402,19 +342,9 @@ fn rewrite_body(
     let mut out = String::with_capacity(end.saturating_sub(body_start));
 
     let mut pos = body_start;
-    let mut leading_mode = true;
-    // Mirrors clean_output's own `newline_count`: sits at 1 immediately after
-    // any non-blank line (that line's own terminator counts as the first `\n`
-    // of a potential run), then increments per subsequent blank line.
-    let mut newline_run: usize = 0;
-    let mut pi: usize = 0;
     let mut ri: usize = 0;
 
-    // Skip past any protected/raw spans that end at or before body_start (the
-    // frontmatter's own spans, when present).
-    while pi < protected.len() && protected[pi].end <= body_start {
-        pi += 1;
-    }
+    // Skip past any raw spans that end at or before body_start.
     while ri < raw_content.len() && raw_content[ri].end <= body_start {
         ri += 1;
     }
@@ -429,13 +359,6 @@ fn rewrite_body(
         let had_newline = line_end < end;
         let next_pos = if had_newline { line_end + 1 } else { line_end };
 
-        while pi < protected.len() && protected[pi].end <= line_start {
-            pi += 1;
-        }
-        let is_protected = pi < protected.len()
-            && protected[pi].start <= line_start
-            && line_start < protected[pi].end;
-
         while ri < raw_content.len() && raw_content[ri].end <= line_start {
             ri += 1;
         }
@@ -446,57 +369,23 @@ fn rewrite_body(
         let raw_line = &source[line_start..line_end];
 
         if directives.contains(&line_start) {
-            // Priority 1: directive lines are never part of any compiled
-            // output (markdown or messages mode), so R4's trailing-whitespace
-            // strip is always safe, even inside a raw-content span.
+            // Priority 1: directive lines — R4 + R1.
             let no_cr = strip_cr(raw_line);
             out.push_str(no_cr.trim_end());
             if had_newline {
                 out.push('\n');
             }
-            leading_mode = false;
-            newline_run = 1;
         } else if is_raw_content {
-            // Priority 2: @message/@define body content bypasses
-            // clean_output entirely (see raw_content_spans) -- copy exactly,
-            // not even R1's \r removal.
+            // Priority 2: @message/@define bodies — verbatim copy, not even R1.
             out.push_str(raw_line);
             if had_newline {
                 out.push('\n');
             }
-            leading_mode = false;
-            newline_run = 1;
-        } else if is_protected {
-            // Priority 3: frontmatter (never reaches here) / code-fence
-            // content -- R1 applies, R3 does not.
+        } else {
+            // Priority 3: ordinary body and code-fence lines — R1 only.
             push_stripped_cr(&mut out, raw_line);
             if had_newline {
                 out.push('\n');
-            }
-            leading_mode = false;
-            newline_run = 1;
-        } else {
-            let no_cr = strip_cr(raw_line);
-            if no_cr.is_empty() {
-                // Truly blank line (zero-width -- nothing between the newlines,
-                // not merely whitespace; see module docs for why a
-                // whitespace-only line is NOT treated as blank here).
-                if leading_mode {
-                    // Elide entirely: no content, no newline.
-                } else {
-                    newline_run += 1;
-                    if newline_run <= 2 && had_newline {
-                        out.push('\n');
-                    }
-                    // newline_run > 2: drop this blank line's newline (R3 cap).
-                }
-            } else {
-                out.push_str(&no_cr);
-                if had_newline {
-                    out.push('\n');
-                }
-                leading_mode = false;
-                newline_run = 1;
             }
         }
 
@@ -646,33 +535,6 @@ fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn protected_spans_covers_frontmatter_and_code_fence() {
-        let src = "---\nname: x\n---\n```\ncode\n```\nAfter\n";
-        let tokens = lexer::tokenize(src, "").unwrap();
-        let spans = protected_spans(&tokens, src);
-        // Every byte of the frontmatter block and the code fence block should
-        // be covered by some protected span; "After\n" should not be.
-        let covers = |offset: usize| spans.iter().any(|r| r.contains(&offset));
-        assert!(covers(0), "frontmatter fence start should be protected");
-        assert!(
-            covers(src.find("name").unwrap()),
-            "frontmatter content should be protected"
-        );
-        assert!(
-            covers(src.find("```").unwrap()),
-            "code fence should be protected"
-        );
-        assert!(
-            covers(src.find("code").unwrap()),
-            "code content should be protected"
-        );
-        assert!(
-            !covers(src.find("After").unwrap()),
-            "body text after the fence should not be protected"
-        );
-    }
 
     #[test]
     fn directive_line_offsets_finds_at_directives_only() {
@@ -847,16 +709,23 @@ mod tests {
 
     #[test]
     fn structural_equivalent_outside_raw_span_uses_clean_output() {
-        // Outside @message/@define bodies, clean_output normalisation is applied:
-        // three raw newlines vs two are structurally equivalent (R3 cap).
+        // Outside @message/@define bodies text tokens are compared via
+        // clean_output (interior-verbatim since v2): identical sources are
+        // equivalent, but differing blank-line counts are NOT (clean_output
+        // no longer caps runs, so a 3-newline run != a 2-newline run).
         let src = "Hello\n\n\nworld\n";
-        let capped = "Hello\n\nworld\n";
+        let same = "Hello\n\n\nworld\n";
+        let different = "Hello\n\nworld\n";
         let raw: Vec<Range<usize>> = vec![];
 
         assert!(
-            structural_equivalent(src, capped, &raw),
-            "text outside raw spans is compared via clean_output; \
-             a 3-newline run and a 2-newline run should be equivalent"
+            structural_equivalent(src, same, &raw),
+            "identical source must be structural_equivalent"
+        );
+        assert!(
+            !structural_equivalent(src, different, &raw),
+            "different blank-line counts must NOT be structural_equivalent \
+             (clean_output is interior-verbatim; a 3-newline run != 2-newline run)"
         );
     }
 }

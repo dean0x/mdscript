@@ -1005,3 +1005,57 @@ fn fm_import_collision_merge_within_fm() {
         "expected collision error for 'common', got: {msg}"
     );
 }
+
+// ── Issue repros: #150 / #151 (interior-verbatim whitespace contract) ─────────
+//
+// These tests lock in the compile-output end-to-end, verifying that the
+// interior-verbatim contract (blank-line runs preserved, leading/trailing
+// newlines no longer stripped from block/define bodies) is observable at the
+// compiled markdown level and not just in parser AST tests.
+
+#[test]
+fn issue_150_interior_blank_line_runs_preserved_in_compiled_output() {
+    // Issue #150: multiple consecutive blank lines inside a body were being
+    // collapsed to one by clean_output's old newline-run cap. With the
+    // interior-verbatim contract, they must survive to compiled output.
+    let src = "Intro.\n\n\n\nBody.\n";
+    let out = mds::compile_str(src)
+        .expect("#150 repro: should compile")
+        .into_markdown()
+        .expect("#150 repro: expected markdown output");
+    assert_eq!(
+        out, "Intro.\n\n\n\nBody.\n",
+        "#150: interior blank-line run must be preserved verbatim"
+    );
+}
+
+#[test]
+fn issue_151_block_body_edge_newline_preserved_at_compile_boundary() {
+    // Issue #151: @block bodies had their leading/trailing newlines stripped
+    // at parse time (strip_leading_newline / strip_trailing_newline). With
+    // the interior-verbatim contract, the trailing \n before @end is part of
+    // the body and must appear in compiled output, producing a blank line
+    // between the block body and the following skeleton text.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        // "Para A\n" + skeleton "\n" + "Para B\n" was "Para A\nPara B\n" (old).
+        // Now "Para A\n" (body verbatim) + "\n" (skeleton) = "Para A\n\nPara B\n".
+        "@block section:\nPara A.\n@end\n\nPara B.\n".to_string(),
+    );
+    modules.insert("child.mds".to_string(), "@extends \"./base.mds\"\n".to_string());
+    let out = mds::compile_virtual(
+        modules
+            .into_iter()
+            .collect::<HashMap<_, _>>(),
+        "child.mds",
+        None,
+    )
+    .expect("#151 repro: should compile")
+    .into_markdown()
+    .expect("#151 repro: expected markdown output");
+    assert_eq!(
+        out, "Para A.\n\nPara B.\n",
+        "#151: trailing \\n of block body + skeleton \\n must produce a blank line"
+    );
+}

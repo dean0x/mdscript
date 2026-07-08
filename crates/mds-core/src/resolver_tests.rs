@@ -2271,74 +2271,67 @@ fn pf004_messages_mode_extends_validates_final_body_parity() {
 #[test]
 fn f11_whitespace_contract_4_combination_matrix() {
     // Base skeleton: text before, one @block, text after.
-    // Between the Text("Intro.\n\n") node and the @block body there is NO
-    // extra whitespace beyond what the skeleton text nodes carry.
+    // Interior-verbatim contract (#150/#151): block body bytes pass through
+    // exactly as authored; only the directive lines (@block … :, @end) are
+    // consumed. The trailing \n before @end is now part of the body.
     //
     // Base source (repr): "Intro.\n\n@block body:\nDefault body.\n@end\n\nAfter.\n"
     //
     // Skeleton nodes after parse:
     //   Text("Intro.\n\n")
-    //   Block("body")  body = [Text("Default body.")]   ← edge \n stripped
-    //   Text("\nAfter.\n")                              ← the blank line + After.
+    //   Block("body")  body = [Text("Default body.\n")]  ← verbatim, no edge strip
+    //   Text("\nAfter.\n")                               ← the blank line + After.
     let base = "Intro.\n\n@block body:\nDefault body.\n@end\n\nAfter.\n";
 
     // ── Combination 1: base default, no child override ────────────────────
     // Child has no @block override — effective_blocks use the base default.
-    // Between-block blank line (\n before "After.") preserved verbatim.
+    // Body text "Default body.\n" + skeleton "\nAfter.\n" → blank line preserved.
     {
         let child = "@extends \"./base.mds\"\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-1: should compile");
         assert_eq!(
-            out, "Intro.\n\nDefault body.\nAfter.\n",
-            "F11 combo-1: base default — between-block blank line preserved, body edge stripped"
+            out, "Intro.\n\nDefault body.\n\nAfter.\n",
+            "F11 combo-1: base default — body verbatim, trailing \\n + skeleton \\n = blank line"
         );
     }
 
     // ── Combination 2: override with no surrounding blank lines ───────────
-    // Block body = "Override." (no leading/trailing blank lines).
-    // After edge-strip: body = [Text("Override.")].
+    // Block body bytes (verbatim): "Override.\n"
+    // Body text "Override.\n" + skeleton "\nAfter.\n" → blank line.
     {
         let child = "@extends \"./base.mds\"\n@block body:\nOverride.\n@end\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-2: should compile");
         assert_eq!(
-            out, "Intro.\n\nOverride.\nAfter.\n",
-            "F11 combo-2: override without blank lines — clean output"
+            out, "Intro.\n\nOverride.\n\nAfter.\n",
+            "F11 combo-2: override without blank lines — trailing \\n + skeleton \\n = blank line"
         );
     }
 
     // ── Combination 3: override WITH leading+trailing blank lines ─────────
-    // Block body raw = "\nOverride.\n\n" (blank line before + blank line after).
-    // strip_leading_newline removes ONE leading \n  → "Override.\n\n"
-    // strip_trailing_newline removes ONE trailing \n → "Override.\n"
-    // Residual \n becomes part of the rendered block body, producing an extra
-    // blank line BEFORE the "After." skeleton text node ("\nAfter.\n").
-    // This pins decision #9: only one edge \n is stripped — extra interior
-    // blank lines are preserved.
+    // Block body bytes (verbatim): "\nOverride.\n\n"
+    // Full verbatim run: "Intro.\n\n" + "\nOverride.\n\n" + "\nAfter.\n"
     {
         let child = "@extends \"./base.mds\"\n@block body:\n\nOverride.\n\n@end\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-3: should compile");
         assert_eq!(
-                out,
-                "Intro.\n\nOverride.\n\nAfter.\n",
-                "F11 combo-3: override with surrounding blanks — extra blank line inside body preserved (only edge \n stripped)"
-            );
+            out, "Intro.\n\n\nOverride.\n\n\nAfter.\n",
+            "F11 combo-3: override with surrounding blanks — full verbatim run preserved"
+        );
     }
 
     // ── Combination 4: override with indented content ─────────────────────
-    // Block body raw = "  Indented.\n".
-    // strip_leading_newline: no leading \n, no change.
-    // strip_trailing_newline: pop \n → "  Indented."
-    // Leading spaces are preserved verbatim (base author's indentation style).
+    // Block body bytes (verbatim): "  Indented.\n"
+    // Body "  Indented.\n" + skeleton "\nAfter.\n" → blank line between.
     {
         let child = "@extends \"./base.mds\"\n@block body:\n  Indented.\n@end\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-4: should compile");
         assert_eq!(
-            out, "Intro.\n\n  Indented.\nAfter.\n",
-            "F11 combo-4: indented override — leading spaces preserved verbatim"
+            out, "Intro.\n\n  Indented.\n\nAfter.\n",
+            "F11 combo-4: indented override — verbatim, trailing \\n + skeleton \\n = blank line"
         );
     }
 }
