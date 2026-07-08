@@ -204,13 +204,13 @@ pub enum MdsError {
 
     /// Cross-type comparison (`string == number`, `boolean != null`, etc.).
     ///
-    /// MDS refuses to silently coerce types in `==` / `!=` conditions. Use
-    /// the built-in `str()` or `num()` conversion functions to make the types
-    /// agree before comparing.
+    /// MDS refuses to silently coerce types in `==` / `!=` conditions.
+    /// Pass string values with `--set-string KEY=VALUE` to keep them as
+    /// strings, or use `@if x:` to test for truthiness without a comparison.
     #[error("type mismatch: cannot compare {lhs_type} with {rhs_type}")]
     #[diagnostic(
         code(mds::type_mismatch),
-        help("convert both operands to the same type before comparing, e.g. str({lhs_type}) or num({rhs_type})")
+        help("left side is {lhs_type}, right side is {rhs_type}; use `@if x:` for truthiness or `--set-string KEY=VALUE` to pass a string")
     )]
     TypeMismatch {
         lhs_type: String,

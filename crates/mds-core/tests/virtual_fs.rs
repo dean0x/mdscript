@@ -1192,6 +1192,22 @@ fn issue_152_cross_type_eq_is_type_mismatch_error() {
 }
 
 #[test]
+fn issue_152_type_mismatch_help_mentions_set_string() {
+    // The TypeMismatch help text must reference --set-string so users know how
+    // to pass a string value without type coercion.  This pins the contract
+    // specified for the error's help field — QA black-box tested exactly this.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src).expect_err("#152: cross-type == must error");
+    let help = miette::Diagnostic::help(&err)
+        .map(|h| h.to_string())
+        .unwrap_or_default();
+    assert!(
+        help.contains("--set-string"),
+        "#152: TypeMismatch help must mention --set-string; got: {help:?}"
+    );
+}
+
+#[test]
 fn issue_152_cross_type_neq_is_type_mismatch_error() {
     // `@if x != "3":` with x=3 (number) — was silently returning true. Now an error.
     let src = "---\nx: 3\n---\n@if x != \"3\":\ndiff\n@else:\nsame\n@end\n";
