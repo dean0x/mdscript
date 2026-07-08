@@ -1060,3 +1060,63 @@ fn issue_151_block_body_edge_newline_preserved_at_compile_boundary() {
         "#151: trailing \\n of block body + skeleton \\n must produce a blank line"
     );
 }
+
+// ── Issue repros: #152 (cross-type comparison errors, --set-string) ───────────
+//
+// Previously, comparing values of different types (e.g. number vs string) in
+// an @if condition silently returned false (for ==) or true (for !=), leading
+// to confusing logic bugs. The fix makes cross-type comparisons a runtime
+// TypeMismatch error, forcing explicit type conversion before comparison.
+
+#[test]
+fn issue_152_cross_type_eq_is_type_mismatch_error() {
+    // `@if x == "3":` with x=3 (number from frontmatter) — number vs string is a
+    // TypeMismatch error, not a silent false.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@else:\nno\n@end\n";
+    let err = mds::compile_str(src).expect_err("#152 repro: cross-type == must be a runtime error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "#152: expected TypeMismatch error for number == string, got: {msg}"
+    );
+}
+
+#[test]
+fn issue_152_cross_type_neq_is_type_mismatch_error() {
+    // `@if x != "3":` with x=3 (number) — was silently returning true. Now an error.
+    let src = "---\nx: 3\n---\n@if x != \"3\":\ndiff\n@else:\nsame\n@end\n";
+    let err = mds::compile_str(src).expect_err("#152 repro: cross-type != must be a runtime error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "#152: expected TypeMismatch error for number != string, got: {msg}"
+    );
+}
+
+#[test]
+fn issue_152_same_type_eq_still_works() {
+    // Same-type comparisons must continue to work correctly after the change.
+    let src = "---\nname: Alice\n---\n@if name == \"Alice\":\nhello Alice\n@end\n";
+    let out = mds::compile_str(src)
+        .expect("#152: same-type string == should succeed")
+        .into_markdown()
+        .expect("#152: expected markdown");
+    assert!(out.contains("hello Alice"), "#152: same-type eq must work");
+}
+
+#[test]
+fn issue_152_set_string_forces_string_type() {
+    // When a variable is set via the --set-string equivalent (Value::String), comparing
+    // it with a string literal must succeed (same-type comparison).
+    let src = "---\n---\n@if count == \"3\":\nstring match\n@else:\nno match\n@end\n";
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("count".to_string(), mds::Value::String("3".to_string()));
+    let out = mds::compile_str_with(src, None, Some(vars))
+        .expect("#152: string count == \"3\" should succeed")
+        .into_markdown()
+        .expect("#152: expected markdown");
+    assert!(
+        out.contains("string match"),
+        "#152: --set-string should make count a string so count == \"3\" is true"
+    );
+}

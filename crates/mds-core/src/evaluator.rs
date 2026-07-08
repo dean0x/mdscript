@@ -446,17 +446,23 @@ fn call_qualified_function(
     invoke_function(&func, &qualified_name, args, scope, ctx).map(Value::String)
 }
 
-/// Compare two runtime `Value` instances using strict equality.
+/// Compare two runtime `Value` instances for strict same-type equality.
 ///
-/// Type matching is strict — `Number(3) != String("3")`. Different types always
-/// return `false`. `NaN == NaN` is `false` (IEEE 754 via Rust's `f64 ==`).
-fn values_equal_runtime(lhs: &Value, rhs: &Value) -> bool {
+/// Returns `Some(true)` / `Some(false)` for same-type comparisons, and `None`
+/// for cross-type comparisons (caller must surface a `TypeMismatch` error).
+/// `NaN == NaN` is `Some(false)` (IEEE 754 via Rust's `f64 ==`).
+///
+/// Arrays and objects are intentionally excluded — structural equality is
+/// checked element-by-element only for scalar types. Attempting to compare
+/// an array or object surfaces a TypeMismatch to encourage explicit iteration.
+fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
     match (lhs, rhs) {
-        (Value::String(a), Value::String(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => a == b,
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Null, Value::Null) => true,
-        _ => false,
+        (Value::String(a), Value::String(b)) => Some(a == b),
+        (Value::Number(a), Value::Number(b)) => Some(a == b),
+        (Value::Boolean(a), Value::Boolean(b)) => Some(a == b),
+        (Value::Null, Value::Null) => Some(true),
+        // Cross-type: signal TypeMismatch to the caller.
+        _ => None,
     }
 }
 
@@ -479,12 +485,15 @@ fn evaluate_condition(
         Condition::Eq(lhs, rhs) => {
             let lhs_val = evaluate_expr(lhs, scope, ctx)?;
             let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            Ok(values_equal_runtime(&lhs_val, &rhs_val))
+            values_equal_same_type(&lhs_val, &rhs_val)
+                .ok_or_else(|| MdsError::type_mismatch(lhs_val.type_name(), rhs_val.type_name()))
         }
         Condition::NotEq(lhs, rhs) => {
             let lhs_val = evaluate_expr(lhs, scope, ctx)?;
             let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            Ok(!values_equal_runtime(&lhs_val, &rhs_val))
+            values_equal_same_type(&lhs_val, &rhs_val)
+                .map(|eq| !eq)
+                .ok_or_else(|| MdsError::type_mismatch(lhs_val.type_name(), rhs_val.type_name()))
         }
         // Short-circuit And: return false on first false operand.
         // Parser invariant: And operands are always leaf conditions (parse_and_level calls
@@ -1201,16 +1210,31 @@ mod tests {
 
     #[test]
     fn values_equal_nan_is_not_equal_to_itself() {
-        // IEEE 754 defines NaN != NaN. values_equal_runtime must follow this — even
+        // IEEE 754 defines NaN != NaN. values_equal_same_type must follow this — even
         // though the parser rejects NaN literals in condition expressions, the runtime
         // Value type holds f64 and could theoretically carry a NaN produced by arithmetic.
-        // Verify that values_equal_runtime returns false for NaN == NaN.
+        // Verify that values_equal_same_type returns Some(false) for NaN == NaN.
         let nan_value = Value::Number(f64::NAN);
         let nan_value2 = Value::Number(f64::NAN);
-        assert!(
-            !values_equal_runtime(&nan_value, &nan_value2),
+        assert_eq!(
+            values_equal_same_type(&nan_value, &nan_value2),
+            Some(false),
             "NaN must not equal NaN (IEEE 754)"
         );
+    }
+
+    #[test]
+    fn values_equal_same_type_returns_none_for_cross_type() {
+        // Cross-type comparisons must return None, not a bool.
+        let s = Value::String("3".to_string());
+        let n = Value::Number(3.0);
+        let b = Value::Boolean(true);
+        let null = Value::Null;
+
+        assert_eq!(values_equal_same_type(&s, &n), None, "string vs number");
+        assert_eq!(values_equal_same_type(&n, &b), None, "number vs boolean");
+        assert_eq!(values_equal_same_type(&b, &null), None, "boolean vs null");
+        assert_eq!(values_equal_same_type(&s, &null), None, "string vs null");
     }
 
     // ── Resource limit: MAX_OUTPUT_SIZE ──────────────────────────────────────

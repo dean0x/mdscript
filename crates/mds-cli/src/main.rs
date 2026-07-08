@@ -9,7 +9,10 @@ mod fmt;
 mod output;
 mod watch;
 
-use build::{build_runtime_vars, exit_code, parse_key_value, resolve_input, run_build, BuildArgs};
+use build::{
+    build_runtime_vars, exit_code, parse_key_value, resolve_input, run_build, BuildArgs,
+    RuntimeVarArgs,
+};
 
 // ── CLI entry point ───────────────────────────────────────────────────────────
 
@@ -58,6 +61,9 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
+        /// Set a runtime variable as a string (no type coercion; e.g. --set-string count=3 sets count to the string "3")
+        #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
+        set_string_vars: Vec<(String, String)>,
     },
     /// Validate an MDS file without rendering
     #[command(
@@ -72,6 +78,9 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
+        /// Set a runtime variable as a string (no type coercion; e.g. --set-string count=3 sets count to the string "3")
+        #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
+        set_string_vars: Vec<(String, String)>,
     },
     /// Reformat MDS file(s) in place (opinionated, safety-gated)
     ///
@@ -142,6 +151,9 @@ enum Commands {
         /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
+        /// Set a runtime variable as a string (no type coercion; e.g. --set-string count=3 sets count to the string "3")
+        #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
+        set_string_vars: Vec<(String, String)>,
         /// Clear the terminal before each rebuild (only when stderr is a TTY)
         #[arg(long)]
         clear: bool,
@@ -172,10 +184,15 @@ fn run_check(
     input: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
+    set_string_vars: Vec<(String, String)>,
     quiet: bool,
 ) -> Result<()> {
     use build::read_stdin;
-    let runtime_vars = build_runtime_vars(vars, set_vars)?;
+    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+        vars,
+        set_vars,
+        set_string_vars,
+    })?;
 
     // Resolve the input: explicit path/stdin, or auto-detect from cwd.
     // run_check does not print a banner on auto-detect — check is a silent validation.
@@ -327,19 +344,22 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
+            set_string_vars,
         } => run_build(BuildArgs {
             input,
             output,
             out_dir,
             vars,
             set_vars,
+            set_string_vars,
             quiet,
         }),
         Commands::Check {
             input,
             vars,
             set_vars,
-        } => run_check(input, vars, set_vars, quiet),
+            set_string_vars,
+        } => run_check(input, vars, set_vars, set_string_vars, quiet),
         Commands::Fmt { input, check, diff } => fmt::run_fmt(fmt::FmtArgs {
             input,
             check,
@@ -353,6 +373,7 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
+            set_string_vars,
             clear,
             debounce,
             poll_interval,
@@ -362,6 +383,7 @@ fn run(cli: Cli) -> Result<()> {
             out_dir,
             vars,
             set_vars,
+            set_string_vars,
             clear,
             debounce,
             quiet,

@@ -383,6 +383,19 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
 
 // ── Runtime vars helpers ──────────────────────────────────────────────────────
 
+/// Bundled runtime-variable arguments from the CLI.
+///
+/// Groups `--vars`, `--set`, and `--set-string` together so they can be passed
+/// as a single unit through CLI dispatch functions.
+pub(crate) struct RuntimeVarArgs {
+    /// Optional JSON vars file (`--vars`).
+    pub(crate) vars: Option<PathBuf>,
+    /// Auto-coerced `--set KEY=VALUE` overrides (bool/number/null/array/string).
+    pub(crate) set_vars: Vec<(String, String)>,
+    /// String-forced `--set-string KEY=VALUE` overrides (always string, no coercion).
+    pub(crate) set_string_vars: Vec<(String, String)>,
+}
+
 /// Load vars from an optional file path, returning None if no file was given.
 pub(crate) fn load_optional_vars_file(
     path: Option<PathBuf>,
@@ -391,16 +404,29 @@ pub(crate) fn load_optional_vars_file(
         .transpose()
 }
 
-/// Merge a `--vars` file with any `--set key=value` overrides into a single map.
+/// Merge a `--vars` file with `--set` and `--set-string` overrides into a single map.
+///
+/// Processing order: file vars < `--set` overrides < `--set-string` overrides.
+/// Both `--set` and `--set-string` can override the same key; last writer wins
+/// (clap preserves CLI order within each flag group).
 pub(crate) fn build_runtime_vars(
-    vars: Option<PathBuf>,
-    set_vars: Vec<(String, String)>,
+    args: RuntimeVarArgs,
 ) -> Result<Option<HashMap<String, mds::Value>>> {
+    let RuntimeVarArgs {
+        vars,
+        set_vars,
+        set_string_vars,
+    } = args;
     let mut runtime_vars = load_optional_vars_file(vars)?;
     for (key, val) in set_vars {
         runtime_vars
             .get_or_insert_with(HashMap::new)
             .insert(key, parse_cli_value(val));
+    }
+    for (key, val) in set_string_vars {
+        runtime_vars
+            .get_or_insert_with(HashMap::new)
+            .insert(key, mds::Value::String(val));
     }
     Ok(runtime_vars)
 }
@@ -636,6 +662,7 @@ pub(crate) struct BuildArgs {
     pub(crate) out_dir: Option<PathBuf>,
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
+    pub(crate) set_string_vars: Vec<(String, String)>,
     pub(crate) quiet: bool,
 }
 
@@ -656,9 +683,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         out_dir,
         vars,
         set_vars,
+        set_string_vars,
         quiet,
     } = args;
-    let runtime_vars = build_runtime_vars(vars, set_vars)?;
+    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+        vars,
+        set_vars,
+        set_string_vars,
+    })?;
 
     // Resolve the input: explicit path, or auto-detect from cwd.
     // When auto-detected, print a "Building {path}" banner so users know which file was selected.

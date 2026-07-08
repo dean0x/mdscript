@@ -36,7 +36,7 @@ use mds::MdsError;
 
 use crate::build::{
     auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
-    resolve_output_path_for_kind, write_output, OutputKind,
+    resolve_output_path_for_kind, write_output, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
@@ -51,6 +51,7 @@ pub(crate) struct WatchArgs {
     pub(crate) out_dir: Option<PathBuf>,
     pub(crate) vars: Option<PathBuf>,
     pub(crate) set_vars: Vec<(String, String)>,
+    pub(crate) set_string_vars: Vec<(String, String)>,
     pub(crate) clear: bool,
     pub(crate) debounce: u64,
     pub(crate) quiet: bool,
@@ -506,6 +507,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
         out_dir,
         vars,
         set_vars,
+        set_string_vars,
         clear,
         debounce,
         quiet,
@@ -552,6 +554,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
             out_dir,
             vars,
             set_vars,
+            set_string_vars,
             clear,
             debounce,
             quiet,
@@ -564,6 +567,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
             out_dir,
             vars,
             set_vars,
+            set_string_vars,
             clear,
             debounce,
             quiet,
@@ -590,6 +594,7 @@ struct FileCompileCtx {
     entry: PathBuf,
     vars_path: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
+    static_set_string_vars: Vec<(String, String)>,
     /// The `-o <path>` or `--out-dir` argument passed by the user, if any.
     /// Kept here so `rebuild_file` can reuse the same path-derivation logic for
     /// the dynamic path case (where output_path itself stays None until after compile).
@@ -774,8 +779,11 @@ fn rebuild_file(
 ) {
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
     // Print the error, settle mtime to avoid re-fire, and keep watching.
-    let runtime_vars = match build_runtime_vars(ctx.vars_path.clone(), ctx.static_set_vars.clone())
-    {
+    let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path.clone(),
+        set_vars: ctx.static_set_vars.clone(),
+        set_string_vars: ctx.static_set_string_vars.clone(),
+    }) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e:?}");
@@ -875,6 +883,7 @@ fn run_watch_file(
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
+    set_string_vars: Vec<(String, String)>,
     clear: bool,
     debounce_ms: u64,
     quiet: bool,
@@ -886,12 +895,17 @@ fn run_watch_file(
 
     // Build runtime vars from the set_vars statics (vars file is reloaded each rebuild).
     let static_set_vars = set_vars;
+    let static_set_string_vars = set_string_vars;
 
     // Initial compile: compile first, derive output path from kind (compile-then-route).
     // For explicit -o / --out-dir the path is determined by the flag.
     // For the default case (no explicit flag), the path depends on the output kind, which
     // is only known after compilation — so we compile first, then derive.
-    let runtime_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+        vars: vars_path.clone(),
+        set_vars: static_set_vars.clone(),
+        set_string_vars: static_set_string_vars.clone(),
+    })?;
     if !quiet {
         eprintln!("Watching {}", entry.display());
     }
@@ -1009,6 +1023,7 @@ fn run_watch_file(
         entry,
         vars_path,
         static_set_vars,
+        static_set_string_vars,
         output_arg: output,
         out_dir,
         output_path,
@@ -1281,6 +1296,7 @@ struct DirWatchCtx {
     root: PathBuf,
     vars_path: Option<PathBuf>,
     static_set_vars: Vec<(String, String)>,
+    static_set_string_vars: Vec<(String, String)>,
     output_base: OutputBase,
     exclude_prefix: Option<PathBuf>,
     vars_dir_extra: Option<PathBuf>,
@@ -1416,15 +1432,18 @@ fn liveness_probe_dir(
 
         if !appeared.is_empty() || !removed.is_empty() {
             // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-            let runtime_vars =
-                match build_runtime_vars(ctx.vars_path.clone(), ctx.static_set_vars.clone()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{e:?}");
-                        state.last_mtimes = snapshot_state(&state.known_set());
-                        return;
-                    }
-                };
+            let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
+                vars: ctx.vars_path.clone(),
+                set_vars: ctx.static_set_vars.clone(),
+                set_string_vars: ctx.static_set_string_vars.clone(),
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{e:?}");
+                    state.last_mtimes = snapshot_state(&state.known_set());
+                    return;
+                }
+            };
             let mut batch: BTreeSet<PathBuf> = appeared.clone();
             batch.extend(removed.iter().cloned());
             process_dir_batch(
@@ -1534,8 +1553,11 @@ fn handle_fs_event_dir(
 
     // ADR-016: reload vars from disk on every rebuild.
     // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-    let runtime_vars = match build_runtime_vars(ctx.vars_path.clone(), ctx.static_set_vars.clone())
-    {
+    let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
+        vars: ctx.vars_path.clone(),
+        set_vars: ctx.static_set_vars.clone(),
+        set_string_vars: ctx.static_set_string_vars.clone(),
+    }) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e:?}");
@@ -1572,6 +1594,7 @@ fn dir_watch_startup(
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
+    set_string_vars: Vec<(String, String)>,
     clear: bool,
     debounce_ms: u64,
     quiet: bool,
@@ -1582,6 +1605,7 @@ fn dir_watch_startup(
     // Also rejects a symlinked vars file at startup (build parity — PF-004).
     let vars_path = canonicalize_vars_path(vars).map_err(miette::Error::from)?;
     let static_set_vars = set_vars;
+    let static_set_string_vars = set_string_vars;
 
     // Canonicalize out_dir as absolute so the starts_with(&root) in-root exclusion check
     // is reliable even when cwd contains symlinks (root is already canonical — security #8).
@@ -1603,7 +1627,11 @@ fn dir_watch_startup(
 
     // Startup compile: compile all .mds files found under root.
     let all_files = collect_mds_files(&root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
-    let runtime_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+        vars: vars_path.clone(),
+        set_vars: static_set_vars.clone(),
+        set_string_vars: static_set_string_vars.clone(),
+    })?;
 
     // Build the dependency graph and compile all files at startup.
     let mut state = DirWatchState {
@@ -1720,7 +1748,11 @@ fn dir_watch_startup(
     // Build the dedup baseline AFTER the watcher is registered so any OS-queued
     // synthetic events arrive after the baseline is recorded and are filtered out.
     {
-        let baseline_vars = build_runtime_vars(vars_path.clone(), static_set_vars.clone())?;
+        let baseline_vars = build_runtime_vars(RuntimeVarArgs {
+            vars: vars_path.clone(),
+            set_vars: static_set_vars.clone(),
+            set_string_vars: static_set_string_vars.clone(),
+        })?;
         for source in &all_files {
             let key = graph_key(source);
             if is_partial(source) {
@@ -1782,6 +1814,7 @@ fn dir_watch_startup(
         root,
         vars_path,
         static_set_vars,
+        static_set_string_vars,
         output_base,
         exclude_prefix,
         vars_dir_extra,
@@ -1805,6 +1838,7 @@ fn run_watch_dir(
     out_dir: Option<PathBuf>,
     vars: Option<PathBuf>,
     set_vars: Vec<(String, String)>,
+    set_string_vars: Vec<(String, String)>,
     clear: bool,
     debounce_ms: u64,
     quiet: bool,
@@ -1816,7 +1850,16 @@ fn run_watch_dir(
         mut state,
         mut liveness,
         ctx,
-    } = dir_watch_startup(root, out_dir, vars, set_vars, clear, debounce_ms, quiet)?;
+    } = dir_watch_startup(
+        root,
+        out_dir,
+        vars,
+        set_vars,
+        set_string_vars,
+        clear,
+        debounce_ms,
+        quiet,
+    )?;
 
     // ── Watch loop ────────────────────────────────────────────────────────────
     loop {
