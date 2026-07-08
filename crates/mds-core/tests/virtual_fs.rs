@@ -1061,6 +1061,116 @@ fn issue_151_block_body_edge_newline_preserved_at_compile_boundary() {
     );
 }
 
+// ── Issue repros: #154 (@extends emits deep-merged frontmatter) ───────────────
+//
+// Previously, a child template using @extends only emitted its own raw
+// frontmatter in the compiled output, discarding base frontmatter keys that
+// the child did not explicitly repeat. The fix serializes the deep-merged
+// mapping (base < child, reserved keys excluded) for the output frontmatter.
+
+#[test]
+fn issue_154_extends_emits_merged_frontmatter() {
+    // Base has `model` and `temperature`; child overrides `temperature` and adds `role`.
+    // The compiled output must contain all three non-reserved keys: model (from base),
+    // temperature (child overrides base), and role (child-only).
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "---\nmodel: gpt-4\ntemperature: 0.7\n---\n@block section:\nbase text\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\ntemperature: 0.2\nrole: system\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let out =
+        compile_vfs(modules.into_iter().collect(), "child.mds").expect("#154: should compile");
+    assert!(
+        out.contains("model: gpt-4"),
+        "#154: base-only key 'model' must appear in merged output; got: {out}"
+    );
+    assert!(
+        out.contains("temperature: 0.2"),
+        "#154: child value must win for 'temperature'; got: {out}"
+    );
+    assert!(
+        out.contains("role: system"),
+        "#154: child-only key 'role' must appear in merged output; got: {out}"
+    );
+}
+
+#[test]
+fn issue_154_extends_no_base_frontmatter() {
+    // Base has no frontmatter; child has frontmatter → only child keys emitted.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "@block section:\nbase text\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nrole: user\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = compile_vfs(modules.into_iter().collect(), "child.mds")
+        .expect("#154: no-base-fm case should compile");
+    assert!(
+        out.contains("role: user"),
+        "#154: child-only key 'role' must appear when base has no frontmatter; got: {out}"
+    );
+}
+
+#[test]
+fn issue_154_extends_reserved_keys_excluded_from_output() {
+    // `extends`, `imports`, and `type` are reserved — they must not appear in the
+    // compiled output frontmatter even if they appear in the source.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "---\nmodel: gpt-4\ntype: mds\n---\n@block section:\nbase\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nrole: system\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = compile_vfs(modules.into_iter().collect(), "child.mds")
+        .expect("#154: reserved-key exclusion case should compile");
+    assert!(
+        !out.contains("type:"),
+        "#154: reserved key 'type' must NOT appear in merged output; got: {out}"
+    );
+    assert!(
+        !out.contains("extends:"),
+        "#154: reserved key 'extends' must NOT appear in merged output; got: {out}"
+    );
+    assert!(
+        out.contains("model: gpt-4"),
+        "#154: non-reserved key 'model' must still appear; got: {out}"
+    );
+    assert!(
+        out.contains("role: system"),
+        "#154: non-reserved key 'role' must still appear; got: {out}"
+    );
+}
+
+#[test]
+fn issue_154_extends_no_frontmatter_on_either_side() {
+    // Neither base nor child has frontmatter → no frontmatter block in output.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "@block section:\nbase text\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = compile_vfs(modules.into_iter().collect(), "child.mds")
+        .expect("#154: no-fm case should compile");
+    assert!(
+        !out.contains("---"),
+        "#154: output must not contain frontmatter fences when neither side has FM; got: {out}"
+    );
+}
+
 // ── Issue repros: #152 (cross-type comparison errors, --set-string) ───────────
 //
 // Previously, comparing values of different types (e.g. number vs string) in

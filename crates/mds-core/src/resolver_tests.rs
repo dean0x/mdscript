@@ -1727,20 +1727,23 @@ fn regression_non_extending_file_fm_unchanged() {
 }
 
 #[test]
-fn f4_child_emits_only_own_raw_frontmatter() {
-    // decision #7 / output emission: extending child emits only its own raw_frontmatter.
-    // Base frontmatter is an input to scope, not output.
+fn f4_extends_emits_deep_merged_frontmatter() {
+    // #154 — @extends must emit the deep-merged frontmatter (base < child),
+    // not just the child's raw FM. Reserved keys (imports, type, extends) are
+    // excluded; non-reserved keys from both sides appear in the output.
     let base = concat!(
         "---\n",
-        "base_secret: only_in_base\n",
+        "base_key: from_base\n",
+        "shared_key: base_wins_without_child_override\n",
         "---\n",
         "@block content:\n",
-        "{base_secret}\n",
+        "{base_key}\n",
         "@end\n",
     );
     let child = concat!(
         "---\n",
-        "child_var: in_child\n",
+        "child_key: from_child\n",
+        "shared_key: child_overrides_base\n",
         "---\n",
         "@extends \"./base.mds\"\n",
     );
@@ -1752,21 +1755,32 @@ fn f4_child_emits_only_own_raw_frontmatter() {
         .resolve_key("child.mds", &Default::default(), &mut warnings)
         .expect("output emission test should compile");
 
-    // raw_frontmatter in the resolved module is the child's raw FM (not base's).
-    if let Some(ref raw_fm) = child_resolved.raw_frontmatter {
-        assert!(
-            !raw_fm.contains("base_secret"),
-            "child output must NOT contain base frontmatter: {raw_fm}"
-        );
-        assert!(
-            raw_fm.contains("child_var"),
-            "child output must contain child's own frontmatter: {raw_fm}"
-        );
-    }
-    // The compiled output uses the merged scope (base_secret visible to blocks)
+    // raw_frontmatter in the resolved module is the deep-merged FM (base < child).
+    let raw_fm = child_resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have frontmatter");
+    assert!(
+        raw_fm.contains("base_key"),
+        "merged output must contain base-only key; got: {raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("child_key"),
+        "merged output must contain child-only key; got: {raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("child_overrides_base"),
+        "child value must win for shared_key; got: {raw_fm}"
+    );
+    assert!(
+        !raw_fm.contains("base_wins_without_child_override"),
+        "base value for shared_key must be overridden; got: {raw_fm}"
+    );
+
+    // The compiled body still uses the merged scope (base_key visible to blocks).
     let output = child_resolved.prompt_body.as_deref().unwrap_or("");
     assert!(
-        output.contains("only_in_base"),
+        output.contains("from_base"),
         "merged scope used: base var rendered in block: {output}"
     );
 }
