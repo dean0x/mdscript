@@ -94,12 +94,16 @@ jobs:
             gz=$(gzip -c "$f" | wc -c | tr -d ' ')
             label="${f#crates/mds-wasm/}"
             echo "::notice::WASM ${label}: ${raw} bytes raw, ${gz} bytes gzipped"
-            # Soft bloat guard. Budget raised 600K->650K (2026-06): the unpinned CI
-            # `stable` toolchain drifted and pushed the optimized binary just over 600K
-            # with no source change (local toolchain still emits ~592K). Follow-up: pin
-            # the wasm build toolchain to make the size deterministic and re-tighten this.
-            if [ "$raw" -gt 650000 ]; then
-              echo "::error::WASM binary exceeds 650,000 byte threshold: ${label} is ${raw} bytes"
+            # Soft bloat guard. Budget history:
+            #   600K initial; raised 600K->650K (2026-06): unpinned CI `stable` toolchain
+            #   drifted past 600K with no source change (local emitted ~592K).
+            #   raised 650K->700K (2026-07, PR #161 / fix/v0-4-0-149-154): toolchain
+            #   drift + new v0.4.0 code (cross-type errors, extended help strings,
+            #   @extends frontmatter merging) pushed CI binary to 650,745 bytes.
+            # Follow-up: pin the wasm build toolchain to make the size deterministic
+            # and re-tighten this guard.
+            if [ "$raw" -gt 700000 ]; then
+              echo "::error::WASM binary exceeds 700,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
             fi
           done
