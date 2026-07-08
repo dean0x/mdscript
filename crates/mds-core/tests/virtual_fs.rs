@@ -1043,11 +1043,12 @@ fn issue_151_block_body_edge_newline_preserved_at_compile_boundary() {
         // Now "Para A\n" (body verbatim) + "\n" (skeleton) = "Para A\n\nPara B\n".
         "@block section:\nPara A.\n@end\n\nPara B.\n".to_string(),
     );
-    modules.insert("child.mds".to_string(), "@extends \"./base.mds\"\n".to_string());
+    modules.insert(
+        "child.mds".to_string(),
+        "@extends \"./base.mds\"\n".to_string(),
+    );
     let out = mds::compile_virtual(
-        modules
-            .into_iter()
-            .collect::<HashMap<_, _>>(),
+        modules.into_iter().collect::<HashMap<_, _>>(),
         "child.mds",
         None,
     )
