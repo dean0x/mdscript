@@ -406,9 +406,9 @@ pub(crate) fn load_optional_vars_file(
 
 /// Merge a `--vars` file with `--set` and `--set-string` overrides into a single map.
 ///
-/// Processing order: file vars < `--set` overrides < `--set-string` overrides.
-/// Both `--set` and `--set-string` can override the same key; last writer wins
-/// (clap preserves CLI order within each flag group).
+/// Processing order: file vars < `--set`/`--set-string` overrides.
+/// Within each flag group, later flags win (last-wins). Cross-flag duplicate keys
+/// (a key present in both `--set` and `--set-string`) are rejected with an error.
 pub(crate) fn build_runtime_vars(
     args: RuntimeVarArgs,
 ) -> Result<Option<HashMap<String, mds::Value>>> {
@@ -417,6 +417,19 @@ pub(crate) fn build_runtime_vars(
         set_vars,
         set_string_vars,
     } = args;
+
+    // Collect unique keys used by --set for cross-flag duplicate detection.
+    let set_keys: HashSet<&str> = set_vars.iter().map(|(k, _)| k.as_str()).collect();
+
+    // Reject any key that appears in both --set and --set-string.
+    for (key, _) in &set_string_vars {
+        if set_keys.contains(key.as_str()) {
+            return Err(miette::miette!(
+                "variable '{key}' is set by both --set and --set-string; use only one"
+            ));
+        }
+    }
+
     let mut runtime_vars = load_optional_vars_file(vars)?;
     for (key, val) in set_vars {
         runtime_vars
@@ -1102,5 +1115,101 @@ mod tests {
             !config.fmt.sort_frontmatter_keys,
             "sort_frontmatter_keys: false must deserialize correctly"
         );
+    }
+
+    // ── build_runtime_vars: cross-flag duplicate rejection (#152) ─────────────
+
+    #[test]
+    fn build_runtime_vars_cross_flag_duplicate_is_error() {
+        // A key present in both --set and --set-string must be a hard error.
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![("x".to_string(), "1".to_string())],
+            set_string_vars: vec![("x".to_string(), "2".to_string())],
+        });
+        assert!(result.is_err(), "cross-flag duplicate key must be rejected");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("variable 'x' is set by both --set and --set-string"),
+            "error message must identify the key; got: {msg}"
+        );
+        assert!(
+            msg.contains("use only one"),
+            "error message must say 'use only one'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_runtime_vars_check_command_cross_flag_duplicate_is_error() {
+        // The same build_runtime_vars function is used by both mds build and mds check.
+        // Verify the error fires regardless of which args struct wraps it.
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![("count".to_string(), "3".to_string())],
+            set_string_vars: vec![("count".to_string(), "three".to_string())],
+        });
+        assert!(
+            result.is_err(),
+            "cross-flag duplicate must be rejected in check parity"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("variable 'count'"),
+            "error must name the duplicate key; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_runtime_vars_same_flag_last_wins() {
+        // Within a single flag group, the last occurrence wins (no error).
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![
+                ("x".to_string(), "1".to_string()),
+                ("x".to_string(), "2".to_string()),
+            ],
+            set_string_vars: vec![],
+        })
+        .expect("same-flag last-wins must not error");
+        let map = result.expect("non-empty vars");
+        assert_eq!(
+            map.get("x"),
+            Some(&mds::Value::Number(2.0)),
+            "last --set wins within the same flag"
+        );
+    }
+
+    #[test]
+    fn build_runtime_vars_same_flag_string_last_wins() {
+        // Within --set-string, the last occurrence also wins (no error).
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![],
+            set_string_vars: vec![
+                ("id".to_string(), "007".to_string()),
+                ("id".to_string(), "009".to_string()),
+            ],
+        })
+        .expect("same-flag last-wins in --set-string must not error");
+        let map = result.expect("non-empty vars");
+        assert_eq!(
+            map.get("id"),
+            Some(&mds::Value::String("009".to_string())),
+            "last --set-string wins within the same flag"
+        );
+    }
+
+    #[test]
+    fn build_runtime_vars_distinct_keys_no_error() {
+        // Using --set and --set-string for DIFFERENT keys must succeed.
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![("num".to_string(), "42".to_string())],
+            set_string_vars: vec![("id".to_string(), "007".to_string())],
+        })
+        .expect("distinct keys across flags must not error");
+        let map = result.expect("non-empty vars");
+        assert_eq!(map.get("num"), Some(&mds::Value::Number(42.0)));
+        assert_eq!(map.get("id"), Some(&mds::Value::String("007".to_string())));
     }
 }
