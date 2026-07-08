@@ -339,6 +339,28 @@ fn parse_invalid_dot_path_interpolation_returns_error() {
     );
 }
 
+#[test]
+fn invalid_interpolation_hint_recommends_single_brace_escape() {
+    // Regression test for #153: the hint must say `\{` (one brace) not `\{{` (two).
+    // The format string in parser_helpers.rs was `\\{{{{` (rendered `\{{`) —
+    // fixed to `\\{{` (renders `\{`).
+    let src = "{123invalid}";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let result = parse_with_ctx(&tokens, "test.mds", src);
+    assert!(result.is_err(), "invalid interpolation should fail");
+    let err_msg = format!("{}", result.unwrap_err());
+    // Must contain `\{` as the escape hint.
+    assert!(
+        err_msg.contains("escape with \\{"),
+        "hint must recommend escape with \\{{ (single brace), got: {err_msg}"
+    );
+    // Must NOT say `\{{` (double brace — the old, broken form).
+    assert!(
+        !err_msg.contains("escape with \\{{"),
+        "hint must NOT say \\{{{{  (double brace), got: {err_msg}"
+    );
+}
+
 // --- Tests for MAX_DOT_SEGMENTS limit ---
 
 #[test]

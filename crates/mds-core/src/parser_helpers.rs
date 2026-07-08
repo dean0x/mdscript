@@ -1099,7 +1099,7 @@ pub(super) fn parse_interpolation_expr(
     if !is_valid_identifier(content) {
         return Err(MdsError::syntax_at(
             format!(
-                "invalid interpolation: '{content}' is not a valid expression. Use a variable name (letters, numbers, underscores), a function call like func(), or escape with \\{{{{ for literal braces."
+                "invalid interpolation: '{content}' is not a valid expression. Use a variable name (letters, numbers, underscores), a function call like func(), or escape with \\{{ for literal braces."
             ),
             file, source, offset, len,
         ));
