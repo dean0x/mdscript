@@ -952,7 +952,7 @@ impl ModuleCache {
         // frontmatter (#154: @extends emits deep-merged frontmatter).
         let (mut scope, merged_mapping) =
             self.build_merged_extends_scope(&base, frontmatter_values, &base_key, ctx, warnings)?;
-        let merged_frontmatter = serialize_merged_frontmatter(&merged_mapping);
+        let merged_frontmatter = serialize_merged_frontmatter(&merged_mapping)?;
 
         // Collect child's own definitions from its body (currently zero @define after
         // child-only-blocks check, but structurally correct).
@@ -2063,29 +2063,32 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
 /// Serialize a deep-merged frontmatter `Mapping` into a YAML string suitable for
 /// `prepend_frontmatter`.
 ///
-/// Returns `None` when `mapping` is empty (no non-reserved keys on either side — no
-/// frontmatter block should be emitted). Otherwise returns `Some(yaml_string)` where
+/// Returns `Ok(None)` when `mapping` is empty (no non-reserved keys on either side — no
+/// frontmatter block should be emitted). Otherwise returns `Ok(Some(yaml_string))` where
 /// `yaml_string` is the canonical YAML representation of `mapping` with a trailing
 /// newline, ready to be wrapped in `---…---` fences by `prepend_frontmatter`.
 ///
 /// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
-fn serialize_merged_frontmatter(mapping: &serde_yaml_ng::Mapping) -> Option<String> {
+///
+/// # Errors
+///
+/// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
+/// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
+/// failure MUST propagate as a compile error rather than silently dropping the emitted
+/// frontmatter fence from the output (no swallowed errors at boundaries).
+fn serialize_merged_frontmatter(
+    mapping: &serde_yaml_ng::Mapping,
+) -> Result<Option<String>, MdsError> {
     if mapping.is_empty() {
-        return None;
+        return Ok(None);
     }
-    match serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone())) {
-        Ok(yaml) => {
-            let trimmed = yaml.trim_end();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(format!("{trimmed}\n"))
-            }
-        }
-        // Serialization failure is not expected for well-formed YAML mappings
-        // produced by deep_merge_yaml, but if it happens we silently omit the
-        // frontmatter rather than propagating an error from the output stage.
-        Err(_) => None,
+    let yaml = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone()))
+        .map_err(|e| MdsError::yaml_error(e.to_string()))?;
+    let trimmed = yaml.trim_end();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!("{trimmed}\n")))
     }
 }
 

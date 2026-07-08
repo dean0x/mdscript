@@ -228,7 +228,7 @@ fn raw_content_spans(tokens: &[Token], src: &str) -> Vec<Range<usize>> {
 
     // Defensive: an unclosed raw-kind block (malformed input the parser will
     // separately reject) still marks its remaining content as raw through
-    // EOF, rather than letting R1/R3 touch content that never had a chance
+    // EOF, rather than letting R1 touch content that never had a chance
     // to be proven equivalent via the safety gate's real-compile path.
     for (is_raw, start) in stack {
         if is_raw {
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn raw_content_spans_defensive_unclosed_message_covers_to_eof() {
         // Malformed input (missing @end) still marks the remainder as raw
-        // rather than leaving it to R1/R3, even though the parser will
+        // rather than leaving it to R1, even though the parser will
         // separately reject this at compile time.
         let src = "@message user:\nHi there";
         let tokens = lexer::tokenize(src, "").unwrap();
