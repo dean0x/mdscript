@@ -7,9 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.4.0] — unreleased
-
-### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter
+### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace
 
 These changes alter observable runtime behavior and compiled output. Templates relying
 on the previous (buggy) behavior must be updated.
@@ -36,7 +34,7 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
 
 ### Added
 
-- **`--set-string KEY=VALUE`** CLI flag for `mds build`, `mds check`, and `mds fmt`.
+- **`--set-string KEY=VALUE`** CLI flag for `mds build`, `mds check`, and `mds watch`.
   Sets a variable as a string without type coercion — useful when a value is
   numeric-looking but must stay a string (e.g. `mds build t.mds --set-string id=007`).
   Repeatable. (#152)
@@ -45,15 +43,14 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   rewrite is guaranteed compile-equivalent: a runtime safety gate re-compiles the formatted
   source and refuses to write if it would change compiled output (`mds::formatter_invariant`)
   rather than silently corrupting a template. Normalizes CRLF to LF everywhere (including
-  inside frontmatter and code fences), collapses runs of two or more consecutive blank lines
-  to a single blank line, strips trailing whitespace on directive lines, and ensures exactly
-  one final newline — while leaving body-text trailing whitespace (Markdown hard breaks),
-  blank-line structure within frontmatter and code fences, and the byte-for-byte content of
-  `@message`/`@define` bodies untouched. Supports a single file,
-  a directory (recursive, including `_`-prefixed partials), or stdin (`-`, as a filter);
-  `--check` exits non-zero without writing when anything would change, and `--diff` prints a
-  unified diff (colorized on a TTY) without writing. New public `mds-core` API:
-  `format_str` / `format_str_with`. (#60)
+  inside frontmatter and code fences), strips trailing whitespace on directive lines, and
+  ensures exactly one trailing newline — while leaving interior blank lines, blank-line
+  structure within frontmatter and code fences, body-text trailing whitespace (Markdown
+  hard breaks), and the byte-for-byte content of `@message`/`@define` bodies untouched.
+  Supports a single file, a directory (recursive, including `_`-prefixed partials), or
+  stdin (`-`, as a filter); `--check` exits non-zero without writing when anything would
+  change, and `--diff` prints a unified diff (colorized on a TTY) without writing. New
+  public `mds-core` API: `format_str` / `format_str_with`. (#60)
 
 - **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), to be distributed
   as `mdscript` on PyPI. Seven functions — `compile`, `compile_file`,
@@ -69,6 +66,15 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   for now, install from source: `pip install ./crates/mds-python`. (#59)
 
 ### Changed
+
+- **BREAKING:** Interior-verbatim whitespace contract for block bodies and `mds fmt`.
+  Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
+  `mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
+  The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
+  equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
+  exactly one final newline). **Migration:** compiled outputs may gain blank lines that
+  were previously collapsed or stripped; templates relying on this collapse must remove
+  the extra blank lines at the source level. (#150, #151)
 
 - **BREAKING:** `FileSystem` trait now requires two new methods — `normalize_in_dir`
   and `parent_dir` — that replace the internal `<source>` path-sentinel pattern.

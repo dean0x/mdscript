@@ -69,6 +69,10 @@ Hello {name}!
 - Inside fenced code blocks (triple backtick or tilde; also indented or blockquoted fences): no interpolation occurs (raw passthrough)
 - Undefined variable → compilation error (not silent empty string)
 
+**Fence out-of-scope:**
+- 4-space indented code blocks (CommonMark style, without fence markers) are **not** recognized as passthrough regions — interpolation IS parsed inside them.
+- Leaving a blockquote does not implicitly close a blockquoted fence: `> ``` ... content without > prefix ... > ` ``` `` — the fence closes only on an explicit matching closer (`> ` `` ` or `> ~~~`). Without an explicit closer the fence extends to end-of-file.
+
 ---
 
 ### 4.3 Conditionals
@@ -173,6 +177,28 @@ Free tier.
 - `@if !!var:` (double negation) is a parse error
 - Maximum 256 `@elseif` branches per `@if` block
 - Nesting: plain `@end`, resolved by innermost matching
+
+**Comparison semantics — type × operator:**
+
+| LHS type | RHS type | `==` | `!=` | Notes |
+|----------|----------|------|------|-------|
+| string | string | structural | structural | `"3" == "3"` → true |
+| number | number | IEEE 754 | IEEE 754 | `NaN == NaN` → false |
+| boolean | boolean | structural | structural | |
+| null | null | true | false | |
+| any | **different type** | **error** | **error** | `mds::type_mismatch` — no implicit coercion |
+
+**Truthiness vs equality — key distinction:**
+
+| Value | `@if` (truthy check) | `@if x == false:` (equality) |
+|-------|----------------------|-------------------------------|
+| `false` | falsy | true (same type, same value) |
+| `""` | falsy | — (must compare with `""` literal) |
+| `0` | falsy | — (must compare with `0` literal) |
+| `"0"` | **truthy** (non-empty string) | requires `x == "0"` |
+| `"false"` | **truthy** (non-empty string) | requires `x == "false"` |
+
+**`--set-string` truthiness footgun:** `--set-string count=0` sets `count` to the string `"0"`, not the number `0`. The string `"0"` is truthy (`@if count:` is true) even though the number `0` is falsy. Similarly, `--set-string flag=false` sets `flag` to the string `"false"` which is truthy. Compare with string literals explicitly when using `--set-string`: `@if count == "0":`.
 
 ---
 
@@ -606,9 +632,13 @@ role: data analysis
 You are a data analysis assistant.
 
 Perform statistical analysis.
+
 You have access to: Python, R
+
 Respond in plain text.
 ```
+
+The blank lines between sections come from the base skeleton (the blank line between each `@end` and the next `@block` directive is part of the skeleton and is carried through verbatim).
 
 #### Rules
 
@@ -637,6 +667,17 @@ Respond in plain text.
 - Reserved keys (`imports`, `type`, `extends`) are excluded from the merged scope
 - Per-file `imports:` entries in frontmatter are each resolved against their own file's location
 - The **deep-merged** frontmatter (base < child, reserved keys excluded) is emitted in the compiled output — not just the child's raw frontmatter. Both base-only and child-only keys appear; child wins on collisions
+
+**Named asymmetry — `@extends` vs standalone:**
+
+`@extends` templates and standalone templates differ in how frontmatter is emitted:
+
+| Template type | Emitted frontmatter |
+|---------------|---------------------|
+| **Standalone** | Raw-verbatim: the original source YAML between `---` fences, byte-for-byte (comments and quoting preserved) |
+| **`@extends` child** | Canonically re-serialized: serde-yaml output of the deep-merged mapping (comments and original quoting are normalized away; YAML structure is canonical) |
+
+This asymmetry is intentional: standalone templates can round-trip YAML comments and non-canonical quoting, while `@extends` templates must emit a merged structure that has no single "source" YAML string. Runtime `--set`/`--set-string` variables do not alter the emitted frontmatter in either case — they affect only the compiled body.
 
 **Intrinsic output with inheritance:**
 
@@ -681,9 +722,14 @@ Compiled output (messages kind — intrinsic because `@message` is present):
 
 **Whitespace contract:**
 
-- Block body edges are stripped of leading/trailing blank lines (same rule as `@message` and `@define`)
-- Skeleton whitespace around a spliced block carries through to the output verbatim, except that `@end` consumes the single newline immediately following it. So a blank line between two `@block` declarations renders as one line break, and back-to-back declarations (no separating line) render with no separator between their bodies — author the base skeleton's spacing accordingly
-- Spacing before and after a spliced block is determined by the surrounding base skeleton, not the block body
+Block bodies follow the **interior-verbatim with trailing-edge normalization** contract:
+- Leading blank lines and interior blank runs inside a block body are preserved verbatim.
+- Only the trailing edge is normalized: trailing whitespace is stripped and exactly one final newline is appended; `\r` is stripped unconditionally.
+- This differs from `@message` and `@define` bodies, which still edge-trim (`.trim()`) — they strip leading and trailing blank lines. Block bodies do not.
+
+For the base skeleton:
+- Skeleton whitespace around a spliced block carries through to the output verbatim, except that `@end` consumes the single newline immediately following it. A blank line between two `@block` declarations in the base renders as one blank line between the corresponding bodies in the output; back-to-back `@block` declarations (no separating blank line) render with no separator between bodies.
+- Spacing before and after a spliced block is determined by the surrounding base skeleton, not the block body.
 
 **Error codes:**
 
@@ -843,7 +889,7 @@ mds fmt template.mds --check              # Exit non-zero if file would change
 mds fmt template.mds --diff               # Print unified diff without writing
 ```
 
-Formats `.mds` templates: normalizes CRLF to LF, collapses multiple consecutive blank lines to one, strips trailing whitespace on directive lines, and ensures exactly one trailing newline. Body-text trailing whitespace (Markdown hard breaks) and the content of `@message`/`@define` bodies are left untouched.
+Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
 
 Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template.
 
@@ -1126,7 +1172,7 @@ quoted_path     := "\"" path_chars "\""
 
 ## 12. Status
 
-v0.4.0 - Breaking fixes release. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion (#152). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154). Interpolation errors now suggest `\{` in the help text (#153).
+v0.4.0 - Breaking fixes release. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Interior whitespace in block bodies, `@define` function calls, and `mds fmt` output now follows the **interior-verbatim with trailing-edge normalization** contract — leading blank lines and interior blank runs are preserved verbatim; only the trailing edge normalizes to one final newline. The `mds fmt` blank-line collapsing rule (R3) has been removed (#150, #151). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion; using a key in both `--set` and `--set-string` is now a hard error (#152). Interpolation errors now suggest `\{` in the help text (#153). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154).
 
 v0.3.0 - Auto-formatter (`mds fmt`), intrinsic output format (Markdown vs JSON messages decided by content not a flag), native Python bindings (PyO3).
 
