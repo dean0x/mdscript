@@ -69,12 +69,13 @@ pub(super) fn deep_merge_yaml(
     // recursive calls (depth > 0).  A nested key like `config.type` is not a
     // top-level directive; filtering it would silently discard user data.
     //
-    // SYNC POINT: if you add a key here, audit `strip_reserved_keys` in lib.rs —
-    // that function strips `type` and `imports` from raw frontmatter output but intentionally
-    // omits `extends` (it is a directive token, not an output FM key).
-    // The two lists serve different purposes and are NOT identical by design; keep this comment
-    // and the strip_reserved_keys comment in sync when either list changes.
-    const RESERVED: &[&str] = &["imports", "type", "extends"];
+    // SYNC POINT: when this constant changes, also audit `RESERVED_OUTPUT_KEYS` in lib.rs.
+    // The two constants serve different purposes and are intentionally not identical:
+    // `RESERVED_MERGE_KEYS` prevents reserved keys from propagating as FM variables at merge
+    // time; `RESERVED_OUTPUT_KEYS` lists keys removed from raw YAML before re-emitting output.
+    // `extends` is in RESERVED_MERGE_KEYS only — it is consumed as a directive during
+    // inheritance and is never emitted as an output FM key.
+    const RESERVED_MERGE_KEYS: &[&str] = &["imports", "type", "extends"];
 
     let mut result = serde_yaml_ng::Mapping::new();
 
@@ -86,7 +87,7 @@ pub(super) fn deep_merge_yaml(
             continue;
         };
         // Reserved keys are stripped at the top-level only (they are directives, not data).
-        if depth == 0 && RESERVED.contains(&key_str.as_str()) {
+        if depth == 0 && RESERVED_MERGE_KEYS.contains(&key_str.as_str()) {
             continue;
         }
 
@@ -114,7 +115,7 @@ pub(super) fn deep_merge_yaml(
             continue;
         };
         // Reserved keys are stripped at the top-level only.
-        if depth == 0 && RESERVED.contains(&key_str.as_str()) {
+        if depth == 0 && RESERVED_MERGE_KEYS.contains(&key_str.as_str()) {
             continue;
         }
         // Skip keys already added from base.

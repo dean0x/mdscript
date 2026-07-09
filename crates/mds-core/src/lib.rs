@@ -555,23 +555,33 @@ pub fn check_str_collecting_warnings(
     Ok(((), warnings))
 }
 
+/// Output-side reserved frontmatter keys: stripped from raw YAML before re-emitting frontmatter.
+///
+/// `extends` is intentionally absent — it is a directive consumed during template inheritance,
+/// never emitted as output FM. Contrast with `RESERVED_MERGE_KEYS` in `resolver/frontmatter.rs`
+/// which includes `extends` (the merge gate sees it as a directive to consume, not a value key).
+///
+/// SYNC POINT: when this constant changes, also audit `RESERVED_MERGE_KEYS` in
+/// `resolver/frontmatter.rs` — the two constants serve different purposes and are intentionally
+/// not identical.
+const RESERVED_OUTPUT_KEYS: &[&str] = &["type", "imports"];
+
 /// Remove reserved keys (`type: mds` and `imports:` blocks) from raw frontmatter content.
 ///
 /// Returns `Some(remaining)` if any non-whitespace content survives after filtering,
 /// or `None` if the frontmatter would be empty (nothing worth emitting).
 ///
-/// Strips:
-/// - Top-level `type: mds` lines (all three YAML quoting styles).
+/// Strips the keys named in `RESERVED_OUTPUT_KEYS`:
+/// - Top-level `type: mds` lines (all three YAML quoting styles; `type` with any other value
+///   is not a reserved directive and is left in place).
 /// - Top-level `imports:` key and its continuation lines (indented child lines).
-///
-/// SYNC POINT: `deep_merge_yaml` in resolver.rs has a RESERVED list `["imports", "type", "extends"]`
-/// that excludes keys from inherited FM variables.  The two lists serve different purposes and are
-/// intentionally not identical: `deep_merge_yaml::RESERVED` prevents keys from propagating as FM
-/// variables; `strip_reserved_keys` removes keys from raw YAML before re-emitting output.  `extends`
-/// appears only in the merge list (it is a directive token, not an output FM key) and is intentionally
-/// absent here.  Keep this note and the SYNC POINT comment in `deep_merge_yaml` in sync when either
-/// list changes.
 fn strip_reserved_keys(raw: &str) -> Option<String> {
+    // Verify this function's bespoke stripping logic covers the keys listed in
+    // RESERVED_OUTPUT_KEYS. Zero cost in release; surfaces drift in debug/test builds.
+    debug_assert!(
+        RESERVED_OUTPUT_KEYS.contains(&"type") && RESERVED_OUTPUT_KEYS.contains(&"imports"),
+        "RESERVED_OUTPUT_KEYS must include 'type' and 'imports' — update strip_reserved_keys if it changes"
+    );
     let mut filtered = String::with_capacity(raw.len());
     let mut in_imports_block = false;
 
