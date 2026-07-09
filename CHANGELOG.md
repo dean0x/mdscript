@@ -22,6 +22,13 @@ instead of silently returning `false` (for `==`) or `true` (for `!=`).
 - `@if str(count) == "3":` — convert number to string
 - `@if count == 3:` — compare number to number literal
 
+#### Cross-flag duplicate keys in `--set` / `--set-string` are now a hard error (#152)
+
+Supplying the same variable key via both `--set KEY=VALUE` and `--set-string KEY=VALUE`
+in a single invocation is now rejected at startup with an explicit error.
+
+**Migration:** remove the duplicate key from one flag.
+
 #### `@extends` emits deep-merged frontmatter (#154)
 
 Compiled output for a child template now contains the **deep-merged** frontmatter
@@ -94,9 +101,9 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   that starts with `[ \t>]*` followed by three or more matching backticks or tildes.
   (#149)
 
-- **Interpolation errors now suggest `\{`** in the help text when an opening brace
-  appears in a context where an interpolation was expected but failed (e.g. `{ invalid`
-  or an unclosed brace). Helps users writing literal brace characters. (#153)
+- **Interpolation errors now suggest `\{`** in the help text when a closed interpolation
+  contains an invalid expression (e.g. `{foo bar}` or `{1+2}`). Helps users who intended
+  a literal `{` but received a parse error on the expression inside. (#153)
 
 - **Windows: string-source `@import`/`@extends` now resolve relative imports
   correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path

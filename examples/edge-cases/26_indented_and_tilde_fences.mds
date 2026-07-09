@@ -4,7 +4,7 @@ language: Rust
 
 ## Code Fences in {language} — indented, tilde, and blockquoted variants
 
-The MDS compiler recognises all CommonMark-legal code-fence forms.
+The MDS compiler recognises indented, tilde, and blockquoted code-fence variants in addition to standard backtick fences.
 No interpolation occurs inside any of them.
 
 ### 1. Standard backtick fence (baseline)
