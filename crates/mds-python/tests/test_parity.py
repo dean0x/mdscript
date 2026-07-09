@@ -85,6 +85,9 @@ def test_par2_live_cli_markdown_byte_parity(
         ("Just some prose text.\n", []),
         ("Hello {name}!\n", ["--set", "name=World"]),
         ("---\ntitle: Doc\n---\n# {title}\n", []),
+        # Blank line after frontmatter fence exercises #150/#151 interior-verbatim
+        # whitespace preservation.
+        ("---\ntitle: Doc\n---\n\n# {title}\n", []),
     ]
     for src, sets in cases:
         cli_out = cli_build(mds_cli, src, tmp_path, *sets)
@@ -115,6 +118,9 @@ NAPI_ERROR_PARITY = [
     ("mds::mixed_content", lambda: m.compile("Some prose text.\n\n@message user:\nA message.\n@end\n")),
     ("mds::extends", lambda: m.compile('Some text.\n@extends "./base.mds"\n')),
     ("mds::invalid_options", lambda: m.compile("Hello!\n", vars=["not", "an", "object"])),
+    # Frontmatter sets count to Number(3); comparing against string literal "3" is a
+    # cross-type comparison → mds::type_mismatch (#152).
+    ("mds::type_mismatch", lambda: m.compile('---\ncount: 3\n---\n@if count == "3":\nx\n@end\n')),
 ]
 
 
