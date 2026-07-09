@@ -75,6 +75,22 @@ impl<'a> Lexer<'a> {
         self.pos == 0 || self.chars[self.pos - 1] == '\n'
     }
 
+    /// Consume the current line from `self.pos` through its trailing newline.
+    ///
+    /// Returns the source bytes from the start of the line up to (not including)
+    /// the first `\r` or `\n`. Advances `self.pos` past the newline.
+    fn consume_fence_line(&mut self) -> String {
+        let bp = self.byte_pos(self.pos);
+        let line_end = self.chars[self.pos..]
+            .iter()
+            .position(|&c| c == '\n' || c == '\r')
+            .map(|rel| self.pos + rel)
+            .unwrap_or(self.chars.len());
+        let fence = self.source[bp..self.byte_pos(line_end)].to_string();
+        self.pos = skip_newline(&self.chars, line_end);
+        fence
+    }
+
     /// Scan a frontmatter block starting at position 0.
     ///
     /// Precondition: the source starts with `---\n` or `---\r\n`.
@@ -126,41 +142,23 @@ impl<'a> Lexer<'a> {
 
     /// Scan a code fence (opening or closing) given the pre-parsed fence info.
     ///
-    /// `fence_char`: the repeated character (`` ` `` or `~`).
-    /// `fence_count`: how many fence chars are present.
-    /// `is_close`: whether the rest of the line is spaces/tabs only (close candidate).
-    ///
     /// Returns `true` when the fence was consumed and the caller should `continue`.
     /// Returns `false` when we are inside a block but this line does not match the
     /// opener — the caller falls through to `scan_code_content`.
-    fn scan_code_fence(&mut self, fence_char: char, fence_count: usize, is_close: bool) -> bool {
+    fn scan_code_fence(&mut self, m: &FenceMatch) -> bool {
         let bp = self.byte_pos(self.pos);
-
         match self.code_fence {
             None => {
-                // Opening fence: capture verbatim up to (but not including) the first
-                // \r or \n (strips \r, matches R1).
-                let line_end = self.chars[self.pos..]
-                    .iter()
-                    .position(|&c| c == '\n' || c == '\r')
-                    .map(|rel| self.pos + rel)
-                    .unwrap_or(self.chars.len());
-                let fence = self.source[bp..self.byte_pos(line_end)].to_string();
-                self.pos = skip_newline(&self.chars, line_end);
-                self.code_fence = Some((fence_char, fence_count, bp));
+                // Opening fence.
+                let fence = self.consume_fence_line();
+                self.code_fence = Some((m.fence_char, m.fence_count, bp));
                 self.tokens.push(Token::CodeFence(fence, bp));
                 true
             }
             Some((open_char, open_count, _)) => {
-                if is_close && fence_char == open_char && fence_count >= open_count {
+                if fence_closes(m, open_char, open_count) {
                     // Closing fence: same char, at least as many, no info string.
-                    let line_end = self.chars[self.pos..]
-                        .iter()
-                        .position(|&c| c == '\n' || c == '\r')
-                        .map(|rel| self.pos + rel)
-                        .unwrap_or(self.chars.len());
-                    let fence = self.source[bp..self.byte_pos(line_end)].to_string();
-                    self.pos = skip_newline(&self.chars, line_end);
+                    let fence = self.consume_fence_line();
                     self.code_fence = None;
                     self.tokens.push(Token::CodeFence(fence, bp));
                     true
@@ -179,14 +177,14 @@ impl<'a> Lexer<'a> {
     fn scan_code_content(&mut self) {
         let start = self.byte_pos(self.pos);
         let mut content = String::new();
+        // Precondition: self.code_fence.is_some() — run() checks before invoking.
+        debug_assert!(self.code_fence.is_some(), "scan_code_content requires active code fence");
+        let (open_char, open_count, _) = self.code_fence.unwrap();
         while self.pos < self.chars.len() {
             if is_line_start_chars(&self.chars, self.pos) {
-                if let Some((_, fc, fc_count, is_close)) = try_scan_fence_at(&self.chars, self.pos)
-                {
-                    if let Some((open_char, open_count, _)) = self.code_fence {
-                        if is_close && fc == open_char && fc_count >= open_count {
-                            break;
-                        }
+                if let Some(m) = try_scan_fence_at(&self.chars, self.pos) {
+                    if fence_closes(&m, open_char, open_count) {
+                        break;
                     }
                 }
             }
@@ -333,10 +331,8 @@ impl<'a> Lexer<'a> {
             // `scan_code_fence` returns true when it consumed the fence; false means
             // we are inside a block but this line is not the closer — fall through to CodeContent.
             if at_line_start {
-                if let Some((_, fence_char, fence_count, is_close)) =
-                    try_scan_fence_at(&self.chars, self.pos)
-                {
-                    if self.scan_code_fence(fence_char, fence_count, is_close) {
+                if let Some(m) = try_scan_fence_at(&self.chars, self.pos) {
+                    if self.scan_code_fence(&m) {
                         continue;
                     }
                 }
@@ -390,15 +386,24 @@ fn is_line_start_chars(chars: &[char], pos: usize) -> bool {
     pos == 0 || chars[pos - 1] == '\n'
 }
 
+/// Parsed attributes of a potential code fence line.
+///
+/// Produced by `try_scan_fence_at`; passed to `scan_code_fence` and `fence_closes`
+/// so callers never destructure a positional tuple.
+struct FenceMatch {
+    fence_char: char,
+    fence_count: usize,
+    is_close: bool,
+}
+
 /// Check whether a code fence begins at position `pos` in `chars`.
 ///
 /// Scans optional `[ \t>]*` prefix, then requires ≥ 3 consecutive `` ` `` or
-/// `~` characters. Returns `Some((prefix_len, fence_char, fence_count, is_close))`
-/// or `None` when no valid fence is present.
+/// `~` characters. Returns `Some(FenceMatch)` or `None` when no valid fence is present.
 ///
 /// `is_close` is `true` when nothing follows the fence chars (before EOL/EOF)
 /// except spaces or tabs — indicating this line can serve as a closing fence.
-fn try_scan_fence_at(chars: &[char], pos: usize) -> Option<(usize, char, usize, bool)> {
+fn try_scan_fence_at(chars: &[char], pos: usize) -> Option<FenceMatch> {
     let prefix_len = chars[pos..]
         .iter()
         .take_while(|&&c| c == ' ' || c == '\t' || c == '>')
@@ -423,7 +428,14 @@ fn try_scan_fence_at(chars: &[char], pos: usize) -> Option<(usize, char, usize, 
         .iter()
         .take_while(|&&c| c != '\n' && c != '\r')
         .all(|&c| c == ' ' || c == '\t');
-    Some((prefix_len, fence_char, fence_count, is_close))
+    Some(FenceMatch { fence_char, fence_count, is_close })
+}
+
+/// Return `true` when `m` describes a line that closes the fence opened with
+/// `open_char`/`open_count`: same fence character, at least as many markers,
+/// and no info string (only spaces/tabs before EOL).
+fn fence_closes(m: &FenceMatch, open_char: char, open_count: usize) -> bool {
+    m.is_close && m.fence_char == open_char && m.fence_count >= open_count
 }
 
 /// Advance `pos` past a line ending (`\n`, `\r\n`, or bare `\r`), if present.
@@ -594,6 +606,79 @@ mod tests {
         assert!(
             combined.contains("still inside"),
             "three-backtick line must not close a four-backtick fence; got: {combined:?}"
+        );
+    }
+
+    // ── #149: unmatched decorative fences now error ───────────────────────────
+
+    #[test]
+    fn unmatched_tilde_fence_raises_unclosed_error() {
+        // Before #149 a lone ~~~ was literal body text. After #149 it opens a
+        // fence; if unmatched the lexer must raise "unclosed code fence".
+        let err = tokenize("A\n~~~\nB\n", "test.mds").unwrap_err();
+        assert!(
+            format!("{err}").contains("unclosed"),
+            "unmatched tilde fence must raise 'unclosed' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unmatched_indented_backtick_fence_raises_unclosed_error() {
+        // A 4-space-indented ``` is a valid fence opener as of #149; if unmatched
+        // it must raise "unclosed code fence" rather than tokenizing as plain text.
+        let err = tokenize("A\n    ```\nB\n", "test.mds").unwrap_err();
+        assert!(
+            format!("{err}").contains("unclosed"),
+            "unmatched indented backtick fence must raise 'unclosed' error, got: {err}"
+        );
+    }
+
+    // ── #149: interpolation resumes after a closed fence ─────────────────────
+
+    #[test]
+    fn interpolation_resumes_after_closed_tilde_fence() {
+        // {post} appears after a closed ~~~ block and must become an Interpolation,
+        // not be swallowed as CodeContent.
+        let src = "{pre}\n~~~python\n{inside}\n~~~\n{post}\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, Token::Interpolation(s, _) if s == "pre")),
+            "pre-fence interpolation must be recognized"
+        );
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, Token::Interpolation(s, _) if s == "post")),
+            "post-fence interpolation must resume after a closed tilde fence"
+        );
+        assert!(
+            !tokens
+                .iter()
+                .any(|t| matches!(t, Token::Interpolation(s, _) if s == "inside")),
+            "interpolation inside tilde fence must be suppressed"
+        );
+    }
+
+    #[test]
+    fn interpolation_resumes_after_closed_blockquoted_fence() {
+        // {post} appears after the closing `> ``` ` line and must become Interpolation.
+        // The `> {inside}` line is raw CodeContent; the blockquote prefix is part of
+        // that raw content (not stripped by the lexer — the formatter handles regions).
+        let src = "> ```python\n> {inside}\n> ```\n{post}\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        assert!(
+            tokens
+                .iter()
+                .any(|t| matches!(t, Token::Interpolation(s, _) if s == "post")),
+            "interpolation must resume after a closed blockquoted fence"
+        );
+        assert!(
+            !tokens
+                .iter()
+                .any(|t| matches!(t, Token::Interpolation(s, _) if s == "inside")),
+            "interpolation inside blockquoted fence must be suppressed"
         );
     }
 }
