@@ -87,7 +87,8 @@ Build/Watch options:
   --out-dir <DIR>             Output directory (build/single-file watch: <stem>.md or <stem>.json;
                               dir-mode watch: mirrors source subtree)
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
-  --set KEY=VALUE             Set a single variable (repeatable)
+  --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
+  --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
 
 Watch-only options:
   --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
@@ -172,20 +173,17 @@ echo 'Hello   {name}!' | mds fmt -   # format from stdin, write to stdout; creat
 What it normalizes:
 
 - CRLF → LF, everywhere (including inside frontmatter and code fences)
-- Two or more consecutive blank lines collapse to a single blank line; leading blank lines in the body are removed entirely
 - Trailing whitespace on `@if`/`@for`/`@define`/… directive lines is stripped
 - Exactly one final newline (empty or whitespace-only input formats to an empty file)
 
 What it deliberately leaves untouched:
 
-- Trailing whitespace on body-text content lines, including whitespace-only "blank" lines — two
-  trailing spaces are a Markdown hard line break, and stripping them (anywhere in body text,
-  including a stray blank line) can change rendered output
-- Blank-line structure within frontmatter and code fences — CRLF is normalized there (the same
-  as everywhere else in the file), but blank lines are not collapsed inside these regions
-- The byte-for-byte content of `@message`/`@define` bodies — neither CRLF normalization nor
-  blank-line collapsing is applied inside them, because these bodies bypass the compiler's own
-  whitespace normalization and their content reaches compiled output verbatim
+- Trailing whitespace on body-text content lines — two trailing spaces are a Markdown hard line
+  break; stripping them would change rendered output
+- Blank-line structure within the file body, frontmatter, and code fences — the formatter does
+  not add or remove blank lines; blank-line layout is the template author's choice
+- The byte-for-byte content of `@message`/`@define` bodies — whitespace inside these bodies
+  reaches compiled output verbatim and must not be altered
 
 Directory mode formats every `.mds` file recursively, **including `_`-prefixed partials**,
 continuing past per-file errors and printing a summary
@@ -269,7 +267,7 @@ live in [`examples/`](examples/).
 
 ## Language Reference
 
-See [spec.md](spec.md) for the full MDS v0.2.0 language specification.
+See [spec.md](spec.md) for the full MDS v0.4.0 language specification.
 
 ## Contributing
 

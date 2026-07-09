@@ -584,8 +584,9 @@ impl ModuleCache {
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        // The child's raw frontmatter is what gets re-emitted (after stripping reserved
-        // keys) in Markdown mode — captured before `module` is partially moved below.
+        // For the standalone (non-extends) path, the module's own raw frontmatter is
+        // re-emitted in Markdown mode. Captured before `module` is partially moved below.
+        // The @extends path uses `merged_frontmatter` from ExtendsComponents instead (#154).
         let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
 
         // ── Extends branch (decision #8) ─────────────────────────────────────
@@ -612,6 +613,7 @@ impl ModuleCache {
             let ExtendsComponents {
                 final_body,
                 mut scope,
+                merged_frontmatter,
                 ..
             } = components;
 
@@ -636,7 +638,9 @@ impl ModuleCache {
 
             let body = evaluate(&final_body, &mut scope, warnings)?;
             let body_clean = crate::clean_output(&body);
-            let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
+            // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
+            // rather than the child's raw frontmatter.
+            let final_str = crate::prepend_frontmatter(merged_frontmatter.as_deref(), body_clean);
             return Ok(crate::CompiledOutput::Markdown(final_str));
         }
 
@@ -736,14 +740,7 @@ impl ModuleCache {
 
         // Branch: child template (@extends) vs. standalone module.
         if let Some(ext) = module.extends.clone() {
-            return self.process_module_extends(
-                module,
-                ext,
-                ctx,
-                raw_frontmatter,
-                frontmatter_values,
-                warnings,
-            );
+            return self.process_module_extends(module, ext, ctx, frontmatter_values, warnings);
         }
 
         // ── Standalone (non-extending) path ──────────────────────────────────
@@ -826,7 +823,7 @@ impl ModuleCache {
         base_key: &str,
         ctx: &ModuleCtx<'_>,
         warnings: &mut Vec<String>,
-    ) -> Result<Scope, MdsError> {
+    ) -> Result<(Scope, serde_yaml_ng::Mapping), MdsError> {
         // 3d-i: Extract frontmatter imports from BOTH base and child BEFORE the deep merge.
         //
         // Base imports resolve relative to the BASE file's directory (base_base_dir, derived
@@ -890,7 +887,7 @@ impl ModuleCache {
             scope.set_function(name, Arc::clone(func));
         }
 
-        Ok(scope)
+        Ok((scope, merged_mapping))
     }
 
     /// Shared extends-pipeline: steps 3a-3e are identical for the text-cached and
@@ -951,8 +948,11 @@ impl ModuleCache {
         // ── Step 3d: build merged scope (Phase 3: deep merge + per-file FM imports) ──
         // Applies decision #3 (base < child < runtime) and decision #7 (reserved-key
         // exclusion, array wholesale replace, both sets of FM imports resolved per-file).
-        let mut scope =
+        // The merged_mapping is also returned so we can serialize it for the output
+        // frontmatter (#154: @extends emits deep-merged frontmatter).
+        let (mut scope, merged_mapping) =
             self.build_merged_extends_scope(&base, frontmatter_values, &base_key, ctx, warnings)?;
+        let merged_frontmatter = serialize_merged_frontmatter(&merged_mapping)?;
 
         // Collect child's own definitions from its body (currently zero @define after
         // child-only-blocks check, but structurally correct).
@@ -986,6 +986,7 @@ impl ModuleCache {
             skeleton_origin,
             has_explicit_exports,
             explicit_exports,
+            merged_frontmatter,
         })
     }
 
@@ -1027,7 +1028,6 @@ impl ModuleCache {
         module: crate::ast::Module,
         ext: crate::ast::ExtendsDirective,
         ctx: &ModuleCtx<'_>,
-        raw_frontmatter: Option<String>,
         frontmatter_values: Option<serde_yaml_ng::Mapping>,
         warnings: &mut Vec<String>,
     ) -> Result<ResolvedModule, MdsError> {
@@ -1053,6 +1053,7 @@ impl ModuleCache {
             skeleton_origin,
             has_explicit_exports,
             explicit_exports,
+            merged_frontmatter,
         } = components;
 
         let prompt_body = evaluate(&final_body, &mut scope, warnings)?;
@@ -1061,7 +1062,9 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
-            raw_frontmatter,
+            // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
+            // rather than the child's raw frontmatter.
+            raw_frontmatter: merged_frontmatter,
             has_explicit_exports,
             explicit_exports,
             effective_skeleton,
@@ -1654,6 +1657,12 @@ struct ExtendsComponents {
     has_explicit_exports: bool,
     /// Named exports from the child.
     explicit_exports: HashSet<String>,
+    /// Deep-merged frontmatter YAML string (base < child, reserved keys excluded).
+    ///
+    /// Replaces the child's raw frontmatter in the compiled output so that `@extends`
+    /// children emit the full merged key set rather than only their own keys (#154).
+    /// `None` when the merged mapping is empty (no non-reserved FM keys on either side).
+    merged_frontmatter: Option<String>,
 }
 
 /// Bundle of borrowed per-module context threaded through the AST walk helpers.
@@ -2050,6 +2059,38 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
 }
 
 // ── Template inheritance helpers ──────────────────────────────────────────────
+
+/// Serialize a deep-merged frontmatter `Mapping` into a YAML string suitable for
+/// `prepend_frontmatter`.
+///
+/// Returns `Ok(None)` when `mapping` is empty (no non-reserved keys on either side — no
+/// frontmatter block should be emitted). Otherwise returns `Ok(Some(yaml_string))` where
+/// `yaml_string` is the canonical YAML representation of `mapping` with a trailing
+/// newline, ready to be wrapped in `---…---` fences by `prepend_frontmatter`.
+///
+/// Used by `resolve_extends_components` for the `@extends` deep-merged FM output (#154).
+///
+/// # Errors
+///
+/// Returns `Err(MdsError::YamlError)` if YAML serialization of the merged mapping fails.
+/// This is not expected for well-formed mappings produced by `deep_merge_yaml`, but the
+/// failure MUST propagate as a compile error rather than silently dropping the emitted
+/// frontmatter fence from the output (no swallowed errors at boundaries).
+fn serialize_merged_frontmatter(
+    mapping: &serde_yaml_ng::Mapping,
+) -> Result<Option<String>, MdsError> {
+    if mapping.is_empty() {
+        return Ok(None);
+    }
+    let yaml = serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping.clone()))
+        .map_err(|e| MdsError::yaml_error(e.to_string()))?;
+    let trimmed = yaml.trim_end();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!("{trimmed}\n")))
+    }
+}
 
 /// Parse the frontmatter YAML into a `serde_yaml_ng::Mapping` for storage.
 ///

@@ -1005,3 +1005,377 @@ fn fm_import_collision_merge_within_fm() {
         "expected collision error for 'common', got: {msg}"
     );
 }
+
+// ── Issue repros: #150 / #151 (interior-verbatim whitespace contract) ─────────
+//
+// These tests lock in the compile-output end-to-end, verifying that the
+// interior-verbatim contract (blank-line runs preserved, leading/trailing
+// newlines no longer stripped from block/define bodies) is observable at the
+// compiled markdown level and not just in parser AST tests.
+
+#[test]
+fn issue_150_interior_blank_line_runs_preserved_in_compiled_output() {
+    // Issue #150: multiple consecutive blank lines inside a body were being
+    // collapsed to one by clean_output's old newline-run cap. With the
+    // interior-verbatim contract, they must survive to compiled output.
+    let src = "Intro.\n\n\n\nBody.\n";
+    let out = mds::compile_str(src)
+        .expect("#150 repro: should compile")
+        .into_markdown()
+        .expect("#150 repro: expected markdown output");
+    assert_eq!(
+        out, "Intro.\n\n\n\nBody.\n",
+        "#150: interior blank-line run must be preserved verbatim"
+    );
+}
+
+#[test]
+fn issue_151_block_body_edge_newline_preserved_at_compile_boundary() {
+    // Issue #151: @block bodies had their leading/trailing newlines stripped
+    // at parse time (strip_leading_newline / strip_trailing_newline). With
+    // the interior-verbatim contract, the trailing \n before @end is part of
+    // the body and must appear in compiled output, producing a blank line
+    // between the block body and the following skeleton text.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        // "Para A\n" + skeleton "\n" + "Para B\n" was "Para A\nPara B\n" (old).
+        // Now "Para A\n" (body verbatim) + "\n" (skeleton) = "Para A\n\nPara B\n".
+        "@block section:\nPara A.\n@end\n\nPara B.\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = mds::compile_virtual(
+        modules.into_iter().collect::<HashMap<_, _>>(),
+        "child.mds",
+        None,
+    )
+    .expect("#151 repro: should compile")
+    .into_markdown()
+    .expect("#151 repro: expected markdown output");
+    assert_eq!(
+        out, "Para A.\n\nPara B.\n",
+        "#151: trailing \\n of block body + skeleton \\n must produce a blank line"
+    );
+}
+
+// ── Issue repros: #154 (@extends emits deep-merged frontmatter) ───────────────
+//
+// Previously, a child template using @extends only emitted its own raw
+// frontmatter in the compiled output, discarding base frontmatter keys that
+// the child did not explicitly repeat. The fix serializes the deep-merged
+// mapping (base < child, reserved keys excluded) for the output frontmatter.
+
+#[test]
+fn issue_154_extends_emits_merged_frontmatter() {
+    // Base has `model` and `temperature`; child overrides `temperature` and adds `role`.
+    // The compiled output must contain all three non-reserved keys: model (from base),
+    // temperature (child overrides base), and role (child-only).
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "---\nmodel: gpt-4\ntemperature: 0.7\n---\n@block section:\nbase text\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\ntemperature: 0.2\nrole: system\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let out =
+        compile_vfs(modules.into_iter().collect(), "child.mds").expect("#154: should compile");
+    assert!(
+        out.contains("model: gpt-4"),
+        "#154: base-only key 'model' must appear in merged output; got: {out}"
+    );
+    assert!(
+        out.contains("temperature: 0.2"),
+        "#154: child value must win for 'temperature'; got: {out}"
+    );
+    assert!(
+        out.contains("role: system"),
+        "#154: child-only key 'role' must appear in merged output; got: {out}"
+    );
+}
+
+#[test]
+fn issue_154_extends_no_base_frontmatter() {
+    // Base has no frontmatter; child has frontmatter → only child keys emitted.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "@block section:\nbase text\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nrole: user\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = compile_vfs(modules.into_iter().collect(), "child.mds")
+        .expect("#154: no-base-fm case should compile");
+    assert!(
+        out.contains("role: user"),
+        "#154: child-only key 'role' must appear when base has no frontmatter; got: {out}"
+    );
+}
+
+#[test]
+fn issue_154_extends_reserved_keys_excluded_from_output() {
+    // `extends`, `imports`, and `type` are reserved — they must not appear in the
+    // compiled output frontmatter even if they appear in the source.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "---\nmodel: gpt-4\ntype: mds\n---\n@block section:\nbase\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nrole: system\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = compile_vfs(modules.into_iter().collect(), "child.mds")
+        .expect("#154: reserved-key exclusion case should compile");
+    assert!(
+        !out.contains("type:"),
+        "#154: reserved key 'type' must NOT appear in merged output; got: {out}"
+    );
+    assert!(
+        !out.contains("extends:"),
+        "#154: reserved key 'extends' must NOT appear in merged output; got: {out}"
+    );
+    assert!(
+        out.contains("model: gpt-4"),
+        "#154: non-reserved key 'model' must still appear; got: {out}"
+    );
+    assert!(
+        out.contains("role: system"),
+        "#154: non-reserved key 'role' must still appear; got: {out}"
+    );
+}
+
+#[test]
+fn issue_154_extends_no_frontmatter_on_either_side() {
+    // Neither base nor child has frontmatter → no frontmatter block in output.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "@block section:\nbase text\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "@extends \"./base.mds\"\n".to_string(),
+    );
+    let out = compile_vfs(modules.into_iter().collect(), "child.mds")
+        .expect("#154: no-fm case should compile");
+    assert!(
+        !out.contains("---"),
+        "#154: output must not contain frontmatter fences when neither side has FM; got: {out}"
+    );
+}
+
+// ── Issue repros: #152 (cross-type comparison errors, --set-string) ───────────
+//
+// Previously, comparing values of different types (e.g. number vs string) in
+// an @if condition silently returned false (for ==) or true (for !=), leading
+// to confusing logic bugs. The fix makes cross-type comparisons a runtime
+// TypeMismatch error, forcing explicit type conversion before comparison.
+
+#[test]
+fn issue_152_cross_type_eq_is_type_mismatch_error() {
+    // `@if x == "3":` with x=3 (number from frontmatter) — number vs string is a
+    // TypeMismatch error, not a silent false.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@else:\nno\n@end\n";
+    let err = mds::compile_str(src).expect_err("#152 repro: cross-type == must be a runtime error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "#152: expected TypeMismatch error for number == string, got: {msg}"
+    );
+}
+
+#[test]
+fn issue_152_type_mismatch_help_mentions_set_string() {
+    // The TypeMismatch help text must reference --set-string so users know how
+    // to pass a string value without type coercion.  This pins the contract
+    // specified for the error's help field — QA black-box tested exactly this.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src).expect_err("#152: cross-type == must error");
+    let help = miette::Diagnostic::help(&err)
+        .map(|h| h.to_string())
+        .unwrap_or_default();
+    assert!(
+        help.contains("--set-string"),
+        "#152: TypeMismatch help must mention --set-string; got: {help:?}"
+    );
+}
+
+#[test]
+fn issue_152_cross_type_neq_is_type_mismatch_error() {
+    // `@if x != "3":` with x=3 (number) — was silently returning true. Now an error.
+    let src = "---\nx: 3\n---\n@if x != \"3\":\ndiff\n@else:\nsame\n@end\n";
+    let err = mds::compile_str(src).expect_err("#152 repro: cross-type != must be a runtime error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "#152: expected TypeMismatch error for number != string, got: {msg}"
+    );
+}
+
+#[test]
+fn issue_152_same_type_eq_still_works() {
+    // Same-type comparisons must continue to work correctly after the change.
+    let src = "---\nname: Alice\n---\n@if name == \"Alice\":\nhello Alice\n@end\n";
+    let out = mds::compile_str(src)
+        .expect("#152: same-type string == should succeed")
+        .into_markdown()
+        .expect("#152: expected markdown");
+    assert!(out.contains("hello Alice"), "#152: same-type eq must work");
+}
+
+#[test]
+fn issue_152_set_string_forces_string_type() {
+    // When a variable is set via the --set-string equivalent (Value::String), comparing
+    // it with a string literal must succeed (same-type comparison).
+    let src = "---\n---\n@if count == \"3\":\nstring match\n@else:\nno match\n@end\n";
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("count".to_string(), mds::Value::String("3".to_string()));
+    let out = mds::compile_str_with(src, None, Some(vars))
+        .expect("#152: string count == \"3\" should succeed")
+        .into_markdown()
+        .expect("#152: expected markdown");
+    assert!(
+        out.contains("string match"),
+        "#152: --set-string should make count a string so count == \"3\" is true"
+    );
+}
+
+// ── Round-trip acceptance test (#150/#151) ────────────────────────────────────
+//
+// A realistic template with frontmatter, post-FM blank line, lists, an indented
+// code fence inside a list item, interior blank runs, and a trailing-space line
+// is compiled through the pass-through pipeline. The compiled output must be
+// byte-identical to the source modulo the two carve-outs mandated by the
+// interior-verbatim contract (#150/#151):
+//   1. Trailing-edge normalization: any trailing whitespace is stripped, exactly
+//      one final newline is appended.
+//   2. \r characters are stripped unconditionally.
+
+#[test]
+fn round_trip_interior_verbatim_byte_identical() {
+    // Source deliberately contains:
+    // - Frontmatter with two keys
+    // - Blank line after the closing ---
+    // - A list with an indented code fence inside a list item
+    // - Literal braces inside the fence (must not be interpolated)
+    // - Interior blank runs (must be preserved verbatim)
+    // - A trailing-space "blank" line (preserved: body-text trailing whitespace
+    //   is NOT stripped by `clean_output` — only the very trailing edge is)
+    let src = concat!(
+        "---\n",
+        "author: test\n",
+        "version: 1\n",
+        "---\n",
+        "\n",
+        "- First item\n",
+        "- Second item with fence:\n",
+        "\n",
+        "  ```json\n",
+        "  {\"key\": \"value\"}\n",
+        "  ```\n",
+        "\n",
+        "- Third item\n",
+        "\n",
+        "Interior blank run above is preserved.\n",
+        "  \n",
+        "Trailing-space line above; this is the last line.\n",
+    );
+
+    let out = mds::compile_str(src)
+        .expect("round-trip source must compile")
+        .into_markdown()
+        .expect("expected markdown");
+
+    // Apply the two permitted carve-outs to the source for the expected value.
+    // clean_output: strip \r, trim trailing whitespace, add one final \n.
+    let frontmatter_part = "---\nauthor: test\nversion: 1\n---\n";
+    let body_part = concat!(
+        "\n",
+        "- First item\n",
+        "- Second item with fence:\n",
+        "\n",
+        "  ```json\n",
+        "  {\"key\": \"value\"}\n",
+        "  ```\n",
+        "\n",
+        "- Third item\n",
+        "\n",
+        "Interior blank run above is preserved.\n",
+        "  \n",
+        "Trailing-space line above; this is the last line.\n",
+    );
+    // After clean_output: \r stripped (none here), trailing edge normalized to one \n.
+    // The body ends with "\n" already, so clean_output produces body_part as-is
+    // (trim_end removes the trailing \n-only sequence, then push_str adds one back).
+    let expected = format!("{frontmatter_part}{body_part}");
+
+    assert_eq!(
+        out, expected,
+        "compiled output must be byte-identical to source (modulo trailing-edge normalization)"
+    );
+}
+
+// ── Integration repro: #149 — indented fence with literal braces ──────────────
+
+#[test]
+fn issue_149_indented_fence_inside_list_item_with_braces() {
+    // An indented code fence inside a list item containing literal `{braces}`
+    // must compile successfully: braces inside the fence are NOT interpolated,
+    // and the fence lines are emitted verbatim.
+    let src = concat!(
+        "Here is a list:\n",
+        "\n",
+        "- Step 1: use the API\n",
+        "\n",
+        "  ```json\n",
+        "  {\"action\": \"query\", \"filter\": {\"type\": \"all\"}}\n",
+        "  ```\n",
+        "\n",
+        "- Step 2: done\n",
+    );
+    let out = mds::compile_str(src)
+        .expect("#149: indented fence in list item with braces must compile")
+        .into_markdown()
+        .expect("#149: expected markdown output");
+
+    // The braces inside the fence must appear literally in the output.
+    assert!(
+        out.contains("{\"action\": \"query\""),
+        "#149: literal braces inside indented fence must be preserved; got: {out}"
+    );
+    assert!(
+        out.contains("```json"),
+        "#149: fence opener must be verbatim; got: {out}"
+    );
+    assert!(
+        out.contains("```\n"),
+        "#149: fence closer must be verbatim; got: {out}"
+    );
+}
+
+// ── Integration repro: #153 — invalid interpolation hint says \{ not \{{ ───────
+
+#[test]
+fn issue_153_invalid_interpolation_hint_text() {
+    // Compiling a file with an invalid interpolation shape must produce an error
+    // whose hint text contains `\{` (single brace) and NOT `\{{` (double brace).
+    let src = "{123invalid}\n";
+    let err = mds::compile_str(src).expect_err("#153: invalid interpolation must fail to compile");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("\\{"),
+        "#153: error hint must mention \\{{ (single brace escape); got: {msg}"
+    );
+    // Guard the regression: must NOT say \{{ (double brace — old broken form).
+    assert!(
+        !msg.contains("\\{{"),
+        "#153: error hint must NOT say \\{{{{  (double brace); got: {msg}"
+    );
+}

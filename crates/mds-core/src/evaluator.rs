@@ -373,7 +373,7 @@ fn invoke_function(
         scope.set_var(&param.name, value);
     }
     ctx.call_stack.push(call_key.to_string());
-    let result = evaluate_nodes(&func.body, scope, ctx);
+    let result = evaluate_nodes(&func.body, scope, ctx).map(|s| s.trim().to_string());
     // Safety-critical LIFO invariant: call_stack tracks recursion detection.
     // A mismatched pop would silently corrupt recursion state and allow
     // stack overflows. Return a structured error rather than panicking so
@@ -446,17 +446,28 @@ fn call_qualified_function(
     invoke_function(&func, &qualified_name, args, scope, ctx).map(Value::String)
 }
 
-/// Compare two runtime `Value` instances using strict equality.
+/// Compare two runtime `Value` instances for strict same-type equality.
 ///
-/// Type matching is strict — `Number(3) != String("3")`. Different types always
-/// return `false`. `NaN == NaN` is `false` (IEEE 754 via Rust's `f64 ==`).
-fn values_equal_runtime(lhs: &Value, rhs: &Value) -> bool {
+/// Returns `Some(true)` / `Some(false)` for same-type comparisons, and `None`
+/// for cross-type comparisons (caller must surface a `TypeMismatch` error).
+/// `NaN == NaN` is `Some(false)` (IEEE 754 via Rust's `f64 ==`).
+///
+/// Arrays and objects use structural (deep) equality: `Value` derives `PartialEq`,
+/// so this is a recursive element-wise comparison. Note that the condition grammar
+/// currently cannot express container literals on the RHS, so same-type container
+/// comparisons are only reachable at the unit-test level today — these arms guard
+/// future grammar extensions and ensure the contract is correct: same-type always
+/// compares structurally, only cross-type is an error.
+fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
     match (lhs, rhs) {
-        (Value::String(a), Value::String(b)) => a == b,
-        (Value::Number(a), Value::Number(b)) => a == b,
-        (Value::Boolean(a), Value::Boolean(b)) => a == b,
-        (Value::Null, Value::Null) => true,
-        _ => false,
+        (Value::String(a), Value::String(b)) => Some(a == b),
+        (Value::Number(a), Value::Number(b)) => Some(a == b),
+        (Value::Boolean(a), Value::Boolean(b)) => Some(a == b),
+        (Value::Null, Value::Null) => Some(true),
+        (Value::Array(a), Value::Array(b)) => Some(a == b),
+        (Value::Object(a), Value::Object(b)) => Some(a == b),
+        // Cross-type: signal TypeMismatch to the caller.
+        _ => None,
     }
 }
 
@@ -479,12 +490,15 @@ fn evaluate_condition(
         Condition::Eq(lhs, rhs) => {
             let lhs_val = evaluate_expr(lhs, scope, ctx)?;
             let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            Ok(values_equal_runtime(&lhs_val, &rhs_val))
+            values_equal_same_type(&lhs_val, &rhs_val)
+                .ok_or_else(|| MdsError::type_mismatch(lhs_val.type_name(), rhs_val.type_name()))
         }
         Condition::NotEq(lhs, rhs) => {
             let lhs_val = evaluate_expr(lhs, scope, ctx)?;
             let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            Ok(!values_equal_runtime(&lhs_val, &rhs_val))
+            values_equal_same_type(&lhs_val, &rhs_val)
+                .map(|eq| !eq)
+                .ok_or_else(|| MdsError::type_mismatch(lhs_val.type_name(), rhs_val.type_name()))
         }
         // Short-circuit And: return false on first false operand.
         // Parser invariant: And operands are always leaf conditions (parse_and_level calls
@@ -1197,19 +1211,143 @@ mod tests {
         );
     }
 
-    // ── values_equal_runtime: NaN semantics ─────────────────────────────────
+    // ── values_equal_same_type: NaN semantics ───────────────────────────────
 
     #[test]
     fn values_equal_nan_is_not_equal_to_itself() {
-        // IEEE 754 defines NaN != NaN. values_equal_runtime must follow this — even
+        // IEEE 754 defines NaN != NaN. values_equal_same_type must follow this — even
         // though the parser rejects NaN literals in condition expressions, the runtime
         // Value type holds f64 and could theoretically carry a NaN produced by arithmetic.
-        // Verify that values_equal_runtime returns false for NaN == NaN.
+        // Verify that values_equal_same_type returns Some(false) for NaN == NaN.
         let nan_value = Value::Number(f64::NAN);
         let nan_value2 = Value::Number(f64::NAN);
-        assert!(
-            !values_equal_runtime(&nan_value, &nan_value2),
+        assert_eq!(
+            values_equal_same_type(&nan_value, &nan_value2),
+            Some(false),
             "NaN must not equal NaN (IEEE 754)"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_returns_none_for_cross_type() {
+        // Cross-type comparisons must return None, not a bool.
+        let s = Value::String("3".to_string());
+        let n = Value::Number(3.0);
+        let b = Value::Boolean(true);
+        let null = Value::Null;
+
+        assert_eq!(values_equal_same_type(&s, &n), None, "string vs number");
+        assert_eq!(values_equal_same_type(&n, &b), None, "number vs boolean");
+        assert_eq!(values_equal_same_type(&b, &null), None, "boolean vs null");
+        assert_eq!(values_equal_same_type(&s, &null), None, "string vs null");
+    }
+
+    // ── values_equal_same_type: container structural equality ────────────────
+
+    #[test]
+    fn values_equal_same_type_arrays_equal() {
+        // [1, 2] == [1, 2] → Some(true)
+        let a = Value::Array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let b = Value::Array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        assert_eq!(
+            values_equal_same_type(&a, &b),
+            Some(true),
+            "[1,2] == [1,2] must be Some(true)"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_arrays_order_matters() {
+        // [1, 2] != [2, 1] → Some(false)
+        let a = Value::Array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let b = Value::Array(vec![Value::Number(2.0), Value::Number(1.0)]);
+        assert_eq!(
+            values_equal_same_type(&a, &b),
+            Some(false),
+            "[1,2] vs [2,1] must be Some(false) — order is significant"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_objects_equal() {
+        // {a: 1} == {a: 1} → Some(true)
+        let mut m1 = std::collections::HashMap::new();
+        m1.insert("a".to_string(), Value::Number(1.0));
+        let mut m2 = std::collections::HashMap::new();
+        m2.insert("a".to_string(), Value::Number(1.0));
+        assert_eq!(
+            values_equal_same_type(&Value::Object(m1), &Value::Object(m2)),
+            Some(true),
+            "{{a:1}} == {{a:1}} must be Some(true)"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_objects_unequal() {
+        // {a: 1} != {a: 2} → Some(false)
+        let mut m1 = std::collections::HashMap::new();
+        m1.insert("a".to_string(), Value::Number(1.0));
+        let mut m2 = std::collections::HashMap::new();
+        m2.insert("a".to_string(), Value::Number(2.0));
+        assert_eq!(
+            values_equal_same_type(&Value::Object(m1), &Value::Object(m2)),
+            Some(false),
+            "{{a:1}} vs {{a:2}} must be Some(false)"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_nested_array_equal() {
+        // [[1], [2]] == [[1], [2]] → Some(true)
+        let a = Value::Array(vec![
+            Value::Array(vec![Value::Number(1.0)]),
+            Value::Array(vec![Value::Number(2.0)]),
+        ]);
+        let b = Value::Array(vec![
+            Value::Array(vec![Value::Number(1.0)]),
+            Value::Array(vec![Value::Number(2.0)]),
+        ]);
+        assert_eq!(
+            values_equal_same_type(&a, &b),
+            Some(true),
+            "nested [[1],[2]] == [[1],[2]] must be Some(true)"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_empty_arrays_equal() {
+        // [] == [] → Some(true)
+        let a = Value::Array(vec![]);
+        let b = Value::Array(vec![]);
+        assert_eq!(
+            values_equal_same_type(&a, &b),
+            Some(true),
+            "[] == [] must be Some(true)"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_array_nan_element() {
+        // [NaN] == [NaN] → Some(false) because NaN != NaN per IEEE 754
+        let a = Value::Array(vec![Value::Number(f64::NAN)]);
+        let b = Value::Array(vec![Value::Number(f64::NAN)]);
+        assert_eq!(
+            values_equal_same_type(&a, &b),
+            Some(false),
+            "[NaN] == [NaN] must be Some(false) — NaN ≠ NaN propagates through arrays"
+        );
+    }
+
+    #[test]
+    fn values_equal_same_type_array_element_type_mismatch_returns_false() {
+        // [1] vs ["1"] is a same-type (both Array) comparison but with a differing
+        // element type — must return Some(false) (not None / not an error).
+        let a = Value::Array(vec![Value::Number(1.0)]);
+        let b = Value::Array(vec![Value::String("1".to_string())]);
+        assert_eq!(
+            values_equal_same_type(&a, &b),
+            Some(false),
+            "[1] vs [\"1\"] must be Some(false) — element type differs but outer type matches"
         );
     }
 
@@ -1332,6 +1470,50 @@ mod tests {
     fn evaluate_arity_error_on_too_few_required_args() {
         let result = crate::compile_str_md("@define greet(name):\n{name}\n@end\n{greet()}\n");
         assert!(result.is_err(), "too few required args should fail");
+    }
+
+    // ── @define body edge-trim contract (spec §4.11) ──────────────────────────
+    //
+    // invoke_function trims the body output at its EDGES (leading/trailing whitespace)
+    // while preserving interior blank runs verbatim. This matches the @message body
+    // contract (symmetric per spec §4.11). Locked here so a refactor of invoke_function
+    // cannot silently change the trimming semantics.
+
+    #[test]
+    fn define_edge_trim_removes_leading_and_trailing_blank_lines() {
+        // Body has a leading blank line and a trailing blank line around the content.
+        // After edge-trim the blank lines are removed; only the content (and its
+        // trailing newline from the template output) survives.
+        let src = "@define body():\n\nHello.\n\n@end\n{body()}\n";
+        let result = crate::compile_str_md(src).unwrap();
+        assert_eq!(
+            result, "Hello.\n",
+            "edge-trim must strip leading and trailing blank lines from @define body"
+        );
+    }
+
+    #[test]
+    fn define_edge_trim_preserves_interior_blank_run() {
+        // Body has leading blank lines, an interior blank run, and trailing blank lines.
+        // Edge-trim removes the outer blank lines; the interior blank run is preserved.
+        let src = "@define body():\n\nLine one.\n\nLine two.\n\n@end\n{body()}\n";
+        let result = crate::compile_str_md(src).unwrap();
+        assert_eq!(
+            result, "Line one.\n\nLine two.\n",
+            "edge-trim must preserve interior blank run while removing leading/trailing blank lines"
+        );
+    }
+
+    #[test]
+    fn define_edge_trim_leading_indentation_stripped() {
+        // A leading newline before indented content: edge-trim removes the leading
+        // whitespace (newline) while preserving the body content.
+        let src = "@define body():\n\nContent here.\n@end\n{body()}\n";
+        let result = crate::compile_str_md(src).unwrap();
+        assert_eq!(
+            result, "Content here.\n",
+            "edge-trim must strip leading blank line even when body has no trailing blank line"
+        );
     }
 
     // ── Built-in functions integration ────────────────────────────────────────

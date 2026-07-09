@@ -7,21 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace
+
+These changes alter observable runtime behavior and compiled output. Templates relying
+on the previous (buggy) behavior must be updated.
+
+#### Cross-type comparisons are now errors (#152)
+
+`@if a == b:` or `@if a != b:` where `a` and `b` are different types (e.g. a number
+vs. a string, or a boolean vs. null) now raises `mds::type_mismatch` at runtime
+instead of silently returning `false` (for `==`) or `true` (for `!=`).
+
+**Migration:** add an explicit conversion before comparing:
+- `@if str(count) == "3":` — convert number to string
+- `@if count == 3:` — compare number to number literal
+
+#### Cross-flag duplicate keys in `--set` / `--set-string` are now a hard error (#152)
+
+Supplying the same variable key via both `--set KEY=VALUE` and `--set-string KEY=VALUE`
+in a single invocation is now rejected at startup with an explicit error.
+
+**Migration:** remove the duplicate key from one flag.
+
+#### `@extends` emits deep-merged frontmatter (#154)
+
+Compiled output for a child template now contains the **deep-merged** frontmatter
+(base keys + child keys, child wins on collision, reserved keys `imports`/`type`/`extends`
+excluded) rather than only the child's raw frontmatter. Base-only frontmatter keys
+now appear in the compiled output.
+
+**Migration:** if your pipeline depends on base frontmatter keys being absent from the
+compiled output, strip them downstream or move them to a non-frontmatter location.
+
 ### Added
+
+- **`--set-string KEY=VALUE`** CLI flag for `mds build`, `mds check`, and `mds watch`.
+  Sets a variable as a string without type coercion — useful when a value is
+  numeric-looking but must stay a string (e.g. `mds build t.mds --set-string id=007`).
+  Repeatable. (#152)
 
 - **`mds fmt`** — an opinionated, safety-gated auto-formatter for `.mds` templates. Every
   rewrite is guaranteed compile-equivalent: a runtime safety gate re-compiles the formatted
   source and refuses to write if it would change compiled output (`mds::formatter_invariant`)
   rather than silently corrupting a template. Normalizes CRLF to LF everywhere (including
-  inside frontmatter and code fences), collapses runs of two or more consecutive blank lines
-  to a single blank line, strips trailing whitespace on directive lines, and ensures exactly
-  one final newline — while leaving body-text trailing whitespace (Markdown hard breaks),
-  blank-line structure within frontmatter and code fences, and the byte-for-byte content of
-  `@message`/`@define` bodies untouched. Supports a single file,
-  a directory (recursive, including `_`-prefixed partials), or stdin (`-`, as a filter);
-  `--check` exits non-zero without writing when anything would change, and `--diff` prints a
-  unified diff (colorized on a TTY) without writing. New public `mds-core` API:
-  `format_str` / `format_str_with`. (#60)
+  inside frontmatter and code fences), strips trailing whitespace on directive lines, and
+  ensures exactly one trailing newline — while leaving interior blank lines, blank-line
+  structure within frontmatter and code fences, body-text trailing whitespace (Markdown
+  hard breaks), and the byte-for-byte content of `@message`/`@define` bodies untouched.
+  Supports a single file, a directory (recursive, including `_`-prefixed partials), or
+  stdin (`-`, as a filter); `--check` exits non-zero without writing when anything would
+  change, and `--diff` prints a unified diff (colorized on a TTY) without writing. New
+  public `mds-core` API: `format_str` / `format_str_with`. (#60)
 
 - **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), to be distributed
   as `mdscript` on PyPI. Seven functions — `compile`, `compile_file`,
@@ -38,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING:** Interior-verbatim whitespace contract for block bodies and `mds fmt`.
+  Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
+  `mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
+  The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
+  equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
+  exactly one final newline). **Migration:** compiled outputs may gain blank lines that
+  were previously collapsed or stripped; templates relying on this collapse must remove
+  the extra blank lines at the source level. (#150, #151)
+
 - **BREAKING:** `FileSystem` trait now requires two new methods — `normalize_in_dir`
   and `parent_dir` — that replace the internal `<source>` path-sentinel pattern.
   String-source `@import`/`@extends` resolution is now directly directory-anchored:
@@ -47,6 +92,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#146)
 
 ### Fixed
+
+- **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
+  as passthrough regions. Previously only `` ``` ``-fences that started at column 1
+  were treated as code — a `~~~` fence, a `` > ``` `` blockquote fence, or a fence
+  indented with spaces/tabs would allow interpolation and directive parsing inside,
+  silently corrupting output for affected templates. The lexer now matches any fence
+  that starts with `[ \t>]*` followed by three or more matching backticks or tildes.
+  (#149)
+
+- **Interpolation errors now suggest `\{`** in the help text when a closed interpolation
+  contains an invalid expression (e.g. `{foo bar}` or `{1+2}`). Helps users who intended
+  a literal `{` but received a parse error on the expression inside. (#153)
 
 - **Windows: string-source `@import`/`@extends` now resolve relative imports
   correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path

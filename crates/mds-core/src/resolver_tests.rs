@@ -1457,6 +1457,52 @@ fn f6_base_only_key_visible_in_child() {
 }
 
 #[test]
+fn f6_nested_reserved_key_config_type_survives_merge() {
+    // F6 / depth-gating fix: a nested key named `type` inside a sub-mapping (e.g.
+    // `config.type: mds`) must survive the deep merge and appear in the compiled output.
+    // Previously deep_merge_yaml filtered all keys named "type" at every recursion depth,
+    // silently dropping user data inside nested objects.
+    let base = concat!(
+        "---\n",
+        "config:\n",
+        "  type: mds\n",
+        "  model: gpt-4\n",
+        "model: base-model\n",
+        "---\n",
+        "@block content:\n",
+        "{config.model}\n",
+        "@end\n",
+    );
+    let child = concat!(
+        "---\n",
+        "role: system\n",
+        "---\n",
+        "@extends \"./base.mds\"\n",
+    );
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let mut warnings = vec![];
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut warnings)
+        .expect("F6 nested reserved key: should compile");
+
+    // Compiled output (body) uses config.model from merged scope.
+    let body = resolved.prompt_body.as_deref().unwrap_or("");
+    assert!(
+        body.contains("gpt-4"),
+        "config.model must be in scope: {body}"
+    );
+
+    // Emitted frontmatter must contain `config.type: mds` — the nested `type` key
+    // must NOT be stripped by the reserved-key filter.
+    let fm = resolved.raw_frontmatter.as_deref().unwrap_or("");
+    assert!(
+        fm.contains("type: mds") || fm.contains("type: 'mds'") || fm.contains("\"type\": mds"),
+        "config.type nested key must survive into emitted frontmatter; got: {fm}"
+    );
+}
+
+#[test]
 fn f7_runtime_override_precedence() {
     // F7: runtime --set overrides merged frontmatter (base < child < runtime).
     // We test at the ResolvedModule level to check the rendered body directly,
@@ -1727,20 +1773,23 @@ fn regression_non_extending_file_fm_unchanged() {
 }
 
 #[test]
-fn f4_child_emits_only_own_raw_frontmatter() {
-    // decision #7 / output emission: extending child emits only its own raw_frontmatter.
-    // Base frontmatter is an input to scope, not output.
+fn f4_extends_emits_deep_merged_frontmatter() {
+    // #154 — @extends must emit the deep-merged frontmatter (base < child),
+    // not just the child's raw FM. Reserved keys (imports, type, extends) are
+    // excluded; non-reserved keys from both sides appear in the output.
     let base = concat!(
         "---\n",
-        "base_secret: only_in_base\n",
+        "base_key: from_base\n",
+        "shared_key: base_wins_without_child_override\n",
         "---\n",
         "@block content:\n",
-        "{base_secret}\n",
+        "{base_key}\n",
         "@end\n",
     );
     let child = concat!(
         "---\n",
-        "child_var: in_child\n",
+        "child_key: from_child\n",
+        "shared_key: child_overrides_base\n",
         "---\n",
         "@extends \"./base.mds\"\n",
     );
@@ -1752,21 +1801,32 @@ fn f4_child_emits_only_own_raw_frontmatter() {
         .resolve_key("child.mds", &Default::default(), &mut warnings)
         .expect("output emission test should compile");
 
-    // raw_frontmatter in the resolved module is the child's raw FM (not base's).
-    if let Some(ref raw_fm) = child_resolved.raw_frontmatter {
-        assert!(
-            !raw_fm.contains("base_secret"),
-            "child output must NOT contain base frontmatter: {raw_fm}"
-        );
-        assert!(
-            raw_fm.contains("child_var"),
-            "child output must contain child's own frontmatter: {raw_fm}"
-        );
-    }
-    // The compiled output uses the merged scope (base_secret visible to blocks)
+    // raw_frontmatter in the resolved module is the deep-merged FM (base < child).
+    let raw_fm = child_resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have frontmatter");
+    assert!(
+        raw_fm.contains("base_key"),
+        "merged output must contain base-only key; got: {raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("child_key"),
+        "merged output must contain child-only key; got: {raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("child_overrides_base"),
+        "child value must win for shared_key; got: {raw_fm}"
+    );
+    assert!(
+        !raw_fm.contains("base_wins_without_child_override"),
+        "base value for shared_key must be overridden; got: {raw_fm}"
+    );
+
+    // The compiled body still uses the merged scope (base_key visible to blocks).
     let output = child_resolved.prompt_body.as_deref().unwrap_or("");
     assert!(
-        output.contains("only_in_base"),
+        output.contains("from_base"),
         "merged scope used: base var rendered in block: {output}"
     );
 }
@@ -2271,74 +2331,67 @@ fn pf004_messages_mode_extends_validates_final_body_parity() {
 #[test]
 fn f11_whitespace_contract_4_combination_matrix() {
     // Base skeleton: text before, one @block, text after.
-    // Between the Text("Intro.\n\n") node and the @block body there is NO
-    // extra whitespace beyond what the skeleton text nodes carry.
+    // Interior-verbatim contract (#150/#151): block body bytes pass through
+    // exactly as authored; only the directive lines (@block … :, @end) are
+    // consumed. The trailing \n before @end is now part of the body.
     //
     // Base source (repr): "Intro.\n\n@block body:\nDefault body.\n@end\n\nAfter.\n"
     //
     // Skeleton nodes after parse:
     //   Text("Intro.\n\n")
-    //   Block("body")  body = [Text("Default body.")]   ← edge \n stripped
-    //   Text("\nAfter.\n")                              ← the blank line + After.
+    //   Block("body")  body = [Text("Default body.\n")]  ← verbatim, no edge strip
+    //   Text("\nAfter.\n")                               ← the blank line + After.
     let base = "Intro.\n\n@block body:\nDefault body.\n@end\n\nAfter.\n";
 
     // ── Combination 1: base default, no child override ────────────────────
     // Child has no @block override — effective_blocks use the base default.
-    // Between-block blank line (\n before "After.") preserved verbatim.
+    // Body text "Default body.\n" + skeleton "\nAfter.\n" → blank line preserved.
     {
         let child = "@extends \"./base.mds\"\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-1: should compile");
         assert_eq!(
-            out, "Intro.\n\nDefault body.\nAfter.\n",
-            "F11 combo-1: base default — between-block blank line preserved, body edge stripped"
+            out, "Intro.\n\nDefault body.\n\nAfter.\n",
+            "F11 combo-1: base default — body verbatim, trailing \\n + skeleton \\n = blank line"
         );
     }
 
     // ── Combination 2: override with no surrounding blank lines ───────────
-    // Block body = "Override." (no leading/trailing blank lines).
-    // After edge-strip: body = [Text("Override.")].
+    // Block body bytes (verbatim): "Override.\n"
+    // Body text "Override.\n" + skeleton "\nAfter.\n" → blank line.
     {
         let child = "@extends \"./base.mds\"\n@block body:\nOverride.\n@end\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-2: should compile");
         assert_eq!(
-            out, "Intro.\n\nOverride.\nAfter.\n",
-            "F11 combo-2: override without blank lines — clean output"
+            out, "Intro.\n\nOverride.\n\nAfter.\n",
+            "F11 combo-2: override without blank lines — trailing \\n + skeleton \\n = blank line"
         );
     }
 
     // ── Combination 3: override WITH leading+trailing blank lines ─────────
-    // Block body raw = "\nOverride.\n\n" (blank line before + blank line after).
-    // strip_leading_newline removes ONE leading \n  → "Override.\n\n"
-    // strip_trailing_newline removes ONE trailing \n → "Override.\n"
-    // Residual \n becomes part of the rendered block body, producing an extra
-    // blank line BEFORE the "After." skeleton text node ("\nAfter.\n").
-    // This pins decision #9: only one edge \n is stripped — extra interior
-    // blank lines are preserved.
+    // Block body bytes (verbatim): "\nOverride.\n\n"
+    // Full verbatim run: "Intro.\n\n" + "\nOverride.\n\n" + "\nAfter.\n"
     {
         let child = "@extends \"./base.mds\"\n@block body:\n\nOverride.\n\n@end\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-3: should compile");
         assert_eq!(
-                out,
-                "Intro.\n\nOverride.\n\nAfter.\n",
-                "F11 combo-3: override with surrounding blanks — extra blank line inside body preserved (only edge \n stripped)"
-            );
+            out, "Intro.\n\n\nOverride.\n\n\nAfter.\n",
+            "F11 combo-3: override with surrounding blanks — full verbatim run preserved"
+        );
     }
 
     // ── Combination 4: override with indented content ─────────────────────
-    // Block body raw = "  Indented.\n".
-    // strip_leading_newline: no leading \n, no change.
-    // strip_trailing_newline: pop \n → "  Indented."
-    // Leading spaces are preserved verbatim (base author's indentation style).
+    // Block body bytes (verbatim): "  Indented.\n"
+    // Body "  Indented.\n" + skeleton "\nAfter.\n" → blank line between.
     {
         let child = "@extends \"./base.mds\"\n@block body:\n  Indented.\n@end\n";
         let files = [("base.mds", base), ("child.mds", child)];
         let out = compile_virtual(&files, "child.mds").expect("F11 combo-4: should compile");
         assert_eq!(
-            out, "Intro.\n\n  Indented.\nAfter.\n",
-            "F11 combo-4: indented override — leading spaces preserved verbatim"
+            out, "Intro.\n\n  Indented.\n\nAfter.\n",
+            "F11 combo-4: indented override — verbatim, trailing \\n + skeleton \\n = blank line"
         );
     }
 }
@@ -2892,6 +2945,186 @@ fn source_label_appears_in_string_source_diagnostics() {
     assert!(
         rendered.contains("<source>"),
         "string-source diagnostic must contain '<source>' as the file label, got:\n{rendered}"
+    );
+}
+
+// ── Adversarial YAML-injection: core-level twin (#154) ───────────────────────
+//
+// These tests exercise the resolver's `raw_frontmatter` serialization path
+// (serialize_merged_frontmatter / serde_yaml_ng::to_string) to verify that values
+// containing fence-like sequences, YAML document-end markers, or block-scalar
+// `type: mds` lines cannot escape the emitted frontmatter block and smuggle
+// additional top-level keys into the compiled output.
+//
+// The CLI-level mirror lives in crates/mds-cli/tests/frontmatter.rs.
+
+#[test]
+fn adversarial_injection_fence_sequence_in_fm_value() {
+    // A frontmatter value containing a literal `\n---\n` YAML document separator
+    // must be serialized as a quoted/escaped YAML string and must NOT break the
+    // outer `---`/`---` fence structure.
+    let base = concat!(
+        "---\n",
+        "prompt: \"start\\n---\\ninjected: evil\\n---\\nend\"\n",
+        "---\n",
+        "@block body:\ndefault\n@end\n",
+    );
+    let child = concat!("---\nrole: system\n---\n", "@extends \"./base.mds\"\n");
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut vec![])
+        .expect("should compile despite adversarial FM value");
+
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+
+    // Extract ONLY the frontmatter section (between the first --- and second ---).
+    // Using the full raw_frontmatter string directly since it's already the inner YAML.
+    let has_injected = raw_fm.lines().any(|l| l == "injected: evil");
+    assert!(
+        !has_injected,
+        "adversarial 'injected: evil' must not appear as a top-level FM key; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("role: system"),
+        "role key must survive; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("prompt:"),
+        "prompt key must survive; raw_fm={raw_fm}"
+    );
+}
+
+#[test]
+fn adversarial_injection_yaml_end_marker_in_fm_value() {
+    // A frontmatter value containing `\n...\n` (YAML stream-end marker) must
+    // be serialized safely and must not close the document prematurely.
+    let base = concat!(
+        "---\n",
+        "note: \"before\\n...\\nafter\"\n",
+        "---\n",
+        "@block body:\ndefault\n@end\n",
+    );
+    let child = concat!("---\nrole: user\n---\n", "@extends \"./base.mds\"\n");
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut vec![])
+        .expect("should compile despite YAML end-marker in value");
+
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+
+    // The end-marker must not split the frontmatter YAML; both keys must appear.
+    assert!(
+        raw_fm.contains("role: user"),
+        "role key must be in raw_fm; got: {raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("note:"),
+        "note key must be in raw_fm; got: {raw_fm}"
+    );
+}
+
+#[test]
+fn adversarial_injection_block_scalar_type_mds_not_stripped() {
+    // A block-scalar FM value whose lines include `type: mds` must not be
+    // confused with the top-level `type: mds` directive — only an unindented
+    // top-level `type: mds` key should be stripped from the emitted output.
+    let base = concat!(
+        "---\n",
+        "description: |\n",
+        "  type: mds\n",
+        "  this is a block scalar\n",
+        "model: gpt-4\n",
+        "---\n",
+        "@block body:\ndefault\n@end\n",
+    );
+    let child = "@extends \"./base.mds\"\n";
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &Default::default(), &mut vec![])
+        .expect("should compile");
+
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+
+    // No unindented `type: mds` key in the raw frontmatter.
+    let has_top_level_type = raw_fm.lines().any(|l| l == "type: mds");
+    assert!(
+        !has_top_level_type,
+        "unindented 'type: mds' must not appear as a top-level key; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("description:"),
+        "description key must be present; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("model:"),
+        "model key must be present; raw_fm={raw_fm}"
+    );
+}
+
+// ── f7 extension: emitted FM ignores --set (#154) ────────────────────────────
+
+#[test]
+fn f7_emitted_frontmatter_ignores_runtime_set() {
+    // Extending an extends test to pass a runtime var whose key collides with a
+    // frontmatter key: the emitted raw_frontmatter must NOT contain the runtime
+    // value. Runtime vars override the SCOPE (what the body renders) but must
+    // never alter the emitted raw frontmatter serialization.
+    let base = concat!(
+        "---\n",
+        "model: gpt-4\n",
+        "---\n",
+        "@block content:\n",
+        "Model: {model}\n",
+        "@end\n",
+    );
+    let child = concat!(
+        "---\n",
+        "role: assistant\n",
+        "---\n",
+        "@extends \"./base.mds\"\n",
+    );
+    let files = [("base.mds", base), ("child.mds", child)];
+    let mut runtime_vars = std::collections::HashMap::new();
+    runtime_vars.insert(
+        "model".to_string(),
+        Value::String("gpt-3.5-turbo".to_string()),
+    );
+    let mut cache = virtual_cache(&files);
+    let resolved = cache
+        .resolve_key("child.mds", &runtime_vars, &mut vec![])
+        .expect("F7 extension: should compile with runtime override");
+
+    // Body renders the runtime value (scope wins).
+    let body = resolved.prompt_body.as_deref().unwrap_or("");
+    assert!(
+        body.contains("gpt-3.5-turbo"),
+        "body must use runtime var value; body={body}"
+    );
+
+    // Emitted raw_frontmatter must show the MERGED FRONTMATTER value, not the runtime one.
+    let raw_fm = resolved
+        .raw_frontmatter
+        .as_deref()
+        .expect("merged output must have raw_frontmatter");
+    assert!(
+        !raw_fm.contains("gpt-3.5-turbo"),
+        "runtime value must NOT appear in emitted frontmatter; raw_fm={raw_fm}"
+    );
+    assert!(
+        raw_fm.contains("gpt-4"),
+        "frontmatter must show merged FM value (gpt-4); raw_fm={raw_fm}"
     );
 }
 

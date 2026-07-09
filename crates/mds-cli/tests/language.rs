@@ -880,27 +880,27 @@ fn if_eq_null_match() {
 
 #[test]
 fn if_eq_strict_no_type_coercion_number_vs_string() {
-    // `@if x == "3":` with x=3 (number) → strict, no coercion → else branch
+    // `@if x == "3":` with x=3 (number) → cross-type comparison is now a TypeMismatch error
     let source = "---\nx: 3\n---\n@if x == \"3\":\ncoercion_yes\n@else:\nstrict_types\n@end\n";
-    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
+    let err = mds::compile_str(source).unwrap_err();
+    let msg = format!("{err}");
     assert!(
-        result.contains("strict_types"),
-        "number 3 must not equal string \"3\""
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "number == string must be a TypeMismatch error, got: {msg}"
     );
-    assert!(!result.contains("coercion_yes"), "coercion must not happen");
 }
 
 #[test]
 fn if_eq_strict_no_type_coercion_bool_vs_string() {
-    // `@if x == "true":` with x=true (bool) → strict, no coercion → else branch
+    // `@if x == "true":` with x=true (bool) → cross-type comparison is now a TypeMismatch error
     let source =
         "---\nx: true\n---\n@if x == \"true\":\ncoercion_yes\n@else:\nstrict_types\n@end\n";
-    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
+    let err = mds::compile_str(source).unwrap_err();
+    let msg = format!("{err}");
     assert!(
-        result.contains("strict_types"),
-        "bool true must not equal string \"true\""
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "bool == string must be a TypeMismatch error, got: {msg}"
     );
-    assert!(!result.contains("coercion_yes"), "coercion must not happen");
 }
 
 #[test]
@@ -990,16 +990,16 @@ fn if_neq_string_match_enters_else_body() {
 }
 
 #[test]
-fn if_neq_cross_type_always_true() {
-    // `@if x != "3":` with x=3 (number) → types differ, always true
+fn if_neq_cross_type_errors() {
+    // `@if x != "3":` with x=3 (number) → type mismatch: number vs string is an error
     let source =
         "---\nx: 3\n---\n@if x != \"3\":\ndiff_type_branch\n@else:\nsame_type_branch\n@end\n";
-    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
+    let err = mds::compile_str(source).unwrap_err();
+    let msg = format!("{err}");
     assert!(
-        result.contains("diff_type_branch"),
-        "cross-type != must be true"
+        msg.contains("type mismatch") || msg.contains("mds::type_mismatch"),
+        "cross-type != must be a TypeMismatch error, got: {msg}"
     );
-    assert!(!result.contains("same_type_branch"), "else must not appear");
 }
 
 // ── @elseif tests ───────────────────────────────────────────────────────────

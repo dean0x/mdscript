@@ -15,8 +15,7 @@
 //! - **Interpolation parsing** — `parse_interpolation_expr`, `parse_dot_expr`,
 //!   `parse_args`, `parse_args_inner`, `parse_single_arg`, `parse_single_arg_inner`
 //! - **Utilities** — `parse_quoted_path`, `validate_dot_path_parts`,
-//!   `unescape_string`, `is_valid_identifier`, `is_directive_token`,
-//!   `strip_leading_newline`, `strip_trailing_newline`
+//!   `unescape_string`, `is_valid_identifier`, `is_directive_token`
 
 use std::collections::HashSet;
 
@@ -1099,7 +1098,7 @@ pub(super) fn parse_interpolation_expr(
     if !is_valid_identifier(content) {
         return Err(MdsError::syntax_at(
             format!(
-                "invalid interpolation: '{content}' is not a valid expression. Use a variable name (letters, numbers, underscores), a function call like func(), or escape with \\{{{{ for literal braces."
+                "invalid interpolation: '{content}' is not a valid expression. Use a variable name (letters, numbers, underscores), a function call like func(), or escape with \\{{ for literal braces."
             ),
             file, source, offset, len,
         ));
@@ -1467,37 +1466,4 @@ pub(crate) fn is_valid_identifier(s: &str) -> bool {
     };
     (first.is_ascii_alphabetic() || first == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Strip a leading newline from the body text nodes.
-pub(super) fn strip_leading_newline(mut nodes: Vec<Node>) -> Vec<Node> {
-    if let Some(Node::Text(t)) = nodes.first_mut() {
-        if let Some(stripped) = t
-            .text
-            .strip_prefix("\r\n")
-            .or_else(|| t.text.strip_prefix('\n'))
-        {
-            t.text = stripped.to_string();
-        }
-        if t.text.is_empty() {
-            nodes.remove(0);
-        }
-    }
-    nodes
-}
-
-/// Strip a trailing newline from the body text nodes.
-pub(super) fn strip_trailing_newline(mut nodes: Vec<Node>) -> Vec<Node> {
-    if let Some(Node::Text(t)) = nodes.last_mut() {
-        if t.text.ends_with('\n') {
-            t.text.pop();
-            if t.text.ends_with('\r') {
-                t.text.pop();
-            }
-        }
-        if t.text.is_empty() {
-            nodes.pop();
-        }
-    }
-    nodes
 }

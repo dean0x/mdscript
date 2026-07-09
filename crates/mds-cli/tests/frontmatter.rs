@@ -212,3 +212,115 @@ fn yaml_map_type_works() {
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("value\n"), "got: {result}");
 }
+
+// ── Adversarial frontmatter injection tests ────────────────────────────────────
+//
+// These tests verify that YAML values containing fence-like content ("\n---\n"),
+// block-scalar `type: mds` lines, or YAML-looking strings cannot escape the
+// frontmatter block and smuggle additional top-level keys into the compiled output.
+//
+// The test strategy: extract only the FRONTMATTER SECTION from the output (the text
+// between the first `---\n` and the second `---\n`) and assert on that slice.
+// Body text may legitimately contain `---` (e.g. from variable substitution), so we
+// do not count `---` occurrences in the whole output.
+
+/// Extract the raw YAML inside the first `---`/`---` fence pair in `output`.
+/// Returns `None` if the output has no frontmatter fences.
+fn extract_frontmatter(output: &str) -> Option<&str> {
+    let open = output.find("---\n")?;
+    let rest = &output[open + 4..];
+    let close = rest.find("\n---")?;
+    Some(&rest[..close])
+}
+
+#[test]
+fn adversarial_value_containing_fence_sequence_via_extends() {
+    // An @extends child whose base has a frontmatter value containing a literal
+    // `\n---\n` sequence must produce exactly one opening and one closing `---`
+    // fence in the emitted frontmatter section — not two document separators.
+    //
+    // The re-serialization path (serialize_merged_frontmatter / serde_yaml_ng::to_string)
+    // must produce valid YAML that doesn't break the fence structure.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        // Value that, when stored and re-serialized, could inject a `---` line.
+        "---\nprompt: \"start\\n---\\ninjected: evil\\n---\\nend\"\n---\n@block body:\ndefault\n@end\n"
+            .to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nrole: system\n---\n@extends \"./base.mds\"\n".to_string(),
+    );
+    let result = mds::compile_virtual(modules, "child.mds", None)
+        .unwrap()
+        .into_markdown()
+        .unwrap();
+
+    // The frontmatter section must be parseable YAML — check the output starts with `---`.
+    assert!(
+        result.starts_with("---\n"),
+        "output must start with a frontmatter fence; got: {result}"
+    );
+
+    // Extract just the frontmatter section and verify `injected: evil` is not a key.
+    let fm = extract_frontmatter(&result)
+        .expect("output must have a frontmatter section; got: {result}");
+
+    // `injected: evil` must not appear as a top-level key in the frontmatter YAML.
+    let has_injected = fm.lines().any(|l| l == "injected: evil");
+    assert!(
+        !has_injected,
+        "adversarial `injected: evil` must not appear as a top-level FM key; fm={fm}"
+    );
+
+    // The legitimate keys must be present.
+    assert!(
+        fm.contains("role: system"),
+        "role key must be in FM; fm={fm}"
+    );
+    assert!(fm.contains("prompt:"), "prompt key must be in FM; fm={fm}");
+}
+
+#[test]
+fn adversarial_block_scalar_with_type_mds_line() {
+    // A block-scalar value whose lines include `type: mds` must not be confused with
+    // the top-level `type: mds` directive — only an unindented `type: mds` top-level
+    // key should be stripped from the output.
+    // The `  type: mds` indented line inside the block scalar must be preserved.
+    let source = concat!(
+        "---\n",
+        "description: |\n",
+        "  type: mds\n",
+        "  this is a block scalar\n",
+        "model: gpt-4\n",
+        "---\n",
+        "{model}\n",
+    );
+    let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
+
+    // No unindented `type: mds` line should appear in the output.
+    let has_top_level_type = result.lines().any(|l| l == "type: mds");
+    assert!(
+        !has_top_level_type,
+        "unindented 'type: mds' must not appear in output; got: {result}"
+    );
+
+    // The description key must be present with block-scalar content preserved.
+    assert!(
+        result.contains("description:"),
+        "description key must be preserved; got: {result}"
+    );
+
+    // The model key must be present.
+    assert!(
+        result.contains("model: gpt-4"),
+        "model key must be preserved; got: {result}"
+    );
+
+    // Body must resolve {model} to gpt-4.
+    assert!(
+        result.contains("gpt-4\n") || result.ends_with("gpt-4"),
+        "body must render model variable; got: {result}"
+    );
+}

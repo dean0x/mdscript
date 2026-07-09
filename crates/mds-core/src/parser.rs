@@ -534,7 +534,6 @@ impl Parser<'_> {
         let _guard = MessageGuard(self);
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
-        let body = strip_trailing_newline(strip_leading_newline(body));
 
         _guard.0.consume_end("@message")?;
 
@@ -552,8 +551,9 @@ impl Parser<'_> {
     /// so any `?` on name parsing does not leave them in an inconsistent state.
     /// A `BlockGuard` Drop implementation ensures both are restored on every exit path.
     ///
-    /// Block bodies have their leading/trailing blank lines stripped — same as
-    /// `@message` and `@define` (decision #9).
+    /// Block body bytes pass through verbatim (interior-verbatim whitespace contract,
+    /// #150/#151): the directive lines (@block … :, @end) are consumed, everything
+    /// else is left exactly as authored.
     fn parse_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
         // Reject @block inside other blocks (top-level only — decision #5).
         // E9: @block-nesting → mds::syntax (correct; not mds::extends — per error-code mapping).
@@ -596,7 +596,6 @@ impl Parser<'_> {
         let _guard = BlockGuard(self);
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
-        let body = strip_trailing_newline(strip_leading_newline(body));
 
         _guard.0.consume_end("@block")?;
 
@@ -636,9 +635,6 @@ impl Parser<'_> {
         let params = parse_define_params(params_str, &name)?;
 
         let body = self.parse_body(&["@end"], &[])?;
-
-        // Trim surrounding newlines added by the block's colons and @end lines.
-        let body = strip_trailing_newline(strip_leading_newline(body));
 
         self.consume_end("@define")?;
 

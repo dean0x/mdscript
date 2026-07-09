@@ -61,24 +61,33 @@ pub(super) fn deep_merge_yaml(
         )));
     }
 
-    // Reserved keys excluded from the merged output (must not propagate as FM variables).
-    // SYNC POINT: if you add a key here, audit `strip_reserved_keys` in lib.rs —
-    // that function strips `type` and `imports` from raw frontmatter output but intentionally
-    // omits `extends` (it is a directive token, not an output FM key).
-    // The two lists serve different purposes and are NOT identical by design; keep this comment
-    // and the strip_reserved_keys comment in sync when either list changes.
-    const RESERVED: &[&str] = &["imports", "type", "extends"];
+    // Reserved keys excluded from the merged output at the TOP LEVEL only (depth == 0).
+    // These keys are directives, not value data, so they are stripped from the emitted
+    // frontmatter to prevent them from appearing in the compiled output.
+    //
+    // !! IMPORTANT: the guard is `depth == 0` — do NOT filter reserved names in
+    // recursive calls (depth > 0).  A nested key like `config.type` is not a
+    // top-level directive; filtering it would silently discard user data.
+    //
+    // SYNC POINT: when this constant changes, also audit `RESERVED_OUTPUT_KEYS` in lib.rs.
+    // The two constants serve different purposes and are intentionally not identical:
+    // `RESERVED_MERGE_KEYS` prevents reserved keys from propagating as FM variables at merge
+    // time; `RESERVED_OUTPUT_KEYS` lists keys removed from raw YAML before re-emitting output.
+    // `extends` is in RESERVED_MERGE_KEYS only — it is consumed as a directive during
+    // inheritance and is never emitted as an output FM key.
+    const RESERVED_MERGE_KEYS: &[&str] = &["imports", "type", "extends"];
 
     let mut result = serde_yaml_ng::Mapping::new();
 
     // Phase 1: walk base keys in order.
     // Each base key keeps its position; value is replaced if child also has that key.
     for (base_key, base_val) in base {
-        // Skip reserved keys and non-string keys.
+        // Skip non-string keys.
         let serde_yaml_ng::Value::String(key_str) = base_key else {
             continue;
         };
-        if RESERVED.contains(&key_str.as_str()) {
+        // Reserved keys are stripped at the top-level only (they are directives, not data).
+        if depth == 0 && RESERVED_MERGE_KEYS.contains(&key_str.as_str()) {
             continue;
         }
 
@@ -105,7 +114,8 @@ pub(super) fn deep_merge_yaml(
         let serde_yaml_ng::Value::String(key_str) = child_key else {
             continue;
         };
-        if RESERVED.contains(&key_str.as_str()) {
+        // Reserved keys are stripped at the top-level only.
+        if depth == 0 && RESERVED_MERGE_KEYS.contains(&key_str.as_str()) {
             continue;
         }
         // Skip keys already added from base.
@@ -294,4 +304,110 @@ pub(crate) fn parse_frontmatter_imports(raw: &str) -> Result<Vec<FrontmatterImpo
     };
 
     parse_frontmatter_imports_from_yaml(imports_val)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mapping_from_str(yaml: &str) -> serde_yaml_ng::Mapping {
+        let val: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).unwrap();
+        match val {
+            serde_yaml_ng::Value::Mapping(m) => m,
+            _ => panic!("expected a YAML mapping"),
+        }
+    }
+
+    fn mapping_get_str<'a>(m: &'a serde_yaml_ng::Mapping, key: &str) -> Option<&'a str> {
+        m.get(serde_yaml_ng::Value::String(key.to_owned()))
+            .and_then(|v| v.as_str())
+    }
+
+    /// Top-level reserved keys (`imports`, `type`, `extends`) must be excluded from
+    /// the merged output — they are directive tokens, not value data.
+    #[test]
+    fn deep_merge_yaml_strips_top_level_reserved_keys() {
+        let base = mapping_from_str("type: mds\nmodel: gpt-4\nimports:\n  - path: ./lib.mds\n");
+        let child = mapping_from_str("extends: ./base.mds\nrole: system\n");
+        let result = deep_merge_yaml(&base, &child, 0).unwrap();
+        assert!(
+            !result.contains_key(serde_yaml_ng::Value::String("type".into())),
+            "top-level 'type' must be stripped"
+        );
+        assert!(
+            !result.contains_key(serde_yaml_ng::Value::String("imports".into())),
+            "top-level 'imports' must be stripped"
+        );
+        assert!(
+            !result.contains_key(serde_yaml_ng::Value::String("extends".into())),
+            "top-level 'extends' must be stripped"
+        );
+        assert_eq!(mapping_get_str(&result, "model"), Some("gpt-4"));
+        assert_eq!(mapping_get_str(&result, "role"), Some("system"));
+    }
+
+    /// Nested keys named `type`, `imports`, or `extends` inside a sub-mapping must
+    /// NOT be filtered — the reserved-key guard applies at the top level only (depth == 0).
+    ///
+    /// Example: `config.type: "mds"` is a user-defined nested key, not a directive.
+    /// Filtering it would silently corrupt user data.
+    #[test]
+    fn deep_merge_yaml_nested_reserved_keys_preserved() {
+        let base = mapping_from_str(
+            "config:\n  type: mds\n  model: gpt-4\n  imports: strict\nmodel: base-model\n",
+        );
+        let child = mapping_from_str("config:\n  type: custom\n  extra: added\nrole: system\n");
+        let result = deep_merge_yaml(&base, &child, 0).unwrap();
+
+        // `config` key must be present with the merged sub-mapping.
+        let config = result
+            .get(serde_yaml_ng::Value::String("config".into()))
+            .and_then(|v| v.as_mapping())
+            .expect("config sub-mapping must survive merge");
+
+        // config.type: child value wins ("custom" overrides "mds").
+        assert_eq!(
+            config
+                .get(serde_yaml_ng::Value::String("type".into()))
+                .and_then(|v| v.as_str()),
+            Some("custom"),
+            "config.type (nested 'type') must NOT be stripped and child value must win"
+        );
+        // config.imports: base-only nested key, must survive.
+        assert_eq!(
+            config
+                .get(serde_yaml_ng::Value::String("imports".into()))
+                .and_then(|v| v.as_str()),
+            Some("strict"),
+            "config.imports (nested 'imports') must NOT be stripped"
+        );
+        // config.model: base-only nested key.
+        assert_eq!(
+            config
+                .get(serde_yaml_ng::Value::String("model".into()))
+                .and_then(|v| v.as_str()),
+            Some("gpt-4"),
+            "base-only config.model must survive"
+        );
+        // config.extra: child-only nested key.
+        assert_eq!(
+            config
+                .get(serde_yaml_ng::Value::String("extra".into()))
+                .and_then(|v| v.as_str()),
+            Some("added"),
+            "child-only config.extra must be present"
+        );
+        // Top-level keys are correct.
+        assert_eq!(mapping_get_str(&result, "model"), Some("base-model"));
+        assert_eq!(mapping_get_str(&result, "role"), Some("system"));
+    }
+
+    /// Merging two empty mappings must produce an empty result (not an error).
+    #[test]
+    fn deep_merge_yaml_both_empty() {
+        let base = serde_yaml_ng::Mapping::new();
+        let child = serde_yaml_ng::Mapping::new();
+        let result = deep_merge_yaml(&base, &child, 0).unwrap();
+        assert!(result.is_empty());
+    }
 }

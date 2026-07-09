@@ -1,0 +1,50 @@
+---
+language: Rust
+---
+
+## Code Fences in {language} — indented, tilde, and blockquoted variants
+
+The MDS compiler recognises indented, tilde, and blockquoted code-fence variants in addition to standard backtick fences.
+No interpolation occurs inside any of them.
+
+### 1. Standard backtick fence (baseline)
+
+```rust
+let x = 42;
+println!("{x}");   // literal {x} — no interpolation
+```
+
+### 2. Tilde fence (`~~~`)
+
+~~~rust
+fn greet(name: &str) -> String {
+    format!("Hello, {name}!")   // literal — not interpolated
+}
+~~~
+
+After the tilde fence, interpolation resumes: {language} is great!
+
+### 3. Indented fence (4 spaces prefix)
+
+A list item whose code block is indented:
+
+- Item one
+- Item two with a fenced code block:
+
+    ```rust
+    // This is a code block indented inside a list item.
+    // {language} is NOT interpolated here.
+    let msg = format!("{}", 42);
+    ```
+
+- Item three continues normally — {language} is back.
+
+### 4. Blockquoted fence (`> \`\`\``)
+
+> ```rust
+> // Inside a blockquote fenced code block.
+> // {language} is NOT interpolated here either.
+> fn main() { println!("Hello"); }
+> ```
+
+Back in normal body: the language is {language}.

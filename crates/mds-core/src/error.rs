@@ -202,6 +202,25 @@ pub enum MdsError {
         src: Option<Arc<miette::NamedSource<String>>>,
     },
 
+    /// Cross-type comparison (`string == number`, `boolean != null`, etc.).
+    ///
+    /// MDS refuses to silently coerce types in `==` / `!=` conditions.
+    /// Pass string values with `--set-string KEY=VALUE` to keep them as
+    /// strings, or use `@if x:` to test for truthiness without a comparison.
+    #[error("type mismatch: cannot compare {lhs_type} with {rhs_type}")]
+    #[diagnostic(
+        code(mds::type_mismatch),
+        help("left side is {lhs_type}, right side is {rhs_type}; use '@if x:' for truthiness or '--set-string KEY=VALUE' to pass a string")
+    )]
+    TypeMismatch {
+        lhs_type: String,
+        rhs_type: String,
+        #[label("cross-type comparison")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
+
     #[error("circular import detected: {cycle}")]
     #[diagnostic(
         code(mds::circular_import),
@@ -500,6 +519,15 @@ impl MdsError {
         }
     }
 
+    pub(crate) fn type_mismatch(lhs_type: impl Into<String>, rhs_type: impl Into<String>) -> Self {
+        MdsError::TypeMismatch {
+            lhs_type: lhs_type.into(),
+            rhs_type: rhs_type.into(),
+            span: None,
+            src: None,
+        }
+    }
+
     pub(crate) fn name_collision(name: impl Into<String>) -> Self {
         MdsError::NameCollision {
             name: name.into(),
@@ -732,6 +760,7 @@ impl MdsError {
             | MdsError::UndefinedFunction { span, src, .. }
             | MdsError::ArityMismatch { span, src, .. }
             | MdsError::TypeError { span, src, .. }
+            | MdsError::TypeMismatch { span, src, .. }
             | MdsError::CircularImport { span, src, .. }
             | MdsError::FileNotFound { span, src, .. }
             | MdsError::ImportError { span, src, .. }
