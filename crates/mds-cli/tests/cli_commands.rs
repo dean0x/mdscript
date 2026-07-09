@@ -329,6 +329,74 @@ fn set_flag_duplicate_key_last_wins() {
     );
 }
 
+// ── --set-string e2e tests (#152) ─────────────────────────────────────────────
+
+#[test]
+fn set_string_forces_string_type() {
+    // --set-string count=3 must keep "3" as a String, not coerce to a Number.
+    // The template compares count == "3" (a string literal); this only succeeds
+    // when count is a String — a Number would raise mds::type_mismatch.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("set_string.mds");
+    std::fs::write(&src, "@if count == \"3\":\nstring\n@end\n").unwrap();
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set-string",
+            "count=3",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build with --set-string should succeed; stderr: {}",
+        String::from_utf8(output.stderr).unwrap()
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("string"),
+        "expected string branch when --set-string count=3, got: {stdout}"
+    );
+}
+
+#[test]
+fn set_string_cross_flag_duplicate_key_is_error() {
+    // --set x=1 --set-string x=2 must exit non-zero — supplying the same key
+    // through both flags is a hard error (#152).
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("conflict.mds");
+    std::fs::write(&src, "{x}\n").unwrap();
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set",
+            "x=1",
+            "--set-string",
+            "x=2",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "build with --set and --set-string for the same key must exit non-zero"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains('x'),
+        "error must name the duplicate key; got: {stderr}"
+    );
+}
+
 #[test]
 fn exit_code_success() {
     // Use a temp directory to avoid writing simple.md into tests/fixtures/.
