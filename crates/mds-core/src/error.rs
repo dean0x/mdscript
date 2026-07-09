@@ -210,7 +210,7 @@ pub enum MdsError {
     #[error("type mismatch: cannot compare {lhs_type} with {rhs_type}")]
     #[diagnostic(
         code(mds::type_mismatch),
-        help("left side is {lhs_type}, right side is {rhs_type}; use `@if x:` for truthiness or `--set-string KEY=VALUE` to pass a string")
+        help("left side is {lhs_type}, right side is {rhs_type}; use '@if x:' for truthiness or '--set-string KEY=VALUE' to pass a string")
     )]
     TypeMismatch {
         lhs_type: String,

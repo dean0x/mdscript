@@ -1472,6 +1472,50 @@ mod tests {
         assert!(result.is_err(), "too few required args should fail");
     }
 
+    // ── @define body edge-trim contract (spec §4.11) ──────────────────────────
+    //
+    // invoke_function trims the body output at its EDGES (leading/trailing whitespace)
+    // while preserving interior blank runs verbatim. This matches the @message body
+    // contract (symmetric per spec §4.11). Locked here so a refactor of invoke_function
+    // cannot silently change the trimming semantics.
+
+    #[test]
+    fn define_edge_trim_removes_leading_and_trailing_blank_lines() {
+        // Body has a leading blank line and a trailing blank line around the content.
+        // After edge-trim the blank lines are removed; only the content (and its
+        // trailing newline from the template output) survives.
+        let src = "@define body():\n\nHello.\n\n@end\n{body()}\n";
+        let result = crate::compile_str_md(src).unwrap();
+        assert_eq!(
+            result, "Hello.\n",
+            "edge-trim must strip leading and trailing blank lines from @define body"
+        );
+    }
+
+    #[test]
+    fn define_edge_trim_preserves_interior_blank_run() {
+        // Body has leading blank lines, an interior blank run, and trailing blank lines.
+        // Edge-trim removes the outer blank lines; the interior blank run is preserved.
+        let src = "@define body():\n\nLine one.\n\nLine two.\n\n@end\n{body()}\n";
+        let result = crate::compile_str_md(src).unwrap();
+        assert_eq!(
+            result, "Line one.\n\nLine two.\n",
+            "edge-trim must preserve interior blank run while removing leading/trailing blank lines"
+        );
+    }
+
+    #[test]
+    fn define_edge_trim_leading_indentation_stripped() {
+        // A leading newline before indented content: edge-trim removes the leading
+        // whitespace (newline) while preserving the body content.
+        let src = "@define body():\n\nContent here.\n@end\n{body()}\n";
+        let result = crate::compile_str_md(src).unwrap();
+        assert_eq!(
+            result, "Content here.\n",
+            "edge-trim must strip leading blank line even when body has no trailing blank line"
+        );
+    }
+
     // ── Built-in functions integration ────────────────────────────────────────
 
     #[test]
