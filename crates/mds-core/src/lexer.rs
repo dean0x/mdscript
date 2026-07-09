@@ -178,7 +178,10 @@ impl<'a> Lexer<'a> {
         let start = self.byte_pos(self.pos);
         let mut content = String::new();
         // Precondition: self.code_fence.is_some() — run() checks before invoking.
-        debug_assert!(self.code_fence.is_some(), "scan_code_content requires active code fence");
+        debug_assert!(
+            self.code_fence.is_some(),
+            "scan_code_content requires active code fence"
+        );
         let (open_char, open_count, _) = self.code_fence.unwrap();
         while self.pos < self.chars.len() {
             if is_line_start_chars(&self.chars, self.pos) {
@@ -428,7 +431,11 @@ fn try_scan_fence_at(chars: &[char], pos: usize) -> Option<FenceMatch> {
         .iter()
         .take_while(|&&c| c != '\n' && c != '\r')
         .all(|&c| c == ' ' || c == '\t');
-    Some(FenceMatch { fence_char, fence_count, is_close })
+    Some(FenceMatch {
+        fence_char,
+        fence_count,
+        is_close,
+    })
 }
 
 /// Return `true` when `m` describes a line that closes the fence opened with
