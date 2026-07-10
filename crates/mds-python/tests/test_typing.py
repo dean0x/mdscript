@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 
 SAMPLE = Path(__file__).parent / "typecheck_sample.py"
+# Pyright project root: the mds-python package directory (contains pyrightconfig.json
+# with extraPaths pointing to ./python so "import mdscript" resolves).
+_PYRIGHT_PROJECT = Path(__file__).parent.parent
 
 # Known, structurally-justified stub/runtime diffs `stubtest` cannot resolve
 # statically — not stub bugs. Substring-matched against each `error:` line so a
@@ -51,7 +54,7 @@ def test_c6_mypy_strict_clean() -> None:
 )
 def test_c6_pyright_clean() -> None:
     proc = subprocess.run(
-        [sys.executable, "-m", "pyright", str(SAMPLE)],
+        [sys.executable, "-m", "pyright", "--project", str(_PYRIGHT_PROJECT), str(SAMPLE)],
         capture_output=True,
         text=True,
     )

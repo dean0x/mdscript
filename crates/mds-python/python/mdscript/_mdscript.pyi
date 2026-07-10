@@ -90,6 +90,26 @@ class CompileResult:
     def __eq__(self, other: object, /) -> bool: ...
     __hash__: None  # type: ignore[assignment]
 
+@final
+class LintResult:
+    """The result of :func:`lint`, :func:`lint_file`, or :func:`lint_virtual`.
+
+    Canonical JSON shape: ``{"files": [...], "truncated": false, "version": 1}``.
+    Keys are in BTreeMap (alphabetical) order — byte-identical across all surfaces.
+    """
+
+    @property
+    def version(self) -> int: ...
+    @property
+    def truncated(self) -> bool: ...
+    @property
+    def files(self) -> list[dict[str, Any]]: ...
+    def __new__(cls, canonical: Mapping[str, Any]) -> LintResult: ...
+    def to_dict(self) -> dict[str, Any]: ...
+    def to_json(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    __hash__: None  # type: ignore[assignment]
+
 class MdsError(Exception):
     """Raised for every MDS compilation failure.
 
@@ -128,3 +148,23 @@ def check_virtual(
     vars: _Vars | None = ...,
 ) -> CheckResult: ...
 def scan_imports(source: str, /) -> list[str]: ...
+def lint(
+    source: str,
+    *,
+    base_path: _StrPath | None = ...,
+    vars: _Vars | None = ...,
+    rules: Mapping[str, str] | None = ...,
+) -> LintResult: ...
+def lint_file(
+    path: _StrPath,
+    *,
+    vars: _Vars | None = ...,
+    rules: Mapping[str, str] | None = ...,
+) -> LintResult: ...
+def lint_virtual(
+    modules: Mapping[str, str],
+    entry: str,
+    *,
+    vars: _Vars | None = ...,
+    rules: Mapping[str, str] | None = ...,
+) -> LintResult: ...

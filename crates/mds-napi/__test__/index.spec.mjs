@@ -925,4 +925,38 @@ describe('lint parity (AC-API-06 guard)', () => {
       'lint and lintFile must produce identical canonical JSON for the same source',
     );
   });
+
+  // P-L-2: lintVirtual matches checked-in canonical JSON goldens (AC-API-06)
+  //
+  // These goldens are derived from the Rust core serializer and checked in — not
+  // regenerated from the napi binding, so the comparison is non-circular. A drift
+  // in the serializer would fail this test before it ships to consumers.
+  //
+  // Keys are in BTreeMap (alphabetical) order:
+  //   {"files":[...],"truncated":false,"version":1}
+  test('P-L-2: lintVirtual clean source matches canonical golden', () => {
+    const CLEAN_GOLDEN = '{"files":[],"truncated":false,"version":1}';
+    const result = lintVirtual({ 'main.mds': 'Hello World!\n' }, 'main.mds');
+    assert.equal(
+      JSON.stringify(result),
+      CLEAN_GOLDEN,
+      `napi lintVirtual clean golden mismatch:\n  got:    ${JSON.stringify(result)}\n  expect: ${CLEAN_GOLDEN}`,
+    );
+  });
+
+  test('P-L-3: lintVirtual unused-variable source matches canonical golden', () => {
+    const UNUSED_GOLDEN =
+      '{"files":[{"diagnostics":[{"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.",' +
+      '"message":"Variable \'unused_key\' is defined in frontmatter but never referenced in the body.",' +
+      '"rule":"unused-variable","severity":"warn","span":{"length":10,"offset":4}}],"file":"main.mds"}],"truncated":false,"version":1}';
+    const result = lintVirtual(
+      { 'main.mds': '---\nunused_key: value\n---\nHello!\n' },
+      'main.mds',
+    );
+    assert.equal(
+      JSON.stringify(result),
+      UNUSED_GOLDEN,
+      `napi lintVirtual unused-variable golden mismatch:\n  got:    ${JSON.stringify(result)}\n  expect: ${UNUSED_GOLDEN}`,
+    );
+  });
 });

@@ -22,20 +22,21 @@
  * Base backend methods — shared by the browser-safe MdsBaseBackend and all
  * Node.js backends. WASM module exports also belong here (plus scanImports).
  * compile and check are the only synchronous source-string operations.
+ * lint is a source-string lint operation available on all backends.
  */
-export const BASE_METHODS = ['compile', 'check'] as const;
+export const BASE_METHODS = ['compile', 'check', 'lint'] as const;
 
 /**
  * Node-only file-based methods. These extend BASE_METHODS on MdsNodeBackend
  * and on the native addon (NapiAddon).
  */
-export const NODE_METHODS = ['compileFile', 'checkFile'] as const;
+export const NODE_METHODS = ['compileFile', 'checkFile', 'lintFile'] as const;
 
 /**
  * WASM module exports — BASE_METHODS plus the import scanner needed for
- * JS-side file resolution.
+ * JS-side file resolution, plus lintVirtual for multi-module lint.
  */
-export const WASM_EXPORTS = [...BASE_METHODS, 'scanImports'] as const;
+export const WASM_EXPORTS = [...BASE_METHODS, 'scanImports', 'lintVirtual'] as const;
 
 export type BaseMethodName = (typeof BASE_METHODS)[number];
 export type NodeMethodName = (typeof NODE_METHODS)[number];
@@ -82,8 +83,9 @@ export function validateBackendMethods(
  *
  * 'compile' covers both MarkdownResult and MessagesResult — the function
  * branches on `result.kind` to validate the correct shape variant.
+ * 'lint' validates the canonical lint JSON shape (version/files/truncated).
  */
-export type ResultKind = 'compile' | 'check';
+export type ResultKind = 'compile' | 'check' | 'lint';
 
 // ---------------------------------------------------------------------------
 // Shallow return-shape validator (AC-PERF-04 — O(1), no element access)
@@ -105,6 +107,9 @@ export type ResultKind = 'compile' | 'check';
  *
  * For kind='check':
  *   assert warnings is array.
+ *
+ * For kind='lint':
+ *   assert version is number; assert files is array; assert truncated is boolean.
  *
  * Extra fields on a valid result are silently tolerated.
  * Throws an Error with code `mds::invalid_backend_result` on mismatch.
@@ -157,6 +162,21 @@ export function assertResultShape(result: unknown, kind: ResultKind): void {
     case 'check': {
       if (!Array.isArray(r['warnings'])) {
         throw makeShapeError(kind, '"warnings" must be an array');
+      }
+      break;
+    }
+    case 'lint': {
+      // Validate the canonical lint JSON shape: version (number), files (array),
+      // truncated (boolean). Validation is shallow (AC-PERF-04 principle):
+      // files elements are not iterated.
+      if (typeof r['version'] !== 'number') {
+        throw makeShapeError(kind, '"version" must be a number');
+      }
+      if (!Array.isArray(r['files'])) {
+        throw makeShapeError(kind, '"files" must be an array');
+      }
+      if (typeof r['truncated'] !== 'boolean') {
+        throw makeShapeError(kind, '"truncated" must be a boolean');
       }
       break;
     }

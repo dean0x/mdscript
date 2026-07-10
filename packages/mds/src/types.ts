@@ -58,6 +58,81 @@ export interface FileOptions {
   vars?: Record<string, unknown>;
 }
 
+// ---------------------------------------------------------------------------
+// Lint types
+// ---------------------------------------------------------------------------
+
+/** Byte-range span locating a lint diagnostic within its source file. */
+export interface LintSpan {
+  /** Byte offset from the start of the source string. */
+  offset: number;
+  /** Byte length of the diagnostic span. */
+  length: number;
+}
+
+/** A single lint finding produced by a lint rule. */
+export interface LintDiagnostic {
+  /** Rule identifier (e.g. `"unused-variable"`, `"duplicate-import"`). */
+  rule: string;
+  /** Severity level: `"error"`, `"warn"`, or `"info"`. */
+  severity: string;
+  /** Human-readable description of the finding. */
+  message: string;
+  /** Optional guidance on how to resolve the finding. */
+  help?: string;
+  /** Whether the lint engine can auto-fix this diagnostic (`--fix`). */
+  fixable: boolean;
+  /** Source location of the finding, if available. */
+  span?: LintSpan;
+}
+
+/** All diagnostics for a single file in a lint result. */
+export interface LintFileResult {
+  /** Path or name of the linted file. */
+  file: string;
+  /** Diagnostics produced for this file. */
+  diagnostics: LintDiagnostic[];
+}
+
+/**
+ * Canonical lint result returned by all lint surfaces (CLI `--format json`,
+ * napi, WASM, Python). All surfaces produce byte-identical JSON for the same
+ * input and rules configuration.
+ */
+export interface LintResult {
+  /** Schema version; always 1 in this release. */
+  version: number;
+  /** Per-file findings. Empty when the source is clean. */
+  files: LintFileResult[];
+  /**
+   * `true` when the diagnostic count exceeded `MAX_DIAGNOSTICS` (1000) and
+   * earlier diagnostics were dropped. Re-run after fixing to surface the rest.
+   */
+  truncated: boolean;
+}
+
+/** Options for source-string lint operations. */
+export interface LintOptions {
+  /** Runtime variables injected into the check gate (not the lint rules). */
+  vars?: Record<string, unknown>;
+  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  rules?: Record<string, string>;
+  /**
+   * Base directory for resolving `@import` directives in the source string.
+   * Required when the source contains `@import` or `@extends`.
+   * Ignored by the WASM backend (which cannot access the filesystem).
+   */
+  basePath?: string;
+}
+
+/** Options for file-based and virtual lint operations. */
+export interface LintFileOptions {
+  /** Runtime variables injected into the check gate (not the lint rules). */
+  vars?: Record<string, unknown>;
+  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  rules?: Record<string, string>;
+}
+
 /** Source location of a compiler error. */
 export interface MdsErrorSpan {
   /** Byte offset from the start of the source string. */
@@ -95,22 +170,34 @@ export interface InitOptions {
 }
 
 /**
- * Browser-safe backend interface — compile/check/getBackend only.
+ * Browser-safe backend interface — compile/check/lint/lintVirtual/getBackend.
  * Does not include file operations (which require node:fs).
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;
   check(source: string, options?: CompileOptions): CheckResult;
+  /**
+   * Lint an MDS source string.
+   * Runs the check gate first; returns a LintResult with per-rule findings.
+   */
+  lint(source: string, options?: LintOptions): LintResult;
+  /**
+   * Lint a multi-module virtual filesystem.
+   * Caller provides the full module map and entry key.
+   */
+  lintVirtual(modules: Record<string, string>, entry: string, options?: LintFileOptions): LintResult;
   getBackend(): BackendType;
 }
 
 /**
  * Full backend interface for Node.js environments.
- * Extends MdsBaseBackend with file-based compile/check operations.
+ * Extends MdsBaseBackend with file-based compile/check/lint operations.
  */
 export interface MdsNodeBackend extends MdsBaseBackend {
   compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
   checkFile(path: string, options?: FileOptions): Promise<CheckResult>;
+  /** Lint an MDS file, resolving @import directives relative to the file. */
+  lintFile(path: string, options?: LintFileOptions): Promise<LintResult>;
 }
 
 /**

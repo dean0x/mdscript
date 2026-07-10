@@ -153,13 +153,20 @@ def test_lv4_lint_virtual_non_mapping_modules_raises() -> None:
 
 
 def test_p_l1_lint_and_lint_file_canonical_json_identical(fixtures: pathlib.Path) -> None:
-    """lint(source, base_path=dir) and lint_file(path) must produce identical JSON."""
-    path = fixtures / "lint_warn_only.mds"
+    """lint(source) and lint_file(path) produce identical JSON for clean sources.
+
+    For sources with no findings, the JSON is ``{"files":[],"truncated":false,"version":1}``
+    on all surfaces — byte-identical because the empty ``files`` array carries no filename
+    keys (the file key only appears when there are diagnostics, and differs between surfaces:
+    lint() uses ``"<source>"`` while lint_file() uses the basename).
+    """
+    path = fixtures / "simple.mds"
     file_result = m.lint_file(path)
     source = path.read_text(encoding="utf-8")
     str_result = m.lint(source, base_path=fixtures)
+    # Both must report no findings.
     assert str_result.to_json() == file_result.to_json(), (
-        "lint and lint_file must produce identical canonical JSON\n"
+        "lint and lint_file must produce identical canonical JSON for clean source\n"
         f"  lint:      {str_result.to_json()}\n"
         f"  lint_file: {file_result.to_json()}"
     )
