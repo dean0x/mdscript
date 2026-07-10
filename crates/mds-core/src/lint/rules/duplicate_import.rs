@@ -146,7 +146,7 @@ mod tests {
             &LintConfig::default(),
             &mut builder,
         );
-        builder.build().diagnostics
+        builder.build(false).diagnostics
     }
 
     // ── L-U-H1: normalize_import_path unit tests ──────────────────────────────
@@ -255,6 +255,6 @@ mod tests {
             rules: [(RULE.to_string(), Severity::Off)].into_iter().collect(),
         };
         check(&module, &ctx, "test.mds", &config, &mut builder);
-        assert!(builder.build().diagnostics.is_empty());
+        assert!(builder.build(false).diagnostics.is_empty());
     }
 }

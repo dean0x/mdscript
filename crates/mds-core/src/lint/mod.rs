@@ -74,11 +74,16 @@ pub(crate) fn lint_source(
 
     let ctx = collect_facts(&module, is_partial || is_extends, source)?;
 
+    // A file is standalone when it has no @import or @extends — Tier B fixes (unused-import,
+    // unused-function) are only safe for standalone files because removing an export changes
+    // what importers receive.
+    let is_standalone = !ctx.is_partial_or_extends && ctx.imports.is_empty();
+
     // Rule dispatch — non-generic plain-fn dispatch (AC-PERF-02, no monomorphization).
     let mut builder = LintResultBuilder::new();
     run_rules(&module, &ctx, filename, config, &mut builder);
 
-    Ok(builder.build())
+    Ok(builder.build(is_standalone))
 }
 
 /// Apply all 9 lint rules over the module and facts context.

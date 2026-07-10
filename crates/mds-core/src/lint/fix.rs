@@ -433,6 +433,7 @@ mod tests {
         LintResult {
             diagnostics: diags,
             truncated: false,
+            is_standalone: false,
         }
     }
 
@@ -630,6 +631,7 @@ mod tests {
             Ok(LintResult {
                 diagnostics: vec![],
                 truncated: false,
+                is_standalone: true,
             })
         });
 
@@ -650,6 +652,7 @@ mod tests {
         let empty_result = LintResult {
             diagnostics: vec![],
             truncated: false,
+            is_standalone: false,
         };
         let plan = plan_fixes(&empty_result, source);
         assert!(plan.edits.is_empty(), "no edits on already-clean source");
@@ -662,6 +665,7 @@ mod tests {
         let truncated_result = LintResult {
             diagnostics: vec![],
             truncated: true,
+            is_standalone: false,
         };
         let plan = plan_fixes(&truncated_result, "Hello!\n");
         assert!(plan.truncated, "truncated flag should propagate to plan");

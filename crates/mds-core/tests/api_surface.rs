@@ -1012,10 +1012,11 @@ fn lint_types_exist() {
     assert_eq!(diag.rule, "unused-variable");
     assert_eq!(diag.severity, Severity::Warn);
 
-    // LintResult has diagnostics and truncated fields.
+    // LintResult has diagnostics, truncated, and is_standalone fields.
     let result = LintResult {
         diagnostics: vec![diag],
         truncated: false,
+        is_standalone: false,
     };
     assert_eq!(result.diagnostics.len(), 1);
     assert!(!result.truncated);
@@ -1079,6 +1080,7 @@ fn lint_canonical_json_schema() {
             file: Some("test.mds".to_string()),
         }],
         truncated: false,
+        is_standalone: false,
     };
 
     let json = result.to_canonical_json();
@@ -1116,6 +1118,75 @@ fn lint_canonical_json_schema() {
     assert_eq!(span["column"], 1);
 }
 
+/// L-U-JSON1b: to_canonical_json fixable field reflects tier semantics and is_standalone flag.
+#[test]
+fn lint_canonical_json_fixable_semantics() {
+    use mds::LintDiagnostic;
+
+    // Tier A rule (duplicate-import) → fixable regardless of is_standalone.
+    let tier_a = LintResult {
+        diagnostics: vec![LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "Duplicate import".to_string(),
+            help: None,
+            span: None,
+            file: Some("a.mds".to_string()),
+        }],
+        truncated: false,
+        is_standalone: false, // even non-standalone Tier A is fixable
+    };
+    let json = tier_a.to_canonical_json();
+    assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
+
+    // Tier B rule (unused-import) → fixable only for standalone files.
+    let tier_b_non_standalone = LintResult {
+        diagnostics: vec![LintDiagnostic {
+            rule: "unused-import".to_string(),
+            severity: Severity::Warn,
+            message: "Unused import".to_string(),
+            help: None,
+            span: None,
+            file: Some("b.mds".to_string()),
+        }],
+        truncated: false,
+        is_standalone: false,
+    };
+    let json = tier_b_non_standalone.to_canonical_json();
+    assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
+
+    let tier_b_standalone = LintResult {
+        diagnostics: vec![LintDiagnostic {
+            rule: "unused-import".to_string(),
+            severity: Severity::Warn,
+            message: "Unused import".to_string(),
+            help: None,
+            span: None,
+            file: Some("c.mds".to_string()),
+        }],
+        truncated: false,
+        is_standalone: true,
+    };
+    let json = tier_b_standalone.to_canonical_json();
+    assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
+
+    // Tier C rule (unused-variable) → never fixable.
+    let tier_c = LintResult {
+        diagnostics: vec![LintDiagnostic {
+            rule: "unused-variable".to_string(),
+            severity: Severity::Warn,
+            message: "Unused variable".to_string(),
+            help: None,
+            span: None,
+            file: Some("d.mds".to_string()),
+        }],
+        truncated: false,
+        is_standalone: true, // even standalone Tier C is not fixable
+    };
+    let json = tier_c.to_canonical_json();
+    assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
+}
+
 /// lint_str on a trivially valid template returns an empty LintResult (no diagnostics).
 #[test]
 fn lint_str_trivial_source_returns_empty() {
@@ -1125,6 +1196,31 @@ fn lint_str_trivial_source_returns_empty() {
         "trivial source should produce no diagnostics: {result:?}"
     );
     assert!(!result.truncated);
+    // A file with no imports or @extends is standalone.
+    assert!(
+        result.is_standalone,
+        "plain source with no imports should be standalone"
+    );
+}
+
+/// lint_str_with on a source that has an @import is not standalone.
+#[test]
+fn lint_str_with_imports_is_not_standalone() {
+    // Source with an import that doesn't exist → check gate fails, MdsError.
+    // Use a virtual-fs approach via lint_virtual to test is_standalone=false.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("lib.mds".to_string(), "Hello!\n".to_string());
+    modules.insert(
+        "consumer.mds".to_string(),
+        "@import \"./lib.mds\" as lib\nHi!\n".to_string(),
+    );
+    let config = LintConfig::default();
+    let result = mds::lint_virtual(modules, "consumer.mds", None, &config).expect("should lint OK");
+    // consumer.mds has @import — it is NOT standalone.
+    assert!(
+        !result.is_standalone,
+        "file with @import should not be standalone"
+    );
 }
 
 /// lint_virtual on a valid virtual FS returns an empty LintResult.

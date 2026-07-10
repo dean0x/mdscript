@@ -118,7 +118,7 @@ mod tests {
             &LintConfig::default(),
             &mut builder,
         );
-        builder.build().diagnostics
+        builder.build(false).diagnostics
     }
 
     /// L-U-UF1: Unexported, uncalled function fires (when has_explicit_exports).
@@ -211,7 +211,7 @@ mod tests {
             &mut builder,
         );
         assert!(
-            builder.build().diagnostics.is_empty(),
+            builder.build(false).diagnostics.is_empty(),
             "partial should suppress unused-function"
         );
     }
@@ -228,6 +228,6 @@ mod tests {
             rules: [(RULE.to_string(), Severity::Off)].into_iter().collect(),
         };
         check(&module, &ctx, "test.mds", &config, &mut builder);
-        assert!(builder.build().diagnostics.is_empty());
+        assert!(builder.build(false).diagnostics.is_empty());
     }
 }

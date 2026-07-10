@@ -143,7 +143,7 @@ mod tests {
             &LintConfig::default(),
             &mut builder,
         );
-        builder.build().diagnostics
+        builder.build(false).diagnostics
     }
 
     /// L-U-DE1 (D2 canary): Export directive offsets must be real byte positions.
@@ -226,6 +226,6 @@ mod tests {
             rules: [(RULE.to_string(), Severity::Off)].into_iter().collect(),
         };
         check(&module, &ctx, "test.mds", &config, &mut builder);
-        assert!(builder.build().diagnostics.is_empty());
+        assert!(builder.build(false).diagnostics.is_empty());
     }
 }

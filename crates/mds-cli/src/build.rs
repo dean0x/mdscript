@@ -26,6 +26,33 @@ pub(crate) struct MdsConfig {
     )]
     #[serde(default)]
     pub(crate) fmt: FmtConfig,
+    /// Per-rule severity overrides for `mds lint` (AC-F-17).
+    ///
+    /// Unknown severity VALUES fail config loading loudly (closed enum).
+    /// Unknown rule NAMES are preserved for forward compat (CLI warns and ignores).
+    #[serde(default)]
+    pub(crate) lint: LintCliConfig,
+}
+
+/// mds.json `lint` section: per-rule severity overrides.
+///
+/// Mirrors the core `LintConfig` shape but lives in the CLI so it can be
+/// loaded alongside `BuildConfig` / `FmtConfig` as part of `MdsConfig`.
+///
+/// Unknown severity VALUES (e.g. `"banana"`) cause a hard parse error (exit 2)
+/// because `Severity` is a closed enum with no sensible fallback. Unknown rule
+/// NAMES are warn-and-ignored at the CLI layer (forward compat).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct LintCliConfig {
+    #[serde(default)]
+    pub(crate) rules: HashMap<String, mds::Severity>,
+}
+
+impl LintCliConfig {
+    /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions.
+    pub(crate) fn into_core_config(self) -> mds::LintConfig {
+        mds::LintConfig { rules: self.rules }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]

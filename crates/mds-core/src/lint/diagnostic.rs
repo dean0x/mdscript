@@ -137,12 +137,19 @@ impl miette::Diagnostic for LintDiagnostic {
 /// `diagnostics` is the collected findings, capped at `MAX_DIAGNOSTICS` per file.
 /// When `truncated` is `true`, collection was stopped early and the caller should
 /// re-run after resolving visible findings.
+///
+/// `is_standalone` is `true` when the entry module has no `@import` or `@extends`
+/// directives — used to determine whether Tier B fixes (unused-import, unused-function)
+/// are safe to apply (they change compiled output for non-standalone files because the
+/// importer's compiled output depends on what the imported module exports).
 #[derive(Debug)]
 pub struct LintResult {
     /// Collected lint findings. Never contains `Severity::Off` diagnostics.
     pub diagnostics: Vec<LintDiagnostic>,
     /// `true` when the `MAX_DIAGNOSTICS` cap was reached for at least one file.
     pub truncated: bool,
+    /// `true` when the entry has no @import or @extends (Tier B fixes are safe).
+    pub is_standalone: bool,
 }
 
 impl LintResult {
@@ -180,6 +187,23 @@ impl LintResult {
     pub fn to_canonical_json(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
 
+        // Inline tier table — must stay in sync with fix.rs::rule_tier / is_fixable.
+        // Not imported from fix.rs to avoid circular dependency (fix.rs imports from
+        // diagnostic.rs). The canonical source is fix.rs; any tier changes must update
+        // BOTH places.
+        let is_fixable_for_json = |rule: &str| -> bool {
+            match rule {
+                // Tier A — always auto-fixable
+                "duplicate-import" | "duplicate-export" | "unreachable-branch" | "empty-block" => {
+                    true
+                }
+                // Tier B — fixable only for standalone files (no @import / @extends)
+                "unused-import" | "unused-function" => self.is_standalone,
+                // Tier C — never fixed (unused-variable, redundant-else, shadow-variable, unknown)
+                _ => false,
+            }
+        };
+
         // Group diagnostics by file, preserving insertion order within each group.
         // BTreeMap gives deterministic (sorted) file ordering in the output.
         let mut by_file: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
@@ -205,7 +229,7 @@ impl LintResult {
                 "severity": diag.severity.to_string(),
                 "message": diag.message,
                 "help": diag.help,
-                "fixable": false,
+                "fixable": is_fixable_for_json(&diag.rule),
                 "span": span_json,
             });
 
@@ -265,10 +289,11 @@ impl LintResultBuilder {
         true
     }
 
-    pub(crate) fn build(self) -> LintResult {
+    pub(crate) fn build(self, is_standalone: bool) -> LintResult {
         LintResult {
             diagnostics: self.diagnostics,
             truncated: self.truncated,
+            is_standalone,
         }
     }
 }
@@ -361,6 +386,7 @@ mod tests {
                 file: Some("f.mds".to_string()),
             }],
             truncated: false,
+            is_standalone: false,
         };
         let json = result.to_canonical_json();
         let raw_msg = json["files"][0]["diagnostics"][0]["message"]
@@ -405,7 +431,7 @@ mod tests {
         });
         assert!(!rejected, "push beyond cap should return false");
 
-        let result = builder.build();
+        let result = builder.build(false);
         assert_eq!(result.diagnostics.len(), MAX_DIAGNOSTICS);
         assert!(result.truncated, "truncated must be true when cap was hit");
     }

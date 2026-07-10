@@ -251,7 +251,7 @@ mod tests {
             &LintConfig::default(),
             &mut builder,
         );
-        builder.build().diagnostics
+        builder.build(false).diagnostics
     }
 
     /// F2: parse-level assertion confirming whitespace-only bodies produce a Text node.
@@ -386,7 +386,7 @@ mod tests {
                 .collect(),
         };
         check(&module, &ctx, "test.mds", &config, &mut builder);
-        let result = builder.build();
+        let result = builder.build(false);
         assert!(
             result.diagnostics.is_empty(),
             "rule=off should produce no diagnostics"

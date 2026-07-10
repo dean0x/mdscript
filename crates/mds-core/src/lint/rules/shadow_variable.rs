@@ -114,7 +114,7 @@ mod tests {
         let ctx = collect_facts(&module, false, src).unwrap();
         let mut builder = LintResultBuilder::new();
         check(&module, &ctx, "test.mds", config, &mut builder);
-        builder.build().diagnostics
+        builder.build(false).diagnostics
     }
 
     fn enabled_config() -> LintConfig {
