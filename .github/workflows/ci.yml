@@ -100,10 +100,13 @@ jobs:
             #   raised 650K->700K (2026-07, PR #161 / fix/v0-4-0-149-154): toolchain
             #   drift + new v0.4.0 code (cross-type errors, extended help strings,
             #   @extends frontmatter merging) pushed CI binary to 650,745 bytes.
+            #   raised 700K->750K (2026-07, #61 / feat/mds-lint-61 S2): 9-rule lint
+            #   engine (AnalysisContext, rule dispatch, fix planner) pushed local
+            #   optimized binary to 712,419 bytes; +50K headroom for CI toolchain drift.
             # Follow-up: pin the wasm build toolchain to make the size deterministic
             # and re-tighten this guard.
-            if [ "$raw" -gt 700000 ]; then
-              echo "::error::WASM binary exceeds 700,000 byte threshold: ${label} is ${raw} bytes"
+            if [ "$raw" -gt 750000 ]; then
+              echo "::error::WASM binary exceeds 750,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
             fi
           done
