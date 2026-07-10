@@ -1,13 +1,13 @@
-# S2 Handoff: feat/mds-lint-61
+# S3 Handoff: feat/mds-lint-61
 
-Phase S2 of 4 — 9-rule lint engine + tiered --fix planner.
-(Supersedes S1 handoff — all S1 content still valid; this file extends it.)
+Phase S3 of 4 — `mds lint` CLI subcommand + `fixable` field wiring.
+(Supersedes S2 handoff — all S1/S2 content still valid; this file extends it.)
 
 ## Branch
 
 `feat/mds-lint-61` (based on `main` @ 3ce9f1d)
 
-## Commits (S1 + S2)
+## Commits (S1 + S2 + S3)
 
 | SHA | Message |
 |-----|---------|
@@ -17,6 +17,8 @@ Phase S2 of 4 — 9-rule lint engine + tiered --fix planner.
 | `4304d15` | `feat(core): 9-rule lint engine — 5 local-AST + 4 semantic rules (#61)` |
 | `462b03d` | `feat(core): tiered --fix planner with overlap rejection and reverify gate (#61)` |
 | `9a65849` | `chore(ci): raise wasm size budget for lint engine (#61)` |
+| `7e92d0f` | `feat(lint): wire fixable field in LintResult + LintCliConfig in mds.json (#61)` |
+| `9bb6ff7` | `feat(cli): add mds lint subcommand with --fix, --check, --diff, --format, --set (#61)` |
 
 ## Files Created (S2)
 
@@ -216,9 +218,145 @@ and S2 additions (AnalysisContext, 9-rule dispatch, fix planner).
 9. **LintResultBuilder cap**: `MAX_DIAGNOSTICS = 1000`. When hit, `truncated = true`
    and `plan.truncated = true` (AC-F-25 idempotence caveat applies).
 
-10. **`fixable` in canonical JSON**: Currently hardcoded `false` in
-    `to_canonical_json()`. S3 should update this to use `mds::fix::is_fixable(rule,
-    standalone)` to populate the `fixable` field correctly.
+10. **`fixable` in canonical JSON**: DONE in S3 (commit `7e92d0f`). Inline tier
+    table in `to_canonical_json()` computes `fixable` correctly.
+
+---
+
+## S3 Phase Summary: CLI subcommand + core touch-up
+
+### Files Created (S3)
+
+| File | Purpose |
+|------|---------|
+| `crates/mds-cli/src/lint.rs` | Full `mds lint` CLI implementation |
+| `crates/mds-cli/tests/cli_lint.rs` | 15 integration tests (all ACs) |
+| `crates/mds-cli/tests/fixtures/lint_clean.mds` | Clean fixture (exit 0) |
+| `crates/mds-cli/tests/fixtures/lint_warn_only.mds` | Warn fixture (exit 1, unused-variable) |
+| `crates/mds-cli/tests/fixtures/lint_error.mds` | Error fixture (exit 2, duplicate-export) |
+| `crates/mds-cli/tests/fixtures/lint_gate_fail.mds` | Gate failure fixture (exit 2, file-not-found) |
+| `crates/mds-cli/tests/fixtures/lint_var_required.mds` | Requires --set (exit 2 without it, exit 1 with it) |
+| `crates/mds-cli/tests/fixtures/_lint_partial.mds` | Partial fixture for directory mode tests |
+
+### Files Modified (S3)
+
+| File | Change |
+|------|--------|
+| `crates/mds-core/src/lint/diagnostic.rs` | `is_standalone: bool` on `LintResult`; `build(is_standalone)` on builder; `to_canonical_json()` inline tier table for `fixable` |
+| `crates/mds-core/src/lint/mod.rs` | Compute `is_standalone` after `collect_facts()`, pass to `builder.build()` |
+| `crates/mds-core/src/lint/fix.rs` | Struct literal test updates: `is_standalone: true/false` |
+| `crates/mds-core/src/lint/rules/*.rs` | `builder.build()` → `builder.build(false)` in all in-module tests (9 files) |
+| `crates/mds-core/tests/api_surface.rs` | `LintResult` struct literals get `is_standalone: false`; 3 new tests: `lint_canonical_json_fixable_semantics`, `lint_str_trivial_source_returns_empty` (asserts `is_standalone`), `lint_str_with_imports_is_not_standalone` |
+| `crates/mds-cli/src/build.rs` | `LintCliConfig` struct + `into_core_config()` + `lint` field on `MdsConfig` |
+| `crates/mds-cli/src/main.rs` | `mod lint;`, `Commands::Lint { ... }` enum variant, dispatch in `run()` |
+| `crates/mds-cli/Cargo.toml` | `tempfile` moved from `[dev-dependencies]` to `[dependencies]` (needed for atomic write) |
+
+### Key Implementation Details for S4
+
+**`LintResult` struct:**
+```rust
+pub struct LintResult {
+    pub diagnostics: Vec<LintDiagnostic>,
+    pub truncated: bool,
+    pub is_standalone: bool,  // NEW in S3: !is_partial_or_extends && imports.is_empty()
+}
+```
+
+**`to_canonical_json()` output shape (unchanged):**
+```json
+{
+  "version": 1,
+  "files": [
+    {
+      "file": "path/to/file.mds",
+      "diagnostics": [
+        { "rule": "unused-variable", "severity": "warn", "message": "...",
+          "help": "...", "fixable": false, "span": {"offset": 20, "length": 10} }
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+**CLI exit code contract (lint-specific, via `std::process::exit`, NOT `exit_code()`):**
+- 0: clean
+- 1: warn-only findings
+- 2: error finding OR analysis failure OR usage error
+- 3: ResourceLimit
+
+**Channel discipline:**
+- Human mode: diagnostics → **stderr** (via `miette::Report::from(diag)`)
+- JSON mode: all output → **stdout**
+- `--quiet`: suppresses Warn/Info rendering, exit codes unchanged
+
+**Atomic write pattern (in `lint.rs:atomic_write_file`):**
+1. `NativeFs::check_symlink(path)` — re-check right before write (TOCTOU)
+2. `tempfile::Builder::new().tempfile_in(parent_dir)` — same dir for intra-FS rename
+3. `tmp.write_all(content.as_bytes())` + `flush()`
+4. `tmp.persist(path)` — atomic rename
+
+**`--fix stdin` filter mode:**
+- stdin source fixed → **stdout** (filter pipe semantics)
+- residual diagnostics → **stderr**
+- `--fix --format json stdin` → USAGE ERROR exit 2
+
+**Directory mode:**
+- `collect_mds_files(dir, MAX_DEPTH, None)` returns ALL `.mds` files including `_`-partials
+- Results MUST be `.sort()`-ed before processing (F1: `collect_mds_files` does NOT sort)
+- Accumulate-and-continue past per-file failures
+- Exit = max severity across all files
+
+**`mds.json` lint section:**
+```json
+{
+  "lint": {
+    "rules": {
+      "unused-variable": "off",
+      "shadow-variable": "warn"
+    }
+  }
+}
+```
+Parsed via `MdsConfig.lint: LintCliConfig` in `build.rs`, converted to `mds::LintConfig` via `into_core_config()`. Unknown rule names → stderr warning, ignored. Unknown severity values → serde parse error → exit 2.
+
+### S4 Task: Bindings Parity
+
+S4 must expose `mds lint` via all three binding layers:
+1. **WASM** (`crates/mds-wasm/src/lib.rs`): extend `parse_options` to extract `options.rules` into `HashMap<String, Severity>` → `LintConfig`. Wire to existing `lint()` export stub.
+2. **NAPI** (`crates/mds-napi/`): expose `lint(path, options?)` and `lintStr(source, options?)` with `rules` option. Return value: canonical JSON object (or typed TS interface).
+3. **Python** (`crates/mds-python/src/lib.rs`): expose `lint_str(source, **kwargs)` returning the canonical JSON string. Rules via dict arg.
+
+**WASM stub (current, from S1 commit `5cf36b4`):**
+```rust
+// crates/mds-wasm/src/lib.rs — CURRENT STATE (S4 entry point)
+pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
+    // Currently: LintConfig::default() — S4 must wire options.rules
+    let result = mds::lint_str(source).map_err(mds_err_to_js)?;
+    Ok(serde_wasm_bindgen::to_value(&result.to_canonical_json()).unwrap())
+}
+```
+
+**DO NOT TOUCH in S4** (S3 owns, already done):
+- `crates/mds-core/` (all core changes complete)
+- `crates/mds-cli/` (CLI subcommand complete)
+
+### Quality Gates (post-S3)
+
+```
+cargo test --workspace          → ALL PASS (0 failed)
+cargo fmt --all --check         → CLEAN
+cargo clippy --workspace --all-targets -- -D warnings  → CLEAN (0 warnings, 0 errors)
+snyk_code_scan                  → Rust not supported (expected, per project memory)
+```
+
+### Test Counts (cumulative)
+
+| Phase | Total |
+|-------|-------|
+| Before S1 | ~593 |
+| After S2 | 813 mds-core lib + 57 cli-watch + 33 doctests |
+| After S3 | +15 cli-lint integration tests; all existing tests still pass |
 
 ## Deviations from Plan
 
