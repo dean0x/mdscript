@@ -55,8 +55,13 @@ fn check_nodes(
         match node {
             Node::If(b) => {
                 // Check if @else body is structurally identical to then-body.
+                // Only meaningful with NO intervening @elseif branches: with an @elseif
+                // present, then==else does NOT make the conditional redundant (the elseif
+                // arm still produces different output), so firing here would be a false
+                // positive with a factually wrong "same output regardless" message.
                 if let Some(else_body) = &b.else_body {
-                    if nodes_eq(&b.then_body, else_body)
+                    if b.elseif_branches.is_empty()
+                        && nodes_eq(&b.then_body, else_body)
                         && !builder.push(LintDiagnostic {
                             rule: RULE.to_string(),
                             severity: severity.clone(),
@@ -161,6 +166,19 @@ mod tests {
         assert!(
             !diags.iter().any(|d| d.rule == RULE),
             "should not fire when no @else"
+        );
+    }
+
+    /// With an intervening @elseif, identical then/else is NOT redundant — the elseif
+    /// arm still produces different output, so the rule must not fire (false positive).
+    #[test]
+    fn identical_then_else_with_elseif_does_not_fire() {
+        let src = "@if x:\nhello\n@elseif y:\nworld\n@else:\nhello\n@end\n";
+        let diags = lint_src(src);
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "must not fire when an @elseif branch differs; got: {:?}",
+            diags
         );
     }
 

@@ -296,14 +296,21 @@ pub fn apply_plan(source: &str, plan: &FixPlan) -> String {
 /// - `Ok(LintResult)`: the lint result of the fixed source (may be empty).
 /// - `Err(MdsError)`: the fixed source failed the check gate.
 ///
+/// `original` is the lint result the plan was built from — it establishes the
+/// baseline of diagnostics that already existed BEFORE any fix. Pre-existing
+/// findings (e.g. a Tier C `unused-variable` that coexists with a fixable
+/// `duplicate-import`) are expected to survive into the residual and must NOT
+/// cause the fix to be refused (AC-F-23: residual findings determine the exit
+/// code). Only a genuinely NEW untargeted diagnostic is a regression.
+///
 /// The fix is REFUSED if:
 /// - The plan has `overlap_rejected = true`.
-/// - The `reverify` callback returns `Err`.
-/// - The fixed lint result contains any diagnostic not targeted by the batch
-///   (i.e., any new diagnostic with a rule NOT in the plan's edit rules).
+/// - The `reverify` callback returns `Err` (the fixed source no longer compiles).
+/// - The residual contains MORE diagnostics of an untargeted rule than `original`
+///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
-pub fn apply_fixes<F>(source: &str, plan: FixPlan, reverify: F) -> FixOutcome
+pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
 where
     F: FnOnce(&str) -> Result<LintResult, MdsError>,
 {
@@ -325,6 +332,17 @@ where
     let targeted_rules: std::collections::HashSet<&str> =
         plan.edits.iter().map(|e| e.rule.as_str()).collect();
 
+    // Baseline: per-rule count of NON-targeted diagnostics that were already present
+    // before the fix. A pre-existing untargeted finding must not trip the gate — only
+    // an untargeted rule whose count INCREASES is a regression the edit introduced.
+    let mut baseline: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for d in &original.diagnostics {
+        let rule = d.rule.as_str();
+        if !targeted_rules.contains(rule) {
+            *baseline.entry(rule).or_insert(0) += 1;
+        }
+    }
+
     // Reverify: run the lint engine on the fixed source.
     match reverify(&fixed_source) {
         Err(err) => FixOutcome::Rejected {
@@ -332,22 +350,33 @@ where
             reason: format!("Reverify failed: fixed source does not compile: {err}"),
         },
         Ok(residual) => {
-            // Fail if the residual result has any diagnostic from an untargeted rule
-            // that was not present before (new regression introduced by the fix).
-            let new_non_targeted: Vec<_> = residual
-                .diagnostics
-                .iter()
-                .filter(|d| !targeted_rules.contains(d.rule.as_str()))
-                .collect();
+            // Count untargeted diagnostics in the residual, per rule.
+            let mut residual_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for d in &residual.diagnostics {
+                let rule = d.rule.as_str();
+                if !targeted_rules.contains(rule) {
+                    *residual_counts.entry(rule).or_insert(0) += 1;
+                }
+            }
 
-            if !new_non_targeted.is_empty() {
-                let new_rules: Vec<_> = new_non_targeted.iter().map(|d| d.rule.as_str()).collect();
+            // A regression is an untargeted rule whose count grew vs. the original —
+            // i.e. a NEW problem the edit introduced (pre-existing findings survive
+            // untouched and are allowed through, per AC-F-23).
+            let mut regressed: Vec<&str> = Vec::new();
+            for (rule, count) in &residual_counts {
+                if *count > baseline.get(rule).copied().unwrap_or(0) {
+                    regressed.push(rule);
+                }
+            }
+
+            if !regressed.is_empty() {
+                regressed.sort_unstable();
                 return FixOutcome::Rejected {
                     source: source.to_string(),
                     reason: format!(
-                        "Reverify produced new untargeted diagnostics: {:?}. \
-                         Fix batch reverted.",
-                        new_rules
+                        "Reverify produced new untargeted diagnostics: {regressed:?}. \
+                         Fix batch reverted."
                     ),
                 };
             }
@@ -574,7 +603,7 @@ mod tests {
         let plan = plan_fixes(&result, source);
 
         // Reverify callback that always fails.
-        let outcome = apply_fixes(source, plan, |_fixed| {
+        let outcome = apply_fixes(source, plan, &result, |_fixed| {
             Err(MdsError::syntax("simulated compile failure after fix"))
         });
 
@@ -596,7 +625,7 @@ mod tests {
         }
 
         // Reverify callback that succeeds with empty result.
-        let outcome = apply_fixes(source, plan, |_fixed| {
+        let outcome = apply_fixes(source, plan, &result, |_fixed| {
             Ok(LintResult {
                 diagnostics: vec![],
                 truncated: false,
@@ -607,6 +636,49 @@ mod tests {
         assert!(
             matches!(outcome, FixOutcome::Fixed { .. }),
             "successful reverify should return Fixed outcome"
+        );
+    }
+
+    /// AC-F-23 regression guard: a pre-existing untargeted diagnostic (e.g. a Tier C
+    /// `unused-variable` that coexists with a fixable `duplicate-import`) survives the
+    /// reverify but must NOT cause the fix to be refused — residual findings are
+    /// expected to remain and determine the exit code.
+    #[test]
+    fn reverify_preexisting_untargeted_survives_and_fix_applies() {
+        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
+        let dup = make_diag("duplicate-import", 23, "@import".len()); // Tier A → targeted
+        let unused = make_diag("unused-variable", 0, 1); // Tier C → untargeted, pre-existing
+        let result = make_result(vec![dup, unused]);
+        let plan = plan_fixes(&result, source);
+        assert!(!plan.overlap_rejected && !plan.edits.is_empty());
+
+        // The untargeted unused-variable is still present after the fix — same count.
+        let outcome = apply_fixes(source, plan, &result, |_fixed| {
+            Ok(make_result(vec![make_diag("unused-variable", 0, 1)]))
+        });
+        assert!(
+            matches!(outcome, FixOutcome::Fixed { .. }),
+            "a surviving pre-existing untargeted diagnostic must not refuse the fix"
+        );
+    }
+
+    /// A genuinely NEW untargeted diagnostic introduced by the edit IS a regression
+    /// and must refuse the fix.
+    #[test]
+    fn reverify_new_untargeted_diagnostic_is_rejected() {
+        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
+        let dup = make_diag("duplicate-import", 23, "@import".len());
+        let result = make_result(vec![dup]); // no untargeted diagnostics in the baseline
+        let plan = plan_fixes(&result, source);
+        assert!(!plan.overlap_rejected && !plan.edits.is_empty());
+
+        // Reverify surfaces an empty-block diagnostic that was NOT present before.
+        let outcome = apply_fixes(source, plan, &result, |_fixed| {
+            Ok(make_result(vec![make_diag("empty-block", 0, 1)]))
+        });
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "a new untargeted diagnostic must refuse the fix"
         );
     }
 

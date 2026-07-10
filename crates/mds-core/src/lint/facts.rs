@@ -318,7 +318,12 @@ fn find_yaml_key_in_source(source: &str, fm_start: usize, key: &str) -> Option<u
         if at_line_start {
             return Some(fm_start + abs_rel);
         }
-        search_from = abs_rel + 1;
+        // Advance past the whole matched substring. `search` ends with an ASCII `:`,
+        // so `abs_rel + search.len()` always lands on a UTF-8 char boundary — advancing
+        // by a single byte would slice mid-character and panic when `key` (or the byte
+        // before the next match) is multi-byte (e.g. a non-ASCII frontmatter key that
+        // also appears inside an earlier quoted value).
+        search_from = abs_rel + search.len();
         if search_from >= fm_region.len() {
             return None;
         }
@@ -884,5 +889,19 @@ mod tests {
                 "should exclude reserved key '{reserved}'"
             );
         }
+    }
+
+    /// Regression: a non-ASCII frontmatter key that ALSO appears inside an earlier
+    /// quoted value must not panic the key-offset search. The old `abs_rel + 1`
+    /// advance sliced mid-character (`byte index N is not a char boundary`).
+    #[test]
+    fn non_ascii_frontmatter_key_does_not_panic() {
+        let src = "---\nintro: \"say évar: now\"\névar: 1\n---\nHello\n";
+        // Must not panic during the facts walk.
+        let ctx = facts(src);
+        assert!(
+            ctx.frontmatter_vars.iter().any(|v| v.name == "évar"),
+            "should collect the non-ASCII frontmatter key without panicking"
+        );
     }
 }

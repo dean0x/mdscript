@@ -350,7 +350,7 @@ fn plan_and_apply_fixes(
 
     let base_dir_owned = base_dir.to_path_buf();
     let config_clone = config.clone();
-    let outcome = mds::fix::apply_fixes(source, plan, move |fixed| {
+    let outcome = mds::fix::apply_fixes(source, plan, &result, move |fixed| {
         mds::lint_str_with(
             fixed,
             Some(&base_dir_owned),
@@ -461,8 +461,11 @@ fn run_lint_file(
     };
 
     if result.truncated && fix {
-        let suppressed = mds::MAX_DIAGNOSTICS - result.diagnostics.len();
-        eprintln!("{suppressed} findings suppressed; re-run --fix to continue");
+        eprintln!(
+            "diagnostic cap ({}) reached; further findings were suppressed — \
+             re-run --fix to continue",
+            mds::MAX_DIAGNOSTICS
+        );
     }
 
     // Named source for span rendering: (display filename, source text).
@@ -496,7 +499,7 @@ fn run_lint_file(
             }
             FixFileOutcome::NothingToFix { original } => {
                 emit_result(format, &original, quiet, named_source);
-                if !quiet && format == LintFormat::Human {
+                if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
                     eprintln!("Clean: {filename}");
                 }
                 let exit = result_exit_code(&original);
@@ -689,10 +692,11 @@ fn lint_one_file_accumulating(
     if result.truncated {
         *any_truncated = true;
         if fix {
-            let suppressed = mds::MAX_DIAGNOSTICS - result.diagnostics.len();
             eprintln!(
-                "{}: {suppressed} findings suppressed; re-run --fix to continue",
-                file.display()
+                "{}: diagnostic cap ({}) reached; further findings were suppressed — \
+                 re-run --fix to continue",
+                file.display(),
+                mds::MAX_DIAGNOSTICS
             );
         }
     }
@@ -771,10 +775,11 @@ fn lint_one_file_human(
     if result.truncated {
         *any_truncated = true;
         if fix {
-            let suppressed = mds::MAX_DIAGNOSTICS - result.diagnostics.len();
             eprintln!(
-                "{}: {suppressed} findings suppressed; re-run --fix to continue",
-                file.display()
+                "{}: diagnostic cap ({}) reached; further findings were suppressed — \
+                 re-run --fix to continue",
+                file.display(),
+                mds::MAX_DIAGNOSTICS
             );
         }
     }

@@ -65,6 +65,17 @@ use napi_derive::napi;
 /// when the caller passes a string, so the limit must be re-enforced here.
 const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
+/// Maximum number of module entries accepted by `lintVirtual`.
+///
+/// Mirrors the WASM and Python bindings. 256 modules is well above any realistic
+/// template graph; the cap prevents a caller from exhausting memory with thousands
+/// of small virtual modules.
+const MAX_MODULE_COUNT: usize = 256;
+
+/// Maximum aggregate byte size of all `lintVirtual` module values combined
+/// (same ceiling as a single source input).
+const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
+
 // ── Return types ──────────────────────────────────────────────────────────────
 
 /// Result returned by `check` and `checkFile`.
@@ -846,8 +857,20 @@ pub fn lint_virtual(
         ));
     };
 
-    // Convert and validate.
-    let mut mods: HashMap<String, String> = HashMap::new();
+    // Convert and validate, enforcing the same module-count and size caps the WASM
+    // and Python bindings apply — the virtual-FS path bypasses the file layer's own
+    // size guard, so it must be re-enforced here (defense-in-depth, cross-binding parity).
+    if mods_map.len() > MAX_MODULE_COUNT {
+        return Err(throw_resource_limit(
+            &env,
+            &format!(
+                "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({} provided)",
+                mods_map.len()
+            ),
+        ));
+    }
+    let mut mods: HashMap<String, String> = HashMap::with_capacity(mods_map.len());
+    let mut aggregate: usize = 0;
     for (key, val) in mods_map {
         let serde_json::Value::String(s) = val else {
             return Err(throw_options_error(
@@ -855,6 +878,24 @@ pub fn lint_virtual(
                 &format!("modules[\"{key}\"] must be a string source"),
             ));
         };
+        if s.len() > MAX_SOURCE_SIZE {
+            return Err(throw_resource_limit(
+                &env,
+                &format!(
+                    "modules[\"{key}\"] exceeds maximum size of {MAX_SOURCE_SIZE} bytes ({} bytes provided)",
+                    s.len()
+                ),
+            ));
+        }
+        aggregate = aggregate.saturating_add(s.len());
+        if aggregate > MAX_MODULES_AGGREGATE_SIZE {
+            return Err(throw_resource_limit(
+                &env,
+                &format!(
+                    "modules aggregate size exceeds maximum of {MAX_MODULES_AGGREGATE_SIZE} bytes"
+                ),
+            ));
+        }
         mods.insert(key, s);
     }
 
