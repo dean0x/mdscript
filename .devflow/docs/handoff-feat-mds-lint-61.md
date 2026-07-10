@@ -1,3 +1,121 @@
+# S4a Handoff: feat/mds-lint-61
+
+Phase S4a of 5 — binding parity (miette spans + WASM + napi + Python).
+(Supersedes S3 handoff — all S1/S2/S3 content still valid; this file extends it.)
+
+---
+
+## S4a Phase Summary: Binding Parity
+
+### Commits (S4a)
+
+| SHA | Message |
+|-----|---------|
+| `3888b5e` | `feat(core): span-labeled human rendering for lint diagnostics (#61)` |
+| `2780bf2` | `feat(wasm): finalize lint + lint_virtual with rules option (#61)` |
+| `5f78dd9` | `feat(napi): lint/lintFile/lintVirtual + index.d.ts type declarations (#61)` |
+| `d69fced` | `feat(python): lint/lint_file/lint_virtual bindings + LintResult (#61)` |
+
+### Files Created (S4a)
+
+| File | Purpose |
+|------|---------|
+| `crates/mds-python/tests/test_lint.py` | 24 pytest tests — shape, rules, parity, LintResult contract |
+| `crates/mds-python/tests/fixtures/lint_warn_only.mds` | Fixture with unused_key frontmatter var triggering unused-variable |
+
+### Files Modified (S4a)
+
+| File | Change |
+|------|--------|
+| `crates/mds-core/src/lint/diagnostic.rs` | Added `labels()` to `impl miette::Diagnostic for LintDiagnostic` — yields `LabeledSpan::at(SourceSpan, message)` from `self.span`. Source NOT stored here. |
+| `crates/mds-cli/src/lint.rs` | `render_diag_human` now accepts `named_source: Option<(&str, &str)>`; `Report::with_source_code(NamedSource::new(filename, src))` when present. Single-file + dir modes pass source text; stdin mode passes `None`. |
+| `crates/mds-cli/tests/cli_lint.rs` | Added `span_source_context_appears_in_human_render` — asserts "unused_key" and filename appear in stderr when linting `lint_warn_only.mds`. |
+| `crates/mds-wasm/src/lib.rs` | `ParsedLintOptions { opts, lint_config }` struct; `extract_rules(obj)` validates via `serde_json::from_str(&format!("\"{s}\""))`; `parse_lint_options` (filename/modules/vars/rules) + `parse_lint_virtual_options` (vars/rules only); `lint()` upgraded; `lintVirtual(modules, entry, options)` export added. |
+| `crates/mds-napi/src/lib.rs` | `extract_rules_direct`, `parse_lint_opts` (basePath/vars/rules), `parse_lint_file_opts` (vars/rules, rejects basePath); `lint(source, opts)`, `lintFile(path, opts)`, `lintVirtual(modules, entry, opts)` exports added. |
+| `crates/mds-napi/__test__/index.spec.mjs` | 18 tests: lint shape, rules silencing, guard (unknown severity/key), lintFile (clean/findings/basePath-reject/str-path/not-found), lintVirtual (clean/findings/rules), parity (lint == lintFile canonical JSON). |
+| `crates/mds-python/src/lib.rs` | `LintResult` frozen pyclass (version/files/truncated getters + to_dict/to_json + pickle); `extract_rules` helper; `lint`, `lint_file`, `lint_virtual` pyfunction exports; all registered in `_mdscript` module. |
+
+### Key Implementation Decisions
+
+1. **miette source attachment at CLI boundary**: `labels()` on `LintDiagnostic` yields `LabeledSpan` from `self.span` (byte range). Source text attached via `Report::with_source_code(NamedSource::new(filename, src))` at CLI render, NOT stored in the struct. Zero new fields on `LintDiagnostic`.
+
+2. **Severity validation via serde roundtrip**: All three binding layers validate rules values as `serde_json::from_str::<mds::Severity>(&format!("\"{s}\""))` — clean closed-enum gate, avoids duplicating the enum variants in binding code.
+
+3. **WASM option split**: `parse_lint_options` (has filename/modules/vars/rules) and `parse_lint_virtual_options` (only vars/rules) — prevents `rules` leaking into compile/check option parsers.
+
+4. **napi `lintFile` basePath guard**: `parse_lint_file_opts` explicitly checks `has_named_property("basePath")` and returns `mds::invalid_options` before `reject_unknown_napi_keys` runs. Matches `compileFile` behavior.
+
+5. **Python `LintResult.files` getter**: Returns pythonized list of dicts (via `value_to_py`). Callers iterate `result.files` or `result.to_dict()["files"]` — no separate pyclass for per-file results (keeps the surface minimal).
+
+### Integration Points for S4b / S5 (docs)
+
+**Core API (all stable, no further changes needed):**
+```rust
+mds::lint(path, vars, &lint_config) -> Result<LintResult, MdsError>
+mds::lint_str_with(source, base_path, vars, &lint_config) -> Result<LintResult, MdsError>
+mds::lint_virtual(modules, entry, vars, &lint_config) -> Result<LintResult, MdsError>
+result.to_canonical_json() -> serde_json::Value   // parity-guaranteed
+```
+
+**WASM API (all stable):**
+```ts
+lint(source: string, options?: object): any        // canonical JSON object
+lintVirtual(modules: object, entry: string, options?: object): any
+```
+
+**napi API (all stable):**
+```ts
+lint(source: string, opts?: {basePath?, vars?, rules?}): LintResult
+lintFile(path: string, opts?: {vars?, rules?}): LintResult
+lintVirtual(modules: Record<string,string>, entry: string, opts?: {vars?,rules?}): LintResult
+```
+
+**Python API (all stable):**
+```python
+m.lint(source, *, base_path=None, vars=None, rules=None) -> LintResult
+m.lint_file(path, *, vars=None, rules=None) -> LintResult
+m.lint_virtual(modules, entry, *, vars=None, rules=None) -> LintResult
+result.version: int    # always 1
+result.files: list     # list of dicts: [{file, diagnostics: [...]}, ...]
+result.truncated: bool
+result.to_dict()       # canonical Python dict
+result.to_json()       # canonical JSON string
+```
+
+### Quality Gates (post-S4a)
+
+```
+cargo test --workspace                                         → ALL PASS (0 failed)
+cargo fmt --all --check                                        → CLEAN
+cargo clippy --workspace --all-targets -- -D warnings         → CLEAN (0 warnings, 0 errors)
+snyk_code_scan /Users/dean/Sandbox/mdl/crates                 → 0 issues
+node scripts/verify-napi-names.mjs                            → Expected local failure (npm/ generated CI-only; index.js untouched)
+```
+
+### Test Counts (cumulative through S4a)
+
+| Phase | Notable additions |
+|-------|-------------------|
+| After S3 | 813 mds-core lib + 57 cli-watch + 33 doctests + 15 cli-lint integration |
+| S4a core | Added span_source_context_appears_in_human_render CLI test |
+| S4a napi | +18 integration tests in index.spec.mjs |
+| S4a python | +24 pytest tests in test_lint.py |
+
+### Deviations from Plan (S4a)
+
+1. **`index.d.ts` is gitignored** — the file exists locally and was updated with full
+   TypeScript interface declarations (LintDiagnostic, LintSpan, LintFileResult,
+   LintResult + lint/lintFile/lintVirtual declarations), but `.gitignore` line 6 excludes
+   it. The napi-rs `#[napi]` proc-macro generates TypeScript at build/publish time;
+   what's on disk is a dev convenience. The declarations are structurally correct but
+   will be regenerated by CI during release.
+
+2. **WASM `lintVirtual` uses `modules: JsValue`** not `Record<string,string>` JS-side —
+   deserialized via `serde_wasm_bindgen::from_value` → `serde_json::Value::Object` →
+   `parse_modules_from_map`. This matches the existing `compileVirtual` pattern.
+
+---
+
 # S3 Handoff: feat/mds-lint-61
 
 Phase S3 of 4 — `mds lint` CLI subcommand + `fixable` field wiring.
