@@ -48,6 +48,7 @@ pub(crate) mod formatter;
 pub(crate) mod fs;
 pub(crate) mod lexer;
 pub(crate) mod limits;
+pub(crate) mod lint;
 pub(crate) mod options;
 pub(crate) mod parser;
 pub(crate) mod resolver;
@@ -57,6 +58,7 @@ pub(crate) mod value;
 
 pub use formatter::{format_str, format_str_with};
 pub use fs::{FileSystem, NativeFs, VirtualFs};
+pub use lint::{sanitize_control_chars, LintConfig, LintDiagnostic, LintResult, Severity};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };
@@ -239,6 +241,15 @@ pub const MAX_FILE_SIZE: u64 = limits::MAX_FILE_SIZE;
 /// Shared between `find_project_root` in the resolver and `load_config` in the
 /// CLI binary — eliminating the duplicate definition.
 pub const MAX_TRAVERSAL_DEPTH: usize = limits::MAX_TRAVERSAL_DEPTH;
+
+/// Maximum number of lint diagnostics collected per file before truncation.
+///
+/// When the `lint_*` entry points accumulate this many diagnostics for a single
+/// file, collection stops and `LintResult::truncated` is set to `true`. Re-run
+/// after resolving visible findings to surface the rest.
+///
+/// Pin guard: L-API-5 / AC-API-10.
+pub const MAX_DIAGNOSTICS: usize = limits::MAX_DIAGNOSTICS;
 
 /// Compile an MDS file, returning a [`CompileResult`].
 ///
@@ -905,6 +916,148 @@ pub fn check_virtual_collecting_warnings(
     // during validation; the CompiledOutput itself is discarded.
     cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
     Ok(((), warnings))
+}
+
+// ── Lint entry points ─────────────────────────────────────────────────────────
+
+/// Lint an MDS source string with default options.
+///
+/// Runs the check gate (resolve+validate) first: returns `Err(MdsError)` when the
+/// template does not compile. On a clean gate, applies the 9 lint rules and returns
+/// a `LintResult` (empty in S1 — rules arrive in S2).
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::lint_str("Hello!\n")?;
+/// assert!(result.diagnostics.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "lint findings should be used"]
+pub fn lint_str(source: &str) -> Result<LintResult, MdsError> {
+    lint_str_with(source, None, None, &LintConfig::default())
+}
+
+/// Lint an MDS source string with full options.
+///
+/// `base_dir` sets the root for resolving `@import` paths; defaults to the current
+/// directory. `runtime_vars` are injected into the check gate (not into lint rules).
+/// `config` carries per-rule severity overrides.
+///
+/// Pipeline (AC-PERF-01): check gate ONCE → lint entry source.
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::lint_str_with(
+///     "Hello!\n",
+///     None,
+///     None,
+///     &mds::LintConfig::default(),
+/// )?;
+/// assert!(result.diagnostics.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "lint findings should be used"]
+pub fn lint_str_with(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+) -> Result<LintResult, MdsError> {
+    let dir = resolve_base_dir(base_dir)?;
+    let vars = runtime_vars.unwrap_or_default();
+    // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
+    {
+        let mut cache = ModuleCache::new();
+        let mut warnings = vec![];
+        cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
+    }
+    // Step 2: lint the entry source.
+    lint::lint_source(source, "<source>", config)
+}
+
+/// Lint an MDS file.
+///
+/// Runs the check gate first (returns `Err` on compile failure), then applies lint
+/// rules to the entry file source.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+/// let result = mds::lint(Path::new("template.mds"), None, &mds::LintConfig::default())?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "lint findings should be used"]
+pub fn lint(
+    path: &Path,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+) -> Result<LintResult, MdsError> {
+    let path_str = path_to_str(path)?;
+    let vars = runtime_vars.unwrap_or_default();
+    // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
+    {
+        let mut cache = ModuleCache::new();
+        let mut warnings = vec![];
+        cache.resolve_path_intrinsic(path_str, &vars, &mut warnings)?;
+    }
+    // Read source for lint re-parse (mirrors NativeFs::read size guard).
+    let bytes =
+        std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {path_str}: {e}")))?;
+    if bytes.len() as u64 > limits::MAX_FILE_SIZE {
+        return Err(MdsError::resource_limit(format!(
+            "file too large ({} bytes, max {} bytes): {path_str}",
+            bytes.len(),
+            limits::MAX_FILE_SIZE,
+        )));
+    }
+    let source = String::from_utf8(bytes)
+        .map_err(|e| MdsError::io(format!("invalid UTF-8 in {path_str}: {e}")))?;
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path_str);
+    lint::lint_source(&source, filename, config)
+}
+
+/// Lint an entry module from a virtual filesystem.
+///
+/// Runs the check gate first (returns `Err` on compile failure), then applies lint
+/// rules to the entry source.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// let mut modules = HashMap::new();
+/// modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+/// let result = mds::lint_virtual(modules, "main.mds", None, &mds::LintConfig::default())?;
+/// assert!(result.diagnostics.is_empty());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "lint findings should be used"]
+pub fn lint_virtual(
+    modules: HashMap<String, String>,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    config: &LintConfig,
+) -> Result<LintResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    // Get the entry source before moving `modules` into the check gate.
+    let source = modules
+        .get(entry)
+        .ok_or_else(|| MdsError::file_not_found(entry))?
+        .clone();
+    // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
+    {
+        let mut cache = ModuleCache::virtual_fs(modules);
+        let mut warnings = vec![];
+        cache.resolve_virtual_intrinsic(entry, &vars, &mut warnings)?;
+    }
+    // Step 2: lint the entry source.
+    lint::lint_source(&source, entry, config)
 }
 
 /// Convenience wrapper around [`compile`] for callers who have a path as `&str`.

@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mds::{
-    CompileResult, CompiledOutput, FileSystem, MdsError, ModuleCache, NativeFs, Value, VirtualFs,
-    MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
+    CompileResult, CompiledOutput, FileSystem, LintConfig, LintDiagnostic, LintResult, MdsError,
+    ModuleCache, NativeFs, Severity, Value, VirtualFs, MAX_DIAGNOSTICS, MAX_FILE_SIZE,
+    MAX_TRAVERSAL_DEPTH,
 };
 
 #[test]
@@ -953,6 +954,201 @@ fn compile_max_file_size_still_enforced() {
     );
 }
 
+// ── Lint API surface pins (L-API-1/2/3/4/5) ──────────────────────────────────
+
+/// L-API-1: lint_* function signatures mirror check_* conventions.
+#[test]
+#[allow(clippy::type_complexity)]
+fn lint_api_signatures_exist() {
+    // lint_str: simplest form, no options.
+    let _: fn(&str) -> Result<LintResult, MdsError> = mds::lint_str;
+
+    // lint_str_with: full options — base_dir, runtime_vars, config.
+    let _: fn(
+        &str,
+        Option<&Path>,
+        Option<HashMap<String, Value>>,
+        &LintConfig,
+    ) -> Result<LintResult, MdsError> = mds::lint_str_with;
+
+    // lint: file-based entry point.
+    let _: fn(&Path, Option<HashMap<String, Value>>, &LintConfig) -> Result<LintResult, MdsError> =
+        mds::lint;
+
+    // lint_virtual: virtual-FS entry point.
+    let _: fn(
+        HashMap<String, String>,
+        &str,
+        Option<HashMap<String, Value>>,
+        &LintConfig,
+    ) -> Result<LintResult, MdsError> = mds::lint_virtual;
+}
+
+/// L-API-2: pub types LintDiagnostic, Severity, LintConfig, LintResult are accessible
+/// and have the expected fields/variants.
+#[test]
+fn lint_types_exist() {
+    // Severity has four variants with lowercase serde names.
+    let _off = Severity::Off;
+    let _info = Severity::Info;
+    let _warn = Severity::Warn;
+    let _err = Severity::Error;
+
+    // LintConfig has a `rules` field (HashMap<String, Severity>).
+    let config = LintConfig {
+        rules: HashMap::from([("unused-variable".to_string(), Severity::Off)]),
+    };
+    assert_eq!(config.rules.get("unused-variable"), Some(&Severity::Off));
+
+    // LintDiagnostic has the expected fields.
+    let diag = LintDiagnostic {
+        rule: "unused-variable".to_string(),
+        severity: Severity::Warn,
+        message: "Variable 'name' is never used".to_string(),
+        help: Some("Remove the frontmatter key or reference it in the body".to_string()),
+        span: None,
+        file: Some("test.mds".to_string()),
+    };
+    assert_eq!(diag.rule, "unused-variable");
+    assert_eq!(diag.severity, Severity::Warn);
+
+    // LintResult has diagnostics and truncated fields.
+    let result = LintResult {
+        diagnostics: vec![diag],
+        truncated: false,
+    };
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(!result.truncated);
+}
+
+/// L-API-4: MdsError enum is unchanged — lint findings are LintDiagnostic, not MdsError variants.
+#[test]
+fn mds_error_variants_unchanged_by_lint() {
+    // All pre-existing MdsError variants still exist and are exhaustively matched.
+    // This is a compile-time check — if new variants were accidentally added, this match
+    // would not produce an "unreachable pattern" warning (since we allow it via `_ => {}`).
+    #[allow(unreachable_patterns)]
+    match (MdsError::Io {
+        message: "x".to_string(),
+    }) {
+        MdsError::Syntax { .. }
+        | MdsError::UndefinedVariable { .. }
+        | MdsError::UndefinedFunction { .. }
+        | MdsError::ArityMismatch { .. }
+        | MdsError::TypeError { .. }
+        | MdsError::CircularImport { .. }
+        | MdsError::FileNotFound { .. }
+        | MdsError::ImportError { .. }
+        | MdsError::NameCollision { .. }
+        | MdsError::NotMdsFile { .. }
+        | MdsError::Io { .. }
+        | MdsError::ResourceLimit { .. }
+        | MdsError::YamlError { .. }
+        | MdsError::JsonError { .. }
+        | MdsError::Recursion { .. }
+        | MdsError::ExportError { .. }
+        | MdsError::BuiltinError { .. }
+        | MdsError::FormatterInvariant { .. } => {}
+        _ => {}
+    }
+}
+
+/// L-API-5: MAX_DIAGNOSTICS is 1_000, a publicly re-exported constant from limits.rs.
+#[test]
+fn max_diagnostics_pinned() {
+    assert_eq!(MAX_DIAGNOSTICS, 1_000);
+}
+
+/// L-U-JSON1: LintResult::to_canonical_json produces the expected schema shape.
+#[test]
+fn lint_canonical_json_schema() {
+    use mds::SerializedSpan;
+
+    let result = LintResult {
+        diagnostics: vec![LintDiagnostic {
+            rule: "unused-variable".to_string(),
+            severity: Severity::Warn,
+            message: "Variable 'name' is never used".to_string(),
+            help: Some("Remove the frontmatter key or reference it in the body".to_string()),
+            span: Some(SerializedSpan {
+                offset: 4,
+                length: 4,
+                line: Some(2),
+                column: Some(1),
+            }),
+            file: Some("test.mds".to_string()),
+        }],
+        truncated: false,
+    };
+
+    let json = result.to_canonical_json();
+
+    // Top-level shape.
+    assert_eq!(json["version"], 1, "version must be 1");
+    assert!(json["files"].is_array(), "files must be an array");
+    assert!(
+        !json["truncated"].as_bool().unwrap_or(true),
+        "truncated must be false"
+    );
+
+    // Per-file grouping.
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "one file entry for test.mds");
+    let file_entry = &files[0];
+    assert_eq!(file_entry["file"], "test.mds");
+    assert!(file_entry["diagnostics"].is_array());
+
+    // Per-diagnostic shape.
+    let diags = file_entry["diagnostics"].as_array().unwrap();
+    assert_eq!(diags.len(), 1);
+    let d = &diags[0];
+    assert_eq!(d["rule"], "unused-variable");
+    assert_eq!(d["severity"], "warn");
+    assert!(d["message"].is_string());
+    assert!(d["help"].is_string());
+    assert_eq!(d["fixable"], false);
+
+    // SerializedError-compatible span shape.
+    let span = &d["span"];
+    assert_eq!(span["offset"], 4);
+    assert_eq!(span["length"], 4);
+    assert_eq!(span["line"], 2);
+    assert_eq!(span["column"], 1);
+}
+
+/// lint_str on a trivially valid template returns an empty LintResult (no diagnostics).
+#[test]
+fn lint_str_trivial_source_returns_empty() {
+    let result = mds::lint_str("Hello!\n").expect("lint_str should succeed for valid source");
+    assert!(
+        result.diagnostics.is_empty(),
+        "trivial source should produce no diagnostics: {result:?}"
+    );
+    assert!(!result.truncated);
+}
+
+/// lint_virtual on a valid virtual FS returns an empty LintResult.
+#[test]
+fn lint_virtual_trivial_returns_empty() {
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+    let config = LintConfig::default();
+    let result =
+        mds::lint_virtual(modules, "main.mds", None, &config).expect("lint_virtual should succeed");
+    assert!(result.diagnostics.is_empty());
+}
+
+/// lint_str on an invalid template (syntax error) returns Err(MdsError).
+#[test]
+fn lint_str_invalid_source_returns_err() {
+    // Unclosed @if block is a syntax error — should fail the check gate.
+    let result = mds::lint_str("@if x:\nhello\n");
+    assert!(
+        result.is_err(),
+        "lint_str should return Err for invalid source"
+    );
+}
+
 // ── D2: ExportDirective offset regression (L-API-3) ─────────────────────────
 //
 // ExportDirective is pub(crate), so we cannot name it directly in an integration
@@ -973,26 +1169,23 @@ fn export_directive_forms_still_resolve_after_d2() {
 
     // Named: check that a module with @export named resolves.
     let result = mds::check_str(named_src);
-    assert!(result.is_ok(), "Named export form should resolve: {result:?}");
+    assert!(
+        result.is_ok(),
+        "Named export form should resolve: {result:?}"
+    );
 
     // ReExport and Wildcard require an importable lib module — use virtual FS.
     let mut modules = std::collections::HashMap::new();
     modules.insert("lib.mds".to_string(), lib_src.to_string());
     modules.insert("main_reexport.mds".to_string(), reexport_src.to_string());
     let result = mds::check_virtual(modules.clone(), "main_reexport.mds", None);
-    assert!(
-        result.is_ok(),
-        "ReExport form should resolve: {result:?}"
-    );
+    assert!(result.is_ok(), "ReExport form should resolve: {result:?}");
 
     let mut modules2 = std::collections::HashMap::new();
     modules2.insert("lib.mds".to_string(), lib_src.to_string());
     modules2.insert("main_wildcard.mds".to_string(), wildcard_src.to_string());
     let result = mds::check_virtual(modules2, "main_wildcard.mds", None);
-    assert!(
-        result.is_ok(),
-        "Wildcard form should resolve: {result:?}"
-    );
+    assert!(result.is_ok(), "Wildcard form should resolve: {result:?}");
 }
 
 // ── NativeFs::check_symlink public API pin ────────────────────────────────────

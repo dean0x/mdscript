@@ -43,7 +43,7 @@ pub struct SerializedError {
 /// Column counts Unicode scalar values (characters) from the start of the current
 /// line, not bytes. This matches the convention used by editors and language
 /// servers that report character-based positions.
-fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
+pub(crate) fn compute_line_column(source: &str, offset: usize) -> Option<(usize, usize)> {
     if offset > source.len() || !source.is_char_boundary(offset) {
         return None;
     }
