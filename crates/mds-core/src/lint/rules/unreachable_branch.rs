@@ -101,23 +101,12 @@ fn check_if_block(
     // Pattern 1: check the primary @if condition.
     match classify_condition(&b.condition) {
         ConditionClass::AlwaysTrue => {
-            // Always-true primary condition → any @elseif/@else branches are unreachable.
-            if b.elseif_branches.is_empty() && b.else_body.is_none() {
-                // No later branches — the condition itself is suspicious but not unreachable.
-                // Still flag: the then-body is always rendered, which is trivially true.
-                if !builder.push(make_diag(
-                    severity.clone(),
-                    filename,
-                    "@if condition is always true — the branch is always taken".to_string(),
-                    Some("Replace the constant condition with a variable or function call, or remove the @if.".to_string()),
-                    b.offset,
-                    "@if".len(),
-                )) {
-                    return;
-                }
-            } else {
-                // Later branches (elseif/else) are unreachable.
-                if !builder.push(make_diag(
+            // Always-true primary condition → LATER branches (@elseif/@else) are unreachable.
+            // Appendix A: "always-true → LATER branches unreachable."
+            // If there are no later branches, nothing is unreachable — do not flag (M2 FP fix).
+            let has_later_branches = !b.elseif_branches.is_empty() || b.else_body.is_some();
+            if has_later_branches
+                && !builder.push(make_diag(
                     severity.clone(),
                     filename,
                     "@if condition is always true — @elseif/@else branches are unreachable"
@@ -128,13 +117,13 @@ fn check_if_block(
                     ),
                     b.offset,
                     "@if".len(),
-                )) {
-                    return;
-                }
+                ))
+            {
+                return;
             }
         }
         ConditionClass::AlwaysFalse => {
-            // Always-false primary condition → then-body is dead code.
+            // Always-false primary condition → then-body is dead code, regardless of later branches.
             if !builder.push(make_diag(
                 severity.clone(),
                 filename,
@@ -161,8 +150,11 @@ fn check_if_block(
         let is_duplicate = seen_conditions
             .iter()
             .any(|prior| conditions_eq(prior, cond));
-        if is_duplicate
-            && !builder.push(make_diag(
+
+        if is_duplicate {
+            // Emit ONE finding for the duplicate. Skip the always-true/false check below —
+            // the duplicate detection already identifies this dead code (M4 dedup).
+            if !builder.push(make_diag(
                 severity.clone(),
                 filename,
                 "@elseif condition is structurally identical to an earlier branch — \
@@ -171,41 +163,41 @@ fn check_if_block(
                 Some("Remove the duplicate @elseif branch or change its condition.".to_string()),
                 b.offset,
                 "@elseif".len(),
-            ))
-        {
-            return;
-        }
-
-        // Also check if this @elseif is always-true or always-false.
-        match classify_condition(cond) {
-            ConditionClass::AlwaysTrue => {
-                if !builder.push(make_diag(
-                    severity.clone(),
-                    filename,
-                    "@elseif condition is always true".to_string(),
-                    Some("Replace the constant condition with a variable.".to_string()),
-                    b.offset,
-                    "@elseif".len(),
-                )) {
-                    return;
-                }
+            )) {
+                return;
             }
-            ConditionClass::AlwaysFalse => {
-                if !builder.push(make_diag(
-                    severity.clone(),
-                    filename,
-                    "@elseif condition is always false — this branch is dead code".to_string(),
-                    Some(
-                        "Replace the constant condition with a variable or remove the dead branch."
-                            .to_string(),
-                    ),
-                    b.offset,
-                    "@elseif".len(),
-                )) {
-                    return;
+        } else {
+            // Not a duplicate — check if this @elseif is always-true or always-false.
+            match classify_condition(cond) {
+                ConditionClass::AlwaysTrue => {
+                    if !builder.push(make_diag(
+                        severity.clone(),
+                        filename,
+                        "@elseif condition is always true".to_string(),
+                        Some("Replace the constant condition with a variable.".to_string()),
+                        b.offset,
+                        "@elseif".len(),
+                    )) {
+                        return;
+                    }
                 }
+                ConditionClass::AlwaysFalse => {
+                    if !builder.push(make_diag(
+                        severity.clone(),
+                        filename,
+                        "@elseif condition is always false — this branch is dead code".to_string(),
+                        Some(
+                            "Replace the constant condition with a variable or remove the dead branch."
+                                .to_string(),
+                        ),
+                        b.offset,
+                        "@elseif".len(),
+                    )) {
+                        return;
+                    }
+                }
+                ConditionClass::Unknown => {}
             }
-            ConditionClass::Unknown => {}
         }
 
         seen_conditions.push(cond);
@@ -323,18 +315,37 @@ mod tests {
         }
     }
 
-    /// L-U-UB1: Always-true condition fires.
+    /// L-U-UB1: Always-true condition with later branches fires.
+    ///
+    /// M2: always-true @if with @elseif/@else → later branches unreachable → fires.
     #[test]
-    fn always_true_literal_eq_fires() {
-        let diags = lint_src("@if \"x\" == \"x\":\nhello\n@end\n");
+    fn always_true_literal_eq_fires_when_later_branches_present() {
+        // @else branch makes the later-branch unreachable.
+        let src = "@if \"x\" == \"x\":\nhello\n@else:\nworld\n@end\n";
+        let diags = lint_src(src);
         assert!(
             diags.iter().any(|d| d.rule == RULE),
-            "should fire for always-true literal condition; got: {:?}",
+            "should fire for always-true literal condition with @else; got: {:?}",
             diags
         );
     }
 
-    /// Always-false condition fires.
+    /// M2 FP fix: always-true @if with NO later branches must NOT fire.
+    ///
+    /// Appendix A: "always-true → LATER branches unreachable."
+    /// With no @elseif or @else, there is nothing unreachable.
+    #[test]
+    fn always_true_no_later_branches_does_not_fire() {
+        let diags = lint_src("@if \"yes\" == \"yes\":\nbody\n@end\n");
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "M2: must NOT fire when always-true @if has no @elseif/@else (nothing is unreachable); \
+             got: {:?}",
+            diags
+        );
+    }
+
+    /// Always-false condition fires (then-body is dead code, regardless of later branches).
     #[test]
     fn always_false_literal_eq_fires() {
         let diags = lint_src("@if \"x\" == \"y\":\nhello\n@end\n");
@@ -345,13 +356,14 @@ mod tests {
         );
     }
 
-    /// NotEq always-true: "a" != "b" is always-true → fires.
+    /// NotEq always-true: "a" != "b" is always-true → fires only when later branches exist.
     #[test]
-    fn always_true_literal_neq_fires() {
-        let diags = lint_src("@if \"a\" != \"b\":\nhello\n@end\n");
+    fn always_true_literal_neq_fires_when_later_branches_present() {
+        let src = "@if \"a\" != \"b\":\nhello\n@elseif x == \"c\":\nworld\n@end\n";
+        let diags = lint_src(src);
         assert!(
             diags.iter().any(|d| d.rule == RULE),
-            "should fire for always-true != condition; got: {:?}",
+            "should fire for always-true != condition with @elseif; got: {:?}",
             diags
         );
     }
@@ -391,13 +403,32 @@ mod tests {
         );
     }
 
-    /// Number literal always-true: 1 == 1 fires.
+    /// Number literal always-true: 1 == 1 fires when later branches exist.
     #[test]
-    fn number_literal_always_true_fires() {
-        let diags = lint_src("@if 1 == 1:\nhello\n@end\n");
+    fn number_literal_always_true_fires_with_later_branches() {
+        let src = "@if 1 == 1:\nhello\n@else:\nworld\n@end\n";
+        let diags = lint_src(src);
         assert!(
             diags.iter().any(|d| d.rule == RULE),
-            "should fire for 1 == 1; got: {:?}",
+            "should fire for 1 == 1 with @else; got: {:?}",
+            diags
+        );
+    }
+
+    /// M4: always-true @if + always-true duplicate @elseif → at most 2 findings (not 3).
+    ///
+    /// Before M4: 3 findings (Pattern 1 + Pattern 2 duplicate + Pattern 2 always-true).
+    /// After M4:  2 findings (Pattern 1 + Pattern 2 duplicate only; always-true skipped as redundant).
+    #[test]
+    fn triple_report_dedup_yields_at_most_two_findings() {
+        // @if "a"=="a" (always-true, has @elseif) + @elseif "a"=="a" (duplicate + always-true).
+        let src = "@if \"a\" == \"a\":\nfoo\n@elseif \"a\" == \"a\":\nbar\n@end\n";
+        let diags = lint_src(src);
+        let count = diags.iter().filter(|d| d.rule == RULE).count();
+        assert_eq!(
+            count, 2,
+            "M4: duplicate always-true @elseif must yield exactly 2 findings \
+             (not 3 — always-true and duplicate are the same dead code); got {count}: {:?}",
             diags
         );
     }

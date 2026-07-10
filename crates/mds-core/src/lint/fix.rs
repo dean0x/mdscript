@@ -305,7 +305,14 @@ pub fn apply_plan(source: &str, plan: &FixPlan) -> String {
 ///
 /// The fix is REFUSED if:
 /// - The plan has `overlap_rejected = true`.
-/// - The `reverify` callback returns `Err` (the fixed source no longer compiles).
+/// - The `reverify` callback returns `Err`. The CLI reverify path checks three
+///   conditions inside this closure (AC-F-20): (1) recompile-success — the fixed
+///   source must still compile; (2) no-new-untargeted-diagnostics — the residual
+///   must not introduce new findings beyond the targeted rules; (3) output
+///   byte-equality — when the original source is standalone-compilable, compiled
+///   output of the fixed source must be byte-identical to the original (enforced by
+///   the caller returning `Err` on delta). All real auto-fixes are output-neutral
+///   by design; any delta signals a bug in the fix logic and must be refused.
 /// - The residual contains MORE diagnostics of an untargeted rule than `original`
 ///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
@@ -710,5 +717,63 @@ mod tests {
         };
         let plan = plan_fixes(&truncated_result, "Hello!\n");
         assert!(plan.truncated, "truncated flag should propagate to plan");
+    }
+
+    // ── L-FIX-REV1: AC-F-20 output-delta gate ────────────────────────────────
+
+    /// L-FIX-REV1: A reverify closure that detects an output delta MUST cause
+    /// `apply_fixes` to return `FixOutcome::Rejected`.
+    ///
+    /// White-box test: we inject a synthetic ByteEdit that removes non-dead content
+    /// ("World" from "Hello World!\n"), then pass a reverify closure that compares
+    /// compiled outputs. The delta (fixed → "Hello !\n") must cause rejection.
+    ///
+    /// This verifies the mechanism the CLI relies on: when the reverify closure
+    /// returns `Err` due to an output delta, the entire fix batch is refused.
+    #[test]
+    fn l_fix_rev1_output_delta_causes_rejection() {
+        let source = "Hello World!\n";
+        // An empty LintResult — no real diagnostics needed for this mechanism test.
+        let original_result = LintResult {
+            diagnostics: vec![],
+            truncated: false,
+            is_standalone: true,
+        };
+        // Synthetic ByteEdit removes " World" (bytes 5-12) — this is NOT a real lint
+        // fix; it simulates a hypothetical broken fix that changes compiled output.
+        let plan = FixPlan {
+            edits: vec![ByteEdit {
+                start: 5,
+                end: 12,
+                rule: "duplicate-import".to_string(),
+            }],
+            overlap_rejected: false,
+            truncated: false,
+        };
+
+        // Capture original compiled output as the baseline.
+        let original_output = crate::compile_str(source)
+            .expect("source should compile cleanly")
+            .output;
+
+        let outcome = apply_fixes(source, plan, &original_result, move |fixed| {
+            // Simulate the CLI output-delta gate (AC-F-20):
+            // lint first, then compare compiled outputs.
+            let residual = crate::lint_str(fixed)?;
+            let fixed_output = crate::compile_str(fixed)
+                .expect("fixed source should still compile")
+                .output;
+            if fixed_output != original_output {
+                return Err(crate::error::MdsError::Io {
+                    message: "lint --fix would change compiled output; batch refused".to_string(),
+                });
+            }
+            Ok(residual)
+        });
+
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "apply_fixes must return Rejected when reverify detects an output delta; got: {outcome:?}"
+        );
     }
 }

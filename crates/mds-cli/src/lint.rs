@@ -334,6 +334,18 @@ enum FixFileOutcome {
 /// Run the `--fix` pipeline for a single file's lint result.
 ///
 /// `base_dir` is the file's parent (for reverify recompile).
+///
+/// ## Reverify gate (AC-F-20)
+///
+/// The reverify closure checks three conditions:
+/// 1. Recompile-success — fixed source must still compile.
+/// 2. No-new-untargeted-diagnostics — edit must not introduce new problems.
+/// 3. Output byte-equality — when the original source is standalone-compilable,
+///    compiled output of the fixed source must be byte-identical to the original.
+///
+/// If the original source does not compile (e.g. missing runtime vars), the
+/// output-diff is skipped — conditions 1 and 2 still apply, and Tier B is
+/// already suggestion-only (non-standalone) in that scenario.
 fn plan_and_apply_fixes(
     result: mds::LintResult,
     source: &str,
@@ -348,15 +360,45 @@ fn plan_and_apply_fixes(
         return FixFileOutcome::NothingToFix { original: result };
     }
 
+    // AC-F-20 output-delta baseline: compile the original source once.
+    // If it fails (e.g. missing runtime vars at eval time), skip the output-diff —
+    // existing gates (recompile-success, no-new-diagnostics) still apply.
+    let original_output =
+        mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
+            .ok()
+            .map(|r| r.output);
+
     let base_dir_owned = base_dir.to_path_buf();
     let config_clone = config.clone();
     let outcome = mds::fix::apply_fixes(source, plan, &result, move |fixed| {
-        mds::lint_str_with(
+        let residual = mds::lint_str_with(
             fixed,
             Some(&base_dir_owned),
             runtime_vars.clone(),
             &config_clone,
-        )
+        )?;
+
+        // AC-F-20 output byte-equality gate: refuse if the fix changes compiled output.
+        // All shipped auto-fixes (dup-import/dup-export removal, empty-block removal,
+        // dead-branch removal) are output-neutral by design — any delta indicates a bug.
+        if let Some(ref orig_out) = original_output {
+            match mds::compile_str_collecting_warnings(
+                fixed,
+                Some(&base_dir_owned),
+                runtime_vars.clone(),
+            ) {
+                Ok(fixed_compile) if fixed_compile.output != *orig_out => {
+                    return Err(MdsError::Io {
+                        message: "lint --fix would change compiled output; \
+                                  batch refused to preserve template semantics"
+                            .to_string(),
+                    });
+                }
+                _ => {} // outputs match, or fixed source didn't compile (lint_str_with caught it)
+            }
+        }
+
+        Ok(residual)
     });
 
     match outcome {
