@@ -1,3 +1,77 @@
+# S4b Handoff: feat/mds-lint-61 — COMPLETE
+
+Phase S4b of 5 — universal TypeScript wrapper, byte-parity goldens, docs.
+Branch `feat/mds-lint-61` is COMPLETE. PR #171 open against `main`.
+
+---
+
+## S4b Phase Summary: Universal Wrapper + Parity Goldens + Docs
+
+### Commits (S4b)
+
+| SHA | Message |
+|-----|---------|
+| `a7e2420` | `feat(mds): lint/lintFile/lintVirtual universal wrapper + byte-parity goldens (#61)` |
+| `9b648de` | `docs: mds lint spec, README, CHANGELOG (#61)` |
+
+### Files Created (S4b)
+
+| File | Purpose |
+|------|---------|
+| `packages/mds/__test__/lint.spec.mjs` | 21 tests: U-L1–U-L8, U-LF1–U-LF4, U-LV1–U-LV6, U-LG1–U-LG3 (canonical JSON goldens) |
+| `packages/mds/__test__/fixtures/lint_warn.mds` | Fixture with unused_key frontmatter triggering unused-variable |
+| `crates/mds-python/pyrightconfig.json` | `extraPaths: ["python"]` so pyright resolves the mdscript package |
+
+### Files Modified (S4b)
+
+| File | Change |
+|------|--------|
+| `packages/mds/src/index.ts` | Added `LintResult`, `LintDiagnostic`, `LintSpan`, `LintFileResult`, `LintOptions`, `LintFileOptions` types + `lint`, `lintFile`, `lintVirtual` public exports |
+| `packages/mds/src/backend/contract.ts` | Extended `BASE_METHODS`, `NODE_METHODS`, `WASM_EXPORTS`; `assertResultShape` handles `'lint'` — O(1) shape check (version:number, files:Array, truncated:boolean) |
+| `packages/mds/src/backend/node.ts` | `lint`, `lintFile`, `lintVirtual` forwarded from native backend; `lintOptions`/`lintFileOptions` bridges |
+| `packages/mds/src/backend/native.ts` | Re-exported `lint`, `lintFile`, `lintVirtual` from `@mdscript/mds-napi` |
+| `packages/mds/src/backend/wasm.ts` | `lint`/`lintVirtual` forwarded; `lintFile` implemented via `wrapWithFileOps` (reads file → `buildModulesMap` → `wasmModule.lint(entry, {filename, modules})`) |
+| `packages/mds/__test__/wasm-backend.spec.mjs` | Fixed U-WB17/U-WB20: added `lint`/`lintVirtual` to stubs so only the tested missing method triggers each error |
+| `crates/mds-napi/__test__/index.spec.mjs` | Added P-L-2 (clean golden) and P-L-3 (unused-variable golden) byte-identical parity tests |
+| `crates/mds-python/python/mdscript/__init__.py` | Added `LintResult`, `lint`, `lint_file`, `lint_virtual` to imports and `__all__` |
+| `crates/mds-python/python/mdscript/__init__.pyi` | Added lint re-exports |
+| `crates/mds-python/python/mdscript/_mdscript.pyi` | Added `LintResult` class stub + `lint`/`lint_file`/`lint_virtual` function stubs |
+| `crates/mds-python/tests/test_typing.py` | Passes `--project /path/to/mds-python` to pyright so it finds `pyrightconfig.json` and `extraPaths` |
+| `crates/mds-python/tests/test_lint.py` | Fixed P-L-1: uses `simple.mds` (clean — empty files array → JSON identical regardless of filename key) |
+| `crates/mds-python/tests/test_parity.py` | Added `LINT_GOLDENS` table; `test_par4_lint_virtual_matches_golden` (3 parametrized); `test_par5_live_cli_lint_json_parity` |
+| `spec.md` | §7.1 commands, §7.5 `mds lint` reference, §7.8 `mds.json lint.rules`, §7.9 exit codes (lint-specific), §8 Lint Rule Catalog (9 rules) |
+| `README.md` | Added `mds lint` to command block + "Static analysis with mds lint" section |
+| `CHANGELOG.md` | Full `[Unreleased]` entry covering all surfaces (no version bump — release is a separate step) |
+
+### Quality Gates (post-S4b, all PASS)
+
+```
+cargo test --workspace                                         → 1570 pass, 0 fail
+cargo fmt --all --check                                        → CLEAN
+cargo clippy --workspace --all-targets -- -D warnings         → CLEAN
+npm test --workspaces --if-present                            → 205 (@mdscript/mds), 83 (napi), all pass
+pytest crates/mds-python/tests -q                             → 182 passed
+wasm-pack test --node crates/mds-wasm                         → 42 passed
+node scripts/verify-versions.mjs                              → 0.3.0 consistent
+WASM size: 749,801 bytes < 750,000 budget                     → PASS
+snyk_code_scan packages/mds/src                               → 0 issues
+node scripts/verify-napi-names.mjs                            → Expected local failure (CI-only gate)
+```
+
+### Cross-Surface Canonical JSON Confirmed
+
+`lintVirtual({ 'main.mds': 'Hello World!\n' }, 'main.mds')` produces byte-identical output on all surfaces:
+```
+{"files":[],"truncated":false,"version":1}
+```
+Verified: CLI (`--format json`), napi, WASM, Python (`lint_virtual(...).to_json()`).
+
+### PR
+
+https://github.com/dean0x/mdscript/pull/171 — target: `main`
+
+---
+
 # S4a Handoff: feat/mds-lint-61
 
 Phase S4a of 5 — binding parity (miette spans + WASM + napi + Python).
