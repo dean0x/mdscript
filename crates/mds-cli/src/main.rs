@@ -6,6 +6,7 @@ use miette::Result;
 
 mod build;
 mod fmt;
+mod lint;
 mod output;
 mod watch;
 
@@ -104,6 +105,41 @@ enum Commands {
         /// Combines with --check (diff is the rendering, check is the exit behavior).
         #[arg(long)]
         diff: bool,
+    },
+    /// Check MDS files for style and correctness issues beyond `mds check`
+    ///
+    /// Runs 9 static-analysis rules (3 error-level, 6 warning-level) on the file
+    /// without executing it. Partials and imported files are included in directory mode.
+    ///
+    /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors or analysis failure,
+    /// 3 = resource limit.
+    #[command(
+        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet template.mds       Suppress warnings; exit 2 on errors only\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
+    )]
+    Lint {
+        /// Input .mds file, directory, or `-` for stdin (omit to auto-detect)
+        input: Option<PathBuf>,
+        /// Apply auto-fixable issues in place (Tier A always; Tier B when standalone)
+        #[arg(long)]
+        fix: bool,
+        /// With --fix: exit 1 if any file would change; never writes
+        #[arg(long, requires = "fix")]
+        check: bool,
+        /// With --fix: print unified diff of pending changes; never writes
+        #[arg(long, requires = "fix")]
+        diff: bool,
+        /// Output format: `human` (default, stderr) or `json` (stdout)
+        #[arg(long = "format", value_name = "FORMAT", default_value = "human")]
+        format: String,
+        /// JSON file with runtime variable overrides
+        #[arg(long)]
+        vars: Option<PathBuf>,
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice)
+        #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
+        set_vars: Vec<(String, String)>,
+        /// Set a runtime variable as a string (repeatable, no type coercion)
+        #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
+        set_string_vars: Vec<(String, String)>,
     },
     /// Create a starter MDS file
     Init {
@@ -364,6 +400,38 @@ fn run(cli: Cli) -> Result<()> {
             diff,
             quiet,
         }),
+        Commands::Lint {
+            input,
+            fix,
+            check,
+            diff,
+            format,
+            vars,
+            set_vars,
+            set_string_vars,
+        } => {
+            let fmt = match format.as_str() {
+                "human" => lint::LintFormat::Human,
+                "json" => lint::LintFormat::Json,
+                other => {
+                    eprintln!(
+                        "error: unknown --format value '{other}'; expected 'human' or 'json'"
+                    );
+                    std::process::exit(2);
+                }
+            };
+            lint::run_lint(lint::LintArgs {
+                input,
+                fix,
+                check,
+                diff,
+                quiet,
+                format: fmt,
+                vars,
+                set_vars,
+                set_string_vars,
+            })
+        }
         Commands::Init { filename, force } => run_init(filename, force, quiet),
         Commands::Watch {
             input,

@@ -1,0 +1,6 @@
+---
+greeting: Hello
+unused_key: this key is never referenced in the body
+---
+
+{greeting}, world!
