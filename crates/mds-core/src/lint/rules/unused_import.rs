@@ -1,0 +1,300 @@
+//! Rule: `unused-import`
+//!
+//! **Severity**: Warn (default) | **Tier**: B (recompile-diff-proven)
+//!
+//! An import that is never used in the module body wastes the resolver's work
+//! (and in partial-eval contexts, the loading of an external file).
+//!
+//! ## Per-form semantics (Appendix A)
+//!
+//! ### Alias import (`@import "path" as alias`)
+//!
+//! Used when `alias` appears as:
+//! - `Expr::QualifiedCall { namespace: alias, .. }` — `{alias.func(...)}`
+//! - `IncludeDirective { alias }` — `@include alias`
+//!
+//! ### Selective import (`@import { name1, name2 } from "path"`)
+//!
+//! Each name is checked individually (better UX). A name is used when it appears as:
+//! - `Expr::Call { name, .. }` — `{name(...)}`
+//! - `Arg::Call { name, .. }` — `func(name(...))`
+//! - `Arg::Var(name)` — `func(name)` (passing a function ref as argument)
+//! - `Expr::Var(name)` — `{name}` (using the imported name as a variable)
+//!
+//! ### Merge import (`@import "path"`)
+//!
+//! **Always treated as used** (conservative). A merge import injects all the
+//! imported module's exports plus the `prompt` variable into scope — tracking
+//! which injected symbols are actually used would require cross-file analysis,
+//! which is out of scope for v1.
+//!
+//! ### Re-export exemption
+//!
+//! A selective import name that appears in a `@export name` or
+//! `@export name from "path"` directive is considered "used" even without a
+//! call-site reference (the module re-exports it).
+//!
+//! ### Frontmatter `imports:` key
+//!
+//! The frontmatter `imports:` YAML key is not tracked as AST import nodes —
+//! it is handled by the resolver outside the AST. This lint rule does not flag
+//! frontmatter imports in v1 (document in rule doc comment).
+//!
+//! ## Suppression on partials/@extends
+//!
+//! Suppressed when `ctx.is_partial_or_extends` is true.
+
+use crate::ast::Module;
+use crate::error::SerializedSpan;
+use crate::lint::config::LintConfig;
+use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
+use crate::lint::facts::{AnalysisContext, ExportKind, ImportKind};
+
+pub(crate) const RULE: &str = "unused-import";
+
+/// Check the module for unused imports.
+pub(crate) fn check(
+    _module: &Module,
+    ctx: &AnalysisContext,
+    filename: &str,
+    config: &LintConfig,
+    builder: &mut LintResultBuilder,
+) {
+    let severity = resolve_severity(config);
+    if severity == Severity::Off {
+        return;
+    }
+
+    // Suppressed on partials / @extends children.
+    if ctx.is_partial_or_extends {
+        return;
+    }
+
+    // Build re-export set: names that are re-exported (exemption for selective imports).
+    let reexport_names: std::collections::HashSet<String> = ctx
+        .exports
+        .iter()
+        .filter(|e| matches!(e.kind, ExportKind::Named | ExportKind::ReExport))
+        .filter_map(|e| e.name.clone())
+        .collect();
+
+    for imp in &ctx.imports {
+        match imp.kind {
+            ImportKind::Merge => {
+                // Always treated as used (conservative — cross-file analysis needed).
+                continue;
+            }
+            ImportKind::Alias => {
+                let alias = imp.alias.as_deref().unwrap_or("");
+                let is_used =
+                    ctx.used_namespaces.contains(alias) || ctx.used_include_aliases.contains(alias);
+                if !is_used
+                    && !builder.push(LintDiagnostic {
+                        rule: RULE.to_string(),
+                        severity: severity.clone(),
+                        message: format!(
+                            "Import alias '{}' from '{}' is never used.",
+                            alias, imp.path
+                        ),
+                        help: Some(
+                            "Remove the @import or use the alias with @include or as \
+                             a qualified call (`alias.func(...)`)."
+                                .to_string(),
+                        ),
+                        span: Some(SerializedSpan {
+                            offset: imp.offset,
+                            length: "@import".len(),
+                            line: None,
+                            column: None,
+                        }),
+                        file: Some(filename.to_string()),
+                    })
+                {
+                    return;
+                }
+            }
+            ImportKind::Selective => {
+                // Per-name flagging: each name checked individually.
+                for name in &imp.names {
+                    let is_used = ctx.used_calls.contains(name)
+                        || ctx.used_vars.contains(name)
+                        || reexport_names.contains(name);
+                    if !is_used
+                        && !builder.push(LintDiagnostic {
+                            rule: RULE.to_string(),
+                            severity: severity.clone(),
+                            message: format!(
+                                "Imported name '{}' from '{}' is never used.",
+                                name, imp.path
+                            ),
+                            help: Some(format!(
+                                "Remove '{}' from the selective import or use it in the body.",
+                                name
+                            )),
+                            span: Some(SerializedSpan {
+                                offset: imp.offset,
+                                length: "@import".len(),
+                                line: None,
+                                column: None,
+                            }),
+                            file: Some(filename.to_string()),
+                        })
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resolve_severity(config: &LintConfig) -> Severity {
+    config.severity_for(RULE).cloned().unwrap_or(Severity::Warn)
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::lint::facts::collect_facts;
+    use crate::parser::parse_with_ctx;
+
+    fn lint_src(src: &str) -> Vec<LintDiagnostic> {
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+        let ctx = collect_facts(&module, false, src).unwrap();
+        let mut builder = LintResultBuilder::new();
+        check(
+            &module,
+            &ctx,
+            "test.mds",
+            &LintConfig::default(),
+            &mut builder,
+        );
+        builder.build().diagnostics
+    }
+
+    /// L-U-UI1: Unused alias import fires.
+    #[test]
+    fn unused_alias_import_fires() {
+        let src = "@import \"./lib.mds\" as lib\nHello!\n";
+        let diags = lint_src(src);
+        assert!(
+            diags.iter().any(|d| d.rule == RULE),
+            "should fire for unused alias import; got: {:?}",
+            diags
+        );
+    }
+
+    /// Used alias import (via qualified call) does not fire.
+    #[test]
+    fn used_alias_via_qualified_call_does_not_fire() {
+        let src = "@import \"./lib.mds\" as lib\n{lib.greet(\"world\")}\n";
+        let diags = lint_src(src);
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "should not fire for alias used in QualifiedCall; got: {:?}",
+            diags
+        );
+    }
+
+    /// Used alias import (via @include) does not fire.
+    #[test]
+    fn used_alias_via_include_does_not_fire() {
+        let src = "@import \"./lib.mds\" as lib\n@include lib\n";
+        let diags = lint_src(src);
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "should not fire for alias used in @include; got: {:?}",
+            diags
+        );
+    }
+
+    /// L-U-UI2: Unused selective import name fires per-name.
+    #[test]
+    fn unused_selective_import_fires() {
+        let src = "@import { greet } from \"./lib.mds\"\nHello!\n";
+        let diags = lint_src(src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.rule == RULE && d.message.contains("greet")),
+            "should fire for unused selective import 'greet'; got: {:?}",
+            diags
+        );
+    }
+
+    /// Used selective import name does not fire.
+    #[test]
+    fn used_selective_import_does_not_fire() {
+        let src = "@import { greet } from \"./lib.mds\"\n{greet(\"world\")}\n";
+        let diags = lint_src(src);
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "should not fire for used selective import; got: {:?}",
+            diags
+        );
+    }
+
+    /// Merge import is always treated as used (conservative).
+    #[test]
+    fn merge_import_always_used() {
+        let src = "@import \"./lib.mds\"\nHello!\n";
+        let diags = lint_src(src);
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "merge import should always be treated as used; got: {:?}",
+            diags
+        );
+    }
+
+    /// Re-export exemption: selective name that is re-exported is not flagged.
+    #[test]
+    fn selective_name_reexported_not_flagged() {
+        let src = "@import { greet } from \"./lib.mds\"\n@export greet\n";
+        let diags = lint_src(src);
+        assert!(
+            !diags.iter().any(|d| d.rule == RULE),
+            "re-exported selective import should not be flagged; got: {:?}",
+            diags
+        );
+    }
+
+    /// Partial file suppresses unused-import.
+    #[test]
+    fn partial_suppresses_unused_import() {
+        let src = "@import \"./lib.mds\" as lib\nHello!\n";
+        let tokens = tokenize(src, "_partial.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "_partial.mds", src).unwrap();
+        let ctx = collect_facts(&module, true, src).unwrap(); // is_partial=true
+        let mut builder = LintResultBuilder::new();
+        check(
+            &module,
+            &ctx,
+            "_partial.mds",
+            &LintConfig::default(),
+            &mut builder,
+        );
+        assert!(
+            builder.build().diagnostics.is_empty(),
+            "partial should suppress unused-import"
+        );
+    }
+
+    /// Rule=off suppresses.
+    #[test]
+    fn rule_off_suppresses() {
+        let src = "@import \"./lib.mds\" as lib\nHello!\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+        let ctx = collect_facts(&module, false, src).unwrap();
+        let mut builder = LintResultBuilder::new();
+        let config = LintConfig {
+            rules: [(RULE.to_string(), Severity::Off)].into_iter().collect(),
+        };
+        check(&module, &ctx, "test.mds", &config, &mut builder);
+        assert!(builder.build().diagnostics.is_empty());
+    }
+}

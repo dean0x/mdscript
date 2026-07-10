@@ -14,7 +14,6 @@
 //! 3. **Facts walk** — single pre-sized traversal building `AnalysisContext`.
 //!    Recursion bounded at `MAX_NESTING_DEPTH=64` → `ResourceLimit` if exceeded.
 //! 4. **Rule dispatch** — 9 rules as plain fns over `AnalysisContext`.
-//!    (S1: stubs return empty; S2 adds rule implementations.)
 //! 5. **Return** `LintResult` with diagnostics capped at `MAX_DIAGNOSTICS`.
 //!
 //! ## Architecture invariants
@@ -27,6 +26,8 @@
 pub mod config;
 pub mod diagnostic;
 pub(crate) mod facts;
+pub mod fix;
+pub(crate) mod rules;
 
 pub use config::LintConfig;
 pub use diagnostic::{sanitize_control_chars, LintDiagnostic, LintResult, Severity};
@@ -58,7 +59,7 @@ pub(crate) fn is_partial_by_name(path: &str) -> bool {
 ///
 /// `source` is the raw entry source string (already used for the check gate).
 /// `filename` is the display name used in diagnostics and JSON grouping.
-/// Returns `Ok(LintResult)` with zero diagnostics in S1 (rules arrive in S2).
+/// Returns `Ok(LintResult)` with diagnostics produced by all 9 rules.
 pub(crate) fn lint_source(
     source: &str,
     filename: &str,
@@ -71,36 +72,39 @@ pub(crate) fn lint_source(
     let is_partial = is_partial_by_name(filename);
     let is_extends = module.extends.is_some();
 
-    let ctx = collect_facts(&module, is_partial || is_extends)?;
+    let ctx = collect_facts(&module, is_partial || is_extends, source)?;
 
-    // Rule dispatch (S1 stub — all rules return empty; S2 adds implementations).
+    // Rule dispatch — non-generic plain-fn dispatch (AC-PERF-02, no monomorphization).
     let mut builder = LintResultBuilder::new();
     run_rules(&module, &ctx, filename, config, &mut builder);
 
     Ok(builder.build())
 }
 
-/// Apply all 9 lint rules over the facts context.
+/// Apply all 9 lint rules over the module and facts context.
 ///
 /// Non-generic dispatch: each rule is a plain function call with no monomorphization.
-/// S1: all stubs. S2 fills in each rule body in lint/rules/*.rs.
+/// Rules are listed in the same order as the implementation steps (local-AST first,
+/// semantic second) for readability.
 fn run_rules(
-    _module: &crate::ast::Module,
-    _ctx: &facts::AnalysisContext,
-    _filename: &str,
-    _config: &LintConfig,
-    _builder: &mut LintResultBuilder,
+    module: &crate::ast::Module,
+    ctx: &facts::AnalysisContext,
+    filename: &str,
+    config: &LintConfig,
+    builder: &mut LintResultBuilder,
 ) {
-    // S2 will call:
-    //   rules::empty_block::check(_module, _ctx, _filename, _config, _builder);
-    //   rules::redundant_else::check(...);
-    //   rules::unreachable_branch::check(...);
-    //   rules::duplicate_import::check(...);
-    //   rules::duplicate_export::check(...);
-    //   rules::unused_variable::check(...);
-    //   rules::unused_import::check(...);
-    //   rules::unused_function::check(...);
-    //   rules::shadow_variable::check(...);
+    // Step 4 — local-AST rules
+    rules::empty_block::check(module, ctx, filename, config, builder);
+    rules::redundant_else::check(module, ctx, filename, config, builder);
+    rules::unreachable_branch::check(module, ctx, filename, config, builder);
+    rules::duplicate_import::check(module, ctx, filename, config, builder);
+    rules::duplicate_export::check(module, ctx, filename, config, builder);
+
+    // Step 5 — semantic rules
+    rules::unused_variable::check(module, ctx, filename, config, builder);
+    rules::unused_import::check(module, ctx, filename, config, builder);
+    rules::unused_function::check(module, ctx, filename, config, builder);
+    rules::shadow_variable::check(module, ctx, filename, config, builder);
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -115,8 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_source_valid_returns_empty() {
-        // The lint_source function does not run the check gate — just parses + rules.
+    fn lint_source_valid_returns_no_diagnostics_for_plain_text() {
         let result = lint_str("Hello!\n").unwrap();
         assert!(result.diagnostics.is_empty());
         assert!(!result.truncated);

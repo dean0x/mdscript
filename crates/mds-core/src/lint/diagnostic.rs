@@ -236,13 +236,13 @@ impl LintResult {
 ///
 /// Used internally by the facts walk and rule dispatch to build a `LintResult`
 /// without needing to check the cap at each call site.
-pub(super) struct LintResultBuilder {
+pub(crate) struct LintResultBuilder {
     diagnostics: Vec<LintDiagnostic>,
     truncated: bool,
 }
 
 impl LintResultBuilder {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LintResultBuilder {
             diagnostics: Vec::new(),
             truncated: false,
@@ -255,9 +255,8 @@ impl LintResultBuilder {
     /// hit (and `truncated` is set). The caller should stop collecting when this
     /// returns `false`.
     ///
-    /// Called by rule implementations in `lint/rules/*.rs` (S2). Dead in S1 stubs.
-    #[allow(dead_code)]
-    pub(super) fn push(&mut self, diag: LintDiagnostic) -> bool {
+    /// Called by rule implementations in `lint/rules/*.rs`.
+    pub(crate) fn push(&mut self, diag: LintDiagnostic) -> bool {
         if self.diagnostics.len() >= MAX_DIAGNOSTICS {
             self.truncated = true;
             return false;
@@ -266,7 +265,7 @@ impl LintResultBuilder {
         true
     }
 
-    pub(super) fn build(self) -> LintResult {
+    pub(crate) fn build(self) -> LintResult {
         LintResult {
             diagnostics: self.diagnostics,
             truncated: self.truncated,

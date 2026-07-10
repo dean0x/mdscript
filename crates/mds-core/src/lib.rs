@@ -58,7 +58,7 @@ pub(crate) mod value;
 
 pub use formatter::{format_str, format_str_with};
 pub use fs::{FileSystem, NativeFs, VirtualFs};
-pub use lint::{sanitize_control_chars, LintConfig, LintDiagnostic, LintResult, Severity};
+pub use lint::{fix, sanitize_control_chars, LintConfig, LintDiagnostic, LintResult, Severity};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };

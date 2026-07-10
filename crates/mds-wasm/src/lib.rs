@@ -579,9 +579,13 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     catch_panic(AssertUnwindSafe(move || {
         let opts = parse_options(options)?;
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
-        let result =
-            mds::lint_virtual(modules, &opts.filename, opts.vars, &mds::LintConfig::default())
-                .map_err(mds_error_to_js)?;
+        let result = mds::lint_virtual(
+            modules,
+            &opts.filename,
+            opts.vars,
+            &mds::LintConfig::default(),
+        )
+        .map_err(mds_error_to_js)?;
 
         to_js(&result.to_canonical_json())
     }))
