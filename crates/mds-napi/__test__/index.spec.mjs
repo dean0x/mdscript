@@ -758,3 +758,171 @@ describe('intrinsic output shape', () => {
     );
   });
 });
+
+// ── Lint tests ────────────────────────────────────────────────────────────────
+
+const { lint, lintFile, lintVirtual } = addon;
+
+describe('lint', () => {
+  // L-N-1: clean source returns canonical shape
+  test('L-N-1: lint on clean source returns version:1, empty files, truncated:false', () => {
+    const result = lint('Hello World!\n');
+    assert.equal(result.version, 1, 'version must be 1');
+    assert.ok(Array.isArray(result.files), 'files must be an array');
+    assert.equal(result.files.length, 0, 'clean source should have no file entries');
+    assert.equal(result.truncated, false, 'truncated must be false');
+  });
+
+  // L-N-2: null/undefined options accepted
+  test('L-N-2: lint accepts null options', () => {
+    const result = lint('Hello World!\n', null);
+    assert.equal(result.version, 1);
+  });
+
+  test('L-N-3: lint accepts undefined options', () => {
+    const result = lint('Hello World!\n', undefined);
+    assert.equal(result.version, 1);
+  });
+
+  // L-N-4: unused-variable finding on frontmatter key
+  test('L-N-4: lint detects unused frontmatter variable', () => {
+    const source = '---\nunused_key: value\n---\nHello!\n';
+    const result = lint(source);
+    assert.equal(result.version, 1);
+    // There should be at least one file entry with a diagnostic for unused-variable.
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    const hasUnused = allDiags.some((d) => d.rule === 'unused-variable');
+    assert.ok(hasUnused, `expected unused-variable diagnostic; got: ${JSON.stringify(allDiags)}`);
+  });
+
+  // L-N-5: rules option silences a rule
+  test('L-N-5: rules option can silence a rule', () => {
+    const source = '---\nunused_key: value\n---\nHello!\n';
+    const result = lint(source, { rules: { 'unused-variable': 'off' } });
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    const hasUnused = allDiags.some((d) => d.rule === 'unused-variable');
+    assert.ok(!hasUnused, `unused-variable should be silenced; got: ${JSON.stringify(allDiags)}`);
+  });
+
+  // L-N-6: unknown severity value in rules throws mds::invalid_options
+  test('L-N-6: unknown severity value in rules throws mds::invalid_options', () => {
+    assert.throws(
+      () => lint('Hello!\n', { rules: { 'unused-variable': 'verbose' } }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // L-N-7: unknown option key throws mds::invalid_options
+  test('L-N-7: unknown option key throws mds::invalid_options', () => {
+    assert.throws(
+      () => lint('Hello!\n', { unknownKey: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // L-N-8: parse error throws (check gate enforced)
+  test('L-N-8: lint on invalid source throws with mds:: error code', () => {
+    assert.throws(
+      () => lint('Hello {undefined_var}!\n'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(err.code.startsWith('mds::'), `expected mds:: code, got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+});
+
+describe('lintFile', () => {
+  // L-NF-1: lint a valid file
+  test('L-NF-1: lintFile on clean file returns canonical shape', () => {
+    const result = lintFile(SIMPLE_MDS);
+    assert.equal(result.version, 1);
+    assert.ok(Array.isArray(result.files));
+    assert.equal(result.truncated, false);
+  });
+
+  // L-NF-2: nonexistent file throws mds::file_not_found
+  test('L-NF-2: lintFile on nonexistent file throws mds::file_not_found', () => {
+    assert.throws(
+      () => lintFile('/nonexistent/path/file.mds'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.code, 'mds::file_not_found', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // L-NF-3: basePath option rejected
+  test('L-NF-3: lintFile rejects basePath option', () => {
+    assert.throws(
+      () => lintFile(SIMPLE_MDS, { basePath: '/some/path' }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // L-NF-4: rules option accepted
+  test('L-NF-4: lintFile accepts rules option', () => {
+    const result = lintFile(SIMPLE_MDS, { rules: { 'unused-variable': 'off' } });
+    assert.equal(result.version, 1);
+  });
+});
+
+describe('lintVirtual', () => {
+  // L-NV-1: clean virtual module
+  test('L-NV-1: lintVirtual on clean module returns canonical shape', () => {
+    const modules = { 'main.mds': 'Hello World!\n' };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1);
+    assert.ok(Array.isArray(result.files));
+    assert.equal(result.truncated, false);
+  });
+
+  // L-NV-2: finding in virtual module
+  test('L-NV-2: lintVirtual detects lint findings', () => {
+    const modules = { 'main.mds': '---\nunused_key: value\n---\nHello!\n' };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1);
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    const hasUnused = allDiags.some((d) => d.rule === 'unused-variable');
+    assert.ok(hasUnused, `expected unused-variable; got: ${JSON.stringify(allDiags)}`);
+  });
+
+  // L-NV-3: rules option accepted
+  test('L-NV-3: lintVirtual accepts rules option', () => {
+    const modules = { 'main.mds': '---\nunused_key: value\n---\nHello!\n' };
+    const result = lintVirtual(modules, 'main.mds', { rules: { 'unused-variable': 'off' } });
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    const hasUnused = allDiags.some((d) => d.rule === 'unused-variable');
+    assert.ok(!hasUnused, 'unused-variable should be silenced');
+  });
+});
+
+// ── Lint parity guard: lint + lintFile produce canonical JSON ─────────────────
+
+describe('lint parity (AC-API-06 guard)', () => {
+  // P-L-1: lint and lintFile produce identical JSON for same source
+  test('P-L-1: lint and lintFile produce identical JSON for the same file', () => {
+    const fileResult = lintFile(SIMPLE_MDS);
+    const source = fs.readFileSync(SIMPLE_MDS, 'utf8');
+    // lint(source, {basePath: dir}) should produce the same canonical JSON.
+    const dir = path.dirname(SIMPLE_MDS);
+    const strResult = lint(source, { basePath: dir });
+    // Compare JSON serializations — they must be byte-identical.
+    assert.equal(
+      JSON.stringify(strResult),
+      JSON.stringify(fileResult),
+      'lint and lintFile must produce identical canonical JSON for the same source',
+    );
+  });
+});
