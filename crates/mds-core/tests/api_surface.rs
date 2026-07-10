@@ -953,6 +953,48 @@ fn compile_max_file_size_still_enforced() {
     );
 }
 
+// ── D2: ExportDirective offset regression (L-API-3) ─────────────────────────
+//
+// ExportDirective is pub(crate), so we cannot name it directly in an integration
+// test.  Instead we verify that parsing and resolution of all three export forms
+// still succeed after the D2 offset field addition — a regression in any variant
+// would surface here as a compile or runtime failure.
+
+#[test]
+fn export_directive_forms_still_resolve_after_d2() {
+    // Named export: @export greet
+    // ReExport: @export greet from "..."
+    // Wildcard: @export * from "..."
+    // All three forms must still parse and resolve without error.
+    let named_src = "@define greet():\nhello\n@end\n@export greet\n";
+    let reexport_src = "@export greet from \"./lib.mds\"\n";
+    let wildcard_src = "@export * from \"./lib.mds\"\n";
+    let lib_src = "@define greet():\nhello\n@end\n@export greet\n";
+
+    // Named: check that a module with @export named resolves.
+    let result = mds::check_str(named_src);
+    assert!(result.is_ok(), "Named export form should resolve: {result:?}");
+
+    // ReExport and Wildcard require an importable lib module — use virtual FS.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("lib.mds".to_string(), lib_src.to_string());
+    modules.insert("main_reexport.mds".to_string(), reexport_src.to_string());
+    let result = mds::check_virtual(modules.clone(), "main_reexport.mds", None);
+    assert!(
+        result.is_ok(),
+        "ReExport form should resolve: {result:?}"
+    );
+
+    let mut modules2 = std::collections::HashMap::new();
+    modules2.insert("lib.mds".to_string(), lib_src.to_string());
+    modules2.insert("main_wildcard.mds".to_string(), wildcard_src.to_string());
+    let result = mds::check_virtual(modules2, "main_wildcard.mds", None);
+    assert!(
+        result.is_ok(),
+        "Wildcard form should resolve: {result:?}"
+    );
+}
+
 // ── NativeFs::check_symlink public API pin ────────────────────────────────────
 
 #[test]

@@ -276,11 +276,24 @@ pub enum ImportDirective {
 #[derive(Debug, Clone)]
 pub enum ExportDirective {
     /// `@export name`
-    Named { name: String },
+    Named {
+        name: String,
+        /// Byte offset of the `@export` token in the source (for diagnostic spans).
+        offset: usize,
+    },
     /// `@export name from "path"`
-    ReExport { name: String, path: String },
+    ReExport {
+        name: String,
+        path: String,
+        /// Byte offset of the `@export` token in the source (for diagnostic spans).
+        offset: usize,
+    },
     /// `@export * from "path"`
-    Wildcard { path: String },
+    Wildcard {
+        path: String,
+        /// Byte offset of the `@export` token in the source (for diagnostic spans).
+        offset: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

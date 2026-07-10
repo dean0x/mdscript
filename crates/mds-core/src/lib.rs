@@ -981,7 +981,7 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
             }
             ast::Node::Export(
                 ast::ExportDirective::ReExport { path, .. }
-                | ast::ExportDirective::Wildcard { path },
+                | ast::ExportDirective::Wildcard { path, .. },
             ) => {
                 paths.insert(path.clone());
             }

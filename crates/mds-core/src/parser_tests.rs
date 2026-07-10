@@ -93,6 +93,68 @@ fn parse_import_selective() {
     }
 }
 
+// D2 canary tests: ExportDirective variants carry the byte offset of the @export token.
+// These tests are RED until `offset: usize` is added to all three ExportDirective
+// variants in ast.rs and threaded through parse_export_directive.
+
+#[test]
+fn export_named_carries_offset() {
+    // "@export greet" starts at byte 0.
+    let src = "@export greet\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", src).unwrap();
+    if let Node::Export(ExportDirective::Named { name, offset }) = &module.body[0] {
+        assert_eq!(name, "greet");
+        assert_eq!(
+            *offset, 0,
+            "Named export offset must be 0 when at source start"
+        );
+    } else {
+        panic!("expected Named export node");
+    }
+}
+
+#[test]
+fn export_reexport_carries_offset() {
+    // A preamble line puts @export at byte offset > 0.
+    let src = "some text\n@export greet from \"./greetings.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", src).unwrap();
+    // Find the Export node (body may also contain Text nodes).
+    let export_node = module
+        .body
+        .iter()
+        .find(|n| matches!(n, Node::Export(_)))
+        .expect("expected Export node");
+    if let Node::Export(ExportDirective::ReExport { name, offset, .. }) = export_node {
+        assert_eq!(name, "greet");
+        // "some text\n" is 10 bytes, so @export begins at byte 10.
+        assert_eq!(
+            *offset, 10,
+            "ReExport offset must equal byte position in source"
+        );
+    } else {
+        panic!("expected ReExport node");
+    }
+}
+
+#[test]
+fn export_wildcard_carries_offset() {
+    // "@export * from ..." at source start → offset 0.
+    let src = "@export * from \"./formatting.mds\"\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "", src).unwrap();
+    if let Node::Export(ExportDirective::Wildcard { path, offset }) = &module.body[0] {
+        assert_eq!(path, "./formatting.mds");
+        assert_eq!(
+            *offset, 0,
+            "Wildcard export offset must be 0 when at source start"
+        );
+    } else {
+        panic!("expected Wildcard export node");
+    }
+}
+
 #[test]
 fn parse_export_named() {
     let src = "@export greet\n";
