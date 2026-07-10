@@ -1,17 +1,19 @@
 //! Native Python bindings for the MDS compiler via PyO3.
 //!
-//! Exposes seven functions to Python as the native extension module
+//! Exposes ten functions to Python as the native extension module
 //! `mdscript._mdscript` (re-exported by the pure-Python `mdscript` package):
 //! [`compile`], [`compile_file`], [`compile_virtual`], [`check`], [`check_file`],
-//! [`check_virtual`], and [`scan_imports`].
+//! [`check_virtual`], [`scan_imports`], [`lint`], [`lint_file`], and
+//! [`lint_virtual`].
 //!
 //! ## Design mirror
 //!
 //! The four string/file functions mirror `crates/mds-napi` for error, panic,
 //! resource-limit, vars, and options handling; the three virtual/scan functions
-//! mirror `crates/mds-wasm` (the virtual filesystem model). All compilation output
-//! funnels through the single shared serializer [`mds::CompileResult::to_canonical_json`],
-//! so the wire shape is byte-identical to the Node.js and WASM bindings by construction.
+//! mirror `crates/mds-wasm` (the virtual filesystem model). Compile output funnels
+//! through [`mds::CompileResult::to_canonical_json`] and lint output through
+//! [`mds::LintResult::to_canonical_json`], so the wire shape is byte-identical to
+//! the Node.js and WASM bindings by construction.
 //!
 //! ## Canonical result object
 //!
@@ -362,6 +364,93 @@ impl CompileResult {
     }
 }
 
+/// The result of [`lint`], [`lint_file`], or [`lint_virtual`].
+///
+/// Stores the canonical `to_canonical_json()` value as its single backing store;
+/// typed getters and `to_dict()`/`to_json()` read from it so they can never diverge.
+/// `__eq__` is wire equality. Byte-identical to the WASM and Node.js lint surfaces.
+#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[derive(Clone, PartialEq)]
+pub struct LintResult {
+    /// Single authoritative source of truth — the canonical lint JSON.
+    value: serde_json::Value,
+}
+
+#[pymethods]
+impl LintResult {
+    /// Reconstruct from a canonical mapping (used by unpickling).
+    #[new]
+    fn new(canonical: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let value: serde_json::Value = depythonize(canonical).map_err(|e| {
+            options_error(canonical.py(), &format!("invalid LintResult state: {e}"))
+        })?;
+        Ok(LintResult { value })
+    }
+
+    /// Wire schema version — currently always `1`.
+    #[getter]
+    fn version(&self) -> u64 {
+        self.value
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1)
+    }
+
+    /// Per-file finding groups as a list of dicts
+    /// (`[{"file": str, "diagnostics": [...]}, ...]`).
+    #[getter]
+    fn files<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let files = self
+            .value
+            .get("files")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(vec![]));
+        value_to_py(py, &files)
+    }
+
+    /// `True` when the per-file diagnostic cap was hit; re-run after fixing.
+    #[getter]
+    fn truncated(&self) -> bool {
+        self.value
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn __repr__(&self) -> String {
+        let n = self
+            .value
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        format!(
+            "LintResult(version={}, files=<{n} file(s)>, truncated={})",
+            self.version(),
+            self.truncated(),
+        )
+    }
+
+    /// Return the canonical lint result as a plain Python `dict`.
+    ///
+    /// Byte-identical to the Node.js and WASM `lint()` surfaces.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        value_to_py(py, &self.value)
+    }
+
+    /// Return the canonical lint result as a JSON string.
+    fn to_json(&self) -> String {
+        self.value.to_string()
+    }
+
+    /// Reconstruct on unpickle via `LintResult(canonical_dict)`.
+    fn __reduce__<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyType>, (Bound<'py, PyAny>,))> {
+        Ok((py.get_type::<LintResult>(), (self.to_dict(py)?,)))
+    }
+}
+
 // ── Error / value conversion helpers ───────────────────────────────────────────
 
 /// Convert an [`mds::MdsError`] into a raised [`MdsError`] with typed attributes.
@@ -668,6 +757,54 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     Ok(result)
 }
 
+/// Parse and validate the `rules` keyword argument into a [`mds::LintConfig`].
+///
+/// `None`/absent → default config (no per-rule overrides). A non-mapping value →
+/// `mds::invalid_options`. Unknown or badly typed severity values →
+/// `mds::invalid_options` (accepted: `"off"`, `"info"`, `"warn"`, `"error"`).
+fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<mds::LintConfig> {
+    let Some(obj) = rules else {
+        return Ok(mds::LintConfig::default());
+    };
+    if obj.is_none() {
+        return Ok(mds::LintConfig::default());
+    }
+    let json: serde_json::Value =
+        depythonize(obj).map_err(|e| options_error(py, &format!("invalid rules: {e}")))?;
+    let serde_json::Value::Object(map) = json else {
+        return Err(options_error(
+            py,
+            &format!(
+                "rules must be a mapping of str to str, got {}",
+                json_type_name(&json)
+            ),
+        ));
+    };
+    let mut rules_map = HashMap::with_capacity(map.len());
+    for (key, val) in map {
+        let serde_json::Value::String(s) = &val else {
+            return Err(options_error(
+                py,
+                &format!(
+                    "rules[{key:?}] must be a string, got {}",
+                    json_type_name(&val)
+                ),
+            ));
+        };
+        let severity: mds::Severity = serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
+            options_error(
+                py,
+                &format!(
+                    "rules[{key:?}]: unknown severity {s:?}; \
+                         expected \"off\", \"info\", \"warn\", or \"error\""
+                ),
+            )
+        })?;
+        rules_map.insert(key, severity);
+    }
+    Ok(mds::LintConfig { rules: rules_map })
+}
+
 // ── Public functions ────────────────────────────────────────────────────────────
 
 /// Compile an MDS template source string.
@@ -797,6 +934,78 @@ fn scan_imports(py: Python<'_>, source: String) -> PyResult<Vec<String>> {
     run_catching(py, move || mds::scan_imports(&source))
 }
 
+/// Lint an MDS template source string for static analysis findings.
+///
+/// Runs the check gate first — on a compile error, raises [`MdsError`] with the same
+/// attributes as [`compile`]. On a clean gate, applies the lint rules and returns the
+/// canonical [`LintResult`].
+///
+/// `base_path`, `vars`, and `rules` are all keyword-only.
+#[pyfunction]
+#[pyo3(signature = (source, *, base_path=None, vars=None, rules=None))]
+fn lint(
+    py: Python<'_>,
+    source: String,
+    base_path: Option<PathBuf>,
+    vars: Option<Bound<'_, PyAny>>,
+    rules: Option<Bound<'_, PyAny>>,
+) -> PyResult<LintResult> {
+    check_source_size(py, &source)?;
+    check_base_path(py, &base_path)?;
+    let vars = extract_vars(py, vars.as_ref())?;
+    let lint_config = extract_rules(py, rules.as_ref())?;
+    let result = run_catching(py, move || {
+        mds::lint_str_with(&source, base_path.as_deref(), vars, &lint_config)
+    })?;
+    Ok(LintResult {
+        value: result.to_canonical_json(),
+    })
+}
+
+/// Lint an MDS template file (`path` is a str or `os.PathLike`).
+///
+/// The base directory is derived from the file's own directory. `vars` and `rules`
+/// are keyword-only. No `base_path` argument — mirrors [`compile_file`].
+#[pyfunction]
+#[pyo3(signature = (path, *, vars=None, rules=None))]
+fn lint_file(
+    py: Python<'_>,
+    path: PathBuf,
+    vars: Option<Bound<'_, PyAny>>,
+    rules: Option<Bound<'_, PyAny>>,
+) -> PyResult<LintResult> {
+    let vars = extract_vars(py, vars.as_ref())?;
+    let lint_config = extract_rules(py, rules.as_ref())?;
+    let result = run_catching(py, move || mds::lint(&path, vars, &lint_config))?;
+    Ok(LintResult {
+        value: result.to_canonical_json(),
+    })
+}
+
+/// Lint a module from an in-memory virtual filesystem.
+///
+/// `modules` maps module key → source string; `entry` is the key to lint. `vars` and
+/// `rules` are keyword-only. Mirrors [`compile_virtual`] for the virtual-FS surface.
+#[pyfunction]
+#[pyo3(signature = (modules, entry, *, vars=None, rules=None))]
+fn lint_virtual(
+    py: Python<'_>,
+    modules: Bound<'_, PyAny>,
+    entry: String,
+    vars: Option<Bound<'_, PyAny>>,
+    rules: Option<Bound<'_, PyAny>>,
+) -> PyResult<LintResult> {
+    let modules = parse_modules(py, &modules)?;
+    let vars = extract_vars(py, vars.as_ref())?;
+    let lint_config = extract_rules(py, rules.as_ref())?;
+    let result = run_catching(py, move || {
+        mds::lint_virtual(modules, &entry, vars, &lint_config)
+    })?;
+    Ok(LintResult {
+        value: result.to_canonical_json(),
+    })
+}
+
 // ── Module ──────────────────────────────────────────────────────────────────────
 
 /// The native extension module — registered as `mdscript._mdscript`.
@@ -811,6 +1020,7 @@ fn _mdscript(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Message>()?;
     m.add_class::<CheckResult>()?;
     m.add_class::<CompileResult>()?;
+    m.add_class::<LintResult>()?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(compile_file, m)?)?;
     m.add_function(wrap_pyfunction!(compile_virtual, m)?)?;
@@ -818,5 +1028,8 @@ fn _mdscript(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_file, m)?)?;
     m.add_function(wrap_pyfunction!(check_virtual, m)?)?;
     m.add_function(wrap_pyfunction!(scan_imports, m)?)?;
+    m.add_function(wrap_pyfunction!(lint, m)?)?;
+    m.add_function(wrap_pyfunction!(lint_file, m)?)?;
+    m.add_function(wrap_pyfunction!(lint_virtual, m)?)?;
     Ok(())
 }
