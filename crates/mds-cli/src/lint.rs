@@ -212,7 +212,10 @@ fn write_stdout(s: &str) -> Result<()> {
 /// Render one lint diagnostic to stderr, applying `sanitize_control_chars` at the boundary.
 ///
 /// `--quiet` suppresses Warn and Info; Error always renders.
-fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool) {
+/// `named_source`: optional `(filename, source_text)` pair attached to the miette Report so
+/// the renderer can show the offending source line + caret (span highlighting). When absent,
+/// diagnostics are still rendered but without source context.
+fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Option<(&str, &str)>) {
     if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
         return;
     }
@@ -226,13 +229,24 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool) {
         span: diag.span.clone(),
         file: diag.file.clone(),
     };
-    eprintln!("{:?}", miette::Report::from(sanitized));
+    // Attach the source code so miette can render the span with source context
+    // (source line + caret underline). The labels() implementation on LintDiagnostic
+    // returns the span; with_source_code() provides the text miette reads to render it.
+    if let Some((filename, src)) = named_source {
+        let report = miette::Report::from(sanitized)
+            .with_source_code(miette::NamedSource::new(filename, src.to_string()));
+        eprintln!("{report:?}");
+    } else {
+        eprintln!("{:?}", miette::Report::from(sanitized));
+    }
 }
 
 /// Render all diagnostics in a `LintResult` to stderr.
-fn render_result_human(result: &mds::LintResult, quiet: bool) {
+///
+/// `named_source` is forwarded to `render_diag_human` for span context rendering.
+fn render_result_human(result: &mds::LintResult, quiet: bool, named_source: Option<(&str, &str)>) {
     for diag in &result.diagnostics {
-        render_diag_human(diag, quiet);
+        render_diag_human(diag, quiet, named_source);
     }
 }
 
@@ -396,7 +410,8 @@ fn run_lint_stdin(
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
-        render_result_human(&diag_result, quiet);
+        // Stdin diagnostics: no named source for span rendering (no stable filename).
+        render_result_human(&diag_result, quiet, None);
         let exit = result_exit_code(&diag_result);
         let _ = write_stdout(&output_src);
         if exit != 0 {
@@ -406,7 +421,7 @@ fn run_lint_stdin(
     }
 
     // Report-only mode.
-    emit_result(format, &result, quiet);
+    emit_result(format, &result, quiet, None);
     let exit = result_exit_code(&result);
     if exit != 0 {
         std::process::exit(exit);
@@ -450,6 +465,9 @@ fn run_lint_file(
         eprintln!("{suppressed} findings suppressed; re-run --fix to continue");
     }
 
+    // Named source for span rendering: (display filename, source text).
+    let named_source = Some((filename, source.as_str()));
+
     // ── Write path: --fix without preview ────────────────────────────────────
     if fix && !check && !diff {
         let fix_outcome = plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config);
@@ -458,7 +476,7 @@ fn run_lint_file(
                 new_source,
                 residual,
             } => {
-                emit_result(format, &residual, quiet);
+                emit_result(format, &residual, quiet, named_source);
                 if !quiet {
                     eprintln!("Fixed: {}", path.display());
                 }
@@ -470,14 +488,14 @@ fn run_lint_file(
             }
             FixFileOutcome::Rejected { reason, original } => {
                 eprintln!("fix rejected: {reason}");
-                emit_result(format, &original, quiet);
+                emit_result(format, &original, quiet, named_source);
                 let exit = result_exit_code(&original);
                 if exit != 0 {
                     std::process::exit(exit);
                 }
             }
             FixFileOutcome::NothingToFix { original } => {
-                emit_result(format, &original, quiet);
+                emit_result(format, &original, quiet, named_source);
                 if !quiet && format == LintFormat::Human {
                     eprintln!("Clean: {filename}");
                 }
@@ -509,7 +527,7 @@ fn run_lint_file(
             }
         }
         // After diff-only preview, render diagnostics and exit by severity.
-        emit_result(format, &result, quiet);
+        emit_result(format, &result, quiet, named_source);
         let exit = result_exit_code(&result);
         if exit != 0 {
             std::process::exit(exit);
@@ -518,7 +536,7 @@ fn run_lint_file(
     }
 
     // ── Report-only mode (no --fix) ───────────────────────────────────────────
-    emit_result(format, &result, quiet);
+    emit_result(format, &result, quiet, named_source);
     if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
         eprintln!("Clean: {filename}");
     }
@@ -734,6 +752,9 @@ fn lint_one_file_human(
     };
 
     let base_dir = file.parent().unwrap_or(Path::new("."));
+    // Named source for span rendering: file display name + source text.
+    let file_display = file.to_str().unwrap_or("<file>");
+    let named_source = Some((file_display, source.as_str()));
 
     let result = match mds::lint(file, runtime_vars.clone(), config) {
         Ok(r) => r,
@@ -765,7 +786,7 @@ fn lint_one_file_human(
                 new_source,
                 residual,
             } => {
-                render_result_human(&residual, quiet);
+                render_result_human(&residual, quiet, named_source);
                 if !quiet {
                     eprintln!("Fixed: {}", file.display());
                 }
@@ -777,16 +798,16 @@ fn lint_one_file_human(
             }
             FixFileOutcome::Rejected { reason, original } => {
                 eprintln!("{}: fix rejected: {reason}", file.display());
-                render_result_human(&original, quiet);
+                render_result_human(&original, quiet, named_source);
                 tally_from_result(&original)
             }
             FixFileOutcome::NothingToFix { original } => {
-                render_result_human(&original, quiet);
+                render_result_human(&original, quiet, named_source);
                 tally_from_result(&original)
             }
         }
     } else {
-        render_result_human(&result, quiet);
+        render_result_human(&result, quiet, named_source);
         tally_from_result(&result)
     }
 }
@@ -794,12 +815,19 @@ fn lint_one_file_human(
 // ── Shared emit helpers ───────────────────────────────────────────────────────
 
 /// Emit a `LintResult` to the appropriate channel based on format.
-fn emit_result(format: LintFormat, result: &mds::LintResult, quiet: bool) {
+///
+/// `named_source` is forwarded to human rendering for span context; ignored in JSON mode.
+fn emit_result(
+    format: LintFormat,
+    result: &mds::LintResult,
+    quiet: bool,
+    named_source: Option<(&str, &str)>,
+) {
     if format == LintFormat::Json {
         let json = result.to_canonical_json();
         let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).unwrap()));
     } else {
-        render_result_human(result, quiet);
+        render_result_human(result, quiet, named_source);
     }
 }
 

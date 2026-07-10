@@ -128,6 +128,21 @@ impl miette::Diagnostic for LintDiagnostic {
             .as_deref()
             .map(|h| -> Box<dyn fmt::Display + 'a> { Box::new(h) })
     }
+
+    /// Return the finding's span as a single labeled span for miette source rendering.
+    ///
+    /// The label text is the diagnostic message so the caret points directly at the
+    /// offending byte range with a one-line summary. Source code is NOT embedded in
+    /// `LintDiagnostic` itself — attach it at the CLI render boundary via
+    /// `miette::Report::from(diag).with_source_code(NamedSource::new(file, src))`.
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        let span = self.span.as_ref()?;
+        let labeled = miette::LabeledSpan::at(
+            miette::SourceSpan::new(span.offset.into(), span.length),
+            self.message.as_str(),
+        );
+        Some(Box::new(std::iter::once(labeled)))
+    }
 }
 
 // ── LintResult ────────────────────────────────────────────────────────────────

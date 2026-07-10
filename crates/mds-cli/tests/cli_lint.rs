@@ -95,6 +95,32 @@ fn warn_only_file_exits_1_with_diagnostic_on_stderr() {
     );
 }
 
+// ── L-CLI-SPAN: span context in human render (Step 0, #61) ──────────────────
+
+/// Verify that miette renders span-labeled source context (source line + caret)
+/// for findings with a span. Uses lint_warn_only.mds which triggers unused-variable
+/// with approx_offset pointing at the `unused_key` frontmatter line.
+///
+/// The rendered stderr must contain the source text from the offending line so the
+/// user can see WHERE in the file the finding is.
+#[test]
+fn span_source_context_appears_in_human_render() {
+    let out = lint_path(&fixture("lint_warn_only.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The source line text from the fixture's frontmatter — miette renders it
+    // in the source context block when labels() and with_source_code() are wired.
+    // The fixture's third line is: "unused_key: this key is never referenced in the body"
+    assert!(
+        stderr.contains("unused_key"),
+        "expected span context with 'unused_key' source text in miette render; got: {stderr}"
+    );
+    // Miette includes the file+line reference when source is attached.
+    assert!(
+        stderr.contains("lint_warn_only.mds"),
+        "expected filename reference in miette span render; got: {stderr}"
+    );
+}
+
 // ── L-CLI-CHAN3: error-severity file ─────────────────────────────────────────
 
 #[test]
