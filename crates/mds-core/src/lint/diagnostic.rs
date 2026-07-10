@@ -194,30 +194,13 @@ impl LintResult {
     /// ```
     ///
     /// Per-file grouping: diagnostics without a `file` are grouped under `null` key.
-    /// The `fixable` field is always present (defaults to `false` until the `--fix`
-    /// planner populates it in S2).
+    /// The `fixable` field reflects tier semantics: `true` for Tier A rules and for
+    /// Tier B rules when the file is standalone, `false` otherwise.
     ///
     /// **NEVER** build this JSON via `format!()` — use `serde_json::json!()` so
     /// control characters in message/help are serialized safely.
     pub fn to_canonical_json(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
-
-        // Inline tier table — must stay in sync with fix.rs::rule_tier / is_fixable.
-        // Not imported from fix.rs to avoid circular dependency (fix.rs imports from
-        // diagnostic.rs). The canonical source is fix.rs; any tier changes must update
-        // BOTH places.
-        let is_fixable_for_json = |rule: &str| -> bool {
-            match rule {
-                // Tier A — always auto-fixable
-                "duplicate-import" | "duplicate-export" | "unreachable-branch" | "empty-block" => {
-                    true
-                }
-                // Tier B — fixable only for standalone files (no @import / @extends)
-                "unused-import" | "unused-function" => self.is_standalone,
-                // Tier C — never fixed (unused-variable, redundant-else, shadow-variable, unknown)
-                _ => false,
-            }
-        };
 
         // Group diagnostics by file, preserving insertion order within each group.
         // BTreeMap gives deterministic (sorted) file ordering in the output.
@@ -244,7 +227,7 @@ impl LintResult {
                 "severity": diag.severity.to_string(),
                 "message": diag.message,
                 "help": diag.help,
-                "fixable": is_fixable_for_json(&diag.rule),
+                "fixable": super::tier::is_fixable(&diag.rule, self.is_standalone),
                 "span": span_json,
             });
 

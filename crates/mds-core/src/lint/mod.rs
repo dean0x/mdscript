@@ -28,6 +28,7 @@ pub mod diagnostic;
 pub(crate) mod facts;
 pub mod fix;
 pub(crate) mod rules;
+pub(crate) mod tier;
 
 pub use config::LintConfig;
 pub use diagnostic::{sanitize_control_chars, LintDiagnostic, LintResult, Severity};

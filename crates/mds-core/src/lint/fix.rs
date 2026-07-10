@@ -22,10 +22,10 @@
 //! gate cannot catch (the compiled output would be output-equivalent).
 //! See [`extend_span_to_line_end`].
 //!
-//! ## Fix.rs is pure (no I/O)
+//! ## fix.rs is pure (no I/O)
 //!
-//! File I/O and atomic writes are S3's job (CLI). `fix.rs` operates entirely on
-//! in-memory byte slices. The caller owns the file read and write.
+//! File I/O and atomic writes are the CLI's responsibility. `fix.rs` operates
+//! entirely on in-memory byte slices. The caller owns the file read and write.
 //!
 //! ## Overlap detection (AC-F-19)
 //!
@@ -50,41 +50,10 @@
 use crate::error::MdsError;
 use crate::lint::diagnostic::{LintDiagnostic, LintResult, Severity};
 
-// ── Tier classification ───────────────────────────────────────────────────────
-
-/// Fix tier for a lint rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FixTier {
-    /// Auto-fixable with a reverify gate. Diagnostic `fixable` = true.
-    A,
-    /// Fixable only when recompile proves output-neutral. Diagnostic `fixable` = true
-    /// for standalone files; `fixable` = false for non-standalone (suggestion only).
-    B,
-    /// Never fixed. Diagnostic `fixable` = false.
-    C,
-}
-
-/// Classify a rule into its fix tier.
-pub fn rule_tier(rule: &str) -> FixTier {
-    match rule {
-        "duplicate-import" | "duplicate-export" | "unreachable-branch" | "empty-block" => {
-            FixTier::A
-        }
-        "unused-import" | "unused-function" => FixTier::B,
-        _ => FixTier::C, // unused-variable, redundant-else, shadow-variable, unknown
-    }
-}
-
-/// Return `true` when this diagnostic is auto-fixable (Tier A or B standalone).
-///
-/// The `is_standalone` flag controls whether Tier B diagnostics are fixable.
-pub fn is_fixable(rule: &str, is_standalone: bool) -> bool {
-    match rule_tier(rule) {
-        FixTier::A => true,
-        FixTier::B => is_standalone,
-        FixTier::C => false,
-    }
-}
+// Tier classification lives in the leaf `tier` module to break the would-be
+// circular dependency (fix.rs → diagnostic.rs → fix.rs). Re-export here so
+// the public API surface at `mds::fix::FixTier` etc. is unchanged.
+pub use super::tier::{is_fixable, rule_tier, FixTier};
 
 // ── Fix plan ─────────────────────────────────────────────────────────────────
 

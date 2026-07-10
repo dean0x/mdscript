@@ -1,6 +1,6 @@
 //! Integration tests for `mds lint` (issue #61).
 //!
-//! Coverage maps to acceptance criteria from the S3 execution plan:
+//! Coverage maps to acceptance criteria (issue #61):
 //! - L-CLI-CHAN1: clean file → exit 0, diagnostics to stderr, stdout empty (human)
 //! - L-CLI-CHAN2: warn-only file → exit 1, warning on stderr
 //! - L-CLI-CHAN3: error-severity file → exit 2, error on stderr
