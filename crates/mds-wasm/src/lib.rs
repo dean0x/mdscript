@@ -1,6 +1,6 @@
 //! WebAssembly bindings for the MDS compiler.
 //!
-//! Exposes [`compile`] and [`check`] to JavaScript via `wasm-bindgen`.
+//! Exposes [`compile`], [`check`], and [`lint`] to JavaScript via `wasm-bindgen`.
 //! All compilation runs against an in-memory virtual filesystem — no
 //! OS file access occurs inside the WASM boundary.
 //!
@@ -535,6 +535,55 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
                 .map_err(mds_error_to_js)?;
 
         to_js(&CheckOutput { warnings })
+    }))
+}
+
+/// Lint an MDS template source string for static analysis findings.
+///
+/// Runs the check gate (resolve+validate) first — on a compile error, throws a
+/// JS `Error` with the same structure as [`check`]. On a clean gate, applies
+/// the lint rules and returns the canonical lint result object.
+///
+/// ## Arguments
+///
+/// - `source`: MDS template source text.
+/// - `options`: optional configuration object (same fields as [`check`]).
+///
+/// ## Returns
+///
+/// On success, the canonical lint JSON object:
+/// `{ version: 1, files: [{file, diagnostics: [...]},...], truncated: bool }`
+///
+/// In S1 the `diagnostics` array is always empty (rule implementations arrive in S2).
+///
+/// On failure (parse or validation error), throws a JS `Error`:
+/// - `code`: diagnostic code (e.g. `"mds::syntax"`)
+/// - `help`: optional hint (may be absent)
+/// - `span`: optional `{ offset, length, line?, column? }` (may be absent)
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const result = lint('Hello!\n');
+/// console.log(result.version);   // 1
+/// console.log(result.files);     // []
+/// console.log(result.truncated); // false
+/// ```
+#[wasm_bindgen]
+pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
+    check_source_size(source)?;
+
+    // Owned String required so the closure satisfies UnwindSafe.
+    let source = source.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let opts = parse_options(options)?;
+        let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
+        let result =
+            mds::lint_virtual(modules, &opts.filename, opts.vars, &mds::LintConfig::default())
+                .map_err(mds_error_to_js)?;
+
+        to_js(&result.to_canonical_json())
     }))
 }
 
