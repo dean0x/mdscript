@@ -103,7 +103,7 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   ```
 
   **Library API**: new public functions in `mds-core` — `lint`, `lint_str`,
-  `lint_str_with`, `lint_virtual`; `LintResult`, `LintFileResult`, `LintDiagnostic`,
+  `lint_str_with`, `lint_virtual`; `LintResult`, `LintDiagnostic`,
   `LintConfig`, `Severity` types.
 
   **napi** (`@mdscript/mds-napi`): `lint`, `lintFile`, `lintVirtual` exports.

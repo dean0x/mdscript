@@ -800,7 +800,7 @@ Errors include a diagnostic code (`mds::*`), file path, line number, column, a v
 3. **Block scope**: `@for` loop vars scoped to their `@for...@end` block
 4. **Function scope**: params scoped to function body, shadow outer vars
 5. **Import scope**: namespaced (aliased) or merged (unaliased), never implicit leaking
-6. **Shadowing**: inner scope wins, no warning (intentional override)
+6. **Shadowing**: inner scope wins, no warning (intentional override). Teams that want visibility into shadowed variables can enable the opt-in `shadow-variable` lint (info severity, default-off) in `mds.json`.
 
 ---
 
@@ -1037,21 +1037,27 @@ Maximum config file size: 1 MB.
 
 ## 8. Lint Rule Catalog
 
-All rules are enabled at `warn` severity by default. Override per rule in `mds.json` or via `--set-rules` (CLI) / the `rules` option (library API). Severity values: `"warn"`, `"error"`, `"off"`.
+Rules default to the severities shown below — **not all rules default to `warn`**. Override per rule in `mds.json` or via the `rules` option (library API). Severity values: `"warn"`, `"error"`, `"info"`, `"off"`.
 
-| Rule | Severity | Fixable | Tier | Description |
-|------|----------|---------|------|-------------|
-| `unused-variable` | warn | no | B | A frontmatter variable is defined but never referenced in the template body. |
-| `unused-import` | warn | no | B | An `@import` statement imports a name that is never used in the file. |
-| `unused-function` | warn | no | B | A `@define` function is defined but never called in the file. |
-| `shadow-variable` | warn | no | A | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable of the same name. |
-| `empty-block` | warn | yes (A) | A | A control-flow block (`@if`, `@for`, `@define`) has an empty body. |
-| `redundant-else` | warn | yes (A) | A | An `@else` branch after an `@if`/`@elif` block that always returns (or is otherwise unreachable). |
-| `unreachable-branch` | warn | no | A | A branch condition that can never be true given the preceding conditions. |
-| `duplicate-import` | warn | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
-| `duplicate-export` | warn | no | A | The same export name is defined more than once in a single file. |
+| Rule | Default Severity | Fixable | Tier | Description |
+|------|-----------------|---------|------|-------------|
+| `unused-variable` | warn | no | C | A frontmatter variable is defined but never referenced in the template body. |
+| `unused-import` | warn | suggestion¹ | B | An `@import` statement imports a name that is never used in the file. |
+| `unused-function` | warn | suggestion¹ | B | A `@define` function is defined but never called in the file. |
+| `shadow-variable` | info (default-off²) | no | C | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable of the same name. |
+| `empty-block` | warn | yes (A)³ | A | A control-flow block (`@if`, `@for`, `@define`, `@message`) has an empty or whitespace-only body. |
+| `redundant-else` | warn | no | C | An `@else` branch after an `@if`/`@elseif` block that always returns (or is otherwise unreachable). |
+| `unreachable-branch` | **error** | yes (A)³ | A | A branch condition (`@if`/`@elseif`) is always-true (with later branches) or always-false, making some code dead. |
+| `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
+| `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
 
-**Tier A** fixes always apply (`--fix`). **Tier B** fixes apply only to standalone files (no `@import` / `@extends`) because removing an export changes the file's public surface.
+¹ **Tier B suggestion**: `unused-import` and `unused-function` fixes are suggestion-only in practice. A file that has `@import` statements is by definition not standalone under the current conservative standalone rule, so these rules are always suggestion-only (never auto-applied by `--fix`). Set the rule to `"off"` in `mds.json` to silence them.
+
+² **`shadow-variable` is default-off**: it emits at `info` severity but is suppressed at the `info` level by default (only shown when explicitly enabled via `mds.json`). It never affects the exit code.
+
+³ **Tier A block rules are best-effort**: `empty-block` and `unreachable-branch` fixes are applied by `--fix` and then validated by the reverify gate. If the reverify gate refuses the removal (e.g. because removing the block would change compiled output — which should never happen for well-formed dead code), the rule is reported as suggestion-only for that file.
+
+**Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). **Tier B** fixes apply only when the file is standalone (no `@import` / `@extends`). **Tier C** rules are report-only — never auto-fixed.
 
 ---
 

@@ -71,6 +71,12 @@ pub(crate) fn check(
     }
 
     // Build re-export set: names that are re-exported (exemption for selective imports).
+    // Wildcard re-exports (@export * from ...) are intentionally NOT in this exemption set:
+    // a wildcard re-export operates on the imported module's own exports, not on a local
+    // import binding — a file with @import + @export * re-exports from different paths and
+    // there is no syntactic link between them at the name level. Adding wildcard to this
+    // set would require cross-file resolution that is deliberately out of scope for v1
+    // (adjudicated more-correct than Appendix A's literal wording).
     let reexport_names: std::collections::HashSet<String> = ctx
         .exports
         .iter()
