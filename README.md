@@ -76,6 +76,7 @@ mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
 mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
+mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (9 rules; --fix, --format json)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
@@ -193,6 +194,35 @@ summaries go to stderr; `--diff` output and stdin filter-mode content go to stdo
 suppresses status but never errors. Reads a `fmt` section from `mds.json`
 (`{"fmt": {"sort_frontmatter_keys": true}}`) for forward compatibility — the field doesn't drive
 any formatting behavior yet; frontmatter key sorting is deferred to a future version.
+
+### Static analysis with `mds lint`
+
+A 9-rule static analyzer that catches common template authoring issues:
+
+```bash
+mds lint template.mds           # lint a single file
+mds lint .                      # lint all .mds files recursively (partials included)
+mds lint --fix template.mds     # auto-fix fixable issues in place
+mds lint --format json .        # machine-readable JSON output (stdout)
+mds lint --quiet template.mds   # suppress warnings; exit 2 on errors only
+```
+
+Rules (all `warn` by default; configure via `mds.json` `lint.rules` or `--set-rules`):
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `unused-variable` | warn | Frontmatter variable defined but never used in the body |
+| `unused-import` | warn | `@import` that is never referenced |
+| `unused-function` | warn | `@define` function that is never called |
+| `shadow-variable` | warn | Inner-scope variable shadows an outer-scope variable |
+| `empty-block` | warn | `@if`/`@for`/`@define` body is empty (auto-fixable) |
+| `redundant-else` | warn | `@else` after an always-returning branch (auto-fixable) |
+| `unreachable-branch` | warn | Branch condition that is always false given prior conditions |
+| `duplicate-import` | warn | Same file imported more than once (auto-fixable) |
+| `duplicate-export` | warn | Same export name defined more than once |
+
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit.
+JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Bundler Integration
 

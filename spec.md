@@ -813,6 +813,7 @@ Errors include a diagnostic code (`mds::*`), file path, line number, column, a v
 | `mds build [FILE\|DIR]` | Compile an `.mds` template (or a directory of templates) |
 | `mds check [FILE\|DIR]` | Validate a template or directory without rendering |
 | `mds fmt [FILE\|DIR]` | Auto-format `.mds` templates in place (safety-gated) |
+| `mds lint [FILE\|DIR]` | Static-analysis lint of `.mds` templates |
 | `mds init [FILENAME]` | Create a starter `.mds` file |
 
 ### 7.2 `mds build`
@@ -899,7 +900,77 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
 
-### 7.5 `mds init`
+### 7.5 `mds lint`
+
+```bash
+mds lint                                   # Auto-detect single .mds in current dir
+mds lint template.mds                      # Lint a single file
+mds lint src/                              # Lint all .mds files recursively (incl. partials)
+mds lint --fix template.mds                # Auto-fix fixable issues in place
+mds lint --fix --check template.mds        # Preview --fix: exit 1 if any file would change
+mds lint --fix --diff template.mds         # Preview --fix: print unified diff without writing
+mds lint --format json template.mds        # Machine-readable JSON output (stdout)
+mds lint --quiet template.mds              # Suppress warnings; exit 2 on errors only
+cat template.mds | mds lint -             # Lint from stdin
+cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source to stdout
+```
+
+**Channel discipline:**
+- Human-readable diagnostics → **stderr** (via miette).
+- `--format json` output → **stdout** (single JSON object, one trailing newline).
+- `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--fix` | Apply auto-fixable issues in place. Tier A fixes apply always; Tier B fixes apply only to standalone (non-importing) files. |
+| `--check` | With `--fix`: exit 1 if any file would change; never writes. Useful for CI. |
+| `--diff` | With `--fix`: print unified diff of pending changes without writing. |
+| `--format <FORMAT>` | Output format: `human` (default, stderr) or `json` (stdout). |
+| `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
+| `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
+| `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
+| `-q, --quiet` | Suppress warning/info human diagnostics; errors still print. |
+
+**Exit codes** (lint-specific; differ from `mds build`/`mds check`):
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean — no warning- or error-severity findings |
+| `1` | Warning-severity findings only (no errors) |
+| `2` | Any error-severity finding, analysis failure (parse/resolve/IO/config), or usage error |
+| `3` | Resource limit exceeded |
+
+With `--fix`, residual post-fix findings determine the exit code.
+
+**JSON output format** (`--format json`):
+
+```json
+{
+  "files": [
+    {
+      "file": "template.mds",
+      "diagnostics": [
+        {
+          "rule": "unused-variable",
+          "severity": "warn",
+          "message": "Variable 'foo' is defined in frontmatter but never referenced in the body.",
+          "help": "Remove the frontmatter key or reference it in the template body.",
+          "fixable": false,
+          "span": { "offset": 4, "length": 3 }
+        }
+      ]
+    }
+  ],
+  "truncated": false,
+  "version": 1
+}
+```
+
+Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic limit (default 500). `"span"` is absent for diagnostics that lack a source location.
+
+### 7.6 `mds init`
 
 ```bash
 mds init                                   # Creates hello.mds in current directory
@@ -909,7 +980,7 @@ mds init my-prompt.mds --force             # Overwrite if file already exists
 
 Creates a compilable starter template. Path traversal (e.g. `../escaped.mds`) is rejected.
 
-### 7.6 Auto-Detection
+### 7.7 Auto-Detection
 
 When no `FILE` argument is given to `mds build` or `mds check`, the compiler scans the current directory for `.mds` files:
 
@@ -917,7 +988,7 @@ When no `FILE` argument is given to `mds build` or `mds check`, the compiler sca
 - **Zero found** → error with hint to run `mds init`.
 - **Multiple found** → error listing the files with a hint to specify one.
 
-### 7.7 `mds.json` Project Config
+### 7.8 `mds.json` Project Config
 
 Place `mds.json` in the project root (or any ancestor directory). The compiler walks up from the input file to find it.
 
@@ -925,6 +996,12 @@ Place `mds.json` in the project root (or any ancestor directory). The compiler w
 {
   "build": {
     "output_dir": "dist"
+  },
+  "lint": {
+    "rules": {
+      "unused-variable": "warn",
+      "unused-import": "off"
+    }
   }
 }
 ```
@@ -932,10 +1009,13 @@ Place `mds.json` in the project root (or any ancestor directory). The compiler w
 | Field | Type | Description |
 |-------|------|-------------|
 | `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
+| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. Unknown rule names are warn-and-ignored (forward compat). |
 
 Maximum config file size: 1 MB.
 
-### 7.8 Exit Codes
+### 7.9 Exit Codes
+
+**`mds build`, `mds check`, `mds fmt`, `mds init`:**
 
 | Code | Meaning |
 |------|---------|
@@ -944,9 +1024,38 @@ Maximum config file size: 1 MB.
 | `2` | I/O or file-system error (file not found, not an MDS file, I/O failure) |
 | `3` | Resource limit exceeded (output too large, too many iterations, message count exceeds `MAX_MESSAGE_COUNT` (10,000), or cumulative message content exceeds 50 MB) |
 
+**`mds lint`** (see §7.5 for per-code meaning):
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean — no warning- or error-severity findings |
+| `1` | Warning-severity findings only (no errors) |
+| `2` | Error-severity finding, analysis failure, or usage error |
+| `3` | Resource limit exceeded |
+
 ---
 
-## 8. Complete Example
+## 8. Lint Rule Catalog
+
+All rules are enabled at `warn` severity by default. Override per rule in `mds.json` or via `--set-rules` (CLI) / the `rules` option (library API). Severity values: `"warn"`, `"error"`, `"off"`.
+
+| Rule | Severity | Fixable | Tier | Description |
+|------|----------|---------|------|-------------|
+| `unused-variable` | warn | no | B | A frontmatter variable is defined but never referenced in the template body. |
+| `unused-import` | warn | no | B | An `@import` statement imports a name that is never used in the file. |
+| `unused-function` | warn | no | B | A `@define` function is defined but never called in the file. |
+| `shadow-variable` | warn | no | A | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable of the same name. |
+| `empty-block` | warn | yes (A) | A | A control-flow block (`@if`, `@for`, `@define`) has an empty body. |
+| `redundant-else` | warn | yes (A) | A | An `@else` branch after an `@if`/`@elif` block that always returns (or is otherwise unreachable). |
+| `unreachable-branch` | warn | no | A | A branch condition that can never be true given the preceding conditions. |
+| `duplicate-import` | warn | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
+| `duplicate-export` | warn | no | A | The same export name is defined more than once in a single file. |
+
+**Tier A** fixes always apply (`--fix`). **Tier B** fixes apply only to standalone files (no `@import` / `@extends`) because removing an export changes the file's public surface.
+
+---
+
+## 9. Complete Example
 
 ### Input: `welcome.mds`
 
