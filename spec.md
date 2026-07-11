@@ -950,17 +950,17 @@ With `--fix`, residual post-fix findings determine the exit code.
 {
   "files": [
     {
-      "file": "template.mds",
       "diagnostics": [
         {
+          "fixable": false,
+          "help": "Remove the frontmatter key or reference it in the template body.",
+          "message": "Variable 'foo' is defined in frontmatter but never referenced in the body.",
           "rule": "unused-variable",
           "severity": "warn",
-          "message": "Variable 'foo' is defined in frontmatter but never referenced in the body.",
-          "help": "Remove the frontmatter key or reference it in the template body.",
-          "fixable": false,
-          "span": { "offset": 4, "length": 3 }
+          "span": { "length": 3, "offset": 4 }
         }
-      ]
+      ],
+      "file": "template.mds"
     }
   ],
   "truncated": false,
@@ -968,7 +968,7 @@ With `--fix`, residual post-fix findings determine the exit code.
 }
 ```
 
-Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic limit (default 500). `"span"` is absent for diagnostics that lack a source location.
+Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is absent for diagnostics that lack a source location.
 
 ### 7.6 `mds init`
 
@@ -1045,13 +1045,13 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `unused-import` | warn | suggestion¹ | B | An `@import` statement imports a name that is never used in the file. |
 | `unused-function` | warn | suggestion¹ | B | A `@define` function is defined but never called in the file. |
 | `shadow-variable` | info (default-off²) | no | C | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable of the same name. |
-| `empty-block` | warn | yes (A)³ | A | A control-flow block (`@if`, `@for`, `@define`, `@message`) has an empty or whitespace-only body. |
+| `empty-block` | warn | yes (A)³ | A | A control-flow block (`@if`, `@elseif`, `@else`, `@for`, `@define`, `@message`) has an empty or whitespace-only body. |
 | `redundant-else` | warn | no | C | An `@else` block whose body is structurally identical to the preceding `@if`/`@elseif` then-body (detected via structural equality). Tier C — never auto-fixed. |
 | `unreachable-branch` | **error** | yes (A)³ | A | A branch condition (`@if`/`@elseif`) is always-true (with later branches) or always-false, making some code dead. |
 | `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
 
-¹ **Tier B suggestion**: `unused-import` and `unused-function` fixes are suggestion-only in practice. A file that has `@import` statements is by definition not standalone under the current conservative standalone rule, so these rules are always suggestion-only (never auto-applied by `--fix`). Set the rule to `"off"` in `mds.json` to silence them.
+¹ **Tier B suggestion**: `unused-import` and `unused-function` fixes are suggestion-only in practice — neither is ever auto-applied by `--fix`. `unused-import` fires only on files that contain `@import` statements, which are by definition not standalone, so `fixable` is always `false`. `unused-function` can fire on a standalone file (`is_fixable` returns `true`), but a `@define` block always spans multiple lines; the block-span reverify gate (ADR-001) refuses the fix for the same reason as footnote ³. Set the rule to `"off"` in `mds.json` to silence it.
 
 ² **`shadow-variable` is default-off**: it emits at `info` severity but is suppressed at the `info` level by default (only shown when explicitly enabled via `mds.json`). It never affects the exit code.
 

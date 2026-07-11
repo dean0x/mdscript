@@ -215,7 +215,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `unused-import` | warn | `@import` that is never referenced (Tier B: auto-fixed only for standalone files) |
 | `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
 | `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
-| `empty-block` | warn | `@if`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
+| `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
 | `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
 | `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |

@@ -82,7 +82,7 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   - `unused-import` (warn): `@import` never used in the file (Tier B: auto-fixed only for standalone files)
   - `unused-function` (warn): `@define` function never called in the file (Tier B: auto-fixed only for standalone files)
   - `shadow-variable` (off by default / info when enabled): inner-scope variable shadows an outer-scope variable; must be enabled via `mds.json`
-  - `empty-block` (warn): `@if`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable)
+  - `empty-block` (warn): `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable)
   - `redundant-else` (warn): `@else` body is structurally identical to the `@if`/`@elseif` then-body (Tier C — never auto-fixed)
   - `unreachable-branch` (error): branch condition is always-true or always-false (auto-fixable)
   - `duplicate-import` (error): same file imported more than once (auto-fixable)
