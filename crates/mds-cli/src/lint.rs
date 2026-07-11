@@ -703,19 +703,13 @@ fn run_lint_directory(
             lint_one_file_accumulating(
                 file,
                 flags,
-                runtime_vars.clone(),
+                &runtime_vars,
                 &config,
                 &mut json_files,
                 &mut any_truncated,
             )
         } else {
-            lint_one_file_human(
-                file,
-                flags,
-                runtime_vars.clone(),
-                &config,
-                &mut any_truncated,
-            )
+            lint_one_file_human(file, flags, &runtime_vars, &config, &mut any_truncated)
         };
         if tally > max_tally {
             max_tally = tally;
@@ -744,7 +738,7 @@ fn run_lint_directory(
 fn lint_one_file_accumulating(
     file: &Path,
     flags: LintFlags,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
+    runtime_vars: &Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
     json_files: &mut Vec<serde_json::Value>,
     any_truncated: &mut bool,
@@ -753,18 +747,8 @@ fn lint_one_file_accumulating(
         fix, check, diff, ..
     } = flags;
 
-    let source = match read_source_file(file) {
-        Ok(s) => s,
-        Err(e) => {
-            // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
-            json_files.push(serde_json::json!({
-                "file": file.display().to_string(),
-                "error": e.serialize()
-            }));
-            return FileTally::Error;
-        }
-    };
-
+    // `source` is only consumed in the fix branch (below); the report-only/JSON
+    // path does not need it — mds::lint() reads the file independently (I-06).
     let base_dir = file.parent().unwrap_or(Path::new("."));
 
     let result = match mds::lint(file, runtime_vars.clone(), config) {
@@ -795,7 +779,22 @@ fn lint_one_file_accumulating(
     }
 
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(result, &source, base_dir, runtime_vars, config);
+        // Read source here only (not earlier) — the report-only path does not need
+        // it. On a read error at this point (rare: lint just succeeded above),
+        // surface the same error format as other per-file I/O failures and bail.
+        let source = match read_source_file(file) {
+            Ok(s) => s,
+            Err(e) => {
+                // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
+                json_files.push(serde_json::json!({
+                    "file": file.display().to_string(),
+                    "error": e.serialize()
+                }));
+                return FileTally::Error;
+            }
+        };
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, runtime_vars.clone(), config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -828,7 +827,7 @@ fn lint_one_file_accumulating(
 fn lint_one_file_human(
     file: &Path,
     flags: LintFlags,
-    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
+    runtime_vars: &Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
     any_truncated: &mut bool,
 ) -> FileTally {
@@ -878,7 +877,8 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(result, &source, base_dir, runtime_vars, config);
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, runtime_vars.clone(), config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,

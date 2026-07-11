@@ -25,7 +25,5 @@ ctrlc = { workspace = true }
 similar = { workspace = true }
 tempfile = { workspace = true }
 
-[dev-dependencies]
-
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
