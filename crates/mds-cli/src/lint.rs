@@ -210,12 +210,25 @@ fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
 
 // ── stdout write ──────────────────────────────────────────────────────────────
 
-/// Write `s` to locked stdout. Errors are non-fatal (caller discards with `let _ =`).
+/// Write `s` to stdout, treating a broken pipe as a clean early exit rather
+/// than an error — matches Unix filter conventions (e.g. `mds lint --fix - | head
+/// -n1` closing the pipe early must not surface as a crash or failure).
+/// Flushes explicitly so a fixed source not ending in `\n` is never silently
+/// truncated before the `std::process::exit` that may follow immediately.
 fn write_stdout(s: &str) -> Result<()> {
-    std::io::stdout()
-        .lock()
-        .write_all(s.as_bytes())
-        .map_err(|e| miette::miette!("cannot write to stdout: {e}"))
+    let mut stdout = std::io::stdout();
+    if let Err(e) = stdout.write_all(s.as_bytes()) {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(miette::miette!("cannot write to stdout: {e}"));
+    }
+    if let Err(e) = stdout.flush() {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(miette::miette!("cannot flush stdout: {e}"));
+        }
+    }
+    Ok(())
 }
 
 // ── Human diagnostic rendering ────────────────────────────────────────────────
@@ -294,6 +307,20 @@ fn mds_error_exit_code(err: &MdsError) -> i32 {
     match err {
         MdsError::ResourceLimit { .. } => 3,
         _ => 2,
+    }
+}
+
+/// Exit the process with the severity-derived lint exit code when non-zero;
+/// no-op for clean (`exit == 0`) results.
+///
+/// Centralizes the seven previously inline
+/// `let exit = result_exit_code(r); if exit != 0 { process::exit(exit) }` patterns
+/// so exit-code semantics live in one place. Exit codes are unchanged:
+/// 0 clean / 1 warn-only / 2 error-or-analysis-failure / 3 resource-limit.
+fn exit_by_severity(result: &mds::LintResult) {
+    let exit = result_exit_code(result);
+    if exit != 0 {
+        std::process::exit(exit);
     }
 }
 
@@ -475,20 +502,14 @@ fn run_lint_stdin(
         };
         // Stdin diagnostics: no named source for span rendering (no stable filename).
         render_result_human(&diag_result, quiet, None);
-        let exit = result_exit_code(&diag_result);
         let _ = write_stdout(&output_src);
-        if exit != 0 {
-            std::process::exit(exit);
-        }
+        exit_by_severity(&diag_result);
         return Ok(());
     }
 
     // Report-only mode.
     emit_result(format, &result, quiet, None);
-    let exit = result_exit_code(&result);
-    if exit != 0 {
-        std::process::exit(exit);
-    }
+    exit_by_severity(&result);
     Ok(())
 }
 
@@ -564,28 +585,19 @@ fn run_lint_file(
                     eprintln!("Fixed: {}", path.display());
                 }
                 atomic_write_file(path, &new_source)?;
-                let exit = result_exit_code(&residual);
-                if exit != 0 {
-                    std::process::exit(exit);
-                }
+                exit_by_severity(&residual);
             }
             FixFileOutcome::Rejected { reason, original } => {
                 eprintln!("fix rejected: {reason}");
                 emit_result(format, &original, quiet, named_source);
-                let exit = result_exit_code(&original);
-                if exit != 0 {
-                    std::process::exit(exit);
-                }
+                exit_by_severity(&original);
             }
             FixFileOutcome::NothingToFix { original } => {
                 emit_result(format, &original, quiet, named_source);
                 if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
                     eprintln!("Clean: {filename}");
                 }
-                let exit = result_exit_code(&original);
-                if exit != 0 {
-                    std::process::exit(exit);
-                }
+                exit_by_severity(&original);
             }
         }
         return Ok(());
@@ -611,10 +623,7 @@ fn run_lint_file(
         }
         // After diff-only preview, render diagnostics and exit by severity.
         emit_result(format, &result, quiet, named_source);
-        let exit = result_exit_code(&result);
-        if exit != 0 {
-            std::process::exit(exit);
-        }
+        exit_by_severity(&result);
         return Ok(());
     }
 
@@ -623,10 +632,7 @@ fn run_lint_file(
     if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
         eprintln!("Clean: {filename}");
     }
-    let exit = result_exit_code(&result);
-    if exit != 0 {
-        std::process::exit(exit);
-    }
+    exit_by_severity(&result);
     Ok(())
 }
 
@@ -725,7 +731,7 @@ fn run_lint_directory(
             "files": json_files,
             "truncated": any_truncated,
         });
-        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).unwrap()));
+        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).expect("canonical lint JSON is always serializable")));
     }
 
     if max_tally.exit_code() != 0 {
@@ -917,7 +923,7 @@ fn emit_result(
 ) {
     if format == LintFormat::Json {
         let json = result.to_canonical_json();
-        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).unwrap()));
+        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).expect("canonical lint JSON is always serializable")));
     } else {
         render_result_human(result, quiet, named_source);
     }
@@ -931,7 +937,7 @@ fn emit_analysis_failure_json_or_stderr(e: &MdsError, format: LintFormat) {
             "version": 1,
             "error": e.serialize()
         });
-        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&envelope).unwrap()));
+        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")));
     } else {
         eprintln!("{:?}", miette::Report::from(e.clone()));
     }
