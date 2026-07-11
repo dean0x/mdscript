@@ -313,10 +313,7 @@ fn mds_error_exit_code(err: &MdsError) -> i32 {
 /// Exit the process with the severity-derived lint exit code when non-zero;
 /// no-op for clean (`exit == 0`) results.
 ///
-/// Centralizes the seven previously inline
-/// `let exit = result_exit_code(r); if exit != 0 { process::exit(exit) }` patterns
-/// so exit-code semantics live in one place. Exit codes are unchanged:
-/// 0 clean / 1 warn-only / 2 error-or-analysis-failure / 3 resource-limit.
+/// Exit codes: 0 clean / 1 warn-only / 2 error-or-analysis-failure / 3 resource-limit.
 fn exit_by_severity(result: &mds::LintResult) {
     let exit = result_exit_code(result);
     if exit != 0 {

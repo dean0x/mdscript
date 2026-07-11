@@ -284,7 +284,7 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 
     // `plan.edits` is already sorted ascending by start offset (guaranteed by
     // plan_fixes_with_options which calls `edits.sort()` before returning).
-    // Iterate right-to-left with `.rev()` — no clone or re-sort needed (RUST-3).
+    // Iterate right-to-left with `.rev()` — no clone or re-sort needed.
     debug_assert!(
         plan.edits.windows(2).all(|w| w[0].start <= w[1].start),
         "apply_plan_unchecked: edits must be sorted ascending by start offset"
