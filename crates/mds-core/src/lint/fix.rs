@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn rel1_non_char_boundary_offset_does_not_panic() {
         let source = "é\n"; // 3 bytes: 0xC3 0xA9 0x0A
-        // Offset 1 is inside the multibyte 'é' — NOT a char boundary.
+                            // Offset 1 is inside the multibyte 'é' — NOT a char boundary.
         let diag = make_diag("duplicate-import", 1, 1);
         let result = make_result(vec![diag]);
 
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn rel1_out_of_range_offset_does_not_panic() {
         let source = "hello\n"; // 6 bytes
-        // Offset 100 is beyond the source length.
+                                // Offset 100 is beyond the source length.
         let diag = make_diag("duplicate-import", 100, 1);
         let result = make_result(vec![diag]);
 

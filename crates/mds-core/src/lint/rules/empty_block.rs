@@ -372,7 +372,9 @@ mod tests {
         // @if then-body has content ("hello") — only @elseif body is empty.
         let diags = lint_src("@if x:\nhello\n@elseif y:\n@end\n");
         assert!(
-            diags.iter().any(|d| d.rule == RULE && d.message.contains("@elseif")),
+            diags
+                .iter()
+                .any(|d| d.rule == RULE && d.message.contains("@elseif")),
             "should fire for empty @elseif body; got: {:?}",
             diags
         );

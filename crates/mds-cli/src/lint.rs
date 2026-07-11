@@ -728,7 +728,10 @@ fn run_lint_directory(
             "files": json_files,
             "truncated": any_truncated,
         });
-        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).expect("canonical lint JSON is always serializable")));
+        let _ = write_stdout(&format!(
+            "{}\n",
+            serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
+        ));
     }
 
     if max_tally.exit_code() != 0 {
@@ -920,7 +923,10 @@ fn emit_result(
 ) {
     if format == LintFormat::Json {
         let json = result.to_canonical_json();
-        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&json).expect("canonical lint JSON is always serializable")));
+        let _ = write_stdout(&format!(
+            "{}\n",
+            serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
+        ));
     } else {
         render_result_human(result, quiet, named_source);
     }
@@ -934,7 +940,10 @@ fn emit_analysis_failure_json_or_stderr(e: &MdsError, format: LintFormat) {
             "version": 1,
             "error": e.serialize()
         });
-        let _ = write_stdout(&format!("{}\n", serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")));
+        let _ = write_stdout(&format!(
+            "{}\n",
+            serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")
+        ));
     } else {
         eprintln!("{:?}", miette::Report::from(e.clone()));
     }

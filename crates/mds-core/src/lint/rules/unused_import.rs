@@ -302,11 +302,12 @@ mod tests {
         // `greet` is selectively imported but never referenced in the body.
         // The wildcard re-export is from an unrelated path and carries no name
         // binding — it must NOT exempt `greet` from the unused-import finding.
-        let src =
-            "@import { greet } from \"./lib.mds\"\n@export * from \"./other.mds\"\n";
+        let src = "@import { greet } from \"./lib.mds\"\n@export * from \"./other.mds\"\n";
         let diags = lint_src(src);
         assert!(
-            diags.iter().any(|d| d.rule == RULE && d.message.contains("greet")),
+            diags
+                .iter()
+                .any(|d| d.rule == RULE && d.message.contains("greet")),
             "wildcard re-export must NOT exempt a selective import from unused-import; \
              got: {:?}",
             diags

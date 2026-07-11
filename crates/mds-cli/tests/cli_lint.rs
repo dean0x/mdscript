@@ -644,7 +644,11 @@ fn directory_json_files_array_is_deterministically_sorted() {
     // F1 invariant: files[] must be in sorted (path-ascending) order.
     let paths: Vec<&str> = files
         .iter()
-        .map(|f| f["file"].as_str().expect("each entry must have a file string"))
+        .map(|f| {
+            f["file"]
+                .as_str()
+                .expect("each entry must have a file string")
+        })
         .collect();
     let mut sorted_paths = paths.clone();
     sorted_paths.sort();

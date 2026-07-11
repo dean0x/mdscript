@@ -85,8 +85,16 @@ mod tests {
     #[test]
     fn all_nine_rules_map_to_expected_tier() {
         // Tier A — auto-fixable with reverify gate
-        assert_eq!(rule_tier("duplicate-import"), FixTier::A, "duplicate-import");
-        assert_eq!(rule_tier("duplicate-export"), FixTier::A, "duplicate-export");
+        assert_eq!(
+            rule_tier("duplicate-import"),
+            FixTier::A,
+            "duplicate-import"
+        );
+        assert_eq!(
+            rule_tier("duplicate-export"),
+            FixTier::A,
+            "duplicate-export"
+        );
         assert_eq!(
             rule_tier("unreachable-branch"),
             FixTier::A,
