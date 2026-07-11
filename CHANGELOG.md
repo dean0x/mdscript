@@ -76,17 +76,17 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   across all surfaces (CLI, Rust, napi, WASM, Python) with byte-identical canonical
   JSON output.
 
-  **Rules** (all `warn` by default; individually configurable via `mds.json`
-  `lint.rules` or the `rules` API option):
-  - `unused-variable`: frontmatter key defined but never referenced in the body
-  - `unused-import`: `@import` never used in the file
-  - `unused-function`: `@define` function never called in the file
-  - `shadow-variable`: inner-scope variable shadows an outer-scope variable
-  - `empty-block`: `@if`/`@for`/`@define` body with an empty body (auto-fixable)
-  - `redundant-else`: `@else` after an always-returning branch (auto-fixable)
-  - `unreachable-branch`: branch condition that is always false
-  - `duplicate-import`: same file imported more than once (auto-fixable)
-  - `duplicate-export`: same export name defined more than once
+  **Rules** (individually configurable via `mds.json` `lint.rules` or the
+  `rules` API option; severities differ per rule):
+  - `unused-variable` (warn): frontmatter key defined but never referenced in the body
+  - `unused-import` (warn): `@import` never used in the file (Tier B: auto-fixed only for standalone files)
+  - `unused-function` (warn): `@define` function never called in the file (Tier B: auto-fixed only for standalone files)
+  - `shadow-variable` (off by default / info when enabled): inner-scope variable shadows an outer-scope variable; must be enabled via `mds.json`
+  - `empty-block` (warn): `@if`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable)
+  - `redundant-else` (warn): `@else` body is structurally identical to the `@if`/`@elseif` then-body (Tier C — never auto-fixed)
+  - `unreachable-branch` (error): branch condition is always-true or always-false (auto-fixable)
+  - `duplicate-import` (error): same file imported more than once (auto-fixable)
+  - `duplicate-export` (error): same export name defined more than once (auto-fixable)
 
   **CLI** (`mds lint`): file, directory, and stdin input modes; `--fix` for
   auto-fixable issues (Tier A always; Tier B for standalone files); `--check`
@@ -119,6 +119,10 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   **Python** (`mdscript`): `lint()`, `lint_file()`, `lint_virtual()` with keyword-only
   `rules` and `base_path` / `vars` options; `LintResult` with `.version`, `.truncated`,
   `.files`, `.to_dict()`, `.to_json()`. Stubs shipped in `_mdscript.pyi` / `__init__.pyi`.
+
+  **⚠ TypeScript interface implementers**: `MdsBaseBackend` gained `lint` and
+  `lintVirtual` as required members; `MdsNodeBackend` gained `lintFile`. Code that
+  directly implements these interfaces (not just calls them) must add these methods.
 
 ### Changed
 

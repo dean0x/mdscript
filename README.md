@@ -207,19 +207,19 @@ mds lint --format json .        # machine-readable JSON output (stdout)
 mds lint --quiet template.mds   # suppress warnings; exit 2 on errors only
 ```
 
-Rules (all `warn` by default; configure via `mds.json` `lint.rules` or `--set-rules`):
+Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 
 | Rule | Severity | Description |
 |------|----------|-------------|
-| `unused-variable` | warn | Frontmatter variable defined but never used in the body |
-| `unused-import` | warn | `@import` that is never referenced |
-| `unused-function` | warn | `@define` function that is never called |
-| `shadow-variable` | warn | Inner-scope variable shadows an outer-scope variable |
-| `empty-block` | warn | `@if`/`@for`/`@define` body is empty (auto-fixable) |
-| `redundant-else` | warn | `@else` after an always-returning branch (auto-fixable) |
-| `unreachable-branch` | warn | Branch condition that is always false given prior conditions |
-| `duplicate-import` | warn | Same file imported more than once (auto-fixable) |
-| `duplicate-export` | warn | Same export name defined more than once |
+| `unused-variable` | warn | Frontmatter variable defined but never referenced in the body |
+| `unused-import` | warn | `@import` that is never referenced (Tier B: auto-fixed only for standalone files) |
+| `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
+| `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
+| `empty-block` | warn | `@if`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
+| `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
+| `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
+| `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
+| `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
 
 Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.

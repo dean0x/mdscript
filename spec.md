@@ -1046,7 +1046,7 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `unused-function` | warn | suggestion¹ | B | A `@define` function is defined but never called in the file. |
 | `shadow-variable` | info (default-off²) | no | C | A variable declared in an inner scope (e.g. `@for`) shadows an outer-scope variable of the same name. |
 | `empty-block` | warn | yes (A)³ | A | A control-flow block (`@if`, `@for`, `@define`, `@message`) has an empty or whitespace-only body. |
-| `redundant-else` | warn | no | C | An `@else` branch after an `@if`/`@elseif` block that always returns (or is otherwise unreachable). |
+| `redundant-else` | warn | no | C | An `@else` block whose body is structurally identical to the preceding `@if`/`@elseif` then-body (detected via structural equality). Tier C — never auto-fixed. |
 | `unreachable-branch` | **error** | yes (A)³ | A | A branch condition (`@if`/`@elseif`) is always-true (with later branches) or always-false, making some code dead. |
 | `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
@@ -1055,7 +1055,7 @@ Rules default to the severities shown below — **not all rules default to `warn
 
 ² **`shadow-variable` is default-off**: it emits at `info` severity but is suppressed at the `info` level by default (only shown when explicitly enabled via `mds.json`). It never affects the exit code.
 
-³ **Tier A block rules are best-effort**: `empty-block` and `unreachable-branch` fixes are applied by `--fix` and then validated by the reverify gate. If the reverify gate refuses the removal (e.g. because removing the block would change compiled output — which should never happen for well-formed dead code), the rule is reported as suggestion-only for that file.
+³ **Tier A block-spanning fixes are always refused**: The fix planner removes only the single directive line containing the span, leaving the matching `@end` orphaned. The reverify gate catches the resulting parse error and refuses the fix (fail-closed; applies ADR-001). As a result, all `empty-block` and `unreachable-branch` fixes that span multiple lines are always reported as suggestion-only — they are never written to disk. Single-directive blocks that reduce to a no-op on removal are not affected. Follow-up: #172.
 
 **Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). **Tier B** fixes apply only when the file is standalone (no `@import` / `@extends`). **Tier C** rules are report-only — never auto-fixed.
 
