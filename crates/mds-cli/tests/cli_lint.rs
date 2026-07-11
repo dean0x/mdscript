@@ -20,6 +20,8 @@
 //! - L-CLI-DIR1: directory mode path-sorts and lints all files including partials
 //! - L-CLI-RESOURCE: nesting > MAX_NESTING_DEPTH (64) → exit 3 ResourceLimit (TEST-4)
 //! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
+//! - I-24: unreachable-branch --fix is refused (block-spanning); file unchanged, exit 2
+//! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
 
 mod common;
 use common::{fixture, mds_bin};
@@ -655,6 +657,113 @@ fn directory_json_files_array_is_deterministically_sorted() {
     assert_eq!(
         paths, sorted_paths,
         "files[] must be in sorted path order (F1 invariant); got: {paths:?}"
+    );
+}
+
+// ── I-24: unreachable-branch --fix refusal (block-spanning, ADR-001) ─────────
+//
+// unreachable-branch is Tier A (auto-fixable per tier.rs), but the fix is always
+// refused for @if blocks: diag_to_edit() removes only the opening @if directive
+// line (span-guided byte removal per ADR-001), orphaning @else/@end. The reverify
+// gate calls lint_str_with on the edited source, which fails to parse (orphaned
+// @else), and refuses the entire fix batch fail-closed.
+//
+// Fixture: lint_unreachable_branch.mds — always-true @if "x" == "x": with a
+// later @else branch (the later branch makes unreachable-branch fire at its
+// default Error severity). After fix refusal the residual Error finding
+// determines exit 2. Non-vacuous: asserts "fix rejected" in stderr, exit 2,
+// AND file content byte-identical to before --fix. (applies ADR-001)
+
+#[test]
+fn fix_refused_for_unreachable_branch_and_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_unreachable_branch.mds");
+    fs::copy(fixture("lint_unreachable_branch.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+    assert!(
+        original.contains("@if \"x\" == \"x\":"),
+        "fixture must contain the always-true @if condition"
+    );
+    assert!(
+        original.contains("@else:"),
+        "fixture must contain a later @else branch"
+    );
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The fix must be refused: removing the @if line orphans @else/@end, caught
+    // by the reverify gate as a parse error and refused fail-closed (ADR-001).
+    assert!(
+        stderr.contains("fix rejected"),
+        "fix must be refused for block-spanning unreachable-branch; got stderr: {stderr}"
+    );
+
+    // Residual: unreachable-branch Error finding survives fix refusal → exit 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "residual Error finding after fix refusal must exit 2; got stderr: {stderr}"
+    );
+
+    // Critical: file on disk must be left UNCHANGED.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "file must be unchanged when unreachable-branch --fix is refused"
+    );
+}
+
+// ── I-26: shadow-variable Info severity → diagnostic emitted, exit 0 ─────────
+//
+// shadow-variable is default-off and always Info severity. When enabled via
+// mds.json, Info findings ARE rendered to stderr in human mode but NEVER
+// contribute to the exit code. This test asserts BOTH properties: the finding
+// appears in output AND the process exits 0 — catching regressions that either
+// suppress the diagnostic or wrongly escalate Info to a non-zero exit.
+//
+// Fixture: loop_var_shadow.mds — @for item in items: shadows the frontmatter
+// key `item` (all vars are defined; check gate passes). mds.json in the same
+// temp dir enables shadow-variable at Info severity (the built-in default when
+// explicitly configured as "info"). The fixture has no Warn/Error findings, so
+// the only diagnostic is the Info shadow-variable — exit must be 0.
+
+#[test]
+fn shadow_variable_info_emits_diagnostic_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("loop_var_shadow.mds");
+    fs::copy(fixture("loop_var_shadow.mds"), &target).unwrap();
+
+    // Enable shadow-variable at Info severity via mds.json in the same directory.
+    // The upward config search finds this mds.json for the fixture in the same dir.
+    fs::write(
+        dir.path().join("mds.json"),
+        r#"{ "lint": { "rules": { "shadow-variable": "info" } } }"#,
+    )
+    .unwrap();
+
+    let out = lint_path(&target, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The shadow-variable diagnostic must be emitted (rule is enabled and fires).
+    assert!(
+        stderr.contains("shadow-variable"),
+        "shadow-variable Info finding must appear in stderr; got: {stderr}"
+    );
+
+    // Info severity never contributes to exit code — must exit 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Info-severity shadow-variable must not affect exit code; got stderr: {stderr}"
+    );
+
+    // Human mode must not write to stdout.
+    assert!(
+        stdout.is_empty(),
+        "human mode must not write to stdout; got: {stdout}"
     );
 }
 
