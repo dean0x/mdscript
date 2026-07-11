@@ -598,7 +598,7 @@ fn run_lint_file(
         if !plan.edits.is_empty() {
             if diff {
                 let label = path.display().to_string();
-                let fixed = mds::fix::apply_plan(&source, &plan);
+                let fixed = mds::fix::apply_plan_unchecked(&source, &plan);
                 let diff_str = render_diff_lint(&source, &fixed, &label);
                 let _ = write_stdout(&diff_str);
             }

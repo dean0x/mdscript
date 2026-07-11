@@ -45,3 +45,78 @@ pub fn is_fixable(rule: &str, is_standalone: bool) -> bool {
         FixTier::C => false,
     }
 }
+
+/// Record `key` → `offset` as the first occurrence and return `true`; if `key`
+/// was already present, leave the map unchanged and return `false`.
+///
+/// Shared by `duplicate-import` and `duplicate-export` for the
+/// "push-first-occurrence, flag-duplicate" pattern. Extracted here because
+/// `tier.rs` is the one lint leaf module with no rule-specific imports —
+/// placing it here avoids duplicating an identical private fn in each rule file.
+pub(crate) fn first_occurrence<K: std::hash::Hash + Eq>(
+    seen: &mut std::collections::HashMap<K, usize>,
+    key: K,
+    offset: usize,
+) -> bool {
+    if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+        e.insert(offset);
+        true
+    } else {
+        false
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ARC-3: Every registered rule name must map to its documented FixTier.
+    ///
+    /// Enumerating all 9 rules explicitly means that a newly-added rule which
+    /// falls silently into the `_ => FixTier::C` catch-all arm will cause this
+    /// test to fail (once its expected tier is added here), preventing silent
+    /// misclassification in the JSON `fixable` field and the fix planner.
+    ///
+    /// Tier A: duplicate-import, duplicate-export, unreachable-branch, empty-block
+    /// Tier B: unused-import, unused-function
+    /// Tier C: unused-variable, redundant-else, shadow-variable
+    #[test]
+    fn all_nine_rules_map_to_expected_tier() {
+        // Tier A — auto-fixable with reverify gate
+        assert_eq!(rule_tier("duplicate-import"), FixTier::A, "duplicate-import");
+        assert_eq!(rule_tier("duplicate-export"), FixTier::A, "duplicate-export");
+        assert_eq!(
+            rule_tier("unreachable-branch"),
+            FixTier::A,
+            "unreachable-branch"
+        );
+        assert_eq!(rule_tier("empty-block"), FixTier::A, "empty-block");
+        // Tier B — standalone-only fixable
+        assert_eq!(rule_tier("unused-import"), FixTier::B, "unused-import");
+        assert_eq!(rule_tier("unused-function"), FixTier::B, "unused-function");
+        // Tier C — report-only, never fixed
+        assert_eq!(rule_tier("unused-variable"), FixTier::C, "unused-variable");
+        assert_eq!(rule_tier("redundant-else"), FixTier::C, "redundant-else");
+        assert_eq!(rule_tier("shadow-variable"), FixTier::C, "shadow-variable");
+    }
+
+    /// first_occurrence: first call inserts and returns true.
+    #[test]
+    fn first_occurrence_new_key_returns_true() {
+        let mut map = std::collections::HashMap::new();
+        assert!(first_occurrence(&mut map, "a".to_string(), 0));
+        assert_eq!(map.get("a"), Some(&0));
+    }
+
+    /// first_occurrence: second call on same key returns false without clobbering.
+    #[test]
+    fn first_occurrence_duplicate_key_returns_false() {
+        let mut map = std::collections::HashMap::new();
+        first_occurrence(&mut map, "a".to_string(), 0);
+        assert!(!first_occurrence(&mut map, "a".to_string(), 99));
+        // Original offset is preserved.
+        assert_eq!(map.get("a"), Some(&0));
+    }
+}

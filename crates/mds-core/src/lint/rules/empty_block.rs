@@ -361,6 +361,23 @@ mod tests {
         );
     }
 
+    /// TEST-7: @elseif with empty body fires.
+    ///
+    /// The `@elseif` path was the one uncovered branch among the six directives
+    /// checked by `check_if_block` and `check_nodes`. This test locks in that
+    /// coverage: when the then-body of @if has content but the @elseif body is
+    /// empty, exactly the @elseif finding must fire.
+    #[test]
+    fn elseif_empty_body_fires() {
+        // @if then-body has content ("hello") — only @elseif body is empty.
+        let diags = lint_src("@if x:\nhello\n@elseif y:\n@end\n");
+        assert!(
+            diags.iter().any(|d| d.rule == RULE && d.message.contains("@elseif")),
+            "should fire for empty @elseif body; got: {:?}",
+            diags
+        );
+    }
+
     /// @else with empty body fires.
     #[test]
     fn else_empty_body_fires() {

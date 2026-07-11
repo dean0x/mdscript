@@ -289,6 +289,30 @@ mod tests {
         );
     }
 
+    /// TEST-5: Wildcard re-export (`@export * from "path"`) does NOT exempt a
+    /// selective import from the unused-import rule.
+    ///
+    /// The KB-adjudicated semantic: `@export * from "..."` operates on the imported
+    /// module's own exports at a different namespace level — there is no syntactic
+    /// link between the wildcard re-export and any local import binding. Only
+    /// `@export name` (Named) and `@export name from "path"` (ReExport) suppress
+    /// their matching local import binding.
+    #[test]
+    fn wildcard_reexport_does_not_exempt_unused_import() {
+        // `greet` is selectively imported but never referenced in the body.
+        // The wildcard re-export is from an unrelated path and carries no name
+        // binding — it must NOT exempt `greet` from the unused-import finding.
+        let src =
+            "@import { greet } from \"./lib.mds\"\n@export * from \"./other.mds\"\n";
+        let diags = lint_src(src);
+        assert!(
+            diags.iter().any(|d| d.rule == RULE && d.message.contains("greet")),
+            "wildcard re-export must NOT exempt a selective import from unused-import; \
+             got: {:?}",
+            diags
+        );
+    }
+
     /// Rule=off suppresses.
     #[test]
     fn rule_off_suppresses() {

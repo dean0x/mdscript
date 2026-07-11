@@ -181,7 +181,10 @@ fn diag_to_edit(diag: &LintDiagnostic, source: &str) -> Option<ByteEdit> {
     let offset = span.offset;
 
     // Find the start of the line containing `offset`.
-    let line_start = source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+    // `str::get(..offset)` returns None for out-of-range or non-char-boundary
+    // offsets — fail-closed per ADR-001 rather than panicking on a bad span.
+    let prefix = source.get(..offset)?;
+    let line_start = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
 
     // Find the end of the line (including the terminator — CRLF or LF).
     let line_end = extend_to_line_end(source, offset);
@@ -240,23 +243,37 @@ fn has_overlapping_edits(edits: &[ByteEdit]) -> bool {
 
 // ── Application ───────────────────────────────────────────────────────────────
 
-/// Apply a `FixPlan` to a source string, returning the fixed bytes.
+/// Apply a `FixPlan` to a source string, returning the fixed source.
 ///
-/// Edits are applied **right-to-left** (highest start offset first) in a single
-/// pass, so earlier edits' offsets remain valid after later edits are applied.
+/// Edits are applied **right-to-left** (highest start offset first) in a
+/// single pass, so earlier edits' offsets remain valid after later edits are
+/// applied.
 ///
-/// Returns the fixed source string. The caller must pass `plan` with
-/// `overlap_rejected == false`; if true, call this function is a logic error
-/// (use [`apply_fixes`] which checks this).
+/// # `_unchecked` suffix — ADR-001
+///
+/// This function bypasses the ADR-001 reverify gate (compile-equivalence
+/// check) — it applies edits without recompiling or verifying that the fixed
+/// source produces identical compiled output. Production code that writes back
+/// to disk **must** use [`apply_fixes`] instead, which gates on the reverify
+/// callback before returning `FixOutcome::Fixed`. `apply_plan_unchecked` is
+/// provided for the `--fix --diff` / `--fix --check` diff-preview path (which
+/// computes the delta without writing it) and for unit tests. Calling it on a
+/// write path without a subsequent reverify is an anti-pattern — the reverify
+/// gate is the only guard against a fix that accidentally changes compiled
+/// semantics.
+///
+/// The caller must pass `plan` with `overlap_rejected == false`; if true,
+/// calling this function is a logic error (use [`apply_fixes`] which checks
+/// this).
 ///
 /// # Panics
 ///
 /// Does not panic — invalid spans produce no change (the edit is skipped with
 /// a `debug_assert` violation in debug builds).
-pub fn apply_plan(source: &str, plan: &FixPlan) -> String {
+pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
     debug_assert!(
         !plan.overlap_rejected,
-        "apply_plan called on a rejected (overlapping) plan"
+        "apply_plan_unchecked called on a rejected (overlapping) plan"
     );
 
     if plan.edits.is_empty() {
@@ -265,11 +282,14 @@ pub fn apply_plan(source: &str, plan: &FixPlan) -> String {
 
     let mut result = source.as_bytes().to_vec();
 
-    // Apply right-to-left to preserve lower offsets.
-    let mut edits_rtl = plan.edits.clone();
-    edits_rtl.sort_by_key(|e: &ByteEdit| std::cmp::Reverse(e.start));
-
-    for edit in &edits_rtl {
+    // `plan.edits` is already sorted ascending by start offset (guaranteed by
+    // plan_fixes_with_options which calls `edits.sort()` before returning).
+    // Iterate right-to-left with `.rev()` — no clone or re-sort needed (RUST-3).
+    debug_assert!(
+        plan.edits.windows(2).all(|w| w[0].start <= w[1].start),
+        "apply_plan_unchecked: edits must be sorted ascending by start offset"
+    );
+    for edit in plan.edits.iter().rev() {
         let start = edit.start;
         let end = edit.end;
         if end > result.len() || start > end {
@@ -333,7 +353,7 @@ where
         };
     }
 
-    let fixed_source = apply_plan(source, &plan);
+    let fixed_source = apply_plan_unchecked(source, &plan);
 
     // Build the set of rules targeted by this fix batch.
     let targeted_rules: std::collections::HashSet<&str> =
@@ -537,7 +557,7 @@ mod tests {
         );
         assert!(!plan.edits.is_empty(), "should produce at least one edit");
 
-        let fixed = apply_plan(source, &plan);
+        let fixed = apply_plan_unchecked(source, &plan);
 
         // The fixed source should contain no STRAY \r bytes (each \r must be followed by \n).
         let bytes = fixed.as_bytes();
@@ -566,24 +586,42 @@ mod tests {
 
     // ── L-FIX-OVL1: Overlap detection ────────────────────────────────────────
 
+    /// AC-F-19: two diagnostics that map to the same line produce identical
+    /// ByteEdits (`{ start: 0, end: 23 }`). The overlap detector fires because
+    /// `a.end (23) > b.start (0)`. The whole batch is rejected — edits cleared,
+    /// `apply_fixes` returns `FixOutcome::Rejected`.
     #[test]
     fn l_fix_ovl1_overlapping_edits_rejected() {
-        // Two diagnostics whose line spans overlap.
         let source =
             "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@import \"./a.mds\" as c\n";
+        // Both diag1 (offset 0) and diag2 (offset 2) are on the same line → same
+        // computed line span → overlap detected.
         let diag1 = make_diag("duplicate-import", 0, "@import".len());
-        let diag2 = make_diag("duplicate-import", 2, "@import".len()); // overlaps with diag1 line
+        let diag2 = make_diag("duplicate-import", 2, "@import".len());
 
         let result = make_result(vec![diag1, diag2]);
         let plan = plan_fixes(&result, source);
 
-        // Check that edits which overlap on the same line are caught.
-        // The overlap detection operates on the computed line spans, not the raw diag spans.
-        // Whether this particular case overlaps depends on the line-span computation.
-        // We test the invariant: if overlap_rejected = true, edits is empty.
-        if plan.overlap_rejected {
-            assert!(plan.edits.is_empty(), "rejected plan must have empty edits");
-        }
+        // Unconditional: overlap must be detected for same-line edits (AC-F-19).
+        assert!(
+            plan.overlap_rejected,
+            "two edits on the same line must trigger overlap detection"
+        );
+        assert!(
+            plan.edits.is_empty(),
+            "rejected plan must have empty edits; got: {:?}",
+            plan.edits
+        );
+
+        // apply_fixes on a rejected plan must return FixOutcome::Rejected
+        // (the reverify closure must never be called in this path).
+        let outcome = apply_fixes(source, plan, &result, |_| {
+            panic!("reverify must not be called when the batch is overlap-rejected")
+        });
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "apply_fixes on an overlap-rejected plan must return Rejected; got: {outcome:?}"
+        );
     }
 
     #[test]
@@ -597,6 +635,55 @@ mod tests {
         assert!(
             !plan.overlap_rejected,
             "non-overlapping edits should not be rejected"
+        );
+    }
+
+    // ── REL-1: slice-panic guard for non-char-boundary / out-of-range offsets ─
+
+    /// REL-1 regression: a diagnostic with a non-char-boundary offset must NOT
+    /// cause a panic. `diag_to_edit` returns `None` (edit skipped).
+    ///
+    /// `"é"` encodes to 2 bytes (U+00E9 → 0xC3 0xA9). Offset 1 splits the
+    /// character — `source[..1]` panics on the pre-fix code;
+    /// `source.get(..1)` returns `None` with the fix (applies ADR-001).
+    #[test]
+    fn rel1_non_char_boundary_offset_does_not_panic() {
+        let source = "é\n"; // 3 bytes: 0xC3 0xA9 0x0A
+        // Offset 1 is inside the multibyte 'é' — NOT a char boundary.
+        let diag = make_diag("duplicate-import", 1, 1);
+        let result = make_result(vec![diag]);
+
+        // Must not panic — edit is skipped (None from diag_to_edit).
+        let plan = plan_fixes(&result, source);
+        assert!(
+            plan.edits.is_empty(),
+            "non-char-boundary offset must produce no edit; got: {:?}",
+            plan.edits
+        );
+        assert!(
+            !plan.overlap_rejected,
+            "no overlap rejection expected when there are no valid edits"
+        );
+    }
+
+    /// REL-1 regression: a diagnostic with an out-of-range offset must NOT
+    /// cause a panic. `diag_to_edit` returns `None` (edit skipped).
+    #[test]
+    fn rel1_out_of_range_offset_does_not_panic() {
+        let source = "hello\n"; // 6 bytes
+        // Offset 100 is beyond the source length.
+        let diag = make_diag("duplicate-import", 100, 1);
+        let result = make_result(vec![diag]);
+
+        let plan = plan_fixes(&result, source);
+        assert!(
+            plan.edits.is_empty(),
+            "out-of-range offset must produce no edit; got: {:?}",
+            plan.edits
+        );
+        assert!(
+            !plan.overlap_rejected,
+            "no overlap rejection expected when there are no valid edits"
         );
     }
 
@@ -620,6 +707,12 @@ mod tests {
         );
     }
 
+    /// A single non-overlapping `duplicate-import` on line 2 must plan, apply,
+    /// pass the (stubbed) reverify, and return `FixOutcome::Fixed`.
+    ///
+    /// The source has the second `@import` starting at byte 23
+    /// (`"@import \"./a.mds\" as a\n"` = 23 bytes), which is a valid char
+    /// boundary, so `diag_to_edit` succeeds and the plan is non-empty.
     #[test]
     fn reverify_success_returns_fixed() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -627,11 +720,17 @@ mod tests {
         let result = make_result(vec![diag]);
         let plan = plan_fixes(&result, source);
 
-        if plan.edits.is_empty() || plan.overlap_rejected {
-            return; // plan not applicable — skip
-        }
+        // Preconditions (non-vacuous): the plan MUST have edits.
+        assert!(
+            !plan.edits.is_empty(),
+            "duplicate-import at byte 23 must produce an edit (assertion must not be vacuous)"
+        );
+        assert!(
+            !plan.overlap_rejected,
+            "single non-overlapping edit must not be rejected"
+        );
 
-        // Reverify callback that succeeds with empty result.
+        // Reverify callback that succeeds with an empty residual.
         let outcome = apply_fixes(source, plan, &result, |_fixed| {
             Ok(LintResult {
                 diagnostics: vec![],
@@ -642,7 +741,7 @@ mod tests {
 
         assert!(
             matches!(outcome, FixOutcome::Fixed { .. }),
-            "successful reverify should return Fixed outcome"
+            "successful reverify must return Fixed outcome; got: {outcome:?}"
         );
     }
 

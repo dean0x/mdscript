@@ -26,6 +26,7 @@ use crate::error::SerializedSpan;
 use crate::lint::config::LintConfig;
 use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
 use crate::lint::facts::{AnalysisContext, ExportKind};
+use crate::lint::tier::first_occurrence;
 
 pub(crate) const RULE: &str = "duplicate-export";
 
@@ -53,61 +54,51 @@ pub(crate) fn check(
         match exp.kind {
             ExportKind::Named | ExportKind::ReExport => {
                 if let Some(name) = &exp.name {
-                    match seen_names.get(name).copied() {
-                        None => {
-                            seen_names.insert(name.clone(), exp.offset);
-                        }
-                        Some(_first_offset) => {
-                            if !builder.push(LintDiagnostic {
-                                rule: RULE.to_string(),
-                                severity,
-                                message: format!(
-                                    "Duplicate export: '{}' is exported more than once.",
-                                    name
-                                ),
-                                help: Some("Remove the duplicate @export directive.".to_string()),
-                                span: Some(SerializedSpan {
-                                    offset: exp.offset,
-                                    length: "@export".len(),
-                                    line: None,
-                                    column: None,
-                                }),
-                                file: Some(filename.to_string()),
-                            }) {
-                                return;
-                            }
-                        }
+                    if !first_occurrence(&mut seen_names, name.clone(), exp.offset)
+                        && !builder.push(LintDiagnostic {
+                            rule: RULE.to_string(),
+                            severity,
+                            message: format!(
+                                "Duplicate export: '{}' is exported more than once.",
+                                name
+                            ),
+                            help: Some("Remove the duplicate @export directive.".to_string()),
+                            span: Some(SerializedSpan {
+                                offset: exp.offset,
+                                length: "@export".len(),
+                                line: None,
+                                column: None,
+                            }),
+                            file: Some(filename.to_string()),
+                        })
+                    {
+                        return;
                     }
                 }
             }
             ExportKind::Wildcard => {
                 if let Some(path) = &exp.path {
-                    match seen_wildcards.get(path).copied() {
-                        None => {
-                            seen_wildcards.insert(path.clone(), exp.offset);
-                        }
-                        Some(_first_offset) => {
-                            if !builder.push(LintDiagnostic {
-                                rule: RULE.to_string(),
-                                severity,
-                                message: format!(
-                                    "Duplicate wildcard export from '{}': already exported above.",
-                                    path
-                                ),
-                                help: Some(
-                                    "Remove the duplicate @export * from directive.".to_string(),
-                                ),
-                                span: Some(SerializedSpan {
-                                    offset: exp.offset,
-                                    length: "@export".len(),
-                                    line: None,
-                                    column: None,
-                                }),
-                                file: Some(filename.to_string()),
-                            }) {
-                                return;
-                            }
-                        }
+                    if !first_occurrence(&mut seen_wildcards, path.clone(), exp.offset)
+                        && !builder.push(LintDiagnostic {
+                            rule: RULE.to_string(),
+                            severity,
+                            message: format!(
+                                "Duplicate wildcard export from '{}': already exported above.",
+                                path
+                            ),
+                            help: Some(
+                                "Remove the duplicate @export * from directive.".to_string(),
+                            ),
+                            span: Some(SerializedSpan {
+                                offset: exp.offset,
+                                length: "@export".len(),
+                                line: None,
+                                column: None,
+                            }),
+                            file: Some(filename.to_string()),
+                        })
+                    {
+                        return;
                     }
                 }
             }
