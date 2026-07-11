@@ -119,6 +119,7 @@ pub enum FixOutcome {
 ///
 /// The returned plan contains sorted, non-overlapping edits or sets
 /// `overlap_rejected = true` if overlapping spans were detected.
+#[must_use = "a dropped FixPlan silently discards planned fix edits"]
 pub fn plan_fixes(lint_result: &LintResult, source: &str) -> FixPlan {
     plan_fixes_with_options(lint_result, source, false)
 }
@@ -127,6 +128,7 @@ pub fn plan_fixes(lint_result: &LintResult, source: &str) -> FixPlan {
 ///
 /// `include_tier_b`: when `true`, Tier B edits are included (use only for
 /// standalone files where a recompile-diff can be obtained).
+#[must_use = "a dropped FixPlan silently discards planned fix edits"]
 pub fn plan_fixes_with_options(
     lint_result: &LintResult,
     source: &str,
@@ -208,7 +210,10 @@ fn diag_to_edit(diag: &LintDiagnostic, source: &str) -> Option<ByteEdit> {
 /// **CRLF discipline (AC-F-24)**: always include `\r\n` as a unit, not just `\n`.
 pub fn extend_to_line_end(source: &str, pos: usize) -> usize {
     let bytes = source.as_bytes();
-    let mut i = pos;
+    // Clamp: if pos is past the end of source, start scanning from source.len().
+    // This satisfies the documented contract ("if pos is past the end of source,
+    // returns source.len()") — applies ADR-001 fail-closed semantics.
+    let mut i = pos.min(bytes.len());
     // Advance to the end of the current line content (before the newline).
     while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
         i += 1;
@@ -337,6 +342,7 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 ///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
+#[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
 where
     F: FnOnce(&str) -> Result<LintResult, MdsError>,
@@ -359,16 +365,27 @@ where
     let targeted_rules: std::collections::HashSet<&str> =
         plan.edits.iter().map(|e| e.rule.as_str()).collect();
 
+    // Local helper: count non-targeted diagnostic occurrences per rule.
+    // Called for both the original baseline and the post-fix residual so the
+    // regression check (below) can compare the two counts in one place.
+    fn count_untargeted_per_rule<'a>(
+        diags: &'a [LintDiagnostic],
+        targeted: &std::collections::HashSet<&str>,
+    ) -> std::collections::HashMap<&'a str, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for d in diags {
+            let rule = d.rule.as_str();
+            if !targeted.contains(rule) {
+                *counts.entry(rule).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     // Baseline: per-rule count of NON-targeted diagnostics that were already present
     // before the fix. A pre-existing untargeted finding must not trip the gate — only
     // an untargeted rule whose count INCREASES is a regression the edit introduced.
-    let mut baseline: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for d in &original.diagnostics {
-        let rule = d.rule.as_str();
-        if !targeted_rules.contains(rule) {
-            *baseline.entry(rule).or_insert(0) += 1;
-        }
-    }
+    let baseline = count_untargeted_per_rule(&original.diagnostics, &targeted_rules);
 
     // Reverify: run the lint engine on the fixed source.
     match reverify(&fixed_source) {
@@ -378,14 +395,7 @@ where
         },
         Ok(residual) => {
             // Count untargeted diagnostics in the residual, per rule.
-            let mut residual_counts: std::collections::HashMap<&str, usize> =
-                std::collections::HashMap::new();
-            for d in &residual.diagnostics {
-                let rule = d.rule.as_str();
-                if !targeted_rules.contains(rule) {
-                    *residual_counts.entry(rule).or_insert(0) += 1;
-                }
-            }
+            let residual_counts = count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
 
             // A regression is an untargeted rule whose count grew vs. the original —
             // i.e. a NEW problem the edit introduced (pre-existing findings survive
@@ -520,6 +530,30 @@ mod tests {
         let source = "hello\rworld\r";
         let end = extend_to_line_end(source, 0);
         assert_eq!(end, 6, "CR: should consume hello\\r (6 bytes)");
+    }
+
+    /// I-09 regression: `extend_to_line_end` with `pos` past source end must return
+    /// `source.len()`, not `pos`.
+    ///
+    /// Doc contract: "If pos is past the end of source, returns source.len()."
+    /// Without `pos.min(bytes.len())`, `i` starts at `pos` and the while-loop body
+    /// never executes, so the function would return `pos` (out-of-range). The clamp
+    /// fixes this (applies ADR-001 fail-closed semantics).
+    #[test]
+    fn extend_to_line_end_past_end_returns_source_len() {
+        let source = "hello\n"; // 6 bytes
+                                // pos well past end
+        assert_eq!(
+            extend_to_line_end(source, source.len() + 10),
+            source.len(),
+            "pos past end must return source.len(), not pos"
+        );
+        // pos == source.len() (exactly at the end boundary) must also return source.len()
+        assert_eq!(
+            extend_to_line_end(source, source.len()),
+            source.len(),
+            "pos == source.len() must return source.len()"
+        );
     }
 
     /// L-FIX-CRLF1: Applying a fix on a CRLF file leaves no stray `\r` bytes.
@@ -819,6 +853,71 @@ mod tests {
     }
 
     // ── L-FIX-REV1: AC-F-20 output-delta gate ────────────────────────────────
+
+    /// I-13: End-to-end Tier B coverage — `unused-function` on a standalone file.
+    ///
+    /// This test closes the coverage gap identified in I-13: no test previously
+    /// exercised `plan_fixes_with_options(result, source, include_tier_b=true)` through
+    /// `apply_fixes` on a REAL Tier B diagnostic with a real reverify closure.
+    ///
+    /// **Why the refusal path**: `diag_to_edit` removes only the `@define dead():`
+    /// opening line, leaving the body (`World!\n`) and `@end` orphaned. The reverify
+    /// parse fails (`MdsError::Syntax`) and `apply_fixes` returns `Rejected`. This is
+    /// the correct fail-closed behavior documented in the KNOWLEDGE.md "block-spanning
+    /// fixes are always refused" gotcha — and exercises the reverify/output-neutrality
+    /// gate for Tier B explicitly.
+    ///
+    /// **Why unused-function, not unused-import**: a standalone file has no `@import`
+    /// by definition (`is_standalone = !is_partial_or_extends && imports.is_empty()`),
+    /// so `unused-import` cannot fire on a standalone file. `unused-function` fires
+    /// when `has_explicit_exports && !exported && !called` — achieved here with an
+    /// explicit `@export greet` plus an unexported, uncalled `@define dead():`.
+    #[test]
+    fn tier_b_unused_function_standalone_apply_is_refused() {
+        // Standalone source: no @import, no @extends, has explicit @export.
+        // `dead` is unexported and uncalled → fires unused-function (Tier B).
+        let source =
+            "@define greet():\nHello!\n@end\n@define dead():\nWorld!\n@end\n@export greet\n";
+
+        // Step 1: obtain a real lint result via the public API (not a stub).
+        let lint_result = crate::lint_str(source).expect("source should lint without error");
+        assert!(
+            lint_result
+                .diagnostics
+                .iter()
+                .any(|d| d.rule == "unused-function"),
+            "unused-function must fire for `dead`; diagnostics: {:?}",
+            lint_result.diagnostics
+        );
+
+        // Step 2: plan with Tier B included.
+        let plan = plan_fixes_with_options(&lint_result, source, /* include_tier_b= */ true);
+        assert!(
+            !plan.overlap_rejected,
+            "no overlap expected on a single Tier B edit"
+        );
+        assert!(
+            !plan.edits.is_empty(),
+            "plan must be non-empty for Tier B unused-function; edits: {:?}",
+            plan.edits
+        );
+        assert!(
+            plan.edits.iter().any(|e| e.rule == "unused-function"),
+            "edit must target the unused-function rule; edits: {:?}",
+            plan.edits
+        );
+
+        // Step 3: apply with a real reverify closure.
+        // Removing only `@define dead():\n` leaves `World!\n@end` orphaned —
+        // the reverify parse fails (Syntax error) → apply_fixes returns Rejected.
+        let outcome = apply_fixes(source, plan, &lint_result, crate::lint_str);
+
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "Tier B unused-function fix must be Rejected (block-span refusal: orphaned @end); \
+             got: {outcome:?}"
+        );
+    }
 
     /// L-FIX-REV1: A reverify closure that detects an output delta MUST cause
     /// `apply_fixes` to return `FixOutcome::Rejected`.
