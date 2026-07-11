@@ -791,15 +791,16 @@ fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<m
                 ),
             ));
         };
-        let severity: mds::Severity = serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
-            options_error(
-                py,
-                &format!(
-                    "rules[{key:?}]: unknown severity {s:?}; \
+        let severity: mds::Severity = serde_json::from_value(serde_json::Value::String(s.clone()))
+            .map_err(|_| {
+                options_error(
+                    py,
+                    &format!(
+                        "rules[{key:?}]: unknown severity {s:?}; \
                          expected \"off\", \"info\", \"warn\", or \"error\""
-                ),
-            )
-        })?;
+                    ),
+                )
+            })?;
         rules_map.insert(key, severity);
     }
     Ok(mds::LintConfig { rules: rules_map })
@@ -940,14 +941,14 @@ fn scan_imports(py: Python<'_>, source: String) -> PyResult<Vec<String>> {
 /// attributes as [`compile`]. On a clean gate, applies the lint rules and returns the
 /// canonical [`LintResult`].
 ///
-/// `base_path`, `vars`, and `rules` are all keyword-only.
+/// `vars`, `base_path`, and `rules` are all keyword-only.
 #[pyfunction]
-#[pyo3(signature = (source, *, base_path=None, vars=None, rules=None))]
+#[pyo3(signature = (source, *, vars=None, base_path=None, rules=None))]
 fn lint(
     py: Python<'_>,
     source: String,
-    base_path: Option<PathBuf>,
     vars: Option<Bound<'_, PyAny>>,
+    base_path: Option<PathBuf>,
     rules: Option<Bound<'_, PyAny>>,
 ) -> PyResult<LintResult> {
     check_source_size(py, &source)?;

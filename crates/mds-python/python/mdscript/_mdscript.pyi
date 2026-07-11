@@ -151,8 +151,8 @@ def scan_imports(source: str, /) -> list[str]: ...
 def lint(
     source: str,
     *,
-    base_path: _StrPath | None = ...,
     vars: _Vars | None = ...,
+    base_path: _StrPath | None = ...,
     rules: Mapping[str, str] | None = ...,
 ) -> LintResult: ...
 def lint_file(

@@ -204,5 +204,5 @@ def test_lr4_lint_result_diagnostic_shape() -> None:
     assert "rule" in d
     assert "severity" in d
     assert "message" in d
-    assert "help" in d or d.get("help") is None
+    assert "help" in d
     assert "fixable" in d
