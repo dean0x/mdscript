@@ -12,11 +12,14 @@
 //! - L-CLI-JSON5: --format json malformed mds.json → exit 2, JSON error envelope stdout (AC-F-14)
 //! - L-CLI-FIX1: --fix applies auto-fixable issues in place (Tier A)
 //! - L-CLI-FIX2: --fix --check exits 1 if fixes pending, never writes
+//! - L-CLI-FIX3: block-spanning --fix is refused fail-closed; file unchanged (TEST-3)
 //! - L-CLI-STDIN1: stdin (no fix) → diagnostics to stderr, stdout empty
 //! - L-CLI-STDIN2: --fix stdin → fixed source to stdout, diagnostics to stderr
 //! - L-CLI-VARS: --set passes runtime variables to the gate check
 //! - L-CLI-QUIET1: --quiet suppresses warnings, exit 0 on clean
 //! - L-CLI-DIR1: directory mode path-sorts and lints all files including partials
+//! - L-CLI-RESOURCE: nesting > MAX_NESTING_DEPTH (64) → exit 3 ResourceLimit (TEST-4)
+//! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
 
 mod common;
 use common::{fixture, mds_bin};
@@ -489,6 +492,165 @@ fn json_format_nonexistent_path_emits_error_envelope() {
     assert!(
         !stderr.contains("mds::file_not_found"),
         "JSON mode must not print error to stderr; got stderr: {stderr}"
+    );
+}
+
+// ── L-CLI-FIX3: block-spanning --fix refusal (TEST-3) ────────────────────────
+//
+// Exercises the KB gotcha "block-spanning Tier A fixes are always refused":
+// diag_to_edit() removes only the opening directive line (span-guided byte
+// removal per ADR-001), orphaning the @end. The reverify gate calls
+// lint_str_with on the edited source, which fails to parse (orphaned @end),
+// and refuses the entire fix batch fail-closed.
+//
+// Fixture: lint_block_span_empty.mds — multi-line empty @define whose body is
+// a single blank line (whitespace-only Text node). The empty-block rule fires
+// (Tier A, Warn), the fix is attempted and refused, and the residual Warn
+// finding determines exit code 1. (applies ADR-001)
+
+#[test]
+fn fix_refused_for_block_spanning_empty_define_and_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_block_span_empty.mds");
+    fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+    assert!(
+        original.contains("@define empty_fn():"),
+        "fixture must contain the multi-line empty @define"
+    );
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The fix must be refused: removing the @define line orphans @end, which
+    // the reverify gate catches as a parse error and rejects fail-closed.
+    assert!(
+        stderr.contains("fix rejected"),
+        "fix must be refused for block-spanning empty-block; got stderr: {stderr}"
+    );
+
+    // Residual finding: the original empty-block Warn survives → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "exit code must reflect residual warn finding after fix refusal; got stderr: {stderr}"
+    );
+
+    // Critical: the file on disk must be left UNCHANGED.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "file must be left unchanged when --fix is refused"
+    );
+}
+
+// ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
+//
+// Verifies that a template causing a ResourceLimit in the RESOLVER causes
+// `mds lint` to exit 3. We trigger MAX_BLOCKS_PER_MODULE (256) by writing
+// 257 uniquely-named @block declarations. The resolver's collect_block()
+// increments a counter on each @block and fails with MdsError::ResourceLimit
+// when count > MAX_BLOCKS_PER_MODULE (i.e. on the 257th block). The check
+// gate propagates this error through mds::lint() and the CLI maps
+// MdsError::ResourceLimit to exit code 3 via mds_error_exit_code.
+//
+// Note: deeply nested @if/@for blocks (> MAX_NESTING_DEPTH=64) are caught
+// by the PARSER with MdsError::Syntax (exit 2, not 3); the facts walker's
+// ResourceLimit for nesting is never reached because the parser fails first.
+// The @block approach is used here because it triggers ResourceLimit in the
+// resolver (inside the check gate), which is the correct path to exit code 3.
+
+#[test]
+fn too_many_block_declarations_exits_3_resource_limit() {
+    // MAX_BLOCKS_PER_MODULE is 256; the 257th @block triggers ResourceLimit.
+    // All blocks must have unique names (the resolver rejects duplicates).
+    const BLOCK_COUNT: usize = 257;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("many_blocks.mds");
+
+    let mut content = String::new();
+    for i in 0..BLOCK_COUNT {
+        content.push_str(&format!("@block block_{i}:\n@end\n"));
+    }
+    fs::write(&target, &content).unwrap();
+
+    let out = lint_path(&target, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{BLOCK_COUNT} @block declarations must exit 3 (ResourceLimit, MAX_BLOCKS_PER_MODULE); \
+         stderr: {stderr}"
+    );
+}
+
+// ── L-CLI-DIR2: directory --format json file-order determinism (TEST-6) ──────
+//
+// Verifies the F1 invariant: files[] in --format json directory-mode output is
+// always in sorted (path-ascending) order regardless of filesystem walk order.
+// Exercises the explicit `files.sort()` in run_lint_directory, which is
+// required because collect_mds_files() does NOT guarantee any walk order.
+//
+// Files MUST carry diagnostics: to_canonical_json() only emits file entries
+// for files that have at least one diagnostic — clean files are omitted from
+// the files[] array entirely. We use lint_warn_only.mds (unused-variable warn)
+// so all 3 copies produce entries in the output.
+//
+// Files are created in REVERSE alphabetical order (c→b→a) to stress-test the
+// F1 sort; an absent sort would produce non-deterministic or reverse output.
+// Two consecutive runs are compared to assert cross-run determinism.
+
+#[test]
+fn directory_json_files_array_is_deterministically_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    // Use warn-only files so each copy appears in the files[] JSON array.
+    // Create them in reverse alphabetical order to stress-test the F1 sort.
+    for name in &["lint_dir_c.mds", "lint_dir_b.mds", "lint_dir_a.mds"] {
+        fs::copy(fixture("lint_warn_only.mds"), dir.path().join(name)).unwrap();
+    }
+
+    // Run twice to assert cross-run determinism.
+    let out1 = lint_path(dir.path(), &["--format", "json"]);
+    let out2 = lint_path(dir.path(), &["--format", "json"]);
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+
+    assert_eq!(
+        out1.status.code(),
+        Some(1),
+        "directory with warn-only files must exit 1; stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Both runs must produce byte-identical output (cross-run determinism).
+    assert_eq!(
+        stdout1, stdout2,
+        "directory mode --format json output must be identical across two consecutive runs"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout1).expect("stdout must be valid JSON");
+    let files = json["files"]
+        .as_array()
+        .expect("JSON output must have a files array");
+    assert_eq!(
+        files.len(),
+        3,
+        "all 3 .mds files must appear in the output; got: {files:?}"
+    );
+
+    // F1 invariant: files[] must be in sorted (path-ascending) order.
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|f| f["file"].as_str().expect("each entry must have a file string"))
+        .collect();
+    let mut sorted_paths = paths.clone();
+    sorted_paths.sort();
+    assert_eq!(
+        paths, sorted_paths,
+        "files[] must be in sorted path order (F1 invariant); got: {paths:?}"
     );
 }
 
