@@ -145,7 +145,7 @@ def test_par3_error_code_parity_with_napi(code: str, thunk) -> None:  # type: ig
 #
 # lint_virtual() is used here to control the entry key ("main.mds") so the golden
 # is byte-identical regardless of which surface produced it. lint() and lint_file()
-# differ in their file key ("<source>" vs basename) when findings are present.
+# differ in their file key ("input.mds" vs basename) when findings are present.
 
 LINT_GOLDENS: list[tuple[str, str, dict[str, str], str]] = [
     (
@@ -192,7 +192,7 @@ def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib
     """CLI `mds lint --format json` must emit byte-identical JSON to Python lint_virtual.
 
     Uses a clean source (no findings) so the JSON is ``{"files":[],...}`` — byte-identical
-    across surfaces without depending on the entry-key convention (basename vs "<source>").
+    across surfaces without depending on the entry-key convention (basename vs "input.mds").
     """
     src = "Hello World!\n"
     mds_file = tmp_path / "main.mds"

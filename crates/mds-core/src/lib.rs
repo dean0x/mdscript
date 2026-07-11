@@ -974,7 +974,9 @@ pub fn lint_str_with(
         cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     }
     // Step 2: lint the entry source.
-    lint::lint_source(source, "<source>", config)
+    // Use the same default filename as the WASM backend so lint(source) produces
+    // a byte-identical "file" key across all surfaces (AC-API-06).
+    lint::lint_source(source, "input.mds", config)
 }
 
 /// Lint an MDS file.

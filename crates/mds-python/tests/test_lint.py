@@ -158,7 +158,7 @@ def test_p_l1_lint_and_lint_file_canonical_json_identical(fixtures: pathlib.Path
     For sources with no findings, the JSON is ``{"files":[],"truncated":false,"version":1}``
     on all surfaces — byte-identical because the empty ``files`` array carries no filename
     keys (the file key only appears when there are diagnostics, and differs between surfaces:
-    lint() uses ``"<source>"`` while lint_file() uses the basename).
+    lint() uses ``"input.mds"`` while lint_file() uses the basename).
     """
     path = fixtures / "simple.mds"
     file_result = m.lint_file(path)
