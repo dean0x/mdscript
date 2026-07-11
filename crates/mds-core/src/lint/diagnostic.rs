@@ -193,7 +193,9 @@ impl LintResult {
     /// }
     /// ```
     ///
-    /// Per-file grouping: diagnostics without a `file` are grouped under `null` key.
+    /// Per-file grouping: diagnostics without a `file` are grouped under the string
+    /// key `"<unknown>"` (a defensive fallback; in practice every rule sets `file:
+    /// Some(..)`).
     /// The `fixable` field reflects tier semantics: `true` for Tier A rules and for
     /// Tier B rules when the file is standalone, `false` otherwise.
     ///
@@ -298,8 +300,9 @@ impl LintResultBuilder {
 
 // ── sanitize_control_chars ────────────────────────────────────────────────────
 
-/// Strip or escape C0 (U+0000–U+001F incl. ESC) and C1 (U+0080–U+009F) control
-/// characters from a string, except `\n` (U+000A) and `\t` (U+0009).
+/// Strip or escape C0 (U+0000–U+001F incl. ESC), DEL (U+007F), and C1
+/// (U+0080–U+009F) control characters from a string, except `\n` (U+000A)
+/// and `\t` (U+0009).
 ///
 /// Applied ONLY at the CLI human-render boundary — NOT in `LintDiagnostic`
 /// constructors. The raw message is preserved in `to_canonical_json()` output
@@ -309,12 +312,15 @@ impl LintResultBuilder {
 /// Replacement strategy: replace each control character with its Unicode escape
 /// `\uXXXX` to make the rendered text visually safe on terminals without silently
 /// dropping information that a developer might need to diagnose rule logic.
+/// DEL (U+007F) is included because some terminals interpret it as a backspace,
+/// which can corrupt human-readable output.
 pub fn sanitize_control_chars(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let is_c0 = ch < '\u{0020}' && ch != '\n' && ch != '\t';
+        let is_del = ch == '\u{007F}';
         let is_c1 = ('\u{0080}'..='\u{009F}').contains(&ch);
-        if is_c0 || is_c1 {
+        if is_c0 || is_del || is_c1 {
             // Replace with Unicode escape so the byte is visible but harmless.
             let _ = fmt::write(&mut out, format_args!("\\u{:04X}", ch as u32));
         } else {
@@ -358,6 +364,12 @@ mod tests {
         assert_eq!(sanitize_control_chars("a\u{0080}b"), "a\\u0080b");
         // U+009F is the last C1 control character.
         assert_eq!(sanitize_control_chars("a\u{009F}b"), "a\\u009Fb");
+    }
+
+    #[test]
+    fn sanitize_escapes_del() {
+        // I-14: DEL (U+007F) is interpreted by some terminals — ensure it is escaped.
+        assert_eq!(sanitize_control_chars("a\u{007F}b"), "a\\u007Fb");
     }
 
     #[test]
@@ -432,6 +444,43 @@ mod tests {
         let result = builder.build(false);
         assert_eq!(result.diagnostics.len(), MAX_DIAGNOSTICS);
         assert!(result.truncated, "truncated must be true when cap was hit");
+    }
+
+    // ── I-25: truncated wire format ───────────────────────────────────────────
+
+    #[test]
+    fn builder_truncated_canonical_json() {
+        // I-25: verify the truncated path in the serialized wire format.
+        // Push MAX_DIAGNOSTICS + 1 to trigger truncation, then confirm the JSON
+        // output has `"truncated": true` and the diagnostics array is capped.
+        let mut builder = LintResultBuilder::new();
+        for i in 0..=MAX_DIAGNOSTICS {
+            builder.push(LintDiagnostic {
+                rule: format!("r{i}"),
+                severity: Severity::Warn,
+                message: format!("m{i}"),
+                help: None,
+                span: None,
+                file: Some("f.mds".to_string()),
+            });
+        }
+        let result = builder.build(false);
+        assert!(result.truncated, "struct truncated flag must be set");
+
+        let json = result.to_canonical_json();
+
+        assert_eq!(
+            json["truncated"],
+            serde_json::Value::Bool(true),
+            "serialized truncated field must be true"
+        );
+
+        let diags = json["files"][0]["diagnostics"].as_array().unwrap();
+        assert_eq!(
+            diags.len(),
+            MAX_DIAGNOSTICS,
+            "serialized diagnostics array must be capped at MAX_DIAGNOSTICS"
+        );
     }
 
     // ── LintDiagnostic miette::Diagnostic impl ────────────────────────────────
