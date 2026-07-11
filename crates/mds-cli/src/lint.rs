@@ -744,11 +744,7 @@ fn lint_one_file_accumulating(
     any_truncated: &mut bool,
 ) -> FileTally {
     let LintFlags {
-        fix,
-        check,
-        diff,
-        quiet: _,
-        ..
+        fix, check, diff, ..
     } = flags;
 
     let source = match read_source_file(file) {
