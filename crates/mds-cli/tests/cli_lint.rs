@@ -8,6 +8,8 @@
 //! - L-CLI-JSON1: --format json clean → exit 0, JSON to stdout, stderr empty
 //! - L-CLI-JSON2: --format json warn → exit 1, JSON with diagnostics to stdout
 //! - L-CLI-JSON3: --format json gate failure → exit 2, error envelope to stdout
+//! - L-CLI-JSON4: --format json nonexistent path → exit 2, JSON error envelope stdout (AC-F-14)
+//! - L-CLI-JSON5: --format json malformed mds.json → exit 2, JSON error envelope stdout (AC-F-14)
 //! - L-CLI-FIX1: --fix applies auto-fixable issues in place (Tier A)
 //! - L-CLI-FIX2: --fix --check exits 1 if fixes pending, never writes
 //! - L-CLI-STDIN1: stdin (no fix) → diagnostics to stderr, stdout empty
@@ -440,5 +442,102 @@ fn fix_json_stdin_is_usage_error_exit_2() {
     assert!(
         !stderr.is_empty(),
         "usage error message must appear on stderr"
+    );
+}
+
+// ── L-CLI-JSON4: nonexistent path → JSON error envelope ─────────────────────
+//
+// AC-F-14: in --format json mode, every analysis-failure path — including
+// "file not found" — must emit `{"version":1,"error":{...}}` to stdout, not a
+// human message to stderr. exit 2 is unchanged.
+
+#[test]
+fn json_format_nonexistent_path_emits_error_envelope() {
+    // Use a path that is guaranteed not to exist.
+    let out = lint_path(
+        Path::new("/nonexistent_mds_lint_test_12345.mds"),
+        &["--format", "json"],
+    );
+
+    // Exit code must be 2 (analysis failure — file not found).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--format json + nonexistent path must exit 2"
+    );
+
+    // stdout must be a parseable JSON error envelope, NOT empty.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON (error envelope); parse error: {e}; stdout: {stdout}")
+    });
+    assert_eq!(
+        parsed["version"].as_u64(),
+        Some(1),
+        "envelope must have version:1; got: {parsed}"
+    );
+    let code = parsed["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error.code must be a string; got: {parsed}"));
+    assert_eq!(
+        code, "mds::file_not_found",
+        "error code must be mds::file_not_found; got: {code}"
+    );
+
+    // The human error message must NOT appear on stderr (it goes to stdout in JSON mode).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("mds::file_not_found"),
+        "JSON mode must not print error to stderr; got stderr: {stderr}"
+    );
+}
+
+// ── L-CLI-JSON5: malformed mds.json → JSON error envelope ───────────────────
+//
+// AC-F-14: config-load failure must also emit the JSON envelope to stdout in
+// --format json mode, so that JSON/LSP consumers always get parseable output.
+
+#[test]
+fn json_format_malformed_config_emits_error_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    // A syntactically valid .mds file — lint must fail at the config stage, not parse stage.
+    let mds_file = dir.path().join("test.mds");
+    fs::write(&mds_file, "---\nfoo: bar\n---\nHello world").unwrap();
+    // Malformed mds.json in the same directory — will be found by the upward config walk.
+    fs::write(dir.path().join("mds.json"), "{ this is not valid json }").unwrap();
+
+    let out = lint_path(&mds_file, &["--format", "json"]);
+
+    // Exit code must be 2 (config-load failure is an analysis failure).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--format json + malformed mds.json must exit 2; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout must be a parseable JSON error envelope.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be valid JSON (error envelope); parse error: {e}; \
+             stdout: {stdout}; stderr: {stderr}"
+        )
+    });
+    assert_eq!(
+        parsed["version"].as_u64(),
+        Some(1),
+        "envelope must have version:1; got: {parsed}"
+    );
+    assert!(
+        parsed["error"]["code"].is_string(),
+        "error envelope must have a code field; got: {parsed}"
+    );
+
+    // The error details must NOT be printed to stderr in JSON mode.
+    assert!(
+        !stderr.contains("invalid mds.json"),
+        "config error must go to stdout in JSON mode, not stderr; got stderr: {stderr}"
     );
 }

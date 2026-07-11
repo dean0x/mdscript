@@ -122,6 +122,9 @@ fn do_lint(args: LintArgs) -> Result<()> {
     let (input, _auto_detected) = resolve_input(input)?;
 
     // USAGE ERROR: --fix + --format json + stdin (AC-F-22b).
+    // DELIBERATE EXCEPTION (AC-F-14): the JSON envelope is deferred for this 3-way combo;
+    // it stays a plain stderr usage message. All other top-level analysis failures route
+    // through emit_analysis_failure_json_or_stderr when --format json is active.
     if fix && format == LintFormat::Json && input == Path::new("-") {
         eprintln!(
             "error: --fix --format json with stdin input is not supported; \
@@ -143,10 +146,15 @@ fn do_lint(args: LintArgs) -> Result<()> {
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
-            return Err(miette::miette!(
-                "directory argument must not be a symlink: {}",
-                input.display()
-            ));
+            // Directory-root symlink → JSON envelope in --format json mode (AC-F-14).
+            let mds_err = MdsError::Io {
+                message: format!(
+                    "directory argument must not be a symlink: {}",
+                    input.display()
+                ),
+            };
+            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            std::process::exit(2);
         }
         return run_lint_directory(&input, flags, runtime_vars);
     }
@@ -189,12 +197,15 @@ fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
 // ── Read source file ──────────────────────────────────────────────────────────
 
 /// Read raw source of `path`: symlink-checked and size-capped (mirrors fmt.rs).
-fn read_source_file(path: &Path) -> Result<String> {
-    let canonical = NativeFs::check_symlink(path).map_err(miette::Error::from)?;
-    let path_str = canonical
-        .to_str()
-        .ok_or_else(|| miette::miette!("path is not valid UTF-8: {}", path.display()))?;
-    NativeFs::new().read(path_str).map_err(miette::Error::from)
+///
+/// Returns `MdsError` (not `miette::Error`) so callers can feed the error into
+/// `emit_analysis_failure_json_or_stderr` without downcasting (AC-F-14).
+fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
+    let canonical = NativeFs::check_symlink(path)?;
+    let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
+        message: format!("path is not valid UTF-8: {}", path.display()),
+    })?;
+    NativeFs::new().read(path_str)
 }
 
 // ── stdout write ──────────────────────────────────────────────────────────────
@@ -428,7 +439,17 @@ fn run_lint_stdin(
     } = flags;
 
     let (source, cwd) = read_stdin()?;
-    let config = load_lint_config(&cwd)?;
+    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
+    let config = match load_lint_config(&cwd) {
+        Ok(c) => c,
+        Err(e) => {
+            let mds_err = MdsError::Io {
+                message: format!("{e}"),
+            };
+            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            std::process::exit(2);
+        }
+    };
 
     let result = match mds::lint_str_with(&source, Some(&cwd), runtime_vars.clone(), &config) {
         Ok(r) => r,
@@ -487,8 +508,25 @@ fn run_lint_file(
     } = flags;
 
     let base_dir = path.parent().unwrap_or(Path::new("."));
-    let config = load_lint_config(base_dir)?;
-    let source = read_source_file(path)?;
+    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
+    let config = match load_lint_config(base_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            let mds_err = MdsError::Io {
+                message: format!("{e}"),
+            };
+            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            std::process::exit(2);
+        }
+    };
+    // File read failure (not found, symlink, I/O) → JSON envelope in --format json mode (AC-F-14).
+    let source = match read_source_file(path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_analysis_failure_json_or_stderr(&e, format);
+            std::process::exit(mds_error_exit_code(&e));
+        }
+    };
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -629,7 +667,17 @@ fn run_lint_directory(
     const MAX_DEPTH: usize = 64;
     let LintFlags { quiet, format, .. } = flags;
 
-    let config = load_lint_config(dir)?;
+    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
+    let config = match load_lint_config(dir) {
+        Ok(c) => c,
+        Err(e) => {
+            let mds_err = MdsError::Io {
+                message: format!("{e}"),
+            };
+            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            std::process::exit(2);
+        }
+    };
 
     let mut files = collect_mds_files(dir, MAX_DEPTH, None);
 
@@ -706,9 +754,10 @@ fn lint_one_file_accumulating(
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
+            // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
             json_files.push(serde_json::json!({
                 "file": file.display().to_string(),
-                "error": format!("{e}")
+                "error": e.serialize()
             }));
             return FileTally::Error;
         }
@@ -792,7 +841,7 @@ fn lint_one_file_human(
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprintln!("{:?}", miette::Report::from(e));
             return FileTally::Error;
         }
     };
