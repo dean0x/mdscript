@@ -274,19 +274,25 @@ fn extract_modules(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsVa
             json_type_name(&modules_json)
         )));
     };
-    parse_modules_from_map(mods_map)
+    parse_modules_from_map(mods_map, "options.modules")
 }
 
 /// Parse a modules map (after deserialization) into HashMap<String, String>.
 ///
-/// Extracted from the original `parse_modules` to allow reuse by `extract_modules`.
+/// `field_label` names the field in error messages (e.g. `"options.modules"` for the
+/// compile/check path where modules are nested under `options`, or `"modules"` for
+/// `lintVirtual` where the map is a top-level positional argument).
+///
+/// Extracted from the original `parse_modules` to allow reuse by `extract_modules` and
+/// `lint_virtual`.
 fn parse_modules_from_map(
     mods: serde_json::Map<String, serde_json::Value>,
+    field_label: &str,
 ) -> Result<HashMap<String, String>, JsValue> {
     if mods.len() > MAX_MODULE_COUNT {
         return Err(js_error(
             &format!(
-                "options.modules exceeds maximum module count of {} ({} provided)",
+                "{field_label} exceeds maximum module count of {} ({} provided)",
                 MAX_MODULE_COUNT,
                 mods.len()
             ),
@@ -303,7 +309,7 @@ fn parse_modules_from_map(
                 if s.len() > MAX_SOURCE_SIZE {
                     return Err(js_error(
                         &format!(
-                            "options.modules[\"{key}\"] exceeds maximum size of {} bytes ({} bytes provided)",
+                            "{field_label}[\"{key}\"] exceeds maximum size of {} bytes ({} bytes provided)",
                             MAX_SOURCE_SIZE,
                             s.len()
                         ),
@@ -314,7 +320,7 @@ fn parse_modules_from_map(
                 if aggregate_size > MAX_MODULES_AGGREGATE_SIZE {
                     return Err(js_error(
                         &format!(
-                            "options.modules aggregate size exceeds maximum of {} bytes",
+                            "{field_label} aggregate size exceeds maximum of {} bytes",
                             MAX_MODULES_AGGREGATE_SIZE
                         ),
                         "mds::resource_limit",
@@ -324,7 +330,7 @@ fn parse_modules_from_map(
             }
             other => {
                 return Err(options_error(&format!(
-                    "options.modules[\"{key}\"] must be a string, got {}",
+                    "{field_label}[\"{key}\"] must be a string, got {}",
                     json_type_name(&other)
                 )));
             }
@@ -685,10 +691,8 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// On success, the canonical lint JSON object:
 /// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
 ///
-/// On failure (parse or validation error), throws a JS `Error`:
-/// - `code`: diagnostic code (e.g. `"mds::syntax"`)
-/// - `help`: optional hint (may be absent)
-/// - `span`: optional `{ offset, length, line?, column? }` (may be absent)
+/// On failure (parse or validation error), throws a JS `Error` with the same
+/// structure as [`compile`].
 ///
 /// ## Example (JavaScript)
 ///
@@ -771,7 +775,7 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
     let entry_owned = entry.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
-        let mods = parse_modules_from_map(mods_map)?;
+        let mods = parse_modules_from_map(mods_map, "modules")?;
         let lint_opts = parse_lint_virtual_options(options)?;
 
         let result = mds::lint_virtual(
