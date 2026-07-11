@@ -50,7 +50,7 @@ pub(crate) fn check(
 }
 
 fn resolve_severity(config: &LintConfig) -> Severity {
-    config.severity_for(RULE).cloned().unwrap_or(Severity::Warn)
+    config.severity_for(RULE).copied().unwrap_or(Severity::Warn)
 }
 
 /// Recursively check a node list for empty bodies.
@@ -68,7 +68,7 @@ fn check_nodes(
             Node::For(b) => {
                 if is_empty_or_whitespace(&b.body) {
                     if !builder.push(make_diag(
-                        severity.clone(),
+                        *severity,
                         filename,
                         "@for body is empty".to_string(),
                         Some("Add content inside the @for block or remove it.".to_string()),
@@ -84,7 +84,7 @@ fn check_nodes(
             Node::Define(b) => {
                 if is_empty_or_whitespace(&b.body) {
                     if !builder.push(make_diag(
-                        severity.clone(),
+                        *severity,
                         filename,
                         format!("@define '{}' body is empty", b.name),
                         Some("Add a body to the function or remove the definition.".to_string()),
@@ -100,7 +100,7 @@ fn check_nodes(
             Node::Message(b) => {
                 if is_empty_or_whitespace(&b.body) {
                     if !builder.push(make_diag(
-                        severity.clone(),
+                        *severity,
                         filename,
                         "@message body is empty".to_string(),
                         Some(
@@ -141,7 +141,7 @@ fn check_if_block(
     // Check then-body.
     if is_empty_or_whitespace(&b.then_body) {
         if !builder.push(make_diag(
-            severity.clone(),
+            *severity,
             filename,
             "@if then-body is empty".to_string(),
             Some("Add content inside the @if block or remove it.".to_string()),
@@ -159,7 +159,7 @@ fn check_if_block(
         let _ = cond; // offset not stored on elseif; use @if offset as approximation
         if is_empty_or_whitespace(branch_body) {
             if !builder.push(make_diag(
-                severity.clone(),
+                *severity,
                 filename,
                 "@elseif body is empty".to_string(),
                 Some("Add content inside the @elseif block or remove it.".to_string()),
@@ -178,7 +178,7 @@ fn check_if_block(
         if is_empty_or_whitespace(else_body) {
             // Last push in this function — return value check is redundant.
             builder.push(make_diag(
-                severity.clone(),
+                *severity,
                 filename,
                 "@else body is empty".to_string(),
                 Some("Add content inside the @else block or remove it.".to_string()),

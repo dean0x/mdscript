@@ -234,7 +234,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
     // are preserved in the stored diagnostic and in JSON output via to_canonical_json().
     let sanitized = mds::LintDiagnostic {
         rule: diag.rule.clone(),
-        severity: diag.severity.clone(),
+        severity: diag.severity,
         message: mds::sanitize_control_chars(&diag.message),
         help: diag.help.as_deref().map(mds::sanitize_control_chars),
         span: diag.span.clone(),

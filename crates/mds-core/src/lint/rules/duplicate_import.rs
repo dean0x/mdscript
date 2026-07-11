@@ -50,7 +50,7 @@ pub(crate) fn check(
             Some(_first_offset) => {
                 if !builder.push(LintDiagnostic {
                     rule: RULE.to_string(),
-                    severity: severity.clone(),
+                    severity,
                     message: format!(
                         "Duplicate import: '{}' is imported more than once.",
                         imp.path
@@ -78,7 +78,7 @@ pub(crate) fn check(
 fn resolve_severity(config: &LintConfig) -> Severity {
     config
         .severity_for(RULE)
-        .cloned()
+        .copied()
         .unwrap_or(Severity::Error)
 }
 

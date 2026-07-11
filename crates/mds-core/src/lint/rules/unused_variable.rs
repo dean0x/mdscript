@@ -68,7 +68,7 @@ pub(crate) fn check(
         if !is_used
             && !builder.push(LintDiagnostic {
                 rule: RULE.to_string(),
-                severity: severity.clone(),
+                severity,
                 message: format!(
                     "Variable '{}' is defined in frontmatter but never referenced in the body.",
                     fv.name
@@ -91,7 +91,7 @@ pub(crate) fn check(
 }
 
 fn resolve_severity(config: &LintConfig) -> Severity {
-    config.severity_for(RULE).cloned().unwrap_or(Severity::Warn)
+    config.severity_for(RULE).copied().unwrap_or(Severity::Warn)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

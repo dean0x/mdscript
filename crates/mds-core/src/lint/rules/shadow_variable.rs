@@ -63,7 +63,7 @@ pub(crate) fn check(
 
         if !builder.push(LintDiagnostic {
             rule: RULE.to_string(),
-            severity: severity.clone(),
+            severity,
             message: format!(
                 "Variable '{}' ({}) shadows an outer {} with the same name.",
                 pair.name, inner_desc, outer_desc
@@ -87,7 +87,7 @@ pub(crate) fn check(
 
 /// Built-in default severity: Off (rule is default-off).
 fn resolve_severity(config: &LintConfig) -> Severity {
-    config.severity_for(RULE).cloned().unwrap_or(Severity::Off)
+    config.severity_for(RULE).copied().unwrap_or(Severity::Off)
 }
 
 fn kind_desc(kind: &ShadowKind) -> &'static str {

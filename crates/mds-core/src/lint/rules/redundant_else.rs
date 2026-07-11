@@ -42,7 +42,7 @@ pub(crate) fn check(
 }
 
 fn resolve_severity(config: &LintConfig) -> Severity {
-    config.severity_for(RULE).cloned().unwrap_or(Severity::Warn)
+    config.severity_for(RULE).copied().unwrap_or(Severity::Warn)
 }
 
 fn check_nodes(
@@ -64,7 +64,7 @@ fn check_nodes(
                         && nodes_eq(&b.then_body, else_body)
                         && !builder.push(LintDiagnostic {
                             rule: RULE.to_string(),
-                            severity: severity.clone(),
+                            severity: *severity,
                             message: "The @else body is identical to the @if body — \
                                       the conditional produces the same output regardless \
                                       of the condition."

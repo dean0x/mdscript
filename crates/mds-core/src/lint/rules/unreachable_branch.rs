@@ -55,7 +55,7 @@ pub(crate) fn check(
 fn resolve_severity(config: &LintConfig) -> Severity {
     config
         .severity_for(RULE)
-        .cloned()
+        .copied()
         .unwrap_or(Severity::Error)
 }
 
@@ -107,7 +107,7 @@ fn check_if_block(
             let has_later_branches = !b.elseif_branches.is_empty() || b.else_body.is_some();
             if has_later_branches
                 && !builder.push(make_diag(
-                    severity.clone(),
+                    *severity,
                     filename,
                     "@if condition is always true — @elseif/@else branches are unreachable"
                         .to_string(),
@@ -125,7 +125,7 @@ fn check_if_block(
         ConditionClass::AlwaysFalse => {
             // Always-false primary condition → then-body is dead code, regardless of later branches.
             if !builder.push(make_diag(
-                severity.clone(),
+                *severity,
                 filename,
                 "@if condition is always false — the then-body is dead code".to_string(),
                 Some(
@@ -155,7 +155,7 @@ fn check_if_block(
             // Emit ONE finding for the duplicate. Skip the always-true/false check below —
             // the duplicate detection already identifies this dead code (M4 dedup).
             if !builder.push(make_diag(
-                severity.clone(),
+                *severity,
                 filename,
                 "@elseif condition is structurally identical to an earlier branch — \
                  this branch can never be reached."
@@ -171,7 +171,7 @@ fn check_if_block(
             match classify_condition(cond) {
                 ConditionClass::AlwaysTrue => {
                     if !builder.push(make_diag(
-                        severity.clone(),
+                        *severity,
                         filename,
                         "@elseif condition is always true".to_string(),
                         Some("Replace the constant condition with a variable.".to_string()),
@@ -183,7 +183,7 @@ fn check_if_block(
                 }
                 ConditionClass::AlwaysFalse => {
                     if !builder.push(make_diag(
-                        severity.clone(),
+                        *severity,
                         filename,
                         "@elseif condition is always false — this branch is dead code".to_string(),
                         Some(

@@ -27,7 +27,7 @@ use crate::limits::MAX_DIAGNOSTICS;
 /// Serialization: `"off"` / `"info"` / `"warn"` / `"error"` (closed enum — unknown
 /// severity VALUE strings fail loudly via serde deserialization error, not
 /// warn-and-ignore; only unknown rule NAMES get the lenient treatment).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Rule is silenced — no diagnostic, no exit-code contribution.
