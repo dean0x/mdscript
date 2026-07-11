@@ -12,6 +12,11 @@ import type {
 import { varsOpt } from '../util/options.js';
 import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS } from './contract.js';
 
+/** Options forwarded to the napi addon for source-string lint (accepts basePath). */
+type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
+/** Options forwarded to the napi addon for file-based and virtual lint. */
+type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
+
 /**
  * Shape of the napi addon exports.
  * compile/check accept { basePath?, vars? } for string sources.
@@ -23,17 +28,15 @@ interface NapiAddon {
   check(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
   compileFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
   checkFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
-  lint(source: string, opts?: { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> }): unknown;
-  lintFile(path: string, opts?: { vars?: Record<string, unknown>; rules?: Record<string, string> }): unknown;
-  lintVirtual(modules: Record<string, unknown>, entry: string, opts?: { vars?: Record<string, unknown>; rules?: Record<string, string> }): unknown;
+  lint(source: string, opts?: NapiLintOpts): unknown;
+  lintFile(path: string, opts?: NapiLintFileOpts): unknown;
+  lintVirtual(modules: Record<string, string>, entry: string, opts?: NapiLintFileOpts): unknown;
 }
 
 /** Build lint options from LintOptions, omitting null/undefined entries. */
-function lintOpt(
-  options?: LintOptions,
-): { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> } | undefined {
+function lintOpt(options?: LintOptions): NapiLintOpts | undefined {
   if (options == null) return undefined;
-  const out: { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> } = {};
+  const out: NapiLintOpts = {};
   if (options.basePath != null) out.basePath = options.basePath;
   if (options.vars != null) out.vars = options.vars;
   if (options.rules != null) out.rules = options.rules;
@@ -41,11 +44,9 @@ function lintOpt(
 }
 
 /** Build lint file options from LintFileOptions, omitting null/undefined entries. */
-function lintFileOpt(
-  options?: LintFileOptions,
-): { vars?: Record<string, unknown>; rules?: Record<string, string> } | undefined {
+function lintFileOpt(options?: LintFileOptions): NapiLintFileOpts | undefined {
   if (options == null) return undefined;
-  const out: { vars?: Record<string, unknown>; rules?: Record<string, string> } = {};
+  const out: NapiLintFileOpts = {};
   if (options.vars != null) out.vars = options.vars;
   if (options.rules != null) out.rules = options.rules;
   return Object.keys(out).length > 0 ? out : undefined;

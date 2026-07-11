@@ -86,8 +86,15 @@ export interface LintDiagnostic {
   span?: LintSpan;
 }
 
+/**
+ * Severity value accepted for a per-rule override in `LintOptions.rules` /
+ * `LintFileOptions.rules`. Mirrors the Rust `Severity` enum serialization:
+ * `"off"` silences the rule; `"info"` / `"warn"` / `"error"` set its level.
+ */
+export type RuleSeverity = 'error' | 'warn' | 'info' | 'off';
+
 /** All diagnostics for a single file in a lint result. */
-export interface LintFileResult {
+export interface LintFileReport {
   /** Path or name of the linted file. */
   file: string;
   /** Diagnostics produced for this file. */
@@ -103,7 +110,7 @@ export interface LintResult {
   /** Schema version; always 1 in this release. */
   version: number;
   /** Per-file findings. Empty when the source is clean. */
-  files: LintFileResult[];
+  files: LintFileReport[];
   /**
    * `true` when the diagnostic count exceeded `MAX_DIAGNOSTICS` (1000) and
    * earlier diagnostics were dropped. Re-run after fixing to surface the rest.
@@ -116,7 +123,7 @@ export interface LintOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
   /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
-  rules?: Record<string, string>;
+  rules?: Record<string, RuleSeverity>;
   /**
    * Base directory for resolving `@import` directives in the source string.
    * Required when the source contains `@import` or `@extends`.
@@ -130,7 +137,7 @@ export interface LintFileOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
   /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
-  rules?: Record<string, string>;
+  rules?: Record<string, RuleSeverity>;
 }
 
 /** Source location of a compiler error. */
