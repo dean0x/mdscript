@@ -2,7 +2,7 @@
 //!
 //! The engine runs AFTER the check gate (resolve+validate) passes, confirming the
 //! template compiles correctly. It then independently tokenizes and parses the entry
-//! source for a single pre-sized facts walk, applies the 9 lint rules as plain
+//! source for a single-pass facts walk, applies the 9 lint rules as plain
 //! functions, and returns a `LintResult`.
 //!
 //! ## Pipeline (per file)
@@ -11,9 +11,11 @@
 //!    Analysis failure → return `Err(MdsError)`. Never run the pipeline twice.
 //! 2. **Re-parse entry** — `tokenize` + `parse_with_ctx` the entry source string
 //!    independently (mirrors the `scan_imports` pattern).
-//! 3. **Facts walk** — single pre-sized traversal building `AnalysisContext`.
+//! 3. **Facts walk** — one traversal building `AnalysisContext`.
 //!    Recursion bounded at `MAX_NESTING_DEPTH=64` → `ResourceLimit` if exceeded.
-//! 4. **Rule dispatch** — 9 rules as plain fns over `AnalysisContext`.
+//! 4. **Rule dispatch** — local-AST rules (empty_block, redundant_else,
+//!    unreachable_branch, duplicate_*) each re-walk the AST; semantic rules
+//!    query only `AnalysisContext`. Total: 1 facts walk + N rule walks.
 //! 5. **Return** `LintResult` with diagnostics capped at `MAX_DIAGNOSTICS`.
 //!
 //! ## Architecture invariants

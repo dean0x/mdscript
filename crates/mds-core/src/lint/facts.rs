@@ -1,4 +1,4 @@
-//! Facts walk: single pre-sized AST traversal building `AnalysisContext`.
+//! Facts walk: single-pass AST traversal building `AnalysisContext`.
 //!
 //! The facts walk visits the entry module's AST exactly ONCE, collecting all
 //! information that rule functions will need (symbol tables, import maps, export
@@ -577,8 +577,8 @@ fn check_for_var_shadow(var: &str, offset: usize, scope: &WalkScope, ctx: &mut A
             outer_kind: ShadowKind::ImportAlias,
             offset,
         });
-    } else if scope.for_var_stack.contains(&var.to_string())
-        || scope.for_key_stack.contains(&var.to_string())
+    } else if scope.for_var_stack.iter().any(|v| v == var)
+        || scope.for_key_stack.iter().any(|v| v == var)
     {
         ctx.shadow_pairs.push(ShadowPair {
             name: var.to_string(),
