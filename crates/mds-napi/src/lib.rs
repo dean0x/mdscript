@@ -755,6 +755,31 @@ fn parse_lint_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFil
     Ok((vars, lint_config))
 }
 
+/// Parse options for `lintVirtual` (virtual-module variant).
+///
+/// Valid keys: `vars`, `rules`. `basePath` is not accepted — virtual modules
+/// have no file path; `@import` paths in a virtual module are resolved
+/// against the module map, not the filesystem.
+fn parse_lint_virtual_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFileOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok((None, mds::LintConfig::default()));
+    };
+
+    if opts_obj.has_named_property("basePath")? {
+        return Err(throw_options_error(
+            env,
+            "option \"basePath\" is not valid for lintVirtual; \
+             virtual modules have no file path",
+        ));
+    }
+
+    reject_unknown_napi_keys(env, &opts_obj, &["vars", "rules"])?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    let lint_config = extract_rules_direct(env, &opts_obj)?;
+
+    Ok((vars, lint_config))
+}
+
 // ── Public lint exports ───────────────────────────────────────────────────────
 
 /// Lint an MDS template source string for static analysis findings.
@@ -899,7 +924,7 @@ pub fn lint_virtual(
         mods.insert(key, s);
     }
 
-    let (vars, lint_config) = parse_lint_file_opts(&env, opts)?;
+    let (vars, lint_config) = parse_lint_virtual_opts(&env, opts)?;
 
     let result = run_catching(
         &env,

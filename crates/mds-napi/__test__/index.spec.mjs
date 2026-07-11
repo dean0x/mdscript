@@ -906,6 +906,26 @@ describe('lintVirtual', () => {
     const hasUnused = allDiags.some((d) => d.rule === 'unused-variable');
     assert.ok(!hasUnused, 'unused-variable should be silenced');
   });
+
+  // L-NV-4: basePath option rejected with correct function name
+  test('L-NV-4: lintVirtual rejects basePath option', () => {
+    const modules = { 'main.mds': 'Hello World!\n' };
+    assert.throws(
+      () => lintVirtual(modules, 'main.mds', { basePath: '/some/path' }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        assert.ok(
+          err.message.includes('lintVirtual'),
+          `expected message to name lintVirtual; got: ${err.message}`,
+        );
+        assert.ok(
+          !err.message.includes('lintFile'),
+          `expected message NOT to name lintFile; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
 });
 
 // ── Lint parity guard: lint + lintFile produce canonical JSON ─────────────────
