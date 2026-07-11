@@ -1,15 +1,17 @@
 """Type-checking sample — must pass `mypy --strict` and `pyright` cleanly (AC-C6).
 
 Exercises the public API with correct types, including `Optional` narrowing on the
-discriminated `CompileResult`.
+discriminated `CompileResult` and explicit coverage of the lint surface (AC-C6 per
+review #171: lint / lint_file / lint_virtual and LintResult attributes).
 """
 
 from __future__ import annotations
 
 import pathlib
+from typing import Any
 
 import mdscript
-from mdscript import CheckResult, CompileResult, MdsError, Message, Span
+from mdscript import CheckResult, CompileResult, LintResult, MdsError, Message, Span
 
 
 def render_markdown() -> str:
@@ -63,3 +65,58 @@ def describe_error() -> str:
 
 def package_version() -> str:
     return mdscript.__version__
+
+
+# ---------------------------------------------------------------------------
+# Lint surface (AC-C6 coverage — review #171)
+# All three lint entry-points and every LintResult attribute are exercised with
+# explicitly-annotated locals so a stub type error surfaces under strict checkers.
+# ---------------------------------------------------------------------------
+
+
+def lint_source(source: str) -> int:
+    """Lint inline source; return the number of files in the result."""
+    result: LintResult = mdscript.lint(source)
+    version: int = result.version
+    truncated: bool = result.truncated
+    files: list[dict[str, Any]] = result.files
+    _ = (version, truncated)
+    return len(files)
+
+
+def lint_source_with_options(source: str) -> str:
+    """Lint source with all optional keyword arguments; return canonical JSON."""
+    rules: dict[str, str] = {"shadow-variable": "warn", "unused-variable": "off"}
+    result: LintResult = mdscript.lint(
+        source,
+        base_path="/tmp",
+        vars={"env": "ci"},
+        rules=rules,
+    )
+    d: dict[str, Any] = result.to_dict()
+    _ = d
+    return result.to_json()
+
+
+def lint_from_file(path: pathlib.Path) -> LintResult:
+    """Lint a .mds file on disk and return the result."""
+    return mdscript.lint_file(
+        path,
+        vars={"count": 1},
+        rules={"unused-variable": "off"},
+    )
+
+
+def lint_virtual_graph() -> bool:
+    """Lint a virtual module graph; return whether the result was truncated."""
+    modules: dict[str, str] = {"entry.mds": "Hello!\n"}
+    result: LintResult = mdscript.lint_virtual(
+        modules,
+        "entry.mds",
+        vars={"name": "world"},
+        rules={"shadow-variable": "warn"},
+    )
+    files: list[dict[str, Any]] = result.files
+    j: str = result.to_json()
+    _ = (files, j)
+    return result.truncated
