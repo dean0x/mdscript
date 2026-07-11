@@ -59,6 +59,8 @@ fn resolve_severity(config: &LintConfig) -> Severity {
         .unwrap_or(Severity::Error)
 }
 
+/// Recursion depth is pre-bounded by the parser's `enter_block` guard
+/// (MAX_NESTING_DEPTH=64), so no local depth counter is needed here.
 fn check_nodes(
     nodes: &[Node],
     filename: &str,

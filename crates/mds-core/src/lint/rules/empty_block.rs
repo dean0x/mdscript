@@ -54,6 +54,9 @@ fn resolve_severity(config: &LintConfig) -> Severity {
 }
 
 /// Recursively check a node list for empty bodies.
+///
+/// Recursion depth is pre-bounded by the parser's `enter_block` guard
+/// (MAX_NESTING_DEPTH=64), so no local depth counter is needed here.
 fn check_nodes(
     nodes: &[Node],
     filename: &str,
@@ -66,40 +69,47 @@ fn check_nodes(
                 check_if_block(b, filename, severity, builder);
             }
             Node::For(b) => {
-                if is_empty_or_whitespace(&b.body) {
-                    if !builder.push(make_diag(
+                if flag_if_empty(
+                    &b.body,
+                    filename,
+                    severity,
+                    make_diag(
                         *severity,
                         filename,
                         "@for body is empty".to_string(),
                         Some("Add content inside the @for block or remove it.".to_string()),
                         b.offset,
                         "@for".len(),
-                    )) {
-                        return;
-                    }
-                } else {
-                    check_nodes(&b.body, filename, severity, builder);
+                    ),
+                    builder,
+                ) {
+                    return;
                 }
             }
             Node::Define(b) => {
-                if is_empty_or_whitespace(&b.body) {
-                    if !builder.push(make_diag(
+                if flag_if_empty(
+                    &b.body,
+                    filename,
+                    severity,
+                    make_diag(
                         *severity,
                         filename,
                         format!("@define '{}' body is empty", b.name),
                         Some("Add a body to the function or remove the definition.".to_string()),
                         b.offset,
                         "@define".len() + 1 + b.name.len(),
-                    )) {
-                        return;
-                    }
-                } else {
-                    check_nodes(&b.body, filename, severity, builder);
+                    ),
+                    builder,
+                ) {
+                    return;
                 }
             }
             Node::Message(b) => {
-                if is_empty_or_whitespace(&b.body) {
-                    if !builder.push(make_diag(
+                if flag_if_empty(
+                    &b.body,
+                    filename,
+                    severity,
+                    make_diag(
                         *severity,
                         filename,
                         "@message body is empty".to_string(),
@@ -110,11 +120,10 @@ fn check_nodes(
                         ),
                         b.offset,
                         "@message".len(),
-                    )) {
-                        return;
-                    }
-                } else {
-                    check_nodes(&b.body, filename, severity, builder);
+                    ),
+                    builder,
+                ) {
+                    return;
                 }
             }
             // @block: intentional placeholder pattern — NEVER flagged.
@@ -139,55 +148,79 @@ fn check_if_block(
     builder: &mut LintResultBuilder,
 ) {
     // Check then-body.
-    if is_empty_or_whitespace(&b.then_body) {
-        if !builder.push(make_diag(
+    if flag_if_empty(
+        &b.then_body,
+        filename,
+        severity,
+        make_diag(
             *severity,
             filename,
             "@if then-body is empty".to_string(),
             Some("Add content inside the @if block or remove it.".to_string()),
             b.offset,
             "@if".len(),
-        )) {
-            return;
-        }
-    } else {
-        check_nodes(&b.then_body, filename, severity, builder);
+        ),
+        builder,
+    ) {
+        return;
     }
 
     // Check @elseif branches.
-    for (cond, branch_body) in &b.elseif_branches {
-        let _ = cond; // offset not stored on elseif; use @if offset as approximation
-        if is_empty_or_whitespace(branch_body) {
-            if !builder.push(make_diag(
+    for (_, branch_body) in &b.elseif_branches {
+        // No per-elseif offset stored in the AST — use the @if offset as an approximation.
+        if flag_if_empty(
+            branch_body,
+            filename,
+            severity,
+            make_diag(
                 *severity,
                 filename,
                 "@elseif body is empty".to_string(),
                 Some("Add content inside the @elseif block or remove it.".to_string()),
                 b.offset, // approximate: no per-elseif offset in AST
                 "@elseif".len(),
-            )) {
-                return;
-            }
-        } else {
-            check_nodes(branch_body, filename, severity, builder);
+            ),
+            builder,
+        ) {
+            return;
         }
     }
 
     // Check @else body.
     if let Some(else_body) = &b.else_body {
-        if is_empty_or_whitespace(else_body) {
-            // Last push in this function — return value check is redundant.
-            builder.push(make_diag(
+        // Last check in this function — no further work follows regardless of return.
+        flag_if_empty(
+            else_body,
+            filename,
+            severity,
+            make_diag(
                 *severity,
                 filename,
                 "@else body is empty".to_string(),
                 Some("Add content inside the @else block or remove it.".to_string()),
                 b.offset,
                 "@else".len(),
-            ));
-        } else {
-            check_nodes(else_body, filename, severity, builder);
-        }
+            ),
+            builder,
+        );
+    }
+}
+
+/// If `body` is empty or whitespace-only, push `diag` and return `true`
+/// (diagnostic limit reached — caller should stop processing). Otherwise recurse
+/// via `check_nodes` and return `false`.
+fn flag_if_empty(
+    body: &[Node],
+    filename: &str,
+    severity: &Severity,
+    diag: LintDiagnostic,
+    builder: &mut LintResultBuilder,
+) -> bool {
+    if is_empty_or_whitespace(body) {
+        !builder.push(diag)
+    } else {
+        check_nodes(body, filename, severity, builder);
+        false
     }
 }
 

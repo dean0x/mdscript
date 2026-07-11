@@ -95,26 +95,20 @@ pub(crate) fn check(
                 let is_used =
                     ctx.used_namespaces.contains(alias) || ctx.used_include_aliases.contains(alias);
                 if !is_used
-                    && !builder.push(LintDiagnostic {
-                        rule: RULE.to_string(),
+                    && !builder.push(make_diag(
                         severity,
-                        message: format!(
+                        filename,
+                        format!(
                             "Import alias '{}' from '{}' is never used.",
                             alias, imp.path
                         ),
-                        help: Some(
+                        Some(
                             "Remove the @import or use the alias with @include or as \
                              a qualified call (`alias.func(...)`)."
                                 .to_string(),
                         ),
-                        span: Some(SerializedSpan {
-                            offset: imp.offset,
-                            length: "@import".len(),
-                            line: None,
-                            column: None,
-                        }),
-                        file: Some(filename.to_string()),
-                    })
+                        imp.offset,
+                    ))
                 {
                     return;
                 }
@@ -126,25 +120,19 @@ pub(crate) fn check(
                         || ctx.used_vars.contains(name)
                         || reexport_names.contains(name);
                     if !is_used
-                        && !builder.push(LintDiagnostic {
-                            rule: RULE.to_string(),
+                        && !builder.push(make_diag(
                             severity,
-                            message: format!(
+                            filename,
+                            format!(
                                 "Imported name '{}' from '{}' is never used.",
                                 name, imp.path
                             ),
-                            help: Some(format!(
+                            Some(format!(
                                 "Remove '{}' from the selective import or use it in the body.",
                                 name
                             )),
-                            span: Some(SerializedSpan {
-                                offset: imp.offset,
-                                length: "@import".len(),
-                                line: None,
-                                column: None,
-                            }),
-                            file: Some(filename.to_string()),
-                        })
+                            imp.offset,
+                        ))
                     {
                         return;
                     }
@@ -156,6 +144,30 @@ pub(crate) fn check(
 
 fn resolve_severity(config: &LintConfig) -> Severity {
     config.severity_for(RULE).copied().unwrap_or(Severity::Warn)
+}
+
+/// Build an unused-import diagnostic. The span always covers the `@import` keyword
+/// (length = 7), so `offset` is the only caller-supplied span parameter.
+fn make_diag(
+    severity: Severity,
+    filename: &str,
+    message: String,
+    help: Option<String>,
+    offset: usize,
+) -> LintDiagnostic {
+    LintDiagnostic {
+        rule: RULE.to_string(),
+        severity,
+        message,
+        help,
+        span: Some(SerializedSpan {
+            offset,
+            length: "@import".len(),
+            line: None,
+            column: None,
+        }),
+        file: Some(filename.to_string()),
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
