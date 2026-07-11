@@ -31,7 +31,7 @@ export interface WasmModule {
     rules?: Record<string, string>;
   }): unknown;
   /** Lint a multi-module virtual filesystem. Returns the canonical lint JSON object. */
-  lintVirtual(modules: object, entry: string, options?: {
+  lintVirtual(modules: Record<string, string>, entry: string, options?: {
     vars?: Record<string, unknown>;
     rules?: Record<string, string>;
   }): unknown;

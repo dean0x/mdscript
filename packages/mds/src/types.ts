@@ -75,7 +75,7 @@ export interface LintDiagnostic {
   /** Rule identifier (e.g. `"unused-variable"`, `"duplicate-import"`). */
   rule: string;
   /** Severity level: `"error"`, `"warn"`, or `"info"`. */
-  severity: string;
+  severity: 'error' | 'warn' | 'info';
   /** Human-readable description of the finding. */
   message: string;
   /** Optional guidance on how to resolve the finding. */
