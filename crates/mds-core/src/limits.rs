@@ -82,6 +82,17 @@ pub(crate) const MAX_BLOCKS_PER_MODULE: usize = 256;
 /// Exceeding this limit surfaces as `mds::resource_limit` (P4).
 pub(crate) const MAX_FRONTMATTER_MERGE_DEPTH: usize = 64;
 
+/// Maximum number of lint diagnostics collected per file.
+///
+/// When the accumulated diagnostic count reaches this limit, collection stops and
+/// `LintResult::truncated` is set to `true`. The truncation marker tells callers to
+/// re-run after addressing visible findings (especially in `--fix` mode, where
+/// remaining diagnostics may be revealed on subsequent passes).
+///
+/// Re-exported as a public constant via `lib.rs` so bindings and tests can pin its
+/// value (L-API-5 / AC-API-10).
+pub(crate) const MAX_DIAGNOSTICS: usize = 1_000;
+
 /// Maximum cumulative byte size of all message content produced by a `@message`-bearing template.
 ///
 /// Caps the aggregate content across the entire message array at the same ceiling as

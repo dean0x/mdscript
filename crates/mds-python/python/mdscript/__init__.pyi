@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from ._mdscript import CheckResult as CheckResult
 from ._mdscript import CompileResult as CompileResult
+from ._mdscript import LintResult as LintResult
 from ._mdscript import MdsError as MdsError
 from ._mdscript import Message as Message
 from ._mdscript import Span as Span
@@ -17,12 +18,16 @@ from ._mdscript import check_virtual as check_virtual
 from ._mdscript import compile as compile
 from ._mdscript import compile_file as compile_file
 from ._mdscript import compile_virtual as compile_virtual
+from ._mdscript import lint as lint
+from ._mdscript import lint_file as lint_file
+from ._mdscript import lint_virtual as lint_virtual
 from ._mdscript import scan_imports as scan_imports
 
 __version__: str
 __all__ = [
     "CheckResult",
     "CompileResult",
+    "LintResult",
     "MdsError",
     "Message",
     "Span",
@@ -33,5 +38,8 @@ __all__ = [
     "compile",
     "compile_file",
     "compile_virtual",
+    "lint",
+    "lint_file",
+    "lint_virtual",
     "scan_imports",
 ]

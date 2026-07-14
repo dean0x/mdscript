@@ -269,11 +269,13 @@ describe('wasm backend — browser shape validation', () => {
     _resetForTesting(0);
   });
 
-  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, scanImports)', () => {
+  test('U-WB17: validateWasmShape accepts a well-formed module (compile, check, lint, scanImports, lintVirtual)', () => {
     const validMod = {
       compile: () => {},
       check: () => {},
+      lint: () => {},
       scanImports: () => [],
+      lintVirtual: () => {},
     };
     assert.doesNotThrow(
       () => validateWasmShape(validMod),
@@ -312,7 +314,7 @@ describe('wasm backend — browser shape validation', () => {
   });
 
   test('U-WB20: validateWasmShape throws when scanImports is missing', () => {
-    const mod = { compile: () => {}, check: () => {} };
+    const mod = { compile: () => {}, check: () => {}, lint: () => {}, lintVirtual: () => {} };
     assert.throws(
       () => validateWasmShape(mod),
       (err) => {

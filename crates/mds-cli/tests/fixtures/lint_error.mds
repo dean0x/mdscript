@@ -1,0 +1,6 @@
+@define greet(name):
+  Hello {name}!
+@end
+
+@export greet
+@export greet

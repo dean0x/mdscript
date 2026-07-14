@@ -5,15 +5,17 @@ import type {
   CompileResult,
   FileOptions,
   InitOptions,
+  LintFileOptions,
+  LintOptions,
+  LintResult,
   MdsBaseBackend,
 } from '../types.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
- * The WASM module exports compile(source, options), check(source, options),
- * and scanImports(source) for dependency resolution.
- * options: { filename?, modules?, vars? }
+ * The WASM module exports compile, check, lint, lintVirtual, and scanImports.
+ * options shapes mirror the Rust wasm-bindgen signatures.
  *
  * Exported so callers can type-annotate pre-loaded modules passed to
  * createWasmBackend().
@@ -21,6 +23,18 @@ import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contr
 export interface WasmModule {
   compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
   check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
+  /** Lint a source string. Returns the canonical lint JSON object. */
+  lint(source: string, options?: {
+    filename?: string;
+    modules?: Record<string, string>;
+    vars?: Record<string, unknown>;
+    rules?: Record<string, string>;
+  }): unknown;
+  /** Lint a multi-module virtual filesystem. Returns the canonical lint JSON object. */
+  lintVirtual(modules: Record<string, string>, entry: string, options?: {
+    vars?: Record<string, unknown>;
+    rules?: Record<string, string>;
+  }): unknown;
   scanImports(source: string): string[];
   default?: (input?: unknown) => Promise<void>;
 }
@@ -334,8 +348,10 @@ export function fileOpts(
  * Create a WASM backend instance from a pre-initialized WasmModule.
  *
  * Synchronous factory — mirrors createNativeBackend(addon) pattern.
- * Returns MdsBaseBackend (compile, check, getBackend) without file operations.
- * File operations (compileFile, checkFile) are added in node.ts via wrapWithFileOps().
+ * Returns MdsBaseBackend (compile, check, lint, lintVirtual, getBackend)
+ * without file operations.
+ * File operations (compileFile, checkFile, lintFile) are added in node.ts
+ * via wrapWithFileOps().
  */
 export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
   return {
@@ -349,6 +365,43 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       const result: unknown = wasmModule.check(source, compileOpts(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
+    },
+
+    lint(source: string, options?: LintOptions): LintResult {
+      // WASM backend does not support basePath (no filesystem access).
+      // vars and rules are forwarded; basePath is silently ignored.
+      const opts: {
+        vars?: Record<string, unknown>;
+        rules?: Record<string, string>;
+      } = {};
+      if (options?.vars != null) opts.vars = options.vars;
+      if (options?.rules != null) opts.rules = options.rules;
+      const result: unknown = wasmModule.lint(
+        source,
+        Object.keys(opts).length > 0 ? opts : undefined,
+      );
+      assertResultShape(result, 'lint');
+      return result as LintResult;
+    },
+
+    lintVirtual(
+      modules: Record<string, string>,
+      entry: string,
+      options?: LintFileOptions,
+    ): LintResult {
+      const opts: {
+        vars?: Record<string, unknown>;
+        rules?: Record<string, string>;
+      } = {};
+      if (options?.vars != null) opts.vars = options.vars;
+      if (options?.rules != null) opts.rules = options.rules;
+      const result: unknown = wasmModule.lintVirtual(
+        modules,
+        entry,
+        Object.keys(opts).length > 0 ? opts : undefined,
+      );
+      assertResultShape(result, 'lint');
+      return result as LintResult;
     },
 
     getBackend(): BackendType {

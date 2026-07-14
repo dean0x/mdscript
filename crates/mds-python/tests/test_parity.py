@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 
 import pytest
 
@@ -131,3 +132,83 @@ def test_par3_error_code_parity_with_napi(code: str, thunk) -> None:  # type: ig
     with pytest.raises(m.MdsError) as ei:
         thunk()
     assert ei.value.code == code
+
+
+# ── PAR4 / PAR5: lint canonical-JSON byte-parity (AC-API-06) ─────────────────────
+#
+# LINT_GOLDENS are captured from the Rust core serializer and checked in.
+# They are NEVER regenerated from the Python binding, so the comparison is
+# non-circular: a drift in the serializer would fail the parity test.
+#
+# All surfaces (Python, CLI, napi, WASM) emit keys in BTreeMap alphabetical order:
+#   {"files":[...],"truncated":false,"version":1}
+#
+# lint_virtual() is used here to control the entry key ("main.mds") so the golden
+# is byte-identical regardless of which surface produced it. lint() and lint_file()
+# differ in their file key ("input.mds" vs basename) when findings are present.
+
+LINT_GOLDENS: list[tuple[str, str, dict[str, str], str]] = [
+    (
+        "clean",
+        "Hello World!\n",
+        {},
+        '{"files":[],"truncated":false,"version":1}',
+    ),
+    (
+        "unused_variable",
+        "---\nunused_key: value\n---\nHello!\n",
+        {},
+        (
+            '{"files":[{"diagnostics":[{"fixable":false,"help":"Remove the frontmatter'
+            ' key or reference it in the template body.","message":"Variable'
+            " 'unused_key' is defined in frontmatter but never referenced in the"
+            ' body.","rule":"unused-variable","severity":"warn","span":{"length":10,'
+            '"offset":4}}],"file":"main.mds"}],"truncated":false,"version":1}'
+        ),
+    ),
+    (
+        "silenced",
+        "---\nunused_key: value\n---\nHello!\n",
+        {"unused-variable": "off"},
+        '{"files":[],"truncated":false,"version":1}',
+    ),
+]
+
+
+@pytest.mark.parametrize("name,src,rules,golden", LINT_GOLDENS, ids=[g[0] for g in LINT_GOLDENS])
+def test_par4_lint_virtual_matches_golden(
+    name: str, src: str, rules: dict[str, str], golden: str
+) -> None:
+    """Python lint_virtual() must produce byte-identical JSON to the checked-in golden."""
+    result = m.lint_virtual({"main.mds": src}, "main.mds", rules=rules or None)
+    assert result.to_json() == golden, (
+        f"lint_virtual golden mismatch for '{name}':\n"
+        f"  got:    {result.to_json()}\n"
+        f"  expect: {golden}"
+    )
+
+
+def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """CLI `mds lint --format json` must emit byte-identical JSON to Python lint_virtual.
+
+    Uses a clean source (no findings) so the JSON is ``{"files":[],...}`` — byte-identical
+    across surfaces without depending on the entry-key convention (basename vs "input.mds").
+    """
+    src = "Hello World!\n"
+    mds_file = tmp_path / "main.mds"
+    mds_file.write_text(src, encoding="utf-8")
+    out = subprocess.run(
+        [str(mds_cli), "lint", "--format", "json", str(mds_file)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    # CLI exits 0 for a clean file (no findings at warning/error severity).
+    assert out.returncode == 0, f"CLI lint exited {out.returncode}: {out.stderr}"
+    cli_json = out.stdout.strip()
+    py_json = m.lint_virtual({"main.mds": src}, "main.mds").to_json()
+    assert cli_json == py_json, (
+        "CLI lint --format json must match Python lint_virtual byte-for-byte:\n"
+        f"  CLI: {cli_json}\n"
+        f"  py:  {py_json}"
+    )

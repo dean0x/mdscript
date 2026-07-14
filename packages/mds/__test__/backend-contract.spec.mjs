@@ -22,22 +22,22 @@ import { createNativeBackend } from '../dist/backend/native.js';
 // ---------------------------------------------------------------------------
 
 describe('backend contract — method manifest', () => {
-  test('U-BC1: BASE_METHODS contains compile, check (no compileMessages)', () => {
+  test('U-BC1: BASE_METHODS contains compile, check, lint', () => {
     assert.deepEqual(
       [...BASE_METHODS].sort(),
-      ['check', 'compile'],
+      ['check', 'compile', 'lint'],
     );
   });
 
-  test('U-BC2: NODE_METHODS contains compileFile, checkFile (no compileMessagesFile)', () => {
+  test('U-BC2: NODE_METHODS contains compileFile, checkFile, lintFile', () => {
     assert.deepEqual(
       [...NODE_METHODS].sort(),
-      ['checkFile', 'compileFile'],
+      ['checkFile', 'compileFile', 'lintFile'],
     );
   });
 
-  test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus scanImports', () => {
-    const expected = [...BASE_METHODS, 'scanImports'].sort();
+  test('U-BC3: WASM_EXPORTS contains BASE_METHODS plus scanImports and lintVirtual', () => {
+    const expected = [...BASE_METHODS, 'scanImports', 'lintVirtual'].sort();
     assert.deepEqual([...WASM_EXPORTS].sort(), expected);
   });
 
@@ -58,19 +58,21 @@ describe('backend contract — validateBackendMethods', () => {
     const stub = {
       compile: () => {},
       check: () => {},
+      lint: () => {},
     };
     assert.doesNotThrow(() => validateBackendMethods(stub, BASE_METHODS, 'test stub'));
   });
 
   test('U-BC5: validateBackendMethods throws when a method is missing', () => {
-    const stub = { compile: () => {} }; // missing check
+    const stub = { compile: () => {} }; // missing check and lint
     assert.throws(
       () => validateBackendMethods(stub, BASE_METHODS, 'test stub'),
       (err) => {
         assert.ok(err instanceof Error);
+        // First missing method in iteration order; must name the missing method.
         assert.ok(
-          err.message.includes('check'),
-          `error must name the missing method, got: ${err.message}`,
+          err.message.includes('check') || err.message.includes('lint'),
+          `error must name a missing method, got: ${err.message}`,
         );
         assert.ok(
           err.message.includes('test stub'),
@@ -85,6 +87,7 @@ describe('backend contract — validateBackendMethods', () => {
     const stub = {
       compile: () => {},
       check: () => {},
+      lint: () => {},
       extraMethod: () => {},
     };
     assert.doesNotThrow(() => validateBackendMethods(stub, BASE_METHODS, 'test stub'));
@@ -93,7 +96,7 @@ describe('backend contract — validateBackendMethods', () => {
   test('U-BC7: validateBackendMethods throws when a property exists but is not a function', () => {
     const stub = {
       compile: () => {},
-      check: 42, // wrong type
+      check: 42, // wrong type — missing lint too, but check is found first
     };
     assert.throws(
       () => validateBackendMethods(stub, BASE_METHODS, 'test stub'),
@@ -282,6 +285,68 @@ describe('backend contract — assertResultShape check', () => {
 });
 
 // ---------------------------------------------------------------------------
+// assertResultShape — lint
+// ---------------------------------------------------------------------------
+
+describe('backend contract — assertResultShape lint', () => {
+  test('U-BC9c: lint — valid result passes', () => {
+    assert.doesNotThrow(() =>
+      assertResultShape({ version: 1, files: [], truncated: false }, 'lint'),
+    );
+  });
+
+  test('U-BC9d: lint — valid result with file entries and extra fields passes', () => {
+    assert.doesNotThrow(() =>
+      assertResultShape(
+        {
+          version: 1,
+          files: [{ file: 'foo.mds', diagnostics: [] }],
+          truncated: false,
+          extra: 'ignored',
+        },
+        'lint',
+      ),
+    );
+  });
+
+  test('U-BC9e: lint — missing version is rejected', () => {
+    assert.throws(
+      () => assertResultShape({ files: [], truncated: false }, 'lint'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(err.message.includes('version'), `expected "version" in error, got: ${err.message}`);
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+
+  test('U-BC9f: lint — non-array files is rejected', () => {
+    assert.throws(
+      () => assertResultShape({ version: 1, files: 'bad', truncated: false }, 'lint'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(err.message.includes('files'), `expected "files" in error, got: ${err.message}`);
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+
+  test('U-BC9g: lint — missing truncated is rejected', () => {
+    assert.throws(
+      () => assertResultShape({ version: 1, files: [] }, 'lint'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(err.message.includes('truncated'), `expected "truncated" in error, got: ${err.message}`);
+        assert.equal(/** @type {any} */ (err).code, 'mds::invalid_backend_result');
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Performance: O(1) validation — no per-element array traversal (AC-PERF-04)
 // ---------------------------------------------------------------------------
 
@@ -364,16 +429,19 @@ describe('backend contract — parity: WASM backend exposes BASE_METHODS (AC-API
   // Stubs return valid discriminated-union shapes.
   const validMarkdownResult = { kind: 'markdown', output: '', warnings: [], dependencies: [] };
   const validCheckResult = { warnings: [] };
+  const validLintResult = { version: 1, files: [], truncated: false };
 
   const stubWasmModule = {
     compile: () => validMarkdownResult,
     check: () => validCheckResult,
+    lint: () => validLintResult,
+    lintVirtual: () => validLintResult,
     scanImports: () => [],
   };
 
   const wasmBackend = createWasmBackend(stubWasmModule);
 
-  test('U-BC13: WASM backend exposes every BASE_METHODS name as a function', () => {
+  test('U-BC13: WASM backend exposes every BASE_METHODS name as a function (includes lint)', () => {
     for (const method of BASE_METHODS) {
       assert.equal(
         typeof (/** @type {any} */ (wasmBackend))[method],
@@ -411,12 +479,16 @@ describe('backend contract — parity: WASM backend exposes BASE_METHODS (AC-API
 describe('backend contract — parity: native backend exposes BASE_METHODS + NODE_METHODS (AC-API-09)', () => {
   const validMarkdownResult = { kind: 'markdown', output: '', warnings: [], dependencies: [] };
   const validCheckResult = { warnings: [] };
+  const validLintResult = { version: 1, files: [], truncated: false };
 
   const stubAddon = {
     compile: () => validMarkdownResult,
     check: () => validCheckResult,
     compileFile: () => validMarkdownResult,
     checkFile: () => validCheckResult,
+    lint: () => validLintResult,
+    lintFile: () => validLintResult,
+    lintVirtual: () => validLintResult,
   };
 
   const nativeBackend = createNativeBackend(stubAddon);

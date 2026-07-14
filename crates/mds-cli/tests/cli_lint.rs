@@ -1,0 +1,818 @@
+//! Integration tests for `mds lint` (issue #61).
+//!
+//! Coverage maps to acceptance criteria (issue #61):
+//! - L-CLI-CHAN1: clean file → exit 0, diagnostics to stderr, stdout empty (human)
+//! - L-CLI-CHAN2: warn-only file → exit 1, warning on stderr
+//! - L-CLI-CHAN3: error-severity file → exit 2, error on stderr
+//! - L-CLI-CHAN4: analysis gate failure → exit 2 (not lint exit 1)
+//! - L-CLI-JSON1: --format json clean → exit 0, JSON to stdout, stderr empty
+//! - L-CLI-JSON2: --format json warn → exit 1, JSON with diagnostics to stdout
+//! - L-CLI-JSON3: --format json gate failure → exit 2, error envelope to stdout
+//! - L-CLI-JSON4: --format json nonexistent path → exit 2, JSON error envelope stdout (AC-F-14)
+//! - L-CLI-JSON5: --format json malformed mds.json → exit 2, JSON error envelope stdout (AC-F-14)
+//! - L-CLI-FIX1: --fix applies auto-fixable issues in place (Tier A)
+//! - L-CLI-FIX2: --fix --check exits 1 if fixes pending, never writes
+//! - L-CLI-FIX3: block-spanning --fix is refused fail-closed; file unchanged (TEST-3)
+//! - L-CLI-STDIN1: stdin (no fix) → diagnostics to stderr, stdout empty
+//! - L-CLI-STDIN2: --fix stdin → fixed source to stdout, diagnostics to stderr
+//! - L-CLI-VARS: --set passes runtime variables to the gate check
+//! - L-CLI-QUIET1: --quiet suppresses warnings, exit 0 on clean
+//! - L-CLI-DIR1: directory mode path-sorts and lints all files including partials
+//! - L-CLI-RESOURCE: nesting > MAX_NESTING_DEPTH (64) → exit 3 ResourceLimit (TEST-4)
+//! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
+//! - I-24: unreachable-branch --fix is refused (block-spanning); file unchanged, exit 2
+//! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
+
+mod common;
+use common::{fixture, mds_bin};
+
+use std::fs;
+use std::path::Path;
+
+/// Run `mds lint <path> [extra_args]`, capturing stdout + stderr separately.
+fn lint_path(path: &Path, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .arg("lint")
+        .arg(path)
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// Run `mds lint [args]` with stdin provided as `input`.
+fn lint_stdin(input: &str, extra_args: &[&str]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .arg("lint")
+        .args(extra_args)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+// ── L-CLI-CHAN1: clean file ───────────────────────────────────────────────────
+
+#[test]
+fn clean_file_exits_0_with_empty_stdout() {
+    let out = lint_path(&fixture("lint_clean.mds"), &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean file should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "human mode must not write to stdout; got: {stdout}"
+    );
+}
+
+// ── L-CLI-CHAN2: warn-only file ───────────────────────────────────────────────
+
+#[test]
+fn warn_only_file_exits_1_with_diagnostic_on_stderr() {
+    let out = lint_path(&fixture("lint_warn_only.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "warn-only file should exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unused-variable"),
+        "expected unused-variable diagnostic on stderr; got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "human mode must not write to stdout; got: {stdout}"
+    );
+}
+
+// ── L-CLI-SPAN: span context in human render (Step 0, #61) ──────────────────
+
+/// Verify that miette renders span-labeled source context (source line + caret)
+/// for findings with a span. Uses lint_warn_only.mds which triggers unused-variable
+/// with approx_offset pointing at the `unused_key` frontmatter line.
+///
+/// The rendered stderr must contain the source text from the offending line so the
+/// user can see WHERE in the file the finding is.
+#[test]
+fn span_source_context_appears_in_human_render() {
+    let out = lint_path(&fixture("lint_warn_only.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The source line text from the fixture's frontmatter — miette renders it
+    // in the source context block when labels() and with_source_code() are wired.
+    // The fixture's third line is: "unused_key: this key is never referenced in the body"
+    assert!(
+        stderr.contains("unused_key"),
+        "expected span context with 'unused_key' source text in miette render; got: {stderr}"
+    );
+    // Miette includes the file+line reference when source is attached.
+    assert!(
+        stderr.contains("lint_warn_only.mds"),
+        "expected filename reference in miette span render; got: {stderr}"
+    );
+}
+
+// ── L-CLI-CHAN3: error-severity file ─────────────────────────────────────────
+
+#[test]
+fn error_file_exits_2_with_error_diagnostic_on_stderr() {
+    let out = lint_path(&fixture("lint_error.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "error-severity finding should exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("duplicate-export"),
+        "expected duplicate-export error on stderr; got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "human mode must not write to stdout; got: {stdout}"
+    );
+}
+
+// ── L-CLI-CHAN4: analysis gate failure ────────────────────────────────────────
+
+#[test]
+fn analysis_gate_failure_exits_2_not_lint_codes() {
+    let out = lint_path(&fixture("lint_gate_fail.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "gate failure (file not found) should exit 2; stderr: {stderr}"
+    );
+    // MdsError should be rendered; no lint-specific content
+    assert!(
+        stderr.contains("file not found") || stderr.contains("lint_nonexistent"),
+        "expected file-not-found error on stderr; got: {stderr}"
+    );
+}
+
+// ── L-CLI-JSON1: --format json, clean file ───────────────────────────────────
+
+#[test]
+fn json_format_clean_file_exits_0_with_json_to_stdout() {
+    let out = lint_path(&fixture("lint_clean.mds"), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean file --format json should exit 0; stderr: {stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["version"], 1, "version must be 1");
+    assert!(json["files"].is_array(), "must have files array");
+    assert!(
+        stderr.is_empty(),
+        "JSON mode must not write to stderr when clean; got: {stderr}"
+    );
+}
+
+// ── L-CLI-JSON2: --format json, warn file ────────────────────────────────────
+
+#[test]
+fn json_format_warn_file_exits_1_with_diagnostic_json() {
+    let out = lint_path(&fixture("lint_warn_only.mds"), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "warn-only --format json should exit 1; stderr: {stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["version"], 1);
+    let files = json["files"].as_array().expect("files must be array");
+    assert!(!files.is_empty(), "files must be non-empty");
+    let diags = files[0]["diagnostics"].as_array().unwrap();
+    assert!(!diags.is_empty(), "diagnostics must be non-empty");
+    assert_eq!(diags[0]["rule"], "unused-variable");
+    assert_eq!(diags[0]["severity"], "warn");
+    // Fixable: unused-variable is Tier C (never fixed automatically)
+    assert_eq!(diags[0]["fixable"], false);
+    assert!(
+        stderr.is_empty(),
+        "JSON mode must not write diagnostics to stderr; got: {stderr}"
+    );
+}
+
+// ── L-CLI-JSON3: --format json, gate failure ─────────────────────────────────
+
+#[test]
+fn json_format_gate_failure_exits_2_with_error_envelope_to_stdout() {
+    let out = lint_path(&fixture("lint_gate_fail.mds"), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "gate failure --format json should exit 2"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON error envelope");
+    assert_eq!(json["version"], 1);
+    assert!(
+        json["error"].is_object(),
+        "error envelope must have 'error' key"
+    );
+    // stdout only — human rendering must not appear on stdout
+    assert!(
+        !stdout.contains("help:"),
+        "human rendering must not appear in JSON stdout"
+    );
+}
+
+// ── L-CLI-FIX1: --fix applies auto-fixable issues ────────────────────────────
+
+#[test]
+fn fix_applies_auto_fixable_issues_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_error.mds");
+    fs::copy(fixture("lint_error.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+    assert!(
+        original.contains("@export greet\n@export greet"),
+        "fixture must have duplicate export"
+    );
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--fix should exit 0 after fixing duplicate-export; stderr: {stderr}"
+    );
+
+    let after = fs::read_to_string(&target).unwrap();
+    assert!(
+        !after.contains("@export greet\n@export greet"),
+        "duplicate export should be removed after --fix; got:\n{after}"
+    );
+    // Exactly one @export greet should remain
+    assert_eq!(
+        after.matches("@export greet").count(),
+        1,
+        "exactly one @export greet should remain; got:\n{after}"
+    );
+}
+
+// ── L-CLI-FIX2: --fix --check exits 1 if fixes pending, never writes ─────────
+
+#[test]
+fn fix_check_exits_1_when_fixes_pending_and_never_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_error.mds");
+    fs::copy(fixture("lint_error.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check should exit 1 when fixes are pending; stderr: {stderr}"
+    );
+
+    // File must NOT have been modified.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(original, after, "--fix --check must not write to the file");
+}
+
+// ── L-CLI-STDIN1: stdin (no fix) ─────────────────────────────────────────────
+
+#[test]
+fn stdin_mode_report_only_sends_diagnostics_to_stderr() {
+    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "duplicate-export from stdin should exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("duplicate-export"),
+        "diagnostic must appear on stderr; got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "stdin report-only mode must not write to stdout; got: {stdout}"
+    );
+}
+
+// ── L-CLI-STDIN2: --fix stdin ────────────────────────────────────────────────
+
+#[test]
+fn stdin_fix_mode_writes_fixed_source_to_stdout() {
+    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &["--fix"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--fix stdin should exit 0 after fixing; stderr: {stderr}"
+    );
+    // Fixed source goes to stdout (filter mode)
+    assert!(
+        stdout.contains("@export greet"),
+        "fixed source must appear on stdout; got: {stdout}"
+    );
+    // Should have exactly one @export greet
+    assert_eq!(
+        stdout.matches("@export greet").count(),
+        1,
+        "exactly one @export should remain in fixed source; got: {stdout}"
+    );
+    // Diagnostics go to stderr (or are empty after fix)
+    drop(stderr);
+}
+
+// ── L-CLI-VARS: --set passes runtime variables ────────────────────────────────
+
+#[test]
+fn set_var_passes_runtime_variable_to_gate_check() {
+    // Without --set: gate fails (UndefinedVariable) → exit 2
+    let out_no_var = lint_path(&fixture("lint_var_required.mds"), &[]);
+    assert_eq!(
+        out_no_var.status.code(),
+        Some(2),
+        "missing required_var should exit 2 (gate failure)"
+    );
+
+    // With --set required_var=foo: gate passes, finds unused_key warning → exit 1
+    let out_with_var = lint_path(
+        &fixture("lint_var_required.mds"),
+        &["--set", "required_var=foo"],
+    );
+    let stderr = String::from_utf8_lossy(&out_with_var.stderr);
+    assert_eq!(
+        out_with_var.status.code(),
+        Some(1),
+        "with required_var set, should exit 1 (unused_key warning); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unused-variable"),
+        "unused_key should be flagged; got: {stderr}"
+    );
+}
+
+// ── L-CLI-QUIET1: --quiet suppresses warnings ─────────────────────────────────
+
+#[test]
+fn quiet_flag_suppresses_warnings_on_warn_only_file() {
+    let out = lint_path(&fixture("lint_warn_only.mds"), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // --quiet suppresses warnings; exit code is still based on severity
+    // (warn-only file still exits 1 — quiet only suppresses rendering)
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--quiet warn-only should still exit 1; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unused-variable"),
+        "--quiet should suppress warning diagnostic; got: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "stdout must remain empty with --quiet; got: {stdout}"
+    );
+}
+
+// ── L-CLI-DIR1: directory mode ───────────────────────────────────────────────
+
+#[test]
+fn directory_mode_lints_all_files_including_partials() {
+    let dir = tempfile::tempdir().unwrap();
+    // Copy only the dedicated lint fixtures into a clean temp dir
+    for name in &["lint_clean.mds", "lint_warn_only.mds", "_lint_partial.mds"] {
+        fs::copy(fixture(name), dir.path().join(name)).unwrap();
+    }
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Directory has a warn-only file → exit 1
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "directory with warn-only file should exit 1; stderr: {stderr}"
+    );
+    // The warning from lint_warn_only.mds should appear
+    assert!(
+        stderr.contains("unused-variable"),
+        "unused-variable warning should appear in directory mode; got: {stderr}"
+    );
+}
+
+// ── L-CLI-USAGE-ERR: --fix --format json stdin → exit 2 ─────────────────────
+
+#[test]
+fn fix_json_stdin_is_usage_error_exit_2() {
+    let out = lint_stdin("Hello {name}!", &["--fix", "--format", "json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--fix --format json stdin must exit 2 (usage error)"
+    );
+    // Error message must go to stderr
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.is_empty(),
+        "usage error message must appear on stderr"
+    );
+}
+
+// ── L-CLI-JSON4: nonexistent path → JSON error envelope ─────────────────────
+//
+// AC-F-14: in --format json mode, every analysis-failure path — including
+// "file not found" — must emit `{"version":1,"error":{...}}` to stdout, not a
+// human message to stderr. exit 2 is unchanged.
+
+#[test]
+fn json_format_nonexistent_path_emits_error_envelope() {
+    // Use a path that is guaranteed not to exist.
+    let out = lint_path(
+        Path::new("/nonexistent_mds_lint_test_12345.mds"),
+        &["--format", "json"],
+    );
+
+    // Exit code must be 2 (analysis failure — file not found).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--format json + nonexistent path must exit 2"
+    );
+
+    // stdout must be a parseable JSON error envelope, NOT empty.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON (error envelope); parse error: {e}; stdout: {stdout}")
+    });
+    assert_eq!(
+        parsed["version"].as_u64(),
+        Some(1),
+        "envelope must have version:1; got: {parsed}"
+    );
+    let code = parsed["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error.code must be a string; got: {parsed}"));
+    assert_eq!(
+        code, "mds::file_not_found",
+        "error code must be mds::file_not_found; got: {code}"
+    );
+
+    // The human error message must NOT appear on stderr (it goes to stdout in JSON mode).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("mds::file_not_found"),
+        "JSON mode must not print error to stderr; got stderr: {stderr}"
+    );
+}
+
+// ── L-CLI-FIX3: block-spanning --fix refusal (TEST-3) ────────────────────────
+//
+// Exercises the KB gotcha "block-spanning Tier A fixes are always refused":
+// diag_to_edit() removes only the opening directive line (span-guided byte
+// removal per ADR-001), orphaning the @end. The reverify gate calls
+// lint_str_with on the edited source, which fails to parse (orphaned @end),
+// and refuses the entire fix batch fail-closed.
+//
+// Fixture: lint_block_span_empty.mds — multi-line empty @define whose body is
+// a single blank line (whitespace-only Text node). The empty-block rule fires
+// (Tier A, Warn), the fix is attempted and refused, and the residual Warn
+// finding determines exit code 1. (applies ADR-001)
+
+#[test]
+fn fix_refused_for_block_spanning_empty_define_and_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_block_span_empty.mds");
+    fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+    assert!(
+        original.contains("@define empty_fn():"),
+        "fixture must contain the multi-line empty @define"
+    );
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The fix must be refused: removing the @define line orphans @end, which
+    // the reverify gate catches as a parse error and rejects fail-closed.
+    assert!(
+        stderr.contains("fix rejected"),
+        "fix must be refused for block-spanning empty-block; got stderr: {stderr}"
+    );
+
+    // Residual finding: the original empty-block Warn survives → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "exit code must reflect residual warn finding after fix refusal; got stderr: {stderr}"
+    );
+
+    // Critical: the file on disk must be left UNCHANGED.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "file must be left unchanged when --fix is refused"
+    );
+}
+
+// ── L-CLI-RESOURCE: exit code 3 for ResourceLimit (TEST-4) ──────────────────
+//
+// Verifies that a template causing a ResourceLimit in the RESOLVER causes
+// `mds lint` to exit 3. We trigger MAX_BLOCKS_PER_MODULE (256) by writing
+// 257 uniquely-named @block declarations. The resolver's collect_block()
+// increments a counter on each @block and fails with MdsError::ResourceLimit
+// when count > MAX_BLOCKS_PER_MODULE (i.e. on the 257th block). The check
+// gate propagates this error through mds::lint() and the CLI maps
+// MdsError::ResourceLimit to exit code 3 via mds_error_exit_code.
+//
+// Note: deeply nested @if/@for blocks (> MAX_NESTING_DEPTH=64) are caught
+// by the PARSER with MdsError::Syntax (exit 2, not 3); the facts walker's
+// ResourceLimit for nesting is never reached because the parser fails first.
+// The @block approach is used here because it triggers ResourceLimit in the
+// resolver (inside the check gate), which is the correct path to exit code 3.
+
+#[test]
+fn too_many_block_declarations_exits_3_resource_limit() {
+    // MAX_BLOCKS_PER_MODULE is 256; the 257th @block triggers ResourceLimit.
+    // All blocks must have unique names (the resolver rejects duplicates).
+    const BLOCK_COUNT: usize = 257;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("many_blocks.mds");
+
+    let mut content = String::new();
+    for i in 0..BLOCK_COUNT {
+        content.push_str(&format!("@block block_{i}:\n@end\n"));
+    }
+    fs::write(&target, &content).unwrap();
+
+    let out = lint_path(&target, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{BLOCK_COUNT} @block declarations must exit 3 (ResourceLimit, MAX_BLOCKS_PER_MODULE); \
+         stderr: {stderr}"
+    );
+}
+
+// ── L-CLI-DIR2: directory --format json file-order determinism (TEST-6) ──────
+//
+// Verifies the F1 invariant: files[] in --format json directory-mode output is
+// always in sorted (path-ascending) order regardless of filesystem walk order.
+// Exercises the explicit `files.sort()` in run_lint_directory, which is
+// required because collect_mds_files() does NOT guarantee any walk order.
+//
+// Files MUST carry diagnostics: to_canonical_json() only emits file entries
+// for files that have at least one diagnostic — clean files are omitted from
+// the files[] array entirely. We use lint_warn_only.mds (unused-variable warn)
+// so all 3 copies produce entries in the output.
+//
+// Files are created in REVERSE alphabetical order (c→b→a) to stress-test the
+// F1 sort; an absent sort would produce non-deterministic or reverse output.
+// Two consecutive runs are compared to assert cross-run determinism.
+
+#[test]
+fn directory_json_files_array_is_deterministically_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    // Use warn-only files so each copy appears in the files[] JSON array.
+    // Create them in reverse alphabetical order to stress-test the F1 sort.
+    for name in &["lint_dir_c.mds", "lint_dir_b.mds", "lint_dir_a.mds"] {
+        fs::copy(fixture("lint_warn_only.mds"), dir.path().join(name)).unwrap();
+    }
+
+    // Run twice to assert cross-run determinism.
+    let out1 = lint_path(dir.path(), &["--format", "json"]);
+    let out2 = lint_path(dir.path(), &["--format", "json"]);
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+
+    assert_eq!(
+        out1.status.code(),
+        Some(1),
+        "directory with warn-only files must exit 1; stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+
+    // Both runs must produce byte-identical output (cross-run determinism).
+    assert_eq!(
+        stdout1, stdout2,
+        "directory mode --format json output must be identical across two consecutive runs"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout1).expect("stdout must be valid JSON");
+    let files = json["files"]
+        .as_array()
+        .expect("JSON output must have a files array");
+    assert_eq!(
+        files.len(),
+        3,
+        "all 3 .mds files must appear in the output; got: {files:?}"
+    );
+
+    // F1 invariant: files[] must be in sorted (path-ascending) order.
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|f| {
+            f["file"]
+                .as_str()
+                .expect("each entry must have a file string")
+        })
+        .collect();
+    let mut sorted_paths = paths.clone();
+    sorted_paths.sort();
+    assert_eq!(
+        paths, sorted_paths,
+        "files[] must be in sorted path order (F1 invariant); got: {paths:?}"
+    );
+}
+
+// ── I-24: unreachable-branch --fix refusal (block-spanning, ADR-001) ─────────
+//
+// unreachable-branch is Tier A (auto-fixable per tier.rs), but the fix is always
+// refused for @if blocks: diag_to_edit() removes only the opening @if directive
+// line (span-guided byte removal per ADR-001), orphaning @else/@end. The reverify
+// gate calls lint_str_with on the edited source, which fails to parse (orphaned
+// @else), and refuses the entire fix batch fail-closed.
+//
+// Fixture: lint_unreachable_branch.mds — always-true @if "x" == "x": with a
+// later @else branch (the later branch makes unreachable-branch fire at its
+// default Error severity). After fix refusal the residual Error finding
+// determines exit 2. Non-vacuous: asserts "fix rejected" in stderr, exit 2,
+// AND file content byte-identical to before --fix. (applies ADR-001)
+
+#[test]
+fn fix_refused_for_unreachable_branch_and_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_unreachable_branch.mds");
+    fs::copy(fixture("lint_unreachable_branch.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+    assert!(
+        original.contains("@if \"x\" == \"x\":"),
+        "fixture must contain the always-true @if condition"
+    );
+    assert!(
+        original.contains("@else:"),
+        "fixture must contain a later @else branch"
+    );
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The fix must be refused: removing the @if line orphans @else/@end, caught
+    // by the reverify gate as a parse error and refused fail-closed (ADR-001).
+    assert!(
+        stderr.contains("fix rejected"),
+        "fix must be refused for block-spanning unreachable-branch; got stderr: {stderr}"
+    );
+
+    // Residual: unreachable-branch Error finding survives fix refusal → exit 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "residual Error finding after fix refusal must exit 2; got stderr: {stderr}"
+    );
+
+    // Critical: file on disk must be left UNCHANGED.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "file must be unchanged when unreachable-branch --fix is refused"
+    );
+}
+
+// ── I-26: shadow-variable Info severity → diagnostic emitted, exit 0 ─────────
+//
+// shadow-variable is default-off and always Info severity. When enabled via
+// mds.json, Info findings ARE rendered to stderr in human mode but NEVER
+// contribute to the exit code. This test asserts BOTH properties: the finding
+// appears in output AND the process exits 0 — catching regressions that either
+// suppress the diagnostic or wrongly escalate Info to a non-zero exit.
+//
+// Fixture: loop_var_shadow.mds — @for item in items: shadows the frontmatter
+// key `item` (all vars are defined; check gate passes). mds.json in the same
+// temp dir enables shadow-variable at Info severity (the built-in default when
+// explicitly configured as "info"). The fixture has no Warn/Error findings, so
+// the only diagnostic is the Info shadow-variable — exit must be 0.
+
+#[test]
+fn shadow_variable_info_emits_diagnostic_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("loop_var_shadow.mds");
+    fs::copy(fixture("loop_var_shadow.mds"), &target).unwrap();
+
+    // Enable shadow-variable at Info severity via mds.json in the same directory.
+    // The upward config search finds this mds.json for the fixture in the same dir.
+    fs::write(
+        dir.path().join("mds.json"),
+        r#"{ "lint": { "rules": { "shadow-variable": "info" } } }"#,
+    )
+    .unwrap();
+
+    let out = lint_path(&target, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The shadow-variable diagnostic must be emitted (rule is enabled and fires).
+    assert!(
+        stderr.contains("shadow-variable"),
+        "shadow-variable Info finding must appear in stderr; got: {stderr}"
+    );
+
+    // Info severity never contributes to exit code — must exit 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Info-severity shadow-variable must not affect exit code; got stderr: {stderr}"
+    );
+
+    // Human mode must not write to stdout.
+    assert!(
+        stdout.is_empty(),
+        "human mode must not write to stdout; got: {stdout}"
+    );
+}
+
+// ── L-CLI-JSON5: malformed mds.json → JSON error envelope ───────────────────
+//
+// AC-F-14: config-load failure must also emit the JSON envelope to stdout in
+// --format json mode, so that JSON/LSP consumers always get parseable output.
+
+#[test]
+fn json_format_malformed_config_emits_error_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    // A syntactically valid .mds file — lint must fail at the config stage, not parse stage.
+    let mds_file = dir.path().join("test.mds");
+    fs::write(&mds_file, "---\nfoo: bar\n---\nHello world").unwrap();
+    // Malformed mds.json in the same directory — will be found by the upward config walk.
+    fs::write(dir.path().join("mds.json"), "{ this is not valid json }").unwrap();
+
+    let out = lint_path(&mds_file, &["--format", "json"]);
+
+    // Exit code must be 2 (config-load failure is an analysis failure).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--format json + malformed mds.json must exit 2; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout must be a parseable JSON error envelope.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "stdout must be valid JSON (error envelope); parse error: {e}; \
+             stdout: {stdout}; stderr: {stderr}"
+        )
+    });
+    assert_eq!(
+        parsed["version"].as_u64(),
+        Some(1),
+        "envelope must have version:1; got: {parsed}"
+    );
+    assert!(
+        parsed["error"]["code"].is_string(),
+        "error envelope must have a code field; got: {parsed}"
+    );
+
+    // The error details must NOT be printed to stderr in JSON mode.
+    assert!(
+        !stderr.contains("invalid mds.json"),
+        "config error must go to stdout in JSON mode, not stderr; got stderr: {stderr}"
+    );
+}

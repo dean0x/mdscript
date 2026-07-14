@@ -4,21 +4,52 @@ import type {
   CompileOptions,
   CompileResult,
   FileOptions,
+  LintFileOptions,
+  LintOptions,
+  LintResult,
   MdsNodeBackend,
 } from '../types.js';
 import { varsOpt } from '../util/options.js';
 import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS } from './contract.js';
 
+/** Options forwarded to the napi addon for source-string lint (accepts basePath). */
+type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
+/** Options forwarded to the napi addon for file-based and virtual lint. */
+type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
+
 /**
  * Shape of the napi addon exports.
  * compile/check accept { basePath?, vars? } for string sources.
  * compileFile/checkFile accept { vars? } for file paths.
+ * lint/lintFile/lintVirtual accept { basePath?, vars?, rules? }.
  */
 interface NapiAddon {
   compile(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
   check(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
   compileFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
   checkFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
+  lint(source: string, opts?: NapiLintOpts): unknown;
+  lintFile(path: string, opts?: NapiLintFileOpts): unknown;
+  lintVirtual(modules: Record<string, string>, entry: string, opts?: NapiLintFileOpts): unknown;
+}
+
+/** Build lint options from LintOptions, omitting null/undefined entries. */
+function lintOpt(options?: LintOptions): NapiLintOpts | undefined {
+  if (options == null) return undefined;
+  const out: NapiLintOpts = {};
+  if (options.basePath != null) out.basePath = options.basePath;
+  if (options.vars != null) out.vars = options.vars;
+  if (options.rules != null) out.rules = options.rules;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Build lint file options from LintFileOptions, omitting null/undefined entries. */
+function lintFileOpt(options?: LintFileOptions): NapiLintFileOpts | undefined {
+  if (options == null) return undefined;
+  const out: NapiLintFileOpts = {};
+  if (options.vars != null) out.vars = options.vars;
+  if (options.rules != null) out.rules = options.rules;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -59,6 +90,24 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
       const result: unknown = await addon.checkFile(path, varsOpt(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
+    },
+
+    lint(source: string, options?: LintOptions): LintResult {
+      const result: unknown = addon.lint(source, lintOpt(options));
+      assertResultShape(result, 'lint');
+      return result as LintResult;
+    },
+
+    async lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+      const result: unknown = await addon.lintFile(path, lintFileOpt(options));
+      assertResultShape(result, 'lint');
+      return result as LintResult;
+    },
+
+    lintVirtual(modules: Record<string, string>, entry: string, options?: LintFileOptions): LintResult {
+      const result: unknown = addon.lintVirtual(modules, entry, lintFileOpt(options));
+      assertResultShape(result, 'lint');
+      return result as LintResult;
     },
 
     getBackend(): BackendType {

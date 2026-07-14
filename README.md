@@ -76,6 +76,7 @@ mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
 mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
+mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (9 rules; --fix, --format json)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
@@ -193,6 +194,35 @@ summaries go to stderr; `--diff` output and stdin filter-mode content go to stdo
 suppresses status but never errors. Reads a `fmt` section from `mds.json`
 (`{"fmt": {"sort_frontmatter_keys": true}}`) for forward compatibility — the field doesn't drive
 any formatting behavior yet; frontmatter key sorting is deferred to a future version.
+
+### Static analysis with `mds lint`
+
+A 9-rule static analyzer that catches common template authoring issues:
+
+```bash
+mds lint template.mds           # lint a single file
+mds lint .                      # lint all .mds files recursively (partials included)
+mds lint --fix template.mds     # auto-fix fixable issues in place
+mds lint --format json .        # machine-readable JSON output (stdout)
+mds lint --quiet template.mds   # suppress warnings; exit 2 on errors only
+```
+
+Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
+
+| Rule | Severity | Description |
+|------|----------|-------------|
+| `unused-variable` | warn | Frontmatter variable defined but never referenced in the body |
+| `unused-import` | warn | `@import` that is never referenced (Tier B: auto-fixed only for standalone files) |
+| `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
+| `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
+| `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
+| `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
+| `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
+| `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
+| `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
+
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit.
+JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Bundler Integration
 

@@ -72,6 +72,58 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   Cross-platform wheel matrix and PyPI publishing are a tracked follow-up (#132) —
   for now, install from source: `pip install ./crates/mds-python`. (#59)
 
+- **`mds lint`** — 9-rule static analyzer for `.mds` templates (#61). Available
+  across all surfaces (CLI, Rust, napi, WASM, Python) with byte-identical canonical
+  JSON output.
+
+  **Rules** (individually configurable via `mds.json` `lint.rules` or the
+  `rules` API option; severities differ per rule):
+  - `unused-variable` (warn): frontmatter key defined but never referenced in the body
+  - `unused-import` (warn): `@import` never used in the file (Tier B: auto-fixed only for standalone files)
+  - `unused-function` (warn): `@define` function never called in the file (Tier B: auto-fixed only for standalone files)
+  - `shadow-variable` (off by default / info when enabled): inner-scope variable shadows an outer-scope variable; must be enabled via `mds.json`
+  - `empty-block` (warn): `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable)
+  - `redundant-else` (warn): `@else` body is structurally identical to the `@if`/`@elseif` then-body (Tier C — never auto-fixed)
+  - `unreachable-branch` (error): branch condition is always-true or always-false (auto-fixable)
+  - `duplicate-import` (error): same file imported more than once (auto-fixable)
+  - `duplicate-export` (error): same export name defined more than once (auto-fixable)
+
+  **CLI** (`mds lint`): file, directory, and stdin input modes; `--fix` for
+  auto-fixable issues (Tier A always; Tier B for standalone files); `--check`
+  and `--diff` preview modes for CI; `--format json` for machine-readable output;
+  `--quiet` to suppress warnings; `--vars`/`--set`/`--set-string` for variable
+  overrides forwarded to the check gate.
+
+  **Exit codes** (lint-specific): `0` = clean, `1` = warnings only, `2` = errors
+  or analysis failure, `3` = resource limit.
+
+  **Canonical JSON shape** (keys alphabetical, BTreeMap order):
+  ```json
+  {"files":[{"diagnostics":[...],"file":"template.mds"}],"truncated":false,"version":1}
+  ```
+
+  **Library API**: new public functions in `mds-core` — `lint`, `lint_str`,
+  `lint_str_with`, `lint_virtual`; `LintResult`, `LintDiagnostic`,
+  `LintConfig`, `Severity` types.
+
+  **napi** (`@mdscript/mds-napi`): `lint`, `lintFile`, `lintVirtual` exports.
+
+  **WASM** (`@mdscript/mds-wasm`): `lint`, `lintVirtual` exports.
+
+  **Universal TypeScript** (`@mdscript/mds`): `lint()`, `lintFile()`,
+  `lintVirtual()` with full TypeScript types (`LintResult`, `LintDiagnostic`,
+  `LintSpan`, `LintFileResult`, `LintOptions`, `LintFileOptions`). Both native
+  and WASM backends implement the full surface; `lintFile()` on the WASM backend
+  uses `buildModulesMap` for `@import` resolution.
+
+  **Python** (`mdscript`): `lint()`, `lint_file()`, `lint_virtual()` with keyword-only
+  `rules` and `base_path` / `vars` options; `LintResult` with `.version`, `.truncated`,
+  `.files`, `.to_dict()`, `.to_json()`. Stubs shipped in `_mdscript.pyi` / `__init__.pyi`.
+
+  **⚠ TypeScript interface implementers**: `MdsBaseBackend` gained `lint` and
+  `lintVirtual` as required members; `MdsNodeBackend` gained `lintFile`. Code that
+  directly implements these interfaces (not just calls them) must add these methods.
+
 ### Changed
 
 - **BREAKING:** Interior-verbatim whitespace contract for block bodies and `mds fmt`.

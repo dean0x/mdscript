@@ -1323,12 +1323,13 @@ impl ModuleCache {
     ) -> Result<(), MdsError> {
         defs.has_explicit_exports = true;
         match export {
-            ExportDirective::Named { name } => {
+            ExportDirective::Named { name, .. } => {
                 defs.explicit_exports.insert(name.clone());
             }
             ExportDirective::ReExport {
                 name,
                 path: import_path,
+                ..
             } => {
                 // Resolve the source module and bring in the function for
                 // re-export only. Per spec: "@export from does not bring the
@@ -1349,7 +1350,9 @@ impl ModuleCache {
                 defs.functions.insert(name.clone(), func);
                 defs.explicit_exports.insert(name.clone());
             }
-            ExportDirective::Wildcard { path: import_path } => {
+            ExportDirective::Wildcard {
+                path: import_path, ..
+            } => {
                 // Re-export all exports from the target module. These are
                 // available to importers but NOT in the current file's scope.
                 // Note: resolve_import_from calls validate_import_path internally,

@@ -7,6 +7,9 @@ import type {
   CompileOptions,
   FileOptions,
   InitOptions,
+  LintFileOptions,
+  LintOptions,
+  LintResult,
 } from './types.js';
 import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
@@ -96,6 +99,40 @@ function wrapWithFileOps(
       const result: unknown = wasmModule.check(source, opts);
       assertResultShape(result, 'check');
       return result as CheckResult;
+    },
+
+    async lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+      // Use buildModulesMap so the WASM check gate can resolve @import chains,
+      // matching the behaviour of the native lintFile (which uses NativeFs).
+      // Note: entryFilename is project-root-relative (e.g. "templates/foo.mds"),
+      // not just the basename — this differs from the native backend's filename
+      // in the canonical JSON. Use lintVirtual for byte-identical cross-surface
+      // comparison.
+      const { entryFilename, modules } = await buildModulesMap(
+        path,
+        (src) => wasmModule.scanImports(src),
+      );
+      const entrySource = modules[entryFilename];
+      if (entrySource === undefined) {
+        throw new Error(
+          `buildModulesMap did not populate entry file "${entryFilename}" in modules map`,
+        );
+      }
+      // Build a copy of modules without the entry (lint() inserts it separately).
+      const extraModules: Record<string, string> = { ...modules };
+      delete extraModules[entryFilename];
+      const lintOpts: {
+        filename: string;
+        modules?: Record<string, string>;
+        vars?: Record<string, unknown>;
+        rules?: Record<string, string>;
+      } = { filename: entryFilename };
+      if (Object.keys(extraModules).length > 0) lintOpts.modules = extraModules;
+      if (options?.vars != null) lintOpts.vars = options.vars;
+      if (options?.rules != null) lintOpts.rules = options.rules;
+      const result: unknown = wasmModule.lint(entrySource, lintOpts);
+      assertResultShape(result, 'lint');
+      return result as LintResult;
     },
   };
 }
@@ -221,6 +258,25 @@ export function checkFile(path: string, options?: FileOptions): Promise<CheckRes
   return assertReady().checkFile(path, options);
 }
 
+/** Lint an MDS source string. Returns a LintResult with per-rule findings. Requires init() to have been called and awaited first. */
+export function lint(source: string, options?: LintOptions): LintResult {
+  return assertReady().lint(source, options);
+}
+
+/** Lint an MDS file, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
+export function lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+  return assertReady().lintFile(path, options);
+}
+
+/** Lint a multi-module virtual filesystem. Caller provides the full module map and entry key. Requires init() to have been called and awaited first. */
+export function lintVirtual(
+  modules: Record<string, string>,
+  entry: string,
+  options?: LintFileOptions,
+): LintResult {
+  return assertReady().lintVirtual(modules, entry, options);
+}
+
 /** Returns which backend is currently active: 'native' or 'wasm'. Requires init() to have been called and awaited first. */
 export function getBackend(): BackendType {
   return assertReady().getBackend();
@@ -234,6 +290,13 @@ export type {
   CompileResult,
   FileOptions,
   InitOptions,
+  LintDiagnostic,
+  LintFileOptions,
+  LintFileReport,
+  LintOptions,
+  LintResult,
+  LintSpan,
+  RuleSeverity,
   MarkdownResult,
   Message,
   MessagesResult,

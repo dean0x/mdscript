@@ -1,6 +1,6 @@
 //! WebAssembly bindings for the MDS compiler.
 //!
-//! Exposes [`compile`] and [`check`] to JavaScript via `wasm-bindgen`.
+//! Exposes [`compile`], [`check`], and [`lint`] to JavaScript via `wasm-bindgen`.
 //! All compilation runs against an in-memory virtual filesystem — no
 //! OS file access occurs inside the WASM boundary.
 //!
@@ -274,19 +274,25 @@ fn extract_modules(obj: &js_sys::Object) -> Result<HashMap<String, String>, JsVa
             json_type_name(&modules_json)
         )));
     };
-    parse_modules_from_map(mods_map)
+    parse_modules_from_map(mods_map, "options.modules")
 }
 
 /// Parse a modules map (after deserialization) into HashMap<String, String>.
 ///
-/// Extracted from the original `parse_modules` to allow reuse by `extract_modules`.
+/// `field_label` names the field in error messages (e.g. `"options.modules"` for the
+/// compile/check path where modules are nested under `options`, or `"modules"` for
+/// `lintVirtual` where the map is a top-level positional argument).
+///
+/// Extracted from the original `parse_modules` to allow reuse by `extract_modules` and
+/// `lint_virtual`.
 fn parse_modules_from_map(
     mods: serde_json::Map<String, serde_json::Value>,
+    field_label: &str,
 ) -> Result<HashMap<String, String>, JsValue> {
     if mods.len() > MAX_MODULE_COUNT {
         return Err(js_error(
             &format!(
-                "options.modules exceeds maximum module count of {} ({} provided)",
+                "{field_label} exceeds maximum module count of {} ({} provided)",
                 MAX_MODULE_COUNT,
                 mods.len()
             ),
@@ -303,7 +309,7 @@ fn parse_modules_from_map(
                 if s.len() > MAX_SOURCE_SIZE {
                     return Err(js_error(
                         &format!(
-                            "options.modules[\"{key}\"] exceeds maximum size of {} bytes ({} bytes provided)",
+                            "{field_label}[\"{key}\"] exceeds maximum size of {} bytes ({} bytes provided)",
                             MAX_SOURCE_SIZE,
                             s.len()
                         ),
@@ -314,7 +320,7 @@ fn parse_modules_from_map(
                 if aggregate_size > MAX_MODULES_AGGREGATE_SIZE {
                     return Err(js_error(
                         &format!(
-                            "options.modules aggregate size exceeds maximum of {} bytes",
+                            "{field_label} aggregate size exceeds maximum of {} bytes",
                             MAX_MODULES_AGGREGATE_SIZE
                         ),
                         "mds::resource_limit",
@@ -324,7 +330,7 @@ fn parse_modules_from_map(
             }
             other => {
                 return Err(options_error(&format!(
-                    "options.modules[\"{key}\"] must be a string, got {}",
+                    "{field_label}[\"{key}\"] must be a string, got {}",
                     json_type_name(&other)
                 )));
             }
@@ -381,6 +387,132 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
         filename,
         extra_modules,
         vars,
+    })
+}
+
+// ── Lint options ──────────────────────────────────────────────────────────────
+
+/// Parsed options for the `lint` and `lint_virtual` functions.
+///
+/// Extends the standard options with a `rules` field — absent in `compile`/`check`.
+struct ParsedLintOptions {
+    /// Standard options (filename, extra_modules, vars).
+    opts: ParsedOptions,
+    /// Per-rule severity overrides parsed from `options.rules`.
+    lint_config: mds::LintConfig,
+}
+
+/// Extract and validate the `rules` field from a lint options object.
+///
+/// `options.rules` is an optional `Record<string, string>` where keys are rule
+/// names and values are severity strings (`"off"` | `"info"` | `"warn"` | `"error"`).
+/// An absent or null/undefined `rules` key returns the default config (all rules at
+/// built-in defaults). An unknown severity VALUE is a hard error (closed enum).
+fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
+    let val = get_prop_js(obj, "rules");
+    if val.is_undefined() || val.is_null() {
+        return Ok(mds::LintConfig::default());
+    }
+    // Deserialize the rules sub-object via serde_wasm_bindgen.
+    let rules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
+        .map_err(|e| options_error(&format!("invalid options.rules: {e}")))?;
+    let serde_json::Value::Object(rules_map) = rules_json else {
+        return Err(options_error(&format!(
+            "options.rules must be a plain object, got {}",
+            json_type_name(&rules_json)
+        )));
+    };
+
+    let mut rules = std::collections::HashMap::new();
+    for (key, val) in rules_map {
+        let serde_json::Value::String(s) = &val else {
+            return Err(options_error(&format!(
+                "options.rules[\"{key}\"] must be a severity string, got {}",
+                json_type_name(&val)
+            )));
+        };
+        // Parse the severity via serde (validates against the closed enum).
+        let severity: mds::Severity = serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
+            options_error(&format!(
+                "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
+                 valid values are \"off\", \"info\", \"warn\", \"error\""
+            ))
+        })?;
+        rules.insert(key, severity);
+    }
+    Ok(mds::LintConfig { rules })
+}
+
+/// Parse the JS options for `lint` and `lint_virtual`.
+///
+/// Same as `parse_options` but also accepts a `rules` key:
+/// - `filename`, `modules`, `vars`: inherited from the standard options.
+/// - `rules`: `Record<string, string>` of per-rule severity overrides.
+fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
+    // null / undefined → all defaults.
+    if options.is_null() || options.is_undefined() {
+        return Ok(ParsedLintOptions {
+            opts: ParsedOptions::default(),
+            lint_config: mds::LintConfig::default(),
+        });
+    }
+
+    // Reject non-objects (including arrays).
+    if !options.is_object() || js_sys::Array::is_array(&options) {
+        return Err(options_error("options must be a plain object"));
+    }
+
+    // SAFETY: we verified options.is_object() above.
+    let obj: js_sys::Object = options.unchecked_into();
+
+    reject_unknown_wasm_keys(&obj, &["filename", "modules", "vars", "rules"])?;
+
+    let filename = extract_filename(&obj)?;
+    let extra_modules = extract_modules(&obj)?;
+    let vars = extract_vars(&obj)?;
+    let lint_config = extract_rules(&obj)?;
+
+    Ok(ParsedLintOptions {
+        opts: ParsedOptions {
+            filename,
+            extra_modules,
+            vars,
+        },
+        lint_config,
+    })
+}
+
+/// Parse the JS options for `lint_virtual` (no `filename` or `modules` — those are
+/// explicit parameters).
+///
+/// Valid keys: `vars`, `rules`.
+fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
+    if options.is_null() || options.is_undefined() {
+        return Ok(ParsedLintOptions {
+            opts: ParsedOptions::default(),
+            lint_config: mds::LintConfig::default(),
+        });
+    }
+
+    if !options.is_object() || js_sys::Array::is_array(&options) {
+        return Err(options_error("options must be a plain object"));
+    }
+
+    // SAFETY: we verified options.is_object() above.
+    let obj: js_sys::Object = options.unchecked_into();
+
+    reject_unknown_wasm_keys(&obj, &["vars", "rules"])?;
+
+    let vars = extract_vars(&obj)?;
+    let lint_config = extract_rules(&obj)?;
+
+    Ok(ParsedLintOptions {
+        opts: ParsedOptions {
+            filename: DEFAULT_FILENAME.to_string(),
+            extra_modules: HashMap::new(),
+            vars,
+        },
+        lint_config,
     })
 }
 
@@ -535,6 +667,126 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
                 .map_err(mds_error_to_js)?;
 
         to_js(&CheckOutput { warnings })
+    }))
+}
+
+/// Lint an MDS template source string for static analysis findings.
+///
+/// Runs the check gate (resolve+validate) first — on a compile error, throws a
+/// JS `Error` with the same structure as [`check`]. On a clean gate, applies
+/// the lint rules and returns the canonical lint result object.
+///
+/// ## Arguments
+///
+/// - `source`: MDS template source text.
+/// - `options`: optional configuration object:
+///   - `filename` (string, default `"input.mds"`): the entry module key.
+///   - `modules` (`Record<string, string>`): additional virtual modules for import resolution.
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `rules` (`Record<string, string>`): per-rule severity overrides (e.g.
+///     `{ "shadow-variable": "warn", "unused-variable": "off" }`).
+///
+/// ## Returns
+///
+/// On success, the canonical lint JSON object:
+/// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
+///
+/// On failure (parse or validation error), throws a JS `Error` with the same
+/// structure as [`compile`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const result = lint('Hello!\n');
+/// console.log(result.version);   // 1
+/// console.log(result.files);     // []
+/// console.log(result.truncated); // false
+///
+/// // With rules overrides:
+/// const result2 = lint(source, { rules: { 'shadow-variable': 'warn' } });
+/// ```
+#[wasm_bindgen]
+pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
+    check_source_size(source)?;
+
+    // Owned String required so the closure satisfies UnwindSafe.
+    let source = source.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let lint_opts = parse_lint_options(options)?;
+        let modules = build_modules(
+            source,
+            &lint_opts.opts.filename,
+            lint_opts.opts.extra_modules,
+        )?;
+        let result = mds::lint_virtual(
+            modules,
+            &lint_opts.opts.filename,
+            lint_opts.opts.vars,
+            &lint_opts.lint_config,
+        )
+        .map_err(mds_error_to_js)?;
+
+        to_js(&result.to_canonical_json())
+    }))
+}
+
+/// Lint a multi-module virtual filesystem for static analysis findings.
+///
+/// Unlike [`lint`], the caller provides the full module map and entry key
+/// explicitly — no source injection and no `filename`/`modules` option keys.
+/// This mirrors the `compile_virtual` pattern in other binding layers.
+///
+/// ## Arguments
+///
+/// - `modules`: JS object mapping module key → source string (e.g.
+///   `{ "main.mds": "...", "_partial.mds": "..." }`).
+/// - `entry`: the key within `modules` to use as the lint entry point.
+/// - `options`: optional configuration object:
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `rules` (`Record<string, string>`): per-rule severity overrides.
+///
+/// ## Returns
+///
+/// Same shape as [`lint`].
+///
+/// ## Example (JavaScript)
+///
+/// ```js
+/// const result = lintVirtual(
+///   { 'main.mds': '@import { greet } from "./helper.mds"\n{greet("World")}\n',
+///     'helper.mds': '@define greet(name): Hello {name}!\n@end\n' },
+///   'main.mds',
+/// );
+/// console.log(result.files.length); // number of files with findings
+/// ```
+#[wasm_bindgen(js_name = "lintVirtual")]
+pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<JsValue, JsValue> {
+    // Deserialize the modules map.
+    let modules_json: serde_json::Value = serde_wasm_bindgen::from_value(modules)
+        .map_err(|e| options_error(&format!("invalid modules: {e}")))?;
+    let serde_json::Value::Object(mods_map) = modules_json else {
+        return Err(options_error(&format!(
+            "modules must be a plain object, got {}",
+            json_type_name(&modules_json)
+        )));
+    };
+
+    let entry_owned = entry.to_string();
+
+    catch_panic(AssertUnwindSafe(move || {
+        let mods = parse_modules_from_map(mods_map, "modules")?;
+        let lint_opts = parse_lint_virtual_options(options)?;
+
+        let result = mds::lint_virtual(
+            mods,
+            &entry_owned,
+            lint_opts.opts.vars,
+            &lint_opts.lint_config,
+        )
+        .map_err(mds_error_to_js)?;
+
+        to_js(&result.to_canonical_json())
     }))
 }
 

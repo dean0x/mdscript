@@ -867,7 +867,11 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
 }
 
 /// Parse an `@export` directive into a Node.
-pub(super) fn parse_export_directive(directive: &str) -> Result<Node, MdsError> {
+///
+/// `offset` is the byte position of the `@export` token in the source — threaded in
+/// from the call site in `parser.rs` and stored on every ExportDirective variant for
+/// span-based lint diagnostics (D2).
+pub(super) fn parse_export_directive(directive: &str, offset: usize) -> Result<Node, MdsError> {
     let rest = directive.trim_start_matches("@export").trim();
 
     // Wildcard re-export: @export * from "path"
@@ -876,7 +880,7 @@ pub(super) fn parse_export_directive(directive: &str) -> Result<Node, MdsError> 
         .or_else(|| rest.strip_prefix("*from "))
     {
         let path = parse_quoted_path(from_part.trim())?;
-        return Ok(Node::Export(ExportDirective::Wildcard { path }));
+        return Ok(Node::Export(ExportDirective::Wildcard { path, offset }));
     }
 
     // Check for "name from" pattern: @export name from "path"
@@ -889,7 +893,11 @@ pub(super) fn parse_export_directive(directive: &str) -> Result<Node, MdsError> 
             )));
         }
         let path = parse_quoted_path(parts[2])?;
-        return Ok(Node::Export(ExportDirective::ReExport { name, path }));
+        return Ok(Node::Export(ExportDirective::ReExport {
+            name,
+            path,
+            offset,
+        }));
     }
 
     // Named export: @export name
@@ -900,7 +908,7 @@ pub(super) fn parse_export_directive(directive: &str) -> Result<Node, MdsError> 
     if !is_valid_identifier(&name) {
         return Err(MdsError::syntax(format!("invalid export name: '{name}'")));
     }
-    Ok(Node::Export(ExportDirective::Named { name }))
+    Ok(Node::Export(ExportDirective::Named { name, offset }))
 }
 
 /// Parse a quoted path like `"./utils.mds"` and return the inner string.

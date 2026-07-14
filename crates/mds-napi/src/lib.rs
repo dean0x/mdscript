@@ -65,6 +65,17 @@ use napi_derive::napi;
 /// when the caller passes a string, so the limit must be re-enforced here.
 const MAX_SOURCE_SIZE: usize = mds::MAX_FILE_SIZE as usize;
 
+/// Maximum number of module entries accepted by `lintVirtual`.
+///
+/// Mirrors the WASM and Python bindings. 256 modules is well above any realistic
+/// template graph; the cap prevents a caller from exhausting memory with thousands
+/// of small virtual modules.
+const MAX_MODULE_COUNT: usize = 256;
+
+/// Maximum aggregate byte size of all `lintVirtual` module values combined
+/// (same ceiling as a single source input).
+const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
+
 // ── Return types ──────────────────────────────────────────────────────────────
 
 /// Result returned by `check` and `checkFile`.
@@ -631,4 +642,294 @@ pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<
     )?;
 
     Ok(CheckResult { warnings })
+}
+
+// ── Lint options parsing ──────────────────────────────────────────────────────
+
+/// Extract and validate the `rules` option: `Record<string, string>` → `mds::LintConfig`.
+///
+/// Returns the default config (all rules at built-in defaults) when `rules` is absent,
+/// `null`, or `undefined`. Validates each severity value against the closed enum.
+fn extract_rules_direct(env: &Env, obj: &Object) -> napi::Result<mds::LintConfig> {
+    if !obj.has_named_property("rules")? {
+        return Ok(mds::LintConfig::default());
+    }
+    let val: Unknown = obj.get_named_property_unchecked("rules")?;
+    let vt = val.get_type()?;
+    match vt {
+        ValueType::Undefined | ValueType::Null => Ok(mds::LintConfig::default()),
+        ValueType::Object => {
+            // Deserialize the rules sub-object; js arrays also satisfy Object so
+            // we guard against that in the JSON shape check below.
+            let rules_json: serde_json::Value = env.from_js_value(val)?;
+            let serde_json::Value::Object(rules_map) = rules_json else {
+                return Err(throw_options_error(
+                    env,
+                    &format!(
+                        "options.rules must be a plain object, got {}",
+                        mds::json_type_name(&rules_json)
+                    ),
+                ));
+            };
+            let mut rules = HashMap::new();
+            for (key, val) in rules_map {
+                let serde_json::Value::String(s) = &val else {
+                    return Err(throw_options_error(
+                        env,
+                        &format!(
+                            "options.rules[\"{key}\"] must be a severity string, got {}",
+                            mds::json_type_name(&val)
+                        ),
+                    ));
+                };
+                // Parse severity via serde — validates against the closed enum.
+                let severity: mds::Severity =
+                    serde_json::from_str(&format!("\"{s}\"")).map_err(|_| {
+                        throw_options_error(
+                            env,
+                            &format!(
+                                "options.rules[\"{key}\"]: unknown severity \"{s}\"; \
+                                 valid values are \"off\", \"info\", \"warn\", \"error\""
+                            ),
+                        )
+                    })?;
+                rules.insert(key, severity);
+            }
+            Ok(mds::LintConfig { rules })
+        }
+        other => Err(throw_options_error(
+            env,
+            &format!(
+                "options.rules must be a plain object, got {}",
+                napi_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// Parse options for `lint` and `lintVirtual` (source-string / virtual variants).
+///
+/// Valid keys: `basePath`, `vars`, `rules`.
+/// Returns `(base_path, vars, lint_config)`.
+type LintOpts = (
+    Option<PathBuf>,
+    Option<HashMap<String, Value>>,
+    mds::LintConfig,
+);
+
+fn parse_lint_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok((None, None, mds::LintConfig::default()));
+    };
+
+    reject_unknown_napi_keys(env, &opts_obj, &["basePath", "vars", "rules"])?;
+    let base_path = extract_base_path_direct(env, &opts_obj)?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    let lint_config = extract_rules_direct(env, &opts_obj)?;
+
+    Ok((base_path, vars, lint_config))
+}
+
+/// Parse options for `lintFile` (file-path variant).
+///
+/// Valid keys: `vars`, `rules`. `basePath` is not accepted (derived from file path).
+type LintFileOpts = (Option<HashMap<String, Value>>, mds::LintConfig);
+
+fn parse_lint_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFileOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok((None, mds::LintConfig::default()));
+    };
+
+    if opts_obj.has_named_property("basePath")? {
+        return Err(throw_options_error(
+            env,
+            "option \"basePath\" is not valid for lintFile; \
+             the base directory is derived from the file path",
+        ));
+    }
+
+    reject_unknown_napi_keys(env, &opts_obj, &["vars", "rules"])?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    let lint_config = extract_rules_direct(env, &opts_obj)?;
+
+    Ok((vars, lint_config))
+}
+
+/// Parse options for `lintVirtual` (virtual-module variant).
+///
+/// Valid keys: `vars`, `rules`. `basePath` is not accepted — virtual modules
+/// have no file path; `@import` paths in a virtual module are resolved
+/// against the module map, not the filesystem.
+fn parse_lint_virtual_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFileOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok((None, mds::LintConfig::default()));
+    };
+
+    if opts_obj.has_named_property("basePath")? {
+        return Err(throw_options_error(
+            env,
+            "option \"basePath\" is not valid for lintVirtual; \
+             virtual modules have no file path",
+        ));
+    }
+
+    reject_unknown_napi_keys(env, &opts_obj, &["vars", "rules"])?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    let lint_config = extract_rules_direct(env, &opts_obj)?;
+
+    Ok((vars, lint_config))
+}
+
+// ── Public lint exports ───────────────────────────────────────────────────────
+
+/// Lint an MDS template source string for static analysis findings.
+///
+/// Runs the check gate (resolve+validate) first — on a compile error, throws a
+/// JS `Error` with the same structure as `compile`. On a clean gate, applies
+/// the lint rules and returns the canonical lint result object.
+///
+/// ## Arguments
+///
+/// - `source`: MDS template source text.
+/// - `opts`: optional configuration object:
+///   - `basePath` (string): base directory for resolving `@import` paths.
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `rules` (`Record<string, string>`): per-rule severity overrides
+///     (e.g. `{ "shadow-variable": "warn", "unused-variable": "off" }`).
+///
+/// ## Returns
+///
+/// On success, the canonical lint JSON object:
+/// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
+///
+/// On failure, throws a JS `Error` with the same structure as `compile`.
+#[napi]
+pub fn lint(env: Env, source: String, opts: Option<Object>) -> napi::Result<serde_json::Value> {
+    check_source_size(&env, &source)?;
+
+    let (base_path, vars, lint_config) = parse_lint_opts(&env, opts)?;
+
+    let result = run_catching(
+        &env,
+        AssertUnwindSafe(move || {
+            mds::lint_str_with(&source, base_path.as_deref(), vars, &lint_config)
+        }),
+    )?;
+
+    Ok(result.to_canonical_json())
+}
+
+/// Lint an MDS template file for static analysis findings.
+///
+/// ## Arguments
+///
+/// - `path`: path to the `.mds` file to lint.
+/// - `opts`: optional configuration object:
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `rules` (`Record<string, string>`): per-rule severity overrides.
+///
+/// `basePath` is not accepted — the base directory is derived from the file's
+/// own directory.
+///
+/// ## Returns
+///
+/// Same shape as `lint`. Dependencies in the returned JSON are absolute filesystem paths.
+#[napi(js_name = "lintFile")]
+pub fn lint_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<serde_json::Value> {
+    let (vars, lint_config) = parse_lint_file_opts(&env, opts)?;
+
+    let path_buf = PathBuf::from(path);
+    let result = run_catching(
+        &env,
+        AssertUnwindSafe(move || mds::lint(&path_buf, vars, &lint_config)),
+    )?;
+
+    Ok(result.to_canonical_json())
+}
+
+/// Lint a multi-module virtual filesystem for static analysis findings.
+///
+/// Provides an explicit virtual module map and entry point for lint, enabling
+/// callers to lint templates without touching the filesystem — useful for
+/// editor integrations, LSP servers, and bundler plugins.
+///
+/// ## Arguments
+///
+/// - `modules`: `Record<string, string>` mapping module key → source string.
+/// - `entry`: the key within `modules` to use as the lint entry point.
+/// - `opts`: optional configuration object:
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `rules` (`Record<string, string>`): per-rule severity overrides.
+///
+/// ## Returns
+///
+/// Same shape as `lint`.
+#[napi(js_name = "lintVirtual")]
+pub fn lint_virtual(
+    env: Env,
+    modules: serde_json::Value,
+    entry: String,
+    opts: Option<Object>,
+) -> napi::Result<serde_json::Value> {
+    // Parse the modules map.
+    let serde_json::Value::Object(mods_map) = modules else {
+        return Err(throw_options_error(
+            &env,
+            &format!(
+                "modules must be a plain object, got {}",
+                mds::json_type_name(&modules)
+            ),
+        ));
+    };
+
+    // Convert and validate, enforcing the same module-count and size caps the WASM
+    // and Python bindings apply — the virtual-FS path bypasses the file layer's own
+    // size guard, so it must be re-enforced here (defense-in-depth, cross-binding parity).
+    if mods_map.len() > MAX_MODULE_COUNT {
+        return Err(throw_resource_limit(
+            &env,
+            &format!(
+                "modules exceeds maximum module count of {MAX_MODULE_COUNT} ({} provided)",
+                mods_map.len()
+            ),
+        ));
+    }
+    let mut mods: HashMap<String, String> = HashMap::with_capacity(mods_map.len());
+    let mut aggregate: usize = 0;
+    for (key, val) in mods_map {
+        let serde_json::Value::String(s) = val else {
+            return Err(throw_options_error(
+                &env,
+                &format!("modules[\"{key}\"] must be a string source"),
+            ));
+        };
+        if s.len() > MAX_SOURCE_SIZE {
+            return Err(throw_resource_limit(
+                &env,
+                &format!(
+                    "modules[\"{key}\"] exceeds maximum size of {MAX_SOURCE_SIZE} bytes ({} bytes provided)",
+                    s.len()
+                ),
+            ));
+        }
+        aggregate = aggregate.saturating_add(s.len());
+        if aggregate > MAX_MODULES_AGGREGATE_SIZE {
+            return Err(throw_resource_limit(
+                &env,
+                &format!(
+                    "modules aggregate size exceeds maximum of {MAX_MODULES_AGGREGATE_SIZE} bytes"
+                ),
+            ));
+        }
+        mods.insert(key, s);
+    }
+
+    let (vars, lint_config) = parse_lint_virtual_opts(&env, opts)?;
+
+    let result = run_catching(
+        &env,
+        AssertUnwindSafe(move || mds::lint_virtual(mods, &entry, vars, &lint_config)),
+    )?;
+
+    Ok(result.to_canonical_json())
 }

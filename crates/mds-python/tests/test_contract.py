@@ -10,6 +10,7 @@ import mdscript as m
 
 MD = m.compile("Hello {name}!\n", vars={"name": "Alice"})
 MSG = m.compile("@message user:\nHi\n@end\n")
+LR = m.lint("---\nunused_key: value\n---\nHello!\n")
 
 
 # ── C2: CompileResult members + frozen ──────────────────────────────────────────
@@ -151,6 +152,13 @@ def test_eq_is_wire_equality() -> None:
 
 
 def test_unhashable() -> None:
-    for obj in (MD, MSG, m.check("Hi\n"), m.Span(1, 2, 3, 4), m.Message("u", "c")):
+    for obj in (MD, MSG, LR, m.check("Hi\n"), m.Span(1, 2, 3, 4), m.Message("u", "c")):
         with pytest.raises(TypeError):
             hash(obj)
+
+
+def test_lint_result_frozen() -> None:
+    with pytest.raises(AttributeError):
+        LR.version = 2  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        LR.truncated = True  # type: ignore[misc]
