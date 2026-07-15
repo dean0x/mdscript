@@ -367,11 +367,7 @@ fn extract_vars(obj: &js_sys::Object) -> Result<Option<HashMap<String, Value>>, 
 ///
 /// Returns `default_val` when the key is absent, undefined, or null.
 /// Errors on non-boolean types.
-fn extract_bool_wasm(
-    obj: &js_sys::Object,
-    key: &str,
-    default_val: bool,
-) -> Result<bool, JsValue> {
+fn extract_bool_wasm(obj: &js_sys::Object, key: &str, default_val: bool) -> Result<bool, JsValue> {
     let val = get_prop_js(obj, key);
     if val.is_undefined() || val.is_null() {
         return Ok(default_val);

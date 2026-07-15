@@ -285,6 +285,36 @@ fn source_map_extends_multi_source() {
     );
 }
 
+/// AC-PERF-02 (@extends): compiled output for an `@extends` template must be
+/// byte-identical whether source maps are on or off. This is the riskiest path
+/// for divergence because map-on evaluates per spliced region
+/// (`evaluate_regions_with_map`) while map-off evaluates the assembled
+/// `final_body` in one pass — the two must produce the same bytes.
+#[test]
+fn source_map_extends_output_unchanged() {
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "# Title\n\n@block intro:\nDefault intro\n@end\n\nMiddle\n\n@block body:\nDefault body\n@end\n\nFooter\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "@extends \"./base.mds\"\n@block body:\nChild content\n@end\n".to_string(),
+    );
+
+    let with_map = vfs_with_map(modules.clone(), "child.mds")
+        .into_markdown()
+        .expect("markdown with source map");
+    let without_map = vfs_no_map(modules, "child.mds")
+        .into_markdown()
+        .expect("markdown without source map");
+
+    assert_eq!(
+        with_map, without_map,
+        "@extends compiled output must be byte-identical regardless of source_map setting"
+    );
+}
+
 /// S3/suppression: function-call interpolation records call-site only.
 ///
 /// When a `@define`d function is invoked, the *body* nodes are suppressed

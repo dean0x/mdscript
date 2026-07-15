@@ -902,18 +902,38 @@ pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: 
     let p = Path::new(stripped);
 
     let result = if p.is_absolute() {
-        // Rule 3: relativize absolute path against the map directory.
-        relative_path(map_dir, p)
+        // Rule 3: relativize the absolute source against the map directory.
+        // `map_dir` derives from the caller's `-o` value and may itself be
+        // relative (or empty when `-o` is a bare filename). Absolutize it
+        // against the CWD first so both paths share one coordinate space —
+        // otherwise the component diff embeds the source's absolute path
+        // verbatim (`..//abs/...`) or produces a leading-`/` result, leaking
+        // the filesystem path into sources[] (AC-SEC-01).
+        let abs_map_dir = if map_dir.is_absolute() {
+            map_dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(map_dir)
+        };
+        relative_path(&abs_map_dir, p)
     } else {
         // Rule 4: already relative — convert separators only.
         stripped.replace('\\', "/")
     };
 
-    // Guarantee no absolute paths leak into sources[] (AC-SEC-01).
-    debug_assert!(
-        !result.starts_with('/') && !result.contains(":\\"),
-        "relativize_source_path produced an absolute path: {result:?}"
-    );
+    // AC-SEC-01: never leak an absolute path into sources[]. The relativization
+    // above yields a relative path for same-root inputs; as defense-in-depth for
+    // exotic cross-root cases (e.g. different Windows drives), degrade a
+    // still-absolute result to the bare file name rather than panicking or
+    // leaking a filesystem path. Runtime guard (not debug_assert) so the
+    // guarantee holds in release builds too.
+    if result.starts_with('/') || result.contains(":\\") {
+        return Path::new(stripped)
+            .file_name()
+            .map(|n| n.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| "source".to_string());
+    }
 
     result
 }
@@ -1733,6 +1753,96 @@ mod tests {
             Some(&mds::Value::String("009".to_string())),
             "last --set-string wins within the same flag"
         );
+    }
+
+    // ── AC-SEC-01: source-path relativization must never leak an absolute path ──
+
+    #[test]
+    fn relativize_absolute_source_with_absolute_mapdir_is_clean_relative() {
+        // Both absolute, sharing a common ancestor → clean map-relative path.
+        let got = relativize_source_path("/proj/src/a.mds", Path::new("/proj/build"), false);
+        assert_eq!(
+            got, "../src/a.mds",
+            "same-root absolute paths relativize cleanly"
+        );
+    }
+
+    #[test]
+    fn relativize_absolute_source_with_relative_mapdir_never_leaks_absolute() {
+        // Regression: a relative `-o` (relative map_dir) diffed against an
+        // absolute source previously produced `..//abs/...` (or a leading-'/'
+        // result that panicked the debug_assert), leaking the absolute path.
+        // After absolutizing map_dir against the CWD the result must be a clean
+        // relative path — never absolute, never an embedded absolute prefix.
+        let got =
+            relativize_source_path("/tmp/deep/nested/abs_input.mds", Path::new("build"), false);
+        assert!(!got.starts_with('/'), "must not be absolute: {got}");
+        assert!(
+            !got.contains("//"),
+            "must not embed a raw absolute path: {got}"
+        );
+        assert!(
+            !got.contains(":\\"),
+            "must not embed a Windows drive path: {got}"
+        );
+        assert!(
+            got.ends_with("abs_input.mds"),
+            "must still resolve to the source file: {got}"
+        );
+    }
+
+    #[test]
+    fn relativize_absolute_source_with_empty_mapdir_never_leaks_absolute() {
+        // `-o out.md` (bare filename) yields an EMPTY map_dir. Previously this
+        // produced a leading-'/' result (`//abs/...`) that panicked in debug and
+        // leaked an absolute path in release. Must now be a clean relative path.
+        let got = relativize_source_path("/tmp/deep/abs_input.mds", Path::new(""), false);
+        assert!(!got.starts_with('/'), "must not be absolute: {got}");
+        assert!(
+            !got.contains("//"),
+            "must not embed a raw absolute path: {got}"
+        );
+        assert!(
+            got.ends_with("abs_input.mds"),
+            "must still resolve to the source file: {got}"
+        );
+    }
+
+    // ── AC-SEC-03: inline carrier is a self-contained, idempotent HTML comment ──
+
+    #[test]
+    fn embed_carrier_is_idempotent() {
+        // Re-embedding must strip the existing carrier first, so applying it
+        // twice yields the same bytes as applying it once (a distributable
+        // artifact must never accumulate stacked carriers).
+        let json = r#"{"version":3,"sources":["a.mds"],"mappings":"AAAA"}"#;
+        let once = embed_carrier("Hello world\n".to_string(), json);
+        let twice = embed_carrier(once.clone(), json);
+        assert_eq!(
+            once, twice,
+            "embedding the carrier twice must be idempotent"
+        );
+        assert_eq!(
+            twice.matches("sourceMappingURL=data:").count(),
+            1,
+            "the carrier must appear exactly once, got:\n{twice}"
+        );
+    }
+
+    #[test]
+    fn carrier_line_cannot_break_out_of_html_comment() {
+        // AC-SEC-03: the base64 payload must exclude '<', '>', and '-' so it
+        // cannot terminate the enclosing HTML comment early, even when the map
+        // JSON itself contains '-->' (e.g. embedded source text).
+        let hostile_json = r#"{"sourcesContent":["--> break out <script>"]}"#;
+        let line = carrier_line(hostile_json);
+        let payload = line
+            .strip_prefix("<!--# sourceMappingURL=data:application/json;base64,")
+            .and_then(|s| s.strip_suffix(" -->"))
+            .expect("carrier must have the expected envelope");
+        assert!(!payload.contains('<'), "payload must not contain '<'");
+        assert!(!payload.contains('>'), "payload must not contain '>'");
+        assert!(!payload.contains('-'), "payload must not contain '-'");
     }
 
     #[test]

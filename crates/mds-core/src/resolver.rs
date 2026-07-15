@@ -790,35 +790,10 @@ impl ModuleCache {
                 let (raw, maybe_builder) =
                     Self::evaluate_regions_with_map(&regions, &mut scope, warnings, Some(builder))?;
                 // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
-                let degraded = match maybe_builder {
-                    Some(b) if b.segments_dropped => {
-                        warnings.push(format!(
-                            "source map segment cap ({} segments) exceeded; \
-                             source_map will be None for this compilation",
-                            crate::limits::MAX_SOURCEMAP_SEGMENTS,
-                        ));
-                        drop(b);
-                        (raw, None)
-                    }
-                    Some(mut b) => {
-                        let total_src_bytes = b.sources_content_bytes();
-                        if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
-                            warnings.push(format!(
-                                "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
-                                 sourcesContent will be omitted from the source map",
-                                total_src_bytes,
-                                crate::limits::MAX_SOURCES_CONTENT_BYTES,
-                            ));
-                            b.no_sources_content = true;
-                        }
-                        if !opts.include_sources_content {
-                            b.no_sources_content = true;
-                        }
-                        (raw, Some(b))
-                    }
+                match maybe_builder {
+                    Some(b) => apply_map_degradation(raw, b, opts, warnings),
                     None => (raw, None),
-                };
-                degraded
+                }
             } else {
                 (evaluate(&final_body, &mut scope, warnings)?, None)
             };
@@ -875,35 +850,9 @@ impl ModuleCache {
         let (body_raw, map_out) = if opts.source_map {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
-            let (raw, mut returned) =
-                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
-            // AC-PERF-03: segment cap hit → degrade to no map rather than a partial/misleading map.
-            if returned.segments_dropped {
-                warnings.push(format!(
-                    "source map segment cap ({} segments) exceeded; \
-                     source_map will be None for this compilation",
-                    crate::limits::MAX_SOURCEMAP_SEGMENTS,
-                ));
-                (raw, None)
-            } else {
-                // AC-SEC-04: total sourcesContent byte ceiling.
-                // Check BEFORE finalize so we can set the flag instead of allocating a
-                // giant SourceMap artifact.  The per-source strings live inside the builder.
-                let total_src_bytes: usize = returned.sources_content_bytes();
-                if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
-                    warnings.push(format!(
-                        "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
-                         sourcesContent will be omitted from the source map",
-                        total_src_bytes,
-                        crate::limits::MAX_SOURCES_CONTENT_BYTES,
-                    ));
-                    returned.no_sources_content = true;
-                }
-                if !opts.include_sources_content {
-                    returned.no_sources_content = true;
-                }
-                (raw, Some(returned))
-            }
+            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
+            apply_map_degradation(raw, returned, opts, warnings)
         } else {
             (evaluate(&module.body, &mut scope, warnings)?, None)
         };
@@ -1963,6 +1912,45 @@ struct ModuleCtx<'a> {
     base_dir: &'a str,
     /// Variables injected at call-time (e.g. via `--set` or the public API `compile` call).
     runtime_vars: &'a HashMap<String, Value>,
+}
+
+/// Apply AC-PERF-03 and AC-SEC-04 degradation checks to a completed builder.
+///
+/// - AC-PERF-03: if the segment cap was hit, degrade to `None` (a partial map
+///   is misleading; warn and discard the builder).
+/// - AC-SEC-04: if `sourcesContent` total bytes exceed the ceiling, set
+///   `no_sources_content` so [`MapBuilder::finalize`] omits the array.
+/// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
+///
+/// Returns `(raw_body, Option<MapBuilder>)`.
+fn apply_map_degradation(
+    raw: String,
+    mut builder: crate::sourcemap::MapBuilder,
+    opts: &crate::sourcemap::CompileOptions,
+    warnings: &mut Vec<String>,
+) -> (String, Option<crate::sourcemap::MapBuilder>) {
+    if builder.segments_dropped {
+        warnings.push(format!(
+            "source map segment cap ({} segments) exceeded; \
+             source_map will be None for this compilation",
+            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+        ));
+        return (raw, None);
+    }
+    let total_src_bytes = builder.sources_content_bytes();
+    if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
+        warnings.push(format!(
+            "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
+             sourcesContent will be omitted from the source map",
+            total_src_bytes,
+            crate::limits::MAX_SOURCES_CONTENT_BYTES,
+        ));
+        builder.no_sources_content = true;
+    }
+    if !opts.include_sources_content {
+        builder.no_sources_content = true;
+    }
+    (raw, Some(builder))
 }
 
 /// Return `true` when the AST body contains at least one `@message` block

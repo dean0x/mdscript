@@ -520,22 +520,8 @@ impl MapBuilder {
     /// Sets [`Self::segments_dropped`] when the cap is first hit so callers
     /// can degrade to `source_map: None` + warning (AC-PERF-03).
     pub(crate) fn push_segment(&mut self, out: u32, src_off: u32, len: u32) {
-        debug_assert!(
-            self.segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
-            "segments.len() {} exceeds cap {}; segments_dropped should be set",
-            self.segments.len(),
-            crate::limits::MAX_SOURCEMAP_SEGMENTS,
-        );
-        if self.segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
-            self.segments.push(RawSegment {
-                out,
-                src: self.current_src,
-                src_off,
-                len,
-            });
-        } else {
-            self.segments_dropped = true;
-        }
+        let src = self.current_src;
+        self.push_raw(out, src, src_off, len);
     }
 
     /// Push a segment with an explicit source index, bypassing `current_src`.
@@ -545,6 +531,11 @@ impl MapBuilder {
     /// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] cap as [`push_segment`].
     /// Sets [`Self::segments_dropped`] when the cap is first hit (AC-PERF-03).
     pub(crate) fn push_fragment_segment(&mut self, out: u32, src: u32, src_off: u32, len: u32) {
+        self.push_raw(out, src, src_off, len);
+    }
+
+    /// Inner push: enforces the segment cap and the debug invariant.
+    fn push_raw(&mut self, out: u32, src: u32, src_off: u32, len: u32) {
         debug_assert!(
             self.segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
             "segments.len() {} exceeds cap {}; segments_dropped should be set",
