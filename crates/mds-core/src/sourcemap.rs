@@ -456,6 +456,22 @@ impl MapBuilder {
         }
     }
 
+    /// Push a segment with an explicit source index, bypassing `current_src`.
+    ///
+    /// Used by the `@include` splice path (S6) to insert rebased [`FragmentMap`]
+    /// segments with foreign source indices.  Subject to the same
+    /// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] cap as [`push_segment`].
+    pub(crate) fn push_fragment_segment(&mut self, out: u32, src: u32, src_off: u32, len: u32) {
+        if self.segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
+            self.segments.push(RawSegment {
+                out,
+                src,
+                src_off,
+                len,
+            });
+        }
+    }
+
     /// Finalize into a [`SourceMap`], consuming the builder.
     ///
     /// Runs the 5-stage pipeline:
@@ -516,6 +532,48 @@ impl MapBuilder {
         // Stage 5: encode into a SourceMap via from_points.
         encode_vlq(points, final_body, sources, Some(sources_content), file)
     }
+}
+
+// ---------------------------------------------------------------------------
+// FragmentMap — pre-computed source attribution for an imported module
+// ---------------------------------------------------------------------------
+
+/// A pre-computed source-map fragment for an imported module's `prompt` body.
+///
+/// Computed once when a module is resolved in source-map mode (see
+/// `process_module` in `resolver.rs`) and cached inside
+/// `ResolvedModule` / [`crate::scope::NamespaceScope`] behind an `Arc` so
+/// every `@include` call-site can share the same allocation.
+///
+/// # Local coordinate space
+///
+/// `sources` is a **local interner** — source indices in `segments` are
+/// 0-based into THIS vector and must be remapped to the global
+/// [`MapBuilder`] source indices before splicing (see `evaluate_include`
+/// in `evaluator.rs`).
+///
+/// Segment `out` offsets are **0-based byte offsets within the module's
+/// own raw evaluator output** (the `prompt_body` string before
+/// `clean_output`).  During splicing the caller adds a `base` offset to
+/// rebase them into the global output stream.
+///
+/// # Nested composition
+///
+/// When module A `@include`s module B, and B itself `@include`s module C,
+/// B's `FragmentMap` is built by running [`evaluate_with_map`] over B's
+/// body.  That evaluation calls `evaluate_include` for `@include C`, which
+/// splices C's `FragmentMap` into B's local builder — so B's `FragmentMap`
+/// already contains segments attributed to C's source file.  When A later
+/// splices B, the three-source attribution comes along for free.
+#[derive(Debug)]
+pub(crate) struct FragmentMap {
+    /// Local source interner: `(display_path, raw_content)` pairs.
+    ///
+    /// Index 0 is always the module's own file.  Additional entries appear
+    /// when the module itself `@include`s nested partials.
+    pub(crate) sources: Vec<(std::sync::Arc<str>, std::sync::Arc<str>)>,
+    /// Raw segments local to this module's prompt body.
+    pub(crate) segments: Vec<RawSegment>,
 }
 
 // ---------------------------------------------------------------------------

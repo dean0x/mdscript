@@ -61,6 +61,15 @@ pub struct NamespaceScope {
     pub functions: HashMap<String, Arc<FunctionDef>>,
     /// The compiled prompt body of the imported module.
     pub prompt_body: Option<String>,
+    /// Pre-computed source-map fragment for the module's `prompt` body.
+    ///
+    /// Populated when the parent compilation runs in source-map mode and the
+    /// module exports a non-empty `prompt`.  `None` in all other cases
+    /// (zero-cost: no allocation when source maps are disabled — AC-PERF-01).
+    ///
+    /// The `Arc` enables O(1) copy into the `NamespaceScope` without cloning
+    /// the segment data; all `@include` call sites share one allocation.
+    pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
 }
 
 impl Default for Scope {
@@ -245,6 +254,7 @@ mod tests {
         NamespaceScope {
             functions: HashMap::new(),
             prompt_body: None,
+            prompt_map: None,
         }
     }
 
@@ -264,6 +274,7 @@ mod tests {
             NamespaceScope {
                 functions: HashMap::new(),
                 prompt_body: Some("outer".into()),
+                prompt_map: None,
             },
         );
         scope.push();
@@ -272,6 +283,7 @@ mod tests {
             NamespaceScope {
                 functions: HashMap::new(),
                 prompt_body: Some("inner".into()),
+                prompt_map: None,
             },
         );
         // Inner frame shadows outer.

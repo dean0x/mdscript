@@ -140,6 +140,13 @@ impl Clone for EffectiveBlock {
 pub struct ResolvedModule {
     pub(crate) functions: HashMap<String, Arc<FunctionDef>>,
     pub(crate) prompt_body: Option<String>,
+    /// Pre-computed source-map fragment for this module's `prompt` output.
+    ///
+    /// Populated by `process_module` when `ModuleCache::source_map_mode` is
+    /// true and the module exports a non-empty `prompt` (S6).  `None` for
+    /// skeleton entries, `@extends` modules (S8 will add those), and all
+    /// non-source-map compilations (zero-cost AC-PERF-01).
+    pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
     pub(crate) raw_frontmatter: Option<String>,
     pub(crate) has_explicit_exports: bool,
     pub(crate) explicit_exports: HashSet<String>,
@@ -192,6 +199,7 @@ impl Clone for ResolvedModule {
         Self {
             functions: self.functions.clone(),
             prompt_body: self.prompt_body.clone(),
+            prompt_map: self.prompt_map.clone(),
             raw_frontmatter: self.raw_frontmatter.clone(),
             has_explicit_exports: self.has_explicit_exports,
             explicit_exports: self.explicit_exports.clone(),
@@ -227,6 +235,14 @@ pub struct ModuleCache {
     /// membership test (like HashSet) and insertion-ordered iteration (like Vec),
     /// so a separate `resolving_stack` is no longer needed.
     resolving: IndexSet<String>,
+    /// Set to `true` by `process_module_intrinsic_opts` when `opts.source_map`
+    /// is enabled.  When true, `process_module` builds a
+    /// [`crate::sourcemap::FragmentMap`] alongside the prompt body for every
+    /// standalone module that exports a non-empty `prompt`.
+    ///
+    /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
+    /// for sub-modules (AC-PERF-01).
+    source_map_mode: bool,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -252,6 +268,7 @@ impl ModuleCache {
             fs: Box::new(NativeFs::new()),
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
+            source_map_mode: false,
         }
     }
 
@@ -264,6 +281,7 @@ impl ModuleCache {
             fs: Box::new(VirtualFs::new(modules)),
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
+            source_map_mode: false,
         }
     }
 
@@ -273,6 +291,7 @@ impl ModuleCache {
             fs,
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
+            source_map_mode: false,
         }
     }
 
@@ -723,6 +742,14 @@ impl ModuleCache {
         opts: &crate::sourcemap::CompileOptions,
         warnings: &mut Vec<String>,
     ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        // Gate sub-module FragmentMap construction on whether source maps are
+        // requested for this compilation.  Must be set before any import
+        // resolution (collect_definitions_and_imports / resolve_frontmatter_imports)
+        // so that transitively-imported modules also build their FragmentMaps.
+        // Zero-cost path: when opts.source_map=false this remains false and no
+        // MapBuilder is allocated for sub-modules (AC-PERF-01).
+        self.source_map_mode = opts.source_map;
+
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
@@ -914,9 +941,42 @@ impl ModuleCache {
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
-        // Evaluate the body to get prompt text
-        let prompt_body = evaluate(&module.body, &mut scope, warnings)?;
-        let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
+        // Determine whether "prompt" is an available export for this module.
+        // Mirrors the `is_exported("prompt")` logic on `ResolvedModule`.
+        let prompt_exported = !has_explicit_exports || explicit_exports.contains("prompt");
+
+        // Evaluate the body to get prompt text (and optionally a FragmentMap).
+        //
+        // When source-map mode is active and the module exports "prompt", run a
+        // single evaluate_with_map pass to collect both the body string and the
+        // segment records in one traversal (no double-evaluation).  The resulting
+        // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
+        // that imports this module, enabling @include splice attribution (S6).
+        let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
+            let builder =
+                crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            let (body_raw, returned) =
+                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
+            // Only keep the FragmentMap when the body is non-empty — an empty prompt
+            // has no segments worth recording.
+            let fmap = body.as_ref().map(|_| {
+                Arc::new(crate::sourcemap::FragmentMap {
+                    sources: returned
+                        .sources
+                        .iter()
+                        .zip(returned.sources_content.iter())
+                        .map(|(p, c)| (Arc::from(p.as_str()), Arc::from(c.as_str())))
+                        .collect(),
+                    segments: returned.segments,
+                })
+            });
+            (body, fmap)
+        } else {
+            let body_raw = evaluate(&module.body, &mut scope, warnings)?;
+            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
+            (body, None)
+        };
 
         // Build Origin once for this module — Arc::clone'd into each EffectiveBlock (P3).
         let origin = Origin {
@@ -933,6 +993,7 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            prompt_map,
             raw_frontmatter,
             has_explicit_exports,
             explicit_exports,
@@ -1210,6 +1271,9 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            // @extends modules do not carry a FragmentMap in S6; multi-source
+            // region attribution for extending modules is deferred to S8.
+            prompt_map: None,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
             raw_frontmatter: merged_frontmatter,
@@ -1412,6 +1476,9 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            // Skeleton entries are never evaluated — no fragment map is built.
+            // A1 invariant: prompt_body=None and prompt_map=None for skeleton entries.
+            prompt_map: None,
             raw_frontmatter,
             has_explicit_exports,
             explicit_exports,
@@ -1757,16 +1824,18 @@ impl ResolvedModule {
             .filter(|(name, _)| self.is_exported(name))
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect();
-        // Respect export visibility: prompt_body is only included in the namespace
-        // when "prompt" is an available export (same rule as get_prompt_value).
-        let prompt_body = if self.is_exported("prompt") {
-            self.prompt_body.clone()
+        // Respect export visibility: prompt_body and prompt_map are only included
+        // in the namespace when "prompt" is an available export (same rule as
+        // get_prompt_value).  Arc::clone is O(1) — no segment data is copied.
+        let (prompt_body, prompt_map) = if self.is_exported("prompt") {
+            (self.prompt_body.clone(), self.prompt_map.clone())
         } else {
-            None
+            (None, None)
         };
         NamespaceScope {
             functions,
             prompt_body,
+            prompt_map,
         }
     }
 }

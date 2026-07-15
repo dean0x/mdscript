@@ -45,6 +45,18 @@ pub(crate) struct EvalContext<'a> {
     /// `true`.  `None` when the caller did not request a source map — zero-cost path
     /// (AC-PERF-01: no allocation when off).
     pub(crate) map: Option<crate::sourcemap::MapBuilder>,
+    /// Per-include-site remap cache for source-map splice (S6 / AC-PERF-05).
+    ///
+    /// Maps `Arc<FragmentMap>` pointer identity (as `usize`) to the
+    /// local-source-index → global-`MapBuilder`-source-index remap `Vec`.
+    ///
+    /// When `@include` appears inside a `@for` loop, the remap is built on the
+    /// first iteration and retrieved from this cache on every subsequent
+    /// iteration — O(1) map lookup instead of re-running `source_index` scans.
+    ///
+    /// The cache is scoped to one `evaluate_with_map` invocation and is empty at
+    /// the start of each top-level compile; no cross-compilation state leaks.
+    pub(crate) fragment_remap_cache: std::collections::HashMap<usize, Vec<u32>>,
 }
 
 /// Evaluate a module body into a final rendered string.
@@ -61,6 +73,7 @@ pub fn evaluate(
         total_message_bytes: 0,
         warnings,
         map: None,
+        fragment_remap_cache: std::collections::HashMap::new(),
     };
     evaluate_nodes(nodes, scope, &mut ctx)
 }
@@ -83,6 +96,7 @@ pub(crate) fn evaluate_with_map(
         total_message_bytes: 0,
         warnings,
         map: Some(builder),
+        fragment_remap_cache: std::collections::HashMap::new(),
     };
     let output = evaluate_nodes(nodes, scope, &mut ctx)?;
     let map = ctx
@@ -838,16 +852,58 @@ fn evaluate_include(
         .get_namespace(&inc.alias)
         .ok_or_else(|| MdsError::undefined_var(&inc.alias))?;
 
-    if let Some(body) = &ns.prompt_body {
-        return Ok(body.clone());
+    let prompt_body = match &ns.prompt_body {
+        Some(body) => body.clone(),
+        None => {
+            if ctx.warnings.len() < MAX_WARNINGS {
+                ctx.warnings.push(format!(
+                    "warning: @include of '{}' produced empty output — module has no body text",
+                    inc.alias
+                ));
+            }
+            return Ok(String::new());
+        }
+    };
+
+    // S6: Splice source-map fragment segments when a builder is active.
+    //
+    // The local→global source-index remap is cached by Arc<FragmentMap> pointer
+    // identity (AC-PERF-05): built once on the first `@include` call for a given
+    // module and reused on all subsequent calls (e.g. inside a `@for` loop).
+    //
+    // The MapBuilder is temporarily taken out of ctx to allow concurrent mutable
+    // access to ctx.fragment_remap_cache (avoiding Rust split-borrow issues).
+    if let Some(fmap) = ns.prompt_map.as_ref() {
+        if let Some(mut map) = ctx.map.take() {
+            // Stable pointer identity of the Arc — used as the cache key.
+            // The Arc lives as long as the NamespaceScope is in scope (at least
+            // for the duration of this compilation), so the pointer is valid.
+            let fmap_ptr = std::sync::Arc::as_ptr(fmap) as usize;
+
+            // Build the remap if not already cached for this include site,
+            // then borrow it directly from the entry return value.
+            let remap: &Vec<u32> = ctx.fragment_remap_cache.entry(fmap_ptr).or_insert_with(|| {
+                fmap.sources
+                    .iter()
+                    .map(|(path, content)| map.source_index(path.as_ref(), content.as_ref()))
+                    .collect()
+            });
+
+            // Splice: rebase each fragment segment into the global output stream.
+            // `map.cursor` is the absolute byte offset where this include's body
+            // starts in the parent output (set by the Node::Include arm in
+            // evaluate_nodes just before calling evaluate_include).
+            let base = map.cursor;
+            for seg in &fmap.segments {
+                let remapped_src = remap[seg.src as usize];
+                map.push_fragment_segment(base + seg.out, remapped_src, seg.src_off, seg.len);
+            }
+
+            ctx.map = Some(map);
+        }
     }
-    if ctx.warnings.len() < MAX_WARNINGS {
-        ctx.warnings.push(format!(
-            "warning: @include of '{}' produced empty output — module has no body text",
-            inc.alias
-        ));
-    }
-    Ok(String::new())
+
+    Ok(prompt_body)
 }
 
 /// A single structured message produced by `evaluate_messages_intrinsic`.
@@ -887,6 +943,7 @@ pub fn evaluate_messages_intrinsic(
         total_message_bytes: 0,
         warnings,
         map: None,
+        fragment_remap_cache: std::collections::HashMap::new(),
     };
     let mut messages = Vec::new();
     collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;
