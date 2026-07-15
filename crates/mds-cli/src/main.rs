@@ -65,6 +65,22 @@ enum Commands {
         /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3")
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
+        /// Generate a source map alongside the compiled output (sidecar: <output>.map).
+        /// Conflicts with --no-source-map.
+        #[arg(long = "source-map", conflicts_with = "no_source_map")]
+        source_map: bool,
+        /// Disable source-map generation (overrides mds.json build.source_map=true).
+        /// Conflicts with --source-map.
+        #[arg(long = "no-source-map", conflicts_with = "source_map")]
+        no_source_map: bool,
+        /// Embed the source map as a data URI comment in the output file instead of a sidecar.
+        /// Requires --source-map.
+        #[arg(long = "inline", requires = "source_map")]
+        inline: bool,
+        /// Embed source file contents in sourcesContent[]. Ships full source text — use with care.
+        /// Requires --source-map.
+        #[arg(long = "embed-sources", requires = "source_map")]
+        embed_sources: bool,
     },
     /// Validate an MDS file without rendering
     #[command(
@@ -379,6 +395,10 @@ fn run(cli: Cli) -> Result<()> {
             vars,
             set_vars,
             set_string_vars,
+            source_map,
+            no_source_map,
+            inline,
+            embed_sources,
         } => run_build(BuildArgs {
             input,
             output,
@@ -387,6 +407,10 @@ fn run(cli: Cli) -> Result<()> {
             set_vars,
             set_string_vars,
             quiet,
+            source_map,
+            no_source_map,
+            inline,
+            embed_sources,
         }),
         Commands::Check {
             input,

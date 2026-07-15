@@ -793,7 +793,12 @@ fn rebuild_file(
     };
 
     let t0 = Instant::now();
-    match compile_to_content(&ctx.entry, runtime_vars, ctx.quiet) {
+    match compile_to_content(
+        &ctx.entry,
+        runtime_vars,
+        ctx.quiet,
+        mds::CompileOptions::default(),
+    ) {
         Ok(compiled) => {
             // Derive the output path from the compiled kind (intrinsic extension).
             // If ctx.output_path is already set (startup succeeded), reuse it.
@@ -916,27 +921,34 @@ fn run_watch_file(
     // Initial compile: returns (output_path, deps, content).
     // content is captured here so the baseline block below can reuse it without
     // recompiling (issue 3 — avoids a redundant second compile at startup).
-    let (output_path, initial_deps, initial_content) =
-        match compile_and_write(&entry, &output, &out_dir, &config, runtime_vars, quiet) {
-            Ok(result) => result,
-            Err(e) => {
-                // Initial compile error: print and continue watching (entry dir still watched).
-                eprintln!("{e:?}");
-                // Fall back: resolve output path with Markdown kind as a placeholder so we
-                // know where to watch. This path may not match a later successful compile if
-                // the template has @message blocks, but it will correct on first successful rebuild.
-                let fallback_path = resolve_output_path_for_kind(
-                    &Some(entry.clone()),
-                    &output,
-                    &out_dir,
-                    &config,
-                    OutputKind::Markdown,
-                    quiet,
-                )
-                .unwrap_or(None);
-                (fallback_path, vec![], String::new())
-            }
-        };
+    let (output_path, initial_deps, initial_content) = match compile_and_write(
+        &entry,
+        &output,
+        &out_dir,
+        &config,
+        runtime_vars,
+        quiet,
+        mds::CompileOptions::default(),
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            // Initial compile error: print and continue watching (entry dir still watched).
+            eprintln!("{e:?}");
+            // Fall back: resolve output path with Markdown kind as a placeholder so we
+            // know where to watch. This path may not match a later successful compile if
+            // the template has @message blocks, but it will correct on first successful rebuild.
+            let fallback_path = resolve_output_path_for_kind(
+                &Some(entry.clone()),
+                &output,
+                &out_dir,
+                &config,
+                OutputKind::Markdown,
+                quiet,
+            )
+            .unwrap_or(None);
+            (fallback_path, vec![], String::new())
+        }
+    };
 
     // Key: resolved output path string, or the sentinel "<stdout>" when output_path is None.
     let output_key: String = output_path
@@ -1190,7 +1202,12 @@ fn compile_one_source(
     state: &mut DirWatchState,
 ) {
     let t0 = Instant::now();
-    match compile_to_content(src, runtime_vars.clone(), quiet) {
+    match compile_to_content(
+        src,
+        runtime_vars.clone(),
+        quiet,
+        mds::CompileOptions::default(),
+    ) {
         Ok(compiled) => {
             let dep_paths: Vec<PathBuf> = compiled.dependencies.iter().map(PathBuf::from).collect();
 
@@ -1645,7 +1662,12 @@ fn dir_watch_startup(
 
     for source in &all_files {
         let key = graph_key(source);
-        match compile_to_content(source, runtime_vars.clone(), quiet) {
+        match compile_to_content(
+            source,
+            runtime_vars.clone(),
+            quiet,
+            mds::CompileOptions::default(),
+        ) {
             Ok(compiled) => {
                 // Collect dep paths (already canonical from mds-core).
                 let dep_paths: Vec<PathBuf> =
@@ -1762,6 +1784,7 @@ fn dir_watch_startup(
                 source,
                 baseline_vars.clone(),
                 true, /* quiet for baseline */
+                mds::CompileOptions::default(),
             ) {
                 Ok(compiled) => {
                     // Derive output path from the compiled kind (intrinsic extension).
@@ -2045,7 +2068,12 @@ fn process_dir_batch_incremental(
         // External deps are graph nodes but never emit their own output (DD3).
         if !is_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
-            match compile_to_content(src, runtime_vars.clone(), true) {
+            match compile_to_content(
+                src,
+                runtime_vars.clone(),
+                true,
+                mds::CompileOptions::default(),
+            ) {
                 Ok(compiled) => {
                     let dep_paths: Vec<PathBuf> =
                         compiled.dependencies.iter().map(PathBuf::from).collect();
@@ -2359,6 +2387,7 @@ mod tests {
             MdsConfig {
                 build: BuildConfig {
                     output_dir: Some("dist".to_string()),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -2379,6 +2408,7 @@ mod tests {
             MdsConfig {
                 build: BuildConfig {
                     output_dir: Some("../bad".to_string()),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -2699,8 +2729,16 @@ mod tests {
         // Use -o <out> style to direct output to a specific path.
         let out = dir.path().join("entry.md");
         let out_str = out.display().to_string();
-        let (_written_path, deps, _content) =
-            compile_and_write(&entry, &Some(out_str), &None, &None, None, true).unwrap();
+        let (_written_path, deps, _content) = compile_and_write(
+            &entry,
+            &Some(out_str),
+            &None,
+            &None,
+            None,
+            true,
+            mds::CompileOptions::default(),
+        )
+        .unwrap();
         // The entry's compile output should list helper as a dependency.
         assert!(out.exists(), "output file should be created");
         assert!(

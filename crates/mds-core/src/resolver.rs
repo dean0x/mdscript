@@ -811,6 +811,9 @@ impl ModuleCache {
                             ));
                             b.no_sources_content = true;
                         }
+                        if !opts.include_sources_content {
+                            b.no_sources_content = true;
+                        }
                         (raw, Some(b))
                     }
                     None => (raw, None),
@@ -894,6 +897,9 @@ impl ModuleCache {
                         total_src_bytes,
                         crate::limits::MAX_SOURCES_CONTENT_BYTES,
                     ));
+                    returned.no_sources_content = true;
+                }
+                if !opts.include_sources_content {
                     returned.no_sources_content = true;
                 }
                 (raw, Some(returned))

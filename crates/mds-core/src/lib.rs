@@ -889,7 +889,7 @@ pub fn compile_virtual_with_deps(
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true })?;
+/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true, include_sources_content: false })?;
 /// if let Some(sm) = result.source_map { println!("{}", sm.to_json()); }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -933,7 +933,7 @@ pub fn compile_with_deps_opts(
 ///     "Hello!\n",
 ///     None,
 ///     None,
-///     mds::CompileOptions { source_map: true },
+///     mds::CompileOptions { source_map: true, include_sources_content: false },
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -974,7 +974,7 @@ pub fn compile_str_with_deps_opts(
 ///     modules,
 ///     "main.mds",
 ///     None,
-///     mds::CompileOptions { source_map: true },
+///     mds::CompileOptions { source_map: true, include_sources_content: false },
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())

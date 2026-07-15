@@ -1296,3 +1296,79 @@ fn native_fs_check_symlink_is_public() {
     type CheckSymlinkFn = fn(&Path) -> Result<PathBuf, MdsError>;
     let _: CheckSymlinkFn = mds::NativeFs::check_symlink;
 }
+
+// ── CompileOptions shape (T1 wire-format parity gate) ────────────────────────
+
+#[test]
+fn compile_options_has_source_map_and_include_sources_content() {
+    // T1: both fields must exist and be independently settable.
+    let off = mds::CompileOptions {
+        source_map: false,
+        include_sources_content: false,
+    };
+    assert!(!off.source_map);
+    assert!(!off.include_sources_content);
+
+    let on = mds::CompileOptions {
+        source_map: true,
+        include_sources_content: true,
+    };
+    assert!(on.source_map);
+    assert!(on.include_sources_content);
+
+    // Default: both false (opts-in semantics — zero cost unless requested).
+    let d = mds::CompileOptions::default();
+    assert!(!d.source_map, "source_map default must be false");
+    assert!(
+        !d.include_sources_content,
+        "include_sources_content default must be false"
+    );
+}
+
+#[test]
+fn include_sources_content_false_omits_sources_content() {
+    // source_map: true, include_sources_content: false → map present, sourcesContent absent.
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+    let result = mds::compile_virtual_with_deps_opts(
+        modules,
+        "main.mds",
+        None,
+        mds::CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+        },
+    )
+    .expect("should compile");
+
+    let sm = result.source_map.expect("source_map must be present");
+    // sourcesContent must be absent when include_sources_content=false.
+    assert!(
+        sm.sources_content.is_none(),
+        "sourcesContent must be None when include_sources_content=false; got: {:?}",
+        sm.sources_content
+    );
+}
+
+#[test]
+fn include_sources_content_true_includes_sources_content() {
+    // source_map: true, include_sources_content: true → sourcesContent present.
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+    let result = mds::compile_virtual_with_deps_opts(
+        modules,
+        "main.mds",
+        None,
+        mds::CompileOptions {
+            source_map: true,
+            include_sources_content: true,
+        },
+    )
+    .expect("should compile");
+
+    let sm = result.source_map.expect("source_map must be present");
+    assert!(
+        sm.sources_content.is_some(),
+        "sourcesContent must be Some when include_sources_content=true"
+    );
+}

@@ -385,6 +385,12 @@ pub struct CompileOptions {
     /// When `false` (the default) no [`MapBuilder`] is allocated — zero overhead
     /// for callers that do not need mapping data (AC-PERF-01).
     pub source_map: bool,
+    /// Include source file contents in the `sourcesContent` array.
+    ///
+    /// When `false` (the default) `sourcesContent` is omitted from the map, saving
+    /// space for callers that do not need embedded sources (CLI default unless
+    /// `--embed-sources` is passed).
+    pub include_sources_content: bool,
 }
 
 // ---------------------------------------------------------------------------

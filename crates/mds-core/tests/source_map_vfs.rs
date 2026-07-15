@@ -43,11 +43,26 @@ fn vfs_opts(modules: HashMap<String, String>, entry: &str, opts: CompileOptions)
 }
 
 fn vfs_with_map(modules: HashMap<String, String>, entry: &str) -> CompileResult {
-    vfs_opts(modules, entry, CompileOptions { source_map: true })
+    // include_sources_content: true so that existing sourcesContent assertions continue to pass.
+    vfs_opts(
+        modules,
+        entry,
+        CompileOptions {
+            source_map: true,
+            include_sources_content: true,
+        },
+    )
 }
 
 fn vfs_no_map(modules: HashMap<String, String>, entry: &str) -> CompileResult {
-    vfs_opts(modules, entry, CompileOptions { source_map: false })
+    vfs_opts(
+        modules,
+        entry,
+        CompileOptions {
+            source_map: false,
+            ..Default::default()
+        },
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -823,7 +838,14 @@ fn source_map_messages_mode_degrades_to_none() {
         "@message role=user:\nHello!\n@end\n".to_string(),
     );
 
-    let result = vfs_opts(modules, "chat.mds", CompileOptions { source_map: true });
+    let result = vfs_opts(
+        modules,
+        "chat.mds",
+        CompileOptions {
+            source_map: true,
+            ..Default::default()
+        },
+    );
 
     // source_map must be None (messages-mode degrades gracefully).
     assert!(
@@ -875,7 +897,10 @@ fn source_map_segment_cap_degrades_to_none() {
         modules,
         "big.mds",
         Some(vars),
-        CompileOptions { source_map: true },
+        CompileOptions {
+            source_map: true,
+            ..Default::default()
+        },
     )
     .expect("compilation must succeed even when cap is hit");
 
