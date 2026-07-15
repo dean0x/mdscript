@@ -21,6 +21,15 @@
 //! - Nested compose: outer includes inner, all three sources present bottom-up
 //! - Determinism: repeated compilations produce identical mappings (AC-FUNC-05)
 //! - Output invariance: compiled text byte-identical with/without source maps (AC-PERF-02)
+//!
+//! CP4 tests cover S7/S8/S9:
+//!
+//! - S8 body attribution: function defined in imported file attributed to that file
+//! - S8 nested trim: f→g→h composition with leading/trailing whitespace
+//! - AC-FUNC-06: sourcesContent present when on, absent when off
+//! - AC-FUNC-07: messages-mode template → `source_map: None` + warning
+//! - AC-PERF-03: segment cap overflow → `source_map: None` + warning
+//! - AC-PERF-04: large multibyte line — map present and VLQ alphabet clean
 
 use std::collections::HashMap;
 
@@ -615,5 +624,349 @@ fn source_map_include_output_unchanged() {
     assert_eq!(
         with_map, without_map,
         "compiled output must be byte-identical regardless of source_map setting"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CP4 tests — S7/S8/S9: provenance, fine-grained body mapping, bounds
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// S8 body attribution: a function defined in an imported file must appear in
+/// `sources` when its body is evaluated under source-map mode (S8 path).
+///
+/// Without S8 provenance, the library file would never appear in `sources`
+/// because the body is suppressed (S3 path attributes output to the call site).
+/// With S8, the body tokens are recorded against the definition file, so
+/// `sources` must contain both `entry.mds` and `lib.mds`.
+#[test]
+fn source_map_s8_cross_file_function_attribution() {
+    let mut modules = HashMap::new();
+    modules.insert(
+        "lib.mds".to_string(),
+        "@define greet(who):\nHello {who}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "entry.mds".to_string(),
+        "@import \"./lib.mds\" as lib\n{lib.greet(\"World\")}\n".to_string(),
+    );
+
+    let result = vfs_with_map(modules.clone(), "entry.mds");
+    let sm = result
+        .source_map
+        .clone()
+        .expect("source_map must be present");
+
+    // Compiled text must still be correct (AC-PERF-02: output unchanged).
+    let text = result.into_markdown().expect("markdown output");
+    assert_eq!(
+        text.trim(),
+        "Hello World!",
+        "S8 must not alter compiled output"
+    );
+
+    // S8: the definition file must appear in sources.
+    assert!(
+        sm.sources.contains(&"lib.mds".to_string()),
+        "lib.mds must appear in sources (S8 body attribution); got: {:?}",
+        sm.sources
+    );
+    assert!(
+        sm.sources.contains(&"entry.mds".to_string()),
+        "entry.mds must appear in sources; got: {:?}",
+        sm.sources
+    );
+
+    // sourcesContent must include lib.mds content.
+    let sc = sm
+        .sources_content
+        .as_ref()
+        .expect("sourcesContent must be present");
+    assert_eq!(
+        sc.len(),
+        sm.sources.len(),
+        "sourcesContent entries must match sources count"
+    );
+    let lib_idx = sm
+        .sources
+        .iter()
+        .position(|s| s == "lib.mds")
+        .expect("lib.mds position");
+    assert!(
+        sc[lib_idx].contains("@define greet"),
+        "sourcesContent for lib.mds must contain its source"
+    );
+
+    // Without source maps, output is identical.
+    let no_map_text = vfs_no_map(modules, "entry.mds")
+        .into_markdown()
+        .expect("markdown without map");
+    assert_eq!(text, no_map_text, "output must be map-independent");
+}
+
+/// S8 nested trim: function composition f→g→h where each level adds
+/// leading/trailing whitespace.  After rebase_trim at each level, only
+/// the actual content tokens are attributed to the definition files.
+///
+/// Verifies:
+/// - Compilation succeeds and output is trimmed correctly.
+/// - All three definition files appear in `sources`.
+/// - VLQ alphabet is valid (no `-`, `<`, `>`).
+#[test]
+fn source_map_s8_nested_trim_composition() {
+    let mut modules = HashMap::new();
+    // h produces content with extra surrounding whitespace.
+    modules.insert(
+        "h.mds".to_string(),
+        "@define h(x):\n   inner {x}   \n@end\n".to_string(),
+    );
+    // g calls h, adding its own wrapper whitespace.
+    modules.insert(
+        "g.mds".to_string(),
+        "@import \"./h.mds\" as hm\n@define g(x):\n  {hm.h(x)}  \n@end\n".to_string(),
+    );
+    // f calls g.
+    modules.insert(
+        "f.mds".to_string(),
+        "@import \"./g.mds\" as gm\n@define f(x):\n{gm.g(x)}\n@end\n".to_string(),
+    );
+    // entry calls f.
+    modules.insert(
+        "entry.mds".to_string(),
+        "@import \"./f.mds\" as fm\nResult: {fm.f(\"test\")}\n".to_string(),
+    );
+
+    let result = vfs_with_map(modules, "entry.mds");
+    let sm = result
+        .source_map
+        .clone()
+        .expect("source_map must be present");
+
+    // Compiled output must be correct.
+    let text = result
+        .into_markdown()
+        .expect("markdown for nested-trim test");
+    assert!(
+        text.contains("inner test"),
+        "nested trim must produce correct content; got: {text:?}"
+    );
+
+    // All definition files must appear in sources.
+    for expected in &["h.mds", "g.mds", "f.mds", "entry.mds"] {
+        assert!(
+            sm.sources.iter().any(|s| s == expected),
+            "{expected} must appear in sources for nested-trim S8; got: {:?}",
+            sm.sources
+        );
+    }
+
+    // VLQ alphabet must be valid.
+    assert!(
+        !sm.mappings.contains('-'),
+        "VLQ mappings must not contain '-'"
+    );
+    assert!(
+        !sm.mappings.contains('<'),
+        "VLQ mappings must not contain '<'"
+    );
+    assert!(
+        !sm.mappings.contains('>'),
+        "VLQ mappings must not contain '>'"
+    );
+}
+
+/// AC-FUNC-06: `sourcesContent` is present when source_map=true and absent
+/// when source_map=false (i.e. source_map field is None).
+///
+/// Also verifies that `sourcesContent[0]` matches the template source byte-for-byte.
+#[test]
+fn source_map_sources_content_on_off() {
+    let source_text = "Hello world\n";
+    let mut modules = HashMap::new();
+    modules.insert("main.mds".to_string(), source_text.to_string());
+
+    // source_map=true → sources_content is Some with matching content.
+    let with_map = vfs_with_map(modules.clone(), "main.mds");
+    let sm = with_map
+        .source_map
+        .expect("source_map must be Some when source_map=true");
+    let sc = sm
+        .sources_content
+        .expect("sourcesContent must be present when source_map=true");
+    assert_eq!(
+        sc.len(),
+        1,
+        "single-source compilation must have one sourcesContent entry"
+    );
+    assert_eq!(
+        sc[0], source_text,
+        "sourcesContent must match original template source byte-for-byte"
+    );
+
+    // source_map=false → source_map field is None (AC-PERF-01 zero-cost path).
+    let no_map = vfs_no_map(modules, "main.mds");
+    assert!(
+        no_map.source_map.is_none(),
+        "source_map must be None when source_map=false"
+    );
+}
+
+/// AC-FUNC-07: a template with `@message` blocks in messages mode combined
+/// with `source_map: true` must return `source_map: None` and emit a warning.
+///
+/// Source maps operate on the flat text output stream; messages-mode boundaries
+/// are not representable in the SMv3 segment model, so we degrade gracefully.
+#[test]
+fn source_map_messages_mode_degrades_to_none() {
+    let mut modules = HashMap::new();
+    modules.insert(
+        "chat.mds".to_string(),
+        "@message role=user:\nHello!\n@end\n".to_string(),
+    );
+
+    let result = vfs_opts(modules, "chat.mds", CompileOptions { source_map: true });
+
+    // source_map must be None (messages-mode degrades gracefully).
+    assert!(
+        result.source_map.is_none(),
+        "messages-mode with source_map=true must degrade to None"
+    );
+
+    // A warning must be emitted explaining the degradation (AC-FUNC-07).
+    let has_warning = result.warnings.iter().any(|w| {
+        w.contains("messages-mode")
+            || w.contains("@message")
+            || w.contains("source_map will be None")
+    });
+    assert!(
+        has_warning,
+        "AC-FUNC-07: must emit a warning for messages-mode + source_map=true; \
+         got warnings: {:?}",
+        result.warnings
+    );
+}
+
+/// AC-PERF-03: when the segment cap (`MAX_SOURCEMAP_SEGMENTS`) is exceeded,
+/// the result degrades to `source_map: None` rather than emitting a partial
+/// (and potentially misleading) map.  A warning is emitted to the caller.
+///
+/// This test generates >1 000 000 segments by iterating over a large array
+/// with a multi-token loop body (11 segment-producing nodes per iteration ×
+/// 100 000 iterations = 1 100 000 > 1 000 000 cap).
+#[test]
+fn source_map_segment_cap_degrades_to_none() {
+    use mds::Value;
+
+    // Build a 100 000-element array at runtime (avoids a giant template literal).
+    let items: Vec<Value> = (0..100_000)
+        .map(|_| Value::String("x".to_string()))
+        .collect();
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("items".to_string(), Value::Array(items));
+
+    let mut modules = std::collections::HashMap::new();
+    // Body has 6 Text nodes + 5 Interpolation nodes = 11 segments per iteration.
+    // 100 000 iters × 11 = 1 100 000 > MAX_SOURCEMAP_SEGMENTS (1 000 000).
+    modules.insert(
+        "big.mds".to_string(),
+        "@for item in items:\nA{item}B{item}C{item}D{item}E{item}F\n@end\n".to_string(),
+    );
+
+    let result = mds::compile_virtual_with_deps_opts(
+        modules,
+        "big.mds",
+        Some(vars),
+        CompileOptions { source_map: true },
+    )
+    .expect("compilation must succeed even when cap is hit");
+
+    // Extract source_map before consuming result via into_markdown.
+    let source_map_none = result.source_map.is_none();
+    let warnings = result.warnings.clone();
+
+    // Compilation succeeds: output is present (no error).
+    let _text = result
+        .into_markdown()
+        .expect("markdown output must be present");
+
+    // Source map degrades to None (AC-PERF-03).
+    assert!(
+        source_map_none,
+        "source_map must be None when segment cap is exceeded (AC-PERF-03)"
+    );
+
+    // A warning must be emitted.
+    let has_warning = warnings
+        .iter()
+        .any(|w| w.contains("segment cap") || w.contains("source_map will be None"));
+    assert!(
+        has_warning,
+        "AC-PERF-03: must emit a warning when segment cap is exceeded; \
+         got warnings: {:?}",
+        warnings
+    );
+}
+
+/// AC-PERF-04: a template with long lines containing multibyte (UTF-8)
+/// characters must produce a valid source map with clean VLQ alphabet.
+///
+/// This is a shape test: we verify the map is present, non-empty, and that
+/// the VLQ encoding does not accidentally emit invalid characters.
+#[test]
+fn source_map_multibyte_line_vlq_alphabet() {
+    let mut modules = HashMap::new();
+    // Mix ASCII and CJK (3-byte UTF-8) characters on one long line.
+    // The VLQ encoder must handle byte-position arithmetic correctly for
+    // multi-byte codepoints (AC-PERF-04).
+    let long_cjk_line = "你好世界".repeat(100); // 400 CJK chars = 1200 bytes
+                                                // Embed as a frontmatter value so the template renders a long CJK string.
+    let source_with_fm = format!("---\nval: \"{long_cjk_line}\"\n---\n{{val}}\n");
+    modules.insert("cjk.mds".to_string(), source_with_fm);
+
+    let result = vfs_with_map(modules, "cjk.mds");
+    let sm = result.source_map.expect("source_map must be present");
+
+    assert!(
+        !sm.mappings.is_empty(),
+        "mappings must be non-empty for multibyte template"
+    );
+    // VLQ alphabet must not contain forbidden characters.
+    assert!(
+        !sm.mappings.contains('-'),
+        "VLQ must not contain '-' (AC-PERF-04)"
+    );
+    assert!(
+        !sm.mappings.contains('<'),
+        "VLQ must not contain '<' (AC-PERF-04)"
+    );
+    assert!(
+        !sm.mappings.contains('>'),
+        "VLQ must not contain '>' (AC-PERF-04)"
+    );
+}
+
+/// S8 output invariance: function defined in an imported file compiles to the
+/// same text regardless of whether source maps are enabled (AC-PERF-02).
+#[test]
+fn source_map_s8_output_unchanged() {
+    let mut modules = HashMap::new();
+    modules.insert(
+        "lib.mds".to_string(),
+        "@define greet(who):\nHello {who}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "entry.mds".to_string(),
+        "@import \"./lib.mds\" as lib\n{lib.greet(\"World\")}\n".to_string(),
+    );
+
+    let with_map = vfs_with_map(modules.clone(), "entry.mds")
+        .into_markdown()
+        .expect("markdown with map");
+    let without_map = vfs_no_map(modules, "entry.mds")
+        .into_markdown()
+        .expect("markdown without map");
+
+    assert_eq!(
+        with_map, without_map,
+        "S8 must not change compiled output (AC-PERF-02)"
     );
 }

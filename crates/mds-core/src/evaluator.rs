@@ -57,6 +57,16 @@ pub(crate) struct EvalContext<'a> {
     /// The cache is scoped to one `evaluate_with_map` invocation and is empty at
     /// the start of each top-level compile; no cross-compilation state leaks.
     pub(crate) fragment_remap_cache: std::collections::HashMap<usize, Vec<u32>>,
+    /// S8 signal: set to `true` by `invoke_function` when it takes the fine-grained
+    /// body-descent path (S8), so the calling `Node::Interpolation` arm knows the body
+    /// already recorded its own segments and the call-site point should be skipped.
+    ///
+    /// Reset to `false` at the start of each `invoke_function` call (prevents
+    /// arg-evaluation side-effects from leaking into the outer Interpolation arm)
+    /// and at the start of each `Node::Interpolation` arm.
+    ///
+    /// Irrelevant (always `false`) when `map` is `None` — zero-cost path.
+    fn_body_owned: bool,
 }
 
 /// Evaluate a module body into a final rendered string.
@@ -74,6 +84,7 @@ pub fn evaluate(
         warnings,
         map: None,
         fragment_remap_cache: std::collections::HashMap::new(),
+        fn_body_owned: false,
     };
     evaluate_nodes(nodes, scope, &mut ctx)
 }
@@ -97,6 +108,7 @@ pub(crate) fn evaluate_with_map(
         warnings,
         map: Some(builder),
         fragment_remap_cache: std::collections::HashMap::new(),
+        fn_body_owned: false,
     };
     let output = evaluate_nodes(nodes, scope, &mut ctx)?;
     let map = ctx
@@ -160,28 +172,40 @@ fn evaluate_nodes(
                 }
             }
             Node::Interpolation(interp) => {
-                // Record the whole `{expr}` as one segment BEFORE evaluating it.
-                // `render_expr` may call `invoke_function` → `evaluate_nodes` on
-                // the function body (suppressed), but those inner segments are not
-                // recorded — only the call site is.
+                // S8: reset ownership flag before each call so arg-evaluation
+                // side-effects from nested S8 calls don't corrupt the outer arm.
+                ctx.fn_body_owned = false;
                 if let Some(ref mut map) = ctx.map {
                     if map.suppress == 0 {
+                        // Assert cursor invariant before anchoring.  On the S8 path,
+                        // invoke_function will read this anchor as the body's base
+                        // output position.
                         let abs_out = saved_cursor + output.len() as u32;
                         debug_assert_eq!(
                             map.cursor, abs_out,
                             "cursor invariant violated at Interpolation offset={}",
                             interp.offset
                         );
-                        map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
                     }
-                    // Anchor cursor so inner evaluate_nodes invocations (via
-                    // invoke_function) start from the correct absolute position.
+                    // Always anchor cursor so inner evaluate_nodes invocations
+                    // (invoke_function / S8 body descent) start from the correct
+                    // absolute position.
                     map.cursor = saved_cursor + output.len() as u32;
                 }
                 let rendered = render_expr(&interp.expr, scope, ctx)?;
+                if let Some(ref mut map) = ctx.map {
+                    if map.suppress == 0 && !ctx.fn_body_owned {
+                        // S3 path: body was suppressed; record the call-site span.
+                        // On the S8 path, invoke_function already pushed fine-grained
+                        // body segments attributed to the definition file — skip here.
+                        let abs_out = saved_cursor + output.len() as u32;
+                        map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
+                    }
+                }
                 output.push_str(&rendered);
-                // Correct cursor after render_expr (function bodies may have left it
-                // at an offset relative to the trimmed inner output).
+                // Correct cursor after render_expr.  For S8, invoke_function already
+                // set cursor to start_cursor + trimmed_len; this final assignment
+                // re-anchors it to the outer output length (same value after push_str).
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
@@ -479,6 +503,10 @@ fn invoke_function(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
+    // Reset fn_body_owned so arg-evaluation side-effects (from inner S8 calls
+    // in resolve_args) don't corrupt the outer Interpolation arm's decision.
+    ctx.fn_body_owned = false;
+
     if ctx.call_stack.iter().any(|s| s == call_key) {
         return Err(MdsError::recursion(call_key));
     }
@@ -514,35 +542,129 @@ fn invoke_function(
         };
         scope.set_var(&param.name, value);
     }
-    // Suppress source-map recording inside function bodies.  The call site
-    // (the Interpolation node) is already recorded as a single point; inner
-    // nodes would produce segments with out-offsets relative to the trimmed
-    // function output, not the parent output, so they must be suppressed.
-    if let Some(ref mut map) = ctx.map {
-        map.suppress += 1;
-    }
-    ctx.call_stack.push(call_key.to_string());
-    let result = evaluate_nodes(&func.body, scope, ctx).map(|s| s.trim().to_string());
-    // Safety-critical LIFO invariant: call_stack tracks recursion detection.
-    // A mismatched pop would silently corrupt recursion state and allow
-    // stack overflows. Return a structured error rather than panicking so
-    // callers get a proper diagnostic instead of an opaque abort.
-    let popped = ctx.call_stack.pop();
-    if let Some(ref mut map) = ctx.map {
-        map.suppress = map.suppress.saturating_sub(1);
-    }
-    let lifo_result = if popped.as_deref() == Some(call_key) {
-        Ok(())
+
+    // S8 path: fine-grained function body source attribution.
+    //
+    // Conditions for S8 (all must hold):
+    //  1. A map is present (source-map mode active, AC-PERF-01).
+    //  2. suppress == 0 — we are not already inside a suppressed body.
+    //  3. func.origin is Some — the function has provenance metadata (populated
+    //     by the resolver when source_map_mode=true, S7).
+    //
+    // On this path, instead of suppressing the body, we:
+    //  - Switch MapBuilder::current_src to the definition file.
+    //  - Evaluate the body without suppression so each leaf node pushes its own
+    //    segment attributed to the definition file.
+    //  - Run rebase_trim to drop segments in the trimmed-away leading/trailing
+    //    whitespace regions and shift surviving out-values by `lead`.
+    //  - Advance cursor to reflect the trimmed output length.
+    //  - Set fn_body_owned=true so the calling Interpolation arm skips its
+    //    call-site segment.
+    let use_s8 = ctx
+        .map
+        .as_ref()
+        .is_some_and(|m| m.suppress == 0 && func.origin.is_some());
+
+    if use_s8 {
+        let origin = func
+            .origin
+            .as_ref()
+            .expect("S8 guard guarantees origin is Some");
+
+        // Snapshot pre-body state.
+        let start_cursor: u32 = ctx.map.as_ref().unwrap().cursor;
+        let seg_start: usize = ctx.map.as_ref().unwrap().segments.len();
+        let saved_src: u32 = ctx.map.as_ref().unwrap().current_src;
+
+        // Register the definition file and switch current_src to it.
+        let def_src: u32 = ctx
+            .map
+            .as_mut()
+            .unwrap()
+            .source_index(origin.file.as_ref(), origin.source.as_ref());
+        ctx.map.as_mut().unwrap().current_src = def_src;
+
+        ctx.call_stack.push(call_key.to_string());
+        let body_result = evaluate_nodes(&func.body, scope, ctx);
+        let popped = ctx.call_stack.pop();
+
+        // Restore source attribution for the outer scope.
+        if let Some(ref mut map) = ctx.map {
+            map.current_src = saved_src;
+        }
+
+        let lifo_result = if popped.as_deref() == Some(call_key) {
+            Ok(())
+        } else {
+            Err(MdsError::syntax(format!(
+                "internal error: call_stack LIFO violated: \
+                 expected '{call_key}', got {popped:?}"
+            )))
+        };
+        let pop_result = scope.pop();
+        let raw_body = prefer_first_error(body_result, lifo_result.and(pop_result))?;
+
+        // Compute lead/trail byte counts for rebase_trim.
+        // Use try_from + unwrap_or(u32::MAX) for safety: body is bounded by
+        // MAX_OUTPUT_SIZE (50 MB) so try_from always succeeds in practice;
+        // u32::MAX fallback causes rebase_trim to drop all segments (safe degradation).
+        let lead = u32::try_from(raw_body.len() - raw_body.trim_start().len()).unwrap_or(u32::MAX);
+        let trail = u32::try_from(raw_body.len() - raw_body.trim_end().len()).unwrap_or(u32::MAX);
+        let untrimmed_len = u32::try_from(raw_body.len()).unwrap_or(u32::MAX);
+
+        let trimmed = raw_body.trim();
+        let trimmed_len = u32::try_from(trimmed.len()).unwrap_or(u32::MAX);
+
+        // Drop segments in trimmed-away regions; shift surviving out-values by -lead.
+        if let Some(ref mut map) = ctx.map {
+            crate::sourcemap::rebase_trim(
+                &mut map.segments,
+                seg_start,
+                start_cursor,
+                lead,
+                untrimmed_len,
+                trail,
+            );
+            // Advance cursor to the trimmed body end so the outer Interpolation
+            // arm's final cursor correction (`saved_cursor + output.len()`) agrees.
+            map.cursor = start_cursor.saturating_add(trimmed_len);
+        }
+
+        // Signal to the Interpolation arm: body owns the segments.
+        ctx.fn_body_owned = true;
+
+        Ok(trimmed.to_string())
     } else {
-        Err(MdsError::syntax(format!(
-            "internal error: call_stack LIFO violated: expected '{call_key}', got {popped:?}"
-        )))
-    };
-    let pop_result = scope.pop();
-    // On double-fault, preserve the render error — it carries the actionable
-    // source-span diagnostic for the user. LIFO/pop failures are compiler
-    // bugs and surface as secondary errors.
-    prefer_first_error(result, lifo_result.and(pop_result))
+        // S3 path: suppress source-map recording inside function bodies.
+        // The call site (the Interpolation node) is recorded as a single point
+        // by the Interpolation arm when fn_body_owned stays false.
+        if let Some(ref mut map) = ctx.map {
+            map.suppress += 1;
+        }
+        ctx.call_stack.push(call_key.to_string());
+        let result = evaluate_nodes(&func.body, scope, ctx).map(|s| s.trim().to_string());
+        // Safety-critical LIFO invariant: call_stack tracks recursion detection.
+        // A mismatched pop would silently corrupt recursion state and allow
+        // stack overflows. Return a structured error rather than panicking so
+        // callers get a proper diagnostic instead of an opaque abort.
+        let popped = ctx.call_stack.pop();
+        if let Some(ref mut map) = ctx.map {
+            map.suppress = map.suppress.saturating_sub(1);
+        }
+        let lifo_result = if popped.as_deref() == Some(call_key) {
+            Ok(())
+        } else {
+            Err(MdsError::syntax(format!(
+                "internal error: call_stack LIFO violated: \
+                 expected '{call_key}', got {popped:?}"
+            )))
+        };
+        let pop_result = scope.pop();
+        // On double-fault, preserve the render error — it carries the actionable
+        // source-span diagnostic for the user. LIFO/pop failures are compiler
+        // bugs and surface as secondary errors.
+        prefer_first_error(result, lifo_result.and(pop_result))
+    }
 }
 
 fn call_function(
@@ -944,6 +1066,7 @@ pub fn evaluate_messages_intrinsic(
         warnings,
         map: None,
         fragment_remap_cache: std::collections::HashMap::new(),
+        fn_body_owned: false,
     };
     let mut messages = Vec::new();
     collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;
@@ -1384,6 +1507,7 @@ mod tests {
                 params: vec![],
                 body,
                 captured: crate::scope::CapturedScope::default(),
+                origin: None,
             };
             scope.set_function(&format!("f{i}"), Arc::new(func));
         }

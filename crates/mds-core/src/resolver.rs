@@ -16,6 +16,8 @@ use crate::lexer::tokenize;
 use crate::limits::MAX_BLOCKS_PER_MODULE;
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
+// Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
+pub(crate) use crate::sourcemap::Origin;
 use crate::validator;
 use crate::value::Value;
 
@@ -28,36 +30,9 @@ use inheritance::{
     spliced_regions,
 };
 
-/// The display name and source bytes that a set of AST node offsets index into.
-///
-/// Each spliced region (skeleton non-block nodes, or a block's effective body) carries
-/// the `Origin` of the file whose source bytes those AST offsets are relative to.
-/// Validation runs per region against `origin.source` so span construction is always
-/// in-bounds (fixing the cross-source-offset `OutOfBounds` diagnostic bug).
-///
-/// `Clone` = two refcount bumps (O(1)).
-///
-/// # Debug output
-///
-/// The manual `Debug` impl prints `file` + `source.len()` bytes — NEVER the raw source
-/// text. This aligns with the `debug-panics` no-leak rule (source bytes must not appear
-/// in panic messages or debug output).
-#[derive(Clone)]
-pub(crate) struct Origin {
-    /// Display name of the file (shown in error messages / source labels).
-    pub(crate) file: Arc<str>,
-    /// Raw source bytes; AST node offsets in this region are relative to this string.
-    pub(crate) source: Arc<str>,
-}
-
-impl std::fmt::Debug for Origin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Origin")
-            .field("file", &self.file)
-            .field("source_len", &self.source.len())
-            .finish()
-    }
-}
+// `Origin` is defined in `sourcemap.rs` and re-exported above via `pub(crate) use`.
+// It carries (file: Arc<str>, source: Arc<str>) — the defining module's display
+// path and raw source content for source-map provenance (S7/S8).
 
 /// An effective block together with the origin (file + source) its offsets index into.
 ///
@@ -777,6 +752,16 @@ impl ModuleCache {
             } = components;
 
             if has_message_block(&final_body) {
+                // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+                // The evaluator only has text-stream semantics; messages boundaries don't
+                // have stable byte offsets relative to the source.  Degrade gracefully.
+                if opts.source_map {
+                    warnings.push(
+                        "source_map: true is not supported for messages-mode templates \
+                         (@message blocks); source_map will be None"
+                            .to_string(),
+                    );
+                }
                 let messages = evaluate_messages_intrinsic(
                     &final_body,
                     &mut scope,
@@ -788,7 +773,7 @@ impl ModuleCache {
                     crate::CompiledOutput::Messages(
                         messages.into_iter().map(crate::Message::from).collect(),
                     ),
-                    None, // source maps cover Markdown only
+                    None, // source maps cover Markdown only (AC-FUNC-07)
                 ));
             }
 
@@ -802,9 +787,35 @@ impl ModuleCache {
                     skeleton_origin.file.to_string(),
                     skeleton_origin.source.to_string(),
                 );
-                let (raw, returned) =
+                let (raw, maybe_builder) =
                     Self::evaluate_regions_with_map(&regions, &mut scope, warnings, Some(builder))?;
-                (raw, returned)
+                // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
+                let degraded = match maybe_builder {
+                    Some(b) if b.segments_dropped => {
+                        warnings.push(format!(
+                            "source map segment cap ({} segments) exceeded; \
+                             source_map will be None for this compilation",
+                            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+                        ));
+                        drop(b);
+                        (raw, None)
+                    }
+                    Some(mut b) => {
+                        let total_src_bytes = b.sources_content_bytes();
+                        if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
+                            warnings.push(format!(
+                                "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
+                                 sourcesContent will be omitted from the source map",
+                                total_src_bytes,
+                                crate::limits::MAX_SOURCES_CONTENT_BYTES,
+                            ));
+                            b.no_sources_content = true;
+                        }
+                        (raw, Some(b))
+                    }
+                    None => (raw, None),
+                };
+                degraded
             } else {
                 (evaluate(&final_body, &mut scope, warnings)?, None)
             };
@@ -835,6 +846,14 @@ impl ModuleCache {
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
         if has_message_block(&module.body) {
+            // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+            if opts.source_map {
+                warnings.push(
+                    "source_map: true is not supported for messages-mode templates \
+                     (@message blocks); source_map will be None"
+                        .to_string(),
+                );
+            }
             let messages = evaluate_messages_intrinsic(
                 &module.body,
                 &mut scope,
@@ -846,15 +865,39 @@ impl ModuleCache {
                 crate::CompiledOutput::Messages(
                     messages.into_iter().map(crate::Message::from).collect(),
                 ),
-                None, // source maps cover Markdown only
+                None, // source maps cover Markdown only (AC-FUNC-07)
             ));
         }
 
         let (body_raw, map_out) = if opts.source_map {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
-            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
-            (raw, Some(returned))
+            let (raw, mut returned) =
+                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            // AC-PERF-03: segment cap hit → degrade to no map rather than a partial/misleading map.
+            if returned.segments_dropped {
+                warnings.push(format!(
+                    "source map segment cap ({} segments) exceeded; \
+                     source_map will be None for this compilation",
+                    crate::limits::MAX_SOURCEMAP_SEGMENTS,
+                ));
+                (raw, None)
+            } else {
+                // AC-SEC-04: total sourcesContent byte ceiling.
+                // Check BEFORE finalize so we can set the flag instead of allocating a
+                // giant SourceMap artifact.  The per-source strings live inside the builder.
+                let total_src_bytes: usize = returned.sources_content_bytes();
+                if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
+                    warnings.push(format!(
+                        "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
+                         sourcesContent will be omitted from the source map",
+                        total_src_bytes,
+                        crate::limits::MAX_SOURCES_CONTENT_BYTES,
+                    ));
+                    returned.no_sources_content = true;
+                }
+                (raw, Some(returned))
+            }
         } else {
             (evaluate(&module.body, &mut scope, warnings)?, None)
         };
@@ -1508,10 +1551,25 @@ impl ModuleCache {
             block_names: HashSet::new(),
         };
 
+        // S7: build the defining-module Origin ONCE per module, cloned cheaply
+        // into each FunctionDef — only when source-map mode is active (AC-PERF-01).
+        // O(1) Arc construction per module; each clone in collect_define is two
+        // refcount bumps.
+        let module_origin: Option<Origin> = if self.source_map_mode {
+            Some(Origin {
+                file: Arc::from(ctx.file_str),
+                source: Arc::from(ctx.source),
+            })
+        } else {
+            None
+        };
+
         let mut block_count: usize = 0;
         for node in body {
             match node {
-                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
+                Node::Define(def) => {
+                    collect_define(def, &mut defs, scope, ctx, module_origin.as_ref())?
+                }
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 Node::Block(block) => {
@@ -1946,6 +2004,7 @@ fn collect_define(
     defs: &mut CollectedDefs,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
+    origin: Option<&Origin>,
 ) -> Result<(), MdsError> {
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
@@ -1967,6 +2026,8 @@ fn collect_define(
         .map(|(k, v)| (k, (*v).clone()))
         .collect();
     func.captured.vars = scope.get_all_vars();
+    // S7: stamp provenance — two Arc refcount bumps, no allocation.
+    func.origin = origin.cloned();
     // Wrap in Arc for cheap storage and O(1) scope insertion.
     let arc = Arc::new(func);
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));

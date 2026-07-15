@@ -111,3 +111,14 @@ pub(crate) const MAX_MESSAGES_TOTAL_SIZE: usize = MAX_OUTPUT_SIZE;
 /// beyond the cap are silently dropped so compilation succeeds with a partial map rather
 /// than erroring on adversarial inputs.
 pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
+
+/// Maximum total byte size of all `sourcesContent` strings embedded in a source map.
+///
+/// Guards against unbounded artifact size when a template imports many large files.
+/// When the total bytes of source file contents would exceed this ceiling, the
+/// `sourcesContent` array is omitted (degraded) rather than embedding the full corpus.
+/// The source map remains valid — consumers will fetch sources separately.
+///
+/// Set equal to `MAX_OUTPUT_SIZE` (50 MB): the content set should not dwarf the
+/// compiled output it annotates.
+pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;

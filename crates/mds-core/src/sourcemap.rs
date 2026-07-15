@@ -20,7 +20,46 @@
 //! HTML comments (`<!--# sourceMappingURL=... -->`). Do **not** change the
 //! alphabet.
 
+use std::sync::Arc;
+
 use serde::Serialize;
+
+// ---------------------------------------------------------------------------
+// Origin — source-file provenance for function bodies (S7)
+// ---------------------------------------------------------------------------
+
+/// The display name and source bytes that a set of AST node offsets index into.
+///
+/// Carried by [`FunctionDef`](crate::scope::FunctionDef) (as `origin`) so that
+/// source-map recording during function-body evaluation (S8) can attribute output
+/// segments to the **defining** file, not the call site.
+///
+/// Placed here (rather than `resolver.rs`) so [`crate::scope`] can import it
+/// without creating a scope → resolver cycle.
+///
+/// `Clone` = two refcount bumps (`O(1)`).
+///
+/// # Debug output
+///
+/// The manual `Debug` impl prints `file` + `source.len()` bytes — **never** the
+/// raw source text.  This aligns with the `debug-panics` no-leak rule (source
+/// bytes must not appear in panic messages or debug output).
+#[derive(Clone)]
+pub(crate) struct Origin {
+    /// Display name of the file (shown in error messages / source labels).
+    pub(crate) file: Arc<str>,
+    /// Raw source bytes; AST node offsets are relative to this string.
+    pub(crate) source: Arc<str>,
+}
+
+impl std::fmt::Debug for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Origin")
+            .field("file", &self.file)
+            .field("source_len", &self.source.len())
+            .finish()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public type
@@ -392,15 +431,18 @@ pub(crate) struct RawSegment {
 ///
 /// # Suppression
 ///
-/// `suppress > 0` while inside a `@define` function body. Nodes inside
-/// function bodies are not individually mapped; the single `Interpolation`
-/// point for the call site in the parent output is already recorded.
+/// `suppress > 0` while inside a `@define` function body that does NOT have
+/// a known `Origin` (S3 fallback).  Nodes inside such bodies are not
+/// individually mapped; the single `Interpolation` point for the call site
+/// in the parent output is already recorded.  When the function has an
+/// `Origin` (S8 path) suppression is skipped and the body is recorded
+/// directly with `current_src` switched to the definition file.
 pub(crate) struct MapBuilder {
     /// Accumulated raw segment records.
     pub(crate) segments: Vec<RawSegment>,
     /// Current absolute byte position in the compiled output.
     pub(crate) cursor: u32,
-    /// Suppression depth: >0 means we are inside a function body.
+    /// Suppression depth: >0 means we are inside a function body (S3 path).
     pub(crate) suppress: u32,
     /// Index of the source file currently being recorded (0-based into `sources`).
     pub(crate) current_src: u32,
@@ -408,6 +450,18 @@ pub(crate) struct MapBuilder {
     pub(crate) sources: Vec<String>,
     /// Source file contents, parallel to `sources` (for `sourcesContent`).
     pub(crate) sources_content: Vec<String>,
+    /// True when at least one segment was silently dropped due to the
+    /// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] cap (AC-PERF-03).
+    ///
+    /// When true, the caller should degrade to `source_map: None` + warning
+    /// rather than emitting a partial map.
+    pub(crate) segments_dropped: bool,
+    /// When true, [`MapBuilder::finalize`] omits `sourcesContent` from the
+    /// emitted [`SourceMap`] (AC-SEC-04 ceiling degradation).
+    ///
+    /// Set by the caller before calling `finalize` when the total embedded
+    /// source bytes exceed [`crate::limits::MAX_SOURCES_CONTENT_BYTES`].
+    pub(crate) no_sources_content: bool,
 }
 
 impl MapBuilder {
@@ -424,6 +478,8 @@ impl MapBuilder {
             current_src: 0,
             sources: vec![source_name],
             sources_content: vec![source_content],
+            segments_dropped: false,
+            no_sources_content: false,
         }
     }
 
@@ -441,11 +497,29 @@ impl MapBuilder {
         idx
     }
 
+    /// Total byte size of all registered `sourcesContent` strings.
+    ///
+    /// Called by the resolver before [`finalize`][Self::finalize] to check
+    /// whether the AC-SEC-04 ceiling is exceeded.  Uses `sources_content`
+    /// (the builder's internal vec) rather than the finalized struct, so the
+    /// check can gate the degradation flag before any allocation.
+    pub(crate) fn sources_content_bytes(&self) -> usize {
+        self.sources_content.iter().map(|s| s.len()).sum()
+    }
+
     /// Push a new segment, capping at [`crate::limits::MAX_SOURCEMAP_SEGMENTS`].
     ///
     /// Segments beyond the cap are silently dropped so compilation succeeds
     /// with a partial map rather than erroring on adversarial inputs.
+    /// Sets [`Self::segments_dropped`] when the cap is first hit so callers
+    /// can degrade to `source_map: None` + warning (AC-PERF-03).
     pub(crate) fn push_segment(&mut self, out: u32, src_off: u32, len: u32) {
+        debug_assert!(
+            self.segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
+            "segments.len() {} exceeds cap {}; segments_dropped should be set",
+            self.segments.len(),
+            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+        );
         if self.segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
             self.segments.push(RawSegment {
                 out,
@@ -453,6 +527,8 @@ impl MapBuilder {
                 src_off,
                 len,
             });
+        } else {
+            self.segments_dropped = true;
         }
     }
 
@@ -461,7 +537,14 @@ impl MapBuilder {
     /// Used by the `@include` splice path (S6) to insert rebased [`FragmentMap`]
     /// segments with foreign source indices.  Subject to the same
     /// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] cap as [`push_segment`].
+    /// Sets [`Self::segments_dropped`] when the cap is first hit (AC-PERF-03).
     pub(crate) fn push_fragment_segment(&mut self, out: u32, src: u32, src_off: u32, len: u32) {
+        debug_assert!(
+            self.segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
+            "segments.len() {} exceeds cap {}; segments_dropped should be set",
+            self.segments.len(),
+            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+        );
         if self.segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
             self.segments.push(RawSegment {
                 out,
@@ -469,6 +552,8 @@ impl MapBuilder {
                 src_off,
                 len,
             });
+        } else {
+            self.segments_dropped = true;
         }
     }
 
@@ -505,15 +590,33 @@ impl MapBuilder {
             segments,
             sources,
             sources_content,
+            no_sources_content,
             ..
         } = self;
 
         // Stage 1: resolve source-side byte offsets to (line, col).
+        // `sources_content` is needed here for LineTable resolution even when
+        // AC-SEC-04 degradation drops it from the final artifact.
+        // debug_assert: the segment count must never exceed the cap (AC-PERF-03).
+        debug_assert!(
+            segments.len() <= crate::limits::MAX_SOURCEMAP_SEGMENTS,
+            "segments.len() {} exceeds cap at finalize; segments_dropped should have been set",
+            segments.len(),
+        );
         let points = expand_per_line(segments, &sources_content);
         // Stage 2: adjust output offsets for \r stripping.
         let points = compensate_cr(points, body_raw);
         // Stage 3: drop segments beyond the trailing-trim boundary.
         let points = clamp_trailing_trim(points, body_clean_len);
+
+        // AC-SEC-04: honour the ceiling flag set by the caller.
+        // Only omit sourcesContent from the final artifact — resolution above
+        // already used it to expand segments to (line, col) form.
+        let opt_sources_content = if no_sources_content {
+            None
+        } else {
+            Some(sources_content)
+        };
 
         // Empty body: return a SourceMap with an empty mappings string.
         if body_clean_len == 0 {
@@ -521,7 +624,7 @@ impl MapBuilder {
                 version: 3,
                 file,
                 sources,
-                sources_content: Some(sources_content),
+                sources_content: opt_sources_content,
                 names: vec![],
                 mappings: String::new(),
             };
@@ -530,7 +633,7 @@ impl MapBuilder {
         // Stage 4: shift output offsets by frontmatter prefix length.
         let points = shift_frontmatter(points, fm_prefix_len);
         // Stage 5: encode into a SourceMap via from_points.
-        encode_vlq(points, final_body, sources, Some(sources_content), file)
+        encode_vlq(points, final_body, sources, opt_sources_content, file)
     }
 }
 
@@ -574,6 +677,74 @@ pub(crate) struct FragmentMap {
     pub(crate) sources: Vec<(std::sync::Arc<str>, std::sync::Arc<str>)>,
     /// Raw segments local to this module's prompt body.
     pub(crate) segments: Vec<RawSegment>,
+}
+
+// ---------------------------------------------------------------------------
+// rebase_trim — adjust body segments after .trim() (S8)
+// ---------------------------------------------------------------------------
+
+/// Rebase function-body segments after `.trim()` is applied to the raw body output.
+///
+/// Called by `invoke_function` (S8 path) immediately after the body's
+/// `evaluate_nodes` returns and before the trimmed string is returned to the
+/// caller.  The function:
+///
+/// 1. **Drops** segments whose `out` offset falls entirely within the leading
+///    `[start_cursor, start_cursor + lead)` or trailing
+///    `[start_cursor + untrimmed_len − trail, start_cursor + untrimmed_len)`
+///    trimmed regions.
+/// 2. **Shifts** every surviving segment's `out` back by `lead` so that output
+///    offsets are relative to the trimmed body's start position.
+/// 3. **Truncates** `segments` to the survivors.
+///
+/// After this call, `segments[seg_start..]` contains exactly the segments that
+/// map into the trimmed body, with `out` values adjusted to the caller's output
+/// coordinate space (`start_cursor` is the absolute position where the trimmed
+/// body will appear in the parent output).
+///
+/// # Arguments
+///
+/// - `segments` — the full segment `Vec`; elements before `seg_start` are not
+///   touched.
+/// - `seg_start` — first segment index belonging to this function body.
+/// - `start_cursor` — absolute output position where the body started (before
+///   trimming).
+/// - `lead` — byte count stripped from the front of the raw body.
+/// - `untrimmed_len` — byte length of the raw (untrimmed) body output.
+/// - `trail` — byte count stripped from the back of the raw body.
+pub(crate) fn rebase_trim(
+    segments: &mut Vec<RawSegment>,
+    seg_start: usize,
+    start_cursor: u32,
+    lead: u32,
+    untrimmed_len: u32,
+    trail: u32,
+) {
+    if seg_start >= segments.len() {
+        return; // Nothing to do.
+    }
+
+    // The kept region of the raw body output is [lead_end, trail_start).
+    let lead_end: u32 = start_cursor.saturating_add(lead);
+    let trail_start: u32 = start_cursor
+        .saturating_add(untrimmed_len)
+        .saturating_sub(trail);
+
+    let mut write = seg_start;
+    for i in seg_start..segments.len() {
+        let seg = segments[i];
+        // Drop segments that fall in the leading or trailing trimmed zones.
+        if seg.out < lead_end || seg.out >= trail_start {
+            continue;
+        }
+        // Shift out back by `lead` so it is relative to the trimmed start.
+        segments[write] = RawSegment {
+            out: seg.out - lead,
+            ..seg
+        };
+        write += 1;
+    }
+    segments.truncate(write);
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,5 +1698,136 @@ mod tests {
         // Should have 2 segments across 2 output lines
         let parts: Vec<&str> = sm.mappings.split(';').collect();
         assert_eq!(parts.len(), 2, "two output lines");
+    }
+
+    // ── rebase_trim unit tests ──────────────────────────────────────────────
+
+    fn make_segs(triples: &[(u32, u32, u32)]) -> Vec<RawSegment> {
+        triples
+            .iter()
+            .map(|&(out, src_off, len)| RawSegment {
+                out,
+                src: 0,
+                src_off,
+                len,
+            })
+            .collect()
+    }
+
+    /// No-op: no segments in the window → nothing changes.
+    #[test]
+    fn rebase_trim_empty_window() {
+        let mut segs = make_segs(&[(5, 0, 3)]);
+        // seg_start beyond vec → no-op.
+        rebase_trim(&mut segs, 1, 10, 2, 10, 2);
+        assert_eq!(segs.len(), 1, "segment outside window must be preserved");
+        assert_eq!(segs[0].out, 5);
+    }
+
+    /// Lead-only trim: drop leading whitespace segment, shift surviving ones.
+    #[test]
+    fn rebase_trim_lead_only() {
+        // Body: "  Hello" — 2-byte lead, 0 trail, 7 total bytes.
+        // start_cursor = 100
+        // Segment at out=100 (in lead region) → dropped.
+        // Segment at out=102 (content start) → shifted to out=100.
+        let mut segs = make_segs(&[(100, 0, 2), (102, 2, 5)]);
+        rebase_trim(&mut segs, 0, 100, 2, 7, 0);
+        assert_eq!(segs.len(), 1, "lead segment must be dropped");
+        assert_eq!(segs[0].out, 100, "surviving segment shifted by lead");
+        assert_eq!(segs[0].src_off, 2, "src_off unchanged");
+    }
+
+    /// Trail-only trim: drop trailing whitespace segment, keep content.
+    #[test]
+    fn rebase_trim_trail_only() {
+        // Body: "Hello  " — 0-byte lead, 2 trail, 7 total.
+        // start_cursor = 50
+        // Segment at out=50 (content) → kept, out unchanged (lead=0, no shift).
+        // Segment at out=55 (in trail region) → dropped.
+        let mut segs = make_segs(&[(50, 0, 5), (55, 5, 2)]);
+        rebase_trim(&mut segs, 0, 50, 0, 7, 2);
+        assert_eq!(segs.len(), 1, "trail segment must be dropped");
+        assert_eq!(segs[0].out, 50, "no shift when lead=0");
+    }
+
+    /// Both lead and trail trimmed; middle segment survives and is shifted.
+    #[test]
+    fn rebase_trim_lead_and_trail() {
+        // Body: "  Hi  " — 2 lead, 2 trail, 6 total.
+        // start_cursor = 0
+        // out=0 → in lead (< 2) → dropped.
+        // out=2 → in content (2 <= out < 4) → shifted to out=0.
+        // out=4 → in trail (>= 4) → dropped.
+        let mut segs = make_segs(&[(0, 0, 2), (2, 2, 2), (4, 4, 2)]);
+        rebase_trim(&mut segs, 0, 0, 2, 6, 2);
+        assert_eq!(segs.len(), 1, "only content segment survives");
+        assert_eq!(segs[0].out, 0, "shifted by lead (2)");
+        assert_eq!(segs[0].src_off, 2);
+    }
+
+    /// All-whitespace body: no segments survive.
+    #[test]
+    fn rebase_trim_all_whitespace() {
+        let mut segs = make_segs(&[(0, 0, 3), (3, 3, 2)]);
+        // Body is "     " — 5-byte lead, 5-byte trail, 5 total → trail_start = 0
+        rebase_trim(&mut segs, 0, 0, 5, 5, 5);
+        assert_eq!(
+            segs.len(),
+            0,
+            "all segments dropped for all-whitespace body"
+        );
+    }
+
+    /// Segments before seg_start are untouched (they belong to the outer eval).
+    #[test]
+    fn rebase_trim_respects_seg_start() {
+        // Outer segment at out=0, body segments at out=10 (lead) and out=12 (content).
+        let mut segs = make_segs(&[(0, 99, 1), (10, 0, 2), (12, 2, 3)]);
+        // seg_start=1 so only indices 1..3 are in the window.
+        // Body start_cursor=10, lead=2, untrimmed=5, trail=0.
+        rebase_trim(&mut segs, 1, 10, 2, 5, 0);
+        assert_eq!(segs.len(), 2, "outer + content survive");
+        assert_eq!(segs[0].out, 0, "outer segment untouched");
+        assert_eq!(segs[0].src_off, 99, "outer segment src_off untouched");
+        assert_eq!(segs[1].out, 10, "content segment shifted by 2 (12 - 2)");
+    }
+
+    /// `segments_dropped` is set when the cap is hit, and NOT set before.
+    #[test]
+    fn map_builder_segments_dropped_flag() {
+        use crate::limits::MAX_SOURCEMAP_SEGMENTS;
+        let mut b = MapBuilder::new("test.mds".to_string(), "source".to_string());
+        // Fill to one below cap.
+        for i in 0..MAX_SOURCEMAP_SEGMENTS {
+            b.push_segment(i as u32, i as u32, 1);
+        }
+        assert!(
+            !b.segments_dropped,
+            "segments_dropped must be false when exactly at cap"
+        );
+        // One more push → triggers the drop path.
+        b.push_segment(MAX_SOURCEMAP_SEGMENTS as u32, 0, 1);
+        assert!(
+            b.segments_dropped,
+            "segments_dropped must be true after cap is exceeded"
+        );
+        assert_eq!(
+            b.segments.len(),
+            MAX_SOURCEMAP_SEGMENTS,
+            "segment count must stay at cap"
+        );
+    }
+
+    /// `sources_content_bytes()` returns the sum of all registered source sizes.
+    #[test]
+    fn map_builder_sources_content_bytes() {
+        let mut b = MapBuilder::new("a.mds".to_string(), "hello".to_string()); // 5 bytes
+        let _ = b.source_index("b.mds", "world!"); // 6 bytes
+        assert_eq!(
+            b.sources_content_bytes(),
+            11,
+            "sources_content_bytes must sum all source content lengths"
+        );
     }
 }
