@@ -138,6 +138,14 @@ export function assertResultShape(result: unknown, kind: ResultKind): void {
         if (!Array.isArray(r['dependencies'])) {
           throw makeShapeError(kind, `kind='markdown': "dependencies" must be an array`);
         }
+        // sourceMap is optional on markdown results. When present it must be a
+        // non-null object (O(1) — never traverse sources or sourcesContent arrays).
+        if ('sourceMap' in r) {
+          const sm = r['sourceMap'];
+          if (sm === null || typeof sm !== 'object') {
+            throw makeShapeError(kind, `kind='markdown': "sourceMap" must be an object when present, got ${sm === null ? 'null' : typeof sm}`);
+          }
+        }
       } else if (resultKind === 'messages') {
         if (!Array.isArray(r['messages'])) {
           throw makeShapeError(kind, `kind='messages': "messages" must be an array`);
@@ -150,6 +158,10 @@ export function assertResultShape(result: unknown, kind: ResultKind): void {
         }
         if (!Array.isArray(r['dependencies'])) {
           throw makeShapeError(kind, `kind='messages': "dependencies" must be an array`);
+        }
+        // sourceMap must be absent for messages results (AC-FUNC-07 degradation).
+        if ('sourceMap' in r) {
+          throw makeShapeError(kind, `kind='messages': field "sourceMap" must be absent (source maps degrade on message-mode templates)`);
         }
       } else {
         throw makeShapeError(

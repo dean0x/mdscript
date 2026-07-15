@@ -90,6 +90,12 @@ Build/Watch options:
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
+  --source-map                Generate a Source Map v3 sidecar (<output>.map) and embed a
+                              sourceMappingURL comment in the output. Ignored for messages-mode
+                              templates (no renderable output). See ⚠ privacy note below.
+  --embed-sources             Embed original source text in the map's sourcesContent field.
+                              Requires --source-map. ⚠ Embeds full template text — avoid if
+                              templates contain secrets or PII.
 
 Watch-only options:
   --clear                     Clear terminal before each rebuild (only when stderr is a TTY)
@@ -271,6 +277,15 @@ if (fileResult.kind === 'markdown') {
 } else {
   console.log(fileResult.messages, fileResult.dependencies);
 }
+
+// Source Map v3 (Markdown templates only)
+const smResult = compile(source, { sourceMap: true });
+if (smResult.kind === 'markdown' && smResult.sourceMap) {
+  console.log(smResult.sourceMap.version);   // 3
+  console.log(smResult.sourceMap.mappings);  // Base64-VLQ string
+}
+// ⚠ Privacy: sourcesContent embeds the full template source — only use in trusted environments.
+const smWithContent = compile(source, { sourceMap: true, sourcesContent: true });
 
 // Error handling
 try {

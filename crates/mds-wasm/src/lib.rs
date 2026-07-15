@@ -183,6 +183,10 @@ struct ParsedOptions {
     filename: String,
     extra_modules: HashMap<String, String>,
     vars: Option<HashMap<String, Value>>,
+    /// Whether to generate a Source Map v3 document (`sourceMap` option).
+    source_map: bool,
+    /// Whether to embed source file contents in the map (`sourcesContent` option).
+    include_sources_content: bool,
 }
 
 impl Default for ParsedOptions {
@@ -191,6 +195,8 @@ impl Default for ParsedOptions {
             filename: DEFAULT_FILENAME.to_string(),
             extra_modules: HashMap::new(),
             vars: None,
+            source_map: false,
+            include_sources_content: false,
         }
     }
 }
@@ -357,12 +363,52 @@ fn extract_vars(obj: &js_sys::Object) -> Result<Option<HashMap<String, Value>>, 
     })
 }
 
+/// Extract and validate a boolean field from the options object.
+///
+/// Returns `default_val` when the key is absent, undefined, or null.
+/// Errors on non-boolean types.
+fn extract_bool_wasm(
+    obj: &js_sys::Object,
+    key: &str,
+    default_val: bool,
+) -> Result<bool, JsValue> {
+    let val = get_prop_js(obj, key);
+    if val.is_undefined() || val.is_null() {
+        return Ok(default_val);
+    }
+    val.as_bool().ok_or_else(|| {
+        options_error(&format!(
+            "options.{key} must be a boolean, got {}",
+            js_type_name(&val)
+        ))
+    })
+}
+
+/// Extract and validate the `sourceMap` and `sourcesContent` options.
+///
+/// Enforces the cross-field constraint: `sourcesContent` requires `sourceMap`.
+fn extract_compile_options_wasm(obj: &js_sys::Object) -> Result<mds::CompileOptions, JsValue> {
+    let source_map = extract_bool_wasm(obj, "sourceMap", false)?;
+    let include_sources_content = extract_bool_wasm(obj, "sourcesContent", false)?;
+    if include_sources_content && !source_map {
+        return Err(options_error(
+            "option \"sourcesContent\" requires \"sourceMap\" to be true",
+        ));
+    }
+    Ok(mds::CompileOptions {
+        source_map,
+        include_sources_content,
+    })
+}
+
 /// Parse the JS options argument into structured Rust data.
 ///
 /// - `options` may be `null` or `undefined` — all fields default.
 /// - `filename`: string key for the source in the virtual FS; default `"input.mds"`.
 /// - `modules`: `Record<string, string>` of additional virtual files.
 /// - `vars`: `Record<string, any>` of runtime variable overrides.
+/// - `sourceMap`: enable Source Map v3 generation (default `false`).
+/// - `sourcesContent`: embed source file content in the map (requires `sourceMap`).
 fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
     // null / undefined → all defaults
     if options.is_null() || options.is_undefined() {
@@ -377,16 +423,22 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
     // SAFETY: we verified options.is_object() above.
     let obj: js_sys::Object = options.unchecked_into();
 
-    reject_unknown_wasm_keys(&obj, &["filename", "modules", "vars"])?;
+    reject_unknown_wasm_keys(
+        &obj,
+        &["filename", "modules", "vars", "sourceMap", "sourcesContent"],
+    )?;
 
     let filename = extract_filename(&obj)?;
     let extra_modules = extract_modules(&obj)?;
     let vars = extract_vars(&obj)?;
+    let compile_opts = extract_compile_options_wasm(&obj)?;
 
     Ok(ParsedOptions {
         filename,
         extra_modules,
         vars,
+        source_map: compile_opts.source_map,
+        include_sources_content: compile_opts.include_sources_content,
     })
 }
 
@@ -477,6 +529,8 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
             filename,
             extra_modules,
             vars,
+            source_map: false,
+            include_sources_content: false,
         },
         lint_config,
     })
@@ -511,6 +565,8 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
             filename: DEFAULT_FILENAME.to_string(),
             extra_modules: HashMap::new(),
             vars,
+            source_map: false,
+            include_sources_content: false,
         },
         lint_config,
     })
@@ -625,9 +681,14 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 
     catch_panic(AssertUnwindSafe(move || {
         let opts = parse_options(options)?;
+        let compile_opts = mds::CompileOptions {
+            source_map: opts.source_map,
+            include_sources_content: opts.include_sources_content,
+        };
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
-        let result = mds::compile_virtual_with_deps(modules, &opts.filename, opts.vars)
-            .map_err(mds_error_to_js)?;
+        let result =
+            mds::compile_virtual_with_deps_opts(modules, &opts.filename, opts.vars, compile_opts)
+                .map_err(mds_error_to_js)?;
 
         build_canonical_js(result)
     }))

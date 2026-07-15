@@ -9,7 +9,7 @@ import type {
   LintResult,
   MdsNodeBackend,
 } from '../types.js';
-import { varsOpt } from '../util/options.js';
+import { compileOpt, varsOpt } from '../util/options.js';
 import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS } from './contract.js';
 
 /** Options forwarded to the napi addon for source-string lint (accepts basePath). */
@@ -17,16 +17,31 @@ type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?:
 /** Options forwarded to the napi addon for file-based and virtual lint. */
 type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
 
+/** Options shape forwarded to the napi addon for compile (string source). */
+type NapiCompileOpts = {
+  basePath?: string;
+  vars?: Record<string, unknown>;
+  sourceMap?: boolean;
+  sourcesContent?: boolean;
+};
+
+/** Options shape forwarded to the napi addon for compileFile. */
+type NapiFileCompileOpts = {
+  vars?: Record<string, unknown>;
+  sourceMap?: boolean;
+  sourcesContent?: boolean;
+};
+
 /**
  * Shape of the napi addon exports.
- * compile/check accept { basePath?, vars? } for string sources.
- * compileFile/checkFile accept { vars? } for file paths.
+ * compile/check accept { basePath?, vars?, sourceMap?, sourcesContent? } for string sources.
+ * compileFile/checkFile accept { vars?, sourceMap?, sourcesContent? } for file paths.
  * lint/lintFile/lintVirtual accept { basePath?, vars?, rules? }.
  */
 interface NapiAddon {
-  compile(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
+  compile(source: string, opts?: NapiCompileOpts): unknown;
   check(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
-  compileFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
+  compileFile(path: string, opts?: NapiFileCompileOpts): unknown;
   checkFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
   lint(source: string, opts?: NapiLintOpts): unknown;
   lintFile(path: string, opts?: NapiLintFileOpts): unknown;
@@ -69,7 +84,7 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
 
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const result: unknown = addon.compile(source, varsOpt(options));
+      const result: unknown = addon.compile(source, compileOpt(options) as NapiCompileOpts | undefined);
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
@@ -81,7 +96,7 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-      const result: unknown = await addon.compileFile(path, varsOpt(options));
+      const result: unknown = await addon.compileFile(path, compileOpt(options) as NapiFileCompileOpts | undefined);
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
