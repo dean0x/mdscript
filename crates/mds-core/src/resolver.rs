@@ -1711,7 +1711,7 @@ fn has_message_block(nodes: &[Node]) -> bool {
         // than silently being misclassified as markdown.
         Node::Text(_)
         | Node::Interpolation(_)
-        | Node::EscapedBrace
+        | Node::EscapedBrace { .. }
         | Node::Define(_)
         | Node::Import(_)
         | Node::Export(_)

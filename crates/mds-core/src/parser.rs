@@ -259,8 +259,8 @@ impl Parser<'_> {
                     nodes.push(Node::Interpolation(interp));
                     self.pos += 1;
                 }
-                Token::EscapedBrace(_) => {
-                    nodes.push(Node::EscapedBrace);
+                Token::EscapedBrace(offset) => {
+                    nodes.push(Node::EscapedBrace { offset: *offset });
                     self.pos += 1;
                 }
                 Token::CodeFence(fence, offset) => {

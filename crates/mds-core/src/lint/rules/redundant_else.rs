@@ -104,7 +104,7 @@ fn check_nodes(
             Node::Block(b) => check_nodes(&b.body, filename, severity, builder),
             Node::Text(_)
             | Node::Interpolation(_)
-            | Node::EscapedBrace
+            | Node::EscapedBrace { .. }
             | Node::Import(_)
             | Node::Export(_)
             | Node::Include(_) => {}

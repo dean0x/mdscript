@@ -394,7 +394,7 @@ fn walk_nodes(
             }
 
             // ── Leaf nodes (no children, no refs to collect here) ─────────────
-            Node::Text(_) | Node::EscapedBrace => {}
+            Node::Text(_) | Node::EscapedBrace { .. } => {}
         }
     }
 

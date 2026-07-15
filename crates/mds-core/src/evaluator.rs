@@ -70,7 +70,7 @@ fn evaluate_nodes(
     for node in nodes {
         match node {
             Node::Text(t) => output.push_str(&t.text),
-            Node::EscapedBrace => output.push('{'),
+            Node::EscapedBrace { .. } => output.push('{'),
             Node::Interpolation(interp) => {
                 output.push_str(&render_expr(&interp.expr, scope, ctx)?);
             }
@@ -783,7 +783,7 @@ fn collect_messages_strict(
                     return Err(MdsError::mixed_content_at(file, source, offset, len));
                 }
             }
-            Node::EscapedBrace => {
+            Node::EscapedBrace { .. } => {
                 // Orphan escaped brace — treated as orphan whitespace; silently ignored
                 // (mirrors the historical messages-mode treatment of escaped braces).
             }
@@ -1099,7 +1099,7 @@ mod tests {
     fn evaluate_escaped_brace() {
         let nodes = vec![
             text("Use "),
-            Node::EscapedBrace,
+            Node::EscapedBrace { offset: 4 },
             text("name} for interpolation"),
         ];
         let mut scope = Scope::new();

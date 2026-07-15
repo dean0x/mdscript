@@ -71,7 +71,10 @@ pub enum Node {
     /// Variable or function call interpolation: `{name}` or `{greet("x")}`.
     Interpolation(Interpolation),
     /// An escaped brace: `\{` → literal `{`.
-    EscapedBrace,
+    ///
+    /// The `offset` field captures the byte position of the `\` in the source,
+    /// so that later phases can emit a source-map point mapping for this node.
+    EscapedBrace { offset: usize },
     /// `@if var:` ... `@else:` ... `@end`
     If(IfBlock),
     /// `@for item in items:` ... `@end`

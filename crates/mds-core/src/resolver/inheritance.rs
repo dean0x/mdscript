@@ -45,7 +45,8 @@ pub(super) fn seed_effective_blocks(
 /// Return the source offset of `node`, or `0` for node types that carry no offset.
 pub(super) fn node_offset(node: &Node) -> usize {
     match node {
-        Node::Text(_) | Node::EscapedBrace => 0,
+        Node::Text(_) => 0,
+        Node::EscapedBrace { offset } => *offset,
         Node::Interpolation(i) => i.offset,
         Node::If(b) => b.offset,
         Node::For(b) => b.offset,

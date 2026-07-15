@@ -108,7 +108,7 @@ pub(crate) fn nodes_eq(a: &[Node], b: &[Node]) -> bool {
 pub(crate) fn node_eq(a: &Node, b: &Node) -> bool {
     match (a, b) {
         (Node::Text(t1), Node::Text(t2)) => t1.text == t2.text,
-        (Node::EscapedBrace, Node::EscapedBrace) => true,
+        (Node::EscapedBrace { .. }, Node::EscapedBrace { .. }) => true,
         (Node::Interpolation(i1), Node::Interpolation(i2)) => exprs_eq(&i1.expr, &i2.expr),
         (Node::If(b1), Node::If(b2)) => {
             conditions_eq(&b1.condition, &b2.condition)
