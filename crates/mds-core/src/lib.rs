@@ -64,7 +64,7 @@ pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };
 pub use resolver::ModuleCache;
-pub use sourcemap::SourceMap;
+pub use sourcemap::{CompileOptions, SourceMap};
 
 /// A single structured message produced by a template containing `@message` blocks.
 ///
@@ -124,6 +124,10 @@ pub struct CompileResult {
     /// Normalized keys of all modules imported during compilation, in
     /// first-resolution (depth-first) order. Excludes the entry module.
     pub dependencies: Vec<String>,
+    /// Source map for the compiled output.  Present only when
+    /// `CompileOptions::source_map` is `true` (AC-API-02: absent, not null, when off).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_map: Option<SourceMap>,
 }
 
 impl CompileResult {
@@ -171,14 +175,24 @@ impl CompileResult {
             .map(serde_json::Value::String)
             .collect::<Vec<_>>()
             .into();
+        // Source map: serialize if present; absent (not null) when off (AC-API-02).
+        let source_map_val: Option<serde_json::Value> = self
+            .source_map
+            .map(|sm| serde_json::to_value(sm).unwrap_or(serde_json::Value::Null));
 
         match self.output {
-            CompiledOutput::Markdown(text) => serde_json::json!({
-                "kind": "markdown",
-                "output": text,
-                "warnings": warnings,
-                "dependencies": dependencies,
-            }),
+            CompiledOutput::Markdown(text) => {
+                let mut obj = serde_json::json!({
+                    "kind": "markdown",
+                    "output": text,
+                    "warnings": warnings,
+                    "dependencies": dependencies,
+                });
+                if let Some(sm) = source_map_val {
+                    obj["sourceMap"] = sm;
+                }
+                obj
+            }
             CompiledOutput::Messages(msgs) => {
                 let messages: serde_json::Value = msgs
                     .into_iter()
@@ -190,12 +204,16 @@ impl CompileResult {
                     })
                     .collect::<Vec<_>>()
                     .into();
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "kind": "messages",
                     "messages": messages,
                     "warnings": warnings,
                     "dependencies": dependencies,
-                })
+                });
+                if let Some(sm) = source_map_val {
+                    obj["sourceMap"] = sm;
+                }
+                obj
             }
         }
     }
@@ -481,6 +499,7 @@ pub fn compile_collecting_warnings(
         output,
         warnings,
         dependencies,
+        source_map: None,
     })
 }
 
@@ -506,6 +525,7 @@ pub fn compile_str_collecting_warnings(
         output,
         warnings,
         dependencies,
+        source_map: None,
     })
 }
 
@@ -764,6 +784,7 @@ pub fn compile_virtual_collecting_warnings(
         output,
         warnings,
         dependencies,
+        source_map: None,
     })
 }
 
@@ -849,6 +870,138 @@ pub fn compile_virtual_with_deps(
     runtime_vars: Option<HashMap<String, Value>>,
 ) -> Result<CompileResult, MdsError> {
     compile_virtual_collecting_warnings(modules, entry, runtime_vars)
+}
+
+// ── Opts-bearing binding seam functions ──────────────────────────────────────
+//
+// These are the primary entry points for CP5/CP6 (CLI, NAPI, WASM) when source
+// maps are requested.  They accept a [`CompileOptions`] and return a
+// [`CompileResult`] whose `source_map` field is populated when
+// `opts.source_map` is `true`.
+
+/// Compile an MDS file with optional source-map generation.
+///
+/// Like [`compile_with_deps`] but accepts [`CompileOptions`] for fine-grained
+/// control.  When `opts.source_map` is `true`, `result.source_map` contains a
+/// Source Map v3 document (AC-API-02: absent, not null, when `source_map: false`).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::path::Path;
+/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true })?;
+/// if let Some(sm) = result.source_map { println!("{}", sm.to_json()); }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_with_deps_opts(
+    path: impl AsRef<Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let path = path.as_ref();
+    let path_str = path_to_str(path)?;
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    let (output, source_map) =
+        cache.resolve_path_intrinsic_opts(path_str, &vars, &opts, &mut warnings)?;
+    let canonical_entry = NativeFs::check_symlink(path)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path_str.to_owned());
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != &canonical_entry)
+        .collect();
+    Ok(CompileResult {
+        output,
+        warnings,
+        dependencies,
+        source_map,
+    })
+}
+
+/// Compile MDS source from a string with optional source-map generation.
+///
+/// Like [`compile_str_with_deps`] but accepts [`CompileOptions`].
+///
+/// # Examples
+///
+/// ```rust
+/// let result = mds::compile_str_with_deps_opts(
+///     "Hello!\n",
+///     None,
+///     None,
+///     mds::CompileOptions { source_map: true },
+/// )?;
+/// assert!(result.source_map.is_some());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_str_with_deps_opts(
+    source: &str,
+    base_dir: Option<&Path>,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let dir = resolve_base_dir(base_dir)?;
+    let mut cache = ModuleCache::new();
+    let mut warnings = vec![];
+    let (output, source_map) =
+        cache.resolve_source_intrinsic_opts(source, &dir, &vars, &opts, &mut warnings)?;
+    let dependencies = cache.dependencies();
+    Ok(CompileResult {
+        output,
+        warnings,
+        dependencies,
+        source_map,
+    })
+}
+
+/// Compile a virtual-filesystem module with optional source-map generation.
+///
+/// Like [`compile_virtual_with_deps`] but accepts [`CompileOptions`].
+///
+/// # Examples
+///
+/// ```rust
+/// use std::collections::HashMap;
+/// let mut modules = HashMap::new();
+/// modules.insert("main.mds".to_string(), "Hello!\n".to_string());
+/// let result = mds::compile_virtual_with_deps_opts(
+///     modules,
+///     "main.mds",
+///     None,
+///     mds::CompileOptions { source_map: true },
+/// )?;
+/// assert!(result.source_map.is_some());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[must_use = "the compiled output, warnings, and dependencies should be used"]
+pub fn compile_virtual_with_deps_opts(
+    modules: HashMap<String, String>,
+    entry: &str,
+    runtime_vars: Option<HashMap<String, Value>>,
+    opts: CompileOptions,
+) -> Result<CompileResult, MdsError> {
+    let vars = runtime_vars.unwrap_or_default();
+    let mut cache = ModuleCache::virtual_fs(modules);
+    let mut warnings = vec![];
+    let (output, source_map) =
+        cache.resolve_virtual_intrinsic_opts(entry, &vars, &opts, &mut warnings)?;
+    let dependencies = cache
+        .dependencies()
+        .into_iter()
+        .filter(|k| k != entry)
+        .collect();
+    Ok(CompileResult {
+        output,
+        warnings,
+        dependencies,
+        source_map,
+    })
 }
 
 /// Check (validate) a module from an in-memory virtual filesystem without rendering output.

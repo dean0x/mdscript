@@ -330,6 +330,309 @@ pub(crate) fn encode_mappings(mut points: Vec<(u32, u32, u32, u32, u32)>) -> Str
 }
 
 // ---------------------------------------------------------------------------
+// CompileOptions
+// ---------------------------------------------------------------------------
+
+/// Options that control optional compilation features.
+///
+/// Passed into the opts-bearing compile entry points
+/// (`compile_with_deps_opts`, `compile_str_with_deps_opts`,
+/// `compile_virtual_with_deps_opts`) and threaded through the resolver and
+/// evaluator.
+#[derive(Debug, Clone, Default)]
+pub struct CompileOptions {
+    /// Generate a [`SourceMap`] and attach it to [`crate::CompileResult::source_map`].
+    ///
+    /// When `false` (the default) no [`MapBuilder`] is allocated — zero overhead
+    /// for callers that do not need mapping data (AC-PERF-01).
+    pub source_map: bool,
+}
+
+// ---------------------------------------------------------------------------
+// RawSegment — unfinalized segment record
+// ---------------------------------------------------------------------------
+
+/// A single raw, unfinalized source-map segment collected during evaluator
+/// traversal.
+///
+/// Offsets are in bytes relative to the raw evaluator output and the original
+/// source file; the finalization pipeline converts them to the 0-based
+/// line/column deltas the SMv3 `mappings` field requires.
+///
+/// Fixed size: 16 bytes (4 × `u32`). The segment vector is capped at
+/// [`crate::limits::MAX_SOURCEMAP_SEGMENTS`] to bound memory use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawSegment {
+    /// Absolute byte offset of this segment's start in the compiled output
+    /// (relative to the raw evaluator output, before `clean_output`).
+    pub(crate) out: u32,
+    /// 0-based source index into [`MapBuilder::sources`].
+    pub(crate) src: u32,
+    /// Byte offset of the corresponding token in the source file.
+    pub(crate) src_off: u32,
+    /// Byte length of the source token.  Used only for range validation;
+    /// source maps encode start points only (no length field in VLQ).
+    pub(crate) len: u32,
+}
+
+// ---------------------------------------------------------------------------
+// MapBuilder — accumulates segments during evaluation
+// ---------------------------------------------------------------------------
+
+/// Accumulates [`RawSegment`] records during evaluator traversal, then
+/// finalizes them into a [`SourceMap`] via [`MapBuilder::finalize`].
+///
+/// # Cursor invariant
+///
+/// `cursor` must always equal the absolute byte count of compiled output
+/// emitted so far (across all `evaluate_nodes` invocations for this
+/// compilation). `evaluate_nodes` updates `cursor` after every output-
+/// producing node arm. A `debug_assert!` checks the invariant at each
+/// leaf-node record point (when `suppress == 0`).
+///
+/// # Suppression
+///
+/// `suppress > 0` while inside a `@define` function body. Nodes inside
+/// function bodies are not individually mapped; the single `Interpolation`
+/// point for the call site in the parent output is already recorded.
+pub(crate) struct MapBuilder {
+    /// Accumulated raw segment records.
+    pub(crate) segments: Vec<RawSegment>,
+    /// Current absolute byte position in the compiled output.
+    pub(crate) cursor: u32,
+    /// Suppression depth: >0 means we are inside a function body.
+    pub(crate) suppress: u32,
+    /// Index of the source file currently being recorded (0-based into `sources`).
+    pub(crate) current_src: u32,
+    /// Source file names, in registration order (parallel to `sources_content`).
+    pub(crate) sources: Vec<String>,
+    /// Source file contents, parallel to `sources` (for `sourcesContent`).
+    pub(crate) sources_content: Vec<String>,
+}
+
+impl MapBuilder {
+    /// Create a builder seeded with a single source file.
+    ///
+    /// The source file at index 0 is used for all segments until
+    /// [`source_index`] registers additional sources (e.g. for `@extends`
+    /// base templates in CP3+).
+    pub(crate) fn new(source_name: String, source_content: String) -> Self {
+        Self {
+            segments: Vec::new(),
+            cursor: 0,
+            suppress: 0,
+            current_src: 0,
+            sources: vec![source_name],
+            sources_content: vec![source_content],
+        }
+    }
+
+    /// Return the index for `file`, registering it as a new source if needed.
+    ///
+    /// Scans linearly (sources vecs are small — typically 1-3 entries per
+    /// single-file compilation).
+    pub(crate) fn source_index(&mut self, file: &str, content: &str) -> u32 {
+        if let Some(pos) = self.sources.iter().position(|s| s == file) {
+            return pos as u32;
+        }
+        let idx = self.sources.len() as u32;
+        self.sources.push(file.to_string());
+        self.sources_content.push(content.to_string());
+        idx
+    }
+
+    /// Push a new segment, capping at [`crate::limits::MAX_SOURCEMAP_SEGMENTS`].
+    ///
+    /// Segments beyond the cap are silently dropped so compilation succeeds
+    /// with a partial map rather than erroring on adversarial inputs.
+    pub(crate) fn push_segment(&mut self, out: u32, src_off: u32, len: u32) {
+        if self.segments.len() < crate::limits::MAX_SOURCEMAP_SEGMENTS {
+            self.segments.push(RawSegment {
+                out,
+                src: self.current_src,
+                src_off,
+                len,
+            });
+        }
+    }
+
+    /// Finalize into a [`SourceMap`], consuming the builder.
+    ///
+    /// Runs the 5-stage pipeline:
+    /// 1. `expand_per_line` — resolve source-side byte offsets to `(line, col)`.
+    /// 2. `compensate_cr` — subtract `\r` count from output offsets.
+    /// 3. `clamp_trailing_trim` — drop segments in the trailing-trimmed suffix.
+    /// 4. `shift_frontmatter` — shift output offsets by frontmatter prefix length.
+    /// 5. `encode_vlq` — call [`SourceMap::from_points`].
+    ///
+    /// # Parameters
+    ///
+    /// - `body_raw` — pre-`clean_output` raw evaluator output; segment `out`
+    ///   values are byte offsets into this string.
+    /// - `final_body` — fully finalized output (after `clean_output` and
+    ///   `prepend_frontmatter`); passed to `from_points` for output-side line
+    ///   resolution.
+    /// - `fm_prefix_len` — byte length of the frontmatter prefix in
+    ///   `final_body` (`0` when there is no frontmatter).
+    /// - `file` — optional SMv3 `file` field (name of the generated file).
+    pub(crate) fn finalize(
+        self,
+        body_raw: &str,
+        final_body: &str,
+        fm_prefix_len: usize,
+        file: Option<String>,
+    ) -> SourceMap {
+        let body_clean_len = final_body.len() - fm_prefix_len;
+
+        // Destructure to allow independent moves/borrows of each field.
+        let MapBuilder {
+            segments,
+            sources,
+            sources_content,
+            ..
+        } = self;
+
+        // Stage 1: resolve source-side byte offsets to (line, col).
+        let points = expand_per_line(segments, &sources_content);
+        // Stage 2: adjust output offsets for \r stripping.
+        let points = compensate_cr(points, body_raw);
+        // Stage 3: drop segments beyond the trailing-trim boundary.
+        let points = clamp_trailing_trim(points, body_clean_len);
+
+        // Empty body: return a SourceMap with an empty mappings string.
+        if body_clean_len == 0 {
+            return SourceMap {
+                version: 3,
+                file,
+                sources,
+                sources_content: Some(sources_content),
+                names: vec![],
+                mappings: String::new(),
+            };
+        }
+
+        // Stage 4: shift output offsets by frontmatter prefix length.
+        let points = shift_frontmatter(points, fm_prefix_len);
+        // Stage 5: encode into a SourceMap via from_points.
+        encode_vlq(points, final_body, sources, Some(sources_content), file)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finalization stages (pub(crate) for unit testing)
+// ---------------------------------------------------------------------------
+
+/// Stage 1 — Resolve source-side byte offsets to `(line, col)` pairs.
+///
+/// For each [`RawSegment`], looks up `(src_line, src_col)` in the source file
+/// at index `seg.src` by building a [`LineTable`] and calling `.resolve()` on
+/// `seg.src_off`. Segments where `resolve` returns `None` (i.e. `src_off` is
+/// not on a UTF-8 char boundary) are silently dropped.
+///
+/// Returns `Vec<(out, src_index, src_line, src_col)>` — all 0-based.
+pub(crate) fn expand_per_line(
+    segments: Vec<RawSegment>,
+    sources_content: &[String],
+) -> Vec<(u32, u32, u32, u32)> {
+    // Build one LineTable per source to amortize construction cost when multiple
+    // segments reference the same source file.
+    let tables: Vec<LineTable<'_>> = sources_content.iter().map(|s| LineTable::new(s)).collect();
+
+    segments
+        .into_iter()
+        .filter_map(|seg| {
+            let table = tables.get(seg.src as usize)?;
+            let (src_line, src_col) = table.resolve(seg.src_off as usize)?;
+            Some((seg.out, seg.src, src_line, src_col))
+        })
+        .collect()
+}
+
+/// Stage 2 — Adjust output offsets for `\r` characters stripped by `clean_output`.
+///
+/// `clean_output` strips every `\r` from the raw evaluator output before
+/// calculating the final body. Each `\r` before a segment's `out` offset shifts
+/// the segment left by one byte in the cleaned output. This stage counts those
+/// `\r`s and subtracts the count from `out`.
+///
+/// Input/output format: `(out, src_index, src_line, src_col)` — all 0-based.
+pub(crate) fn compensate_cr(
+    points: Vec<(u32, u32, u32, u32)>,
+    body_raw: &str,
+) -> Vec<(u32, u32, u32, u32)> {
+    let raw_bytes = body_raw.as_bytes();
+    points
+        .into_iter()
+        .map(|(out, src, src_line, src_col)| {
+            let up_to = (out as usize).min(raw_bytes.len());
+            let cr_count = raw_bytes[..up_to].iter().filter(|&&b| b == b'\r').count() as u32;
+            (out - cr_count, src, src_line, src_col)
+        })
+        .collect()
+}
+
+/// Stage 3 — Drop segments that fall in the trailing-trimmed suffix.
+///
+/// `clean_output` trims all trailing whitespace from the body.  Any segment
+/// whose `out` offset (after CR compensation) is ≥ `body_clean_len` maps into
+/// the stripped suffix and must be dropped.
+///
+/// `body_clean_len = final_body.len() - fm_prefix_len` is computed by the caller
+/// before calling this function.
+///
+/// Input/output format: `(out, src_index, src_line, src_col)` — all 0-based.
+pub(crate) fn clamp_trailing_trim(
+    points: Vec<(u32, u32, u32, u32)>,
+    body_clean_len: usize,
+) -> Vec<(u32, u32, u32, u32)> {
+    points
+        .into_iter()
+        .filter(|(out, _, _, _)| (*out as usize) < body_clean_len)
+        .collect()
+}
+
+/// Stage 4 — Shift output offsets by the frontmatter prefix byte length.
+///
+/// After `prepend_frontmatter`, the body starts at byte `fm_prefix_len` in the
+/// final output string. Adding this offset to each `out` value aligns segment
+/// positions with the string that [`SourceMap::from_points`] receives.
+///
+/// Input/output format: `(out, src_index, src_line, src_col)` — all 0-based.
+pub(crate) fn shift_frontmatter(
+    points: Vec<(u32, u32, u32, u32)>,
+    fm_prefix_len: usize,
+) -> Vec<(u32, u32, u32, u32)> {
+    let shift = fm_prefix_len as u32;
+    points
+        .into_iter()
+        .map(|(out, src, src_line, src_col)| (out + shift, src, src_line, src_col))
+        .collect()
+}
+
+/// Stage 5 — Build the final [`SourceMap`] from adjusted points.
+///
+/// Calls [`SourceMap::from_points`] with the fully adjusted point list.
+///
+/// Input format: `(out_byte_in_final_body, src_index, src_line, src_col)`.
+pub(crate) fn encode_vlq(
+    points: Vec<(u32, u32, u32, u32)>,
+    final_body: &str,
+    sources: Vec<String>,
+    sources_content: Option<Vec<String>>,
+    file: Option<String>,
+) -> SourceMap {
+    SourceMap::from_points(
+        final_body,
+        sources,
+        sources_content,
+        file,
+        points
+            .into_iter()
+            .map(|(out, src, src_line, src_col)| (out as usize, src, src_line, src_col)),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -696,13 +999,12 @@ mod tests {
         // Decode the mappings string back into absolute points.
         let lines: Vec<&str> = m.split(';').collect();
         let mut decoded: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
-        let mut prev_gen_col: i64 = 0;
         let mut prev_src_idx: i64 = 0;
         let mut prev_src_line: i64 = 0;
         let mut prev_src_col: i64 = 0;
 
         for (line_idx, line_str) in lines.iter().enumerate() {
-            prev_gen_col = 0; // reset per line
+            let mut prev_gen_col: i64 = 0; // resets to 0 at each new output line
             for seg in line_str.split(',').filter(|s| !s.is_empty()) {
                 let fields = vlq_decode_fields(seg);
                 assert_eq!(fields.len(), 4, "each segment must have 4 fields");
@@ -870,5 +1172,302 @@ mod tests {
 
         let fields = vlq_decode_fields(segs[0]);
         assert_eq!(fields, vec![0, 0, 0, 0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // MapBuilder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn map_builder_new_seeds_source_at_index_zero() {
+        let b = MapBuilder::new("a.mds".to_string(), "source".to_string());
+        assert_eq!(b.sources, vec!["a.mds"]);
+        assert_eq!(b.sources_content, vec!["source"]);
+        assert_eq!(b.current_src, 0);
+        assert_eq!(b.cursor, 0);
+        assert_eq!(b.suppress, 0);
+        assert!(b.segments.is_empty());
+    }
+
+    #[test]
+    fn map_builder_source_index_deduplicates() {
+        let mut b = MapBuilder::new("a.mds".to_string(), "content-a".to_string());
+        assert_eq!(b.source_index("a.mds", "content-a"), 0);
+        assert_eq!(b.source_index("b.mds", "content-b"), 1);
+        assert_eq!(b.source_index("a.mds", "content-a"), 0); // dedup
+        assert_eq!(b.source_index("b.mds", "content-b"), 1); // dedup
+        assert_eq!(b.sources.len(), 2);
+    }
+
+    #[test]
+    fn map_builder_push_segment_caps_at_limit() {
+        use crate::limits::MAX_SOURCEMAP_SEGMENTS;
+        let mut b = MapBuilder::new("a.mds".to_string(), String::new());
+        for i in 0..=(MAX_SOURCEMAP_SEGMENTS + 5) as u32 {
+            b.push_segment(i, i, 1);
+        }
+        assert_eq!(b.segments.len(), MAX_SOURCEMAP_SEGMENTS, "capped at limit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 1: expand_per_line
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expand_per_line_basic() {
+        // Source: "hello\nworld\n"
+        // byte 0 → line 0, col 0
+        // byte 6 → line 1, col 0
+        let source = "hello\nworld\n";
+        let segs = vec![
+            RawSegment {
+                out: 0,
+                src: 0,
+                src_off: 0,
+                len: 5,
+            },
+            RawSegment {
+                out: 5,
+                src: 0,
+                src_off: 6,
+                len: 5,
+            },
+        ];
+        let pts = expand_per_line(segs, &[source.to_string()]);
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0], (0, 0, 0, 0)); // out=0, src=0, line=0, col=0
+        assert_eq!(pts[1], (5, 0, 1, 0)); // out=5, src=0, line=1, col=0
+    }
+
+    #[test]
+    fn expand_per_line_drops_invalid_src_off() {
+        // 'é' is 2 bytes; byte 1 is not a char boundary → dropped.
+        let source = "é";
+        let segs = vec![
+            RawSegment {
+                out: 0,
+                src: 0,
+                src_off: 0,
+                len: 2,
+            }, // valid
+            RawSegment {
+                out: 2,
+                src: 0,
+                src_off: 1,
+                len: 1,
+            }, // mid-char → drop
+        ];
+        let pts = expand_per_line(segs, &[source.to_string()]);
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0], (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn expand_per_line_multi_source() {
+        let src_a = "abc";
+        let src_b = "xyz";
+        let segs = vec![
+            RawSegment {
+                out: 0,
+                src: 0,
+                src_off: 0,
+                len: 1,
+            },
+            RawSegment {
+                out: 1,
+                src: 1,
+                src_off: 0,
+                len: 1,
+            },
+        ];
+        let pts = expand_per_line(segs, &[src_a.to_string(), src_b.to_string()]);
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0], (0, 0, 0, 0));
+        assert_eq!(pts[1], (1, 1, 0, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 2: compensate_cr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compensate_cr_no_cr() {
+        let body_raw = "hello\nworld\n";
+        let pts = vec![(5u32, 0u32, 0u32, 5u32)];
+        let result = compensate_cr(pts.clone(), body_raw);
+        assert_eq!(result, pts, "no \\r → offsets unchanged");
+    }
+
+    #[test]
+    fn compensate_cr_one_cr_before_point() {
+        // "hello\r\nworld": \r at byte 5.  Point at byte 6 (the \n's successor)
+        // has 1 \r before it → adjusted to 5.
+        let body_raw = "hello\r\nworld";
+        let pts = vec![(6u32, 0u32, 0u32, 0u32)];
+        let result = compensate_cr(pts, body_raw);
+        assert_eq!(result[0].0, 5, "one \\r before offset 6 → adjusted to 5");
+    }
+
+    #[test]
+    fn compensate_cr_multiple_cr() {
+        // "\r\r\rfoo": 3 \r at bytes 0,1,2.  Point at byte 3 has 3 \r before it.
+        let body_raw = "\r\r\rfoo";
+        let pts = vec![(3u32, 0u32, 0u32, 0u32)];
+        let result = compensate_cr(pts, body_raw);
+        assert_eq!(result[0].0, 0, "3 \\r before offset 3 → adjusted to 0");
+    }
+
+    #[test]
+    fn compensate_cr_cr_after_point() {
+        // "\rhello\r": \r at byte 0, point at byte 0 → no \r before it.
+        let body_raw = "\rhello\r";
+        let pts = vec![(0u32, 0u32, 0u32, 0u32)];
+        let result = compensate_cr(pts, body_raw);
+        assert_eq!(result[0].0, 0, "\\r at or after point → no adjustment");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 3: clamp_trailing_trim
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clamp_trailing_trim_drops_past_clean_len() {
+        let pts = vec![
+            (0u32, 0u32, 0u32, 0u32),
+            (5u32, 0u32, 0u32, 5u32),
+            (10u32, 0u32, 1u32, 0u32),
+        ];
+        // body_clean_len = 6: points at 0 and 5 survive; 10 is dropped.
+        let result = clamp_trailing_trim(pts, 6);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0);
+        assert_eq!(result[1].0, 5);
+    }
+
+    #[test]
+    fn clamp_trailing_trim_empty_body() {
+        let pts = vec![(0u32, 0u32, 0u32, 0u32), (3u32, 0u32, 0u32, 3u32)];
+        let result = clamp_trailing_trim(pts, 0);
+        assert!(result.is_empty(), "empty body → all segments dropped");
+    }
+
+    #[test]
+    fn clamp_trailing_trim_all_survive() {
+        let pts = vec![(0u32, 0u32, 0u32, 0u32), (4u32, 0u32, 0u32, 4u32)];
+        let result = clamp_trailing_trim(pts.clone(), 100);
+        assert_eq!(result, pts, "all within clean_len → none dropped");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 4: shift_frontmatter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shift_frontmatter_zero_prefix() {
+        let pts = vec![(0u32, 0u32, 0u32, 0u32), (5u32, 0u32, 1u32, 0u32)];
+        let result = shift_frontmatter(pts.clone(), 0);
+        assert_eq!(result, pts, "zero prefix → no shift");
+    }
+
+    #[test]
+    fn shift_frontmatter_nonzero_prefix() {
+        // "---\nfm: v\n---\nbody\n" — prefix = 14 bytes.
+        let pts = vec![(0u32, 0u32, 0u32, 0u32), (5u32, 0u32, 1u32, 0u32)];
+        let result = shift_frontmatter(pts, 14);
+        assert_eq!(result[0].0, 14);
+        assert_eq!(result[1].0, 19);
+    }
+
+    // -----------------------------------------------------------------------
+    // MapBuilder::finalize (end-to-end integration)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn finalize_simple_no_frontmatter_no_cr() {
+        // Source template: "Hello {name}!\n"
+        // After evaluation with name="World": raw = "Hello World!\n"
+        // clean_output: same (no trailing whitespace change)
+        // Segments: Text("Hello ") at src_off=0, len=6; Interpolation at src_off=6, len=6
+        let mut b = MapBuilder::new("t.mds".to_string(), "Hello {name}!\n".to_string());
+        b.push_segment(0, 0, 6); // "Hello " maps to src byte 0
+        b.push_segment(6, 6, 6); // "{name}" maps to src byte 6
+
+        let body_raw = "Hello World!\n";
+        let final_body = "Hello World!\n"; // no frontmatter
+        let sm = b.finalize(body_raw, final_body, 0, None);
+
+        assert_eq!(sm.version, 3);
+        assert_eq!(sm.sources, vec!["t.mds"]);
+        assert!(sm.sources_content.is_some());
+        // mappings must be non-empty (two segments on one line)
+        assert!(!sm.mappings.is_empty(), "mappings should not be empty");
+        assert!(
+            !sm.mappings.contains(';'),
+            "single output line → no semicolons in mappings"
+        );
+        assert!(
+            !sm.mappings.contains(r#""-""#),
+            "VLQ alphabet must not contain '-'"
+        );
+        // Verify 2 segments
+        let segs: Vec<&str> = sm.mappings.split(',').collect();
+        assert_eq!(segs.len(), 2, "two segments expected");
+    }
+
+    #[test]
+    fn finalize_empty_body_yields_empty_mappings() {
+        // Raw output is whitespace-only; clean_output produces "".
+        let mut b = MapBuilder::new("t.mds".to_string(), "  \n  ".to_string());
+        b.push_segment(0, 0, 5);
+
+        let body_raw = "  \n  ";
+        let final_body = ""; // clean_output → ""
+        let sm = b.finalize(body_raw, final_body, 0, None);
+
+        assert_eq!(sm.mappings, "", "empty body → empty mappings");
+    }
+
+    #[test]
+    fn finalize_with_frontmatter_shifts_points() {
+        // "---\nfm: v\n---\nHello\n" — frontmatter prefix = 14 bytes
+        // Segment at out=0 in raw output → out=14 in final output after shift
+        let mut b = MapBuilder::new("t.mds".to_string(), "Hello\n".to_string());
+        b.push_segment(0, 0, 5);
+
+        let body_raw = "Hello\n";
+        let final_body = "---\nfm: v\n---\nHello\n"; // 14 byte prefix + 6 body
+        let fm_prefix_len = 14;
+        let sm = b.finalize(body_raw, final_body, fm_prefix_len, None);
+
+        assert!(!sm.mappings.is_empty());
+        // The output side point should be on line 3 (0-based), col 0
+        // "---\n" = line 0, "fm: v\n" = line 1, "---\n" = line 2, "Hello\n" = line 3
+        let lines: Vec<&str> = sm.mappings.split(';').collect();
+        // Lines 0, 1, 2 are frontmatter (empty segments), line 3 has the segment
+        assert_eq!(lines.len(), 4, "output has 4 lines (0-indexed: 0..3)");
+        assert!(
+            lines[3].contains('A') || !lines[3].is_empty(),
+            "line 3 has segment"
+        );
+    }
+
+    #[test]
+    fn finalize_compensates_cr() {
+        // Raw output contains \r\n line endings → clean_output strips \r.
+        // "Hello\r\nWorld\r\n" → clean: "Hello\nWorld\n"
+        // Segment at raw out=7 ("\r\n" takes bytes 5-6, "World" starts at 7)
+        // → compensated: 7 - 1 cr before 7 = 6 (correct position in clean output)
+        let mut b = MapBuilder::new("t.mds".to_string(), "src".to_string());
+        b.push_segment(0, 0, 5); // "Hello" in raw output
+        b.push_segment(7, 0, 5); // "World" in raw output (byte 7 after \r\n)
+
+        let body_raw = "Hello\r\nWorld\r\n";
+        let final_body = "Hello\nWorld\n"; // clean_output result
+        let sm = b.finalize(body_raw, final_body, 0, None);
+
+        assert!(!sm.mappings.is_empty());
+        // Should have 2 segments across 2 output lines
+        let parts: Vec<&str> = sm.mappings.split(';').collect();
+        assert_eq!(parts.len(), 2, "two output lines");
     }
 }

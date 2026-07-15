@@ -102,3 +102,12 @@ pub(crate) const MAX_DIAGNOSTICS: usize = 1_000;
 /// `evaluate_nodes` size check; this limit guards the cumulative total.
 /// The incremental check in `collect_single_message` catches runaway growth early.
 pub(crate) const MAX_MESSAGES_TOTAL_SIZE: usize = MAX_OUTPUT_SIZE;
+
+/// Maximum number of segments in a generated source map.
+///
+/// At 16 bytes per `RawSegment`, 1 000 000 segments cap the in-memory segment buffer
+/// at ~16 MiB — well above the segment count for any practical MDS template (a 50 MiB
+/// output would need ~millions of distinct tokens to saturate this limit).  New segments
+/// beyond the cap are silently dropped so compilation succeeds with a partial map rather
+/// than erroring on adversarial inputs.
+pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;

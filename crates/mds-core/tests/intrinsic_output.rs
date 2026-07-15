@@ -603,6 +603,7 @@ fn compile_result_is_debug_clone_partialeq() {
         output: CompiledOutput::Markdown("x\n".to_string()),
         warnings: vec!["w".to_string()],
         dependencies: vec!["dep.mds".to_string()],
+        source_map: None,
     };
     let cloned = r.clone();
     assert_eq!(r, cloned);

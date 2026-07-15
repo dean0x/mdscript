@@ -28,7 +28,7 @@ const MAX_WARNINGS: usize = 1_000;
 
 /// Transient state threaded through the evaluator for a single compilation.
 ///
-/// Bundles the three mutable parameters that were previously threaded individually
+/// Bundles the mutable parameters that were previously threaded individually
 /// through every function signature, reducing arity and making call sites clearer.
 pub(crate) struct EvalContext<'a> {
     /// LIFO stack of active function call keys, used to detect direct recursion.
@@ -41,6 +41,10 @@ pub(crate) struct EvalContext<'a> {
     total_message_bytes: usize,
     /// Accumulated warnings (e.g. empty @include).
     warnings: &'a mut Vec<String>,
+    /// Optional source-map builder.  Present when `CompileOptions::source_map` is
+    /// `true`.  `None` when the caller did not request a source map — zero-cost path
+    /// (AC-PERF-01: no allocation when off).
+    pub(crate) map: Option<crate::sourcemap::MapBuilder>,
 }
 
 /// Evaluate a module body into a final rendered string.
@@ -56,8 +60,36 @@ pub fn evaluate(
         total_iterations: 0,
         total_message_bytes: 0,
         warnings,
+        map: None,
     };
     evaluate_nodes(nodes, scope, &mut ctx)
+}
+
+/// Evaluate a module body into a rendered string while recording source-map
+/// segments via `builder`.
+///
+/// Returns `(output, builder)` so the caller can pass the builder on to the
+/// finalization stage.  The builder's `cursor` is guaranteed to equal
+/// `output.len() as u32` when this function returns.
+pub(crate) fn evaluate_with_map(
+    nodes: &[Node],
+    scope: &mut Scope,
+    warnings: &mut Vec<String>,
+    builder: crate::sourcemap::MapBuilder,
+) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
+    let mut ctx = EvalContext {
+        call_stack: Vec::new(),
+        total_iterations: 0,
+        total_message_bytes: 0,
+        warnings,
+        map: Some(builder),
+    };
+    let output = evaluate_nodes(nodes, scope, &mut ctx)?;
+    let map = ctx
+        .map
+        .take()
+        .expect("MapBuilder disappeared during evaluate_with_map — compiler bug");
+    Ok((output, map))
 }
 
 fn evaluate_nodes(
@@ -67,33 +99,123 @@ fn evaluate_nodes(
 ) -> Result<String, MdsError> {
     let mut output = String::new();
 
+    // `saved_cursor` anchors the absolute output position when this invocation
+    // of evaluate_nodes started.  All segment `out` values are computed as
+    // `saved_cursor + output.len()` so that segments in recursive calls (e.g.
+    // inside @if/@for arms) carry the correct absolute byte offset in the final
+    // compiled output even though each call has its own local `output` string.
+    //
+    // We read cursor once here (O(1)) rather than on every node to avoid
+    // repeated borrows of ctx.map inside the loop body.
+    let saved_cursor: u32 = ctx.map.as_ref().map_or(0, |m| m.cursor);
+
     for node in nodes {
         match node {
-            Node::Text(t) => output.push_str(&t.text),
-            Node::EscapedBrace { .. } => output.push('{'),
+            Node::Text(t) => {
+                if let Some(ref mut map) = ctx.map {
+                    if map.suppress == 0 {
+                        let abs_out = saved_cursor + output.len() as u32;
+                        debug_assert_eq!(
+                            map.cursor, abs_out,
+                            "cursor invariant violated at Text offset={}",
+                            t.offset
+                        );
+                        map.push_segment(abs_out, t.offset as u32, t.text.len() as u32);
+                    }
+                }
+                output.push_str(&t.text);
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
+            }
+            Node::EscapedBrace { offset } => {
+                if let Some(ref mut map) = ctx.map {
+                    if map.suppress == 0 {
+                        let abs_out = saved_cursor + output.len() as u32;
+                        debug_assert_eq!(
+                            map.cursor, abs_out,
+                            "cursor invariant violated at EscapedBrace offset={offset}"
+                        );
+                        // Source span: '\{' is 2 source bytes (backslash + brace).
+                        map.push_segment(abs_out, *offset as u32, 2);
+                    }
+                }
+                output.push('{');
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
+            }
             Node::Interpolation(interp) => {
-                output.push_str(&render_expr(&interp.expr, scope, ctx)?);
+                // Record the whole `{expr}` as one segment BEFORE evaluating it.
+                // `render_expr` may call `invoke_function` → `evaluate_nodes` on
+                // the function body (suppressed), but those inner segments are not
+                // recorded — only the call site is.
+                if let Some(ref mut map) = ctx.map {
+                    if map.suppress == 0 {
+                        let abs_out = saved_cursor + output.len() as u32;
+                        debug_assert_eq!(
+                            map.cursor, abs_out,
+                            "cursor invariant violated at Interpolation offset={}",
+                            interp.offset
+                        );
+                        map.push_segment(abs_out, interp.offset as u32, interp.len as u32);
+                    }
+                    // Anchor cursor so inner evaluate_nodes invocations (via
+                    // invoke_function) start from the correct absolute position.
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
+                let rendered = render_expr(&interp.expr, scope, ctx)?;
+                output.push_str(&rendered);
+                // Correct cursor after render_expr (function bodies may have left it
+                // at an offset relative to the trimmed inner output).
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
             }
             Node::If(block) => {
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
                 output.push_str(&evaluate_if(block, scope, ctx)?);
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
             }
             Node::For(block) => {
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
                 output.push_str(&evaluate_for(block, scope, ctx)?);
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
             }
             Node::Define(_) => {
-                // Handled by resolver with full lexical capture
+                // Handled by resolver with full lexical capture; no output.
             }
             Node::Import(_) | Node::Export(_) => {
-                // Handled by resolver, skip during evaluation
+                // Handled by resolver, skip during evaluation.
             }
             Node::Include(inc) => {
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
                 output.push_str(&evaluate_include(inc, scope, ctx)?);
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
             }
             Node::Message(block) => {
                 // Text mode: render the body inline, ignoring the role marker.
                 // This maintains full backward compatibility — @message blocks are
                 // transparent when compiling to plain text.
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
                 output.push_str(&evaluate_nodes(&block.body, scope, ctx)?);
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
             }
             Node::Block(block) => {
                 // Standalone mode: render the block's default body inline.
@@ -101,7 +223,13 @@ fn evaluate_nodes(
                 // transparent wrapper in non-extending files.
                 // The resolver splices child overrides before evaluation, so this arm
                 // handles both base defaults and child-override bodies.
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
                 output.push_str(&evaluate_block(block, scope, ctx)?);
+                if let Some(ref mut map) = ctx.map {
+                    map.cursor = saved_cursor + output.len() as u32;
+                }
             }
         }
         if output.len() > MAX_OUTPUT_SIZE {
@@ -372,6 +500,13 @@ fn invoke_function(
         };
         scope.set_var(&param.name, value);
     }
+    // Suppress source-map recording inside function bodies.  The call site
+    // (the Interpolation node) is already recorded as a single point; inner
+    // nodes would produce segments with out-offsets relative to the trimmed
+    // function output, not the parent output, so they must be suppressed.
+    if let Some(ref mut map) = ctx.map {
+        map.suppress += 1;
+    }
     ctx.call_stack.push(call_key.to_string());
     let result = evaluate_nodes(&func.body, scope, ctx).map(|s| s.trim().to_string());
     // Safety-critical LIFO invariant: call_stack tracks recursion detection.
@@ -379,6 +514,9 @@ fn invoke_function(
     // stack overflows. Return a structured error rather than panicking so
     // callers get a proper diagnostic instead of an opaque abort.
     let popped = ctx.call_stack.pop();
+    if let Some(ref mut map) = ctx.map {
+        map.suppress = map.suppress.saturating_sub(1);
+    }
     let lifo_result = if popped.as_deref() == Some(call_key) {
         Ok(())
     } else {
@@ -748,6 +886,7 @@ pub fn evaluate_messages_intrinsic(
         total_iterations: 0,
         total_message_bytes: 0,
         warnings,
+        map: None,
     };
     let mut messages = Vec::new();
     collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;

@@ -280,6 +280,7 @@ fn compile_result_type_importable() {
         output: CompiledOutput::Markdown("hello\n".to_string()),
         warnings: vec!["warn".to_string()],
         dependencies: vec!["lib.mds".to_string()],
+        source_map: None,
     };
     let cloned = co.clone();
     assert_eq!(co, cloned);
@@ -307,6 +308,7 @@ fn compile_result_to_json() {
         output: CompiledOutput::Markdown("hello\n".to_string()),
         warnings: vec![],
         dependencies: vec!["dep.mds".to_string()],
+        source_map: None,
     };
     let json = serde_json::to_string(&co).expect("should serialize");
     assert!(json.contains("\"output\""), "missing output key: {json}");
