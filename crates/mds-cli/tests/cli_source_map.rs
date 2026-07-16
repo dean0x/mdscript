@@ -745,6 +745,110 @@ fn sm_vlq_decoder_known_values() {
     assert_eq!(seg2, (1, 1, 1, 1), "CCCC must decode to all-one offsets");
 }
 
+// ── helpers: multi-source attribution ────────────────────────────────────────
+
+/// Return `true` if the mappings string contains at least one 4-field segment
+/// whose accumulated `src_idx` is > 0 after applying all deltas.
+///
+/// Implements the SMv3 state-machine: gen_col resets at each `;`, but all
+/// other fields (src_idx, orig_line, orig_col) accumulate across the entire
+/// mapping string.  A src_idx > 0 means the segment references a source file
+/// other than the primary entry (index 0 in sources[]).
+fn mappings_reference_multiple_sources(mappings: &str) -> bool {
+    let mut src_idx: i64 = 0;
+    for group in mappings.split(';') {
+        for seg in group.split(',') {
+            if seg.is_empty() {
+                continue;
+            }
+            let mut iter = seg.bytes();
+            // First field: gen_col delta — consume but ignore.
+            if decode_vlq_one(&mut iter).is_none() {
+                continue;
+            }
+            // Second field: src_idx delta — accumulate and test.
+            if let Some(delta) = decode_vlq_one(&mut iter) {
+                src_idx = src_idx.saturating_add(delta);
+                if src_idx > 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ── SM-17: @include multi-file source attribution (TEST-3) ───────────────────
+
+/// Compile a parent template that `@import`s a partial and verify that the
+/// generated source map attributes output lines to BOTH source files.
+///
+/// Acceptance criteria (TEST-3):
+///   1. sources[] contains at least 2 entries.
+///   2. One entry refers to the parent (sm_include_parent.mds).
+///   3. One entry refers to the included file (_sm_partial.mds).
+///   4. The mappings contain a segment that references src_idx > 0
+///      (i.e., at least one output line is attributed to the included file).
+#[test]
+fn sm17_include_multi_file_attribution() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.md");
+    let result = build_file(
+        &fixture("sm_include_parent.mds"),
+        &["--source-map", "-o", out.to_str().unwrap()],
+    );
+    assert!(
+        result.status.success(),
+        "build of @include fixture should succeed, stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let map_path = dir.path().join("out.md.map");
+    assert!(map_path.exists(), "sidecar .md.map must exist");
+
+    let v = read_map_json(&map_path);
+
+    // (1) sources[] must have at least 2 entries.
+    let sources = v["sources"].as_array().expect("sources must be an array");
+    assert!(
+        sources.len() >= 2,
+        "sources[] must have ≥ 2 entries for a template that @imports another, got: {:?}",
+        sources
+    );
+
+    // (2) At least one source must identify the parent file.
+    let has_parent = sources.iter().any(|s| {
+        s.as_str()
+            .map_or(false, |p| p.contains("sm_include_parent"))
+    });
+    assert!(
+        has_parent,
+        "sources[] must include the parent file (sm_include_parent), got: {:?}",
+        sources
+    );
+
+    // (3) At least one source must identify the imported partial.
+    let has_partial = sources
+        .iter()
+        .any(|s| s.as_str().map_or(false, |p| p.contains("_sm_partial")));
+    assert!(
+        has_partial,
+        "sources[] must include the imported file (_sm_partial), got: {:?}",
+        sources
+    );
+
+    // (4) The VLQ mappings must attribute at least one output segment to a
+    //     source other than the primary entry (src_idx > 0).
+    let mappings = v["mappings"].as_str().unwrap();
+    assert!(
+        mappings_reference_multiple_sources(mappings),
+        "mappings must contain a segment referencing the imported source (src_idx > 0); \
+         got sources: {:?}, mappings: {:?}",
+        sources,
+        mappings
+    );
+}
+
 // ── SM-VLQ-INT: VLQ integration test with actual map output ──────────────────
 
 #[test]
