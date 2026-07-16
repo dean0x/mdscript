@@ -225,39 +225,62 @@ def test_sm_py8_golden_structure(
 def test_sm_py9_live_cli_source_map_parity(
     mds_cli: Path, tmp_path: Path
 ) -> None:
-    """CLI `mds build --source-map` must produce a sourceMap that matches Python's.
+    """CLI `mds build --source-map` sidecar must be structurally valid and
+    match the Python binding's sourceMap at the structural level.
 
-    Parity is checked at the structural level (version, sources, names) rather
-    than byte-for-byte because the CLI path relativizes sources[] while the
-    Python binding echoes the file's absolute path as caller-supplied identity.
+    `mds build` does not have a `--format` flag (only `mds lint` does), so
+    parity is obtained by reading the `.md.map` sidecar file written by
+    `mds build --source-map -o <output>`.  Structural fields (version, names,
+    mappings) are compared; sources[] is intentionally excluded because the
+    CLI relativizes paths while the Python binding uses the caller-supplied
+    absolute path as the source label.
     """
     src = _SIMPLE_SRC
     src_file = tmp_path / "parity.mds"
     src_file.write_text(src, encoding="utf-8")
 
-    out = subprocess.run(
-        [str(mds_cli), "build", "--source-map", "--format", "json", str(src_file)],
+    out_file = tmp_path / "parity_out.md"
+    map_file = tmp_path / "parity_out.md.map"
+
+    proc = subprocess.run(
+        [str(mds_cli), "build", "--source-map", str(src_file), "-o", str(out_file)],
         capture_output=True,
         text=True,
         encoding="utf-8",
     )
-    if out.returncode != 0 or not out.stdout.strip():
-        pytest.skip("CLI does not support --format json output (older build)")
+    assert proc.returncode == 0, (
+        f"CLI build --source-map failed (rc={proc.returncode}): {proc.stderr}"
+    )
+    assert map_file.exists(), f"CLI did not write sidecar map at {map_file}"
 
-    cli_payload = json.loads(out.stdout)
-    cli_sm = cli_payload.get("sourceMap")
-    if cli_sm is None:
-        pytest.skip("CLI does not include sourceMap in JSON output")
+    cli_sm = json.loads(map_file.read_text(encoding="utf-8"))
 
     py_result = m.compile_file(src_file, source_map=True)
     py_sm = py_result.source_map
     assert py_sm is not None
 
-    # Structural invariants must hold for both.
-    _check_sm_structure(cli_sm)
+    # Structural invariants for CLI sidecar (has a "file" key; use inline check).
+    assert cli_sm.get("version") == 3, f"CLI map version must be 3, got: {cli_sm.get('version')}"
+    assert isinstance(cli_sm.get("sources"), list), "CLI map sources must be a list"
+    assert isinstance(cli_sm.get("names"), list), "CLI map names must be a list"
+    assert isinstance(cli_sm.get("mappings"), str), "CLI map mappings must be a string"
+    assert _VLQ_RE.match(cli_sm["mappings"]) is not None, (
+        f"CLI map mappings not valid VLQ: {cli_sm['mappings']!r}"
+    )
+
+    # Structural invariants for Python binding result.
     _check_sm_structure(py_sm)
+
+    # Cross-binding parity on fields that are format-invariant.
     assert cli_sm["version"] == py_sm["version"] == 3
     assert cli_sm["names"] == py_sm["names"]
+    # mappings must be byte-identical: both bindings use the same mds-core
+    # serializer (ADR-002 / AC-API-04).
+    assert cli_sm["mappings"] == py_sm["mappings"], (
+        f"CLI and Python mappings must match:\n"
+        f"  CLI:    {cli_sm['mappings']!r}\n"
+        f"  Python: {py_sm['mappings']!r}"
+    )
 
 
 # ── SM-PY-10: compile_file source_map ──────────────────────────────────────
