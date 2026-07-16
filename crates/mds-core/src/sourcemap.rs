@@ -393,6 +393,32 @@ pub struct CompileOptions {
     pub include_sources_content: bool,
 }
 
+/// Error returned by [`CompileOptions::validate`] when the field combination is invalid.
+///
+/// Each binding maps this to its own error type and message; the unit struct intentionally
+/// carries no context — the per-binding wording is always determined at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidOptionsError;
+
+impl CompileOptions {
+    /// Enforce the cross-field invariant: `include_sources_content` requires `source_map`.
+    ///
+    /// Returns `Err(InvalidOptionsError)` when the combination is invalid.  Each binding
+    /// is responsible for converting the failure into its own error type and message,
+    /// preserving the existing `mds::invalid_options` code and binding-appropriate wording.
+    ///
+    /// avoids PF-004/PF-005: this is the single enforcement point; no binding can
+    /// silently diverge on the rule even when message wording legitimately differs
+    /// (napi/wasm use camelCase; Python uses snake_case + `True`).
+    pub fn validate(&self) -> Result<(), InvalidOptionsError> {
+        if self.include_sources_content && !self.source_map {
+            Err(InvalidOptionsError)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RawSegment — unfinalized segment record
 // ---------------------------------------------------------------------------
@@ -787,11 +813,35 @@ pub(crate) fn compensate_cr(
     body_raw: &str,
 ) -> Vec<(u32, u32, u32, u32)> {
     let raw_bytes = body_raw.as_bytes();
+
+    // Fast path: no CRs anywhere in the body (the common LF-only case, ADR-002).
+    // Avoids both the prefix-sum build and any per-point work.
+    if !raw_bytes.contains(&b'\r') {
+        return points;
+    }
+
+    // Build a prefix-sum table: `cr_prefix[i]` = number of `\r` bytes in
+    // `raw_bytes[..i]`.  Length = `raw_bytes.len() + 1` so the lookup
+    // `cr_prefix[up_to]` is valid for any `out` in `0..=raw_bytes.len()`.
+    //
+    // This is O(M) where M = body length, and reduces the per-point work to
+    // an O(1) index — total cost O(M + N) vs the previous O(M × N).
+    //
+    // NOTE: the lookup is order-independent: each point is adjusted using only
+    // its own `out` value, so unsorted or out-of-order `out` values (produced
+    // by the splice/S8 paths) are handled correctly.
+    let mut cr_prefix: Vec<u32> = Vec::with_capacity(raw_bytes.len() + 1);
+    cr_prefix.push(0);
+    for &b in raw_bytes {
+        let prev = *cr_prefix.last().unwrap();
+        cr_prefix.push(if b == b'\r' { prev + 1 } else { prev });
+    }
+
     points
         .into_iter()
         .map(|(out, src, src_line, src_col)| {
             let up_to = (out as usize).min(raw_bytes.len());
-            let cr_count = raw_bytes[..up_to].iter().filter(|&&b| b == b'\r').count() as u32;
+            let cr_count = cr_prefix[up_to];
             (out - cr_count, src, src_line, src_col)
         })
         .collect()
@@ -865,6 +915,52 @@ pub(crate) fn encode_vlq(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // CompileOptions::validate (ARCH-1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compile_options_validate_ok_defaults() {
+        let opts = CompileOptions::default();
+        assert!(opts.validate().is_ok(), "default options must be valid");
+    }
+
+    #[test]
+    fn compile_options_validate_ok_source_map_only() {
+        let opts = CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+        };
+        assert!(
+            opts.validate().is_ok(),
+            "source_map without include_sources_content is valid"
+        );
+    }
+
+    #[test]
+    fn compile_options_validate_ok_both() {
+        let opts = CompileOptions {
+            source_map: true,
+            include_sources_content: true,
+        };
+        assert!(
+            opts.validate().is_ok(),
+            "source_map=true + include_sources_content=true is valid"
+        );
+    }
+
+    #[test]
+    fn compile_options_validate_err_sources_content_without_source_map() {
+        let opts = CompileOptions {
+            source_map: false,
+            include_sources_content: true,
+        };
+        assert!(
+            opts.validate().is_err(),
+            "include_sources_content=true without source_map=true must be Err"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Test-only VLQ decoder

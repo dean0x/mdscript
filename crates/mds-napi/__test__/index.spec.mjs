@@ -447,6 +447,33 @@ describe('options validation', () => {
       },
     );
   });
+
+  // V-11: source-map options are not accepted on the check/checkFile path (ARCH-5).
+  // check() does not generate maps; passing sourceMap/sourcesContent is rejected as
+  // an unknown key (aligns with Python's check() which has no such parameters).
+  test('V-11: sourceMap on check throws mds::invalid_options (not a valid check option)', () => {
+    assert.throws(
+      () => check('Hello!\n', { sourceMap: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+    assert.throws(
+      () => check('Hello!\n', { sourcesContent: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+    assert.throws(
+      () => checkFile(SIMPLE_MDS, { sourceMap: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
 });
 
 // ── Resource limit tests ──────────────────────────────────────────────────────

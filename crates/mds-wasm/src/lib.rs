@@ -382,19 +382,19 @@ fn extract_bool_wasm(obj: &js_sys::Object, key: &str, default_val: bool) -> Resu
 
 /// Extract and validate the `sourceMap` and `sourcesContent` options.
 ///
-/// Enforces the cross-field constraint: `sourcesContent` requires `sourceMap`.
+/// Delegates the cross-field constraint check to [`mds::CompileOptions::validate`] —
+/// the single enforcement point (avoids PF-004/PF-005).
 fn extract_compile_options_wasm(obj: &js_sys::Object) -> Result<mds::CompileOptions, JsValue> {
     let source_map = extract_bool_wasm(obj, "sourceMap", false)?;
     let include_sources_content = extract_bool_wasm(obj, "sourcesContent", false)?;
-    if include_sources_content && !source_map {
-        return Err(options_error(
-            "option \"sourcesContent\" requires \"sourceMap\" to be true",
-        ));
-    }
-    Ok(mds::CompileOptions {
+    let opts = mds::CompileOptions {
         source_map,
         include_sources_content,
-    })
+    };
+    opts.validate().map_err(|_| {
+        options_error("option \"sourcesContent\" requires \"sourceMap\" to be true")
+    })?;
+    Ok(opts)
 }
 
 /// Parse the JS options argument into structured Rust data.

@@ -502,21 +502,23 @@ fn extract_bool_direct(
 
 /// Extract and validate the `sourceMap` and `sourcesContent` options.
 ///
-/// Enforces the cross-field constraint: `sourcesContent` requires `sourceMap`.
+/// Delegates the cross-field constraint check to [`mds::CompileOptions::validate`] —
+/// the single enforcement point (avoids PF-004/PF-005).
 /// Returns a [`mds::CompileOptions`] with both fields populated.
 fn extract_compile_options_direct(env: &Env, obj: &Object) -> napi::Result<mds::CompileOptions> {
     let source_map = extract_bool_direct(env, obj, "sourceMap", false)?;
     let include_sources_content = extract_bool_direct(env, obj, "sourcesContent", false)?;
-    if include_sources_content && !source_map {
-        return Err(throw_options_error(
-            env,
-            "option \"sourcesContent\" requires \"sourceMap\" to be true",
-        ));
-    }
-    Ok(mds::CompileOptions {
+    let opts = mds::CompileOptions {
         source_map,
         include_sources_content,
-    })
+    };
+    opts.validate().map_err(|_| {
+        throw_options_error(
+            env,
+            "option \"sourcesContent\" requires \"sourceMap\" to be true",
+        )
+    })?;
+    Ok(opts)
 }
 
 /// Parse options for `compile` and `check` (source-string variants).
@@ -571,6 +573,46 @@ fn parse_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<FileOpts> {
     let compile_opts = extract_compile_options_direct(env, &opts_obj)?;
 
     Ok((vars, compile_opts))
+}
+
+/// Parse options for `check` (source-string check-only path) — no source-map keys.
+///
+/// Valid keys: `basePath`, `vars`.  Source-map options (`sourceMap`, `sourcesContent`)
+/// are NOT accepted here — `check` does not generate maps, so they are irrelevant and
+/// would silently mislead callers.  Aligns with Python's `check()` which accepts only
+/// `base_path`/`vars` (ARCH-5).
+type CheckOpts = (Option<PathBuf>, Option<HashMap<String, Value>>);
+
+fn parse_check_opts(env: &Env, opts: Option<Object>) -> napi::Result<CheckOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok((None, None));
+    };
+    reject_unknown_napi_keys(env, &opts_obj, &["basePath", "vars"])?;
+    let base_path = extract_base_path_direct(env, &opts_obj)?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    Ok((base_path, vars))
+}
+
+/// Parse options for `checkFile` (file-path check-only path) — no source-map keys.
+///
+/// Valid keys: `vars` only.  Source-map options and `basePath` are not accepted (ARCH-5).
+type CheckFileOpts = Option<HashMap<String, Value>>;
+
+fn parse_check_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<CheckFileOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok(None);
+    };
+    // basePath is not valid for file operations.
+    if opts_obj.has_named_property("basePath")? {
+        return Err(throw_options_error(
+            env,
+            "option \"basePath\" is not valid for compileFile/checkFile; \
+             the base directory is derived from the file path",
+        ));
+    }
+    reject_unknown_napi_keys(env, &opts_obj, &["vars"])?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    Ok(vars)
 }
 
 // ── Canonical result object builder ──────────────────────────────────────────
@@ -671,7 +713,8 @@ pub fn compile_file(
 pub fn check(env: Env, source: String, opts: Option<Object>) -> napi::Result<CheckResult> {
     check_source_size(&env, &source)?;
 
-    let (base_path, vars, _compile_opts) = parse_compile_opts(&env, opts)?;
+    // Use the check-only parser: source-map options are not valid here (ARCH-5).
+    let (base_path, vars) = parse_check_opts(&env, opts)?;
 
     let ((), warnings) = run_catching(
         &env,
@@ -696,7 +739,8 @@ pub fn check(env: Env, source: String, opts: Option<Object>) -> napi::Result<Che
 /// Same shape as `check`.
 #[napi(js_name = "checkFile")]
 pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<CheckResult> {
-    let (vars, _compile_opts) = parse_file_opts(&env, opts)?;
+    // Use the check-only parser: source-map options are not valid here (ARCH-5).
+    let vars = parse_check_file_opts(&env, opts)?;
 
     let path_buf = PathBuf::from(path);
     let ((), warnings) = run_catching(

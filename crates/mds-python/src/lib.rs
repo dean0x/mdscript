@@ -825,23 +825,27 @@ fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<m
 }
 
 /// Build a [`mds::CompileOptions`] from the `source_map` and `sources_content`
-/// keyword arguments, enforcing the cross-field invariant:
+/// keyword arguments, enforcing the cross-field invariant via
+/// [`mds::CompileOptions::validate`] — the single enforcement point
+/// (avoids PF-004/PF-005).
+///
 /// `sources_content=True` without `source_map=True` → `mds::invalid_options`.
 fn extract_compile_options(
     py: Python<'_>,
     source_map: bool,
     sources_content: bool,
 ) -> PyResult<mds::CompileOptions> {
-    if sources_content && !source_map {
-        return Err(options_error(
-            py,
-            "option \"sources_content\" requires \"source_map\" to be True",
-        ));
-    }
-    Ok(mds::CompileOptions {
+    let opts = mds::CompileOptions {
         source_map,
         include_sources_content: sources_content,
-    })
+    };
+    opts.validate().map_err(|_| {
+        options_error(
+            py,
+            "option \"sources_content\" requires \"source_map\" to be True",
+        )
+    })?;
+    Ok(opts)
 }
 
 // ── Public functions ────────────────────────────────────────────────────────────
