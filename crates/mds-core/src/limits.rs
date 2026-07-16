@@ -122,3 +122,14 @@ pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
 /// Set equal to `MAX_OUTPUT_SIZE` (50 MB): the content set should not dwarf the
 /// compiled output it annotates.
 pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
+
+/// Maximum number of distinct modules (files) that may be resolved in a single
+/// compilation, across all paths (native file, virtual/WASM/napi).
+///
+/// Enforced on the native file resolution path by `resolve_by_key` so that
+/// adversarial import graphs cannot cause unbounded module loading.  The
+/// virtual/WASM/napi binding layers enforce the same cap at input-validation time
+/// before any resolution begins (applies PF-004).
+///
+/// 256 matches the binding-layer constant so all code paths behave identically.
+pub(crate) const MAX_MODULE_COUNT: usize = 256;

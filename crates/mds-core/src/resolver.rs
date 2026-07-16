@@ -11,9 +11,10 @@ use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::evaluator::evaluate_messages_intrinsic;
 use crate::evaluator::evaluate_with_map;
+use crate::evaluator::evaluate_with_map_seeded;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
-use crate::limits::MAX_BLOCKS_PER_MODULE;
+use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_MODULE_COUNT};
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
 // Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
@@ -368,6 +369,18 @@ impl ModuleCache {
         // Step 3: depth guard.
         self.check_import_depth()?;
 
+        // Step 3.5: module count guard (REL-2, applies PF-004).
+        // Virtual/WASM/napi paths enforce MAX_MODULE_COUNT at input-validation time;
+        // native file resolution enforces it here as each new module is resolved from
+        // disk so all paths share an identical bound.  Runtime guard, not debug_assert
+        // — must hold in release builds (aligns with PF-005).
+        if self.modules.len() >= MAX_MODULE_COUNT {
+            return Err(MdsError::resource_limit(format!(
+                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
+                self.modules.len(),
+            )));
+        }
+
         // Step 4: read the file only on a cache miss.
         let source = self.fs.read(key)?;
 
@@ -638,19 +651,36 @@ impl ModuleCache {
         let mut output = String::new();
         let mut current_map = map;
 
+        // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
+        // across ALL regions.  Before this fix each call to evaluate_with_map seeded a
+        // fresh EvalContext (total_iterations = 0) so K regions each got an independent
+        // 1 M budget — CPU/DoS amplification ∝ region count.  Now we thread the running
+        // totals from region to region via evaluate_with_map_seeded so the same cap
+        // applies to the entire @extends compilation, matching the non-map (text) path.
+        let mut running_iterations: usize = 0;
+        let mut running_msg_bytes: usize = 0;
+
         for (nodes, origin) in regions {
             // Switch the builder's current_src to the source that owns this region.
             if let Some(ref mut builder) = current_map {
                 let src_idx = builder.source_index(origin.file.as_ref(), origin.source.as_ref());
                 builder.current_src = src_idx;
                 // Cursor must equal accumulated output length before entering each region.
-                // evaluate_with_map maintains this invariant internally, but after each
-                // region we push the raw output and the builder's cursor is already correct.
+                // evaluate_with_map_seeded maintains this invariant internally, but after
+                // each region we push the raw output and the builder's cursor is correct.
             }
 
             let region_output = if let Some(builder) = current_map.take() {
-                let (region_out, returned_builder) =
-                    evaluate_with_map(nodes, scope, warnings, builder)?;
+                let (region_out, returned_builder, iters, bytes) = evaluate_with_map_seeded(
+                    nodes,
+                    scope,
+                    warnings,
+                    builder,
+                    running_iterations,
+                    running_msg_bytes,
+                )?;
+                running_iterations = iters;
+                running_msg_bytes = bytes;
                 current_map = Some(returned_builder);
                 region_out
             } else {
@@ -956,19 +986,34 @@ impl ModuleCache {
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
-            // Only keep the FragmentMap when the body is non-empty — an empty prompt
-            // has no segments worth recording.
-            let fmap = body.as_ref().map(|_| {
-                Arc::new(crate::sourcemap::FragmentMap {
-                    sources: returned
-                        .sources
-                        .iter()
-                        .zip(returned.sources_content.iter())
-                        .map(|(p, c)| (Arc::from(p.as_str()), Arc::from(c.as_str())))
-                        .collect(),
-                    segments: returned.segments,
+
+            // RUST-3 / PF-004 observability: propagate the segment-cap drop flag from
+            // sub-module evaluation.  Without this check a >1M-segment imported module
+            // silently yields a partial FragmentMap (incorrect splice attributions) with
+            // no AC-PERF-03 warning.  Mirror the top-level degradation logic exactly.
+            let fmap = if returned.segments_dropped {
+                warnings.push(format!(
+                    "source map segment cap ({} segments) exceeded in imported module '{}'; \
+                     source_map will be None for this compilation",
+                    crate::limits::MAX_SOURCEMAP_SEGMENTS,
+                    ctx.file_str,
+                ));
+                None
+            } else {
+                // Only keep the FragmentMap when the body is non-empty — an empty prompt
+                // has no segments worth recording.
+                body.as_ref().map(|_| {
+                    Arc::new(crate::sourcemap::FragmentMap {
+                        sources: returned
+                            .sources
+                            .iter()
+                            .zip(returned.sources_content.iter())
+                            .map(|(p, c)| (Arc::from(p.as_str()), Arc::from(c.as_str())))
+                            .collect(),
+                        segments: returned.segments,
+                    })
                 })
-            });
+            };
             (body, fmap)
         } else {
             let body_raw = evaluate(&module.body, &mut scope, warnings)?;
@@ -1312,6 +1357,14 @@ impl ModuleCache {
 
         // Depth guard (E6).
         self.check_import_depth()?;
+
+        // Module count guard — mirrors the check in resolve_by_key (REL-2, applies PF-004).
+        if self.modules.len() >= MAX_MODULE_COUNT {
+            return Err(MdsError::resource_limit(format!(
+                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
+                self.modules.len(),
+            )));
+        }
 
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;

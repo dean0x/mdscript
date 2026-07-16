@@ -95,27 +95,54 @@ pub fn evaluate(
 /// Returns `(output, builder)` so the caller can pass the builder on to the
 /// finalization stage.  The builder's `cursor` is guaranteed to equal
 /// `output.len() as u32` when this function returns.
+///
+/// Delegates to [`evaluate_with_map_seeded`] with seed counters of 0.
+/// Use [`evaluate_with_map_seeded`] directly when you need to carry cumulative
+/// resource budgets across multiple invocations (e.g. `@extends` regions).
 pub(crate) fn evaluate_with_map(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
+    let (output, map, _, _) = evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0)?;
+    Ok((output, map))
+}
+
+/// Evaluate nodes with source-map recording and pre-seeded cumulative resource budgets.
+///
+/// Like [`evaluate_with_map`] but additionally accepts `seed_iterations` and
+/// `seed_msg_bytes` to continue cumulative budgets from prior work (e.g. earlier
+/// `@extends` regions).  Returns `(output, builder, total_iterations, total_msg_bytes)`
+/// so the caller can thread the running totals into the next invocation.
+///
+/// Used by `evaluate_regions_with_map` (resolver.rs) to enforce a single cumulative
+/// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
+///
+/// The `MapBuilder` is returned as a structured error rather than a panic if it
+/// disappears — aligns with PF-005 (don't rely on panic for invariants).
+pub(crate) fn evaluate_with_map_seeded(
+    nodes: &[Node],
+    scope: &mut Scope,
+    warnings: &mut Vec<String>,
+    builder: crate::sourcemap::MapBuilder,
+    seed_iterations: usize,
+    seed_msg_bytes: usize,
+) -> Result<(String, crate::sourcemap::MapBuilder, usize, usize), MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
-        total_iterations: 0,
-        total_message_bytes: 0,
+        total_iterations: seed_iterations,
+        total_message_bytes: seed_msg_bytes,
         warnings,
         map: Some(builder),
         fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
     };
     let output = evaluate_nodes(nodes, scope, &mut ctx)?;
-    let map = ctx
-        .map
-        .take()
-        .expect("MapBuilder disappeared during evaluate_with_map — compiler bug");
-    Ok((output, map))
+    let map = ctx.map.take().ok_or_else(|| {
+        MdsError::syntax("internal: MapBuilder disappeared during evaluate_with_map — compiler bug")
+    })?;
+    Ok((output, map, ctx.total_iterations, ctx.total_message_bytes))
 }
 
 fn evaluate_nodes(
@@ -566,23 +593,26 @@ fn invoke_function(
         .is_some_and(|m| m.suppress == 0 && func.origin.is_some());
 
     if use_s8 {
-        let origin = func
-            .origin
-            .as_ref()
-            .expect("S8 guard guarantees origin is Some");
-
-        // Snapshot pre-body state.
-        let start_cursor: u32 = ctx.map.as_ref().unwrap().cursor;
-        let seg_start: usize = ctx.map.as_ref().unwrap().segments.len();
-        let saved_src: u32 = ctx.map.as_ref().unwrap().current_src;
-
-        // Register the definition file and switch current_src to it.
-        let def_src: u32 = ctx
-            .map
-            .as_mut()
-            .unwrap()
-            .source_index(origin.file.as_ref(), origin.source.as_ref());
-        ctx.map.as_mut().unwrap().current_src = def_src;
+        // use_s8 := ctx.map.is_some() && func.origin.is_some() — bind both once so the
+        // body avoids six scattered .expect()/.unwrap() re-derivations (RUST-1 / PF-005).
+        // The else branch is unreachable by invariant but returns a structured error
+        // rather than panicking, aligning with PF-005.
+        let (start_cursor, seg_start, saved_src) =
+            if let (Some(map), Some(origin)) = (ctx.map.as_mut(), func.origin.as_ref()) {
+                // Snapshot pre-body state and register the definition file in one binding.
+                let sc = map.cursor;
+                let ss = map.segments.len();
+                let sr = map.current_src;
+                let def_src = map.source_index(origin.file.as_ref(), origin.source.as_ref());
+                map.current_src = def_src;
+                (sc, ss, sr)
+                // map and origin borrows released here; ctx is usable below.
+            } else {
+                // Unreachable: use_s8 verified both are Some above.
+                return Err(MdsError::syntax(
+                    "internal: S8 invariant violated — map or origin unexpectedly None",
+                ));
+            };
 
         ctx.call_stack.push(call_key.to_string());
         let body_result = evaluate_nodes(&func.body, scope, ctx);
