@@ -187,6 +187,8 @@ impl From<&CompiledOutput> for OutputKind {
         match output {
             CompiledOutput::Markdown(_) => OutputKind::Markdown,
             CompiledOutput::Messages(_) => OutputKind::Messages,
+            // `CompiledOutput` is `#[non_exhaustive]`; update this match when new variants land.
+            _ => unreachable!("unknown CompiledOutput variant"),
         }
     }
 }
@@ -611,6 +613,8 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
             json.push('\n');
             Ok(json)
         }
+        // `CompiledOutput` is `#[non_exhaustive]`; update this match when new variants land.
+        _ => unreachable!("unknown CompiledOutput variant"),
     }
 }
 

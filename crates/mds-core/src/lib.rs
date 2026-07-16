@@ -69,6 +69,10 @@ pub use sourcemap::{CompileOptions, InvalidOptionsError, SourceMap};
 /// A single structured message produced by a template containing `@message` blocks.
 ///
 /// Mirrors a chat API message: `{ "role": "system", "content": "..." }`.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from the compile API; do not construct via struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Message {
     /// The role string (e.g. `"system"`, `"user"`, `"assistant"`).
@@ -96,10 +100,14 @@ pub use value::Value;
 ///
 /// Shape is intrinsic to the template: any `@message` block → Messages, otherwise Markdown.
 ///
+/// This enum is `#[non_exhaustive]`: new variants may be added in minor releases.
+/// Exhaustive `match` patterns require a `_ => { ... }` catch-all arm in external crates.
+///
 /// # JSON shape
 /// Serializes as adjacently-tagged: `{"kind":"markdown","value":"..."}` or
 /// `{"kind":"messages","value":[...]}`. (Internal tagging cannot represent newtype
 /// variants wrapping `String`/`Vec`, so `content`/`value` field is required.)
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum CompiledOutput {
@@ -115,6 +123,11 @@ pub enum CompiledOutput {
 /// template (Markdown or Messages). The `dependencies` list is in depth-first
 /// resolution order and excludes the entry module itself — it contains only
 /// the files imported (transitively) by the entry.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from the compile API; do not construct via struct literal in
+/// external crates.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CompileResult {
     /// The compiled output: Markdown or structured messages, depending on the template.

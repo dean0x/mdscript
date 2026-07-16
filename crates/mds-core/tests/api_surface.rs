@@ -275,13 +275,13 @@ fn module_cache_new_still_works() {
 
 #[test]
 fn compile_result_type_importable() {
-    // CompileResult must be constructible and implement Debug + Clone + PartialEq.
-    let co = CompileResult {
-        output: CompiledOutput::Markdown("hello\n".to_string()),
-        warnings: vec!["warn".to_string()],
-        dependencies: vec!["lib.mds".to_string()],
-        source_map: None,
-    };
+    // CompileResult is produced by the compile API (it is #[non_exhaustive] — not externally
+    // constructible). Its public fields are readable and it implements Debug + Clone + PartialEq.
+    let co = mds::compile_str("Hello!\n").expect("should compile");
+    let _ = &co.output;
+    let _ = &co.warnings;
+    let _ = &co.dependencies;
+    let _ = &co.source_map;
     let cloned = co.clone();
     assert_eq!(co, cloned);
     let _ = format!("{co:?}");
@@ -289,27 +289,39 @@ fn compile_result_type_importable() {
 
 #[test]
 fn compiled_output_type_importable() {
-    // CompiledOutput must be constructible (both variants) + Debug + Clone + PartialEq.
-    let md = CompiledOutput::Markdown("hi\n".to_string());
-    let msgs = CompiledOutput::Messages(vec![mds::Message {
-        role: "user".to_string(),
-        content: "hi".to_string(),
-    }]);
+    // CompiledOutput is produced by the compile API.  Both CompiledOutput and Message are
+    // #[non_exhaustive]; callers obtain them from compile results, not from struct/enum literals.
+    // The type implements Debug + Clone + PartialEq and Message fields are publicly readable.
+    let md = mds::compile_str("hi\n").expect("compile").output;
+    let msgs = mds::compile_str("@message user:\nhi\n@end\n")
+        .expect("compile")
+        .output;
     assert_eq!(md.clone(), md);
     assert_ne!(md, msgs);
     let _ = format!("{md:?} {msgs:?}");
+    // Message fields are readable via if-let (match on #[non_exhaustive] enum needs `_` arm).
+    if let CompiledOutput::Messages(v) = &msgs {
+        let _ = &v[0].role;
+        let _ = &v[0].content;
+    }
 }
 
 #[test]
 fn compile_result_to_json() {
     // CompileResult must serialize to JSON with "output", "warnings", "dependencies" keys,
     // and the output is the adjacently-tagged CompiledOutput shape.
-    let co = CompileResult {
-        output: CompiledOutput::Markdown("hello\n".to_string()),
-        warnings: vec![],
-        dependencies: vec!["dep.mds".to_string()],
-        source_map: None,
-    };
+    // Obtain a real CompileResult with a dependency via the compile API.
+    let modules = HashMap::from([
+        (
+            "dep.mds".to_string(),
+            "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        ),
+        (
+            "main.mds".to_string(),
+            "@import \"./dep.mds\"\n{greet(\"World\")}\n".to_string(),
+        ),
+    ]);
+    let co = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
     let json = serde_json::to_string(&co).expect("should serialize");
     assert!(json.contains("\"output\""), "missing output key: {json}");
     assert!(
@@ -831,11 +843,15 @@ fn module_cache_resolve_source_accepts_str() {
 
 #[test]
 fn message_type_exists() {
-    // Message must be constructible and implement Debug + Clone + PartialEq.
-    let msg = mds::Message {
-        role: "user".to_string(),
-        content: "Hello.".to_string(),
-    };
+    // Message is produced by the compile API (it is #[non_exhaustive] — not externally
+    // constructible). Its public fields are readable and it implements Debug + Clone + PartialEq.
+    let msgs = mds::compile_str("@message user:\nHello.\n@end\n")
+        .expect("should compile")
+        .into_messages()
+        .expect("messages result");
+    let msg = msgs.into_iter().next().expect("one message");
+    assert_eq!(msg.role, "user");
+    assert_eq!(msg.content, "Hello.");
     let cloned = msg.clone();
     assert_eq!(msg, cloned);
     let _ = format!("{msg:?}");
@@ -846,10 +862,12 @@ fn message_serde_field_names_pinned() {
     // CRITICAL: pin the serde field names "role" and "content" so a future Rust
     // rename cannot silently break the WASM/JS contract that depends on the JSON
     // shape `[{"role":"...", "content":"..."}]`.
-    let msg = mds::Message {
-        role: "system".to_string(),
-        content: "You are helpful.".to_string(),
-    };
+    // Obtain the Message from the compile API (Message is #[non_exhaustive]).
+    let msgs = mds::compile_str("@message system:\nYou are helpful.\n@end\n")
+        .expect("should compile")
+        .into_messages()
+        .expect("messages result");
+    let msg = msgs.into_iter().next().expect("one message");
     let json = serde_json::to_string(&msg).expect("Message must serialize to JSON");
     let parsed: serde_json::Value =
         serde_json::from_str(&json).expect("Message JSON must be valid");

@@ -817,10 +817,9 @@ fn sm17_include_multi_file_attribution() {
     );
 
     // (2) At least one source must identify the parent file.
-    let has_parent = sources.iter().any(|s| {
-        s.as_str()
-            .map_or(false, |p| p.contains("sm_include_parent"))
-    });
+    let has_parent = sources
+        .iter()
+        .any(|s| s.as_str().is_some_and(|p| p.contains("sm_include_parent")));
     assert!(
         has_parent,
         "sources[] must include the parent file (sm_include_parent), got: {:?}",
@@ -830,7 +829,7 @@ fn sm17_include_multi_file_attribution() {
     // (3) At least one source must identify the imported partial.
     let has_partial = sources
         .iter()
-        .any(|s| s.as_str().map_or(false, |p| p.contains("_sm_partial")));
+        .any(|s| s.as_str().is_some_and(|p| p.contains("_sm_partial")));
     assert!(
         has_partial,
         "sources[] must include the imported file (_sm_partial), got: {:?}",
