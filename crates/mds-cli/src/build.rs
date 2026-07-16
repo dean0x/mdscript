@@ -928,7 +928,24 @@ pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: 
     // still-absolute result to the bare file name rather than panicking or
     // leaking a filesystem path. Runtime guard (not debug_assert) so the
     // guarantee holds in release builds too.
-    if result.starts_with('/') || result.contains(":\\") {
+    //
+    // SEC-2 (guards PF-005 theme / AC-SEC-01): broaden the Windows drive-path
+    // guard beyond the backslash-only check.  `relative_path` and Rule 4 both
+    // normalise separators to `/`, so a forward-slashed drive path such as
+    // `C:/secret/foo.mds` or a cross-drive relative result like `../../D:/x.mds`
+    // contains `:/` rather than `:\\` and slipped through the old guard.  The
+    // three conditions below together catch all three forms:
+    //   • `:\` — classic backslash-qualified Windows drive path
+    //   • `:/` — forward-slash-normalised Windows drive path (SEC-2 gap)
+    //   • leading `<letter>:` — bare drive designator without a separator
+    let is_drive_qualified = |s: &str| -> bool {
+        s.contains(":\\")
+            || s.contains(":/")
+            || (s.len() >= 2
+                && (s.as_bytes()[0] as char).is_ascii_alphabetic()
+                && s.as_bytes()[1] == b':')
+    };
+    if result.starts_with('/') || is_drive_qualified(&result) {
         return Path::new(stripped)
             .file_name()
             .map(|n| n.to_string_lossy().replace('\\', "/"))
@@ -1817,6 +1834,31 @@ mod tests {
         assert!(
             got.ends_with("abs_input.mds"),
             "must still resolve to the source file: {got}"
+        );
+    }
+
+    // SEC-2: forward-slashed Windows drive paths must also degrade to filename.
+    // (The old guard only checked ":\\" — "C:/" slipped through.)
+
+    #[test]
+    fn relativize_forward_slashed_drive_path_degrades_to_filename() {
+        // `C:/secret/foo.mds` on Unix is not seen as absolute by Path, so it
+        // went through Rule 4 unchanged and slipped past the old `":\\"` guard.
+        let got = relativize_source_path("C:/secret/foo.mds", Path::new("build"), false);
+        assert_eq!(
+            got, "foo.mds",
+            "forward-slashed drive path must degrade to filename: {got}"
+        );
+    }
+
+    #[test]
+    fn relativize_cross_drive_relative_path_degrades_to_filename() {
+        // A cross-drive path suffix (`../../D:/x.mds`) that passes through
+        // Rule 4 contains `:/ ` not `:\\` and previously slipped through.
+        let got = relativize_source_path("../../D:/x.mds", Path::new("build"), false);
+        assert_eq!(
+            got, "x.mds",
+            "cross-drive :/ path must degrade to filename: {got}"
         );
     }
 
