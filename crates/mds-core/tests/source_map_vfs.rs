@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 
-use mds::{CompileOptions, CompileResult};
+use mds::{CompileOptions, CompileResult, Value};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1023,5 +1023,118 @@ fn source_map_s8_output_unchanged() {
     assert_eq!(
         with_map, without_map,
         "S8 must not change compiled output (AC-PERF-02)"
+    );
+}
+
+/// RUST-4 / guards ADR-002: @extends compiled output must be byte-identical whether
+/// `source_map` is `true` (region-by-region `evaluate_regions_with_map` path) or
+/// `false` (whole-body `evaluate` path).
+///
+/// This test would catch output drift introduced by the REL-1 budget-threading fix
+/// — if cumulative iteration counting ever altered the output string the assertion
+/// below would fail.
+#[test]
+fn extends_output_byte_identical_with_and_without_source_map() {
+    let mut modules = HashMap::new();
+    // Base has no frontmatter; @block is a body directive, not YAML.
+    modules.insert(
+        "base.mds".to_string(),
+        "@block content:\ndefault\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nextends: base.mds\n---\n@block content:\nchild content\n@end\n".to_string(),
+    );
+
+    let with_map = vfs_opts(
+        modules.clone(),
+        "child.mds",
+        CompileOptions {
+            source_map: true,
+            ..Default::default()
+        },
+    );
+    let without_map = vfs_opts(
+        modules,
+        "child.mds",
+        CompileOptions {
+            source_map: false,
+            ..Default::default()
+        },
+    );
+
+    // ADR-002: byte-identical output regardless of source-map mode.
+    assert_eq!(
+        with_map.output, without_map.output,
+        "ADR-002: @extends compiled output must be byte-identical with and without source maps"
+    );
+    assert!(
+        with_map.source_map.is_some(),
+        "source_map must be present when source_map=true"
+    );
+    assert!(
+        without_map.source_map.is_none(),
+        "source_map must be absent when source_map=false"
+    );
+}
+
+/// REL-1 regression / applies PF-004: the cumulative loop-iteration budget must be
+/// shared across ALL @extends regions when `source_map: true`.
+///
+/// Before the fix, `evaluate_regions_with_map` called `evaluate_with_map` per region
+/// and each call seeded a FRESH `EvalContext` (total_iterations = 0), giving K regions
+/// an independent 1 M budget — CPU/DoS amplification ∝ region count.
+///
+/// After the fix `evaluate_with_map_seeded` threads the running totals so the same
+/// cumulative cap applies to the entire @extends compilation.
+///
+/// Setup: the child overrides two blocks; each block drives 600 outer × 1 000 inner =
+/// 600 000 iterations.  No single region exceeds the 1 M cap, but the cumulative total
+/// (1 200 000) does.  The outer/inner arrays are injected via runtime_vars to avoid
+/// large YAML in the template.
+#[test]
+fn for_max_total_iterations_across_extends_regions_source_map() {
+    // 600 × 1 000 = 600 000 per region; 2 regions = 1 200 000 > MAX_TOTAL_ITERATIONS (1 M).
+    // Each array is well below MAX_LOOP_ITERATIONS (100 000) so the per-loop cap does
+    // not trip — only the cumulative cap fires.
+    let outer: Vec<Value> = (0..600usize).map(|i| Value::Number(i as f64)).collect();
+    let inner: Vec<Value> = (0..1000usize).map(|i| Value::Number(i as f64)).collect();
+    let mut vars = HashMap::new();
+    vars.insert("outer".to_string(), Value::Array(outer));
+    vars.insert("inner".to_string(), Value::Array(inner));
+
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        "@block loop1:\n@end\n@block loop2:\n@end\n".to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        "---\nextends: base.mds\n---\n\
+         @block loop1:\n\
+         @for o in outer:\n@for i in inner:\n{o}{i}\n@end\n@end\n\
+         @end\n\
+         @block loop2:\n\
+         @for o in outer:\n@for i in inner:\n{o}{i}\n@end\n@end\n\
+         @end\n"
+            .to_string(),
+    );
+
+    let err = mds::compile_virtual_with_deps_opts(
+        modules,
+        "child.mds",
+        Some(vars),
+        CompileOptions {
+            source_map: true,
+            ..Default::default()
+        },
+    )
+    .expect_err(
+        "REL-1: cumulative iteration budget across @extends regions must trip MAX_TOTAL_ITERATIONS",
+    );
+
+    assert!(
+        format!("{err}").contains("total loop iterations exceeded maximum"),
+        "REL-1: expected total-iterations resource_limit error, got: {err}"
     );
 }
