@@ -292,6 +292,23 @@ impl ModuleCache {
         Ok(())
     }
 
+    /// Guard against unbounded module loading from adversarial import graphs (REL-2).
+    ///
+    /// Enforced on the native file-resolution paths as each new module is resolved
+    /// from disk; the virtual/WASM/napi binding layers enforce the same cap at
+    /// input-validation time before resolution begins, so all paths share an
+    /// identical bound.  Runtime guard, not `debug_assert` — must hold in release
+    /// builds (applies PF-004/PF-005).
+    fn check_module_count(&self) -> Result<(), MdsError> {
+        if self.modules.len() >= MAX_MODULE_COUNT {
+            return Err(MdsError::resource_limit(format!(
+                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
+                self.modules.len(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Resolve a module from a filesystem path string.
     ///
     /// `path` is a UTF-8 string representation of the OS path (callers convert
@@ -370,16 +387,7 @@ impl ModuleCache {
         self.check_import_depth()?;
 
         // Step 3.5: module count guard (REL-2, applies PF-004).
-        // Virtual/WASM/napi paths enforce MAX_MODULE_COUNT at input-validation time;
-        // native file resolution enforces it here as each new module is resolved from
-        // disk so all paths share an identical bound.  Runtime guard, not debug_assert
-        // — must hold in release builds (aligns with PF-005).
-        if self.modules.len() >= MAX_MODULE_COUNT {
-            return Err(MdsError::resource_limit(format!(
-                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
-                self.modules.len(),
-            )));
-        }
+        self.check_module_count()?;
 
         // Step 4: read the file only on a cache miss.
         let source = self.fs.read(key)?;
@@ -1358,13 +1366,8 @@ impl ModuleCache {
         // Depth guard (E6).
         self.check_import_depth()?;
 
-        // Module count guard — mirrors the check in resolve_by_key (REL-2, applies PF-004).
-        if self.modules.len() >= MAX_MODULE_COUNT {
-            return Err(MdsError::resource_limit(format!(
-                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
-                self.modules.len(),
-            )));
-        }
+        // Module count guard (REL-2, applies PF-004).
+        self.check_module_count()?;
 
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;
