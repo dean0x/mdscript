@@ -127,8 +127,11 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
 - **Source Map v3** (#62). Compile calls can now produce a [Source Map v3](https://sourcemaps.info/spec.html)
   document alongside the rendered output.
 
-  **CLI** (`mds build`): `--source-map` appends a `.mds.map` sidecar file next to the
-  output and embeds a `//# sourceMappingURL=` comment in the output. `--embed-sources`
+  **CLI** (`mds build`): `--source-map` writes a `<output>.md.map` sidecar and leaves
+  the compiled output byte-identical to a no-flag build (ADR-002). `--inline` embeds
+  the map as a `<!--# sourceMappingURL=data:... -->` HTML comment at the end of the
+  output; no sidecar is written (requires `--source-map`). `--no-source-map` suppresses
+  generation when `build.source_map=true` is set in `mds.json`. `--embed-sources`
   (requires `--source-map`) embeds the original source text as `sourcesContent`.
 
   **Rust** (`mds-core`): new `compile_str_with_deps_opts`, `compile_with_deps_opts`,
@@ -146,9 +149,11 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   `.source_map` property (`dict | None`).
 
   **Cross-field invariant**: passing `sourcesContent: true` (or `sources_content=True`)
-  without `sourceMap: true` (or `source_map=True`) is a hard error on all surfaces
-  (`mds::invalid_options`). Messages-mode templates silently degrade: `sourceMap` is
-  absent from the result and a warning is emitted.
+  without `sourceMap: true` (or `source_map=True`) is rejected on all surfaces — the
+  CLI rejects the combination at argument-parse time (clap `requires`; exit code 2);
+  the library bindings (napi/WASM/Python) raise `mds::invalid_options`. Messages-mode
+  templates silently degrade: `sourceMap` is absent from the result and a warning is
+  emitted.
 
   **⚠ Privacy warning**: `--embed-sources` / `sourcesContent: true` / `sources_content=True`
   includes the full original template source in the map file — including any hardcoded
