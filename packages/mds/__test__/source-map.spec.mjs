@@ -9,7 +9,9 @@
  *   U-SM5: sourcesContent:true without sourceMap:true → mds::invalid_options
  *   U-SM6: unknown option key still rejected (sourceMap/sourcesContent are now allowed)
  *   U-SM7: compileFile sourceMap structural validity
- *   U-SM8: native == WASM byte-identical parity (AC-API-04) via compile()
+ *   U-SM8: JSON determinism — sourceMap round-trips and has correct types
+ *   VLQ-SELF: self-tests for the hand-rolled Base64-VLQ decoder (TEST-2)
+ *   W-SM: WASM backend source-map coverage — emission, cross-field guard, parity (TEST-1)
  *
  * Hand-rolled Base64-VLQ decoder — no new devDeps.
  */
@@ -17,6 +19,7 @@ import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { compile, compileFile, isMdsError, init } from '../dist/node.js';
 import { SIMPLE_MDS } from './helpers.mjs';
+import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 
 // ---------------------------------------------------------------------------
 // Hand-rolled Base64-VLQ decoder (no external dependency)
@@ -234,17 +237,13 @@ describe('source maps (U-SM)', () => {
     assert.ok(VLQ_RE.test(result.sourceMap.mappings));
   });
 
-  // ── U-SM8: native == WASM byte-identical parity (AC-API-04) ───────────
+  // ── U-SM8: JSON determinism (source-map contract) ──────────────────────
   //
-  // The core serializer produces a deterministic JSON representation so
-  // both backends must return an identical sourceMap object for the same
-  // source input when both use compile() with sourceMap:true.
-  //
-  // This test runs only in environments where both backends are available.
-  // The init() call selects the native backend; to test WASM parity we'd
-  // need a separate init with forced WASM. Instead we test the contract:
-  // the canonical JSON shape is the same regardless of backend.
-  // Full cross-backend identity is asserted by the napi + wasm unit tests.
+  // These tests verify that the sourceMap object produced by the native backend
+  // is a well-formed, JSON-serializable SMv3 object whose content is stable
+  // across round-trips. The native backend uses the shared core serializer;
+  // cross-backend WASM parity (byte-identical mappings from both backends for
+  // the same input) is asserted by the W-SM describe block in this file.
 
   test('U-SM8: sourceMap JSON round-trips to identical object', () => {
     const src = 'Hello World!\n';
@@ -264,5 +263,205 @@ describe('source maps (U-SM)', () => {
     assert.ok(Array.isArray(sm.sources));
     assert.ok(Array.isArray(sm.names));
     assert.equal(typeof sm.mappings, 'string');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VLQ decoder self-tests (TEST-2)
+//
+// The hand-rolled decodeVlqOne / decodeMappings functions are the spec's
+// validation gate; a silent bug here would mis-validate all source maps.
+// These tests mirror the CLI's sm_vlq_decoder_known_values Rust test so the
+// two independent decoders agree on known vectors.
+// ---------------------------------------------------------------------------
+
+describe('VLQ decoder self-test (VLQ-SELF)', () => {
+  // ── VLQ-SELF-1: single-group known values ──────────────────────────────
+  //
+  // Mirror of CLI sm_vlq_decoder_known_values:
+  //   A → 0   (B64=0,  zig-zag → 0)
+  //   C → 1   (B64=2,  zig-zag → 1)
+  //   D → -1  (B64=3,  zig-zag → -1)
+  //   E → 2   (B64=4,  zig-zag → 2)
+
+  test('VLQ-SELF-1: A → 0', () => {
+    const [val, next] = decodeVlqOne(['A'], 0);
+    assert.equal(val, 0, 'A must decode to 0');
+    assert.equal(next, 1, 'position must advance by 1');
+  });
+
+  test('VLQ-SELF-1: C → 1', () => {
+    const [val] = decodeVlqOne(['C'], 0);
+    assert.equal(val, 1, 'C must decode to 1');
+  });
+
+  test('VLQ-SELF-1: D → -1', () => {
+    const [val] = decodeVlqOne(['D'], 0);
+    assert.equal(val, -1, 'D must decode to -1');
+  });
+
+  test('VLQ-SELF-1: E → 2', () => {
+    const [val] = decodeVlqOne(['E'], 0);
+    assert.equal(val, 2, 'E must decode to 2');
+  });
+
+  test('VLQ-SELF-1: G → 3', () => {
+    const [val] = decodeVlqOne(['G'], 0);
+    assert.equal(val, 3, 'G must decode to 3');
+  });
+
+  // ── VLQ-SELF-2: position advancement in a multi-char sequence ──────────
+
+  test('VLQ-SELF-2: decodeVlqOne advances pos correctly in multi-char sequence', () => {
+    // Sequence ['A', 'C']: decode two values in order.
+    const chars = ['A', 'C'];
+    const [v0, pos1] = decodeVlqOne(chars, 0);
+    assert.equal(v0, 0, 'first char A → 0');
+    assert.equal(pos1, 1, 'position must be 1 after decoding A');
+    const [v1, pos2] = decodeVlqOne(chars, pos1);
+    assert.equal(v1, 1, 'second char C → 1');
+    assert.equal(pos2, 2, 'position must be 2 after decoding C');
+  });
+
+  // ── VLQ-SELF-3: full-segment decode via decodeMappings ─────────────────
+  //
+  // Known 4-field segments:
+  //   "AAAA" → [0, 0, 0, 0]  (all-zero offsets)
+  //   "CCCC" → [1, 1, 1, 1]  (all-one offsets)
+  //   "AAGA" → [0, 0, 3, 0]  (golden first segment for sm_basic.mds with
+  //                            body starting 3 frontmatter lines in)
+
+  test('VLQ-SELF-3: decodeMappings("AAAA") → [[0,0,0,0]]', () => {
+    const segs = decodeMappings('AAAA');
+    assert.equal(segs.length, 1, 'one segment');
+    assert.deepEqual(segs[0], [0, 0, 0, 0], 'AAAA must decode to [0,0,0,0]');
+  });
+
+  test('VLQ-SELF-3: decodeMappings("CCCC") → [[1,1,1,1]]', () => {
+    const segs = decodeMappings('CCCC');
+    assert.deepEqual(segs[0], [1, 1, 1, 1], 'CCCC must decode to [1,1,1,1]');
+  });
+
+  test('VLQ-SELF-3: decodeMappings("AAGA") → [[0,0,3,0]] (golden first segment)', () => {
+    const segs = decodeMappings('AAGA');
+    assert.deepEqual(segs[0], [0, 0, 3, 0], 'AAGA must decode to [0,0,3,0]');
+  });
+
+  // ── VLQ-SELF-4: error cases ─────────────────────────────────────────────
+
+  test('VLQ-SELF-4: decodeVlqOne throws on empty input', () => {
+    assert.throws(
+      () => decodeVlqOne([], 0),
+      /VLQ truncated/,
+      'empty input must throw VLQ truncated',
+    );
+  });
+
+  test('VLQ-SELF-4: decodeVlqOne throws on unknown Base64 char', () => {
+    assert.throws(
+      () => decodeVlqOne(['!'], 0),
+      /Unknown Base64 char/,
+      'non-Base64 char must throw',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WASM backend source-map coverage (TEST-1)
+//
+// The WASM backend has a separate code path from the native (napi) backend.
+// These tests verify:
+//   W-SM1: WASM compile() emits a valid SMv3 sourceMap for simple input
+//   W-SM2: cross-field guard — sourcesContent:true without sourceMap:true
+//          throws mds::invalid_options on the WASM backend
+//   W-SM3: WASM and native backends produce byte-identical mappings for the
+//          same input (AC-API-04 / ADR-002: shared core serializer)
+//
+// The WASM default filename is "input.mds" (vs "<source>" for the native
+// backend), so sources[] will differ by convention; mappings are compared
+// without the filename entry.
+// ---------------------------------------------------------------------------
+
+describe('source maps — WASM backend (W-SM)', () => {
+  let wasmBackend;
+
+  before(async () => {
+    const wasmMod = await initWasmNode();
+    wasmBackend = createWasmBackend(wasmMod);
+  });
+
+  // ── W-SM1: WASM compile produces valid SMv3 ─────────────────────────────
+
+  test('W-SM1: WASM compile() with sourceMap:true returns valid sourceMap', () => {
+    const result = wasmBackend.compile('Hello World!\n', { sourceMap: true });
+    assert.ok('sourceMap' in result, 'sourceMap key must be present');
+    // WASM default filename is "input.mds".
+    assertSmStructure(result.sourceMap);
+    assert.deepEqual(result.sourceMap.sources, ['input.mds'],
+      'WASM default source label must be "input.mds"');
+    assert.ok(result.sourceMap.mappings.length > 0, 'mappings must be non-empty');
+  });
+
+  test('W-SM1: WASM compile() with sourceMap:true, sourcesContent:true → both present', () => {
+    const src = 'Hello World!\n';
+    const result = wasmBackend.compile(src, { sourceMap: true, sourcesContent: true });
+    assert.ok('sourceMap' in result, 'sourceMap must be present');
+    assertSmStructure(result.sourceMap, { hasSourcesContent: true });
+    const sc = result.sourceMap.sourcesContent;
+    assert.ok(sc.some((v) => typeof v === 'string' && v.includes('Hello World')),
+      'sourcesContent must embed source text');
+  });
+
+  test('W-SM1: WASM compile() with sourceMap:false → sourceMap absent', () => {
+    const result = wasmBackend.compile('Hello!\n', { sourceMap: false });
+    assert.ok(!('sourceMap' in result), 'sourceMap must be absent when sourceMap:false');
+  });
+
+  // ── W-SM2: cross-field guard on WASM backend ────────────────────────────
+
+  test('W-SM2: WASM compile() with sourcesContent:true without sourceMap → mds::invalid_options', () => {
+    assert.throws(
+      () => wasmBackend.compile('Hello!\n', { sourcesContent: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options',
+          `expected mds::invalid_options, got code: ${err.code}, message: ${err.message}`);
+        return true;
+      },
+      'sourcesContent without sourceMap must throw mds::invalid_options',
+    );
+  });
+
+  // ── W-SM3: WASM vs native byte-identical parity (AC-API-04) ───────────
+  //
+  // Both backends delegate to the same mds-core serializer, so mappings,
+  // version, and names must be byte-identical. sources[] is intentionally
+  // excluded from this check because the WASM backend uses a different
+  // default filename convention ("input.mds" vs "<source>").
+
+  test('W-SM3: WASM and native backends produce byte-identical mappings for same input', () => {
+    const src = 'Hello World!\n';
+    const nativeResult = compile(src, { sourceMap: true });
+    const wasmResult = wasmBackend.compile(src, { sourceMap: true });
+
+    assert.ok(nativeResult.sourceMap != null, 'native must produce sourceMap');
+    assert.ok(wasmResult.sourceMap != null, 'wasm must produce sourceMap');
+
+    assertSmStructure(wasmResult.sourceMap);
+
+    assert.equal(
+      nativeResult.sourceMap.version,
+      wasmResult.sourceMap.version,
+      'version must match across backends',
+    );
+    assert.deepEqual(
+      nativeResult.sourceMap.names,
+      wasmResult.sourceMap.names,
+      'names must match across backends',
+    );
+    assert.equal(
+      nativeResult.sourceMap.mappings,
+      wasmResult.sourceMap.mappings,
+      'mappings must be byte-identical across backends (ADR-002: shared core serializer)',
+    );
   });
 });
