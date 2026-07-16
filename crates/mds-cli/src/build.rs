@@ -986,9 +986,21 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
         return;
     };
     if v.get("version").and_then(|x| x.as_u64()) != Some(3) {
+        if !quiet {
+            eprintln!(
+                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
+                map_path.display()
+            );
+        }
         return;
     }
     if v.get("file").and_then(|x| x.as_str()) != Some(expected_basename) {
+        if !quiet {
+            eprintln!(
+                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
+                map_path.display()
+            );
+        }
         return;
     }
     if let Err(e) = std::fs::remove_file(map_path) {

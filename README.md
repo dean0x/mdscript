@@ -90,10 +90,15 @@ Build/Watch options:
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
-  --source-map                Generate a Source Map v3 sidecar (<output>.map) and embed a
-                              sourceMappingURL comment in the output. Ignored for messages-mode
+  --source-map                Write a Source Map v3 sidecar (<output>.md.map); output is
+                              byte-identical to a no-flag build. Ignored for messages-mode
                               templates (no renderable output). See ⚠ privacy note below.
-  --embed-sources             Embed original source text in the map's sourcesContent field.
+  --inline                    Embed the source map as a sourceMappingURL data-URI comment
+                              at the end of the output; no sidecar is written.
+                              Requires --source-map.
+  --no-source-map             Suppress source-map generation for this invocation, even when
+                              build.source_map=true is set in mds.json.
+  --embed-sources             Include original source text in the map's sourcesContent field.
                               Requires --source-map. ⚠ Embeds full template text — avoid if
                               templates contain secrets or PII.
 

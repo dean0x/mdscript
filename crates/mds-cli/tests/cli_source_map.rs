@@ -771,3 +771,53 @@ fn sm_vlq_actual_map_first_segment_decodes() {
     assert!(orig_line >= 0, "original line must be >= 0");
     assert!(orig_col >= 0, "original column must be >= 0");
 }
+
+// ── SM-16: hand-authored non-SMv3 map preserved with warning (AC-FUNC-10) ───
+
+/// A hand-authored `.map` file that is NOT a valid SMv3 tool-generated sidecar
+/// must be left in place (preserved) and must trigger a warning on stderr.
+/// With `--quiet`, the warning is suppressed but the file is still preserved.
+#[test]
+fn sm16_stale_map_not_smv3_preserved_with_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.md");
+    let map_path = dir.path().join("out.md.map");
+
+    // Place a hand-authored map that is NOT valid SMv3 (version=2, wrong file field).
+    std::fs::write(&map_path, r#"{"version":2,"file":"WRONG.md"}"#).unwrap();
+
+    // Build WITHOUT --source-map; this triggers stale-map reconciliation.
+    let result = build_file(&fixture("sm_basic.mds"), &["-o", out.to_str().unwrap()]);
+    assert!(result.status.success(), "build should succeed");
+
+    // (i) The hand-authored map must still exist (preserved, not deleted).
+    assert!(
+        map_path.exists(),
+        "hand-authored non-SMv3 map must be preserved (not deleted)"
+    );
+
+    // (ii) A warning must appear on stderr.
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("out.md.map"),
+        "expected a warning about leaving the non-SMv3 map in place, got stderr: {stderr:?}"
+    );
+
+    // With --quiet the warning must be suppressed (but the file is still preserved).
+    // Re-write the map (build above may have recreated or left it).
+    std::fs::write(&map_path, r#"{"version":2,"file":"WRONG.md"}"#).unwrap();
+    let quiet_result = build_file(
+        &fixture("sm_basic.mds"),
+        &["-o", out.to_str().unwrap(), "--quiet"],
+    );
+    assert!(quiet_result.status.success(), "quiet build should succeed");
+    assert!(
+        map_path.exists(),
+        "hand-authored non-SMv3 map must be preserved even with --quiet"
+    );
+    let quiet_stderr = String::from_utf8_lossy(&quiet_result.stderr);
+    assert!(
+        !quiet_stderr.contains("warning:"),
+        "--quiet must suppress the warning; got stderr: {quiet_stderr:?}"
+    );
+}
