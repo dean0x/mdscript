@@ -133,7 +133,7 @@ fn check_nodes(
             // Leaf nodes.
             Node::Text(_)
             | Node::Interpolation(_)
-            | Node::EscapedBrace
+            | Node::EscapedBrace { .. }
             | Node::Import(_)
             | Node::Export(_)
             | Node::Include(_) => {}

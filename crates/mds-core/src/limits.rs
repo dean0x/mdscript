@@ -102,3 +102,34 @@ pub(crate) const MAX_DIAGNOSTICS: usize = 1_000;
 /// `evaluate_nodes` size check; this limit guards the cumulative total.
 /// The incremental check in `collect_single_message` catches runaway growth early.
 pub(crate) const MAX_MESSAGES_TOTAL_SIZE: usize = MAX_OUTPUT_SIZE;
+
+/// Maximum number of segments in a generated source map.
+///
+/// At 16 bytes per `RawSegment`, 1 000 000 segments cap the in-memory segment buffer
+/// at ~16 MiB — well above the segment count for any practical MDS template (a 50 MiB
+/// output would need ~millions of distinct tokens to saturate this limit).  New segments
+/// beyond the cap are silently dropped so compilation succeeds with a partial map rather
+/// than erroring on adversarial inputs.
+pub(crate) const MAX_SOURCEMAP_SEGMENTS: usize = 1_000_000;
+
+/// Maximum total byte size of all `sourcesContent` strings embedded in a source map.
+///
+/// Guards against unbounded artifact size when a template imports many large files.
+/// When the total bytes of source file contents would exceed this ceiling, the
+/// `sourcesContent` array is omitted (degraded) rather than embedding the full corpus.
+/// The source map remains valid — consumers will fetch sources separately.
+///
+/// Set equal to `MAX_OUTPUT_SIZE` (50 MB): the content set should not dwarf the
+/// compiled output it annotates.
+pub(crate) const MAX_SOURCES_CONTENT_BYTES: usize = MAX_OUTPUT_SIZE;
+
+/// Maximum number of distinct modules (files) that may be resolved in a single
+/// compilation, across all paths (native file, virtual/WASM/napi).
+///
+/// Enforced on the native file resolution path by `resolve_by_key` so that
+/// adversarial import graphs cannot cause unbounded module loading.  The
+/// virtual/WASM/napi binding layers enforce the same cap at input-validation time
+/// before any resolution begins (applies PF-004).
+///
+/// 256 matches the binding-layer constant so all code paths behave identically.
+pub(crate) const MAX_MODULE_COUNT: usize = 256;

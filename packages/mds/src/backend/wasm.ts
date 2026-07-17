@@ -11,6 +11,7 @@ import type {
   MdsBaseBackend,
 } from '../types.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
+import { compileOpt } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
@@ -21,7 +22,13 @@ import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contr
  * createWasmBackend().
  */
 export interface WasmModule {
-  compile(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
+  compile(source: string, options?: {
+    filename?: string;
+    modules?: Record<string, string>;
+    vars?: Record<string, unknown>;
+    sourceMap?: boolean;
+    sourcesContent?: boolean;
+  }): unknown;
   check(source: string, options?: { filename?: string; modules?: Record<string, string>; vars?: Record<string, unknown> }): unknown;
   /** Lint a source string. Returns the canonical lint JSON object. */
   lint(source: string, options?: {
@@ -322,8 +329,27 @@ const DEFAULT_COMPILE_OPTS = Object.freeze({
   modules: Object.freeze({} as Record<string, string>),
 });
 
-/** Build the options object for compile/check, merging vars when present. */
+/** Build the options object for compile, merging vars and source-map options when present. */
 function compileOpts(
+  options?: CompileOptions,
+): {
+  filename: string;
+  modules: Record<string, string>;
+  vars?: Record<string, unknown>;
+  sourceMap?: boolean;
+  sourcesContent?: boolean;
+} {
+  const extra = compileOpt(options);
+  if (extra == null) return DEFAULT_COMPILE_OPTS;
+  return {
+    filename: DEFAULT_COMPILE_OPTS.filename,
+    modules: DEFAULT_COMPILE_OPTS.modules,
+    ...extra,
+  };
+}
+
+/** Build the options object for check, merging vars when present. */
+function checkOpts(
   options?: CompileOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
   const vars = options?.vars;
@@ -332,15 +358,21 @@ function compileOpts(
     : DEFAULT_COMPILE_OPTS;
 }
 
-/** Build the options object for compileFile/checkFile, merging vars when present. */
+/** Build the options object for compileFile, merging vars and source-map options when present. */
 export function fileOpts(
   entryFilename: string,
   modules: Record<string, string>,
   options?: FileOptions,
-): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
-  const vars = options?.vars;
-  return vars != null
-    ? { filename: entryFilename, modules, vars }
+): {
+  filename: string;
+  modules: Record<string, string>;
+  vars?: Record<string, unknown>;
+  sourceMap?: boolean;
+  sourcesContent?: boolean;
+} {
+  const extra = compileOpt(options);
+  return extra != null
+    ? { filename: entryFilename, modules, ...extra }
     : { filename: entryFilename, modules };
 }
 
@@ -362,7 +394,7 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
     },
 
     check(source: string, options?: CompileOptions): CheckResult {
-      const result: unknown = wasmModule.check(source, compileOpts(options));
+      const result: unknown = wasmModule.check(source, checkOpts(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },

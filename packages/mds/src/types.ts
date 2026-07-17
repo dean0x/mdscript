@@ -1,3 +1,34 @@
+/**
+ * Source Map v3 document appended to a {@link MarkdownResult} when
+ * `sourceMap: true` is passed to a compile function.
+ *
+ * All bindings and the CLI produce compliant SMv3. The `file` key is absent
+ * for binding results (caller-supplied entry identity is used as `sources[0]`);
+ * the CLI writes the sidecar path. `sourcesContent` is present only when
+ * `sourcesContent: true` was requested.
+ *
+ * @see https://sourcemaps.info/spec.html
+ */
+export interface SourceMapV3 {
+  /** Always `3`. */
+  version: 3;
+  /** Source file paths. Binding results use the caller-supplied entry identity. */
+  sources: string[];
+  /**
+   * Original source text for each entry in `sources`, index-aligned.
+   * Present only when `sourcesContent: true` was requested.
+   *
+   * **Privacy warning**: embedding `sourcesContent` includes the full original
+   * template text — including any hardcoded secrets or PII — in the map.
+   * Only use `--embed-sources` / `sourcesContent: true` in trusted environments.
+   */
+  sourcesContent?: (string | null)[];
+  /** Symbol names referenced by segments (typically empty for MDS). */
+  names: string[];
+  /** Base64-VLQ encoded segment mapping string. */
+  mappings: string;
+}
+
 /** A single structured message produced by a `@message` block. */
 export interface Message {
   /** The role string (e.g. `"system"`, `"user"`, `"assistant"`). */
@@ -18,6 +49,11 @@ export interface MarkdownResult {
   warnings: string[];
   /** Absolute paths of every file transitively imported by the source. */
   dependencies: string[];
+  /**
+   * Source Map v3 document. Present only when `sourceMap: true` was passed
+   * to the compile function. Absent (not `null`) when not requested.
+   */
+  sourceMap?: SourceMapV3;
 }
 
 /**
@@ -50,12 +86,38 @@ export interface CheckResult {
 export interface CompileOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
+  /**
+   * When `true`, appends a {@link SourceMapV3} document to the result as
+   * `result.sourceMap`. Ignored for `@message`-mode templates (no renderable
+   * output means no mappable positions). Defaults to `false`.
+   */
+  sourceMap?: boolean;
+  /**
+   * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
+   * Requires `sourceMap: true`; passing `sourcesContent: true` without
+   * `sourceMap: true` is an error (`mds::invalid_options`).
+   *
+   * **Privacy warning**: the embedded text contains the full template source,
+   * including any hardcoded values. Only use in trusted environments.
+   * Defaults to `false`.
+   */
+  sourcesContent?: boolean;
 }
 
 /** Options shared by file-based compile and check operations. */
 export interface FileOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
+  /**
+   * When `true`, appends a {@link SourceMapV3} document to the result as
+   * `result.sourceMap`. Ignored for `@message`-mode templates. Defaults to `false`.
+   */
+  sourceMap?: boolean;
+  /**
+   * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
+   * Requires `sourceMap: true`. Defaults to `false`.
+   */
+  sourcesContent?: boolean;
 }
 
 // ---------------------------------------------------------------------------

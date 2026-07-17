@@ -468,33 +468,95 @@ fn extract_vars_direct(env: &Env, obj: &Object) -> napi::Result<Option<HashMap<S
     }
 }
 
+/// Extract and validate a boolean option from an options object.
+///
+/// Returns `default_val` when the key is absent, undefined, or null.
+/// Errors on non-boolean types with a descriptive message.
+fn extract_bool_direct(
+    env: &Env,
+    obj: &Object,
+    key: &str,
+    default_val: bool,
+) -> napi::Result<bool> {
+    if !obj.has_named_property(key)? {
+        return Ok(default_val);
+    }
+    let val: Unknown = obj.get_named_property_unchecked(key)?;
+    let vt = val.get_type()?;
+    match vt {
+        ValueType::Undefined | ValueType::Null => Ok(default_val),
+        ValueType::Boolean => {
+            // SAFETY: we checked get_type() == Boolean above before casting.
+            let b: bool = unsafe { val.cast()? };
+            Ok(b)
+        }
+        other => Err(throw_options_error(
+            env,
+            &format!(
+                "options.{key} must be a boolean, got {}",
+                napi_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// Extract and validate the `sourceMap` and `sourcesContent` options.
+///
+/// Delegates the cross-field constraint check to [`mds::CompileOptions::validate`] —
+/// the single enforcement point (avoids PF-004/PF-005).
+/// Returns a [`mds::CompileOptions`] with both fields populated.
+fn extract_compile_options_direct(env: &Env, obj: &Object) -> napi::Result<mds::CompileOptions> {
+    let source_map = extract_bool_direct(env, obj, "sourceMap", false)?;
+    let include_sources_content = extract_bool_direct(env, obj, "sourcesContent", false)?;
+    let opts = mds::CompileOptions {
+        source_map,
+        include_sources_content,
+    };
+    opts.validate().map_err(|_| {
+        throw_options_error(
+            env,
+            "option \"sourcesContent\" requires \"sourceMap\" to be true",
+        )
+    })?;
+    Ok(opts)
+}
+
 /// Parse options for `compile` and `check` (source-string variants).
 ///
-/// Valid keys: `basePath`, `vars`.
-/// Returns `(base_path, vars)`.
-type CompileOpts = (Option<PathBuf>, Option<HashMap<String, Value>>);
+/// Valid keys: `basePath`, `vars`, `sourceMap`, `sourcesContent`.
+/// Returns `(base_path, vars, compile_opts)`.
+type CompileOpts = (
+    Option<PathBuf>,
+    Option<HashMap<String, Value>>,
+    mds::CompileOptions,
+);
 
 fn parse_compile_opts(env: &Env, opts: Option<Object>) -> napi::Result<CompileOpts> {
     let Some(opts_obj) = opts else {
-        return Ok((None, None));
+        return Ok((None, None, mds::CompileOptions::default()));
     };
 
-    reject_unknown_napi_keys(env, &opts_obj, &["basePath", "vars"])?;
+    reject_unknown_napi_keys(
+        env,
+        &opts_obj,
+        &["basePath", "vars", "sourceMap", "sourcesContent"],
+    )?;
     let base_path = extract_base_path_direct(env, &opts_obj)?;
     let vars = extract_vars_direct(env, &opts_obj)?;
+    let compile_opts = extract_compile_options_direct(env, &opts_obj)?;
 
-    Ok((base_path, vars))
+    Ok((base_path, vars, compile_opts))
 }
 
 /// Parse options for `compileFile` and `checkFile` (file-path variants).
 ///
-/// Valid keys: `vars` only. `basePath` is not accepted.
-fn parse_file_opts(
-    env: &Env,
-    opts: Option<Object>,
-) -> napi::Result<Option<HashMap<String, Value>>> {
+/// Valid keys: `vars`, `sourceMap`, `sourcesContent`. `basePath` is not accepted.
+/// Returns `(vars, compile_opts)`.
+type FileOpts = (Option<HashMap<String, Value>>, mds::CompileOptions);
+
+fn parse_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<FileOpts> {
     let Some(opts_obj) = opts else {
-        return Ok(None);
+        return Ok((None, mds::CompileOptions::default()));
     };
 
     // basePath is not valid for file operations.
@@ -506,9 +568,50 @@ fn parse_file_opts(
         ));
     }
 
+    reject_unknown_napi_keys(env, &opts_obj, &["vars", "sourceMap", "sourcesContent"])?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    let compile_opts = extract_compile_options_direct(env, &opts_obj)?;
+
+    Ok((vars, compile_opts))
+}
+
+/// Parse options for `check` (source-string check-only path) — no source-map keys.
+///
+/// Valid keys: `basePath`, `vars`.  Source-map options (`sourceMap`, `sourcesContent`)
+/// are NOT accepted here — `check` does not generate maps, so they are irrelevant and
+/// would silently mislead callers.  Aligns with Python's `check()` which accepts only
+/// `base_path`/`vars` (ARCH-5).
+type CheckOpts = (Option<PathBuf>, Option<HashMap<String, Value>>);
+
+fn parse_check_opts(env: &Env, opts: Option<Object>) -> napi::Result<CheckOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok((None, None));
+    };
+    reject_unknown_napi_keys(env, &opts_obj, &["basePath", "vars"])?;
+    let base_path = extract_base_path_direct(env, &opts_obj)?;
+    let vars = extract_vars_direct(env, &opts_obj)?;
+    Ok((base_path, vars))
+}
+
+/// Parse options for `checkFile` (file-path check-only path) — no source-map keys.
+///
+/// Valid keys: `vars` only.  Source-map options and `basePath` are not accepted (ARCH-5).
+type CheckFileOpts = Option<HashMap<String, Value>>;
+
+fn parse_check_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<CheckFileOpts> {
+    let Some(opts_obj) = opts else {
+        return Ok(None);
+    };
+    // basePath is not valid for file operations.
+    if opts_obj.has_named_property("basePath")? {
+        return Err(throw_options_error(
+            env,
+            "option \"basePath\" is not valid for compileFile/checkFile; \
+             the base directory is derived from the file path",
+        ));
+    }
     reject_unknown_napi_keys(env, &opts_obj, &["vars"])?;
     let vars = extract_vars_direct(env, &opts_obj)?;
-
     Ok(vars)
 }
 
@@ -552,11 +655,13 @@ fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
 pub fn compile(env: Env, source: String, opts: Option<Object>) -> napi::Result<serde_json::Value> {
     check_source_size(&env, &source)?;
 
-    let (base_path, vars) = parse_compile_opts(&env, opts)?;
+    let (base_path, vars, compile_opts) = parse_compile_opts(&env, opts)?;
 
     let result = run_catching(
         &env,
-        AssertUnwindSafe(move || mds::compile_str_with_deps(&source, base_path.as_deref(), vars)),
+        AssertUnwindSafe(move || {
+            mds::compile_str_with_deps_opts(&source, base_path.as_deref(), vars, compile_opts)
+        }),
     )?;
 
     Ok(build_canonical_result(result))
@@ -582,12 +687,12 @@ pub fn compile_file(
     path: String,
     opts: Option<Object>,
 ) -> napi::Result<serde_json::Value> {
-    let vars = parse_file_opts(&env, opts)?;
+    let (vars, compile_opts) = parse_file_opts(&env, opts)?;
 
     let path_buf = PathBuf::from(path);
     let result = run_catching(
         &env,
-        AssertUnwindSafe(move || mds::compile_with_deps(&path_buf, vars)),
+        AssertUnwindSafe(move || mds::compile_with_deps_opts(&path_buf, vars, compile_opts)),
     )?;
 
     Ok(build_canonical_result(result))
@@ -608,7 +713,8 @@ pub fn compile_file(
 pub fn check(env: Env, source: String, opts: Option<Object>) -> napi::Result<CheckResult> {
     check_source_size(&env, &source)?;
 
-    let (base_path, vars) = parse_compile_opts(&env, opts)?;
+    // Use the check-only parser: source-map options are not valid here (ARCH-5).
+    let (base_path, vars) = parse_check_opts(&env, opts)?;
 
     let ((), warnings) = run_catching(
         &env,
@@ -633,7 +739,8 @@ pub fn check(env: Env, source: String, opts: Option<Object>) -> napi::Result<Che
 /// Same shape as `check`.
 #[napi(js_name = "checkFile")]
 pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<CheckResult> {
-    let vars = parse_file_opts(&env, opts)?;
+    // Use the check-only parser: source-map options are not valid here (ARCH-5).
+    let vars = parse_check_file_opts(&env, opts)?;
 
     let path_buf = PathBuf::from(path);
     let ((), warnings) = run_catching(

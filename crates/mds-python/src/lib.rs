@@ -324,10 +324,28 @@ impl CompileResult {
         json_str_array(&self.value, "dependencies")
     }
 
+    /// The Source Map v3 document as a plain `dict`, or `None` when not generated.
+    ///
+    /// Present only when `source_map=True` was passed to the compile function AND the
+    /// result is Markdown (messages-mode degrades to `None` per AC-FUNC-07).
+    /// The wire key in `to_dict()` / `to_json()` is `"sourceMap"` (camelCase).
+    #[getter]
+    fn source_map<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        match self.value.get("sourceMap") {
+            Some(sm) => value_to_py(py, sm).map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn __repr__(&self) -> String {
+        let sm_part = if self.value.get("sourceMap").is_some() {
+            ", source_map=<present>"
+        } else {
+            ""
+        };
         match self.kind().as_str() {
             "messages" => format!(
-                "CompileResult(kind='messages', messages=<{} item(s)>, warnings={:?}, dependencies={:?})",
+                "CompileResult(kind='messages', messages=<{} item(s)>, warnings={:?}, dependencies={:?}{sm_part})",
                 self.value
                     .get("messages")
                     .and_then(serde_json::Value::as_array)
@@ -336,7 +354,7 @@ impl CompileResult {
                 self.dependencies(),
             ),
             _ => format!(
-                "CompileResult(kind='markdown', output={:?}, warnings={:?}, dependencies={:?})",
+                "CompileResult(kind='markdown', output={:?}, warnings={:?}, dependencies={:?}{sm_part})",
                 self.output().unwrap_or_default(),
                 self.warnings(),
                 self.dependencies(),
@@ -806,6 +824,30 @@ fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<m
     Ok(mds::LintConfig { rules: rules_map })
 }
 
+/// Build a [`mds::CompileOptions`] from the `source_map` and `sources_content`
+/// keyword arguments, enforcing the cross-field invariant via
+/// [`mds::CompileOptions::validate`] — the single enforcement point
+/// (avoids PF-004/PF-005).
+///
+/// `sources_content=True` without `source_map=True` → `mds::invalid_options`.
+fn extract_compile_options(
+    py: Python<'_>,
+    source_map: bool,
+    sources_content: bool,
+) -> PyResult<mds::CompileOptions> {
+    let opts = mds::CompileOptions {
+        source_map,
+        include_sources_content: sources_content,
+    };
+    opts.validate().map_err(|_| {
+        options_error(
+            py,
+            "option \"sources_content\" requires \"source_map\" to be True",
+        )
+    })?;
+    Ok(opts)
+}
+
 // ── Public functions ────────────────────────────────────────────────────────────
 
 /// Compile an MDS template source string.
@@ -813,20 +855,25 @@ fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<m
 /// `vars` is an optional mapping of runtime variable overrides; `base_path` (str or
 /// `os.PathLike`) sets the base directory for resolving `@import` paths (defaults to
 /// the current working directory; an explicit empty string raises `mds::invalid_options`
-/// rather than silently resolving against an empty path). Both are keyword-only.
+/// rather than silently resolving against an empty path). `source_map=True` appends a
+/// Source Map v3 document to the result; `sources_content=True` embeds original source
+/// text in the map (requires `source_map=True`). All are keyword-only.
 #[pyfunction]
-#[pyo3(signature = (source, *, vars=None, base_path=None))]
+#[pyo3(signature = (source, *, vars=None, base_path=None, source_map=false, sources_content=false))]
 fn compile(
     py: Python<'_>,
     source: String,
     vars: Option<Bound<'_, PyAny>>,
     base_path: Option<PathBuf>,
+    source_map: bool,
+    sources_content: bool,
 ) -> PyResult<CompileResult> {
     check_source_size(py, &source)?;
     check_base_path(py, &base_path)?;
     let vars = extract_vars(py, vars.as_ref())?;
+    let compile_opts = extract_compile_options(py, source_map, sources_content)?;
     let result = run_catching(py, move || {
-        mds::compile_str_with_deps(&source, base_path.as_deref(), vars)
+        mds::compile_str_with_deps_opts(&source, base_path.as_deref(), vars, compile_opts)
     })?;
     Ok(CompileResult {
         value: result.to_canonical_json(),
@@ -836,16 +883,22 @@ fn compile(
 /// Compile an MDS template file (`path` is a str or `os.PathLike`).
 ///
 /// The base directory is derived from the file's own directory, so there is no
-/// `base_path` argument. `vars` is keyword-only. Dependencies are absolute paths.
+/// `base_path` argument. `vars`, `source_map`, and `sources_content` are keyword-only.
+/// Dependencies are absolute paths.
 #[pyfunction]
-#[pyo3(signature = (path, *, vars=None))]
+#[pyo3(signature = (path, *, vars=None, source_map=false, sources_content=false))]
 fn compile_file(
     py: Python<'_>,
     path: PathBuf,
     vars: Option<Bound<'_, PyAny>>,
+    source_map: bool,
+    sources_content: bool,
 ) -> PyResult<CompileResult> {
     let vars = extract_vars(py, vars.as_ref())?;
-    let result = run_catching(py, move || mds::compile_with_deps(&path, vars))?;
+    let compile_opts = extract_compile_options(py, source_map, sources_content)?;
+    let result = run_catching(py, move || {
+        mds::compile_with_deps_opts(&path, vars, compile_opts)
+    })?;
     Ok(CompileResult {
         value: result.to_canonical_json(),
     })
@@ -854,20 +907,24 @@ fn compile_file(
 /// Compile a module from an in-memory virtual filesystem.
 ///
 /// `modules` maps module key → source; `entry` is the key to compile and must be a
-/// key present in `modules`. `vars` is keyword-only. No source injection occurs —
-/// all modules (entry included) are supplied by the caller.
+/// key present in `modules`. `vars`, `source_map`, and `sources_content` are
+/// keyword-only. No source injection occurs — all modules (entry included) are
+/// supplied by the caller.
 #[pyfunction]
-#[pyo3(signature = (modules, entry, *, vars=None))]
+#[pyo3(signature = (modules, entry, *, vars=None, source_map=false, sources_content=false))]
 fn compile_virtual(
     py: Python<'_>,
     modules: Bound<'_, PyAny>,
     entry: String,
     vars: Option<Bound<'_, PyAny>>,
+    source_map: bool,
+    sources_content: bool,
 ) -> PyResult<CompileResult> {
     let modules = parse_modules(py, &modules)?;
     let vars = extract_vars(py, vars.as_ref())?;
+    let compile_opts = extract_compile_options(py, source_map, sources_content)?;
     let result = run_catching(py, move || {
-        mds::compile_virtual_with_deps(modules, &entry, vars)
+        mds::compile_virtual_with_deps_opts(modules, &entry, vars, compile_opts)
     })?;
     Ok(CompileResult {
         value: result.to_canonical_json(),

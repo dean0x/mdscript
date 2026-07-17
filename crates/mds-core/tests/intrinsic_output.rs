@@ -586,10 +586,10 @@ fn compiled_output_markdown_json_shape() {
 
 #[test]
 fn compiled_output_messages_json_shape() {
-    let out = CompiledOutput::Messages(vec![mds::Message {
-        role: "user".to_string(),
-        content: "hi".to_string(),
-    }]);
+    // Obtain a Messages output via the compile API (Message is #[non_exhaustive] and
+    // not externally constructible).
+    let result = mds::compile_str("@message user:\nhi\n@end\n").expect("compile");
+    let out = result.output;
     let json = serde_json::to_string(&out).expect("serialize");
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
     assert_eq!(parsed["kind"].as_str(), Some("messages"));
@@ -599,11 +599,9 @@ fn compiled_output_messages_json_shape() {
 
 #[test]
 fn compile_result_is_debug_clone_partialeq() {
-    let r = CompileResult {
-        output: CompiledOutput::Markdown("x\n".to_string()),
-        warnings: vec!["w".to_string()],
-        dependencies: vec!["dep.mds".to_string()],
-    };
+    // CompileResult is produced by the compile API (it is #[non_exhaustive]).
+    // Verify it implements Debug + Clone + PartialEq.
+    let r = mds::compile_str("x\n").expect("should compile");
     let cloned = r.clone();
     assert_eq!(r, cloned);
     let _ = format!("{r:?}");

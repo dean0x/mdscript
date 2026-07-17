@@ -124,6 +124,41 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   `lintVirtual` as required members; `MdsNodeBackend` gained `lintFile`. Code that
   directly implements these interfaces (not just calls them) must add these methods.
 
+- **Source Map v3** (#62). Compile calls can now produce a [Source Map v3](https://sourcemaps.info/spec.html)
+  document alongside the rendered output.
+
+  **CLI** (`mds build`): `--source-map` writes a `<output>.md.map` sidecar and leaves
+  the compiled output byte-identical to a no-flag build (ADR-002). `--inline` embeds
+  the map as a `<!--# sourceMappingURL=data:... -->` HTML comment at the end of the
+  output; no sidecar is written (requires `--source-map`). `--no-source-map` suppresses
+  generation when `build.source_map=true` is set in `mds.json`. `--embed-sources`
+  (requires `--source-map`) embeds the original source text as `sourcesContent`.
+
+  **Rust** (`mds-core`): new `compile_str_with_deps_opts`, `compile_with_deps_opts`,
+  `compile_virtual_with_deps_opts` functions accept `CompileOptions { source_map: bool,
+  include_sources_content: bool }`. `CompileResult` carries `source_map: Option<SourceMap>`.
+
+  **Node.js** (`@mdscript/mds-napi`, `@mdscript/mds`): pass `{ sourceMap: true }` (and
+  optionally `{ sourcesContent: true }`) to `compile()` or `compileFile()`. The returned
+  result gains a `sourceMap` key when source maps are enabled.
+
+  **WASM** (`@mdscript/mds-wasm`): same `sourceMap`/`sourcesContent` options on `compile()`.
+
+  **Python** (`mdscript`): `compile()`, `compile_file()`, and `compile_virtual()` accept
+  `source_map=True` and `sources_content=True` keyword arguments. Results expose a
+  `.source_map` property (`dict | None`).
+
+  **Cross-field invariant**: passing `sourcesContent: true` (or `sources_content=True`)
+  without `sourceMap: true` (or `source_map=True`) is rejected on all surfaces — the
+  CLI rejects the combination at argument-parse time (clap `requires`; exit code 2);
+  the library bindings (napi/WASM/Python) raise `mds::invalid_options`. Messages-mode
+  templates silently degrade: `sourceMap` is absent from the result and a warning is
+  emitted.
+
+  **⚠ Privacy warning**: `--embed-sources` / `sourcesContent: true` / `sources_content=True`
+  includes the full original template source in the map file — including any hardcoded
+  secrets or PII. Only use in trusted build environments.
+
 ### Changed
 
 - **BREAKING:** Interior-verbatim whitespace contract for block bodies and `mds fmt`.

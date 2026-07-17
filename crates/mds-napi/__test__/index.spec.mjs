@@ -447,6 +447,33 @@ describe('options validation', () => {
       },
     );
   });
+
+  // V-11: source-map options are not accepted on the check/checkFile path (ARCH-5).
+  // check() does not generate maps; passing sourceMap/sourcesContent is rejected as
+  // an unknown key (aligns with Python's check() which has no such parameters).
+  test('V-11: sourceMap on check throws mds::invalid_options (not a valid check option)', () => {
+    assert.throws(
+      () => check('Hello!\n', { sourceMap: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+    assert.throws(
+      () => check('Hello!\n', { sourcesContent: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+    assert.throws(
+      () => checkFile(SIMPLE_MDS, { sourceMap: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
 });
 
 // ── Resource limit tests ──────────────────────────────────────────────────────
@@ -977,6 +1004,122 @@ describe('lint parity (AC-API-06 guard)', () => {
       JSON.stringify(result),
       UNUSED_GOLDEN,
       `napi lintVirtual unused-variable golden mismatch:\n  got:    ${JSON.stringify(result)}\n  expect: ${UNUSED_GOLDEN}`,
+    );
+  });
+});
+
+// ── Source map tests ──────────────────────────────────────────────────────────
+
+describe('source maps (F-SM)', () => {
+  // F-SM1: sourceMap present in markdown result when sourceMap: true
+  test('F-SM1: sourceMap is present in result when sourceMap: true', () => {
+    const result = compile('Hello World!\n', { sourceMap: true });
+    assert.equal(result.kind, 'markdown');
+    assert.ok('sourceMap' in result, 'sourceMap must be present in result');
+    const sm = result.sourceMap;
+    assert.equal(sm.version, 3, 'sourceMap.version must be 3');
+    assert.ok(Array.isArray(sm.sources), 'sourceMap.sources must be an array');
+    assert.ok(sm.sources.length > 0, 'sourceMap.sources must be non-empty');
+    assert.ok(Array.isArray(sm.names), 'sourceMap.names must be an array');
+    assert.equal(sm.names.length, 0, 'sourceMap.names must be empty');
+    assert.equal(typeof sm.mappings, 'string', 'sourceMap.mappings must be a string');
+    assert.ok(sm.mappings.length > 0, 'sourceMap.mappings must be non-empty');
+    // file is absent (bindings set file: None)
+    assert.ok(!('file' in sm), 'sourceMap.file must be absent for string compilation');
+    // sourcesContent absent (not requested)
+    assert.ok(!('sourcesContent' in sm), 'sourcesContent must be absent when not requested');
+  });
+
+  // F-SM2: sourceMap absent when sourceMap not requested (default)
+  test('F-SM2: sourceMap is absent in result by default', () => {
+    const result = compile('Hello World!\n');
+    assert.ok(!('sourceMap' in result), 'sourceMap must be absent by default');
+  });
+
+  // F-SM3: sourcesContent present and index-aligned when requested
+  test('F-SM3: sourcesContent present and index-aligned when sourcesContent: true', () => {
+    const result = compile('Hello World!\n', { sourceMap: true, sourcesContent: true });
+    const sm = result.sourceMap;
+    assert.ok('sourcesContent' in sm, 'sourcesContent must be present when requested');
+    assert.ok(Array.isArray(sm.sourcesContent), 'sourcesContent must be an array');
+    // sourcesContent must be index-aligned with sources
+    assert.equal(
+      sm.sourcesContent.length,
+      sm.sources.length,
+      'sourcesContent must have same length as sources',
+    );
+    for (const sc of sm.sourcesContent) {
+      assert.equal(typeof sc, 'string', 'each sourcesContent element must be a string');
+    }
+  });
+
+  // F-SM4: sourceMap absent for messages-mode (degradation per AC-FUNC-07)
+  test('F-SM4: sourceMap absent for messages-mode compilation (degradation)', () => {
+    const result = compile('@message user:\nHello!\n@end\n', { sourceMap: true });
+    assert.equal(result.kind, 'messages');
+    // Messages-mode degrades to source_map: None + a warning
+    assert.ok(!('sourceMap' in result), 'sourceMap must be absent for messages result');
+    // Warning text may use "source map" (spaces) or "source_map" (underscore)
+    assert.ok(
+      result.warnings.some((w) => /source.?map/i.test(w)),
+      `expected a source-map degradation warning; got: ${JSON.stringify(result.warnings)}`,
+    );
+  });
+
+  // F-SM5: sourcesContent without sourceMap rejects with mds::invalid_options
+  test('F-SM5: sourcesContent without sourceMap rejects with mds::invalid_options', () => {
+    assert.throws(
+      () => compile('Hello!\n', { sourcesContent: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got code: ${err.code}`);
+        assert.ok(
+          err.message.includes('sourcesContent'),
+          `expected message to mention sourcesContent; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+    // compileFile also rejects
+    assert.throws(
+      () => compileFile(SIMPLE_MDS, { sourcesContent: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got code: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // F-SM6: unknown-key rejection; new keys are valid and not rejected
+  test('F-SM6: unknown key rejected; sourceMap and sourcesContent are valid', () => {
+    // Unknown key is still rejected
+    assert.throws(
+      () => compile('Hello!\n', { unknownKey: true }),
+      (err) => {
+        assert.equal(err.code, 'mds::invalid_options', `got code: ${err.code}`);
+        return true;
+      },
+    );
+    // New keys are valid
+    assert.doesNotThrow(() => compile('Hello!\n', { sourceMap: false }));
+    assert.doesNotThrow(() => compile('Hello!\n', { sourceMap: true, sourcesContent: false }));
+  });
+
+  // F-SM7: structural validity of sourceMap from compileFile
+  test('F-SM7: compileFile produces structurally valid sourceMap', () => {
+    const result = compileFile(SIMPLE_MDS, { sourceMap: true });
+    assert.equal(result.kind, 'markdown');
+    const sm = result.sourceMap;
+    assert.equal(sm.version, 3);
+    assert.ok(Array.isArray(sm.sources), 'sources must be array');
+    assert.ok(sm.sources.length > 0, 'sources must be non-empty');
+    assert.equal(typeof sm.mappings, 'string', 'mappings must be string');
+    assert.ok(sm.mappings.length > 0, 'mappings must be non-empty');
+    // file is absent (bindings do not set file)
+    assert.ok(!('file' in sm), 'file must be absent (bindings do not set file)');
+    // Validate mappings contains only valid Base64-VLQ chars
+    assert.ok(
+      /^[A-Za-z0-9+/,;]*$/.test(sm.mappings),
+      `mappings contains invalid chars: ${sm.mappings}`,
     );
   });
 });

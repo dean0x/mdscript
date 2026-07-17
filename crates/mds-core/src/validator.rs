@@ -24,7 +24,7 @@ pub fn validate(
 
 fn validate_node(node: &Node, scope: &mut Scope, file: &str, source: &str) -> Result<(), MdsError> {
     match node {
-        Node::Text(_) | Node::EscapedBrace => Ok(()),
+        Node::Text(_) | Node::EscapedBrace { .. } => Ok(()),
         Node::Interpolation(interp) => {
             validate_expr(&interp.expr, scope, file, source, interp.offset, interp.len)
         }

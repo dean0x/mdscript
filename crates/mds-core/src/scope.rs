@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::ast::{DefineBlock, Param};
+use crate::sourcemap::Origin;
 use crate::value::Value;
 
 /// Closure captures bundled at function definition time.
@@ -26,6 +27,16 @@ pub struct FunctionDef {
     pub body: Vec<crate::ast::Node>,
     /// Lexical closure captures populated by the resolver at definition time.
     pub captured: CapturedScope,
+    /// Source provenance for source-map attribution (S7).
+    ///
+    /// Populated by the resolver when `CompileOptions::source_map` is `true`.
+    /// Carries the defining module's display path and raw source so that
+    /// `invoke_function` (S8 path) can switch `MapBuilder::current_src` to the
+    /// definition file and attribute body-output segments there.
+    ///
+    /// `None` when source-map mode is disabled (zero-cost, AC-PERF-01) or when
+    /// the function was not collected through the opts-aware resolver path.
+    pub(crate) origin: Option<Origin>,
 }
 
 impl From<&DefineBlock> for FunctionDef {
@@ -34,6 +45,7 @@ impl From<&DefineBlock> for FunctionDef {
             params: d.params.clone(),
             body: d.body.clone(),
             captured: CapturedScope::default(),
+            origin: None,
         }
     }
 }
@@ -61,6 +73,15 @@ pub struct NamespaceScope {
     pub functions: HashMap<String, Arc<FunctionDef>>,
     /// The compiled prompt body of the imported module.
     pub prompt_body: Option<String>,
+    /// Pre-computed source-map fragment for the module's `prompt` body.
+    ///
+    /// Populated when the parent compilation runs in source-map mode and the
+    /// module exports a non-empty `prompt`.  `None` in all other cases
+    /// (zero-cost: no allocation when source maps are disabled — AC-PERF-01).
+    ///
+    /// The `Arc` enables O(1) copy into the `NamespaceScope` without cloning
+    /// the segment data; all `@include` call sites share one allocation.
+    pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
 }
 
 impl Default for Scope {
@@ -204,6 +225,7 @@ mod tests {
                 params: vec![crate::ast::Param::required("name")],
                 body: vec![],
                 captured: CapturedScope::default(),
+                origin: None,
             }),
         );
         assert!(scope.get_function("greet").is_some());
@@ -245,6 +267,7 @@ mod tests {
         NamespaceScope {
             functions: HashMap::new(),
             prompt_body: None,
+            prompt_map: None,
         }
     }
 
@@ -264,6 +287,7 @@ mod tests {
             NamespaceScope {
                 functions: HashMap::new(),
                 prompt_body: Some("outer".into()),
+                prompt_map: None,
             },
         );
         scope.push();
@@ -272,6 +296,7 @@ mod tests {
             NamespaceScope {
                 functions: HashMap::new(),
                 prompt_body: Some("inner".into()),
+                prompt_map: None,
             },
         );
         // Inner frame shadows outer.

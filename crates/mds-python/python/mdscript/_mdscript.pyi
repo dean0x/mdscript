@@ -72,6 +72,10 @@ class CompileResult:
 
     ``kind`` is ``"markdown"`` or ``"messages"``. On a ``markdown`` result
     ``messages`` is ``None``; on a ``messages`` result ``output`` is ``None``.
+
+    ``source_map`` is a Source Map v3 ``dict`` when ``source_map=True`` was passed
+    to the compile function and the result is Markdown; otherwise ``None``.
+    The wire key in ``to_dict()`` / ``to_json()`` is ``"sourceMap"`` (camelCase).
     """
 
     @property
@@ -84,6 +88,8 @@ class CompileResult:
     def warnings(self) -> list[str]: ...
     @property
     def dependencies(self) -> list[str]: ...
+    @property
+    def source_map(self) -> dict[str, Any] | None: ...
     def __new__(cls, canonical: Mapping[str, Any]) -> CompileResult: ...
     def to_dict(self) -> dict[str, Any]: ...
     def to_json(self) -> str: ...
@@ -126,13 +132,23 @@ def compile(
     *,
     vars: _Vars | None = ...,
     base_path: _StrPath | None = ...,
+    source_map: bool = ...,
+    sources_content: bool = ...,
 ) -> CompileResult: ...
-def compile_file(path: _StrPath, *, vars: _Vars | None = ...) -> CompileResult: ...
+def compile_file(
+    path: _StrPath,
+    *,
+    vars: _Vars | None = ...,
+    source_map: bool = ...,
+    sources_content: bool = ...,
+) -> CompileResult: ...
 def compile_virtual(
     modules: Mapping[str, str],
     entry: str,
     *,
     vars: _Vars | None = ...,
+    source_map: bool = ...,
+    sources_content: bool = ...,
 ) -> CompileResult: ...
 def check(
     source: str,

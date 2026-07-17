@@ -58,6 +58,12 @@ impl LintCliConfig {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct BuildConfig {
     pub(crate) output_dir: Option<String>,
+    /// Enable source-map generation for all builds (equivalent to `--source-map`).
+    #[serde(default)]
+    pub(crate) source_map: bool,
+    /// Embed source text in the source map (equivalent to `--embed-sources`).
+    #[serde(default)]
+    pub(crate) embed_sources: bool,
 }
 
 /// Forward-compatibility scaffolding for `mds fmt` configuration.
@@ -181,6 +187,8 @@ impl From<&CompiledOutput> for OutputKind {
         match output {
             CompiledOutput::Markdown(_) => OutputKind::Markdown,
             CompiledOutput::Messages(_) => OutputKind::Messages,
+            // `CompiledOutput` is `#[non_exhaustive]`; update this match when new variants land.
+            _ => unreachable!("unknown CompiledOutput variant"),
         }
     }
 }
@@ -586,6 +594,8 @@ pub(crate) struct CompileOutput {
     pub(crate) kind: OutputKind,
     /// Transitive dependency paths (empty when no `@import`s).
     pub(crate) dependencies: Vec<String>,
+    /// Source map if `opts.source_map` was `true` and the compilation produced one.
+    pub(crate) source_map: Option<mds::SourceMap>,
 }
 
 /// Serialize `CompiledOutput` to the CLI wire format.
@@ -603,6 +613,8 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
             json.push('\n');
             Ok(json)
         }
+        // `CompiledOutput` is `#[non_exhaustive]`; update this match when new variants land.
+        _ => unreachable!("unknown CompiledOutput variant"),
     }
 }
 
@@ -615,25 +627,30 @@ fn serialize_output(output: CompiledOutput) -> Result<String> {
 /// `build` and the initial watch compile use [`compile_and_write`], which calls
 /// this internally and then always writes.
 ///
+/// Pass `opts = mds::CompileOptions::default()` from watch callers that do not want
+/// source maps; the watch paths never emit maps so they always use the default.
+///
 /// # PF-004 compliance
-/// All file reads go through `mds::compile_with_deps` or `mds::compile_str_with_deps`
-/// (which use the resolver that enforces MAX_FILE_SIZE). Stdin input is read through
-/// `read_stdin` which enforces the same cap. There is no bare `std::fs::read_to_string`.
+/// All file reads go through `mds::compile_with_deps_opts` or
+/// `mds::compile_str_with_deps_opts` (which use the resolver that enforces
+/// MAX_FILE_SIZE). Stdin input is read through `read_stdin` which enforces the same cap.
+/// There is no bare `std::fs::read_to_string`.
 pub(crate) fn compile_to_content(
     input: &Path,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
+    opts: mds::CompileOptions,
 ) -> Result<CompileOutput> {
     let result = if input == Path::new("-") {
         // Stdin: compile from source string using cwd as base_dir.
         // read_stdin enforces MAX_FILE_SIZE (PF-004).
         let (source, cwd) = read_stdin()?;
-        mds::compile_str_with_deps(&source, Some(&cwd), runtime_vars)
+        mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
             .map_err(miette::Error::from)?
     } else {
-        // File path: compile_with_deps routes through the resolver which enforces
+        // File path: compile_with_deps_opts routes through the resolver which enforces
         // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
-        mds::compile_with_deps(input, runtime_vars).map_err(miette::Error::from)?
+        mds::compile_with_deps_opts(input, runtime_vars, opts).map_err(miette::Error::from)?
     };
 
     if !quiet {
@@ -643,6 +660,7 @@ pub(crate) fn compile_to_content(
     }
 
     let kind = OutputKind::from(&result.output);
+    let source_map = result.source_map;
     // Move result.output into serialize_output so the Markdown arm avoids a clone
     // (the kind was already derived from the borrow above — issue 2).
     let content = serialize_output(result.output)?;
@@ -650,6 +668,7 @@ pub(crate) fn compile_to_content(
         content,
         kind,
         dependencies: result.dependencies,
+        source_map,
     })
 }
 
@@ -669,9 +688,13 @@ pub(crate) fn compile_to_content(
 /// warning is emitted when the extension contradicts the kind (AC-FUNC-11).
 /// If `-o -` or stdin-with-no-flags, content is written to stdout.
 ///
+/// Source-map writing is NOT performed here — callers that need maps handle them
+/// after this call returns (so map writing logic stays in `run_build`, not here).
+/// Watch callers pass `opts = mds::CompileOptions::default()` to opt out of maps.
+///
 /// # PF-004 compliance
-/// All file reads go through `compile_to_content` → `mds::compile_with_deps` or
-/// `mds::compile_str_with_deps` (which use the resolver that enforces MAX_FILE_SIZE).
+/// All file reads go through `compile_to_content` → `mds::compile_with_deps_opts` or
+/// `mds::compile_str_with_deps_opts` (which use the resolver that enforces MAX_FILE_SIZE).
 /// There is no bare `std::fs::read_to_string` path here.
 pub(crate) fn compile_and_write(
     input: &Path,
@@ -680,8 +703,9 @@ pub(crate) fn compile_and_write(
     config: &Option<(MdsConfig, PathBuf)>,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
+    opts: mds::CompileOptions,
 ) -> Result<(Option<PathBuf>, Vec<String>, String)> {
-    let compiled = compile_to_content(input, runtime_vars, quiet)?;
+    let compiled = compile_to_content(input, runtime_vars, quiet, opts)?;
     let output_path = resolve_output_path_for_kind(
         &Some(input.to_path_buf()),
         output,
@@ -704,6 +728,14 @@ pub(crate) struct BuildArgs {
     pub(crate) set_vars: Vec<(String, String)>,
     pub(crate) set_string_vars: Vec<(String, String)>,
     pub(crate) quiet: bool,
+    /// `--source-map` CLI flag (requires `mds build`).
+    pub(crate) source_map: bool,
+    /// `--no-source-map` CLI flag (overrides `build.source_map` from mds.json).
+    pub(crate) no_source_map: bool,
+    /// `--inline` CLI flag: embed map as data URI comment in the output file.
+    pub(crate) inline: bool,
+    /// `--embed-sources` CLI flag: include source text in sourcesContent[].
+    pub(crate) embed_sources: bool,
 }
 
 /// Resolve the input path: use the explicit value, or auto-detect from cwd.
@@ -716,6 +748,294 @@ pub(crate) fn resolve_input(input: Option<PathBuf>) -> Result<(PathBuf, bool)> {
     }
 }
 
+// ── Source-map helpers ────────────────────────────────────────────────────────
+
+/// Return the sidecar map path: append `.map` to the full output name.
+///
+/// `foo.md` → `foo.md.map`, `foo.json` → `foo.json.map`.
+/// Never uses `with_extension` because that replaces the final component
+/// (e.g. `foo.md.map` would become `foo.map`), not appends.
+pub(crate) fn map_path_for(output_path: &Path) -> PathBuf {
+    let mut s = output_path.as_os_str().to_owned();
+    s.push(".map");
+    PathBuf::from(s)
+}
+
+/// RFC-4648 standard base64 encode (no line wrapping).
+///
+/// Alphabet: `A-Za-z0-9+/` with `=` padding.  None of these characters are
+/// `<`, `>`, or `-`, so the encoded payload cannot break out of an HTML comment
+/// (AC-SEC-03).
+pub(crate) fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Build the inline sourceMappingURL comment carrier for a source map JSON.
+///
+/// Format: `<!--# sourceMappingURL=data:application/json;base64,<B64> -->`
+///
+/// The `<!--# ... -->` syntax is the canonical format supported by browser
+/// devtools and bundler tooling.  The base64 alphabet excludes `<`, `>`, and
+/// `-` so the payload cannot break out of the HTML comment (AC-SEC-03).
+pub(crate) fn carrier_line(map_json: &str) -> String {
+    let b64 = base64_encode(map_json.as_bytes());
+    format!("<!--# sourceMappingURL=data:application/json;base64,{b64} -->")
+}
+
+/// Strip a trailing inline sourceMappingURL carrier comment from `content`
+/// (for idempotent re-embedding).
+///
+/// Looks for `<!--# sourceMappingURL=data:` as the last non-empty line.
+fn strip_existing_carrier(content: &str) -> &str {
+    // Scan from the end, skipping a final newline if present.
+    let trimmed = content.trim_end_matches('\n');
+    // Find the last newline boundary.
+    if let Some(pos) = trimmed.rfind('\n') {
+        let last_line = &trimmed[pos + 1..];
+        if last_line.starts_with("<!--# sourceMappingURL=data:") {
+            // Strip the last line plus its preceding newline.
+            return &content[..pos + 1];
+        }
+    } else if trimmed.starts_with("<!--# sourceMappingURL=data:") {
+        // The entire content is the carrier (single-line file).
+        return "";
+    }
+    content
+}
+
+/// Embed an inline carrier comment at the end of `content`.
+///
+/// Strips any existing carrier first (idempotent), then appends a newline
+/// separator (if needed) and the carrier line.
+pub(crate) fn embed_carrier(content: String, map_json: &str) -> String {
+    let base = strip_existing_carrier(&content);
+    // Ensure there is exactly one newline before the carrier.
+    let sep = if base.ends_with('\n') { "" } else { "\n" };
+    format!("{base}{sep}{}\n", carrier_line(map_json))
+}
+
+/// Compute a relative path from `base_dir` to `target` using forward slashes.
+///
+/// Used to relativize `sources[]` entries in the source map so they are
+/// map-relative rather than absolute (AC-FUNC-05 / AC-SEC-01).
+///
+/// Falls back to the absolute path (forward-slash converted) when a relative
+/// path cannot be computed (e.g. different drive roots on Windows).
+pub(crate) fn relative_path(base_dir: &Path, target: &Path) -> String {
+    // Use `pathdiff` logic inline so we don't add a dependency.
+    // Build the relative path by walking up from base_dir to the common ancestor,
+    // then down to target.
+    let base = base_dir;
+    let mut base_comps: Vec<_> = base.components().collect();
+    let mut target_comps: Vec<_> = target.components().collect();
+
+    // Strip common prefix.
+    let common = base_comps
+        .iter()
+        .zip(target_comps.iter())
+        .take_while(|(b, t)| b == t)
+        .count();
+    base_comps.drain(..common);
+    target_comps.drain(..common);
+
+    if base_comps.is_empty() && target_comps.is_empty() {
+        return ".".to_string();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for _ in &base_comps {
+        parts.push("..".to_string());
+    }
+    for c in &target_comps {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+
+    let rel = parts.join("/");
+    // Guard: if rel somehow became empty use ".".
+    if rel.is_empty() {
+        ".".to_string()
+    } else {
+        rel
+    }
+}
+
+/// Relativize and sanitize a single source path for use in `sources[]`.
+///
+/// Rules (AC-FUNC-05 / AC-SEC-01 / PF-003):
+/// 1. `<source>` sentinel → relabeled to `<stdin>` (AC-FUNC-12) when
+///    the caller explicitly passes `stdin_label = true`.
+/// 2. Windows `\\?\` verbatim-prefix paths → stripped before further processing.
+/// 3. Absolute paths → relativized against `map_dir`.
+/// 4. Relative paths → left as-is (already relative).
+/// 5. All backslashes → forward slashes (AC-FUNC-05).
+/// 6. Result MUST NOT be an absolute path (enforced by assertion).
+pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: bool) -> String {
+    // Rule 1: stdin sentinel relabeling.
+    if source == "<source>" && stdin_label {
+        return "<stdin>".to_string();
+    }
+    // Pass through non-path sentinels unchanged (e.g. "<source>" in non-stdin builds).
+    if source.starts_with('<') && source.ends_with('>') {
+        return source.to_string();
+    }
+
+    // Rule 2: strip Windows \\?\ verbatim prefix (PF-003 / AC-SEC-01).
+    let stripped = source.strip_prefix(r"\\?\").unwrap_or(source);
+
+    // Normalize to a Path.
+    let p = Path::new(stripped);
+
+    let result = if p.is_absolute() {
+        // Rule 3: relativize the absolute source against the map directory.
+        // `map_dir` derives from the caller's `-o` value and may itself be
+        // relative (or empty when `-o` is a bare filename). Absolutize it
+        // against the CWD first so both paths share one coordinate space —
+        // otherwise the component diff embeds the source's absolute path
+        // verbatim (`..//abs/...`) or produces a leading-`/` result, leaking
+        // the filesystem path into sources[] (AC-SEC-01).
+        let abs_map_dir = if map_dir.is_absolute() {
+            map_dir.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(map_dir)
+        };
+        relative_path(&abs_map_dir, p)
+    } else {
+        // Rule 4: already relative — convert separators only.
+        stripped.replace('\\', "/")
+    };
+
+    // AC-SEC-01: never leak an absolute path into sources[]. The relativization
+    // above yields a relative path for same-root inputs; as defense-in-depth for
+    // exotic cross-root cases (e.g. different Windows drives), degrade a
+    // still-absolute result to the bare file name rather than panicking or
+    // leaking a filesystem path. Runtime guard (not debug_assert) so the
+    // guarantee holds in release builds too.
+    //
+    // SEC-2 (guards PF-005 theme / AC-SEC-01): broaden the Windows drive-path
+    // guard beyond the backslash-only check.  `relative_path` and Rule 4 both
+    // normalise separators to `/`, so a forward-slashed drive path such as
+    // `C:/secret/foo.mds` or a cross-drive relative result like `../../D:/x.mds`
+    // contains `:/` rather than `:\\` and slipped through the old guard.  The
+    // three conditions below together catch all three forms:
+    //   • `:\` — classic backslash-qualified Windows drive path
+    //   • `:/` — forward-slash-normalised Windows drive path (SEC-2 gap)
+    //   • leading `<letter>:` — bare drive designator without a separator
+    let is_drive_qualified = |s: &str| -> bool {
+        s.contains(":\\")
+            || s.contains(":/")
+            || (s.len() >= 2
+                && (s.as_bytes()[0] as char).is_ascii_alphabetic()
+                && s.as_bytes()[1] == b':')
+    };
+    if result.starts_with('/') || is_drive_qualified(&result) {
+        return Path::new(stripped)
+            .file_name()
+            .map(|n| n.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| "source".to_string());
+    }
+
+    result
+}
+
+/// Relativize `sources[]` and set `file` in a [`mds::SourceMap`] in place.
+///
+/// Must be called before writing the map to disk or embedding it inline.
+/// - `output_path`: the path where the compiled output is written (used to
+///   compute the map directory and the `file` basename).
+/// - When `output_path` is `None` (stdout), sources are left as-is and
+///   `file` remains as set by the core (no map-relative anchor exists).
+pub(crate) fn relativize_source_map_fields(
+    sm: &mut mds::SourceMap,
+    output_path: Option<&Path>,
+    stdin_label: bool,
+) {
+    let Some(out) = output_path else {
+        return;
+    };
+    let map_dir = out.parent().unwrap_or(Path::new("."));
+
+    // Set `file` to the output basename.
+    sm.file = out.file_name().map(|n| n.to_string_lossy().into_owned());
+
+    // Relativize each source.
+    for src in &mut sm.sources {
+        *src = relativize_source_path(src, map_dir, stdin_label);
+    }
+}
+
+/// Verify a `.map` file is a valid source-map v3 for `expected_basename`,
+/// then delete it (AC-FUNC-10: stale-map reconciliation).
+///
+/// Silently skips deletion if:
+/// - The file does not exist.
+/// - The file is not valid UTF-8 JSON.
+/// - `version != 3`.
+/// - `file` does not match `expected_basename`.
+///
+/// This avoids clobbering a hand-authored file that happens to share a name with
+/// a tool-generated map.
+pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, quiet: bool) {
+    let Ok(bytes) = std::fs::read(map_path) else {
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return;
+    };
+    if v.get("version").and_then(|x| x.as_u64()) != Some(3) {
+        if !quiet {
+            eprintln!(
+                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
+                map_path.display()
+            );
+        }
+        return;
+    }
+    if v.get("file").and_then(|x| x.as_str()) != Some(expected_basename) {
+        if !quiet {
+            eprintln!(
+                "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
+                map_path.display()
+            );
+        }
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(map_path) {
+        if !quiet {
+            eprintln!(
+                "warning: could not remove stale map {}: {e}",
+                map_path.display()
+            );
+        }
+    } else if !quiet {
+        eprintln!("Removed stale map {}", map_path.display());
+    }
+}
+
 pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let BuildArgs {
         input,
@@ -725,6 +1045,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         set_vars,
         set_string_vars,
         quiet,
+        source_map: flag_source_map,
+        no_source_map,
+        inline,
+        embed_sources: flag_embed_sources,
     } = args;
     let runtime_vars = build_runtime_vars(RuntimeVarArgs {
         vars,
@@ -759,33 +1083,229 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 input.display()
             ));
         }
-        return run_build_directory(&input, out_dir, runtime_vars, quiet);
+
+        // Load project config to determine effective flags for directory mode.
+        let dir_config = load_config(&input)?;
+        let cfg_source_map = dir_config
+            .as_ref()
+            .map(|(c, _)| c.build.source_map)
+            .unwrap_or(false);
+        let cfg_embed_sources = dir_config
+            .as_ref()
+            .map(|(c, _)| c.build.embed_sources)
+            .unwrap_or(false);
+        let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
+        let use_embed_sources = flag_embed_sources || cfg_embed_sources;
+
+        return run_build_directory(
+            &input,
+            out_dir,
+            runtime_vars,
+            quiet,
+            use_source_map,
+            use_embed_sources,
+            inline,
+        );
     }
 
+    // ── Stdin path ───────────────────────────────────────────────────────────────
+
     if input == Path::new("-") {
-        // Stdin: compile from source string, route to stdout (or -o).
-        // No project config for stdin; output direction follows -o/-o-.
+        // Stdin: no project config; effective flags from CLI only.
+        let use_source_map = flag_source_map && !no_source_map;
+        let use_embed_sources = flag_embed_sources;
+
+        // AC-SEC-02: warn when shipping full source text in a distributable artifact.
+        if use_embed_sources && inline && !quiet {
+            eprintln!(
+                "warning: --embed-sources with --inline ships full source text in the output \
+                 (AC-SEC-02)"
+            );
+        }
+
+        // Inline + stdout is not supported (there is no file to embed the carrier into).
+        if use_source_map && inline && output.as_deref() == Some("-") {
+            return Err(miette::miette!(
+                "--inline cannot be used with -o - (stdout has no file to embed the carrier into)"
+            ));
+        }
+
+        let opts = mds::CompileOptions {
+            source_map: use_source_map,
+            include_sources_content: use_embed_sources,
+        };
+
         let (source, cwd) = read_stdin()?;
-        let result = mds::compile_str_with_deps(&source, Some(&cwd), runtime_vars)
+        let result = mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
             .map_err(miette::Error::from)?;
         if !quiet {
             for w in &result.warnings {
                 eprintln!("{w}");
             }
         }
+
+        let mut source_map = result.source_map;
         let kind = OutputKind::from(&result.output);
-        // Move result.output (issue 2 — avoids clone for Markdown arm).
         let content = serialize_output(result.output)?;
+
         // Stdin: no project config; output path follows -o flag or defaults to stdout.
         let output_path =
             resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind, quiet)?;
+
+        if let Some(ref mut sm) = source_map {
+            // Relabel <source> → <stdin> for stdin builds (AC-FUNC-12).
+            relativize_source_map_fields(sm, output_path.as_deref(), true);
+        }
+
+        if use_source_map {
+            if inline {
+                // Inline: embed carrier into the output content, then write.
+                let map_json = source_map.as_ref().map(|sm| sm.to_json());
+                let final_content = if let Some(ref json) = map_json {
+                    embed_carrier(content, json)
+                } else {
+                    content
+                };
+                return write_output(output_path, &final_content, quiet, true);
+            } else {
+                // Sidecar: write output first (byte-identical to no-flag; ADR-002).
+                match &output_path {
+                    None => {
+                        // Sidecar + stdout: cannot write a sidecar without a file path.
+                        return Err(miette::miette!(
+                            "--source-map (sidecar) requires an output file; \
+                             use -o <file> or --out-dir, or use --inline for stdout"
+                        ));
+                    }
+                    Some(out) => {
+                        write_output(Some(out.clone()), &content, quiet, true)?;
+                        if let Some(ref sm) = source_map {
+                            let map_path = map_path_for(out);
+                            let map_json = sm.to_json();
+                            std::fs::write(&map_path, &map_json).map_err(|e| {
+                                miette::miette!("cannot write {}: {e}", map_path.display())
+                            })?;
+                            if !quiet {
+                                eprintln!("Source map written to {}", map_path.display());
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         return write_output(output_path, &content, quiet, true);
     }
 
-    // File input: load project config and compile.
-    // compile-then-route: compile first, derive output path from kind, then write.
+    // ── File input path ──────────────────────────────────────────────────────────
+
+    // File input: load project config and compute effective flags.
     let config = load_config(&input)?;
-    let _ = compile_and_write(&input, &output, &out_dir, &config, runtime_vars, quiet)?;
+    let cfg_source_map = config
+        .as_ref()
+        .map(|(c, _)| c.build.source_map)
+        .unwrap_or(false);
+    let cfg_embed_sources = config
+        .as_ref()
+        .map(|(c, _)| c.build.embed_sources)
+        .unwrap_or(false);
+
+    let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
+    let use_embed_sources = flag_embed_sources || cfg_embed_sources;
+
+    // AC-SEC-02: warn when shipping full source text in a distributable artifact.
+    if use_embed_sources && inline && !quiet {
+        eprintln!(
+            "warning: --embed-sources with --inline ships full source text in the output \
+             (AC-SEC-02)"
+        );
+    }
+
+    let opts = mds::CompileOptions {
+        source_map: use_source_map,
+        include_sources_content: use_embed_sources,
+    };
+
+    let compiled = compile_to_content(&input, runtime_vars, quiet, opts)?;
+    let output_path = resolve_output_path_for_kind(
+        &Some(input.clone()),
+        &output,
+        &out_dir,
+        &config,
+        compiled.kind,
+        quiet,
+    )?;
+
+    let mut source_map = compiled.source_map;
+    if let Some(ref mut sm) = source_map {
+        relativize_source_map_fields(sm, output_path.as_deref(), false);
+    }
+
+    if use_source_map {
+        if inline {
+            // Inline: embed carrier into the output, then write (ADR-002 not applicable:
+            // inline mode intentionally modifies the output file).
+            let map_json = source_map.as_ref().map(|sm| sm.to_json());
+            let final_content = if let Some(ref json) = map_json {
+                embed_carrier(compiled.content, json)
+            } else {
+                compiled.content
+            };
+            write_output(output_path.clone(), &final_content, quiet, true)?;
+
+            // Stale sidecar reconciliation: if there is an existing .map file from
+            // a prior sidecar build, remove it (AC-FUNC-10).
+            if let Some(ref out) = output_path {
+                let map_path = map_path_for(out);
+                let basename = out
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                verify_then_delete_map(&map_path, &basename, quiet);
+            }
+        } else {
+            // Sidecar: write output byte-identical to no-flag build (ADR-002).
+            match &output_path {
+                None => {
+                    // Sidecar + stdout: not supported.
+                    return Err(miette::miette!(
+                        "--source-map (sidecar) requires an output file; \
+                         use -o <file> or --out-dir, or use --inline for stdout"
+                    ));
+                }
+                Some(out) => {
+                    write_output(Some(out.clone()), &compiled.content, quiet, true)?;
+                    if let Some(ref sm) = source_map {
+                        let map_path = map_path_for(out);
+                        let map_json = sm.to_json();
+                        std::fs::write(&map_path, &map_json).map_err(|e| {
+                            miette::miette!("cannot write {}: {e}", map_path.display())
+                        })?;
+                        if !quiet {
+                            eprintln!("Source map written to {}", map_path.display());
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        write_output(output_path.clone(), &compiled.content, quiet, true)?;
+
+        // No-source-map build: if a stale sidecar exists from a prior source-map build,
+        // remove it (AC-FUNC-10).
+        if let Some(ref out) = output_path {
+            let map_path = map_path_for(out);
+            if map_path.exists() {
+                let basename = out
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                verify_then_delete_map(&map_path, &basename, quiet);
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -807,6 +1327,9 @@ fn run_build_directory(
     out_dir: Option<PathBuf>,
     runtime_vars: Option<HashMap<String, mds::Value>>,
     quiet: bool,
+    source_map: bool,
+    embed_sources: bool,
+    inline: bool,
 ) -> Result<()> {
     use crate::output::{
         canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
@@ -844,6 +1367,11 @@ fn run_build_directory(
         return Ok(());
     }
 
+    let opts = mds::CompileOptions {
+        source_map,
+        include_sources_content: embed_sources,
+    };
+
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
     // Track paths successfully written in this build run so the stale-cleanup
@@ -862,8 +1390,8 @@ fn run_build_directory(
         }
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
-        match compile_to_content(file, runtime_vars.clone(), quiet) {
-            Ok(compiled) => {
+        match compile_to_content(file, runtime_vars.clone(), quiet, opts.clone()) {
+            Ok(mut compiled) => {
                 let ext = compiled.kind.extension();
                 let out_path = output_path_for(file, dir, &output_base, ext);
 
@@ -881,12 +1409,45 @@ fn run_build_directory(
                     }
                 }
 
-                match std::fs::write(&out_path, &compiled.content) {
+                // Relativize source map fields for this output path.
+                if let Some(ref mut sm) = compiled.source_map {
+                    relativize_source_map_fields(sm, Some(&out_path), false);
+                }
+
+                // Determine final content (inline embeds the carrier).
+                let final_content = if source_map && inline {
+                    if let Some(ref sm) = compiled.source_map {
+                        embed_carrier(compiled.content, &sm.to_json())
+                    } else {
+                        compiled.content
+                    }
+                } else {
+                    compiled.content
+                };
+
+                match std::fs::write(&out_path, &final_content) {
                     Ok(()) => {
                         if !quiet {
                             eprintln!("Compiled to {}", out_path.display());
                         }
                         written_this_run.insert(out_path.clone());
+
+                        // Write sidecar map (non-inline mode).
+                        if source_map && !inline {
+                            if let Some(ref sm) = compiled.source_map {
+                                let map_path = map_path_for(&out_path);
+                                let map_json = sm.to_json();
+                                if let Err(e) = std::fs::write(&map_path, &map_json) {
+                                    eprintln!("error: cannot write {}: {e}", map_path.display());
+                                    fail_count += 1;
+                                    continue;
+                                }
+                                if !quiet {
+                                    eprintln!("Source map written to {}", map_path.display());
+                                }
+                            }
+                        }
+
                         // Stale-output cleanup: remove the wrong-extension sibling only
                         // if this tool wrote it (i.e. it appears in written_this_run from
                         // a previous iteration, or matches a prior build's output).
@@ -1082,6 +1643,7 @@ mod tests {
             MdsConfig {
                 build: BuildConfig {
                     output_dir: Some("build".to_string()),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -1224,6 +1786,121 @@ mod tests {
             Some(&mds::Value::String("009".to_string())),
             "last --set-string wins within the same flag"
         );
+    }
+
+    // ── AC-SEC-01: source-path relativization must never leak an absolute path ──
+
+    #[test]
+    fn relativize_absolute_source_with_absolute_mapdir_is_clean_relative() {
+        // Both absolute, sharing a common ancestor → clean map-relative path.
+        let got = relativize_source_path("/proj/src/a.mds", Path::new("/proj/build"), false);
+        assert_eq!(
+            got, "../src/a.mds",
+            "same-root absolute paths relativize cleanly"
+        );
+    }
+
+    #[test]
+    fn relativize_absolute_source_with_relative_mapdir_never_leaks_absolute() {
+        // Regression: a relative `-o` (relative map_dir) diffed against an
+        // absolute source previously produced `..//abs/...` (or a leading-'/'
+        // result that panicked the debug_assert), leaking the absolute path.
+        // After absolutizing map_dir against the CWD the result must be a clean
+        // relative path — never absolute, never an embedded absolute prefix.
+        let got =
+            relativize_source_path("/tmp/deep/nested/abs_input.mds", Path::new("build"), false);
+        assert!(!got.starts_with('/'), "must not be absolute: {got}");
+        assert!(
+            !got.contains("//"),
+            "must not embed a raw absolute path: {got}"
+        );
+        assert!(
+            !got.contains(":\\"),
+            "must not embed a Windows drive path: {got}"
+        );
+        assert!(
+            got.ends_with("abs_input.mds"),
+            "must still resolve to the source file: {got}"
+        );
+    }
+
+    #[test]
+    fn relativize_absolute_source_with_empty_mapdir_never_leaks_absolute() {
+        // `-o out.md` (bare filename) yields an EMPTY map_dir. Previously this
+        // produced a leading-'/' result (`//abs/...`) that panicked in debug and
+        // leaked an absolute path in release. Must now be a clean relative path.
+        let got = relativize_source_path("/tmp/deep/abs_input.mds", Path::new(""), false);
+        assert!(!got.starts_with('/'), "must not be absolute: {got}");
+        assert!(
+            !got.contains("//"),
+            "must not embed a raw absolute path: {got}"
+        );
+        assert!(
+            got.ends_with("abs_input.mds"),
+            "must still resolve to the source file: {got}"
+        );
+    }
+
+    // SEC-2: forward-slashed Windows drive paths must also degrade to filename.
+    // (The old guard only checked ":\\" — "C:/" slipped through.)
+
+    #[test]
+    fn relativize_forward_slashed_drive_path_degrades_to_filename() {
+        // `C:/secret/foo.mds` on Unix is not seen as absolute by Path, so it
+        // went through Rule 4 unchanged and slipped past the old `":\\"` guard.
+        let got = relativize_source_path("C:/secret/foo.mds", Path::new("build"), false);
+        assert_eq!(
+            got, "foo.mds",
+            "forward-slashed drive path must degrade to filename: {got}"
+        );
+    }
+
+    #[test]
+    fn relativize_cross_drive_relative_path_degrades_to_filename() {
+        // A cross-drive path suffix (`../../D:/x.mds`) that passes through
+        // Rule 4 contains `:/ ` not `:\\` and previously slipped through.
+        let got = relativize_source_path("../../D:/x.mds", Path::new("build"), false);
+        assert_eq!(
+            got, "x.mds",
+            "cross-drive :/ path must degrade to filename: {got}"
+        );
+    }
+
+    // ── AC-SEC-03: inline carrier is a self-contained, idempotent HTML comment ──
+
+    #[test]
+    fn embed_carrier_is_idempotent() {
+        // Re-embedding must strip the existing carrier first, so applying it
+        // twice yields the same bytes as applying it once (a distributable
+        // artifact must never accumulate stacked carriers).
+        let json = r#"{"version":3,"sources":["a.mds"],"mappings":"AAAA"}"#;
+        let once = embed_carrier("Hello world\n".to_string(), json);
+        let twice = embed_carrier(once.clone(), json);
+        assert_eq!(
+            once, twice,
+            "embedding the carrier twice must be idempotent"
+        );
+        assert_eq!(
+            twice.matches("sourceMappingURL=data:").count(),
+            1,
+            "the carrier must appear exactly once, got:\n{twice}"
+        );
+    }
+
+    #[test]
+    fn carrier_line_cannot_break_out_of_html_comment() {
+        // AC-SEC-03: the base64 payload must exclude '<', '>', and '-' so it
+        // cannot terminate the enclosing HTML comment early, even when the map
+        // JSON itself contains '-->' (e.g. embedded source text).
+        let hostile_json = r#"{"sourcesContent":["--> break out <script>"]}"#;
+        let line = carrier_line(hostile_json);
+        let payload = line
+            .strip_prefix("<!--# sourceMappingURL=data:application/json;base64,")
+            .and_then(|s| s.strip_suffix(" -->"))
+            .expect("carrier must have the expected envelope");
+        assert!(!payload.contains('<'), "payload must not contain '<'");
+        assert!(!payload.contains('>'), "payload must not contain '>'");
+        assert!(!payload.contains('-'), "payload must not contain '-'");
     }
 
     #[test]

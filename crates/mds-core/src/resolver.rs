@@ -10,11 +10,15 @@ use crate::ast::{BlockNode, DefineBlock, ExportDirective, ImportDirective, Node}
 use crate::error::MdsError;
 use crate::evaluator::evaluate;
 use crate::evaluator::evaluate_messages_intrinsic;
+use crate::evaluator::evaluate_with_map;
+use crate::evaluator::evaluate_with_map_seeded;
 use crate::fs::{FileSystem, NativeFs, VirtualFs};
 use crate::lexer::tokenize;
-use crate::limits::MAX_BLOCKS_PER_MODULE;
+use crate::limits::{MAX_BLOCKS_PER_MODULE, MAX_MODULE_COUNT};
 use crate::parser::parse_with_ctx;
 use crate::scope::{FunctionDef, NamespaceScope, Scope};
+// Import Origin from sourcemap.rs to avoid a scope→resolver import cycle.
+pub(crate) use crate::sourcemap::Origin;
 use crate::validator;
 use crate::value::Value;
 
@@ -27,36 +31,9 @@ use inheritance::{
     spliced_regions,
 };
 
-/// The display name and source bytes that a set of AST node offsets index into.
-///
-/// Each spliced region (skeleton non-block nodes, or a block's effective body) carries
-/// the `Origin` of the file whose source bytes those AST offsets are relative to.
-/// Validation runs per region against `origin.source` so span construction is always
-/// in-bounds (fixing the cross-source-offset `OutOfBounds` diagnostic bug).
-///
-/// `Clone` = two refcount bumps (O(1)).
-///
-/// # Debug output
-///
-/// The manual `Debug` impl prints `file` + `source.len()` bytes — NEVER the raw source
-/// text. This aligns with the `debug-panics` no-leak rule (source bytes must not appear
-/// in panic messages or debug output).
-#[derive(Clone)]
-pub(crate) struct Origin {
-    /// Display name of the file (shown in error messages / source labels).
-    pub(crate) file: Arc<str>,
-    /// Raw source bytes; AST node offsets in this region are relative to this string.
-    pub(crate) source: Arc<str>,
-}
-
-impl std::fmt::Debug for Origin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Origin")
-            .field("file", &self.file)
-            .field("source_len", &self.source.len())
-            .finish()
-    }
-}
+// `Origin` is defined in `sourcemap.rs` and re-exported above via `pub(crate) use`.
+// It carries (file: Arc<str>, source: Arc<str>) — the defining module's display
+// path and raw source content for source-map provenance (S7/S8).
 
 /// An effective block together with the origin (file + source) its offsets index into.
 ///
@@ -139,6 +116,13 @@ impl Clone for EffectiveBlock {
 pub struct ResolvedModule {
     pub(crate) functions: HashMap<String, Arc<FunctionDef>>,
     pub(crate) prompt_body: Option<String>,
+    /// Pre-computed source-map fragment for this module's `prompt` output.
+    ///
+    /// Populated by `process_module` when `ModuleCache::source_map_mode` is
+    /// true and the module exports a non-empty `prompt` (S6).  `None` for
+    /// skeleton entries, `@extends` modules (S8 will add those), and all
+    /// non-source-map compilations (zero-cost AC-PERF-01).
+    pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
     pub(crate) raw_frontmatter: Option<String>,
     pub(crate) has_explicit_exports: bool,
     pub(crate) explicit_exports: HashSet<String>,
@@ -191,6 +175,7 @@ impl Clone for ResolvedModule {
         Self {
             functions: self.functions.clone(),
             prompt_body: self.prompt_body.clone(),
+            prompt_map: self.prompt_map.clone(),
             raw_frontmatter: self.raw_frontmatter.clone(),
             has_explicit_exports: self.has_explicit_exports,
             explicit_exports: self.explicit_exports.clone(),
@@ -226,6 +211,14 @@ pub struct ModuleCache {
     /// membership test (like HashSet) and insertion-ordered iteration (like Vec),
     /// so a separate `resolving_stack` is no longer needed.
     resolving: IndexSet<String>,
+    /// Set to `true` by `process_module_intrinsic_opts` when `opts.source_map`
+    /// is enabled.  When true, `process_module` builds a
+    /// [`crate::sourcemap::FragmentMap`] alongside the prompt body for every
+    /// standalone module that exports a non-empty `prompt`.
+    ///
+    /// Zero-cost path: when false (the default), no `MapBuilder` is allocated
+    /// for sub-modules (AC-PERF-01).
+    source_map_mode: bool,
 }
 
 impl std::fmt::Debug for ModuleCache {
@@ -251,6 +244,7 @@ impl ModuleCache {
             fs: Box::new(NativeFs::new()),
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
+            source_map_mode: false,
         }
     }
 
@@ -263,6 +257,7 @@ impl ModuleCache {
             fs: Box::new(VirtualFs::new(modules)),
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
+            source_map_mode: false,
         }
     }
 
@@ -272,6 +267,7 @@ impl ModuleCache {
             fs,
             modules: IndexMap::new(),
             resolving: IndexSet::new(),
+            source_map_mode: false,
         }
     }
 
@@ -291,6 +287,23 @@ impl ModuleCache {
         if self.resolving.len() >= MAX_IMPORT_DEPTH {
             return Err(MdsError::import_error(format!(
                 "import depth exceeds maximum of {MAX_IMPORT_DEPTH} (possible deep chain)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Guard against unbounded module loading from adversarial import graphs (REL-2).
+    ///
+    /// Enforced on the native file-resolution paths as each new module is resolved
+    /// from disk; the virtual/WASM/napi binding layers enforce the same cap at
+    /// input-validation time before resolution begins, so all paths share an
+    /// identical bound.  Runtime guard, not `debug_assert` — must hold in release
+    /// builds (applies PF-004/PF-005).
+    fn check_module_count(&self) -> Result<(), MdsError> {
+        if self.modules.len() >= MAX_MODULE_COUNT {
+            return Err(MdsError::resource_limit(format!(
+                "module count exceeds maximum of {MAX_MODULE_COUNT} ({} modules resolved)",
+                self.modules.len(),
             )));
         }
         Ok(())
@@ -329,6 +342,19 @@ impl ModuleCache {
         self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
+    /// Like [`resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// returns `(CompiledOutput, Option<SourceMap>)`.
+    pub fn resolve_path_intrinsic_opts(
+        &mut self,
+        path: &str,
+        runtime_vars: &HashMap<String, Value>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let key = self.fs.normalize("", path)?;
+        self.resolve_intrinsic_by_key_opts(&key, runtime_vars, opts, warnings)
+    }
+
     /// Resolve a module by its normalized key.
     ///
     /// This is the core resolution loop: cache check → depth check →
@@ -359,6 +385,9 @@ impl ModuleCache {
 
         // Step 3: depth guard.
         self.check_import_depth()?;
+
+        // Step 3.5: module count guard (REL-2, applies PF-004).
+        self.check_module_count()?;
 
         // Step 4: read the file only on a cache miss.
         let source = self.fs.read(key)?;
@@ -494,6 +523,18 @@ impl ModuleCache {
         self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
     }
 
+    /// Like [`resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// returns `(CompiledOutput, Option<SourceMap>)`.
+    pub fn resolve_virtual_intrinsic_opts(
+        &mut self,
+        entry: &str,
+        runtime_vars: &HashMap<String, Value>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        self.resolve_intrinsic_by_key_opts(entry, runtime_vars, opts, warnings)
+    }
+
     /// Resolve a module by its normalized key, dispatching on output shape.
     ///
     /// Shared core of [`resolve_path_intrinsic`] and [`resolve_virtual_intrinsic`].
@@ -507,6 +548,19 @@ impl ModuleCache {
         runtime_vars: &HashMap<String, Value>,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
+        self.resolve_intrinsic_by_key_opts(key, runtime_vars, &Default::default(), warnings)
+            .map(|(output, _)| output)
+    }
+
+    /// Like [`resolve_intrinsic_by_key`] but accepts opts and returns
+    /// `(CompiledOutput, Option<SourceMap>)`.
+    fn resolve_intrinsic_by_key_opts(
+        &mut self,
+        key: &str,
+        runtime_vars: &HashMap<String, Value>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
         // Cycle detection: if this key is already on the resolving stack it forms
         // a circular import that must be rejected.
         if self.resolving.contains(key) {
@@ -529,7 +583,7 @@ impl ModuleCache {
             base_dir: &base_dir_owned,
             runtime_vars,
         };
-        let result = self.process_module_intrinsic(&ctx, is_md, warnings);
+        let result = self.process_module_intrinsic_opts(&ctx, is_md, opts, warnings);
 
         let popped = self.resolving.pop();
         Self::check_lifo_pop(result, popped, key)
@@ -561,6 +615,100 @@ impl ModuleCache {
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
 
+    /// Like [`resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// returns `(CompiledOutput, Option<SourceMap>)`.
+    pub fn resolve_source_intrinsic_opts(
+        &mut self,
+        source: &str,
+        base_dir: &str,
+        runtime_vars: &HashMap<String, Value>,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        let canonical_str = self.fs.canonicalize(base_dir)?;
+        self.fs.set_root(&canonical_str)?;
+        self.check_import_depth()?;
+        self.resolving.insert(SOURCE_LABEL.into());
+        let ctx = ModuleCtx {
+            file_str: SOURCE_LABEL,
+            source,
+            base_dir: &canonical_str,
+            runtime_vars,
+        };
+        let result = self.process_module_intrinsic_opts(&ctx, false, opts, warnings);
+        let popped = self.resolving.pop();
+        Self::check_lifo_pop(result, popped, SOURCE_LABEL)
+    }
+
+    /// Evaluate spliced `@extends` regions, accumulating output while recording
+    /// source-map segments.
+    ///
+    /// Each region carries its own [`Origin`] so the builder's `current_src` is
+    /// updated to the correct source index before evaluating that region.  Scope
+    /// is shared across all regions (functions defined in earlier regions are
+    /// visible to later ones).
+    ///
+    /// PF-004: cumulative output size is checked after each region rather than
+    /// only at the end so runaway base templates are caught early.
+    fn evaluate_regions_with_map(
+        regions: &[(&[crate::ast::Node], &Origin)],
+        scope: &mut crate::scope::Scope,
+        warnings: &mut Vec<String>,
+        map: Option<crate::sourcemap::MapBuilder>,
+    ) -> Result<(String, Option<crate::sourcemap::MapBuilder>), MdsError> {
+        let mut output = String::new();
+        let mut current_map = map;
+
+        // REL-1 / applies PF-004: single cumulative iteration and message-byte budget
+        // across ALL regions.  Before this fix each call to evaluate_with_map seeded a
+        // fresh EvalContext (total_iterations = 0) so K regions each got an independent
+        // 1 M budget — CPU/DoS amplification ∝ region count.  Now we thread the running
+        // totals from region to region via evaluate_with_map_seeded so the same cap
+        // applies to the entire @extends compilation, matching the non-map (text) path.
+        let mut running_iterations: usize = 0;
+        let mut running_msg_bytes: usize = 0;
+
+        for (nodes, origin) in regions {
+            // Switch the builder's current_src to the source that owns this region.
+            if let Some(ref mut builder) = current_map {
+                let src_idx = builder.source_index(origin.file.as_ref(), origin.source.as_ref());
+                builder.current_src = src_idx;
+                // Cursor must equal accumulated output length before entering each region.
+                // evaluate_with_map_seeded maintains this invariant internally, but after
+                // each region we push the raw output and the builder's cursor is correct.
+            }
+
+            let region_output = if let Some(builder) = current_map.take() {
+                let (region_out, returned_builder, iters, bytes) = evaluate_with_map_seeded(
+                    nodes,
+                    scope,
+                    warnings,
+                    builder,
+                    running_iterations,
+                    running_msg_bytes,
+                )?;
+                running_iterations = iters;
+                running_msg_bytes = bytes;
+                current_map = Some(returned_builder);
+                region_out
+            } else {
+                evaluate(nodes, scope, warnings)?
+            };
+
+            // PF-004: cumulative size guard — same limit as the per-node check.
+            let new_len = output.len() + region_output.len();
+            if new_len > crate::limits::MAX_OUTPUT_SIZE {
+                return Err(MdsError::resource_limit(format!(
+                    "output exceeds maximum size of {} bytes",
+                    crate::limits::MAX_OUTPUT_SIZE
+                )));
+            }
+            output.push_str(&region_output);
+        }
+
+        Ok((output, current_map))
+    }
+
     /// Common intrinsic processing: tokenize, parse, build scope, then dispatch on
     /// output shape.
     ///
@@ -581,30 +729,51 @@ impl ModuleCache {
         is_md: bool,
         warnings: &mut Vec<String>,
     ) -> Result<crate::CompiledOutput, MdsError> {
+        self.process_module_intrinsic_opts(ctx, is_md, &Default::default(), warnings)
+            .map(|(output, _)| output)
+    }
+
+    /// Opts-bearing variant of `process_module_intrinsic`.
+    ///
+    /// Returns `(CompiledOutput, Option<SourceMap>)`.  The source map is
+    /// populated when `opts.source_map` is `true`; `None` otherwise.
+    ///
+    /// For Markdown output the source map is built by threading a
+    /// [`crate::sourcemap::MapBuilder`] through the evaluator:
+    ///
+    /// - Standalone path: [`evaluate_with_map`] on `module.body`.
+    /// - `@extends` path: [`evaluate_regions_with_map`] over
+    ///   `spliced_regions(skeleton, effective_blocks, skeleton_origin)` so each
+    ///   region's segments are attributed to the correct source file.
+    ///
+    /// Messages templates do not generate a source map (the source map covers
+    /// compiled Markdown only; messages mode is not a single contiguous string).
+    fn process_module_intrinsic_opts(
+        &mut self,
+        ctx: &ModuleCtx<'_>,
+        is_md: bool,
+        opts: &crate::sourcemap::CompileOptions,
+        warnings: &mut Vec<String>,
+    ) -> Result<(crate::CompiledOutput, Option<crate::SourceMap>), MdsError> {
+        // Gate sub-module FragmentMap construction on whether source maps are
+        // requested for this compilation.  Must be set before any import
+        // resolution (collect_definitions_and_imports / resolve_frontmatter_imports)
+        // so that transitively-imported modules also build their FragmentMaps.
+        // Zero-cost path: when opts.source_map=false this remains false and no
+        // MapBuilder is allocated for sub-modules (AC-PERF-01).
+        self.source_map_mode = opts.source_map;
+
         let tokens = tokenize(ctx.source, ctx.file_str)?;
         let module = parse_with_ctx(&tokens, ctx.file_str, ctx.source)?;
 
-        // For the standalone (non-extends) path, the module's own raw frontmatter is
-        // re-emitted in Markdown mode. Captured before `module` is partially moved below.
-        // The @extends path uses `merged_frontmatter` from ExtendsComponents instead (#154).
         let raw_frontmatter = module.frontmatter.as_ref().map(|fm| fm.raw.clone());
 
-        // ── Extends branch (decision #8) ─────────────────────────────────────
-        // When the child has @extends, delegate to the shared extends pipeline so that:
-        // - PF-004 (avoids PF-004): oversized-base guard fires via resolve_by_key_skeleton.
-        // - dispatch is performed on final_body (base+overrides spliced), not module.body.
-        // - Scope and final_body are assembled identically to text mode (no drift).
+        // ── Extends branch ────────────────────────────────────────────────────
         if let Some(ext) = module.extends.clone() {
             let frontmatter_values = parse_frontmatter_mapping(module.frontmatter.as_ref())?;
             let components =
                 self.resolve_extends_components(&module, &ext, ctx, &frontmatter_values, warnings)?;
 
-            // ── Step 3f: validate per-region before evaluate ────────────────
-            // Uses the shared validate_extends_components helper (PF-004: single shared
-            // implementation for both modes — they can never drift). Validates each
-            // region against its own origin source so span construction is always
-            // in-bounds (fixes the cross-source OutOfBounds diagnostic bug).
-            // ADR-016: re-validate dynamically-assembled content at the leaf.
             {
                 let mut scope = components.scope.clone();
                 Self::validate_extends_components(&components, &mut scope)?;
@@ -614,16 +783,23 @@ impl ModuleCache {
                 final_body,
                 mut scope,
                 merged_frontmatter,
+                effective_skeleton,
+                effective_blocks,
+                skeleton_origin,
                 ..
             } = components;
 
-            // Dispatch on @message presence against final_body (NOT module.body): a base
-            // whose @message blocks live inside @block defaults is correctly detected
-            // after splice. (ADR-016: re-validate dynamically-assembled content at leaf.)
             if has_message_block(&final_body) {
-                // final_body may splice nodes from base templates whose offsets do
-                // not index ctx.source; the mixed_content span uses the at() guard,
-                // which drops src on out-of-bounds so no OutOfBounds render occurs.
+                // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+                // The evaluator only has text-stream semantics; messages boundaries don't
+                // have stable byte offsets relative to the source.  Degrade gracefully.
+                if opts.source_map {
+                    warnings.push(
+                        "source_map: true is not supported for messages-mode templates \
+                         (@message blocks); source_map will be None"
+                            .to_string(),
+                    );
+                }
                 let messages = evaluate_messages_intrinsic(
                     &final_body,
                     &mut scope,
@@ -631,21 +807,45 @@ impl ModuleCache {
                     ctx.file_str,
                     ctx.source,
                 )?;
-                return Ok(crate::CompiledOutput::Messages(
-                    messages.into_iter().map(crate::Message::from).collect(),
+                return Ok((
+                    crate::CompiledOutput::Messages(
+                        messages.into_iter().map(crate::Message::from).collect(),
+                    ),
+                    None, // source maps cover Markdown only (AC-FUNC-07)
                 ));
             }
 
-            let body = evaluate(&final_body, &mut scope, warnings)?;
-            let body_clean = crate::clean_output(&body);
-            // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
-            // rather than the child's raw frontmatter.
+            let (body_raw, map_out) = if opts.source_map {
+                // Per-region evaluation so each block's segments carry the
+                // correct source origin (base template vs. child override).
+                let regions =
+                    spliced_regions(&effective_skeleton, &effective_blocks, &skeleton_origin);
+                // Seed builder with the skeleton's root file.
+                let builder = crate::sourcemap::MapBuilder::new(
+                    skeleton_origin.file.to_string(),
+                    skeleton_origin.source.to_string(),
+                );
+                let (raw, maybe_builder) =
+                    Self::evaluate_regions_with_map(&regions, &mut scope, warnings, Some(builder))?;
+                // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
+                match maybe_builder {
+                    Some(b) => apply_map_degradation(raw, b, opts, warnings),
+                    None => (raw, None),
+                }
+            } else {
+                (evaluate(&final_body, &mut scope, warnings)?, None)
+            };
+
+            let body_clean = crate::clean_output(&body_raw);
+            let body_clean_len = body_clean.len();
             let final_str = crate::prepend_frontmatter(merged_frontmatter.as_deref(), body_clean);
-            return Ok(crate::CompiledOutput::Markdown(final_str));
+            let fm_prefix_len = final_str.len() - body_clean_len;
+            let source_map =
+                map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+            return Ok((crate::CompiledOutput::Markdown(final_str), source_map));
         }
 
-        // ── Standalone (non-extending) path ──────────────────────────────────
-
+        // ── Standalone path ───────────────────────────────────────────────────
         let (mut scope, fm_imports) =
             build_scope_from_frontmatter(module.frontmatter.as_ref(), is_md, ctx.runtime_vars)?;
 
@@ -657,23 +857,19 @@ impl ModuleCache {
             ..
         } = self.collect_definitions_and_imports(&module.body, &mut scope, ctx, warnings)?;
 
-        // Validate that all named exports refer to defined functions or "prompt" —
-        // mirrors process_module exactly so @export <undefined> errors identically in
-        // both modes (avoids PF-004: alternate path bypassing a check).
         validate_exports(&explicit_exports, &functions)?;
-
-        // NOTE: @define functions are already inserted into scope directly by collect_define
-        // (via scope.set_function) during collect_definitions_and_imports. Re-inserting
-        // `functions` here would also bring re-exported symbols (@export foo from "…") into
-        // local scope, which violates the spec: "@export from does not make the symbol
-        // available in the current file's scope." No extra insertion is needed.
 
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
-        // Dispatch on output shape: any @message block → Messages, else Markdown.
         if has_message_block(&module.body) {
-            // Standalone path: module.body offsets index ctx.source directly, so a
-            // mixed_content error underlines the orphan prose in the file's source.
+            // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+            if opts.source_map {
+                warnings.push(
+                    "source_map: true is not supported for messages-mode templates \
+                     (@message blocks); source_map will be None"
+                        .to_string(),
+                );
+            }
             let messages = evaluate_messages_intrinsic(
                 &module.body,
                 &mut scope,
@@ -681,15 +877,30 @@ impl ModuleCache {
                 ctx.file_str,
                 ctx.source,
             )?;
-            return Ok(crate::CompiledOutput::Messages(
-                messages.into_iter().map(crate::Message::from).collect(),
+            return Ok((
+                crate::CompiledOutput::Messages(
+                    messages.into_iter().map(crate::Message::from).collect(),
+                ),
+                None, // source maps cover Markdown only (AC-FUNC-07)
             ));
         }
 
-        let body = evaluate(&module.body, &mut scope, warnings)?;
-        let body_clean = crate::clean_output(&body);
+        let (body_raw, map_out) = if opts.source_map {
+            let builder =
+                crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
+            apply_map_degradation(raw, returned, opts, warnings)
+        } else {
+            (evaluate(&module.body, &mut scope, warnings)?, None)
+        };
+
+        let body_clean = crate::clean_output(&body_raw);
+        let body_clean_len = body_clean.len();
         let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
-        Ok(crate::CompiledOutput::Markdown(final_str))
+        let fm_prefix_len = final_str.len() - body_clean_len;
+        let source_map = map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+        Ok((crate::CompiledOutput::Markdown(final_str), source_map))
     }
 
     /// Assert the LIFO pop invariant after `process_module`.
@@ -766,9 +977,57 @@ impl ModuleCache {
         // Validate semantic correctness before evaluation
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
-        // Evaluate the body to get prompt text
-        let prompt_body = evaluate(&module.body, &mut scope, warnings)?;
-        let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
+        // Determine whether "prompt" is an available export for this module.
+        // Mirrors the `is_exported("prompt")` logic on `ResolvedModule`.
+        let prompt_exported = !has_explicit_exports || explicit_exports.contains("prompt");
+
+        // Evaluate the body to get prompt text (and optionally a FragmentMap).
+        //
+        // When source-map mode is active and the module exports "prompt", run a
+        // single evaluate_with_map pass to collect both the body string and the
+        // segment records in one traversal (no double-evaluation).  The resulting
+        // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
+        // that imports this module, enabling @include splice attribution (S6).
+        let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
+            let builder =
+                crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            let (body_raw, returned) =
+                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
+
+            // RUST-3 / PF-004 observability: propagate the segment-cap drop flag from
+            // sub-module evaluation.  Without this check a >1M-segment imported module
+            // silently yields a partial FragmentMap (incorrect splice attributions) with
+            // no AC-PERF-03 warning.  Mirror the top-level degradation logic exactly.
+            let fmap = if returned.segments_dropped {
+                warnings.push(format!(
+                    "source map segment cap ({} segments) exceeded in imported module '{}'; \
+                     source_map will be None for this compilation",
+                    crate::limits::MAX_SOURCEMAP_SEGMENTS,
+                    ctx.file_str,
+                ));
+                None
+            } else {
+                // Only keep the FragmentMap when the body is non-empty — an empty prompt
+                // has no segments worth recording.
+                body.as_ref().map(|_| {
+                    Arc::new(crate::sourcemap::FragmentMap {
+                        sources: returned
+                            .sources
+                            .iter()
+                            .zip(returned.sources_content.iter())
+                            .map(|(p, c)| (Arc::from(p.as_str()), Arc::from(c.as_str())))
+                            .collect(),
+                        segments: returned.segments,
+                    })
+                })
+            };
+            (body, fmap)
+        } else {
+            let body_raw = evaluate(&module.body, &mut scope, warnings)?;
+            let body = (!body_raw.trim().is_empty()).then_some(body_raw);
+            (body, None)
+        };
 
         // Build Origin once for this module — Arc::clone'd into each EffectiveBlock (P3).
         let origin = Origin {
@@ -785,6 +1044,7 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            prompt_map,
             raw_frontmatter,
             has_explicit_exports,
             explicit_exports,
@@ -1062,6 +1322,9 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            // @extends modules do not carry a FragmentMap in S6; multi-source
+            // region attribution for extending modules is deferred to S8.
+            prompt_map: None,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.
             raw_frontmatter: merged_frontmatter,
@@ -1102,6 +1365,9 @@ impl ModuleCache {
 
         // Depth guard (E6).
         self.check_import_depth()?;
+
+        // Module count guard (REL-2, applies PF-004).
+        self.check_module_count()?;
 
         // PF-004: read via FileSystem trait — NEVER std::fs.
         let source = self.fs.read(key)?;
@@ -1264,6 +1530,9 @@ impl ModuleCache {
         Ok(ResolvedModule {
             functions,
             prompt_body,
+            // Skeleton entries are never evaluated — no fragment map is built.
+            // A1 invariant: prompt_body=None and prompt_map=None for skeleton entries.
+            prompt_map: None,
             raw_frontmatter,
             has_explicit_exports,
             explicit_exports,
@@ -1293,10 +1562,25 @@ impl ModuleCache {
             block_names: HashSet::new(),
         };
 
+        // S7: build the defining-module Origin ONCE per module, cloned cheaply
+        // into each FunctionDef — only when source-map mode is active (AC-PERF-01).
+        // O(1) Arc construction per module; each clone in collect_define is two
+        // refcount bumps.
+        let module_origin: Option<Origin> = if self.source_map_mode {
+            Some(Origin {
+                file: Arc::from(ctx.file_str),
+                source: Arc::from(ctx.source),
+            })
+        } else {
+            None
+        };
+
         let mut block_count: usize = 0;
         for node in body {
             match node {
-                Node::Define(def) => collect_define(def, &mut defs, scope, ctx)?,
+                Node::Define(def) => {
+                    collect_define(def, &mut defs, scope, ctx, module_origin.as_ref())?
+                }
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
                 Node::Block(block) => {
@@ -1609,16 +1893,18 @@ impl ResolvedModule {
             .filter(|(name, _)| self.is_exported(name))
             .map(|(name, func)| (name.clone(), Arc::clone(func)))
             .collect();
-        // Respect export visibility: prompt_body is only included in the namespace
-        // when "prompt" is an available export (same rule as get_prompt_value).
-        let prompt_body = if self.is_exported("prompt") {
-            self.prompt_body.clone()
+        // Respect export visibility: prompt_body and prompt_map are only included
+        // in the namespace when "prompt" is an available export (same rule as
+        // get_prompt_value).  Arc::clone is O(1) — no segment data is copied.
+        let (prompt_body, prompt_map) = if self.is_exported("prompt") {
+            (self.prompt_body.clone(), self.prompt_map.clone())
         } else {
-            None
+            (None, None)
         };
         NamespaceScope {
             functions,
             prompt_body,
+            prompt_map,
         }
     }
 }
@@ -1684,6 +1970,45 @@ struct ModuleCtx<'a> {
     runtime_vars: &'a HashMap<String, Value>,
 }
 
+/// Apply AC-PERF-03 and AC-SEC-04 degradation checks to a completed builder.
+///
+/// - AC-PERF-03: if the segment cap was hit, degrade to `None` (a partial map
+///   is misleading; warn and discard the builder).
+/// - AC-SEC-04: if `sourcesContent` total bytes exceed the ceiling, set
+///   `no_sources_content` so [`MapBuilder::finalize`] omits the array.
+/// - Caller opt-out: `!opts.include_sources_content` also sets the flag.
+///
+/// Returns `(raw_body, Option<MapBuilder>)`.
+fn apply_map_degradation(
+    raw: String,
+    mut builder: crate::sourcemap::MapBuilder,
+    opts: &crate::sourcemap::CompileOptions,
+    warnings: &mut Vec<String>,
+) -> (String, Option<crate::sourcemap::MapBuilder>) {
+    if builder.segments_dropped {
+        warnings.push(format!(
+            "source map segment cap ({} segments) exceeded; \
+             source_map will be None for this compilation",
+            crate::limits::MAX_SOURCEMAP_SEGMENTS,
+        ));
+        return (raw, None);
+    }
+    let total_src_bytes = builder.sources_content_bytes();
+    if total_src_bytes > crate::limits::MAX_SOURCES_CONTENT_BYTES {
+        warnings.push(format!(
+            "sourcesContent total size ({} bytes) exceeds the {} byte ceiling; \
+             sourcesContent will be omitted from the source map",
+            total_src_bytes,
+            crate::limits::MAX_SOURCES_CONTENT_BYTES,
+        ));
+        builder.no_sources_content = true;
+    }
+    if !opts.include_sources_content {
+        builder.no_sources_content = true;
+    }
+    (raw, Some(builder))
+}
+
 /// Return `true` when the AST body contains at least one `@message` block
 /// (possibly nested inside `@if` or `@for` — a shallow scan is enough for the
 /// "no messages at all" guard; evaluation handles deeper nesting).
@@ -1711,7 +2036,7 @@ fn has_message_block(nodes: &[Node]) -> bool {
         // than silently being misclassified as markdown.
         Node::Text(_)
         | Node::Interpolation(_)
-        | Node::EscapedBrace
+        | Node::EscapedBrace { .. }
         | Node::Define(_)
         | Node::Import(_)
         | Node::Export(_)
@@ -1729,6 +2054,7 @@ fn collect_define(
     defs: &mut CollectedDefs,
     scope: &mut Scope,
     ctx: &ModuleCtx<'_>,
+    origin: Option<&Origin>,
 ) -> Result<(), MdsError> {
     if defs.functions.contains_key(&def.name) || defs.block_names.contains(&def.name) {
         return Err(MdsError::name_collision_at(
@@ -1750,6 +2076,8 @@ fn collect_define(
         .map(|(k, v)| (k, (*v).clone()))
         .collect();
     func.captured.vars = scope.get_all_vars();
+    // S7: stamp provenance — two Arc refcount bumps, no allocation.
+    func.origin = origin.cloned();
     // Wrap in Arc for cheap storage and O(1) scope insertion.
     let arc = Arc::new(func);
     defs.functions.insert(def.name.clone(), Arc::clone(&arc));

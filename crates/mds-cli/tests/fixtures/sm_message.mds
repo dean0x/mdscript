@@ -1,0 +1,6 @@
+@message system:
+You are a helpful assistant.
+@end
+@message user:
+Hello!
+@end
