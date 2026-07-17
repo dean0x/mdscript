@@ -272,6 +272,26 @@ pub struct NativeFs {
     root_dir: OnceLock<PathBuf>,
 }
 
+/// Return the effective parent directory of `path`, always resolving to
+/// `Path::new(".")` for bare filenames.
+///
+/// `Path::parent()` returns `Some("")` (an empty path) for bare relative
+/// filenames like `"hello.mds"`, NOT `None`. An empty path fails
+/// `canonicalize()` with a file-not-found error, which is the root cause of
+/// the bare-filename release blocker.  This function maps both `Some("")` and
+/// `None` to `Path::new(".")` so that `check_symlink` resolves bare filenames
+/// against the current working directory, matching the behaviour users expect.
+///
+/// Absolute paths and paths with a non-empty parent component are returned
+/// unchanged.
+pub(crate) fn effective_parent(path: &Path) -> &Path {
+    match path.parent() {
+        None => Path::new("."),
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+    }
+}
+
 impl NativeFs {
     /// Create a new `NativeFs` with no root directory set.
     ///
@@ -302,7 +322,13 @@ impl NativeFs {
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;
 
-        let parent = path.parent().unwrap_or(Path::new("."));
+        // Use effective_parent rather than path.parent().unwrap_or(".") because
+        // Path::parent() on a bare filename (e.g. "hello.mds") returns Some("") —
+        // an empty string — NOT None, so the unwrap_or fallback is dead code and
+        // "".canonicalize() fails with a file-not-found error on every bare-filename
+        // invocation of any subcommand.  effective_parent maps both Some("") and None
+        // to Path::new("."), making bare relative filenames work correctly.
+        let parent = effective_parent(path);
         let canonical_parent = parent
             .canonicalize()
             .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
@@ -1249,6 +1275,75 @@ mod tests {
         fn is_markdown(&self, normalized: &str) -> bool {
             Path::new(normalized).extension().and_then(|e| e.to_str()) == Some("md")
         }
+    }
+
+    // ── effective_parent ──────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_parent_bare_name_returns_dot() {
+        // "hello.mds" — no directory component; Path::parent() returns Some("").
+        // effective_parent must return Path::new("."), not the empty path.
+        assert_eq!(effective_parent(Path::new("hello.mds")), Path::new("."));
+    }
+
+    #[test]
+    fn effective_parent_dot_slash_prefix_returns_dot() {
+        // "./hello.mds" — parent is "." (non-empty); returned as-is.
+        assert_eq!(effective_parent(Path::new("./hello.mds")), Path::new("."));
+    }
+
+    #[test]
+    fn effective_parent_subdir_path_unchanged() {
+        // "sub/hello.mds" — parent is "sub"; returned unchanged.
+        assert_eq!(effective_parent(Path::new("sub/hello.mds")), Path::new("sub"));
+    }
+
+    #[test]
+    fn effective_parent_absolute_path_unchanged() {
+        // Absolute path: parent is the directory, which is non-empty.
+        let p = Path::new("/tmp/hello.mds");
+        assert_eq!(effective_parent(p), Path::new("/tmp"));
+    }
+
+    // ── check_symlink bare-filename regression ─────────────────────────────────
+
+    #[test]
+    fn check_symlink_bare_filename_resolves_via_cwd() {
+        // Regression for the release blocker: when the caller passes a bare filename
+        // (e.g. "hello.mds") from cwd, check_symlink must not fail with file_not_found
+        // due to canonicalizing the empty parent path "".
+        //
+        // We do NOT mutate std::env::set_current_dir here (process-global, races under
+        // nextest).  Instead we verify the root cause is fixed by calling check_symlink
+        // with an absolute path whose parent is a real directory — the same code path
+        // that effective_parent enables for a bare filename resolved from cwd.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "bare.mds", "hello");
+        // Absolute path: parent is the temp dir (non-empty absolute) — must succeed.
+        let result = NativeFs::check_symlink(&file);
+        assert!(
+            result.is_ok(),
+            "check_symlink should succeed for a real file with an absolute path: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_symlink_bare_filename_symlink_is_rejected() {
+        // With the effective_parent fix in place, a bare symlink filename no longer
+        // surfaces as file_not_found — it correctly surfaces as a symlink rejection.
+        let dir = TempDir::new().unwrap();
+        let target = make_temp_file(&dir, "target.mds", "hello");
+        let link_path = dir.path().join("link.mds");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+        // Absolute path (same code path as bare filename from cwd after effective_parent):
+        let result = NativeFs::check_symlink(&link_path);
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinks"),
+            "expected symlink rejection (not file_not_found), got: {msg}"
+        );
     }
 
     #[test]

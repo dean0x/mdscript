@@ -758,3 +758,97 @@ fn build_mds_json_discovery_walks_up() {
         md_path.display()
     );
 }
+
+// ── Bare-filename regression tests (release blocker — effective_parent fix) ──
+
+/// `mds build hello.mds` from the directory containing `hello.mds` must succeed.
+/// Before the effective_parent fix, Path::parent() returned Some("") for a bare
+/// filename, causing "".canonicalize() to fail with file_not_found on EVERY
+/// subcommand when the user passed a bare relative filename as the argument.
+#[test]
+fn build_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["build", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds build <bare-filename> from cwd should succeed; stderr: {stderr}"
+    );
+    assert!(
+        dir.path().join("hello.md").exists(),
+        "hello.md should be created next to hello.mds"
+    );
+}
+
+/// `mds check hello.mds` from the directory containing it must succeed.
+#[test]
+fn check_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["check", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds check <bare-filename> from cwd should succeed; stderr: {stderr}"
+    );
+}
+
+/// `mds fmt hello.mds` from the directory containing it must succeed.
+#[test]
+fn fmt_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["fmt", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds fmt <bare-filename> from cwd should succeed; stderr: {stderr}"
+    );
+}
+
+/// `mds lint hello.mds` from the directory containing it must succeed (exit 0 for clean file).
+#[test]
+fn lint_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Clean file: no lint findings expected.
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["lint", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds lint <bare-filename> from cwd should succeed for a clean file; stderr: {stderr}"
+    );
+}
