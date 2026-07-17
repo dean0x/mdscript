@@ -101,9 +101,9 @@ fn validate_if_node(
     validate_condition(&block.condition, scope, file, source, block.offset)?;
     validate(&block.then_body, scope, file, source)?;
     // Validate all @elseif branches
-    for (elseif_cond, elseif_body) in &block.elseif_branches {
-        validate_condition(elseif_cond, scope, file, source, block.offset)?;
-        validate(elseif_body, scope, file, source)?;
+    for elseif in &block.elseif_branches {
+        validate_condition(&elseif.condition, scope, file, source, elseif.offset)?;
+        validate(&elseif.body, scope, file, source)?;
     }
     if let Some(else_body) = &block.else_body {
         validate(else_body, scope, file, source)?;

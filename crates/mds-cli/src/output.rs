@@ -513,7 +513,11 @@ mod tests {
 
         let mut files = collect_mds_files(dir.path(), 64, None);
         files.sort();
-        assert_eq!(files.len(), 2, "hidden file should still be collected; found: {files:?}");
+        assert_eq!(
+            files.len(),
+            2,
+            "hidden file should still be collected; found: {files:?}"
+        );
     }
 
     #[test]

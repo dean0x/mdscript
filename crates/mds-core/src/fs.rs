@@ -1295,7 +1295,10 @@ mod tests {
     #[test]
     fn effective_parent_subdir_path_unchanged() {
         // "sub/hello.mds" — parent is "sub"; returned unchanged.
-        assert_eq!(effective_parent(Path::new("sub/hello.mds")), Path::new("sub"));
+        assert_eq!(
+            effective_parent(Path::new("sub/hello.mds")),
+            Path::new("sub")
+        );
     }
 
     #[test]

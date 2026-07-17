@@ -2,7 +2,7 @@
 
 use super::helpers::*;
 use super::*;
-use crate::ast::{Arg, ExportDirective, Expr, ImportDirective};
+use crate::ast::{Arg, Condition, ExportDirective, Expr, ImportDirective, Node};
 use crate::lexer::tokenize;
 use crate::limits::MAX_DOT_SEGMENTS;
 
@@ -1587,7 +1587,8 @@ fn parse_elseif_call_condition() {
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::If(block) = &module.body[0] {
         assert_eq!(block.elseif_branches.len(), 1);
-        let (cond, _) = &block.elseif_branches[0];
+        let branch = &block.elseif_branches[0];
+        let cond = &branch.condition;
         assert!(
             matches!(cond, Condition::Eq(Expr::Call { name, .. }, Expr::StringLiteral(s))
                 if name == "lower" && s == "val"),
@@ -1920,6 +1921,127 @@ fn parse_elseif_unterminated_string_error() {
     assert!(
         err.contains("unterminated string"),
         "error should mention unterminated string, got: {err}"
+    );
+}
+
+// ── ElseifBranch.offset and IfBlock.else_offset ──────────────────────────────
+
+/// ElseifBranch.offset is captured at the @elseif directive position.
+///
+/// Source layout (all ASCII bytes):
+///   "@if a:\nA\n@elseif b:\nB\n@end\n"
+///    ^0       ^7  ^9
+/// '@elseif b:' begins at byte offset 9.
+#[test]
+fn elseif_branch_offset_captured() {
+    let src = "@if a:\nA\n@elseif b:\nB\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+    let Node::If(block) = &module.body[0] else {
+        panic!("expected If node");
+    };
+    assert_eq!(block.elseif_branches.len(), 1);
+    let branch = &block.elseif_branches[0];
+    assert_eq!(
+        branch.offset, 9,
+        "ElseifBranch.offset must point at the @elseif directive byte (9); got {}",
+        branch.offset
+    );
+}
+
+/// IfBlock.else_offset is Some when @else is present, pointing at the @else directive.
+///
+/// Source layout:
+///   "@if a:\nA\n@else:\nB\n@end\n"
+///    ^0       ^7  ^9
+/// '@else:' begins at byte offset 9.
+#[test]
+fn else_offset_captured_when_present() {
+    let src = "@if a:\nA\n@else:\nB\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+    let Node::If(block) = &module.body[0] else {
+        panic!("expected If node");
+    };
+    assert_eq!(
+        block.else_offset,
+        Some(9),
+        "IfBlock.else_offset must be Some(9) when @else is at byte 9; got {:?}",
+        block.else_offset
+    );
+}
+
+/// IfBlock.else_offset is None when there is no @else clause.
+#[test]
+fn else_offset_absent_when_no_else() {
+    let src = "@if a:\nA\n@end\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+    let Node::If(block) = &module.body[0] else {
+        panic!("expected If node");
+    };
+    assert_eq!(
+        block.else_offset, None,
+        "IfBlock.else_offset must be None when no @else present"
+    );
+}
+
+// ── Unclosed-block error spans ────────────────────────────────────────────────
+
+/// Unclosed @if block produces a syntax error anchored at the @if opener.
+///
+/// Before consume_end received opener_offset, unclosed-block errors were
+/// anchored at EOF (offset 0 / no span). After the change the error must
+/// carry a span at the @if opener so users see the unclosed line.
+#[test]
+fn unclosed_if_error_anchored_at_opener() {
+    let src = "@if x:\nhello\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let err = parse_with_ctx(&tokens, "test.mds", src)
+        .unwrap_err()
+        .serialize();
+    assert!(
+        err.message.contains("unclosed") || err.message.contains("@end"),
+        "error message should mention unclosed block or @end; got: {}",
+        err.message
+    );
+    let span = err.span.expect("unclosed @if error must carry a span");
+    assert_eq!(
+        span.offset, 0,
+        "unclosed @if error span must be at the @if opener (byte 0); got offset {}",
+        span.offset
+    );
+}
+
+/// Unclosed @for block produces a syntax error anchored at the @for opener.
+#[test]
+fn unclosed_for_error_anchored_at_opener() {
+    let src = "@for x in items:\nhello\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let err = parse_with_ctx(&tokens, "test.mds", src)
+        .unwrap_err()
+        .serialize();
+    let span = err.span.expect("unclosed @for error must carry a span");
+    assert_eq!(
+        span.offset, 0,
+        "unclosed @for error span must be at the @for opener (byte 0); got offset {}",
+        span.offset
+    );
+}
+
+/// Unclosed @define block produces a syntax error anchored at the @define opener.
+#[test]
+fn unclosed_define_error_anchored_at_opener() {
+    let src = "@define greet(name):\nhello {name}\n";
+    let tokens = tokenize(src, "test.mds").unwrap();
+    let err = parse_with_ctx(&tokens, "test.mds", src)
+        .unwrap_err()
+        .serialize();
+    let span = err.span.expect("unclosed @define error must carry a span");
+    assert_eq!(
+        span.offset, 0,
+        "unclosed @define error span must be at the @define opener (byte 0); got offset {}",
+        span.offset
     );
 }
 

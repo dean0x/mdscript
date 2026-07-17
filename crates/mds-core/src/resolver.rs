@@ -2020,7 +2020,7 @@ fn has_message_block(nodes: &[Node]) -> bool {
                 || block
                     .elseif_branches
                     .iter()
-                    .any(|(_, body)| has_message_block(body))
+                    .any(|branch| has_message_block(&branch.body))
                 || block
                     .else_body
                     .as_deref()

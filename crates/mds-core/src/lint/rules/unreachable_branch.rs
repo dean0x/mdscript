@@ -73,8 +73,8 @@ fn check_nodes(
                 check_if_block(b, filename, severity, builder);
                 // Recurse into bodies.
                 check_nodes(&b.then_body, filename, severity, builder);
-                for (_, body) in &b.elseif_branches {
-                    check_nodes(body, filename, severity, builder);
+                for branch in &b.elseif_branches {
+                    check_nodes(&branch.body, filename, severity, builder);
                 }
                 if let Some(else_body) = &b.else_body {
                     check_nodes(else_body, filename, severity, builder);
@@ -147,7 +147,8 @@ fn check_if_block(
     // Collect all seen conditions in order; flag a branch if its condition equals any prior one.
     let mut seen_conditions: Vec<&Condition> = vec![&b.condition];
 
-    for (cond, _body) in &b.elseif_branches {
+    for branch in &b.elseif_branches {
+        let cond = &branch.condition;
         // Check if this @elseif condition duplicates any prior condition.
         let is_duplicate = seen_conditions
             .iter()
@@ -163,7 +164,7 @@ fn check_if_block(
                  this branch can never be reached."
                     .to_string(),
                 Some("Remove the duplicate @elseif branch or change its condition.".to_string()),
-                b.offset,
+                branch.offset,
                 "@elseif".len(),
             )) {
                 return;
@@ -177,7 +178,7 @@ fn check_if_block(
                         filename,
                         "@elseif condition is always true".to_string(),
                         Some("Replace the constant condition with a variable.".to_string()),
-                        b.offset,
+                        branch.offset,
                         "@elseif".len(),
                     )) {
                         return;
@@ -192,7 +193,7 @@ fn check_if_block(
                             "Replace the constant condition with a variable or remove the dead branch."
                                 .to_string(),
                         ),
-                        b.offset,
+                        branch.offset,
                         "@elseif".len(),
                     )) {
                         return;
@@ -432,6 +433,49 @@ mod tests {
             "M4: duplicate always-true @elseif must yield exactly 2 findings \
              (not 3 — always-true and duplicate are the same dead code); got {count}: {:?}",
             diags
+        );
+    }
+
+    /// Duplicate @elseif diagnostic is anchored at the @elseif line, not the @if line.
+    ///
+    /// Source layout (all ASCII):
+    ///   "@if x == \"a\":\nfoo\n@elseif x == \"a\":\nbar\n@end\n"
+    ///    ^0              ^14    ^18
+    ///
+    /// The duplicate-@elseif diagnostic must have span.offset == 18 (start of @elseif),
+    /// not 0 (start of @if).
+    #[test]
+    fn duplicate_elseif_diagnostic_anchored_at_elseif() {
+        // Need x in scope for check_str to pass.
+        let src = "---\nx: hello\n---\n@if x == \"a\":\nfoo\n@elseif x == \"a\":\nbar\n@end\n";
+        // "---\nx: hello\n---\n" = 17 bytes; @if starts at 17.
+        // "@if x == \"a\":\n" = 14 bytes, so @elseif starts at 17+14+3 (foo\n) = 34
+        // Let's compute: "---\nx: hello\n---\n" has chars:
+        //   '-','-','-','\n','x',':',' ','h','e','l','l','o','\n','-','-','-','\n' = 17 bytes
+        // "@if x == \"a\":\n" = '@','i','f',' ','x',' ','=','=',' ','"','a','"',':','\n' = 14 bytes → starts at 17, ends at 30
+        // "foo\n" = 4 bytes → starts at 31, ends at 34
+        // "@elseif x == \"a\":\n" starts at 35
+        let diags = lint_src(src);
+        let dup_diag = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("structurally identical"))
+            .expect("expected a duplicate-@elseif diagnostic");
+        let span = dup_diag
+            .span
+            .as_ref()
+            .expect("diagnostic must carry a span");
+        // Verify the span is NOT at the @if opener (byte 17).
+        assert_ne!(
+            span.offset, 17,
+            "duplicate @elseif diagnostic must NOT be anchored at @if opener (byte 17)"
+        );
+        // Verify the span IS at or after the @elseif directive.
+        // The @elseif "x == \"a\":" starts at offset 35 in this source.
+        assert_eq!(
+            span.offset, 35,
+            "duplicate @elseif diagnostic must be at the @elseif directive (byte 35); \
+             got offset {}",
+            span.offset
         );
     }
 

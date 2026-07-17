@@ -862,9 +862,9 @@ fn evaluate_if(
         block.elseif_branches.len(),
         MAX_ELSEIF_BRANCHES,
     );
-    for (cond, body) in &block.elseif_branches {
-        if evaluate_condition(cond, scope, ctx)? {
-            return evaluate_nodes(body, scope, ctx);
+    for branch in &block.elseif_branches {
+        if evaluate_condition(&branch.condition, scope, ctx)? {
+            return evaluate_nodes(&branch.body, scope, ctx);
         }
     }
 
@@ -1261,9 +1261,9 @@ fn collect_messages_from_if(
         block.elseif_branches.len(),
         MAX_ELSEIF_BRANCHES,
     );
-    for (cond, body) in &block.elseif_branches {
-        if evaluate_condition(cond, scope, ctx)? {
-            return collect_messages_strict(body, scope, ctx, out, file, source);
+    for branch in &block.elseif_branches {
+        if evaluate_condition(&branch.condition, scope, ctx)? {
+            return collect_messages_strict(&branch.body, scope, ctx, out, file, source);
         }
     }
     if let Some(else_body) = &block.else_body {
@@ -1354,6 +1354,7 @@ mod tests {
             then_body: vec![text("yes")],
             else_body: Some(vec![text("no")]),
             offset: 0,
+            else_offset: None,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1369,6 +1370,7 @@ mod tests {
             then_body: vec![text("yes")],
             else_body: Some(vec![text("no")]),
             offset: 0,
+            else_offset: None,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];

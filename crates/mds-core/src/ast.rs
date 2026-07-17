@@ -187,15 +187,40 @@ pub enum Arg {
     },
 }
 
+/// A single `@elseif` branch in an `@if` block.
+///
+/// Replaces the prior `(Condition, Vec<Node>)` tuple to carry a per-branch
+/// byte offset, closing the span-accuracy gap tracked in #181: lint rules can
+/// now anchor diagnostics at the exact `@elseif` line rather than the
+/// enclosing `@if` offset.
+///
+/// # Structural equality
+///
+/// `structural_eq.rs` compares `ElseifBranch` by `condition` and `body` only
+/// — `offset` is intentionally excluded (it is a span annotation, not part of
+/// the template's logical identity).
+#[derive(Debug, Clone)]
+pub struct ElseifBranch {
+    pub condition: Condition,
+    pub body: Vec<Node>,
+    /// Byte offset of the `@elseif` token in the source (for diagnostic spans).
+    pub offset: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct IfBlock {
     /// The primary condition (`@if <condition>:`).
     pub condition: Condition,
     pub then_body: Vec<Node>,
     /// Zero or more `@elseif` branches, evaluated in order (short-circuit).
-    pub elseif_branches: Vec<(Condition, Vec<Node>)>,
+    pub elseif_branches: Vec<ElseifBranch>,
     pub else_body: Option<Vec<Node>>,
     pub offset: usize,
+    /// Byte offset of the `@else:` token in the source, when present.
+    ///
+    /// `None` when there is no `@else` clause. Used by lint rules to anchor
+    /// diagnostics at the exact `@else` line rather than the enclosing `@if`.
+    pub else_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone)]

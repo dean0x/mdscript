@@ -166,10 +166,9 @@ fn check_if_block(
     }
 
     // Check @elseif branches.
-    for (_, branch_body) in &b.elseif_branches {
-        // No per-elseif offset stored in the AST — use the @if offset as an approximation.
+    for branch in &b.elseif_branches {
         if flag_if_empty(
-            branch_body,
+            &branch.body,
             filename,
             severity,
             make_diag(
@@ -177,7 +176,7 @@ fn check_if_block(
                 filename,
                 "@elseif body is empty".to_string(),
                 Some("Add content inside the @elseif block or remove it.".to_string()),
-                b.offset, // approximate: no per-elseif offset in AST
+                branch.offset,
                 "@elseif".len(),
             ),
             builder,
@@ -198,7 +197,7 @@ fn check_if_block(
                 filename,
                 "@else body is empty".to_string(),
                 Some("Add content inside the @else block or remove it.".to_string()),
-                b.offset,
+                b.else_offset.unwrap_or(b.offset),
                 "@else".len(),
             ),
             builder,
@@ -421,6 +420,63 @@ mod tests {
             diags.iter().any(|d| d.rule == RULE),
             "should fire for empty @else body; got: {:?}",
             diags
+        );
+    }
+
+    /// The @elseif diagnostic span is anchored at the @elseif line, not the @if line.
+    ///
+    /// Before the ElseifBranch AST change, the rule fell back to `b.offset` (the @if
+    /// position) because no per-branch offset was stored.  After the change the span
+    /// must point at the `@elseif` directive itself.
+    ///
+    /// Source layout (ASCII, all bytes):
+    ///   "@if x:\nhello\n@elseif y:\n@end\n"
+    ///    ^0       ^7     ^13
+    /// @elseif is at byte offset 13.
+    #[test]
+    fn elseif_empty_body_span_at_elseif_offset() {
+        // @if then-body has content; only @elseif body is empty.
+        let src = "@if x:\nhello\n@elseif y:\n@end\n";
+        let diags = lint_src(src);
+        let elseif_diag = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@elseif"))
+            .expect("expected an @elseif empty-body diagnostic");
+        let span = elseif_diag
+            .span
+            .as_ref()
+            .expect("diagnostic must carry a span");
+        assert_eq!(
+            span.offset, 13,
+            "@elseif diagnostic span must be at the @elseif directive (byte 13), \
+             not at the @if opener (byte 0); got offset {}",
+            span.offset
+        );
+    }
+
+    /// The @else diagnostic span uses else_offset when present.
+    ///
+    /// Source layout:
+    ///   "@if x:\nhello\n@else:\n@end\n"
+    ///    ^0       ^7     ^13
+    /// @else is at byte offset 13.
+    #[test]
+    fn else_empty_body_span_at_else_offset() {
+        let src = "@if x:\nhello\n@else:\n@end\n";
+        let diags = lint_src(src);
+        let else_diag = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@else"))
+            .expect("expected an @else empty-body diagnostic");
+        let span = else_diag
+            .span
+            .as_ref()
+            .expect("diagnostic must carry a span");
+        assert_eq!(
+            span.offset, 13,
+            "@else diagnostic span must be at the @else directive (byte 13), \
+             not at the @if opener (byte 0); got offset {}",
+            span.offset
         );
     }
 

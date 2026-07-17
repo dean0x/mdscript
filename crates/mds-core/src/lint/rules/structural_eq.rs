@@ -118,7 +118,10 @@ pub(crate) fn node_eq(a: &Node, b: &Node) -> bool {
                     .elseif_branches
                     .iter()
                     .zip(&b2.elseif_branches)
-                    .all(|((c1, n1), (c2, n2))| conditions_eq(c1, c2) && nodes_eq(n1, n2))
+                    .all(|(br1, br2)| {
+                        conditions_eq(&br1.condition, &br2.condition)
+                            && nodes_eq(&br1.body, &br2.body)
+                    })
                 && match (&b1.else_body, &b2.else_body) {
                     (None, None) => true,
                     (Some(n1), Some(n2)) => nodes_eq(n1, n2),
@@ -198,7 +201,7 @@ pub(crate) fn is_literal(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Expr, Node, TextNode};
+    use crate::ast::{Condition, ElseifBranch, Expr, IfBlock, Node, TextNode};
 
     #[test]
     fn exprs_eq_var() {
@@ -252,5 +255,41 @@ mod tests {
         assert!(is_literal(&Expr::BooleanLiteral(true)));
         assert!(is_literal(&Expr::NullLiteral));
         assert!(!is_literal(&Expr::Var("x".to_string())));
+    }
+
+    /// ElseifBranch.offset is intentionally excluded from structural equality.
+    ///
+    /// Two IfBlock nodes that are logically identical (same condition, same bodies)
+    /// but parsed from different source positions must compare equal. This locks in
+    /// the invariant documented in ast.rs: `offset` is a span annotation, not part
+    /// of the template's logical identity.
+    #[test]
+    fn elseif_branch_offset_excluded_from_structural_eq() {
+        let make_if = |elseif_offset: usize| {
+            Node::If(IfBlock {
+                condition: Condition::Truthy(Expr::Var("a".to_string())),
+                then_body: vec![Node::Text(TextNode {
+                    text: "A".to_string(),
+                    offset: 0,
+                })],
+                elseif_branches: vec![ElseifBranch {
+                    condition: Condition::Truthy(Expr::Var("b".to_string())),
+                    body: vec![Node::Text(TextNode {
+                        text: "B".to_string(),
+                        offset: 0,
+                    })],
+                    offset: elseif_offset, // the only difference between the two nodes
+                }],
+                else_body: None,
+                offset: 0,
+                else_offset: None,
+            })
+        };
+        let a = make_if(9);
+        let b = make_if(999);
+        assert!(
+            node_eq(&a, &b),
+            "IfBlocks differing only in ElseifBranch.offset must be structurally equal"
+        );
     }
 }
