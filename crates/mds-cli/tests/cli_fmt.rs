@@ -944,3 +944,39 @@ fn pre_existing_config_without_fmt_section_still_loads() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── Walker default exclusion: node_modules ────────────────────────────────────
+
+/// `mds fmt <dir>` must leave files inside `node_modules/` untouched.
+/// The summary must not count the `node_modules` file in the formatted/unchanged
+/// total — the directory is simply not traversed.
+#[test]
+fn dir_fmt_skips_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    // One normal file that needs formatting (has \r so it changes).
+    fs::write(dir.path().join("main.mds"), "Hello \r\nworld\r\n").unwrap();
+    // File inside node_modules — must not be touched.
+    let nm = dir.path().join("node_modules");
+    std::fs::create_dir(&nm).unwrap();
+    fs::write(nm.join("lib.mds"), "lib content\r\n").unwrap();
+
+    let output = fmt_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The node_modules file must not have been modified.
+    let nm_content = fs::read_to_string(nm.join("lib.mds")).unwrap();
+    assert_eq!(
+        nm_content, "lib content\r\n",
+        "node_modules/lib.mds must not be reformatted"
+    );
+
+    // Summary must say "1 formatted" (only the root-level main.mds), not "2".
+    assert!(
+        stderr.contains("1 formatted"),
+        "summary must show exactly 1 formatted file (node_modules excluded); got: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "fmt should succeed; stderr: {stderr}"
+    );
+}

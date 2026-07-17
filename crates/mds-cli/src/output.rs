@@ -149,6 +149,55 @@ pub(crate) fn collect_mds_files(
     results
 }
 
+/// Return `true` when a directory name should be excluded from recursive
+/// traversal by default (PF-004: enforced on the shared walker so ALL
+/// subcommands — build / check / lint / fmt / watch — inherit the behaviour).
+///
+/// Excluded directory names:
+/// - Any name that starts with `.` (hidden directories, e.g. `.git`, `.cache`)
+/// - `node_modules`
+///
+/// Note: this gate applies to the RECURSION step only — the root directory
+/// that was explicitly passed to `collect_mds_files` is always processed,
+/// even if its own name happens to start with `.`.  Hidden *files* (e.g.
+/// `.dotfile.mds`) at the traversed directory level are still collected.
+pub(crate) fn is_default_excluded_dir(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules"
+}
+
+/// Return `true` when `path` lives inside a default-excluded sub-directory
+/// of `root` (i.e. traversal would have been skipped there by
+/// `is_default_excluded_dir`).
+///
+/// Used by the watch guards to detect events that should be treated as external
+/// dependencies rather than normal output-producing sources (PF-004 class:
+/// the same limit must be enforced on the parallel event-processing path as on
+/// the initial walker path — avoids the "limit on one path but not another"
+/// bug class).
+pub(crate) fn is_within_default_excluded_dir(root: &Path, path: &Path) -> bool {
+    // Strip the root prefix to get a relative path, then check every ancestor
+    // component to see if any one of them is a default-excluded dir name.
+    let rel = match path.strip_prefix(root) {
+        Ok(r) => r,
+        Err(_) => return false, // path is not under root at all
+    };
+    // Walk the ancestors (all components except the final file/dir component).
+    // We want to know if the path is INSIDE an excluded dir, so we check all
+    // components that are ancestors of the final component.
+    let components: Vec<_> = rel.components().collect();
+    // All but the last component are directories we need to check.
+    components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|c| {
+            if let std::path::Component::Normal(n) = c {
+                n.to_str().map(is_default_excluded_dir).unwrap_or(false)
+            } else {
+                false
+            }
+        })
+}
+
 fn collect_mds_files_inner(
     dir: &Path,
     depth: usize,
@@ -189,6 +238,17 @@ fn collect_mds_files_inner(
             continue;
         }
         if file_type.is_dir() {
+            // Skip hidden directories (e.g. .git, .cache) and node_modules on the
+            // RECURSION step so all subcommands inherit the default exclusions via
+            // the shared walker (PF-004).  The root dir that was explicitly passed
+            // to collect_mds_files() is NEVER checked here — this guard applies
+            // only to directory ENTRIES discovered during traversal.  Since entries
+            // are always children of the current dir, they are never the explicit root.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if is_default_excluded_dir(name) {
+                    continue;
+                }
+            }
             collect_mds_files_inner(&path, depth + 1, max_depth, exclude_prefix, results);
         } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mds") {
             results.push(path);
@@ -333,6 +393,143 @@ mod tests {
         assert!(is_partial(Path::new("/dir/_partial.mds")));
         assert!(!is_partial(Path::new("/dir/main.mds")));
         assert!(!is_partial(Path::new("/dir/not_partial.mds")));
+    }
+
+    // ── is_default_excluded_dir ───────────────────────────────────────────────
+
+    #[test]
+    fn hidden_dir_is_excluded() {
+        assert!(is_default_excluded_dir(".git"));
+        assert!(is_default_excluded_dir(".cache"));
+        assert!(is_default_excluded_dir(".hidden"));
+    }
+
+    #[test]
+    fn node_modules_is_excluded() {
+        assert!(is_default_excluded_dir("node_modules"));
+    }
+
+    #[test]
+    fn ordinary_dirs_are_not_excluded() {
+        assert!(!is_default_excluded_dir("src"));
+        assert!(!is_default_excluded_dir("prompts"));
+        assert!(!is_default_excluded_dir("templates"));
+    }
+
+    // ── is_within_default_excluded_dir ───────────────────────────────────────
+
+    #[test]
+    fn path_inside_node_modules_is_excluded() {
+        assert!(is_within_default_excluded_dir(
+            Path::new("/root"),
+            Path::new("/root/node_modules/foo.mds")
+        ));
+    }
+
+    #[test]
+    fn path_inside_git_dir_is_excluded() {
+        assert!(is_within_default_excluded_dir(
+            Path::new("/root"),
+            Path::new("/root/.git/config")
+        ));
+    }
+
+    #[test]
+    fn path_inside_hidden_subdir_is_excluded() {
+        assert!(is_within_default_excluded_dir(
+            Path::new("/root"),
+            Path::new("/root/.cache/something.mds")
+        ));
+    }
+
+    #[test]
+    fn normal_path_under_root_is_not_excluded() {
+        assert!(!is_within_default_excluded_dir(
+            Path::new("/root"),
+            Path::new("/root/src/main.mds")
+        ));
+    }
+
+    #[test]
+    fn hidden_file_at_root_level_is_not_excluded() {
+        // Hidden files at the top level are not inside an excluded DIR.
+        assert!(!is_within_default_excluded_dir(
+            Path::new("/root"),
+            Path::new("/root/.dotfile.mds")
+        ));
+    }
+
+    #[test]
+    fn path_outside_root_is_not_excluded() {
+        // Paths not under root at all are not affected by the root-relative check.
+        assert!(!is_within_default_excluded_dir(
+            Path::new("/root"),
+            Path::new("/other/node_modules/foo.mds")
+        ));
+    }
+
+    // ── collect_mds_files walker exclusions ───────────────────────────────────
+
+    #[test]
+    fn walker_skips_node_modules_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a normal .mds file and one inside node_modules.
+        std::fs::write(dir.path().join("main.mds"), "hello").unwrap();
+        let nm = dir.path().join("node_modules");
+        std::fs::create_dir(&nm).unwrap();
+        std::fs::write(nm.join("lib.mds"), "lib").unwrap();
+
+        let files = collect_mds_files(dir.path(), 64, None);
+        assert_eq!(
+            files.len(),
+            1,
+            "node_modules/lib.mds should be excluded; found: {files:?}"
+        );
+        assert!(files[0].ends_with("main.mds"));
+    }
+
+    #[test]
+    fn walker_skips_hidden_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.mds"), "hello").unwrap();
+        let hidden = dir.path().join(".git");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join("config.mds"), "not a real file").unwrap();
+
+        let files = collect_mds_files(dir.path(), 64, None);
+        assert_eq!(
+            files.len(),
+            1,
+            ".git/*.mds should be excluded; found: {files:?}"
+        );
+    }
+
+    #[test]
+    fn walker_collects_hidden_file_at_root_level() {
+        // Hidden FILES (not directories) at the traversed level are still collected.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.mds"), "hello").unwrap();
+        std::fs::write(dir.path().join(".dotfile.mds"), "dot").unwrap();
+
+        let mut files = collect_mds_files(dir.path(), 64, None);
+        files.sort();
+        assert_eq!(files.len(), 2, "hidden file should still be collected; found: {files:?}");
+    }
+
+    #[test]
+    fn walker_processes_explicitly_passed_hidden_root() {
+        // The root dir itself is always processed even if its name starts with '.'.
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_root = dir.path().join(".myhidden");
+        std::fs::create_dir(&hidden_root).unwrap();
+        std::fs::write(hidden_root.join("template.mds"), "hello").unwrap();
+
+        let files = collect_mds_files(&hidden_root, 64, None);
+        assert_eq!(
+            files.len(),
+            1,
+            "explicitly-passed hidden root should be processed; found: {files:?}"
+        );
     }
 
     #[test]
