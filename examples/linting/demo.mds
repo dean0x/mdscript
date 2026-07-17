@@ -1,0 +1,20 @@
+---
+audience: developers
+retries: 3
+---
+@import "./_shared.mds" as shared
+@import "./_shared.mds" as extra
+
+# Lint demo
+
+{shared.greet("linter")} This template compiles cleanly, but `mds lint`
+flags four issues: a duplicate import of `_shared.mds` (error, auto-fixable),
+the unused `extra` alias it creates (warning), the `retries` frontmatter key
+that the body never references (warning), and a redundant @else branch whose
+body matches the @if body (warning).
+
+@if audience == "developers":
+Thanks for reading, {audience}.
+@else:
+Thanks for reading, {audience}.
+@end

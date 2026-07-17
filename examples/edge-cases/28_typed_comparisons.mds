@@ -1,0 +1,32 @@
+---
+count: 3
+zip_code: "02134"
+strict: true
+---
+
+## Typed comparisons — equality is strict as of v0.4.0
+
+Comparing values of different runtime types with `==` or `!=` raises
+`mds::type_mismatch` instead of silently returning false. Compare same
+types, or convert explicitly with `string()` / `number()`.
+
+@if count == 3:
+- number == number: count is 3
+@end
+@if string(count) == "3":
+- string(count) bridges number to string: "3"
+@end
+@if zip_code == "02134":
+- string == string: zip_code stays "02134" — the leading zero matters
+@end
+@if number(zip_code) == 2134:
+- number(zip_code) bridges string to number: 2134 — the leading zero is lost
+@end
+@if strict != false:
+- boolean != boolean compares fine
+@end
+
+CLI note: `--set zip_code=02134` coerces the value to the number 2134;
+use `--set-string zip_code=02134` to keep the string "02134" byte-for-byte.
+Supplying the same key via both `--set` and `--set-string` in one
+invocation is a hard error.

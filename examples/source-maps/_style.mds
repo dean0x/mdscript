@@ -1,0 +1,11 @@
+@define section(title):
+## {title}
+@end
+
+@define rule(text):
+- {text}
+@end
+
+@define separator():
+---
+@end

@@ -1,0 +1,40 @@
+---
+title: Interior Blank Lines
+---
+
+## {title} — whitespace is verbatim as of v0.4.0
+
+Interior blank-line runs are preserved byte-for-byte everywhere. Only the
+trailing edge of the whole output normalizes to exactly one final newline.
+
+### Ordinary body
+
+BEFORE-RUN
+
+
+
+AFTER-RUN — exactly three blank lines above, none collapsed.
+
+### Inside a @define body
+
+@define spaced(first, second):
+{first}
+
+
+{second} — exactly two blank lines above, carried from the macro body.
+@end
+
+{spaced("alpha", "omega")}
+
+### Inside a @block body
+
+@block spacer:
+block-start
+
+
+block-end — the two blank lines above are verbatim.
+@end
+
+Edge rule: `@define` and `@message` bodies edge-trim (leading and trailing
+blank lines of the body are stripped), but interior runs are never collapsed.
+`@block` bodies and ordinary text keep even their edge blank lines.

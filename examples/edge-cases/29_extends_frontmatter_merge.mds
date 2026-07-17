@@ -1,0 +1,22 @@
+---
+role: release auditor
+focus:
+  - breaking changes
+  - frontmatter merge
+style:
+  tone: terse
+---
+@extends "../inheritance/base-agent.mds"
+@block persona:
+You are a {role} verifying the deep-merged frontmatter contract of v0.4.0.
+@end
+@block capabilities:
+The compiled output above starts with the MERGED frontmatter: base keys
+plus child keys, child winning on collisions. `audience` comes only from
+the base template; `role` is overridden here; `focus` and `style` exist
+only in this child. Arrays replace wholesale; nested maps merge per key.
+Focus areas:
+@for item in focus:
+- {item}
+@end
+@end
