@@ -11,8 +11,10 @@ use mds::{
 fn public_functions_exist() {
     let _: fn(&str) -> Result<String, MdsError> = mds::format_str;
     let _: fn(&str, Option<&Path>) -> Result<String, MdsError> = mds::format_str_with;
+    let _: fn(&str, Option<&Path>, &str) -> Result<String, MdsError> = mds::format_str_named;
     let _ = mds::format_str("Hello!\n");
     let _ = mds::format_str_with("Hello!\n", None);
+    let _ = mds::format_str_named("Hello!\n", None, "<test>");
     let _ = mds::compile_str("---\nname: World\n---\nHello {name}!\n");
     let _ = mds::compile_str_with("Hello!\n", None, None);
     let _ = mds::compile_str_collecting_warnings("Hello!\n", None, None);

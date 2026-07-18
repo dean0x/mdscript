@@ -125,8 +125,17 @@ struct FmtResult {
     changed: bool,
 }
 
-fn format_source(source: &str, base_dir: Option<&Path>) -> Result<FmtResult> {
-    let formatted = mds::format_str_with(source, base_dir).map_err(miette::Error::from)?;
+/// Format `source` and return a [`FmtResult`] with change detection.
+///
+/// `file_name` is threaded into lexer and safety-gate errors so diagnostics
+/// name the file rather than showing a blank path.
+fn format_source_named(
+    source: &str,
+    base_dir: Option<&Path>,
+    file_name: &str,
+) -> Result<FmtResult> {
+    let formatted =
+        mds::format_str_named(source, base_dir, file_name).map_err(miette::Error::from)?;
     let changed = formatted != source;
     Ok(FmtResult { formatted, changed })
 }
@@ -136,7 +145,7 @@ fn format_source(source: &str, base_dir: Option<&Path>) -> Result<FmtResult> {
 fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
     let FmtFlags { check, diff, quiet } = flags;
     let (source, cwd) = read_stdin()?;
-    let result = format_source(&source, Some(&cwd))?;
+    let result = format_source_named(&source, Some(&cwd), "<stdin>")?;
 
     if diff {
         print_diff(&render_diff(&source, &result.formatted, "<stdin>"))?;
@@ -160,7 +169,8 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let FmtFlags { check, diff, quiet } = flags;
     let source = read_source_file(path)?;
     let base_dir = path.parent();
-    let result = format_source(&source, base_dir)?;
+    let file_name = path.display().to_string();
+    let result = format_source_named(&source, base_dir, &file_name)?;
 
     if diff && result.changed {
         let label = path.display().to_string();
@@ -221,26 +231,27 @@ enum FileOutcome {
 /// read and format errors are treated in the surrounding loop.
 fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
+    let file_name = file.display().to_string();
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprintln!("{file_name}: {e:?}");
             return FileOutcome::Failed;
         }
     };
     let base_dir = file.parent();
-    let result = match format_source(&source, base_dir) {
+    let result = match format_source_named(&source, base_dir, &file_name) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprintln!("{file_name}: {e:?}");
             return FileOutcome::Failed;
         }
     };
 
     if diff && result.changed {
-        let label = file.display().to_string();
+        let label = file_name.clone();
         if let Err(e) = print_diff(&render_diff(&source, &result.formatted, &label)) {
-            eprintln!("{e:?}");
+            eprintln!("{file_name}: {e:?}");
             return FileOutcome::Failed;
         }
     }
@@ -447,14 +458,15 @@ mod tests {
 
     #[test]
     fn format_source_detects_no_change() {
-        let result = format_source("Hello!\n", None).unwrap();
+        let result = format_source_named("Hello!\n", None, "<source>").unwrap();
         assert!(!result.changed);
         assert_eq!(result.formatted, "Hello!\n");
     }
 
     #[test]
     fn format_source_detects_change() {
-        let result = format_source("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None).unwrap();
+        let result =
+            format_source_named("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None, "<source>").unwrap();
         assert!(result.changed);
         assert!(!result.formatted.contains('\r'));
     }

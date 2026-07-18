@@ -57,7 +57,7 @@ pub(crate) mod sourcemap;
 pub(crate) mod validator;
 pub(crate) mod value;
 
-pub use formatter::{format_str, format_str_with};
+pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{FileSystem, NativeFs, VirtualFs};
 pub use lint::{fix, sanitize_control_chars, LintConfig, LintDiagnostic, LintResult, Severity};
 pub use options::{

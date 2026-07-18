@@ -74,6 +74,7 @@
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::error::MdsError;
 use crate::lexer::{self, Token};
@@ -115,13 +116,34 @@ pub fn format_str(source: &str) -> Result<String, MdsError> {
 /// See [`format_str`].
 #[must_use = "the formatted source should be used"]
 pub fn format_str_with(source: &str, base_dir: Option<&Path>) -> Result<String, MdsError> {
-    let tokens = lexer::tokenize(source, "")?;
+    format_str_named(source, base_dir, "<source>")
+}
+
+/// Format MDS source code with an explicit base directory and file name.
+///
+/// Identical to [`format_str_with`] but threads `file_name` into lexer errors
+/// and into any [`MdsError::Syntax`] surfaced by the safety gate, so callers
+/// get a diagnostic that names the file rather than showing a blank path.
+///
+/// `file_name` is used only for error reporting — it does not affect how
+/// `@import` paths are resolved (that is controlled by `base_dir`).
+///
+/// # Errors
+///
+/// See [`format_str`].
+#[must_use = "the formatted source should be used"]
+pub fn format_str_named(
+    source: &str,
+    base_dir: Option<&Path>,
+    file_name: &str,
+) -> Result<String, MdsError> {
+    let tokens = lexer::tokenize(source, file_name)?;
     let raw_content = raw_content_spans(&tokens, source);
     let directives = directive_line_offsets(&tokens);
     let body_start = body_start_offset(&tokens, source);
 
     let formatted = rewrite(source, body_start, &raw_content, &directives);
-    assert_equivalent(source, &formatted, base_dir, &raw_content)?;
+    assert_equivalent(source, &formatted, base_dir, &raw_content, file_name)?;
     Ok(formatted)
 }
 
@@ -426,6 +448,7 @@ fn assert_equivalent(
     formatted: &str,
     base_dir: Option<&Path>,
     raw_content: &[Range<usize>],
+    file_name: &str,
 ) -> Result<(), MdsError> {
     match crate::compile_str_collecting_warnings(source, base_dir, None) {
         Ok(orig) => match crate::compile_str_collecting_warnings(formatted, base_dir, None) {
@@ -441,7 +464,17 @@ fn assert_equivalent(
         // (e.g. an unclosed `@message`/`@if`/`@for` block, which tokenizes but
         // fails at parse time). There is nothing safe to format: surface the
         // real error rather than papering over it with the structural check.
-        Err(e @ MdsError::Syntax { .. }) => Err(e),
+        //
+        // Rebuild `src` so the diagnostic names `file_name` rather than the
+        // blank label used internally by `compile_str_collecting_warnings`.
+        Err(MdsError::Syntax { message, span, .. }) => Err(MdsError::Syntax {
+            message,
+            span,
+            src: Some(Arc::new(miette::NamedSource::new(
+                file_name,
+                source.to_string(),
+            ))),
+        }),
         // Any other compile failure (undefined var/fn, unresolved import, …)
         // means the token stream is well-formed and only later analysis failed,
         // so the rule-aware structural comparison is a meaningful fallback.

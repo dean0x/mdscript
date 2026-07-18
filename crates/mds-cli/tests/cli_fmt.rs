@@ -1017,3 +1017,53 @@ fn gate_fallback_no_false_positive_on_trailing_blank_line_exits_zero() {
         "formatted file must have trailing blank removed"
     );
 }
+
+// ── format_str_named: file path appears in error output ───────────────────────
+
+/// Single-file mode: when the source has a genuine syntax error (unclosed @if),
+/// `mds fmt` must show the file path in stderr so the user can locate the problem.
+/// The file name must appear regardless of whether it is a lex- or parse-level error.
+#[test]
+fn single_file_syntax_error_includes_path_in_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("broken.mds");
+    fs::write(&target, "@if cond:\nHello\n").unwrap(); // unclosed @if -> parse-level Syntax
+
+    let output = fmt_path(&target, &[]);
+
+    assert!(
+        !output.status.success(),
+        "fmt must fail (exit non-zero) on syntax error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("broken.mds"),
+        "stderr must contain the file name so the user can locate the problem; got: {stderr}"
+    );
+}
+
+/// Directory mode: each failing file should be identified in stderr.
+/// The file path prefix (`{file}: `) must appear before the error so large
+/// directory runs show which file triggered each failure.
+#[test]
+fn dir_mode_format_error_includes_file_prefix_in_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.mds");
+    let good = dir.path().join("good.mds");
+    fs::write(&bad, "@if cond:\nHello\n").unwrap(); // unclosed @if -> format error
+    fs::write(&good, "Hello!\n").unwrap();
+
+    let output = fmt_path(dir.path(), &[]);
+
+    // Exit non-zero because bad.mds failed.
+    assert!(
+        !output.status.success(),
+        "fmt should exit non-zero when a file in the directory fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The bad file's name must appear in stderr (either as a {file}: prefix or in the error).
+    assert!(
+        stderr.contains("bad.mds"),
+        "dir-mode stderr must identify the failing file; got: {stderr}"
+    );
+}
