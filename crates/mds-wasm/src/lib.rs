@@ -63,13 +63,10 @@ const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
 
 /// Default filename used when the caller does not supply `options.filename`.
 ///
-/// # SYNC
-///
-/// Must equal `mds_core::sourcemap::STRING_SOURCE_MAP_LABEL` (`"input.mds"`).
-/// The native backend maps the `"<source>"` sentinel to this value inside
-/// `MapBuilder::new` / `source_index` so both backends produce identical
-/// `sources[0]` for string-source compilations (PF-007 cross-surface parity).
-const DEFAULT_FILENAME: &str = "input.mds";
+/// This is the canonical label for all string-source compilations across every
+/// surface — imported from `mds_core` so cross-surface `sources[0]` parity
+/// (PF-007 / AC-API-06) is enforced by the compiler rather than by comment.
+const DEFAULT_FILENAME: &str = mds::STRING_SOURCE_MAP_LABEL;
 
 // ── JS interop primitives ─────────────────────────────────────────────────────
 

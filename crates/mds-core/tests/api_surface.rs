@@ -1457,3 +1457,19 @@ fn fix_api_incremental_exists() {
         "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
     );
 }
+
+/// Regression gate (issue #9): `STRING_SOURCE_MAP_LABEL` must be reachable from
+/// the public `mds` API so every surface can import it rather than redeclaring
+/// the literal (avoids PF-007 per-surface re-declaration defeating cross-surface
+/// byte-parity; applies ADR-005).
+///
+/// This test fails to COMPILE if the constant reverts to `pub(crate)`.
+#[test]
+fn string_source_map_label_is_in_public_api() {
+    let label: &str = mds::STRING_SOURCE_MAP_LABEL;
+    assert_eq!(
+        label, "input.mds",
+        "STRING_SOURCE_MAP_LABEL must equal \"input.mds\"; changing it requires \
+         updating every surface that uses it"
+    );
+}

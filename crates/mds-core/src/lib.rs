@@ -64,7 +64,7 @@ pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };
 pub use resolver::ModuleCache;
-pub use sourcemap::{CompileOptions, InvalidOptionsError, SourceMap};
+pub use sourcemap::{CompileOptions, InvalidOptionsError, SourceMap, STRING_SOURCE_MAP_LABEL};
 
 /// A single structured message produced by a template containing `@message` blocks.
 ///

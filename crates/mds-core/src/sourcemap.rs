@@ -72,16 +72,11 @@ impl std::fmt::Debug for Origin {
 /// apply [`map_source_label`] so the diagnostic sentinel `"<source>"` can
 /// never appear in `sources[]`.
 ///
-/// # SYNC
-///
-/// This const must equal:
-/// - `crates/mds-wasm/src/lib.rs` `DEFAULT_FILENAME` (`"input.mds"`) — the
-///   WASM backend seeds the VirtualFs with this key, so WASM string-source
-///   maps already emit `"input.mds"`.  Change one → change both.
-/// - The lint string-source file key in `crates/mds-core/src/lib.rs`
-///   `lint_source` call (~L1147) — both surfaces must agree on the file key
-///   for cross-surface JSON parity (AC-API-06).
-pub(crate) const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
+/// All binding surfaces (WASM, napi, Python, CLI) that handle string-source
+/// compiles must import this constant rather than redeclaring the literal, so
+/// cross-surface `sources[0]` parity (PF-007 / AC-API-06) is a compile-time
+/// fact rather than a comment-coordinated manual sync.
+pub const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
 
 /// Map a raw source file label to its canonical source-map label.
 ///
