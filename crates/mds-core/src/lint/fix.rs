@@ -550,19 +550,22 @@ where
         };
         let test_source = apply_plan_unchecked(&running_source, &single_plan);
 
-        // Use a single-rule targeted set so the regression check is scoped to
-        // this edit's rule only — cross-rule baseline still applies.
-        let single_targeted: std::collections::HashSet<String> =
-            std::iter::once(edit.rule.clone()).collect();
-
         let reverify_result = reverify(&test_source);
         let reject_reason: Option<String> = match &reverify_result {
             Err(err) => Some(format!(
                 "Reverify failed: fixed source does not compile: {err}"
             )),
             Ok(residual) => {
+                // Use the full targeted_rules set (identical to the baseline) so the
+                // comparison is symmetric: other targeted-rule diagnostics that are
+                // still present (not yet fixed) must not be counted as regressions.
+                // Using a single-rule targeted set would cause false positives when
+                // two rules share the same baseline (e.g. empty-block + duplicate-export
+                // both targeted → applying dup-export fix alone leaves empty-block in
+                // residual, which would incorrectly look like a new regression against
+                // a baseline that excluded it).
                 let residual_counts =
-                    count_untargeted_per_rule(&residual.diagnostics, &single_targeted);
+                    count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
                 let regressed = regressed_rules(&residual_counts, &baseline);
                 if !regressed.is_empty() {
                     Some(format!(

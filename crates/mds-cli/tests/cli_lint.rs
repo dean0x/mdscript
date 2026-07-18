@@ -816,3 +816,447 @@ fn json_format_malformed_config_emits_error_envelope() {
         "config error must go to stdout in JSON mode, not stderr; got stderr: {stderr}"
     );
 }
+
+// ── Phase B pin tests ─────────────────────────────────────────────────────────
+
+// ── Test (a): Dir-mode JSON distinct paths for same-basename files ────────────
+//
+// Pins bug-4 fix: in directory mode with --format json, the `file` key in each
+// JSON diagnostic entry must be the relative path from the lint root, NOT the
+// basename. Two files with the same basename in different subdirectories must
+// produce two distinct `file` keys.
+//
+// Pre-Phase-B behavior: mds::lint() sets diag.file to the basename only
+// (path.file_name()), so all three entries would share the key "template.mds".
+
+#[test]
+fn dir_mode_json_same_basename_files_have_distinct_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create two subdirs each with a file of the same basename but a diagnostic.
+    for sub in &["sub_a", "sub_b"] {
+        let subdir = dir.path().join(sub);
+        fs::create_dir_all(&subdir).unwrap();
+        // lint_warn_only content: unused-variable warning → appears in JSON output.
+        fs::copy(fixture("lint_warn_only.mds"), subdir.join("template.mds")).unwrap();
+    }
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // At least one file has a warning → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "dir with warn-only files must exit 1; stderr: {stderr}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    let files = json["files"].as_array().expect("must have files[]");
+    assert_eq!(
+        files.len(),
+        2,
+        "both files must appear in JSON output; got: {files:?}"
+    );
+
+    let paths: Vec<&str> = files
+        .iter()
+        .map(|f| {
+            f["file"]
+                .as_str()
+                .expect("each entry must have a file string")
+        })
+        .collect();
+
+    // Each path must contain its subdirectory prefix — not just "template.mds".
+    assert!(
+        paths.iter().any(|p| p.contains("sub_a")),
+        "sub_a path must appear in file keys; got: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.contains("sub_b")),
+        "sub_b path must appear in file keys; got: {paths:?}"
+    );
+
+    // The two entries must be distinct (not both "template.mds").
+    let mut sorted = paths.clone();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        2,
+        "file keys must be distinct; got: {paths:?}"
+    );
+}
+
+// ── Test (b): --fix --format json dir-mode residuals keyed by relative path ──
+//
+// Pins that after --fix in directory mode, residual diagnostics in the JSON output
+// are keyed by the relative display path, NOT by "input.mds" or the raw basename.
+//
+// Fixture: a file with duplicate-export (Tier A, auto-fixed) + unused-variable
+// (Tier C, not auto-fixed). After --fix, the residual unused-variable diagnostic
+// must appear under the relative path key, not "input.mds".
+
+#[test]
+fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Put the fixture one level deep so display_path = "subdir/mixed.mds".
+    let subdir = dir.path().join("subdir");
+    fs::create_dir_all(&subdir).unwrap();
+
+    // Construct a file that has both duplicate-export (fixable) and unused-variable
+    // (residual after fix): reuse lint_error.mds (duplicate-export) content plus the
+    // unused frontmatter key from lint_warn_only.mds.
+    let mixed = "---\ngreeting: Hello\nunused_key: not referenced\n---\n\n\
+                  @define greet(name):\n  Hello {name}!\n@end\n\n\
+                  @export greet\n@export greet\n";
+    let target = subdir.join("mixed.mds");
+    fs::write(&target, mixed).unwrap();
+
+    let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}; stderr: {stderr}")
+    });
+
+    // After fixing duplicate-export, unused-variable residual remains → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "residual unused-variable must produce exit 1; stderr: {stderr}"
+    );
+
+    let files = json["files"].as_array().expect("must have files[]");
+    assert!(!files.is_empty(), "files[] must be non-empty after fix");
+
+    // Every file key must be the relative path, not "input.mds".
+    for entry in files {
+        let file_key = entry["file"].as_str().unwrap_or("");
+        assert!(
+            !file_key.contains("input.mds"),
+            "file key must NOT be 'input.mds'; got: {file_key}"
+        );
+        assert!(
+            file_key.contains("subdir") || file_key.contains("mixed"),
+            "file key must reference the actual file; got: {file_key}"
+        );
+    }
+}
+
+// ── Test (c): --fix --check on refused-fix fixture → prints "fix rejected" ───
+//
+// Pins bug-5 / PF-004 fix for the check path: preview_fixes now returns a
+// PreviewOutcome::Rejected so --fix --check can surface the rejection reason.
+//
+// Pre-Phase-B behavior: preview_fixes returned Option<String> and mapped Rejected
+// to None — --fix --check never printed "fix rejected" even when the reverify gate
+// refused the edit.
+//
+// Fixture: lint_block_span_empty.mds (multi-line empty @define). The fix removes
+// the opening @define line, orphaning @end → reverify gate fails → Rejected.
+
+#[test]
+fn fix_check_refused_fix_prints_rejected_not_would_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_block_span_empty.mds");
+    fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
+    let original = fs::read_to_string(&target).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // "fix rejected" must appear: the reverify gate refused the empty-block removal.
+    assert!(
+        stderr.contains("fix rejected"),
+        "--fix --check must print 'fix rejected' when the reverify gate refuses; got stderr: {stderr}"
+    );
+
+    // "Would fix" must NOT appear: the fix was rejected, not pending.
+    assert!(
+        !stderr.contains("Would fix"),
+        "--fix --check must NOT print 'Would fix' when fix is rejected; got stderr: {stderr}"
+    );
+
+    // File must be untouched — check mode never writes.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "--fix --check must never write to the file"
+    );
+}
+
+// ── Test (d): --fix --check fixable fixture → "Would fix", exit 1, no write ──
+//
+// Pins the positive case: when a fix WOULD succeed, --fix --check prints "Would fix",
+// exits 1, and leaves the file unchanged on disk.
+
+#[test]
+fn fix_check_fixable_prints_would_fix_and_exits_1_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_error.mds");
+    fs::copy(fixture("lint_error.mds"), &target).unwrap();
+    let original = fs::read_to_string(&target).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // "Would fix" must appear.
+    assert!(
+        stderr.contains("Would fix"),
+        "--fix --check must print 'Would fix' for a fixable file; got stderr: {stderr}"
+    );
+
+    // exit 1 (fix pending).
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check must exit 1 when a fix is pending; got stderr: {stderr}"
+    );
+
+    // File must be unchanged on disk.
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "--fix --check must never write to the file"
+    );
+}
+
+// ── Test (e): Directory --fix --check exits 1 iff any file would change ──────
+//
+// Pins the directory-mode any_would_fix accumulation (--fix --check exits 1 after
+// processing all files when at least one would be modified, exit 0 when none).
+
+#[test]
+fn dir_fix_check_exits_1_when_any_file_fixable_exits_0_when_none() {
+    // Case 1: directory with one fixable file → exit 1.
+    let dir1 = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_error.mds"), dir1.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir1.path().join("b.mds")).unwrap();
+
+    let out1 = lint_path(dir1.path(), &["--fix", "--check"]);
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+    assert_eq!(
+        out1.status.code(),
+        Some(1),
+        "dir with fixable file must exit 1 under --fix --check; stderr: {stderr1}"
+    );
+    // Neither file must have been modified.
+    assert_eq!(
+        fs::read_to_string(dir1.path().join("a.mds")).unwrap(),
+        fs::read_to_string(fixture("lint_error.mds")).unwrap(),
+        "fixable file must not be written by --fix --check"
+    );
+
+    // Case 2: directory with only clean files → exit 0.
+    let dir2 = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir2.path().join("c.mds")).unwrap();
+
+    let out2 = lint_path(dir2.path(), &["--fix", "--check"]);
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+    assert_eq!(
+        out2.status.code(),
+        Some(0),
+        "dir with only clean files must exit 0 under --fix --check; stderr: {stderr2}"
+    );
+}
+
+// ── Test (f): Overlap fixture → visible "fix rejected"/overlap message ────────
+//
+// Pins bug-12 / preview-honesty: when two Tier-A edits target the same line
+// (overlap detected), the fix is refused with "Overlapping fix spans detected"
+// and the output is NOT silent.
+//
+// Fixture: lint_overlap.mds — a @define containing an @if "a"=="a" block with
+// a @elseif "a"=="a" that is both unreachable AND has an empty body.  Both
+// empty-block and unreachable-branch fire on the same @elseif line → same byte
+// range → overlap detected → Rejected.
+//
+// Tests --fix (apply) path: the rejection message appears on stderr, the file is
+// untouched, and exit code reflects the residual diagnostics.
+
+#[test]
+fn fix_overlap_surfaced_not_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_overlap.mds");
+    fs::copy(fixture("lint_overlap.mds"), &target).unwrap();
+    let original = fs::read_to_string(&target).unwrap();
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // "fix rejected" must appear — not silent.
+    assert!(
+        stderr.contains("fix rejected"),
+        "--fix on overlap fixture must print 'fix rejected'; got stderr: {stderr}"
+    );
+
+    // The overlap reason must mention "overlap" or "Overlapping".
+    assert!(
+        stderr.to_lowercase().contains("overlap"),
+        "rejection reason must mention 'overlap'; got stderr: {stderr}"
+    );
+
+    // File must be unchanged (fix was refused, no write).
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        original, after,
+        "overlap-rejected file must be left unchanged"
+    );
+}
+
+// ── Test (g): PartiallyFixed end-to-end: applied count in summary ─────────────
+//
+// Pins the PartiallyFixed outcome: when some edits pass the reverify gate and
+// some fail, the CLI writes the partially-fixed file and emits a
+// "{applied} of {total} fixes applied" summary.
+//
+// Fixture: lint_partial_fix.mds — contains a multi-line empty @define (Tier A,
+// fix fails reverify because @end is orphaned after removing the @define line)
+// and a duplicate @export (Tier A, fix passes — just removes a line).
+//
+// Expected behaviour:
+// - Batch attempt: fails (empty-block removal + dup-export removal together →
+//   @end orphaned → reverify rejects).
+// - Per-edit fallback right-to-left:
+//   1. duplicate-export (higher offset) → applied, reverify passes.
+//   2. empty-block (lower offset) → reverify fails → rejected.
+// - File written with one @export greet remaining; empty @define still present.
+// - Stderr: "1 of 2 fixes applied" (or "Partially fixed: … (1 of 2 fixes applied)").
+
+#[test]
+fn partially_fixed_end_to_end_count_in_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lint_partial_fix.mds");
+    fs::copy(fixture("lint_partial_fix.mds"), &target).unwrap();
+
+    let out = lint_path(&target, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Stderr must contain the count summary.
+    assert!(
+        stderr.contains("1 of 2"),
+        "stderr must contain '1 of 2 fixes applied' summary; got: {stderr}"
+    );
+
+    let after = fs::read_to_string(&target).unwrap();
+
+    // The duplicate export must have been removed (duplicate-export fix was applied).
+    assert_eq!(
+        after.matches("@export greet").count(),
+        1,
+        "file must have exactly one @export greet after partial fix; got:\n{after}"
+    );
+
+    // The empty @define must still be present (empty-block fix was rejected).
+    assert!(
+        after.contains("@define empty_fn():"),
+        "empty @define must still be present after partial fix; got:\n{after}"
+    );
+
+    // Residual diagnostics remain (empty-block Warn) → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "residual empty-block Warn must produce exit 1; got stderr: {stderr}"
+    );
+}
+
+// ── Test (h): Stdin lint with diagnostic includes code frame ─────────────────
+//
+// Pins bug-19 fix: when lint runs in stdin (report-only) mode and emits a
+// human diagnostic, the named source "input.mds" + source text must be attached
+// so miette renders the annotated source context (code frame with caret underline).
+//
+// Pre-Phase-B behavior: named_source was None for stdin report-only mode, so no
+// source context was rendered — diagnostics lacked the code frame entirely.
+
+#[test]
+fn stdin_lint_diagnostic_includes_code_frame() {
+    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // "duplicate-export" diagnostic must appear.
+    assert!(
+        stderr.contains("duplicate-export"),
+        "diagnostic must appear in stdin report-only mode; got: {stderr}"
+    );
+
+    // "input.mds" must appear: miette renders it as the file reference in the span header.
+    assert!(
+        stderr.contains("input.mds"),
+        "stdin mode must show 'input.mds' in the code frame; got: {stderr}"
+    );
+
+    // At least one token from the source must appear in the code frame context.
+    // miette renders the offending line; "@export greet" is on that line.
+    assert!(
+        stderr.contains("@export"),
+        "code frame must include the offending source line '@export greet'; got: {stderr}"
+    );
+}
+
+// ── Test (i): Auto-detect hint names the invoking subcommand ─────────────────
+//
+// Pins bugs 22/23: auto_detect_mds_file and resolve_input now take a `subcommand:
+// &str` parameter.  When multiple .mds files are present in the current directory
+// and no file argument is given, the error hint must include the specific subcommand
+// name (e.g. "mds lint <file>"), NOT a generic "mds build <file>".
+//
+// Tests two subcommands (lint, fmt) to cover separate call sites.
+
+#[test]
+fn auto_detect_hint_names_subcommand_lint_and_fmt() {
+    // ── lint subcommand ──────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+        fs::copy(fixture("lint_warn_only.mds"), dir.path().join("b.mds")).unwrap();
+
+        let out = mds_bin()
+            .arg("lint")
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("mds lint"),
+            "auto-detect hint for 'lint' must contain 'mds lint'; got: {stderr}"
+        );
+        // Must NOT say "mds build" or "mds fmt" (wrong subcommand).
+        assert!(
+            !stderr.contains("mds build"),
+            "hint must not name a different subcommand; got: {stderr}"
+        );
+    }
+
+    // ── fmt subcommand ───────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+        fs::copy(fixture("lint_warn_only.mds"), dir.path().join("b.mds")).unwrap();
+
+        let out = mds_bin()
+            .arg("fmt")
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("mds fmt"),
+            "auto-detect hint for 'fmt' must contain 'mds fmt'; got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("mds build"),
+            "fmt hint must not name 'mds build'; got: {stderr}"
+        );
+    }
+}

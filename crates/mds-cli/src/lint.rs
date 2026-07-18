@@ -379,9 +379,12 @@ enum FixFileOutcome {
     /// Produced when `apply_fixes_incremental` falls back to the per-edit path and not
     /// all edits pass. The `new_source` is the partially-fixed text; `residual` carries
     /// remaining diagnostics (from the last successful per-edit reverify).
+    /// `applied_count` / `total_count` are used for the summary line.
     PartiallyFixed {
         new_source: String,
         residual: mds::LintResult,
+        applied_count: usize,
+        total_count: usize,
     },
     Rejected {
         reason: String,
@@ -423,6 +426,10 @@ fn plan_and_apply_fixes(
     if plan.edits.is_empty() && !plan.overlap_rejected {
         return FixFileOutcome::NothingToFix { original: result };
     }
+
+    // Capture total edit count before moving plan into apply_fixes_incremental.
+    // Used to compute the "{applied} of {total}" summary for PartiallyFixed output.
+    let total_edits = plan.edits.len();
 
     // AC-F-20 output-delta baseline: compile the original source once.
     // If it fails (e.g. missing runtime vars at eval time), skip the output-diff —
@@ -480,10 +487,12 @@ fn plan_and_apply_fixes(
         mds::fix::FixOutcome::PartiallyFixed {
             source: new_source,
             residual,
-            ..
+            rejected,
         } => FixFileOutcome::PartiallyFixed {
             new_source,
             residual,
+            applied_count: total_edits - rejected.len(),
+            total_count: total_edits,
         },
         mds::fix::FixOutcome::Rejected { source: _, reason } => FixFileOutcome::Rejected {
             reason,
@@ -493,28 +502,46 @@ fn plan_and_apply_fixes(
     }
 }
 
+/// Outcome of the preview fix pipeline (`--fix --check` / `--fix --diff`).
+///
+/// Distinguishes "would fix", "rejected by reverify gate", and "nothing to fix"
+/// so that callers can surface rejection reasons in `--fix --check` output (bug 5
+/// / PF-004: preview must use the same gated pipeline as apply and be equally honest
+/// about outcomes).
+enum PreviewOutcome {
+    /// At least one edit would be applied; contains the would-be fixed source.
+    WouldFix(String),
+    /// Every edit was refused by the reverify gate (overlap or recompile failure);
+    /// contains the human-readable rejection reason.
+    Rejected(String),
+    /// No fixable edits exist or the plan is empty with no overlap.
+    NothingToFix,
+}
+
 /// Run the fix pipeline in preview mode (for `--fix --check` / `--fix --diff`).
 ///
 /// Routes through the same gated pipeline as the write path — plan, reverify, and
-/// apply — but does NOT write to disk.  Returns the would-be fixed source when at
-/// least one edit would be applied (Fixed or PartiallyFixed outcome); `None` when
-/// everything was rejected or there is nothing to fix.
+/// apply — but does NOT write to disk.  Returns [`PreviewOutcome::WouldFix`] with
+/// the would-be fixed source when at least one edit would be applied;
+/// [`PreviewOutcome::Rejected`] with the rejection reason when the reverify gate
+/// refused every edit; [`PreviewOutcome::NothingToFix`] when the plan is empty.
 ///
 /// ADR-004 / PF-004: preview must use the same gated pipeline as apply so that
 /// `--diff` shows exactly what `--fix` would write, and `--check` exits 1 iff
-/// `--fix` would change the file.
+/// `--fix` would change the file.  The `Rejected` variant gives `--fix --check`
+/// the same honesty as `--fix` (which prints "fix rejected: …" on refusal).
 fn preview_fixes(
     result: &mds::LintResult,
     source: &str,
     base_dir: &Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
-) -> Option<String> {
+) -> PreviewOutcome {
     let is_standalone = result.is_standalone;
     let plan = mds::fix::plan_fixes_with_options(result, source, is_standalone);
 
     if plan.edits.is_empty() && !plan.overlap_rejected {
-        return None;
+        return PreviewOutcome::NothingToFix;
     }
 
     let original_output =
@@ -558,8 +585,9 @@ fn preview_fixes(
         }
         | mds::fix::FixOutcome::PartiallyFixed {
             source: new_source, ..
-        } => Some(new_source),
-        mds::fix::FixOutcome::Rejected { .. } | mds::fix::FixOutcome::NothingToFix => None,
+        } => PreviewOutcome::WouldFix(new_source),
+        mds::fix::FixOutcome::Rejected { reason, .. } => PreviewOutcome::Rejected(reason),
+        mds::fix::FixOutcome::NothingToFix => PreviewOutcome::NothingToFix,
     }
 }
 
@@ -605,9 +633,12 @@ fn run_lint_stdin(
             FixFileOutcome::PartiallyFixed {
                 new_source,
                 residual,
+                applied_count,
+                total_count,
             } => {
                 eprintln!(
-                    "partial fix: some edits were individually rejected by the reverify gate"
+                    "partial fix: {applied_count} of {total_count} fixes applied, \
+                     some edits individually rejected by the reverify gate"
                 );
                 (new_source, residual)
             }
@@ -713,10 +744,12 @@ fn run_lint_file(
             FixFileOutcome::PartiallyFixed {
                 new_source,
                 residual,
+                applied_count,
+                total_count,
             } => {
                 if !quiet {
                     eprintln!(
-                        "Partially fixed: {} (some edits rejected by reverify gate)",
+                        "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         path.display()
                     );
                 }
@@ -745,22 +778,31 @@ fn run_lint_file(
     // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
     // a diff or check result could misrepresent what --fix would actually do.
     if fix && (check || diff) {
-        let preview_source = preview_fixes(&result, &source, base_dir, runtime_vars, &config);
-        if let Some(ref fixed) = preview_source {
-            if diff {
-                let label = path.display().to_string();
-                let diff_str = render_diff_lint(&source, fixed, &label);
-                let _ = write_stdout(&diff_str);
-            }
-            if check {
-                if !quiet {
-                    eprintln!("Would fix: {}", path.display());
+        let preview = preview_fixes(&result, &source, base_dir, runtime_vars, &config);
+        match preview {
+            PreviewOutcome::WouldFix(ref fixed) => {
+                if diff {
+                    let label = path.display().to_string();
+                    let diff_str = render_diff_lint(&source, fixed, &label);
+                    let _ = write_stdout(&diff_str);
                 }
-                std::process::exit(1);
+                if check {
+                    if !quiet {
+                        eprintln!("Would fix: {}", path.display());
+                    }
+                    std::process::exit(1);
+                }
             }
+            PreviewOutcome::Rejected(ref reason) => {
+                // Surface the rejection reason so --fix --check is as honest as --fix.
+                if !quiet {
+                    eprintln!("fix rejected: {reason}");
+                }
+            }
+            PreviewOutcome::NothingToFix => {}
         }
-        // After diff-only preview (or when nothing would change), render diagnostics
-        // and exit by severity.
+        // After diff-only preview (or when nothing would change / fix rejected),
+        // render diagnostics and exit by severity.
         emit_result(format, &result, quiet, named_source);
         exit_by_severity(&result);
         return Ok(());
@@ -984,9 +1026,11 @@ fn lint_one_file_accumulating(
             FixFileOutcome::PartiallyFixed {
                 new_source,
                 mut residual,
+                applied_count,
+                total_count,
             } => {
                 eprintln!(
-                    "{}: partial fix (some edits rejected by reverify gate)",
+                    "{}: partial fix ({applied_count} of {total_count} fixes applied, some rejected by reverify gate)",
                     file.display()
                 );
                 set_diag_display_path(&mut residual, &display_path);
@@ -1019,14 +1063,19 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        if let Some(fixed) = preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config)
-        {
-            *any_would_fix = true;
-            if diff {
-                let label = file.display().to_string();
-                let diff_str = render_diff_lint(&source, &fixed, &label);
-                let _ = write_stdout(&diff_str);
+        match preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config) {
+            PreviewOutcome::WouldFix(ref fixed) => {
+                *any_would_fix = true;
+                if diff {
+                    let label = file.display().to_string();
+                    let diff_str = render_diff_lint(&source, fixed, &label);
+                    let _ = write_stdout(&diff_str);
+                }
             }
+            PreviewOutcome::Rejected(ref reason) => {
+                eprintln!("{}: fix rejected: {reason}", file.display());
+            }
+            PreviewOutcome::NothingToFix => {}
         }
         accumulate_result_json(&result, json_files);
         tally_from_result(&result)
@@ -1122,10 +1171,12 @@ fn lint_one_file_human(
             FixFileOutcome::PartiallyFixed {
                 new_source,
                 mut residual,
+                applied_count,
+                total_count,
             } => {
                 if !quiet {
                     eprintln!(
-                        "{}: partial fix (some edits rejected by reverify gate)",
+                        "{}: partial fix ({applied_count} of {total_count} fixes applied, some rejected by reverify gate)",
                         file.display()
                     );
                 }
@@ -1149,17 +1200,24 @@ fn lint_one_file_human(
         }
     } else if fix && (check || diff) {
         // Bug 5: directory-mode preview — route through gated pipeline.
-        if let Some(fixed) = preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config)
-        {
-            *any_would_fix = true;
-            if diff {
-                let label = file.display().to_string();
-                let diff_str = render_diff_lint(&source, &fixed, &label);
-                let _ = write_stdout(&diff_str);
+        match preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config) {
+            PreviewOutcome::WouldFix(ref fixed) => {
+                *any_would_fix = true;
+                if diff {
+                    let label = file.display().to_string();
+                    let diff_str = render_diff_lint(&source, fixed, &label);
+                    let _ = write_stdout(&diff_str);
+                }
+                if check && !quiet {
+                    eprintln!("Would fix: {}", file.display());
+                }
             }
-            if check && !quiet {
-                eprintln!("Would fix: {}", file.display());
+            PreviewOutcome::Rejected(ref reason) => {
+                if !quiet {
+                    eprintln!("{}: fix rejected: {reason}", file.display());
+                }
             }
+            PreviewOutcome::NothingToFix => {}
         }
         render_result_human(&result, quiet, named_source);
         tally_from_result(&result)

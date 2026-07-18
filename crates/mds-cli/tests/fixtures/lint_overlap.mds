@@ -1,0 +1,6 @@
+@define test():
+@if "a" == "a":
+  always true
+@elseif "a" == "a":
+@end
+@end
