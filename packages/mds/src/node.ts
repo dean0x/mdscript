@@ -263,7 +263,7 @@ export function compileFile(path: string, options?: FileOptions): Promise<Compil
  * Only `vars` is forwarded; source-map options are not applicable to check operations.
  * Requires init() to have been called and awaited first.
  */
-export async function checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
+export function checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
   if (options != null) assertKnownKeys(options, 'checkFile');
   return assertReady().checkFile(path, options);
 }
@@ -275,7 +275,7 @@ export function lint(source: string, options?: LintOptions): LintResult {
 }
 
 /** Lint an MDS file, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
-export async function lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+export function lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
   if (options != null) assertKnownKeys(options, 'lintFile');
   return assertReady().lintFile(path, options);
 }

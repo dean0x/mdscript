@@ -154,36 +154,38 @@ describe('options-validation', () => {
     );
   });
 
-  // ── async file-ops reject unknown keys synchronously ──────────────────────
+  // ── async file-ops throw unknown-key errors synchronously ────────────────
+  //
+  // checkFile and lintFile are NOT async functions: assertKnownKeys() fires
+  // before any I/O and throws synchronously.  The tests are intentionally
+  // non-async and use assert.throws (not assert.rejects) so that a regression
+  // to async would be caught: Node.js assert.rejects() with a validator
+  // function does NOT intercept synchronous throws in v22, so the error would
+  // escape the validator and the test would fail with "testCodeFailure" rather
+  // than "Missing expected exception", masking the regression.
 
-  test('U-OV-12: checkFile rejects unknown key (sourceMap not valid for check)', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-test-'));
-    const file = path.join(tmp, 'ok.mds');
-    fs.writeFileSync(file, 'Hello\n', 'utf8');
-    await assert.rejects(
-      () => checkFile(file, { sourceMap: true }),
+  test('U-OV-12: checkFile throws synchronously for unknown key (sourceMap not valid for check)', () => {
+    // assertKnownKeys fires before any I/O, so no real file is needed.
+    assert.throws(
+      () => checkFile('/any.mds', { sourceMap: true }),
       (err) => {
-        assert.ok(isMdsError(err));
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
         assert.equal(err.code, 'mds::invalid_options');
         return true;
       },
     );
-    fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  test('U-OV-13: lintFile rejects unknown key "basePath"', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-test-'));
-    const file = path.join(tmp, 'ok.mds');
-    fs.writeFileSync(file, 'Hello\n', 'utf8');
-    await assert.rejects(
-      () => lintFile(file, { basePath: '.' }),
+  test('U-OV-13: lintFile throws synchronously for unknown key "basePath"', () => {
+    // assertKnownKeys fires before any I/O, so no real file is needed.
+    assert.throws(
+      () => lintFile('/any.mds', { basePath: '.' }),
       (err) => {
-        assert.ok(isMdsError(err));
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
         assert.equal(err.code, 'mds::invalid_options');
         return true;
       },
     );
-    fs.rmSync(tmp, { recursive: true, force: true });
   });
 
   // ── message-parity: wrapper format matches backend format ─────────────────

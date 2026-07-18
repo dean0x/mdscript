@@ -91,10 +91,13 @@ export interface CheckOptions {
   vars?: Record<string, unknown>;
 }
 
-/** Options shared by compile operations. */
-export interface CompileOptions {
-  /** Runtime variables made available for interpolation in the template. */
-  vars?: Record<string, unknown>;
+/**
+ * Options for compile operations.
+ *
+ * Extends {@link CheckOptions}: check accepts a strict subset of compile's options.
+ * The `vars` field is inherited from {@link CheckOptions}.
+ */
+export interface CompileOptions extends CheckOptions {
   /**
    * When `true`, appends a {@link SourceMapV3} document to the result as
    * `result.sourceMap`. Ignored for `@message`-mode templates (no renderable
@@ -113,21 +116,14 @@ export interface CompileOptions {
   sourcesContent?: boolean;
 }
 
-/** Options shared by file-based compile and check operations. */
-export interface FileOptions {
-  /** Runtime variables made available for interpolation in the template. */
-  vars?: Record<string, unknown>;
-  /**
-   * When `true`, appends a {@link SourceMapV3} document to the result as
-   * `result.sourceMap`. Ignored for `@message`-mode templates. Defaults to `false`.
-   */
-  sourceMap?: boolean;
-  /**
-   * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
-   * Requires `sourceMap: true`. Defaults to `false`.
-   */
-  sourcesContent?: boolean;
-}
+/**
+ * Options for file-based compile operations.
+ *
+ * Structurally identical to {@link CompileOptions} (inherits `vars`, `sourceMap`,
+ * `sourcesContent`). Kept as a distinct named type so `compileFile` and
+ * `checkFile` can evolve their option sets independently.
+ */
+export interface FileOptions extends CompileOptions {}
 
 // ---------------------------------------------------------------------------
 // Lint types

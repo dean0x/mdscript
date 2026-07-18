@@ -17,7 +17,7 @@
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { compile, compileFile, isMdsError, init } from '../dist/node.js';
+import { compile, compileFile, checkFile, lintFile, isMdsError, init } from '../dist/node.js';
 import { SIMPLE_MDS } from './helpers.mjs';
 import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 
@@ -453,26 +453,15 @@ describe('source maps — WASM backend (W-SM)', () => {
     assertSmStructure(nativeResult.sourceMap);
     assertSmStructure(wasmResult.sourceMap);
 
-    // Full deep-equal: after the choke-point fix sources[] must also match.
+    // Full object comparison — avoids PF-007: per-field assertions cannot catch
+    // new fields being added or fields that differ unexpectedly.  The ENTIRE
+    // sourceMap object must be byte-identical across backends (ADR-002: shared
+    // core serializer; PF-007: differential test rather than per-surface golden).
     assert.deepEqual(
-      nativeResult.sourceMap.sources,
-      wasmResult.sourceMap.sources,
-      `sources[] must match across backends (PF-007); native=${JSON.stringify(nativeResult.sourceMap.sources)}, wasm=${JSON.stringify(wasmResult.sourceMap.sources)}`,
-    );
-    assert.equal(
-      nativeResult.sourceMap.version,
-      wasmResult.sourceMap.version,
-      'version must match across backends',
-    );
-    assert.deepEqual(
-      nativeResult.sourceMap.names,
-      wasmResult.sourceMap.names,
-      'names must match across backends',
-    );
-    assert.equal(
-      nativeResult.sourceMap.mappings,
-      wasmResult.sourceMap.mappings,
-      'mappings must be byte-identical across backends (ADR-002: shared core serializer)',
+      nativeResult.sourceMap,
+      wasmResult.sourceMap,
+      `full sourceMap must be identical across backends (PF-007); ` +
+        `native=${JSON.stringify(nativeResult.sourceMap)}, wasm=${JSON.stringify(wasmResult.sourceMap)}`,
     );
   });
 
@@ -498,6 +487,62 @@ describe('source maps — WASM backend (W-SM)', () => {
       nativeResult.sourceMap.sourcesContent,
       wasmResult.sourceMap.sourcesContent,
       'sourcesContent must be identical across backends',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: file-op error-contract (issue #35)
+//
+// checkFile and lintFile must NOT be async functions.  When they were async,
+// assertKnownKeys() (which runs synchronously before any I/O) would fire
+// inside an async body, converting a synchronous throw into a promise
+// rejection.  This silently changed the public error contract and was
+// invisible to assert.rejects() because Node's assert.rejects(fn) also
+// accepts synchronous throws from fn() — so the existing options-validation
+// tests passed under BOTH the broken (async) and correct (sync) forms.
+//
+// The tests below are intentionally SYNCHRONOUS (not async functions) and
+// use assert.throws, not assert.rejects.  assert.throws requires the callback
+// to throw synchronously: if checkFile/lintFile were async they would return
+// a rejected Promise instead of throwing, assert.throws would NOT catch it,
+// and the test would fail with "Missing expected exception" — catching the
+// regression that assert.rejects missed.
+//
+// assertKnownKeys fires before any I/O or backend access, so no real file
+// path or init() call is required for these specific assertions.
+// ---------------------------------------------------------------------------
+
+describe('file-op error contract — sync throw regression (#35)', () => {
+  before(() => init());
+
+  test('checkFile throws synchronously (not a rejected promise) for an unknown option key', () => {
+    // checkFile must be a plain function (not async).  If it were async,
+    // this assert.throws call would see the function return without throwing
+    // and fail with "Missing expected exception".
+    assert.throws(
+      () => { checkFile('/any.mds', { sourceMap: true }); },
+      (err) => {
+        assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options',
+          `expected mds::invalid_options, got: ${err.code}`);
+        return true;
+      },
+      'checkFile must throw synchronously for unknown option keys (not reject a promise)',
+    );
+  });
+
+  test('lintFile throws synchronously (not a rejected promise) for an unknown option key', () => {
+    // Same contract for lintFile.
+    assert.throws(
+      () => { lintFile('/any.mds', { basePath: '.' }); },
+      (err) => {
+        assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options',
+          `expected mds::invalid_options, got: ${err.code}`);
+        return true;
+      },
+      'lintFile must throw synchronously for unknown option keys (not reject a promise)',
     );
   });
 });
