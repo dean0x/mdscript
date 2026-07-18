@@ -27,7 +27,7 @@
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
-use mds::{FileSystem, MdsError, NativeFs, Severity};
+use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
 
 use crate::build::{build_runtime_vars, load_config, read_stdin, resolve_input, RuntimeVarArgs};
@@ -349,13 +349,35 @@ fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
     // Re-check for symlink right before writing (TOCTOU guard).
     NativeFs::check_symlink(path).map_err(miette::Error::from)?;
 
-    let parent = path.parent().unwrap_or(Path::new("."));
+    // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
+    let parent = effective_parent(path);
+
+    // Capture original permissions before creating the temp file so they can be
+    // preserved after the atomic rename (tempfile::Builder defaults to mode 0600,
+    // turning a 0644 source file into owner-only after --fix). avoids security
+    // regression introduced the moment --fix starts applying edits (#4).
+    #[cfg(unix)]
+    let original_mode: Option<u32> = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).map(|m| m.permissions().mode()).ok()
+    };
+
     // Temp file in same directory so rename is always intra-filesystem.
     let mut tmp = tempfile::Builder::new()
         .prefix(".mds-lint-fix-")
         .suffix(".tmp")
         .tempfile_in(parent)
         .map_err(|e| miette::miette!("cannot create temp file in {}: {e}", parent.display()))?;
+
+    // Restore original permissions before writing content so that the file
+    // permissions are correct even if a signal interrupts between write and rename.
+    #[cfg(unix)]
+    if let Some(mode) = original_mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))
+            .map_err(|e| miette::miette!("cannot set permissions on temp file: {e}"))?;
+    }
+
     tmp.write_all(content.as_bytes())
         .map_err(|e| miette::miette!("cannot write temp file: {e}"))?;
     tmp.flush()
@@ -499,6 +521,10 @@ fn plan_and_apply_fixes(
             original: result,
         },
         mds::fix::FixOutcome::NothingToFix => FixFileOutcome::NothingToFix { original: result },
+        // FixOutcome is #[non_exhaustive]: a wildcard arm is required when
+        // matching from outside mds-core.  New variants added in future
+        // releases should be plumbed here; until then, treat them as no-ops.
+        _ => FixFileOutcome::NothingToFix { original: result },
     }
 }
 
@@ -588,6 +614,8 @@ fn preview_fixes(
         } => PreviewOutcome::WouldFix(new_source),
         mds::fix::FixOutcome::Rejected { reason, .. } => PreviewOutcome::Rejected(reason),
         mds::fix::FixOutcome::NothingToFix => PreviewOutcome::NothingToFix,
+        // FixOutcome is #[non_exhaustive]: wildcard required from outside mds-core.
+        _ => PreviewOutcome::NothingToFix,
     }
 }
 
@@ -682,7 +710,8 @@ fn run_lint_file(
         format,
     } = flags;
 
-    let base_dir = path.parent().unwrap_or(Path::new("."));
+    // effective_parent maps "" (bare filename) to "." — avoids PF-006.
+    let base_dir = effective_parent(path);
     // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
     let config = match load_lint_config(base_dir) {
         Ok(c) => c,
@@ -962,7 +991,8 @@ fn lint_one_file_accumulating(
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
-    let base_dir = file.parent().unwrap_or(Path::new("."));
+    // effective_parent maps "" (bare filename) to "." — avoids PF-006.
+    let base_dir = effective_parent(file);
 
     let mut result = match mds::lint(file, runtime_vars.clone(), config) {
         Ok(r) => r,
@@ -1119,7 +1149,8 @@ fn lint_one_file_human(
         }
     };
 
-    let base_dir = file.parent().unwrap_or(Path::new("."));
+    // effective_parent maps "" (bare filename) to "." — avoids PF-006.
+    let base_dir = effective_parent(file);
     // Named source for span rendering: relative display path + source text.
     let named_source = Some((display_path.as_str(), source.as_str()));
 

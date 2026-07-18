@@ -930,3 +930,55 @@ fn vars_file_non_object_json_error_names_the_file() {
         "error must name the vars file; got: {stderr}"
     );
 }
+
+// ── Bare-filename regression (PF-006 / issue #11) ────────────────────────────
+
+/// `load_config` must find `mds.json` in a grandparent directory when building
+/// from a bare filename in a deeply nested subdirectory.
+///
+/// Regression for issue #11: a relative `start_dir` (`"."`) caused
+/// `current.parent()` to return `None` after just one iteration, making any
+/// `mds.json` beyond the immediate parent unreachable even when
+/// `MAX_TRAVERSAL_DEPTH` would allow it.
+///
+/// Verifier: we configure `build.output_dir = "out"` in the root `mds.json`.
+/// If `load_config` finds the config, output lands in `root/out/hello.md`.
+/// If it silently skips it, output falls back to the input directory
+/// (`root/sub/nested/hello.md`), failing the assertion.
+#[test]
+fn build_load_config_finds_grandparent_mds_json() {
+    let root = tempfile::tempdir().unwrap();
+    // Create: root/sub/nested/hello.mds
+    let nested = root.path().join("sub").join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("hello.mds"), "Hello!\n").unwrap();
+    // Place mds.json at root/ with an output_dir that differs from the input dir.
+    std::fs::write(
+        root.path().join("mds.json"),
+        r#"{"build": {"output_dir": "out"}}"#,
+    )
+    .unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg("hello.mds") // bare filename — not an absolute path
+        .current_dir(&nested)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "build from bare filename in nested dir must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `load_config` found root/mds.json → output goes to root/out/hello.md.
+    // Without the fix it would fall back to root/sub/nested/hello.md.
+    let config_output = root.path().join("out").join("hello.md");
+    assert!(
+        config_output.exists(),
+        "output must be in root/out/ (per grandparent mds.json); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

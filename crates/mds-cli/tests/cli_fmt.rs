@@ -1101,3 +1101,50 @@ fn dir_check_summary_includes_unchanged_count() {
         "expected '1 would reformat' and '1 unchanged' in summary; got: {stderr}"
     );
 }
+
+// ── Bare-filename regression (PF-006) ────────────────────────────────────────
+
+/// A syntax error in a bare-filename source must exit non-zero and propagate
+/// the syntax diagnostic.
+///
+/// Regression for PF-006: `path.parent()` on a bare filename returns `Some("")`.
+/// `NativeFs::canonicalize("")` failed with `MdsError::Io`, which the
+/// `assert_equivalent` fallback path silently swallowed (fell through to
+/// `structural_equivalent`) instead of propagating the `MdsError::Syntax` error.
+/// After the `resolve_base_dir` + `effective_parent` fix the syntax error must
+/// surface as a non-zero exit.
+///
+/// Uses `.current_dir(tempdir)` with a bare argument — absolute paths go through
+/// a different code path and never triggered the bug.
+#[test]
+fn fmt_bare_filename_propagates_syntax_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // An unclosed @message block is a parse-level syntax error (missing @end).
+    // This same source is used by unclosed_directive_block_exits_one_with_syntax_not_formatter_invariant
+    // (which passes an absolute path); our test exercises the bare-filename path.
+    let src = "@message user:\nHi there\n";
+    fs::write(dir.path().join("broken.mds"), src).unwrap();
+
+    let output = mds_bin()
+        .arg("fmt")
+        .arg("broken.mds") // bare filename — the only form that triggered the bug
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "fmt of a bare broken filename must exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("syntax") || stderr.contains("@end"),
+        "stderr must name the syntax problem; got: {stderr}"
+    );
+    // File must be untouched — the formatter must never write garbled output.
+    let after = fs::read_to_string(dir.path().join("broken.mds")).unwrap();
+    assert_eq!(after, src, "broken file must be left untouched");
+}

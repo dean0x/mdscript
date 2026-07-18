@@ -284,7 +284,7 @@ pub struct NativeFs {
 ///
 /// Absolute paths and paths with a non-empty parent component are returned
 /// unchanged.
-pub(crate) fn effective_parent(path: &Path) -> &Path {
+pub fn effective_parent(path: &Path) -> &Path {
     match path.parent() {
         None => Path::new("."),
         Some(p) if p.as_os_str().is_empty() => Path::new("."),
@@ -423,14 +423,16 @@ impl FileSystem for NativeFs {
             // Root entry point: treat `relative` as a filesystem path.
             let canonical = Self::check_symlink(Path::new(relative))?;
             // Anchor the security root on first entry-point resolution.
-            let entry_dir = canonical.parent().unwrap_or(Path::new("."));
+            // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
+            let entry_dir = effective_parent(&canonical);
             self.init_root(entry_dir);
             self.check_path_traversal(&canonical)?;
             Ok(canonical.display().to_string())
         } else {
             // Import from within a resolved module: resolve against the parent
             // directory of `base` via the Path-typed helper (no String round-trip).
-            let base_dir = Path::new(base).parent().unwrap_or(Path::new("."));
+            // effective_parent guards against an empty parent — avoids PF-006.
+            let base_dir = effective_parent(Path::new(base));
             self.normalize_in_dir_impl(base_dir, relative)
         }
     }
@@ -1308,44 +1310,43 @@ mod tests {
         assert_eq!(effective_parent(p), Path::new("/tmp"));
     }
 
-    // ── check_symlink bare-filename regression ─────────────────────────────────
+    // ── check_symlink unit tests (absolute paths) ─────────────────────────────
+    //
+    // Note: bare-filename (PF-006) integration testing lives at CLI level in
+    // cli_build::build_load_config_finds_grandparent_mds_json,
+    // cli_fmt::fmt_bare_filename_propagates_syntax_error, and
+    // cli_lint::lint_fix_bare_filename_applies_fix.
 
     #[test]
-    fn check_symlink_bare_filename_resolves_via_cwd() {
-        // Regression for the release blocker: when the caller passes a bare filename
-        // (e.g. "hello.mds") from cwd, check_symlink must not fail with file_not_found
-        // due to canonicalizing the empty parent path "".
-        //
-        // We do NOT mutate std::env::set_current_dir here (process-global, races under
-        // nextest).  Instead we verify the root cause is fixed by calling check_symlink
-        // with an absolute path whose parent is a real directory — the same code path
-        // that effective_parent enables for a bare filename resolved from cwd.
+    fn check_symlink_real_absolute_file_is_accepted() {
+        // A real file reached via an absolute path must succeed.
+        // Uses an absolute path to avoid mutating std::env::current_dir (process-global,
+        // races under nextest); this is the same code path that effective_parent enables
+        // for a bare filename resolved from cwd.
         let dir = TempDir::new().unwrap();
         let file = make_temp_file(&dir, "bare.mds", "hello");
-        // Absolute path: parent is the temp dir (non-empty absolute) — must succeed.
         let result = NativeFs::check_symlink(&file);
         assert!(
             result.is_ok(),
-            "check_symlink should succeed for a real file with an absolute path: {result:?}"
+            "check_symlink should succeed for a real absolute-path file: {result:?}"
         );
     }
 
     #[test]
     #[cfg(unix)]
-    fn check_symlink_bare_filename_symlink_is_rejected() {
-        // With the effective_parent fix in place, a bare symlink filename no longer
-        // surfaces as file_not_found — it correctly surfaces as a symlink rejection.
+    fn check_symlink_symlinked_file_is_rejected() {
+        // A symlinked file must be rejected, regardless of whether it is reached
+        // via a bare name or an absolute path.
         let dir = TempDir::new().unwrap();
         let target = make_temp_file(&dir, "target.mds", "hello");
         let link_path = dir.path().join("link.mds");
         std::os::unix::fs::symlink(&target, &link_path).unwrap();
-        // Absolute path (same code path as bare filename from cwd after effective_parent):
         let result = NativeFs::check_symlink(&link_path);
         let err = result.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("symlinks"),
-            "expected symlink rejection (not file_not_found), got: {msg}"
+            "expected symlink rejection, got: {msg}"
         );
     }
 

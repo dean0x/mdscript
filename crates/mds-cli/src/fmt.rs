@@ -25,7 +25,7 @@
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
-use mds::{FileSystem, MdsError};
+use mds::{effective_parent, FileSystem, MdsError};
 use miette::Result;
 
 use crate::build::{load_config, read_stdin, resolve_input};
@@ -168,7 +168,11 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
 fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let FmtFlags { check, diff, quiet } = flags;
     let source = read_source_file(path)?;
-    let base_dir = path.parent();
+    // effective_parent maps "" (bare filename) to "." so that resolve_base_dir
+    // (called by format_str_named → assert_equivalent) receives a canonicalisable
+    // path and does not silently fall through to the structural_equivalent fallback
+    // that would swallow a genuine mds::syntax error. avoids PF-006, applies ADR-001.
+    let base_dir = Some(effective_parent(path));
     let file_name = path.display().to_string();
     let result = format_source_named(&source, base_dir, &file_name)?;
 
@@ -239,7 +243,8 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
             return FileOutcome::Failed;
         }
     };
-    let base_dir = file.parent();
+    // effective_parent maps "" (bare filename) to "." — avoids PF-006, applies ADR-001.
+    let base_dir = Some(effective_parent(file));
     let result = match format_source_named(&source, base_dir, &file_name) {
         Ok(r) => r,
         Err(e) => {

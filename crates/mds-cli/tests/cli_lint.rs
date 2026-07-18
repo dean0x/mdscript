@@ -1257,3 +1257,51 @@ fn auto_detect_hint_names_subcommand_lint_and_fmt() {
         );
     }
 }
+
+// ── Bare-filename regression (PF-006) ────────────────────────────────────────
+
+/// `mds lint --fix` on a bare filename must apply fixes in place.
+///
+/// Regression for PF-006: `path.parent()` on a bare filename returns `Some("")`.
+/// `NativeFs::check_symlink("")` failed because `"".file_name()` returns `None`,
+/// making `atomic_write_file` reject every fix edit with an Io error — silently
+/// turning `--fix` into a no-op for any file passed as a bare name.
+///
+/// Uses `.current_dir(tempdir)` with a bare argument.
+#[test]
+fn lint_fix_bare_filename_applies_fix() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("dup.mds");
+    fs::copy(fixture("lint_error.mds"), &target).unwrap();
+
+    let original = fs::read_to_string(&target).unwrap();
+    assert!(
+        original.contains("@export greet\n@export greet"),
+        "fixture must have duplicate export"
+    );
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg("--fix")
+        .arg("dup.mds") // bare filename — the only form that triggered the bug
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--fix on bare filename should exit 0 after fixing; stderr: {stderr}"
+    );
+
+    let after = fs::read_to_string(&target).unwrap();
+    assert_ne!(after, original, "--fix must have rewritten the file");
+    assert_eq!(
+        after.matches("@export greet").count(),
+        1,
+        "exactly one @export greet should remain after --fix; got:\n{after}"
+    );
+}

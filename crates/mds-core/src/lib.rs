@@ -58,7 +58,7 @@ pub(crate) mod validator;
 pub(crate) mod value;
 
 pub use formatter::{format_str, format_str_named, format_str_with};
-pub use fs::{FileSystem, NativeFs, VirtualFs};
+pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{fix, sanitize_control_chars, LintConfig, LintDiagnostic, LintResult, Severity};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
@@ -411,18 +411,53 @@ pub fn check_str(source: &str) -> Result<(), MdsError> {
 /// This is one of two UTF-8 boundary enforcement points; the other is
 /// [`path_to_str`], which handles the entry-point `path` argument.
 fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
+    // Canonicalize to an absolute path so NativeFs::canonicalize() always
+    // receives a path whose file_name() is non-None.
+    //
+    // Path::parent() on a bare filename (e.g. "hello.mds") returns Some(""),
+    // and effective_parent normalises that to Some("."). Neither "" nor "."
+    // survive NativeFs::canonicalize() because check_symlink() calls
+    // file_name() on them, which returns None, causing a FileNotFound error
+    // that assert_equivalent's Err(_) arm then silently swallows via
+    // structural_equivalent. avoids PF-006.
     match base_dir {
-        Some(d) => d
-            .to_str()
-            .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
-            .map(str::to_owned),
+        // None and the empty-string sentinel both mean "current working directory".
         None => std::env::current_dir()
             .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
-            .and_then(|p| {
-                p.to_str()
+            .and_then(|cwd| {
+                cwd.to_str()
                     .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
                     .map(str::to_owned)
             }),
+        Some(d) if d.as_os_str().is_empty() => std::env::current_dir()
+            .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
+            .and_then(|cwd| {
+                cwd.to_str()
+                    .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
+                    .map(str::to_owned)
+            }),
+        // Canonicalize resolves "." → absolute cwd, relative → absolute, and
+        // strips trailing separators so the last component is a real directory name.
+        // UTF-8 boundary check runs first so that invalid bytes produce a clear
+        // error rather than a confusing "No such file" from canonicalize.
+        Some(d) => {
+            if d.to_str().is_none() {
+                return Err(MdsError::io("base_dir path is not valid UTF-8"));
+            }
+            d.canonicalize()
+                .map_err(|e| {
+                    MdsError::io(format!(
+                        "cannot resolve base directory {}: {e}",
+                        d.display()
+                    ))
+                })
+                .and_then(|canonical| {
+                    canonical
+                        .to_str()
+                        .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
+                        .map(str::to_owned)
+                })
+        }
     }
 }
 

@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use mds::{CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use mds::{effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
 use miette::Result;
 use serde::Deserialize;
 
@@ -110,16 +110,20 @@ const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 /// resolve relative `output_dir` values.
 pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> {
     // Walk upward from `start` (which may be a file; begin at its parent).
-    let start_dir = if start.is_dir() {
+    // avoids PF-006: a relative start_dir (e.g. "" or ".") causes current.parent()
+    // to return None after just 1–2 iterations, making grandparent mds.json
+    // unreachable even when MAX_TRAVERSAL_DEPTH would allow it.  Canonicalize
+    // to an absolute path first so every parent() step advances one real directory.
+    let raw_start_dir = if start.is_dir() {
         start.to_path_buf()
     } else {
-        start
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+        effective_parent(start).to_path_buf()
     };
 
-    let mut current = start_dir;
+    let mut current = match raw_start_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => raw_start_dir,
+    };
     // Cap prevents unbounded traversal on unusual filesystems.
     for _ in 0..MAX_TRAVERSAL_DEPTH {
         let candidate = current.join("mds.json");
@@ -331,7 +335,8 @@ pub(crate) fn resolve_output_path_for_kind(
     match input_path {
         Some(p) => {
             let filename = derive_output_filename_for_kind(p, kind);
-            let dir = p.parent().unwrap_or(Path::new("."));
+            // effective_parent maps "" (bare filename) to "." — avoids PF-006.
+            let dir = effective_parent(p);
             Ok(Some(dir.join(filename)))
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
@@ -983,7 +988,8 @@ pub(crate) fn relativize_source_map_fields(
         Some(out) => {
             // Set `file` to the output basename (sidecar / inline-to-file).
             sm.file = out.file_name().map(|n| n.to_string_lossy().into_owned());
-            out.parent().unwrap_or(Path::new(".")).to_path_buf()
+            // effective_parent maps "" (bare output path) to "." — avoids PF-006.
+            effective_parent(out).to_path_buf()
         }
         // Stdout: no `file` anchor; relativize against CWD so that absolute
         // source paths are never embedded in inline data-URI maps (AC-SEC-01).
