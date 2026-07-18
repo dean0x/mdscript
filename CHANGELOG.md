@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace
+### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
 
 These changes alter observable runtime behavior and compiled output. Templates relying
 on the previous (buggy) behavior must be updated.
@@ -38,6 +38,62 @@ now appear in the compiled output.
 
 **Migration:** if your pipeline depends on base frontmatter keys being absent from the
 compiled output, strip them downstream or move them to a non-frontmatter location.
+
+#### Interior-verbatim whitespace contract for block bodies and `mds fmt` (#150, #151)
+
+Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
+`mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
+The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
+equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
+exactly one final newline).
+
+**Migration:** compiled outputs may gain blank lines that were previously collapsed or
+stripped; templates relying on this collapse must remove the extra blank lines at the
+source level.
+
+#### `FileSystem` trait now requires `normalize_in_dir` and `parent_dir` (#146)
+
+`FileSystem` now requires two new methods — `normalize_in_dir` and `parent_dir` — that
+replace the internal `<source>` path-sentinel pattern. String-source `@import`/`@extends`
+resolution is now directly directory-anchored: `ctx.base_dir` carries the importing
+directory explicitly, with no synthetic filename appended. No behavior change for
+`compile`/`check` users; only affects code that implements the `FileSystem` trait
+directly via `ModuleCache::with_fs`.
+
+### **BREAKING** — Options validation, directory walker, source-map labels, check API (#196)
+
+- **`@mdscript/mds` now rejects unknown option keys** with
+  `Error { code: 'mds::invalid_options' }` before forwarding to the backend. Previously
+  unrecognized keys were silently passed through (napi and WASM backends would reject
+  them, but the universal JS wrapper did not validate). Callers with typos in option
+  objects will now get immediate, accurate error messages. (#196)
+
+- **`CheckOptions` is now split from `CompileOptions`** in `@mdscript/mds`.
+  `check()` and `checkFile()` accept only `{ vars? }` — source-map options
+  (`sourceMap`, `sourcesContent`) are not valid for check calls and are rejected with
+  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`.
+  TS interface implementers: `check`/`checkFile` signatures narrow to `CheckOptions`. (#196)
+
+- **String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
+  across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
+  output for `compile(src, {sourceMap:true})` / `compile_str*` / WASM `compile` now reads
+  `"input.mds"` instead of `"<source>"`. CLI stdin builds use `"<stdin>"` (unchanged).
+  Code inspecting `sources[0]` for the string `"<source>"` must be updated. (#196)
+
+- **Directory walker now excludes hidden directories and `node_modules` by default**
+  across all subcommands (`mds build`, `mds check`, `mds watch`, `mds fmt`,
+  `mds lint`). Directories whose name starts with `.` (e.g. `.git`, `.venv`) and
+  `node_modules` are silently skipped during recursive traversal. Templates inside these
+  directories are no longer compiled, formatted, or linted in directory mode. (#196)
+
+- **`mds check` summary wording changed** from `N checked` to `N passed, M
+  failed`. Scripts parsing CLI output must be updated. (#196)
+
+- **lint `--format json` `"file"` keys are now full relative paths** in directory mode.
+  When running `mds lint --format json .`, the `"file"` key in each JSON result is now
+  the path relative to the lint root (e.g. `"src/template.mds"`) rather than just the
+  basename (e.g. `"template.mds"`). This prevents key collisions when two different
+  files have the same filename. (#196)
 
 ### Added
 
@@ -159,91 +215,6 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   includes the full original template source in the map file — including any hardcoded
   secrets or PII. Only use in trusted build environments.
 
-### Changed
-
-- **BREAKING:** Interior-verbatim whitespace contract for block bodies and `mds fmt`.
-  Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
-  `mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
-  The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
-  equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
-  exactly one final newline). **Migration:** compiled outputs may gain blank lines that
-  were previously collapsed or stripped; templates relying on this collapse must remove
-  the extra blank lines at the source level. (#150, #151)
-
-- **BREAKING:** `FileSystem` trait now requires two new methods — `normalize_in_dir`
-  and `parent_dir` — that replace the internal `<source>` path-sentinel pattern.
-  String-source `@import`/`@extends` resolution is now directly directory-anchored:
-  `ctx.base_dir` carries the importing directory explicitly, with no synthetic
-  filename appended. No behavior change for `compile`/`check` users; only affects
-  code that implements the `FileSystem` trait directly via `ModuleCache::with_fs`.
-  (#146)
-
-### Fixed
-
-- **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
-  as passthrough regions. Previously only `` ``` ``-fences that started at column 1
-  were treated as code — a `~~~` fence, a `` > ``` `` blockquote fence, or a fence
-  indented with spaces/tabs would allow interpolation and directive parsing inside,
-  silently corrupting output for affected templates. The lexer now matches any fence
-  that starts with `[ \t>]*` followed by three or more matching backticks or tildes.
-  (#149)
-
-- **Interpolation errors now suggest `\{`** in the help text when a closed interpolation
-  contains an invalid expression (e.g. `{foo bar}` or `{1+2}`). Helps users who intended
-  a literal `{` but received a parse error on the expression inside. (#153)
-
-- **Windows: string-source `@import`/`@extends` now resolve relative imports
-  correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path
-  on Windows, and inside a `\\?\` prefix `/` is a literal character, not a path
-  separator — so building the in-memory-source base key with
-  `format!("{canonical}/<source>")` produced a key that `Path::parent()` could not
-  strip back to the base directory, silently resolving relative imports against the
-  wrong directory. Fixed by eliminating the synthetic `<source>` key entirely: the
-  importing directory is now carried directly as `ctx.base_dir` and passed to
-  `FileSystem::normalize_in_dir`, so no synthetic path component is ever constructed
-  or decomposed. Fixes napi `compile`/`check(src, { basePath })`, Python
-  `compile`/`check(src, base_path=...)`, and CLI `mds build -` / `mds check -`
-  (stdin) — all share the same resolution path. POSIX behavior is unchanged. (#133,
-  #146)
-
----
-
-### v0.4.0 Remediation — dogfooding blockers, bug batch, UX polish (#196)
-
-Six-agent dogfooding campaign found 3 release blockers, a bug batch, and a UX/docs
-batch. All are fixed in this consolidated remediation (Phases A–F).
-
-#### Breaking
-
-- **BREAKING: `@mdscript/mds` now rejects unknown option keys** with
-  `Error { code: 'mds::invalid_options' }` before forwarding to the backend. Previously
-  unrecognized keys were silently passed through (napi and WASM backends would reject
-  them, but the universal JS wrapper did not validate). Callers with typos in option
-  objects will now get immediate, accurate error messages. (#196)
-
-- **BREAKING: `CheckOptions` is now split from `CompileOptions`** in `@mdscript/mds`.
-  `check()` and `checkFile()` accept only `{ vars? }` — source-map options
-  (`sourceMap`, `sourcesContent`) are not valid for check calls and are rejected with
-  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`.
-  TS interface implementers: `check`/`checkFile` signatures narrow to `CheckOptions`. (#196)
-
-- **BREAKING: String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
-  across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
-  output for `compile(src, {sourceMap:true})` / `compile_str*` / WASM `compile` now reads
-  `"input.mds"` instead of `"<source>"`. CLI stdin builds use `"<stdin>"` (unchanged).
-  Code inspecting `sources[0]` for the string `"<source>"` must be updated. (#196)
-
-- **BREAKING: Directory walker now excludes hidden directories and `node_modules` by
-  default** across all subcommands (`mds build`, `mds check`, `mds watch`, `mds fmt`,
-  `mds lint`). Directories whose name starts with `.` (e.g. `.git`, `.venv`) and
-  `node_modules` are silently skipped during recursive traversal. Templates inside these
-  directories are no longer compiled, formatted, or linted in directory mode. (#196)
-
-- **BREAKING: `mds check` summary wording changed** from `N checked` to `N passed, M
-  failed`. Scripts parsing CLI output must be updated. (#196)
-
-#### Added
-
 - **Partial fix application** for `mds lint --fix`: when a batch of fixes partially
   applies (some edits are accepted, some are rejected due to post-fix regression),
   the CLI now reports `"N of M fixes applied"` and writes the best accumulated state
@@ -286,7 +257,7 @@ batch. All are fixed in this consolidated remediation (Phases A–F).
 - **napi workspace `build` script**: `crates/mds-napi/package.json` gains a `build`
   script (`napi build --release --no-js`) for local development. (#196)
 
-#### Changed
+### Changed
 
 - **Inline stdout source-map absolute-path leak fixed**: `mds build --source-map
   --inline -o -` and `mds build --source-map -o -` no longer leak absolute filesystem
@@ -298,12 +269,6 @@ batch. All are fixed in this consolidated remediation (Phases A–F).
 - **`mds build --inline -o -` for stdin input is now allowed**: previously rejected
   with an error. Inline and sidecar source maps now work identically for stdin and
   file inputs. The `sources[0]` label is `"<stdin>"` for stdin builds. (#196)
-
-- **lint `--format json` file keys now use relative paths** in directory mode. When
-  running `mds lint --format json .`, the `"file"` key in each JSON result is now the
-  path relative to the lint root (e.g. `"src/template.mds"`) rather than just the
-  basename (e.g. `"template.mds"`). This prevents key collisions when two different
-  files have the same filename. (#196)
 
 - **lint `--fix --check` and `--fix --diff` are now honest gated previews**: the
   preview pass runs through the same reverify gate as apply. Fixes that would be
@@ -352,7 +317,33 @@ batch. All are fixed in this consolidated remediation (Phases A–F).
   label was previously set to `{message}` (same as the headline), producing redundant
   output in code-frame renderings. It now reads `"syntax error occurred here"`. (#196)
 
-Closes #181
+### Fixed
+
+- **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
+  as passthrough regions. Previously only `` ``` ``-fences that started at column 1
+  were treated as code — a `~~~` fence, a `` > ``` `` blockquote fence, or a fence
+  indented with spaces/tabs would allow interpolation and directive parsing inside,
+  silently corrupting output for affected templates. The lexer now matches any fence
+  that starts with `[ \t>]*` followed by three or more matching backticks or tildes.
+  (#149)
+
+- **Interpolation errors now suggest `\{`** in the help text when a closed interpolation
+  contains an invalid expression (e.g. `{foo bar}` or `{1+2}`). Helps users who intended
+  a literal `{` but received a parse error on the expression inside. (#153)
+
+- **Windows: string-source `@import`/`@extends` now resolve relative imports
+  correctly.** `std::fs::canonicalize` returns a `\\?\` verbatim extended-length path
+  on Windows, and inside a `\\?\` prefix `/` is a literal character, not a path
+  separator — so building the in-memory-source base key with
+  `format!("{canonical}/<source>")` produced a key that `Path::parent()` could not
+  strip back to the base directory, silently resolving relative imports against the
+  wrong directory. Fixed by eliminating the synthetic `<source>` key entirely: the
+  importing directory is now carried directly as `ctx.base_dir` and passed to
+  `FileSystem::normalize_in_dir`, so no synthetic path component is ever constructed
+  or decomposed. Fixes napi `compile`/`check(src, { basePath })`, Python
+  `compile`/`check(src, base_path=...)`, and CLI `mds build -` / `mds check -`
+  (stdin) — all share the same resolution path. POSIX behavior is unchanged. (#133,
+  #146)
 
 ## [0.3.0] — 2026-06-28
 
@@ -591,7 +582,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dean0x/mdscript/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dean0x/mdscript/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.1.0
-[0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
