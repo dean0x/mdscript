@@ -204,8 +204,8 @@ const SOURCE_LABEL: &str = "<source>";
 /// (`@message` blocks) are not representable in the SMv3 segment model.
 /// The warning is surface-neutral (no mention of specific option names or APIs).
 const MSG_MODE_SOURCE_MAP_WARNING: &str =
-    "source maps are not supported for messages-mode output (@message blocks); \
-     source_map will be None for this compilation";
+    "source maps are not supported for messages-mode templates (@message blocks); \
+     no source map will be generated";
 
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
@@ -807,7 +807,7 @@ impl ModuleCache {
             } = components;
 
             if has_message_block(&final_body) {
-                // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+                // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
                 // The evaluator only has text-stream semantics; messages boundaries don't
                 // have stable byte offsets relative to the source.  Degrade gracefully.
                 if opts.source_map {
@@ -878,7 +878,7 @@ impl ModuleCache {
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
         if has_message_block(&module.body) {
-            // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+            // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
             if opts.source_map {
                 warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
             }
@@ -1030,7 +1030,7 @@ impl ModuleCache {
             let fmap = if returned.segments_dropped {
                 warnings.push(format!(
                     "source map segment cap ({} segments) exceeded in imported module '{}'; \
-                     source_map will be None for this compilation",
+                     no source map will be generated",
                     crate::limits::MAX_SOURCEMAP_SEGMENTS,
                     ctx.file_str,
                 ));
@@ -2049,7 +2049,7 @@ fn apply_map_degradation(
     if builder.segments_dropped {
         warnings.push(format!(
             "source map segment cap ({} segments) exceeded; \
-             source_map will be None for this compilation",
+             no source map will be generated",
             crate::limits::MAX_SOURCEMAP_SEGMENTS,
         ));
         return (raw, None);

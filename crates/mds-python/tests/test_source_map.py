@@ -125,8 +125,8 @@ def test_sm_py4_messages_mode_degrades() -> None:
     assert result.kind == "messages"
     # The binding should emit a warning about source map being unavailable.
     warnings = result.warnings
-    assert any("source_map" in w or "messages-mode" in w for w in warnings), (
-        f"expected a source_map/messages-mode warning, got: {warnings}"
+    assert any("source map" in w.lower() or "not supported" in w for w in warnings), (
+        f"expected a source-map/messages-mode warning, got: {warnings}"
     )
 
 

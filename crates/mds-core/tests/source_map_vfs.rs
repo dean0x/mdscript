@@ -888,7 +888,7 @@ fn source_map_messages_mode_degrades_to_none() {
     let matching_warnings: Vec<&String> = result
         .warnings
         .iter()
-        .filter(|w| w.contains("messages-mode output") && w.contains("source_map will be None"))
+        .filter(|w| w.contains("messages-mode") && w.contains("no source map will be generated"))
         .collect();
     assert!(
         !matching_warnings.is_empty(),
@@ -963,9 +963,7 @@ fn source_map_segment_cap_degrades_to_none() {
     );
 
     // A warning must be emitted.
-    let has_warning = warnings
-        .iter()
-        .any(|w| w.contains("segment cap") || w.contains("source_map will be None"));
+    let has_warning = warnings.iter().any(|w| w.contains("segment cap"));
     assert!(
         has_warning,
         "AC-PERF-03: must emit a warning when segment cap is exceeded; \
