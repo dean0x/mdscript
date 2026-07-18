@@ -894,7 +894,10 @@ pub(crate) fn relative_path(base_dir: &Path, target: &Path) -> String {
 /// 6. Result MUST NOT be an absolute path (enforced by assertion).
 pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: bool) -> String {
     // Rule 1: stdin sentinel relabeling.
-    if source == "<source>" && stdin_label {
+    // After the STRING_SOURCE_MAP_LABEL fix in sourcemap.rs, string-source stdin
+    // compiles emit "input.mds" (not "<source>") in sources[].  Match both for
+    // defense-in-depth (AC-FUNC-12).
+    if (source == "input.mds" || source == "<source>") && stdin_label {
         return "<stdin>".to_string();
     }
     // Pass through non-path sentinels unchanged (e.g. "<source>" in non-stdin builds).

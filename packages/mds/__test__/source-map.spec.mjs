@@ -134,8 +134,10 @@ describe('source maps (U-SM)', () => {
     const result = compile('Hello World!\n', { sourceMap: true });
     assert.ok('sourceMap' in result, 'sourceMap key must be present');
     assertSmStructure(result.sourceMap);
-    // String-source compilation uses "<source>" as the entry label.
-    assert.deepEqual(result.sourceMap.sources, ['<source>']);
+    // String-source compilation uses "input.mds" as the entry label (unified
+    // with the WASM backend via the STRING_SOURCE_MAP_LABEL choke-point fix).
+    assert.deepEqual(result.sourceMap.sources, ['input.mds'],
+      `string-source sources[0] must be "input.mds" after map_source_label fix; got: ${JSON.stringify(result.sourceMap.sources)}`);
     assert.ok(result.sourceMap.mappings.length > 0, 'mappings must be non-empty for non-trivial content');
   });
 
@@ -374,12 +376,12 @@ describe('VLQ decoder self-test (VLQ-SELF)', () => {
 //   W-SM1: WASM compile() emits a valid SMv3 sourceMap for simple input
 //   W-SM2: cross-field guard — sourcesContent:true without sourceMap:true
 //          throws mds::invalid_options on the WASM backend
-//   W-SM3: WASM and native backends produce byte-identical mappings for the
-//          same input (AC-API-04 / ADR-002: shared core serializer)
+//   W-SM3: WASM and native backends produce IDENTICAL sourceMaps for the
+//          same input (AC-API-04 / ADR-002 / PF-007 cross-surface parity)
 //
-// The WASM default filename is "input.mds" (vs "<source>" for the native
-// backend), so sources[] will differ by convention; mappings are compared
-// without the filename entry.
+// After the STRING_SOURCE_MAP_LABEL choke-point fix both backends emit
+// "input.mds" in sources[0], so the full sourceMap (including sources[])
+// is now comparable.  W-SM3 is now a true differential test (PF-007).
 // ---------------------------------------------------------------------------
 
 describe('source maps — WASM backend (W-SM)', () => {
@@ -431,14 +433,16 @@ describe('source maps — WASM backend (W-SM)', () => {
     );
   });
 
-  // ── W-SM3: WASM vs native byte-identical parity (AC-API-04) ───────────
+  // ── W-SM3: WASM vs native full sourceMap parity (PF-007 differential) ─
   //
-  // Both backends delegate to the same mds-core serializer, so mappings,
-  // version, and names must be byte-identical. sources[] is intentionally
-  // excluded from this check because the WASM backend uses a different
-  // default filename convention ("input.mds" vs "<source>").
+  // Both backends delegate to the same mds-core serializer.  After the
+  // STRING_SOURCE_MAP_LABEL choke-point fix (map_source_label in
+  // MapBuilder::new / source_index) both backends emit "input.mds" in
+  // sources[0], so the ENTIRE sourceMap object is now identical.
+  // This is a true differential test (PF-007): compare backends to each
+  // other rather than to per-surface constants.
 
-  test('W-SM3: WASM and native backends produce byte-identical mappings for same input', () => {
+  test('W-SM3: WASM and native backends produce identical full sourceMap for same input', () => {
     const src = 'Hello World!\n';
     const nativeResult = compile(src, { sourceMap: true });
     const wasmResult = wasmBackend.compile(src, { sourceMap: true });
@@ -446,8 +450,15 @@ describe('source maps — WASM backend (W-SM)', () => {
     assert.ok(nativeResult.sourceMap != null, 'native must produce sourceMap');
     assert.ok(wasmResult.sourceMap != null, 'wasm must produce sourceMap');
 
+    assertSmStructure(nativeResult.sourceMap);
     assertSmStructure(wasmResult.sourceMap);
 
+    // Full deep-equal: after the choke-point fix sources[] must also match.
+    assert.deepEqual(
+      nativeResult.sourceMap.sources,
+      wasmResult.sourceMap.sources,
+      `sources[] must match across backends (PF-007); native=${JSON.stringify(nativeResult.sourceMap.sources)}, wasm=${JSON.stringify(wasmResult.sourceMap.sources)}`,
+    );
     assert.equal(
       nativeResult.sourceMap.version,
       wasmResult.sourceMap.version,
@@ -462,6 +473,31 @@ describe('source maps — WASM backend (W-SM)', () => {
       nativeResult.sourceMap.mappings,
       wasmResult.sourceMap.mappings,
       'mappings must be byte-identical across backends (ADR-002: shared core serializer)',
+    );
+  });
+
+  // ── W-SM3b: cross-backend parity without sourcesContent ─────────────────
+  //
+  // Same input, sourcesContent:true — verify that both backends embed
+  // identical source content and the labeling is consistent (PF-007).
+
+  test('W-SM3b: WASM and native produce identical sourceMap with sourcesContent:true', () => {
+    const src = 'Hello World!\n';
+    const nativeResult = compile(src, { sourceMap: true, sourcesContent: true });
+    const wasmResult = wasmBackend.compile(src, { sourceMap: true, sourcesContent: true });
+
+    assert.ok(nativeResult.sourceMap != null, 'native must produce sourceMap');
+    assert.ok(wasmResult.sourceMap != null, 'wasm must produce sourceMap');
+
+    assert.deepEqual(
+      nativeResult.sourceMap.sources,
+      wasmResult.sourceMap.sources,
+      `sources[] must match across backends with sourcesContent; native=${JSON.stringify(nativeResult.sourceMap.sources)}`,
+    );
+    assert.deepEqual(
+      nativeResult.sourceMap.sourcesContent,
+      wasmResult.sourceMap.sourcesContent,
+      'sourcesContent must be identical across backends',
     );
   });
 });

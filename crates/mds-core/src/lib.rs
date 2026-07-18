@@ -1142,9 +1142,11 @@ pub fn lint_str_with(
         cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     }
     // Step 2: lint the entry source.
-    // Use the same default filename as the WASM backend so lint(source) produces
-    // a byte-identical "file" key across all surfaces (AC-API-06).
-    lint::lint_source(source, "input.mds", config)
+    // Use STRING_SOURCE_MAP_LABEL ("input.mds") — the shared const that both
+    // the source-map choke-point (sourcemap.rs) and the WASM DEFAULT_FILENAME
+    // agree on — so lint(source) produces a byte-identical "file" key across
+    // all surfaces (AC-API-06).
+    lint::lint_source(source, crate::sourcemap::STRING_SOURCE_MAP_LABEL, config)
 }
 
 /// Lint an MDS file.

@@ -64,8 +64,9 @@ def test_sm_py1_compile_produces_source_map() -> None:
     sm = result.source_map
     assert sm is not None, "source_map getter should be non-None"
     _check_sm_structure(sm)
-    # String-source compilation uses "<source>" as the entry label.
-    assert sm["sources"] == ["<source>"]
+    # String-source compilation uses "input.mds" (STRING_SOURCE_MAP_LABEL) as
+    # the entry label — unified with the WASM backend via the choke-point fix.
+    assert sm["sources"] == ["input.mds"]
 
 
 def test_sm_py1_compile_virtual_produces_source_map() -> None:

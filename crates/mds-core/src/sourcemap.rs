@@ -62,6 +62,53 @@ impl std::fmt::Debug for Origin {
 }
 
 // ---------------------------------------------------------------------------
+// String-source canonical map label
+// ---------------------------------------------------------------------------
+
+/// Canonical `sources[]` label for in-memory (string-source) compilations.
+///
+/// All paths that produce a [`MapBuilder`] for string-source input converge
+/// on [`MapBuilder::new`] or [`MapBuilder::source_index`].  Both choke-points
+/// apply [`map_source_label`] so the diagnostic sentinel `"<source>"` can
+/// never appear in `sources[]`.
+///
+/// # SYNC
+///
+/// This const must equal:
+/// - `crates/mds-wasm/src/lib.rs` `DEFAULT_FILENAME` (`"input.mds"`) — the
+///   WASM backend seeds the VirtualFs with this key, so WASM string-source
+///   maps already emit `"input.mds"`.  Change one → change both.
+/// - The lint string-source file key in `crates/mds-core/src/lib.rs`
+///   `lint_source` call (~L1147) — both surfaces must agree on the file key
+///   for cross-surface JSON parity (AC-API-06).
+pub(crate) const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
+
+/// Map a raw source file label to its canonical source-map label.
+///
+/// The diagnostic/cycle-detection sentinel `"<source>"` is remapped to
+/// [`STRING_SOURCE_MAP_LABEL`] so that the `sources[]` array in produced
+/// source maps is identical across native, WASM, napi, and Python surfaces
+/// (fixes the PF-007 cross-surface divergence).
+///
+/// Applied at BOTH choke-points where new labels enter a [`MapBuilder`]:
+/// - [`MapBuilder::new`] (the seed label at index 0), and
+/// - [`MapBuilder::source_index`] (before the dedup compare, so `"<source>"`
+///   and `"input.mds"` can never coexist as two distinct `sources[]` entries
+///   even if S8 or spliced-region paths pass the sentinel separately).
+///
+/// The literal `"<source>"` is used here rather than `SOURCE_LABEL` from
+/// `resolver.rs` to avoid a cross-module dependency.  If the sentinel ever
+/// changes, update this function first.
+#[inline]
+pub(crate) fn map_source_label(name: &str) -> &str {
+    if name == "<source>" {
+        STRING_SOURCE_MAP_LABEL
+    } else {
+        name
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public type
 // ---------------------------------------------------------------------------
 
@@ -503,12 +550,15 @@ impl MapBuilder {
     /// [`source_index`] registers additional sources (e.g. for `@extends`
     /// base templates in CP3+).
     pub(crate) fn new(source_name: String, source_content: String) -> Self {
+        // Canonicalize the label at the choke-point: "<source>" (the diagnostic
+        // sentinel for string-source compiles) becomes STRING_SOURCE_MAP_LABEL.
+        let canonical = map_source_label(&source_name).to_string();
         Self {
             segments: Vec::new(),
             cursor: 0,
             suppress: 0,
             current_src: 0,
-            sources: vec![source_name],
+            sources: vec![canonical],
             sources_content: vec![source_content],
             segments_dropped: false,
             no_sources_content: false,
@@ -520,11 +570,16 @@ impl MapBuilder {
     /// Scans linearly (sources vecs are small — typically 1-3 entries per
     /// single-file compilation).
     pub(crate) fn source_index(&mut self, file: &str, content: &str) -> u32 {
-        if let Some(pos) = self.sources.iter().position(|s| s == file) {
+        // Apply the canonical label BEFORE the dedup compare so that "<source>"
+        // and "input.mds" can never coexist as two distinct entries (e.g. when
+        // S8 function-body attribution passes the sentinel after the seed is
+        // already "input.mds").
+        let canonical = map_source_label(file);
+        if let Some(pos) = self.sources.iter().position(|s| s == canonical) {
             return pos as u32;
         }
         let idx = self.sources.len() as u32;
-        self.sources.push(file.to_string());
+        self.sources.push(canonical.to_string());
         self.sources_content.push(content.to_string());
         idx
     }

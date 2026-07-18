@@ -1020,6 +1020,9 @@ describe('source maps (F-SM)', () => {
     assert.equal(sm.version, 3, 'sourceMap.version must be 3');
     assert.ok(Array.isArray(sm.sources), 'sourceMap.sources must be an array');
     assert.ok(sm.sources.length > 0, 'sourceMap.sources must be non-empty');
+    // String-source uses "input.mds" (STRING_SOURCE_MAP_LABEL) — unified with WASM.
+    assert.equal(sm.sources[0], 'input.mds',
+      `sources[0] must be "input.mds" after map_source_label fix; got: ${JSON.stringify(sm.sources[0])}`);
     assert.ok(Array.isArray(sm.names), 'sourceMap.names must be an array');
     assert.equal(sm.names.length, 0, 'sourceMap.names must be empty');
     assert.equal(typeof sm.mappings, 'string', 'sourceMap.mappings must be a string');
