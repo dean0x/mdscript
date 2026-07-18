@@ -345,7 +345,7 @@ fn exit_by_severity(result: &mds::LintResult) {
 /// Re-checks for symlink immediately before the write cycle (TOCTOU protection,
 /// AC-F-21). Uses `tempfile::Builder` for the temp file so cleanup is automatic
 /// on drop if the rename fails.
-fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
+pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
     // Re-check for symlink right before writing (TOCTOU guard).
     NativeFs::check_symlink(path).map_err(miette::Error::from)?;
 

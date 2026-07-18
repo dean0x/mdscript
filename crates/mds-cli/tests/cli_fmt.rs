@@ -1186,6 +1186,74 @@ fn fmt_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
     );
 }
 
+// ── Permission preservation (issue #25 — atomic write regression gate) ──────
+
+/// Regression gate: `mds fmt <file>` (single-file mode) must preserve the
+/// original Unix file mode after formatting.
+///
+/// The write path was changed from bare `std::fs::write` (which truncates the
+/// existing file in place, keeping its permissions) to `atomic_write_file` (temp
+/// file + rename).  `tempfile::Builder` defaults to mode 0600; without permission
+/// preservation the rename would silently turn a 0644 source file into owner-only.
+///
+/// `atomic_write_file` already handles this (commit c5aa086 hardened the lint
+/// path) — this test locks in the same guarantee for the fmt path.
+#[cfg(unix)]
+#[test]
+fn fmt_single_file_preserves_mode_0644() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("perm_test.mds");
+    // Write unformatted content that fmt will actually rewrite.
+    fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
+    // Set 0644 explicitly (some systems may default differently).
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = fmt_path(&target, &[]);
+    assert!(
+        output.status.success(),
+        "fmt should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "fmt single-file must preserve file mode 0644 after atomic write; got 0{mode:o}"
+    );
+}
+
+/// Regression gate: `mds fmt <dir>` (directory mode) must preserve the original
+/// Unix file mode after formatting.
+///
+/// Directory mode routes through `format_one_file` → `atomic_write_file`.
+/// Same tempfile-0600 hazard as the single-file path above.
+#[cfg(unix)]
+#[test]
+fn fmt_directory_mode_preserves_mode_0644() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("perm_dir_test.mds");
+    fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Run fmt on the DIRECTORY — exercises format_one_file, not run_fmt_file.
+    let output = fmt_path(dir.path(), &[]);
+    assert!(
+        output.status.success(),
+        "fmt dir should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "fmt directory mode must preserve file mode 0644 after atomic write; got 0{mode:o}"
+    );
+}
+
 /// Regression gate: `mds fmt <dir>` (directory mode) must not emit raw ESC bytes
 /// to stderr when a source file contains a raw ESC byte that reaches `MdsError::Syntax`.
 ///
