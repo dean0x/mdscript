@@ -31,7 +31,7 @@ use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
 
 use crate::build::{build_runtime_vars, load_config, read_stdin, resolve_input, RuntimeVarArgs};
-use crate::output::collect_mds_files;
+use crate::output::collect_mds_files_detailed;
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
 const KNOWN_RULES: &[&str] = &[
@@ -895,9 +895,20 @@ fn run_lint_directory(
         }
     };
 
-    let mut files = collect_mds_files(dir, MAX_DEPTH, None);
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
+    let mut files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // Always emit — not suppressed by --quiet (avoids silent CI green pass).
+            // Exit 2: usage error consistent with lint's exit-code table.
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was linted",
+                walk.excluded_by_default
+            );
+            std::process::exit(2);
+        }
         if !quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }

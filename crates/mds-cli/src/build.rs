@@ -1343,8 +1343,8 @@ fn run_build_directory(
     inline: bool,
 ) -> Result<()> {
     use crate::output::{
-        canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
-        probe_and_remove_stale, resolve_output_base, OutputBase,
+        canonicalize_out_dir, collect_mds_files_detailed, is_partial, output_base_no_ext,
+        output_path_for, probe_and_remove_stale, resolve_output_base, OutputBase,
     };
 
     const MAX_DEPTH: usize = 64;
@@ -1369,9 +1369,22 @@ fn run_build_directory(
         _ => None,
     };
 
-    let files = collect_mds_files(dir, MAX_DEPTH, exclude_prefix.as_deref());
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, exclude_prefix.as_deref());
+    let files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // All candidates were inside default-excluded directories.  Emit the
+            // diagnostic even under --quiet (avoids a silent CI green pass — avoids
+            // PF-004 enforcement gap where the limit is real on one path and absent
+            // on another).
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was built",
+                walk.excluded_by_default
+            );
+            std::process::exit(1);
+        }
         if !quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }

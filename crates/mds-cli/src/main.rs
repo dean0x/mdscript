@@ -297,13 +297,23 @@ fn run_check_directory(
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<()> {
-    use output::{collect_mds_files, is_partial};
+    use output::{collect_mds_files_detailed, is_partial};
 
     const MAX_DEPTH: usize = 64;
 
-    let files = collect_mds_files(dir, MAX_DEPTH, None);
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
+    let files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // Always emit — not suppressed by --quiet (avoids silent CI green pass).
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was checked",
+                walk.excluded_by_default
+            );
+            std::process::exit(1);
+        }
         if !quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }

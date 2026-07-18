@@ -29,7 +29,7 @@ use mds::{effective_parent, FileSystem, MdsError};
 use miette::Result;
 
 use crate::build::{load_config, read_stdin, resolve_input};
-use crate::output::collect_mds_files;
+use crate::output::collect_mds_files_detailed;
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -306,9 +306,19 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // malformed config rather than silently ignoring it.
     let _ = load_config(dir)?;
 
-    let files = collect_mds_files(dir, MAX_DEPTH, None);
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
+    let files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // Always emit — not suppressed by --quiet (avoids silent CI green pass).
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was formatted",
+                walk.excluded_by_default
+            );
+            std::process::exit(1);
+        }
         if !flags.quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }
