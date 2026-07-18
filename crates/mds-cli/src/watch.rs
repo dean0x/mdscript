@@ -87,14 +87,11 @@ pub(crate) fn dirs_to_watch(
     let mut dirs = BTreeSet::new();
 
     let push_parent = |path: &Path, set: &mut BTreeSet<PathBuf>| {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                set.insert(parent.to_path_buf());
-            } else {
-                // Relative path with no directory component: watch "."
-                set.insert(PathBuf::from("."));
-            }
-        }
+        // Route through mds::effective_parent so that bare filenames — where
+        // Path::parent() returns Some("") rather than None — are handled by the
+        // single canonical implementation rather than an inline re-implementation.
+        // Avoids PF-006: one owner, one place to maintain or regress.
+        set.insert(mds::effective_parent(path).to_path_buf());
     };
 
     push_parent(entry, &mut dirs);
@@ -200,12 +197,15 @@ pub(crate) fn graph_key(p: &Path) -> PathBuf {
     if let Ok(c) = p.canonicalize() {
         return c;
     }
-    // File doesn't exist (just deleted): canonicalize parent + rejoin filename.
-    if let Some(parent) = p.parent() {
-        if let Ok(cp) = parent.canonicalize() {
-            if let Some(name) = p.file_name() {
-                return cp.join(name);
-            }
+    // File doesn't exist (just deleted): canonicalize effective parent + rejoin filename.
+    // mds::effective_parent maps Some("") (bare filename, e.g. "hello.mds") to
+    // Path::new(".") so that "".canonicalize() never runs — avoids PF-006 in the
+    // graph-key lookup-miss path: without this guard a bare-named file that is
+    // deleted cannot be matched against the absolute-path keys stored in forward_deps.
+    let parent = mds::effective_parent(p);
+    if let Ok(cp) = parent.canonicalize() {
+        if let Some(name) = p.file_name() {
+            return cp.join(name);
         }
     }
     p.to_path_buf()

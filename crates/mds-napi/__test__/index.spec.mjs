@@ -162,6 +162,36 @@ describe('compileFile', () => {
       assert.ok(result.output.includes('Hello Alice!'), `got: ${result.output}`);
     }
   });
+
+  test('F-CF7: bare filename (no separator, no ./ prefix) resolves from cwd (avoids PF-006)', () => {
+    // PF-006: Path::parent() returns Some("") for a bare name like "simple.mds".
+    // "".canonicalize() fails with file_not_found unless effective_parent maps it
+    // to ".".  This test exercises exactly that path — a bare filename with NO
+    // separator character and NO "./" prefix — by chdir-ing into the fixtures
+    // directory so the bare name is resolvable.
+    // F-CF6 uses path.relative() which always produces a SEPARATOR-CONTAINING
+    // relative path (e.g. "../../fixtures/simple.mds"), bypassing the bug entirely.
+    // This test is the genuine bare-filename gate.
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(FIXTURES);
+      const result = compileFile('simple.mds'); // no separator, no './' prefix
+      assert.equal(result.kind, 'markdown', 'F-CF7: kind must be markdown');
+      assert.ok(
+        result.output.includes('Hello Alice!'),
+        `F-CF7: bare-filename compileFile must produce compiled content; got: ${result.output}`,
+      );
+      // Dependencies must be absolute paths even when the entry was a bare filename.
+      for (const dep of result.dependencies) {
+        assert.ok(
+          path.isAbsolute(dep),
+          `F-CF7: dependency must be absolute; got: ${dep}`,
+        );
+      }
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
 });
 
 // ── Check tests ───────────────────────────────────────────────────────────────

@@ -83,6 +83,28 @@ def test_f5_compile_file_deps_absolute_entry_excluded(fixtures: pathlib.Path) ->
     assert any(d.endswith("import_provider.mds") for d in r.dependencies)
 
 
+def test_f5_compile_file_bare_name_from_cwd(
+    fixtures: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PF-006 regression: bare relative filename (no ./ prefix) resolves from cwd.
+
+    Path::parent() returns Some("") for a bare name — "".canonicalize() would fail
+    with file_not_found on every binding surface if not for effective_parent.
+    This test passes "simple.mds" with NO separator so it exercises the bare-name
+    path that shipped broken in v0.1.0–v0.3.0.
+    """
+    monkeypatch.chdir(fixtures)
+    r = m.compile_file("simple.mds")  # bare name — no "./" prefix
+    assert r.kind == "markdown"
+    assert "Hello Alice!" in (r.output or ""), (
+        f"expected 'Hello Alice!' in output, got: {r.output!r}"
+    )
+    # Dependencies must be absolute even when the entry was a bare filename.
+    assert all(pathlib.Path(d).is_absolute() for d in r.dependencies), (
+        f"all dependencies must be absolute paths, got: {r.dependencies}"
+    )
+
+
 # ── check / check_file (F6, F7) ─────────────────────────────────────────────────
 
 

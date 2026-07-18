@@ -933,6 +933,65 @@ fn vars_file_non_object_json_error_names_the_file() {
 
 // ── Bare-filename regression (PF-006 / issue #11) ────────────────────────────
 
+/// `mds watch hello.mds` from the directory containing `hello.mds` must start up,
+/// complete the initial compile, and write `hello.md` with the correct content.
+///
+/// PF-006 fifth sibling: bare-filename watch invocation.  The other four siblings
+/// (build / check / fmt / lint) are above.  Watch is the one subcommand that
+/// resolves parents through its own call sites; this test locks in that startup path.
+///
+/// Only asserts the INITIAL BUILD (bounded 10-second wait) — no event-timing
+/// assertions that would be timing-flaky on Linux CI.
+#[test]
+fn watch_bare_filename_from_cwd_succeeds() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    // RAII guard — kills + waits the child on drop so the test never leaks processes.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // Use a distinguishable sentinel so "exit 0 + empty file" can't pass.
+    std::fs::write(dir.path().join("hello.mds"), "Hello from watch!\n").unwrap();
+    let out = dir.path().join("hello.md");
+
+    let _child = ChildGuard(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "hello.mds", "--debounce", "0", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn mds watch"),
+    );
+
+    // Poll until the output file appears and contains the compiled content.
+    // Bounded to 10 s; the initial compile typically finishes in < 100 ms.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let found = loop {
+        if let Ok(content) = std::fs::read_to_string(&out) {
+            if content.contains("Hello from watch!") {
+                break true;
+            }
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        found,
+        "mds watch <bare-filename> from cwd should complete initial compile and write hello.md \
+         containing 'Hello from watch!'"
+    );
+}
+
 /// `load_config` must find `mds.json` in a grandparent directory when building
 /// from a bare filename in a deeply nested subdirectory.
 ///
