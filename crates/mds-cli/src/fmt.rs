@@ -239,7 +239,9 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{file_name}: {e:?}");
+            // File path is embedded in the miette report; sanitize for ESC injection safety
+            // (avoids PF-004 parallel-path gap — uses the shared render helper).
+            crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
     };
@@ -248,7 +250,9 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let result = match format_source_named(&source, base_dir, &file_name) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{file_name}: {e:?}");
+            // MdsError::Syntax embeds user-controlled source fragments that may contain
+            // raw ESC bytes; file_name is threaded into the report by format_source_named.
+            crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
     };
@@ -256,7 +260,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     if diff && result.changed {
         let label = file_name.clone();
         if let Err(e) = print_diff(&render_diff(&source, &result.formatted, &label)) {
-            eprintln!("{file_name}: {e:?}");
+            crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
     }

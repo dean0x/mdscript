@@ -1222,7 +1222,7 @@ fn lint_one_file_human(
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{:?}", miette::Report::from(e));
+            crate::output::eprint_error(miette::Report::from(e));
             return FileTally::Error;
         }
     };
@@ -1235,7 +1235,7 @@ fn lint_one_file_human(
     let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
         Ok(r) => r,
         Err(ref e) => {
-            eprintln!("{:?}", miette::Report::from(e.clone()));
+            crate::output::eprint_error(miette::Report::from(e.clone()));
             return if matches!(e, MdsError::ResourceLimit { .. }) {
                 FileTally::ResourceLimit
             } else {

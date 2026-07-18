@@ -1148,3 +1148,78 @@ fn fmt_bare_filename_propagates_syntax_error() {
     let after = fs::read_to_string(dir.path().join("broken.mds")).unwrap();
     assert_eq!(after, src, "broken file must be left untouched");
 }
+
+// ── ESC injection regression — mds fmt (issue #5 / ESC-INJECTION) ────────────
+
+/// Regression gate: `mds fmt <file>` (single-file mode) must not emit raw ESC
+/// bytes to stderr when the source file contains a raw ESC byte that reaches
+/// `MdsError::Syntax`.
+///
+/// Single-file fmt errors propagate to `main()` via `?`, which is the
+/// last-resort sanitizer boundary at `main.rs`.  This test validates that
+/// boundary for the fmt subcommand specifically.
+#[test]
+fn fmt_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("esc_fmt.mds");
+    fs::write(&path, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = fmt_path(&path, &[]);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "fmt with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (fmt single-file); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout (fmt single-file); \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
+    );
+}
+
+/// Regression gate: `mds fmt <dir>` (directory mode) must not emit raw ESC bytes
+/// to stderr when a source file contains a raw ESC byte that reaches `MdsError::Syntax`.
+///
+/// Directory mode routes through `format_one_file`, which previously called
+/// `eprintln!("{file_name}: {e:?}")` without sanitization.  That path is now
+/// guarded by `crate::output::eprint_error` (avoids PF-004 parallel-path gap).
+#[test]
+fn fmt_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    // Raw ESC byte (0x1B) on the error line so miette renders it in the source context frame.
+    fs::write(
+        dir.path().join("esc_fmt_dir.mds"),
+        b"@define \x1bfoo:\nhello\n",
+    )
+    .unwrap();
+
+    let out = fmt_path(dir.path(), &[]);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "fmt dir with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (fmt directory); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout (fmt directory); \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
+    );
+}

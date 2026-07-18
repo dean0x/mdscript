@@ -1461,7 +1461,7 @@ fn lint_fix_bare_filename_applies_fix() {
 // ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
 
 /// Regression gate: a .mds file containing a raw ESC byte (U+001B) that reaches
-/// `MdsError::Syntax` must not emit raw ESC bytes to stderr.
+/// `MdsError::Syntax` must not emit raw ESC bytes to stderr — single-file mode.
 ///
 /// Background: `MdsError::Syntax` embeds user-controlled source fragments via
 /// miette's NamedSource.  Before the fix, those fragments printed with raw ESC
@@ -1489,5 +1489,44 @@ fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         "raw ESC byte (0x1B) must be sanitized before writing to stderr; \
          got (hex): {:02x?}",
         &out.stderr[..out.stderr.len().min(512)]
+    );
+}
+
+/// Regression gate: `mds lint <dir>` (directory mode) must not emit raw ESC bytes to
+/// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
+/// `MdsError::Syntax`.
+///
+/// Directory mode routes through `lint_one_file_human`, which previously called
+/// `eprintln!("{:?}", miette::Report::from(e.clone()))` directly without sanitization.
+/// That path is now guarded by `crate::output::eprint_error` (avoids PF-004 parallel-path
+/// gap — the sibling that slipped past rounds 1 and 2).
+#[test]
+fn lint_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    // Raw ESC byte (0x1B) in a .mds file that has a syntax error (unclosed @define).
+    // The ESC is on the error line so miette renders it inside the source context frame.
+    fs::write(dir.path().join("esc_dir.mds"), b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    // Must exit non-zero (syntax error aborts lint analysis).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "lint dir with syntax error should exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Raw ESC byte (0x1B) must not appear anywhere in stderr.
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (directory mode); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    // Stdout must also be clean (JSON path not taken in human mode).
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout; \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
     );
 }

@@ -408,6 +408,25 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
     }
 }
 
+// ── Sanitized stderr render ───────────────────────────────────────────────────
+
+/// Render a miette Report to stderr with control-character sanitization applied.
+///
+/// Per-file error handlers in directory-mode loops (e.g. `lint_one_file_human`,
+/// `format_one_file`) MUST use this helper instead of bare
+/// `eprintln!("{:?}", miette::Report::from(e))`.  Centralising the render here
+/// means the sanitizer cannot be forgotten on any future parallel path
+/// (avoids PF-004: a check enforced on the primary path silently absent on a
+/// sibling path).
+///
+/// The `mds::sanitize_control_chars` function strips C0, C1, and DEL codepoints
+/// while preserving `\n`, `\t`, and printable Unicode — miette box-drawing and
+/// carets therefore survive intact; only raw ESC bytes and other non-printing
+/// controls are escaped to `\uXXXX` literals.
+pub(crate) fn eprint_error(report: miette::Report) {
+    eprintln!("{}", mds::sanitize_control_chars(&format!("{report:?}")));
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

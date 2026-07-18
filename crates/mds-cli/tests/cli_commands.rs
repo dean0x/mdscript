@@ -608,3 +608,89 @@ fn cli_init_rejects_path_traversal() {
         "error should mention path traversal, got: {stderr}"
     );
 }
+
+// ── ESC injection regression — mds check (issue #5 / ESC-INJECTION) ──────────
+
+/// Regression gate: `mds check <file>` (single-file mode) must not emit raw
+/// ESC bytes to stderr when the source file contains a raw ESC byte that reaches
+/// `MdsError::Syntax`.
+///
+/// Single-file check errors propagate to `main()` via `?`, which is the
+/// last-resort sanitizer boundary at `main.rs`.  This test validates that
+/// boundary for the check subcommand specifically.
+#[test]
+fn check_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("esc_check.mds");
+    std::fs::write(&path, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = mds_bin()
+        .args(["check"])
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "check with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (check single-file); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout (check single-file); \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
+    );
+}
+
+/// Regression gate: `mds check <dir>` (directory mode) must not emit raw ESC bytes
+/// to stderr when a source file contains a raw ESC byte that reaches `MdsError::Syntax`.
+///
+/// Directory check errors are handled in `run_check_directory` (main.rs) which
+/// explicitly calls `mds::sanitize_control_chars` at the per-file render site.
+/// This test validates that boundary for the check directory path.
+#[test]
+fn check_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("esc_check.mds"),
+        b"@define \x1bfoo:\nhello\n",
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .args(["check"])
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "check dir with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (check directory); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout (check directory); \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
+    );
+}
