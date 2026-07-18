@@ -846,10 +846,14 @@ impl ModuleCache {
                     None => (raw, None),
                 }
             } else {
-                (
-                    evaluate(&final_body, &mut scope, warnings, ctx.file_str, ctx.source)?,
-                    None,
-                )
+                // `final_body` is spliced from base-skeleton nodes (base-relative
+                // offsets) and child block overrides (child-relative offsets), so no
+                // single source can attribute every node's offset. Pass empty file/source
+                // so `build_type_mismatch` degrades a `type_mismatch` to spanless rather
+                // than anchoring a base-relative offset against the child source (ADR-005
+                // "degrade rather than mis-attribute"). The source-map branch above keeps
+                // spans correct by evaluating per-region with each region's own origin.
+                (evaluate(&final_body, &mut scope, warnings, "", "")?, None)
             };
 
             let body_clean = crate::clean_output(&body_raw);
@@ -1344,7 +1348,13 @@ impl ModuleCache {
             merged_frontmatter,
         } = components;
 
-        let prompt_body = evaluate(&final_body, &mut scope, warnings, ctx.file_str, ctx.source)?;
+        // `final_body` splices base-skeleton nodes (base-relative offsets) with child
+        // block overrides (child-relative offsets); a single `ctx.source` cannot attribute
+        // both. Pass empty file/source so a `type_mismatch` in an inherited condition
+        // degrades to spanless instead of mis-attributing a base-relative offset onto the
+        // child source (ADR-005 "degrade rather than mis-attribute"). Per-region source
+        // attribution for `@extends` is deferred to S8; spanless is the safe interim.
+        let prompt_body = evaluate(&final_body, &mut scope, warnings, "", "")?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
         Ok(ResolvedModule {

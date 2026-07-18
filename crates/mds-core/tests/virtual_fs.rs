@@ -1461,6 +1461,52 @@ fn d2_type_mismatch_cross_source_extends_degrades_spanless() {
     // the guard itself is tested via unit coverage in evaluator.rs.
 }
 
+#[test]
+fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
+    // A type mismatch in a BASE skeleton `@if` condition (offset relative to the base
+    // template) must NOT be attributed to the CHILD source. The flat
+    // `evaluate(&final_body, …, ctx.source)` path in the `@extends` pipeline evaluates a
+    // body spliced from base-skeleton nodes (base-relative offsets) and child block
+    // overrides (child-relative offsets) against a single `ctx.source` (the child). A
+    // base-relative offset that happens to land within the child source at a char
+    // boundary would otherwise anchor the `type_mismatch` span onto the child's
+    // `@extends` line — mis-attribution to a foreign source. The contract
+    // (`build_type_mismatch` doc / ADR-005) is to degrade to spanless rather than
+    // mis-attribute, exactly as the flat non-`@extends` path never faces this because its
+    // offsets and `ctx.source` share one origin.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        // `n` is a string; `@if n == 5` is a string-vs-number mismatch that fires at eval
+        // time (the validator cannot type-check it). The `@if` lives in the base SKELETON
+        // (not inside a `@block`), so its offset (14) is base-relative. The `@block`
+        // placeholder lets `child.mds` be a valid extender.
+        "---\nn: hi\n---\n@if n == 5:\nbase-if-branch\n@end\n@block body:\nbase default\n@end\n"
+            .to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        // Long enough that the base `@if` offset (14) falls inside the child source at a
+        // valid char boundary — the exact condition that triggered mis-attribution.
+        "@extends \"./base.mds\"\n@block body:\nThis override body is intentionally long so the base skeleton offset lands inside the child source.\n@end\n"
+            .to_string(),
+    );
+    let err = compile_vfs(modules, "child.mds")
+        .expect_err("cross-type mismatch in an inherited @if must error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "must surface as mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    assert!(
+        serialized.span.is_none(),
+        "cross-source @extends type_mismatch must degrade to spanless (never mis-attributed \
+         to the child source); got span: {:?}",
+        serialized.span
+    );
+}
+
 // ── Integration repro: #153 — invalid interpolation hint says \{ not \{{ ───────
 
 #[test]
