@@ -147,6 +147,8 @@ def test_e5_span_offset_and_line_column_single_line() -> None:
         # 1-indexed character column (ASCII → char offset == byte offset)
         assert e.span.column == e.span.offset + 1
         assert isinstance(e.span.offset, int)  # Python int — no truncation
+    else:
+        pytest.fail("expected MdsError")
 
 
 def test_e5_span_line_increments_on_multiline() -> None:
@@ -157,6 +159,8 @@ def test_e5_span_line_increments_on_multiline() -> None:
         assert e.span is not None
         assert e.span.line == 2
         assert e.span.column and e.span.column > 1
+    else:
+        pytest.fail("expected MdsError")
 
 
 def test_e5_span_none_when_core_reports_none() -> None:
@@ -165,6 +169,8 @@ def test_e5_span_none_when_core_reports_none() -> None:
         m.compile("x" * (10 * 1024 * 1024 + 1))
     except m.MdsError as e:
         assert e.span is None
+    else:
+        pytest.fail("expected MdsError")
 
 
 # ── D2: type_mismatch_at — span present on @if cross-type comparison ─────────────
