@@ -53,12 +53,9 @@ fn lint_stdin(input: &str, extra_args: &[&str]) -> std::process::Output {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // Ignore BrokenPipe — the child may exit before reading stdin
+    // (e.g. a usage error detected before the process reads any input).
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
     child.wait_with_output().unwrap()
 }
 
