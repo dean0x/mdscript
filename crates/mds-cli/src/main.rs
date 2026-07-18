@@ -225,7 +225,11 @@ fn main() {
 
     let result = run(cli);
     if let Err(e) = result {
-        eprintln!("{e:?}");
+        // Sanitize at the last-resort render boundary: every subcommand's error propagates
+        // here, and MdsError::Syntax embeds user-controlled source fragments that may contain
+        // raw ESC bytes. Guarding here makes the protection hold by construction for any
+        // future error path, not just the ones we remember to sanitize individually (PF-004).
+        eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
         process::exit(exit_code(&e));
     }
 }
@@ -339,7 +343,9 @@ fn run_check_directory(
                 ok_count += 1;
             }
             Err(e) => {
-                eprintln!("{e:?}");
+                // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
+                // source fragments that may contain raw ESC bytes (PF-004 parallel-path guard).
+                eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
                 fail_count += 1;
             }
         }

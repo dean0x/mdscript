@@ -1044,6 +1044,49 @@ fn build_load_config_finds_grandparent_mds_json() {
 
 // ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
 
+/// Regression gate: `mds build` (single-file mode) must not emit raw ESC bytes to
+/// stderr when the source file embeds a raw ESC byte (U+001B) in content that reaches
+/// `MdsError::Syntax`.
+///
+/// Single-file builds do not go through the per-file handler in `run_build_directory`;
+/// the error propagates all the way to `main()`, which is the last-resort render boundary.
+/// This test validates that boundary specifically.
+///
+/// Companion to `build_esc_byte_in_syntax_error_is_sanitized_on_stderr` which covers
+/// directory mode (the first guarded path). Both paths must be sanitized to prevent
+/// terminal escape injection from untrusted source files (PF-004 / ESC-INJECTION).
+#[test]
+fn build_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("esc.mds");
+    // Raw ESC byte (0x1B) in a .mds file that has a syntax error (unclosed @define).
+    // The ESC is on the error line so miette renders it inside the source context frame.
+    std::fs::write(&path, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(&path) // single-file mode (not a directory)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // Build must fail (syntax error in the file).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "build with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Raw ESC byte (0x1B) must not appear anywhere in stderr.
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (single-file mode); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+}
+
 /// Regression gate: `mds build` (directory mode) must not emit raw ESC bytes to
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
