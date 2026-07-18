@@ -885,14 +885,27 @@ fn source_map_messages_mode_degrades_to_none() {
 
     // A warning must be emitted explaining the degradation (AC-FUNC-07).
     // The warning uses MSG_MODE_SOURCE_MAP_WARNING (surface-neutral wording).
-    let has_warning = result
+    let matching_warnings: Vec<&String> = result
         .warnings
         .iter()
-        .any(|w| w.contains("messages-mode output") && w.contains("source_map will be None"));
+        .filter(|w| w.contains("messages-mode output") && w.contains("source_map will be None"))
+        .collect();
     assert!(
-        has_warning,
+        !matching_warnings.is_empty(),
         "AC-FUNC-07: must emit a warning for messages-mode + source_map=true; \
          got warnings: {:?}",
+        result.warnings
+    );
+    // Deduplicated: the warning must appear EXACTLY ONCE per compilation.
+    // (Previously the same literal string was present in two code paths; MSG_MODE_SOURCE_MAP_WARNING
+    // const was introduced to enforce a single canonical string — this test guards against regression
+    // where both paths fire for the same input.)
+    assert_eq!(
+        matching_warnings.len(),
+        1,
+        "AC-FUNC-07: messages-mode degradation warning must appear exactly once; \
+         got {} occurrences in warnings: {:?}",
+        matching_warnings.len(),
         result.warnings
     );
 }
