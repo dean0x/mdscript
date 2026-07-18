@@ -117,8 +117,9 @@ pub fn evaluate(
 /// finalization stage.  The builder's `cursor` is guaranteed to equal
 /// `output.len() as u32` when this function returns.
 ///
-/// `file` and `source` are threaded into `EvalContext` for diagnostic spans
-/// (see [`evaluate`] for details).
+/// `file` and `source` for `EvalContext` diagnostic spans are derived from
+/// `builder.current_src` — single source of truth, no redundant parameter
+/// (avoids the dual-channel mis-attribution class fixed in c5a4d65; issue #58).
 ///
 /// Delegates to [`evaluate_with_map_seeded`] with seed counters of 0.
 /// Use [`evaluate_with_map_seeded`] directly when you need to carry cumulative
@@ -128,11 +129,9 @@ pub(crate) fn evaluate_with_map(
     scope: &mut Scope,
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
-    file: &str,
-    source: &str,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
     let (output, map, _, _) =
-        evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0, file, source)?;
+        evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0)?;
     Ok((output, map))
 }
 
@@ -143,15 +142,17 @@ pub(crate) fn evaluate_with_map(
 /// `@extends` regions).  Returns `(output, builder, total_iterations, total_msg_bytes)`
 /// so the caller can thread the running totals into the next invocation.
 ///
-/// `file` and `source` are threaded into `EvalContext` for diagnostic spans
-/// (see [`evaluate`] for details).
+/// `file` and `source` for `EvalContext` diagnostic spans are derived from
+/// `builder.current_src` — the single source of truth.  Callers must update
+/// `builder.current_src` before each call (as `evaluate_regions_with_map` does)
+/// so that the derived values reflect the correct region origin (issue #58;
+/// avoids the dual-channel mis-attribution class fixed in c5a4d65).
 ///
 /// Used by `evaluate_regions_with_map` (resolver.rs) to enforce a single cumulative
 /// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
 ///
 /// The `MapBuilder` is returned as a structured error rather than a panic if it
 /// disappears — aligns with PF-005 (don't rely on panic for invariants).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_with_map_seeded(
     nodes: &[Node],
     scope: &mut Scope,
@@ -159,9 +160,21 @@ pub(crate) fn evaluate_with_map_seeded(
     builder: crate::sourcemap::MapBuilder,
     seed_iterations: usize,
     seed_msg_bytes: usize,
-    file: &str,
-    source: &str,
 ) -> Result<(String, crate::sourcemap::MapBuilder, usize, usize), MdsError> {
+    // Clone file/source from the builder's current source entry before moving
+    // builder into EvalContext.map.  This is the single source of truth for
+    // diagnostic span attribution — eliminates the redundant explicit params
+    // that caused mis-attributed spans before c5a4d65 (issue #58).
+    let file_owned = builder
+        .sources
+        .get(builder.current_src as usize)
+        .cloned()
+        .unwrap_or_default();
+    let source_owned = builder
+        .sources_content
+        .get(builder.current_src as usize)
+        .cloned()
+        .unwrap_or_default();
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
         total_iterations: seed_iterations,
@@ -170,8 +183,8 @@ pub(crate) fn evaluate_with_map_seeded(
         map: Some(builder),
         fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
-        file,
-        source,
+        file: &file_owned,
+        source: &source_owned,
     };
     let output = evaluate_nodes(nodes, scope, &mut ctx)?;
     let map = ctx.map.take().ok_or_else(|| {

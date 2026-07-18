@@ -1496,3 +1496,104 @@ fn issue_153_invalid_interpolation_hint_text() {
         "#153: error hint must NOT say \\{{{{  (double brace); got: {msg}"
     );
 }
+
+// ── Issue #58: evaluate_with_map file/source single source of truth ───────────
+//
+// Regression guard for the c5a4d65 bug class: `file` and `source` previously
+// traveled as BOTH explicit parameters AND EvalContext fields in the source-map
+// path.  The fix (#58) derives them from `builder.current_src` — the single
+// source of truth — so a caller cannot accidentally pass mismatched values.
+//
+// These tests compile with source_map=true and verify that type_mismatch spans
+// are attributed to the correct source, never to the wrong module.
+
+#[test]
+fn source_map_extends_type_mismatch_span_not_misattributed_to_child() {
+    // With source_map=true, the @extends pipeline uses evaluate_regions_with_map,
+    // which sets builder.current_src to the region's origin before each call.
+    // After issue #58, evaluate_with_map_seeded derives ctx.file/ctx.source from
+    // that builder entry rather than from explicit params — so the region's own
+    // source is always in scope for span attribution.
+    //
+    // A type_mismatch in the BASE skeleton's @if fires with ctx.source = base content.
+    // Any resulting span must fall within the base source, not the child source.
+    let mut modules = HashMap::new();
+    let base_source = "---\nn: hi\n---\n@if n == 5:\nbase-if-branch\n@end\n@block body:\nbase default\n@end\n";
+    modules.insert("base.mds".to_string(), base_source.to_string());
+    modules.insert(
+        "child.mds".to_string(),
+        // Long enough that the base @if offset (14) lands inside the child source at
+        // a valid char boundary — the exact condition that triggered mis-attribution
+        // before c5a4d65 and that #58 structurally prevents.
+        "@extends \"./base.mds\"\n@block body:\nThis override body is intentionally long enough that the base skeleton @if offset falls inside the child source.\n@end\n"
+            .to_string(),
+    );
+    let err = mds::compile_virtual_with_deps_opts(
+        modules,
+        "child.mds",
+        None,
+        mds::CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+        },
+    )
+    .expect_err("cross-type mismatch in an inherited @if must error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "must surface as mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    // In the source_map path, evaluate_regions_with_map evaluates the skeleton
+    // with the base's origin, so the span (if present) must fall within the base
+    // source.  If it degrades to spanless (ADR-005), that is also correct.
+    // What is NOT correct: a span with offset >= base_source.len() pointing into
+    // child territory.
+    if let Some(span) = &serialized.span {
+        assert!(
+            span.offset < base_source.len(),
+            "type_mismatch span (offset={}) must fall within base source (len={}); \
+             a larger offset would indicate mis-attribution to the child source",
+            span.offset,
+            base_source.len()
+        );
+    }
+}
+
+#[test]
+fn source_map_standalone_type_mismatch_carries_span() {
+    // Standalone (non-@extends) compile with source_map=true: the builder is seeded
+    // with the module's own file/source at current_src=0.  After issue #58,
+    // evaluate_with_map derives ctx.file and ctx.source from that entry.
+    // A type_mismatch in the @if must carry a span whose offset falls within the source.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str_with_deps_opts(
+        src,
+        None,
+        None,
+        mds::CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+        },
+    )
+    .expect_err("cross-type == in @if must fail");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "must surface as mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("standalone source_map type_mismatch must carry a span");
+    assert!(
+        span.offset < src.len(),
+        "span offset ({}) must fall within the source (len={})",
+        span.offset,
+        src.len()
+    );
+    assert!(
+        span.length > 0,
+        "span length must be > 0, got: {span:?}"
+    );
+}

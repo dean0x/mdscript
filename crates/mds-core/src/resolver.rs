@@ -688,6 +688,8 @@ impl ModuleCache {
             }
 
             let region_output = if let Some(builder) = current_map.take() {
+                // builder.current_src was set to origin's source index above;
+                // evaluate_with_map_seeded derives file/source from it (issue #58).
                 let (region_out, returned_builder, iters, bytes) = evaluate_with_map_seeded(
                     nodes,
                     scope,
@@ -695,8 +697,6 @@ impl ModuleCache {
                     builder,
                     running_iterations,
                     running_msg_bytes,
-                    origin.file.as_ref(),
-                    origin.source.as_ref(),
                 )?;
                 running_iterations = iters;
                 running_msg_bytes = bytes;
@@ -902,6 +902,8 @@ impl ModuleCache {
         }
 
         let (body_raw, map_out) = if opts.source_map {
+            // Builder seeds current_src=0 pointing to ctx.file_str/ctx.source;
+            // evaluate_with_map derives file/source from builder (issue #58).
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
             let (raw, returned) = evaluate_with_map(
@@ -909,8 +911,6 @@ impl ModuleCache {
                 &mut scope,
                 warnings,
                 builder,
-                ctx.file_str,
-                ctx.source,
             )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             apply_map_degradation(raw, returned, opts, warnings)
@@ -1017,13 +1017,12 @@ impl ModuleCache {
         let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            // evaluate_with_map derives file/source from builder.current_src (issue #58).
             let (body_raw, returned) = evaluate_with_map(
                 &module.body,
                 &mut scope,
                 warnings,
                 builder,
-                ctx.file_str,
-                ctx.source,
             )?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
 
@@ -1686,13 +1685,7 @@ impl ModuleCache {
                     ctx.runtime_vars,
                     warnings,
                 )?;
-                let line_len = if ctx.source.len() > *offset {
-                    ctx.source[*offset..]
-                        .find('\n')
-                        .unwrap_or(ctx.source[*offset..].len())
-                } else {
-                    0
-                };
+                let line_len = line_len_at(ctx.source, *offset);
                 for (name, func) in source_module.get_all_exports() {
                     if defs.functions.contains_key(&name) {
                         return Err(MdsError::name_collision_at(
@@ -1815,13 +1808,7 @@ impl ModuleCache {
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
-        let line_len = if ctx.source.len() > offset {
-            ctx.source[offset..]
-                .find('\n')
-                .unwrap_or(ctx.source[offset..].len())
-        } else {
-            0
-        };
+        let line_len = line_len_at(ctx.source, offset);
         for (name, func) in resolved.get_all_exports() {
             if scope.get_function(&name).is_some() {
                 return Err(MdsError::name_collision_at(
@@ -1852,9 +1839,7 @@ impl ModuleCache {
         let resolved = self
             .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
-        let line_len = ctx.source[offset..]
-            .find('\n')
-            .unwrap_or(ctx.source[offset..].len());
+        let line_len = line_len_at(ctx.source, offset);
         let not_exported = |name: &str| {
             MdsError::import_error_at(
                 format!("'{name}' is not exported from '{path}'"),
@@ -2510,6 +2495,20 @@ fn parse_frontmatter_mapping(
         Ok(Some(map))
     } else {
         Ok(None)
+    }
+}
+
+/// Returns the byte count from `offset` to just before the next `\n` (or
+/// to the end of the string when there is no newline). Returns `0` when
+/// `offset` is out of bounds or falls on a non-UTF-8 char boundary so callers
+/// degrade gracefully rather than panic (ADR-005 — degrade rather than
+/// mis-attribute; consistent with the `is_char_boundary` guard in
+/// `build_type_mismatch` in evaluator.rs).
+fn line_len_at(source: &str, offset: usize) -> usize {
+    if source.is_char_boundary(offset) {
+        source[offset..].find('\n').unwrap_or(source[offset..].len())
+    } else {
+        0
     }
 }
 

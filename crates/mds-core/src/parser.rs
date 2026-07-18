@@ -424,7 +424,7 @@ impl Parser<'_> {
     /// input that exceeds `MAX_ELSEIF_BRANCHES` cannot force unbounded parse work.
     fn collect_elseif_branches(&mut self) -> Result<Vec<ElseifBranch>, MdsError> {
         let mut branches: Vec<ElseifBranch> = Vec::with_capacity(4);
-        while let Some(Token::Directive(d, _)) = self.peek() {
+        while let Some(Token::Directive(d, off)) = self.peek() {
             if !d.trim().starts_with("@elseif ") {
                 break;
             }
@@ -436,11 +436,10 @@ impl Parser<'_> {
                 )));
             }
 
-            // Consume the @elseif directive token; capture its byte offset.
-            let (elseif_dir, elseif_offset) = match &self.tokens[self.pos] {
-                Token::Directive(d, off) => (d.clone(), *off),
-                _ => unreachable!("peek() confirmed Directive"),
-            };
+            // d and off are borrowed from self.tokens[self.pos] via peek(); clone
+            // before advancing pos so the borrows end before the mutable advance.
+            let elseif_dir = d.clone();
+            let elseif_offset = *off;
             self.pos += 1;
 
             // Extract condition string: strip "@elseif " prefix and trailing ":".
