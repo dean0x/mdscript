@@ -1355,11 +1355,13 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
     }
     let content = String::from_utf8(bytes)
         .map_err(|e| MdsError::io(format!("invalid UTF-8 in vars file {path_str}: {e}")))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| MdsError::json_error(e.to_string()))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| MdsError::json_error(format!("{path_str}: {e}")))?;
 
     let serde_json::Value::Object(map) = json else {
-        return Err(MdsError::json_error("vars file must contain a JSON object"));
+        return Err(MdsError::json_error(format!(
+            "{path_str}: vars file must contain a JSON object"
+        )));
     };
 
     map.into_iter()

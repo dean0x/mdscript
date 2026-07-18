@@ -1067,3 +1067,37 @@ fn dir_mode_format_error_includes_file_prefix_in_stderr() {
         "dir-mode stderr must identify the failing file; got: {stderr}"
     );
 }
+
+/// `mds fmt --check` summary includes the unchanged count alongside the would-reformat count.
+/// New format: `{changed} would reformat, {unchanged} unchanged, {fail} failed`
+#[test]
+fn dir_check_summary_includes_unchanged_count() {
+    let dir = tempfile::tempdir().unwrap();
+    // One dirty file (would reformat) + one already-clean file (unchanged).
+    fs::write(
+        dir.path().join("dirty.mds"),
+        read_fixture("fmt_unformatted.mds"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("clean.mds"),
+        read_fixture("fmt_formatted.mds"),
+    )
+    .unwrap();
+
+    let output = fmt_path(dir.path(), &["--check"]);
+    assert!(
+        !output.status.success(),
+        "dir --check with a dirty file must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("would reformat") && stderr.contains("unchanged"),
+        "check summary must include both 'would reformat' and 'unchanged'; got: {stderr}"
+    );
+    // Verify the exact format: "N would reformat, M unchanged, K failed"
+    assert!(
+        stderr.contains("1 would reformat") && stderr.contains("1 unchanged"),
+        "expected '1 would reformat' and '1 unchanged' in summary; got: {stderr}"
+    );
+}

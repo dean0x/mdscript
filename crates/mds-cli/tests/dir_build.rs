@@ -369,7 +369,7 @@ fn dir_check_validates_tree_exits_zero_on_all_ok() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("checked"),
+        stderr.contains("passed"),
         "stderr should contain check summary; got: {stderr}"
     );
 }
@@ -392,7 +392,7 @@ fn dir_check_continues_on_error_nonzero_exit() {
     // Summary should show counts.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("checked") || stderr.contains("failed"),
+        stderr.contains("passed") || stderr.contains("failed"),
         "stderr must contain check summary; got: {stderr}"
     );
 }

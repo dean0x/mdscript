@@ -852,3 +852,81 @@ fn lint_bare_filename_from_cwd_succeeds() {
         "mds lint <bare-filename> from cwd should succeed for a clean file; stderr: {stderr}"
     );
 }
+
+/// `mds build --vars <file>` with a malformed JSON vars file exits 1 and the
+/// error message names the vars file so the user knows which file to fix.
+#[test]
+fn vars_file_malformed_json_error_names_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    // Write intentionally invalid JSON.
+    std::fs::write(&vars, "{ not valid json }").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "malformed vars JSON should cause a non-zero exit"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed vars JSON should exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("vars.json"),
+        "error must name the vars file; got: {stderr}"
+    );
+}
+
+/// `mds build --vars <file>` with a non-object JSON root (array) exits 1 and
+/// the error message names the vars file.
+#[test]
+fn vars_file_non_object_json_error_names_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    let vars = dir.path().join("myvars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    // Write a JSON array — valid JSON but not a JSON object.
+    std::fs::write(&vars, r#"["a", "b"]"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "non-object vars JSON should cause a non-zero exit"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "non-object vars JSON should exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("myvars.json"),
+        "error must name the vars file; got: {stderr}"
+    );
+}

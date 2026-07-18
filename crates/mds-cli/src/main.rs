@@ -336,7 +336,7 @@ fn run_check_directory(
     }
 
     if !quiet || fail_count > 0 {
-        eprintln!("{ok_count} checked, {fail_count} failed");
+        eprintln!("{ok_count} passed, {fail_count} failed");
     }
 
     if fail_count > 0 {
