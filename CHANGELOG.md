@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Source Map v3 `sources[]` no longer leaks absolute filesystem paths** across
+  all surfaces. Previously, `compileFile` on napi and Python emitted the absolute
+  filesystem path (e.g. `/home/user/project/src/foo.mds`) as `sources[0]` in the
+  generated Source Map v3. Shipped source maps and inline maps embedded with
+  `--inline` could expose the full path of the machine that compiled the template,
+  a privacy-significant information disclosure. Fixed by the `relativize_source`
+  choke-point in `crates/mds-core/src/source_path.rs` (ADR-005 Phase A): all
+  surfaces now emit root-relative paths (e.g. `src/foo.mds`) relative to the
+  project root (located via `.mdsroot` / `.git` walk-up), and `..`-escaping
+  references outside the project root fall back to the basename. (#3)
+
 ### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
 
 These changes alter observable runtime behavior and compiled output. Templates relying
@@ -94,6 +107,11 @@ directly via `ModuleCache::with_fs`.
   the path relative to the lint root (e.g. `"src/template.mds"`) rather than just the
   basename (e.g. `"template.mds"`). This prevents key collisions when two different
   files have the same filename. (#196)
+
+- **`mds-core::CompileOptions` gained `source_map_base: Option<PathBuf>`**.  Rust code
+  that initializes `CompileOptions` with a struct literal must either add
+  `source_map_base: None` or use the `..Default::default()` tail.  Binding surfaces
+  (napi, Python, WASM) are not affected. (#3)
 
 ### Added
 
@@ -259,6 +277,16 @@ directly via `ModuleCache::with_fs`.
 
 ### Changed
 
+- **napi and Python `compileFile` / `compile_file` now emit root-relative
+  `sources[]`** in Source Map v3 output. Previously these surfaces emitted the
+  absolute filesystem path as `sources[0]` (e.g. `/home/user/project/src/foo.mds`);
+  now they emit a slash-separated path relative to the project root found via
+  `.mdsroot` / `.git` walk-up (e.g. `src/foo.mds`). The `@mdscript/mds`
+  universal package's `compileFile` previously returned different `sources[]`
+  depending on which backend `init()` loaded (absolute on native, root-relative via
+  `buildModulesMap` on WASM); both backends now produce identical root-relative paths.
+  Code that compares `sources[0]` to an absolute path must be updated. (#3)
+
 - **Inline stdout source-map absolute-path leak fixed**: `mds build --source-map
   --inline -o -` and `mds build --source-map -o -` no longer leak absolute filesystem
   paths in the embedded `sourceMappingURL` data-URI; sources are relativized against
@@ -318,6 +346,16 @@ directly via `ModuleCache::with_fs`.
   output in code-frame renderings. It now reads `"syntax error occurred here"`. (#196)
 
 ### Fixed
+
+- **`mds build -o build/out.md` with sources in `src/` again emits map-relative
+  paths** (e.g. `../src/foo.mds`) in the sidecar `.map` file and inline source map.
+  The `source_map_base` field added to `CompileOptions` tells `relativize_source`
+  to emit paths relative to the map file's parent directory (as the Source Map v3
+  spec requires) rather than root-relative. Without this, a source `src/foo.mds`
+  compiled to `build/out.md` with `--source-map` would emit `src/foo.mds` in the
+  map instead of the spec-correct `../src/foo.mds`. Root-relative emission
+  (`source_map_base: None`) is now the default for all binding surfaces (napi,
+  Python, WASM), which never write map files to disk. (#3)
 
 - **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
   as passthrough regions. Previously only `` ``` ``-fences that started at column 1

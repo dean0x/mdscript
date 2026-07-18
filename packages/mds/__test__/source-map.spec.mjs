@@ -17,9 +17,13 @@
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { compile, compileFile, checkFile, lintFile, isMdsError, init } from '../dist/node.js';
 import { SIMPLE_MDS } from './helpers.mjs';
 import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
+import { buildModulesMap } from '../dist/util/module-scanner.js';
 
 // ---------------------------------------------------------------------------
 // Hand-rolled Base64-VLQ decoder (no external dependency)
@@ -385,10 +389,11 @@ describe('VLQ decoder self-test (VLQ-SELF)', () => {
 // ---------------------------------------------------------------------------
 
 describe('source maps — WASM backend (W-SM)', () => {
+  let wasmMod;
   let wasmBackend;
 
   before(async () => {
-    const wasmMod = await initWasmNode();
+    wasmMod = await initWasmNode();
     wasmBackend = createWasmBackend(wasmMod);
   });
 
@@ -488,6 +493,132 @@ describe('source maps — WASM backend (W-SM)', () => {
       wasmResult.sourceMap.sourcesContent,
       'sourcesContent must be identical across backends',
     );
+  });
+
+  // ── V-SM1: virtual module map path — WASM compile with filename option ─────
+  //
+  // PF-007: per-surface goldens cannot catch cross-surface divergence.  This
+  // differential test verifies that when the WASM backend is given an explicit
+  // `filename` (as buildModulesMap produces for the compileFile path), the
+  // resulting sources[] is byte-identical to what the native compile produces
+  // for the same source.
+  //
+  // The modules:{} (empty) arg exercises the modules-map code path without
+  // requiring any @import directives.  The key assertion is deepEqual on
+  // sources[], not per-surface goldens (catches future divergence between
+  // STRING_SOURCE_MAP_LABEL and the WASM filename passthrough).
+
+  test('V-SM1: WASM compile() with explicit filename + empty modules produces same sources[] as native', () => {
+    const src = 'Hello World!\n';
+
+    // Native compile: sources[0] = STRING_SOURCE_MAP_LABEL = "input.mds".
+    const nativeResult = compile(src, { sourceMap: true });
+
+    // WASM compile with the same filename the modules-map path would produce
+    // (the buildModulesMap default when the project root is the entry's directory).
+    const wasmResult = wasmBackend.compile(src, {
+      filename: 'input.mds',
+      modules: {},
+      sourceMap: true,
+    });
+
+    assert.ok(nativeResult.sourceMap != null, 'native must produce sourceMap');
+    assert.ok(wasmResult.sourceMap != null, 'wasm must produce sourceMap');
+
+    // deepEqual comparison — avoids PF-007: per-field assertions cannot detect
+    // future divergence in how native vs WASM label the virtual entry source.
+    assert.deepEqual(
+      nativeResult.sourceMap.sources,
+      wasmResult.sourceMap.sources,
+      `sources[] must be identical across backends on the modules-map path (PF-007); ` +
+        `native=${JSON.stringify(nativeResult.sourceMap.sources)}, ` +
+        `wasm-modules=${JSON.stringify(wasmResult.sourceMap.sources)}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CF-SM1: compileFile differential — native napi vs WASM-via-buildModulesMap
+//
+// Catches the live PF-007 instance: the universal @mdscript/mds compileFile
+// returned different sources[] depending on which backend init() loaded.
+// WASM produced root-relative keys (buildModulesMap) while native produced
+// absolute paths before the Phase A relativize_source choke-point fix.
+//
+// The test manually replicates the WASM compileFile code path (buildModulesMap
+// + wasmModule.compile) and compares its sources[] against the native compileFile.
+// After the fix both must produce identical root-relative sources[].
+//
+// A temp dir with .mdsroot is used so buildModulesMap can locate the project
+// root and produce the correct root-relative entry filename.
+// ---------------------------------------------------------------------------
+
+describe('source maps — compileFile differential (CF-SM)', () => {
+  let wasmMod;
+
+  before(async () => {
+    // init() loads the native backend; wasmMod gives us the WASM path.
+    await init();
+    wasmMod = await initWasmNode();
+  });
+
+  test('CF-SM1: native compileFile and WASM-via-buildModulesMap produce identical sources[]', async () => {
+    // Create a temp dir with .mdsroot so buildModulesMap identifies it as the
+    // project root, making the entry filename root-relative.
+    const dir = await mkdtemp(join(tmpdir(), 'cf-sm1-'));
+    try {
+      await writeFile(join(dir, '.mdsroot'), '');
+      await writeFile(join(dir, 'hello.mds'), 'Hello World!\n');
+      const filePath = join(dir, 'hello.mds');
+
+      // Native compileFile: uses NativeFs which now emits root-relative paths
+      // (source_path.rs relativize_source choke-point, ADR-005 Phase A fix).
+      const nativeResult = await compileFile(filePath, { sourceMap: true });
+
+      // WASM compileFile simulation: the exact code path wrapWithFileOps uses.
+      // buildModulesMap returns entryFilename as a root-relative slash path
+      // (e.g. "hello.mds") and populates modules with the file source.
+      const { entryFilename, modules } = await buildModulesMap(
+        filePath,
+        (src) => wasmMod.scanImports(src),
+      );
+      const entrySource = modules[entryFilename];
+      // Remove entry from modules — WASM inserts it separately under filename.
+      delete modules[entryFilename];
+      const wasmResult = createWasmBackend(wasmMod).compile(entrySource, {
+        filename: entryFilename,
+        modules,
+        sourceMap: true,
+      });
+
+      assert.ok(nativeResult.sourceMap != null, 'native compileFile must produce sourceMap');
+      assert.ok(wasmResult.sourceMap != null, 'wasm compileFile path must produce sourceMap');
+
+      // Full deepEqual on sources[] — the PF-007 failure mode was that native
+      // produced absolute path while WASM produced root-relative key; now both
+      // must produce the same root-relative value ("hello.mds").
+      assert.deepEqual(
+        nativeResult.sourceMap.sources,
+        wasmResult.sourceMap.sources,
+        `compileFile sources[] must be identical across backends (PF-007); ` +
+          `native=${JSON.stringify(nativeResult.sourceMap.sources)}, ` +
+          `wasm=${JSON.stringify(wasmResult.sourceMap.sources)}`,
+      );
+
+      // Extra guard: sources[0] must be root-relative (just the filename, no
+      // absolute path prefix) — ensures the choke-point fix is actually active.
+      const src0 = nativeResult.sourceMap.sources[0];
+      assert.ok(
+        !src0.includes('/') || src0.startsWith('./') || src0 === src0.replace(/^\//, ''),
+        `sources[0] must not be an absolute path; got: ${src0}`,
+      );
+      assert.ok(
+        src0.endsWith('hello.mds'),
+        `sources[0] must end with "hello.mds"; got: ${src0}`,
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

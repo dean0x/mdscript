@@ -31,7 +31,7 @@ use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
 
 use crate::build::{build_runtime_vars, load_config, read_stdin, resolve_input, RuntimeVarArgs};
-use crate::output::collect_mds_files_detailed;
+use crate::output::{atomic_write_file, collect_mds_files_detailed};
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
 const KNOWN_RULES: &[&str] = &[
@@ -336,56 +336,6 @@ fn exit_by_severity(result: &mds::LintResult) {
     if exit != 0 {
         std::process::exit(exit);
     }
-}
-
-// ── Atomic write ──────────────────────────────────────────────────────────────
-
-/// Write `content` to `path` atomically via a temp file in the same directory.
-///
-/// Re-checks for symlink immediately before the write cycle (TOCTOU protection,
-/// AC-F-21). Uses `tempfile::Builder` for the temp file so cleanup is automatic
-/// on drop if the rename fails.
-pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
-    // Re-check for symlink right before writing (TOCTOU guard).
-    NativeFs::check_symlink(path).map_err(miette::Error::from)?;
-
-    // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
-    let parent = effective_parent(path);
-
-    // Capture original permissions before creating the temp file so they can be
-    // preserved after the atomic rename (tempfile::Builder defaults to mode 0600,
-    // turning a 0644 source file into owner-only after --fix). avoids security
-    // regression introduced the moment --fix starts applying edits (#4).
-    #[cfg(unix)]
-    let original_mode: Option<u32> = {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path).map(|m| m.permissions().mode()).ok()
-    };
-
-    // Temp file in same directory so rename is always intra-filesystem.
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".mds-lint-fix-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(|e| miette::miette!("cannot create temp file in {}: {e}", parent.display()))?;
-
-    // Restore original permissions before writing content so that the file
-    // permissions are correct even if a signal interrupts between write and rename.
-    #[cfg(unix)]
-    if let Some(mode) = original_mode {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))
-            .map_err(|e| miette::miette!("cannot set permissions on temp file: {e}"))?;
-    }
-
-    tmp.write_all(content.as_bytes())
-        .map_err(|e| miette::miette!("cannot write temp file: {e}"))?;
-    tmp.flush()
-        .map_err(|e| miette::miette!("cannot flush temp file: {e}"))?;
-    // persist() atomically renames the temp file to the target path.
-    tmp.persist(path)
-        .map_err(|e| miette::miette!("cannot rename temp file to {}: {e}", path.display()))?;
-    Ok(())
 }
 
 // ── Fix pipeline helpers ──────────────────────────────────────────────────────

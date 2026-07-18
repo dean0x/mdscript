@@ -1,4 +1,4 @@
-//! Shared output-path machinery for build, check, and watch subcommands.
+//! Shared output-path machinery for build, check, watch, fmt, and lint subcommands.
 //!
 //! # What lives here
 //!
@@ -6,11 +6,14 @@
 //!   path resolution used by watch and build-directory.
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
+//! - [`eprint_error`]: sanitized stderr render for directory-mode error loops (PF-004).
+//! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`.
 //!
 //! Single-file path helpers (`OutputKind`, `compile_to_content`, `compile_and_write`,
 //! `resolve_output_path_for_kind`) remain in `build.rs`; they are imported here when
 //! callers need both single-file and directory logic.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use miette::Result;
@@ -406,6 +409,78 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
             source.with_extension("")
         }
     }
+}
+
+// ── Atomic file write ─────────────────────────────────────────────────────────
+
+/// Write `content` to `path` atomically via a temp-file-then-rename cycle.
+///
+/// Centralising this helper in `output.rs` ensures both `fmt` and `lint --fix`
+/// route through the same write path (avoids PF-004 — a check enforced on the
+/// primary path silently absent on a sibling path).
+///
+/// Safety properties:
+/// - Re-checks for symlink immediately before the write (TOCTOU guard, AC-F-21).
+/// - Temp file lives in the SAME directory as the target so the rename is
+///   always intra-filesystem (atomic on POSIX, near-atomic on Windows).
+/// - On Unix, captures and restores the original file mode (masked to `& 0o7777`
+///   to strip filesystem-type bits before passing to `Permissions::from_mode`).
+///   `tempfile::Builder` defaults to mode 0600; without this step a 0644 source
+///   file would silently become owner-only after the rename.
+/// - Calls `sync_all()` (not `flush()` — `flush()` is a no-op on unbuffered
+///   `File`) for crash durability before the rename.
+pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
+    use mds::{effective_parent, NativeFs};
+
+    // Re-check for symlink right before writing (TOCTOU guard).
+    NativeFs::check_symlink(path)
+        .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
+
+    // effective_parent maps "" (bare filename) and None to "." — avoids PF-006.
+    let parent = effective_parent(path);
+
+    // Capture original permissions before creating the temp file.
+    #[cfg(unix)]
+    let original_mode: Option<u32> = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).map(|m| m.permissions().mode()).ok()
+    };
+
+    // Temp file in same directory so rename is always intra-filesystem.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".mds-tmp-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|e| miette::miette!("cannot create temp file for {}: {e}", path.display()))?;
+
+    // Restore original permissions before writing; mask off file-type bits
+    // (high bits of st_mode) so only the permission bits reach from_mode.
+    #[cfg(unix)]
+    if let Some(mode) = original_mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(|e| {
+                miette::miette!(
+                    "cannot set permissions on temp file for {}: {e}",
+                    path.display()
+                )
+            })?;
+    }
+
+    tmp.write_all(content.as_bytes())
+        .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
+
+    // sync_all() flushes data + metadata to storage (flush() is a no-op on
+    // unbuffered File and provides no crash durability guarantee).
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| miette::miette!("cannot fsync {}: {e}", path.display()))?;
+
+    // persist() atomically renames the temp file to the target path.
+    tmp.persist(path)
+        .map_err(|e| miette::miette!("cannot rename temp file to {}: {e}", path.display()))?;
+
+    Ok(())
 }
 
 // ── Sanitized stderr render ───────────────────────────────────────────────────

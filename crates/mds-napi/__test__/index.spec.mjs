@@ -1155,7 +1155,14 @@ describe('source maps (F-SM)', () => {
   });
 
   // F-SM7: structural validity of sourceMap from compileFile
-  test('F-SM7: compileFile produces structurally valid sourceMap', () => {
+  //
+  // After the ADR-005 Phase A choke-point fix (source_path.rs::relativize_source),
+  // compileFile emits ROOT-RELATIVE paths in sources[] — NOT absolute filesystem
+  // paths.  The value is slash-separated relative to the project root (found via
+  // .mdsroot / .git walk-up).  The assertion below checks the path ends with the
+  // fixture basename; for a stronger cross-surface parity assertion see CF-SM1 in
+  // packages/mds/__test__/source-map.spec.mjs.
+  test('F-SM7: compileFile produces structurally valid sourceMap with root-relative sources[]', () => {
     const result = compileFile(SIMPLE_MDS, { sourceMap: true });
     assert.equal(result.kind, 'markdown');
     const sm = result.sourceMap;
@@ -1166,6 +1173,15 @@ describe('source maps (F-SM)', () => {
     assert.ok(sm.mappings.length > 0, 'mappings must be non-empty');
     // file is absent (bindings do not set file)
     assert.ok(!('file' in sm), 'file must be absent (bindings do not set file)');
+    // sources[0] must be root-relative (not an absolute path).
+    assert.ok(
+      !sm.sources[0].startsWith('/') && !sm.sources[0].match(/^[A-Za-z]:\\/),
+      `sources[0] must be root-relative, not an absolute path; got: ${JSON.stringify(sm.sources[0])}`,
+    );
+    assert.ok(
+      sm.sources[0].endsWith('.mds'),
+      `sources[0] must end with .mds extension; got: ${JSON.stringify(sm.sources[0])}`,
+    );
     // Validate mappings contains only valid Base64-VLQ chars
     assert.ok(
       /^[A-Za-z0-9+/,;]*$/.test(sm.mappings),

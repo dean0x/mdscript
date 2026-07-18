@@ -29,7 +29,7 @@ use mds::{effective_parent, FileSystem, MdsError};
 use miette::Result;
 
 use crate::build::{load_config, read_stdin, resolve_input};
-use crate::lint::atomic_write_file;
+use crate::output::atomic_write_file;
 use crate::output::collect_mds_files_detailed;
 
 pub(crate) struct FmtArgs {

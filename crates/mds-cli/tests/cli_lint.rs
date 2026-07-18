@@ -1492,6 +1492,94 @@ fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
     );
 }
 
+// ── atomic_write_file: mode preservation and error-message coverage ──────────
+
+/// Regression gate: `mds lint --fix <file>` must preserve the original Unix file
+/// mode after applying auto-fixes via `atomic_write_file`.
+///
+/// `tempfile::Builder` defaults to mode 0600; without the permission-restoration
+/// step a 0644 source file turns owner-only after the rename.  The masking of
+/// file-type bits (`mode & 0o7777`) ensures `Permissions::from_mode` receives
+/// only the permission bits.  This test locks in that guarantee for the lint path
+/// now that `atomic_write_file` lives in `output.rs` and is shared with `fmt`.
+#[cfg(unix)]
+#[test]
+fn lint_fix_preserves_mode_0644() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("perm_lint.mds");
+    // Write content with a single Tier A auto-fixable issue (duplicate-export)
+    // and no residual warning, so --fix exits 0 (clean after fix).
+    fs::write(
+        &target,
+        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+    )
+    .unwrap();
+    // Set 0644 explicitly before invoking --fix.
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = lint_path(&target, &["--fix"]);
+    // Must succeed (duplicate-export is Tier A; residual after fix is clean).
+    assert!(
+        out.status.success(),
+        "lint --fix should succeed on duplicate-export fixture; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "lint --fix must preserve file mode 0644 after atomic write; got 0{mode:o}"
+    );
+}
+
+/// Regression gate: when `atomic_write_file` fails (e.g. directory not writable),
+/// the error message emitted to stderr MUST include the target filename so the
+/// user can diagnose which file caused the failure.
+///
+/// This gates that all error paths in `atomic_write_file` carry `path.display()`.
+/// Previously only the `persist()` error carried the path; all other paths
+/// (temp-file creation, permission set, write, fsync) emitted generic messages.
+/// Fixed by step 9.1 (all 5 non-persist errors now include `path.display()`).
+#[cfg(unix)]
+#[test]
+fn lint_write_failure_includes_filename_in_stderr() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("write_fail.mds");
+    // A single Tier A auto-fixable issue so lint will attempt to write the file.
+    fs::write(
+        &target,
+        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+    )
+    .unwrap();
+
+    // Make the parent directory read-only so temp-file creation fails.
+    // This triggers the "cannot create temp file for {path}" error path.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = lint_path(&target, &["--fix"]);
+
+    // Restore writability so tempdir cleanup can succeed.
+    let _ = fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755));
+
+    // The write must have failed (non-zero exit).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "lint --fix must fail when the parent dir is read-only"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The filename "write_fail.mds" must appear in the error message.
+    assert!(
+        stderr.contains("write_fail.mds"),
+        "error stderr must contain the target filename; got: {stderr}"
+    );
+}
+
 /// Regression gate: `mds lint <dir>` (directory mode) must not emit raw ESC bytes to
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
