@@ -6,7 +6,7 @@
   "types": "index.d.ts",
   "license": "MIT",
   "scripts": {
-    "build": "napi build --release --no-js"
+    "build:native": "napi build --release --no-js"
   },
   "repository": {
     "type": "git",
