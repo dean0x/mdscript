@@ -55,7 +55,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
         quiet,
     } = args;
 
-    let (input, auto_detected) = resolve_input(input)?;
+    let (input, auto_detected) = resolve_input(input, "fmt")?;
     if auto_detected && !quiet {
         eprintln!("Formatting {}", input.display());
     }

@@ -525,7 +525,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 
     // Resolve the input path (may trigger auto-detect).
     let resolved_input = match input {
-        None => auto_detect_mds_file()?,
+        None => auto_detect_mds_file("watch")?,
         Some(p) => p,
     };
 

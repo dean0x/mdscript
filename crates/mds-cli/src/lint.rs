@@ -119,7 +119,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
         set_string_vars,
     })?;
 
-    let (input, _auto_detected) = resolve_input(input)?;
+    let (input, _auto_detected) = resolve_input(input, "lint")?;
 
     // USAGE ERROR: --fix + --format json + stdin (AC-F-22b).
     // DELIBERATE EXCEPTION (AC-F-14): the JSON envelope is deferred for this 3-way combo;
@@ -191,6 +191,23 @@ fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
             }
             Ok(mds_config.lint.into_core_config())
         }
+    }
+}
+
+// ── Display-path remap ────────────────────────────────────────────────────────
+
+/// Remap the `file` field in every diagnostic in `result` to `display`.
+///
+/// `mds::lint(path, …)` sets each diagnostic's `file` to the file's basename
+/// (via `path.file_name()`). In directory mode the same basename appears for
+/// every file, so the JSON output groups all findings under the same key.
+/// This function replaces the field with the caller-supplied relative path so
+/// the JSON output uses distinct, navigable paths (bug 4 fix).
+///
+/// Call this immediately after every `mds::lint` that runs in directory mode.
+fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
+    for diag in &mut result.diagnostics {
+        diag.file = Some(display.to_string());
     }
 }
 
@@ -357,6 +374,15 @@ enum FixFileOutcome {
         new_source: String,
         residual: mds::LintResult,
     },
+    /// Some edits applied, some individually rejected by the per-edit reverify gate.
+    ///
+    /// Produced when `apply_fixes_incremental` falls back to the per-edit path and not
+    /// all edits pass. The `new_source` is the partially-fixed text; `residual` carries
+    /// remaining diagnostics (from the last successful per-edit reverify).
+    PartiallyFixed {
+        new_source: String,
+        residual: mds::LintResult,
+    },
     Rejected {
         reason: String,
         original: mds::LintResult,
@@ -391,7 +417,10 @@ fn plan_and_apply_fixes(
     let is_standalone = result.is_standalone;
     let plan = mds::fix::plan_fixes_with_options(&result, source, is_standalone);
 
-    if plan.edits.is_empty() {
+    // Bug 12 fix: treat overlap_rejected as "something to do" — don't short-circuit
+    // as NothingToFix when edits were rejected due to overlap.  The incremental
+    // fallback (per-edit retry) handles individual edits that survive the overlap check.
+    if plan.edits.is_empty() && !plan.overlap_rejected {
         return FixFileOutcome::NothingToFix { original: result };
     }
 
@@ -405,7 +434,11 @@ fn plan_and_apply_fixes(
 
     let base_dir_owned = base_dir.to_path_buf();
     let config_clone = config.clone();
-    let outcome = mds::fix::apply_fixes(source, plan, &result, move |fixed| {
+    // apply_fixes_incremental requires F: Fn (not FnOnce) — the reverify closure
+    // may be called up to plan.edits.len()+1 times (batch attempt + per-edit fallback).
+    // All captured variables are either borrowed (&) or cloned inside, so the closure
+    // satisfies Fn without any extra effort.
+    let outcome = mds::fix::apply_fixes_incremental(source, plan, &result, |fixed| {
         let residual = mds::lint_str_with(
             fixed,
             Some(&base_dir_owned),
@@ -425,7 +458,7 @@ fn plan_and_apply_fixes(
                 Ok(fixed_compile) if fixed_compile.output != *orig_out => {
                     return Err(MdsError::Io {
                         message: "lint --fix would change compiled output; \
-                                  batch refused to preserve template semantics"
+                                  edit reverted to preserve template semantics"
                             .to_string(),
                     });
                 }
@@ -444,11 +477,89 @@ fn plan_and_apply_fixes(
             new_source,
             residual,
         },
+        mds::fix::FixOutcome::PartiallyFixed {
+            source: new_source,
+            residual,
+            ..
+        } => FixFileOutcome::PartiallyFixed {
+            new_source,
+            residual,
+        },
         mds::fix::FixOutcome::Rejected { source: _, reason } => FixFileOutcome::Rejected {
             reason,
             original: result,
         },
         mds::fix::FixOutcome::NothingToFix => FixFileOutcome::NothingToFix { original: result },
+    }
+}
+
+/// Run the fix pipeline in preview mode (for `--fix --check` / `--fix --diff`).
+///
+/// Routes through the same gated pipeline as the write path — plan, reverify, and
+/// apply — but does NOT write to disk.  Returns the would-be fixed source when at
+/// least one edit would be applied (Fixed or PartiallyFixed outcome); `None` when
+/// everything was rejected or there is nothing to fix.
+///
+/// ADR-004 / PF-004: preview must use the same gated pipeline as apply so that
+/// `--diff` shows exactly what `--fix` would write, and `--check` exits 1 iff
+/// `--fix` would change the file.
+fn preview_fixes(
+    result: &mds::LintResult,
+    source: &str,
+    base_dir: &Path,
+    runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
+    config: &mds::LintConfig,
+) -> Option<String> {
+    let is_standalone = result.is_standalone;
+    let plan = mds::fix::plan_fixes_with_options(result, source, is_standalone);
+
+    if plan.edits.is_empty() && !plan.overlap_rejected {
+        return None;
+    }
+
+    let original_output =
+        mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
+            .ok()
+            .map(|r| r.output);
+
+    let base_dir_owned = base_dir.to_path_buf();
+    let config_clone = config.clone();
+    let outcome = mds::fix::apply_fixes_incremental(source, plan, result, |fixed| {
+        let residual = mds::lint_str_with(
+            fixed,
+            Some(&base_dir_owned),
+            runtime_vars.clone(),
+            &config_clone,
+        )?;
+
+        if let Some(ref orig_out) = original_output {
+            match mds::compile_str_collecting_warnings(
+                fixed,
+                Some(&base_dir_owned),
+                runtime_vars.clone(),
+            ) {
+                Ok(fixed_compile) if fixed_compile.output != *orig_out => {
+                    return Err(MdsError::Io {
+                        message: "lint --fix would change compiled output; \
+                                  edit reverted to preserve template semantics"
+                            .to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(residual)
+    });
+
+    match outcome {
+        mds::fix::FixOutcome::Fixed {
+            source: new_source, ..
+        }
+        | mds::fix::FixOutcome::PartiallyFixed {
+            source: new_source, ..
+        } => Some(new_source),
+        mds::fix::FixOutcome::Rejected { .. } | mds::fix::FixOutcome::NothingToFix => None,
     }
 }
 
@@ -491,21 +602,36 @@ fn run_lint_stdin(
                 new_source,
                 residual,
             } => (new_source, residual),
+            FixFileOutcome::PartiallyFixed {
+                new_source,
+                residual,
+            } => {
+                eprintln!(
+                    "partial fix: some edits were individually rejected by the reverify gate"
+                );
+                (new_source, residual)
+            }
             FixFileOutcome::Rejected { reason, original } => {
                 eprintln!("fix rejected: {reason}");
                 (source, original)
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
-        // Stdin diagnostics: no named source for span rendering (no stable filename).
-        render_result_human(&diag_result, quiet, None);
+        // Stdin diagnostics: pass source text for span context rendering (bug 19).
+        let named_source = Some(("input.mds", output_src.as_str()));
+        render_result_human(&diag_result, quiet, named_source);
         let _ = write_stdout(&output_src);
         exit_by_severity(&diag_result);
         return Ok(());
     }
 
-    // Report-only mode.
-    emit_result(format, &result, quiet, None);
+    // Report-only mode: pass stdin source for span context rendering (bug 19).
+    let named_source = if format == LintFormat::Human {
+        Some(("input.mds", source.as_str()))
+    } else {
+        None
+    };
+    emit_result(format, &result, quiet, named_source);
     exit_by_severity(&result);
     Ok(())
 }
@@ -584,6 +710,20 @@ fn run_lint_file(
                 atomic_write_file(path, &new_source)?;
                 exit_by_severity(&residual);
             }
+            FixFileOutcome::PartiallyFixed {
+                new_source,
+                residual,
+            } => {
+                if !quiet {
+                    eprintln!(
+                        "Partially fixed: {} (some edits rejected by reverify gate)",
+                        path.display()
+                    );
+                }
+                emit_result(format, &residual, quiet, named_source);
+                atomic_write_file(path, &new_source)?;
+                exit_by_severity(&residual);
+            }
             FixFileOutcome::Rejected { reason, original } => {
                 eprintln!("fix rejected: {reason}");
                 emit_result(format, &original, quiet, named_source);
@@ -601,14 +741,15 @@ fn run_lint_file(
     }
 
     // ── Preview path: --fix --check and/or --fix --diff ───────────────────────
+    // Bug 5 fix: route preview through the same gated pipeline as the write path.
+    // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
+    // a diff or check result could misrepresent what --fix would actually do.
     if fix && (check || diff) {
-        let is_standalone = result.is_standalone;
-        let plan = mds::fix::plan_fixes_with_options(&result, &source, is_standalone);
-        if !plan.edits.is_empty() {
+        let preview_source = preview_fixes(&result, &source, base_dir, runtime_vars, &config);
+        if let Some(ref fixed) = preview_source {
             if diff {
                 let label = path.display().to_string();
-                let fixed = mds::fix::apply_plan_unchecked(&source, &plan);
-                let diff_str = render_diff_lint(&source, &fixed, &label);
+                let diff_str = render_diff_lint(&source, fixed, &label);
                 let _ = write_stdout(&diff_str);
             }
             if check {
@@ -618,7 +759,8 @@ fn run_lint_file(
                 std::process::exit(1);
             }
         }
-        // After diff-only preview, render diagnostics and exit by severity.
+        // After diff-only preview (or when nothing would change), render diagnostics
+        // and exit by severity.
         emit_result(format, &result, quiet, named_source);
         exit_by_severity(&result);
         return Ok(());
@@ -698,22 +840,40 @@ fn run_lint_directory(
     let mut json_files: Vec<serde_json::Value> = Vec::new();
     let mut any_truncated = false;
 
+    let mut any_would_fix = false;
+
     for file in &files {
         let tally = if format == LintFormat::Json {
             lint_one_file_accumulating(
                 file,
+                dir,
                 flags,
                 &runtime_vars,
                 &config,
                 &mut json_files,
                 &mut any_truncated,
+                &mut any_would_fix,
             )
         } else {
-            lint_one_file_human(file, flags, &runtime_vars, &config, &mut any_truncated)
+            lint_one_file_human(
+                file,
+                dir,
+                flags,
+                &runtime_vars,
+                &config,
+                &mut any_truncated,
+                &mut any_would_fix,
+            )
         };
         if tally > max_tally {
             max_tally = tally;
         }
+    }
+
+    // --fix --check: exit 1 if any file would have been modified (accumulate-and-continue,
+    // so every file is checked before exiting).
+    if flags.check && any_would_fix {
+        std::process::exit(1);
     }
 
     if format == LintFormat::Json {
@@ -735,27 +895,38 @@ fn run_lint_directory(
 }
 
 /// Lint one file in directory mode, accumulating results into a JSON array.
+#[allow(clippy::too_many_arguments)]
 fn lint_one_file_accumulating(
     file: &Path,
+    lint_root: &Path,
     flags: LintFlags,
     runtime_vars: &Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
     json_files: &mut Vec<serde_json::Value>,
     any_truncated: &mut bool,
+    any_would_fix: &mut bool,
 ) -> FileTally {
     let LintFlags {
         fix, check, diff, ..
     } = flags;
 
+    // Bug 4: compute a display path relative to the lint root so JSON `file` keys
+    // are navigable and unique across the whole directory tree (not just basenames).
+    let display_path = file
+        .strip_prefix(lint_root)
+        .unwrap_or(file)
+        .display()
+        .to_string();
+
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
     let base_dir = file.parent().unwrap_or(Path::new("."));
 
-    let result = match mds::lint(file, runtime_vars.clone(), config) {
+    let mut result = match mds::lint(file, runtime_vars.clone(), config) {
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
-                "file": file.display().to_string(),
+                "file": display_path,
                 "error": e.serialize()
             }));
             return if matches!(e, MdsError::ResourceLimit { .. }) {
@@ -765,6 +936,8 @@ fn lint_one_file_accumulating(
             };
         }
     };
+    // Bug 4: remap basename-only file field → relative display path.
+    set_diag_display_path(&mut result, &display_path);
 
     if result.truncated {
         *any_truncated = true;
@@ -787,7 +960,7 @@ fn lint_one_file_accumulating(
             Err(e) => {
                 // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
                 json_files.push(serde_json::json!({
-                    "file": file.display().to_string(),
+                    "file": display_path,
                     "error": e.serialize()
                 }));
                 return FileTally::Error;
@@ -798,8 +971,25 @@ fn lint_one_file_accumulating(
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                residual,
+                mut residual,
             } => {
+                set_diag_display_path(&mut residual, &display_path);
+                accumulate_result_json(&residual, json_files);
+                if let Err(e) = atomic_write_file(file, &new_source) {
+                    eprintln!("error writing {}: {e}", file.display());
+                    return FileTally::Error;
+                }
+                tally_from_result(&residual)
+            }
+            FixFileOutcome::PartiallyFixed {
+                new_source,
+                mut residual,
+            } => {
+                eprintln!(
+                    "{}: partial fix (some edits rejected by reverify gate)",
+                    file.display()
+                );
+                set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {e}", file.display());
@@ -817,6 +1007,29 @@ fn lint_one_file_accumulating(
                 tally_from_result(&original)
             }
         }
+    } else if fix && (check || diff) {
+        // Bug 5: directory-mode preview — route through gated pipeline.
+        let source = match read_source_file(file) {
+            Ok(s) => s,
+            Err(e) => {
+                json_files.push(serde_json::json!({
+                    "file": display_path,
+                    "error": e.serialize()
+                }));
+                return FileTally::Error;
+            }
+        };
+        if let Some(fixed) = preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config)
+        {
+            *any_would_fix = true;
+            if diff {
+                let label = file.display().to_string();
+                let diff_str = render_diff_lint(&source, &fixed, &label);
+                let _ = write_stdout(&diff_str);
+            }
+        }
+        accumulate_result_json(&result, json_files);
+        tally_from_result(&result)
     } else {
         accumulate_result_json(&result, json_files);
         tally_from_result(&result)
@@ -824,12 +1037,15 @@ fn lint_one_file_accumulating(
 }
 
 /// Lint one file in directory mode, rendering diagnostics to stderr (human mode).
+#[allow(clippy::too_many_arguments)]
 fn lint_one_file_human(
     file: &Path,
+    lint_root: &Path,
     flags: LintFlags,
     runtime_vars: &Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
     any_truncated: &mut bool,
+    any_would_fix: &mut bool,
 ) -> FileTally {
     let LintFlags {
         fix,
@@ -838,6 +1054,13 @@ fn lint_one_file_human(
         quiet,
         ..
     } = flags;
+
+    // Bug 4: compute a display path relative to the lint root for human rendering.
+    let display_path = file
+        .strip_prefix(lint_root)
+        .unwrap_or(file)
+        .display()
+        .to_string();
 
     let source = match read_source_file(file) {
         Ok(s) => s,
@@ -848,11 +1071,10 @@ fn lint_one_file_human(
     };
 
     let base_dir = file.parent().unwrap_or(Path::new("."));
-    // Named source for span rendering: file display name + source text.
-    let file_display = file.to_str().unwrap_or("<file>");
-    let named_source = Some((file_display, source.as_str()));
+    // Named source for span rendering: relative display path + source text.
+    let named_source = Some((display_path.as_str(), source.as_str()));
 
-    let result = match mds::lint(file, runtime_vars.clone(), config) {
+    let mut result = match mds::lint(file, runtime_vars.clone(), config) {
         Ok(r) => r,
         Err(ref e) => {
             eprintln!("{:?}", miette::Report::from(e.clone()));
@@ -863,6 +1085,8 @@ fn lint_one_file_human(
             };
         }
     };
+    // Bug 4: remap basename-only file field → relative display path.
+    set_diag_display_path(&mut result, &display_path);
 
     if result.truncated {
         *any_truncated = true;
@@ -882,12 +1106,31 @@ fn lint_one_file_human(
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                residual,
+                mut residual,
             } => {
+                set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if !quiet {
                     eprintln!("Fixed: {}", file.display());
                 }
+                if let Err(e) = atomic_write_file(file, &new_source) {
+                    eprintln!("error writing {}: {e}", file.display());
+                    return FileTally::Error;
+                }
+                tally_from_result(&residual)
+            }
+            FixFileOutcome::PartiallyFixed {
+                new_source,
+                mut residual,
+            } => {
+                if !quiet {
+                    eprintln!(
+                        "{}: partial fix (some edits rejected by reverify gate)",
+                        file.display()
+                    );
+                }
+                set_diag_display_path(&mut residual, &display_path);
+                render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {e}", file.display());
                     return FileTally::Error;
@@ -904,6 +1147,22 @@ fn lint_one_file_human(
                 tally_from_result(&original)
             }
         }
+    } else if fix && (check || diff) {
+        // Bug 5: directory-mode preview — route through gated pipeline.
+        if let Some(fixed) = preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config)
+        {
+            *any_would_fix = true;
+            if diff {
+                let label = file.display().to_string();
+                let diff_str = render_diff_lint(&source, &fixed, &label);
+                let _ = write_stdout(&diff_str);
+            }
+            if check && !quiet {
+                eprintln!("Would fix: {}", file.display());
+            }
+        }
+        render_result_human(&result, quiet, named_source);
+        tally_from_result(&result)
     } else {
         render_result_human(&result, quiet, named_source);
         tally_from_result(&result)

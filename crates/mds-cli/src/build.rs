@@ -546,7 +546,7 @@ pub(crate) fn write_output(
 ///
 /// Returns `Ok(path)` if exactly one `.mds` file is found, or an `Err` describing
 /// why auto-detection failed (zero files, multiple files, or I/O error).
-pub(crate) fn auto_detect_mds_file() -> Result<PathBuf> {
+pub(crate) fn auto_detect_mds_file(subcommand: &str) -> Result<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
 
@@ -573,7 +573,7 @@ pub(crate) fn auto_detect_mds_file() -> Result<PathBuf> {
             names.sort();
             Err(miette::miette!(
                 "multiple .mds files found: {}\n  \
-                 hint: specify which file to compile, e.g. 'mds build {}'",
+                 hint: specify which file, e.g. 'mds {subcommand} {}'",
                 names.join(", "),
                 names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
             ))
@@ -740,11 +740,14 @@ pub(crate) struct BuildArgs {
 
 /// Resolve the input path: use the explicit value, or auto-detect from cwd.
 ///
+/// `subcommand` is the CLI verb (e.g. `"build"`, `"lint"`, `"fmt"`, `"check"`, `"watch"`)
+/// used in the auto-detect error hint so the user sees a correct example command.
+///
 /// Returns `(path, auto_detected)`.
-pub(crate) fn resolve_input(input: Option<PathBuf>) -> Result<(PathBuf, bool)> {
+pub(crate) fn resolve_input(input: Option<PathBuf>, subcommand: &str) -> Result<(PathBuf, bool)> {
     match input {
         Some(p) => Ok((p, false)),
-        None => auto_detect_mds_file().map(|p| (p, true)),
+        None => auto_detect_mds_file(subcommand).map(|p| (p, true)),
     }
 }
 
@@ -1058,7 +1061,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
     // Resolve the input: explicit path, or auto-detect from cwd.
     // When auto-detected, print a "Building {path}" banner so users know which file was selected.
-    let (input, auto_detected) = resolve_input(input)?;
+    let (input, auto_detected) = resolve_input(input, "build")?;
     if auto_detected && !quiet {
         eprintln!("Building {}", input.display());
     }

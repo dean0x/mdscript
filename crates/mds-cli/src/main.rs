@@ -246,7 +246,7 @@ fn run_check(
 
     // Resolve the input: explicit path/stdin, or auto-detect from cwd.
     // run_check does not print a banner on auto-detect — check is a silent validation.
-    let (input, _) = resolve_input(input)?;
+    let (input, _) = resolve_input(input, "check")?;
 
     // Directory mode: validate every non-partial .mds file in the tree.
     if input != std::path::Path::new("-") && input.is_dir() {
