@@ -1293,8 +1293,14 @@ fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
              parse error: {e}; stdout: '{stdout}'"
         )
     });
-    assert_eq!(json["version"], 1, "envelope must have version:1; got: {json}");
-    assert!(json["files"].is_array(), "envelope must have files[]; got: {json}");
+    assert_eq!(
+        json["version"], 1,
+        "envelope must have version:1; got: {json}"
+    );
+    assert!(
+        json["files"].is_array(),
+        "envelope must have files[]; got: {json}"
+    );
 }
 
 // ── resolve-w2 #59: stdin --fix --check never writes fixed source ─────────────
@@ -1353,7 +1359,11 @@ fn dir_and_single_file_agree_on_quiet_for_partially_fixed() {
     // "Partially fixed" — this is the realized defect from #43.
     {
         let dir = tempfile::tempdir().unwrap();
-        fs::copy(fixture("lint_partial_fix.mds"), dir.path().join("partial.mds")).unwrap();
+        fs::copy(
+            fixture("lint_partial_fix.mds"),
+            dir.path().join("partial.mds"),
+        )
+        .unwrap();
 
         let out = lint_path(dir.path(), &["--fix", "--format", "json", "--quiet"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1385,7 +1395,11 @@ fn dir_and_single_file_agree_on_quiet_for_partially_fixed() {
     }
     {
         let dir = tempfile::tempdir().unwrap();
-        fs::copy(fixture("lint_partial_fix.mds"), dir.path().join("partial.mds")).unwrap();
+        fs::copy(
+            fixture("lint_partial_fix.mds"),
+            dir.path().join("partial.mds"),
+        )
+        .unwrap();
 
         let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1441,5 +1455,39 @@ fn lint_fix_bare_filename_applies_fix() {
         after.matches("@export greet").count(),
         1,
         "exactly one @export greet should remain after --fix; got:\n{after}"
+    );
+}
+
+// ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
+
+/// Regression gate: a .mds file containing a raw ESC byte (U+001B) that reaches
+/// `MdsError::Syntax` must not emit raw ESC bytes to stderr.
+///
+/// Background: `MdsError::Syntax` embeds user-controlled source fragments via
+/// miette's NamedSource.  Before the fix, those fragments printed with raw ESC
+/// bytes intact, enabling terminal escape injection when linting untrusted repos.
+/// The fix sanitizes at the CLI render boundary in `emit_analysis_failure_json_or_stderr`.
+#[test]
+fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("esc_test.mds");
+    // Raw ESC byte (0x1B) on the same line as the syntax error so miette renders it
+    // as part of the source context.  Unclosed @define → guaranteed syntax error.
+    fs::write(&file, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = lint_path(&file, &[]);
+    // Must exit 2 (analysis/gate failure, not lint-severity exit 1).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "syntax error should exit 2; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Raw ESC byte (0x1B) must not appear anywhere in stderr output.
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr; \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
     );
 }

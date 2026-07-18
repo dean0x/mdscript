@@ -1041,3 +1041,44 @@ fn build_load_config_finds_grandparent_mds_json() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
+
+/// Regression gate: `mds build` (directory mode) must not emit raw ESC bytes to
+/// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
+/// `MdsError::Syntax`.
+///
+/// Uses directory mode so the error is rendered by the per-file error handler in
+/// `run_build_directory` (the `build.rs` render boundary that was vulnerable).
+/// For single-file builds the error propagates through `main`; this test
+/// validates the directory-mode path specifically.
+#[test]
+fn build_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    // Raw ESC byte (0x1B) in a .mds file that has a syntax error (unclosed @define).
+    // The ESC is on the error line so miette renders it inside the source context frame.
+    std::fs::write(dir.path().join("esc.mds"), b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // Build must fail (syntax error in the file).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "build with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Raw ESC byte (0x1B) must not appear anywhere in stderr.
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr; \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+}

@@ -7,7 +7,10 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use mds::{effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use mds::{
+    effective_parent, sanitize_control_chars, CompiledOutput, MdsError, MAX_FILE_SIZE,
+    MAX_TRAVERSAL_DEPTH, STRING_SOURCE_MAP_LABEL,
+};
 use miette::Result;
 use serde::Deserialize;
 
@@ -898,11 +901,8 @@ pub(crate) fn relative_path(base_dir: &Path, target: &Path) -> String {
 /// 5. All backslashes → forward slashes (AC-FUNC-05).
 /// 6. Result MUST NOT be an absolute path (enforced by assertion).
 pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: bool) -> String {
-    // Rule 1: stdin sentinel relabeling.
-    // After the STRING_SOURCE_MAP_LABEL fix in sourcemap.rs, string-source stdin
-    // compiles emit "input.mds" (not "<source>") in sources[].  Match both for
-    // defense-in-depth (AC-FUNC-12).
-    if (source == "input.mds" || source == "<source>") && stdin_label {
+    // Rule 1: stdin sentinel relabeling (AC-FUNC-12).
+    if source == STRING_SOURCE_MAP_LABEL && stdin_label {
         return "<stdin>".to_string();
     }
     // Pass through non-path sentinels unchanged (e.g. "<source>" in non-stdin builds).
@@ -1501,7 +1501,9 @@ fn run_build_directory(
                 }
             }
             Err(e) => {
-                eprintln!("{e:?}");
+                // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
+                // source fragments that may contain raw ESC bytes (avoids terminal escape injection).
+                eprintln!("{}", sanitize_control_chars(&format!("{e:?}")));
                 fail_count += 1;
             }
         }
@@ -1826,11 +1828,9 @@ mod tests {
 
     #[test]
     fn relativize_absolute_source_with_relative_mapdir_never_leaks_absolute() {
-        // Regression: a relative `-o` (relative map_dir) diffed against an
-        // absolute source previously produced `..//abs/...` (or a leading-'/'
-        // result that panicked the debug_assert), leaking the absolute path.
-        // After absolutizing map_dir against the CWD the result must be a clean
-        // relative path — never absolute, never an embedded absolute prefix.
+        // A relative map_dir must be absolutized against CWD before relativizing
+        // an absolute source — the result must be a clean relative path, never
+        // absolute, never containing an embedded absolute prefix.
         let got =
             relativize_source_path("/tmp/deep/nested/abs_input.mds", Path::new("build"), false);
         assert!(!got.starts_with('/'), "must not be absolute: {got}");
@@ -1881,8 +1881,8 @@ mod tests {
 
     #[test]
     fn relativize_cross_drive_relative_path_degrades_to_filename() {
-        // A cross-drive path suffix (`../../D:/x.mds`) that passes through
-        // Rule 4 contains `:/ ` not `:\\` and previously slipped through.
+        // A cross-drive path suffix (`../../D:/x.mds`) containing `:/` must be
+        // caught by Rule 4 and degrade to the bare filename, not pass through.
         let got = relativize_source_path("../../D:/x.mds", Path::new("build"), false);
         assert_eq!(
             got, "x.mds",
@@ -1941,16 +1941,13 @@ mod tests {
         assert_eq!(map.get("id"), Some(&mds::Value::String("007".to_string())));
     }
 
-    // ── relativize_source_map_fields: None output now relativizes against CWD ─
-    //
-    // Before the fix the early return on None bypassed all relativization.
-    // The functions below test the fix through relativize_source_path (the inner
-    // worker) since SourceMap is #[non_exhaustive] and cannot be constructed in
-    // this crate. The SM-16 CLI integration tests cover the full stack.
+    // ── relativize_source_map_fields: None output (bare filename -o) relativizes ─
+    // ── against CWD.  Tests use relativize_source_path directly since SourceMap  ─
+    // ── is #[non_exhaustive]; SM-16 CLI integration tests cover the full stack.  ─
 
     #[test]
     fn relativize_source_path_empty_map_dir_relativizes_absolute_against_cwd() {
-        // map_dir = PathBuf::new() (the value used for None output after the fix).
+        // map_dir = PathBuf::new() (the value used for None/-o stdout output).
         // An absolute source must be relativized against CWD — not leak as absolute.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/cwd"));
         let abs_src = cwd.join("proj/template.mds");
@@ -1968,16 +1965,6 @@ mod tests {
         assert_eq!(
             result, "<stdin>",
             "stdin label with empty map_dir must become \"<stdin>\"; got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn relativize_source_path_empty_map_dir_legacy_source_sentinel_becomes_stdin() {
-        // Defense-in-depth: the legacy "<source>" sentinel also becomes "<stdin>".
-        let result = relativize_source_path("<source>", &PathBuf::new(), true);
-        assert_eq!(
-            result, "<stdin>",
-            "legacy \"<source>\" sentinel with stdin_label=true must become \"<stdin>\"; got: {result:?}"
         );
     }
 }

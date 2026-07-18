@@ -623,7 +623,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let result = collect_mds_files_detailed(dir.path(), 64, None);
         assert_eq!(result.files.len(), 0);
-        assert_eq!(result.excluded_by_default, 0, "genuinely empty dir must have 0 excluded");
+        assert_eq!(
+            result.excluded_by_default, 0,
+            "genuinely empty dir must have 0 excluded"
+        );
     }
 
     #[test]
@@ -638,8 +641,7 @@ mod tests {
         let result = collect_mds_files_detailed(dir.path(), 64, None);
         assert_eq!(result.files.len(), 0, "no files should be in results");
         assert_eq!(
-            result.excluded_by_default,
-            2,
+            result.excluded_by_default, 2,
             "excluded_by_default must equal the count of skipped .mds files; got {}",
             result.excluded_by_default
         );
@@ -657,8 +659,7 @@ mod tests {
         let result = collect_mds_files_detailed(dir.path(), 64, None);
         assert_eq!(result.files.len(), 1, "only normal.mds should be collected");
         assert_eq!(
-            result.excluded_by_default,
-            1,
+            result.excluded_by_default, 1,
             "one file in node_modules should be counted as excluded"
         );
     }

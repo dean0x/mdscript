@@ -85,7 +85,7 @@ pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
     match do_lint(args) {
         Ok(()) => Ok(()),
         Err(e) => {
-            eprintln!("{e:?}");
+            eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
             std::process::exit(2);
         }
     }
@@ -625,8 +625,8 @@ fn run_lint_stdin(
     flags: LintFlags,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
 ) -> Result<()> {
-    // Bind all five flags — previously `check` and `diff` were silently dropped
-    // via `..`, causing `--fix --check` to apply fixes unconditionally (avoids PF-004).
+    // Bind all five flags explicitly — `..` would silently drop unbound flags to
+    // their defaults, which breaks `--fix --check` semantics (avoids PF-004).
     let LintFlags {
         fix,
         check,
@@ -685,7 +685,7 @@ fn run_lint_stdin(
             // After diff-only preview, or when nothing would change / fix rejected:
             // render diagnostics of the original result and exit by severity.
             let named_source = if format == LintFormat::Human {
-                Some(("input.mds", source.as_str()))
+                Some((mds::STRING_SOURCE_MAP_LABEL, source.as_str()))
             } else {
                 None
             };
@@ -721,7 +721,7 @@ fn run_lint_stdin(
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
         // Stdin diagnostics: pass source text for span context rendering.
-        let named_source = Some(("input.mds", output_src.as_str()));
+        let named_source = Some((mds::STRING_SOURCE_MAP_LABEL, output_src.as_str()));
         render_result_human(&diag_result, quiet, named_source);
         let _ = write_stdout(&output_src);
         exit_by_severity(&diag_result);
@@ -730,7 +730,7 @@ fn run_lint_stdin(
 
     // Report-only mode: pass stdin source for span context rendering.
     let named_source = if format == LintFormat::Human {
-        Some(("input.mds", source.as_str()))
+        Some((mds::STRING_SOURCE_MAP_LABEL, source.as_str()))
     } else {
         None
     };
@@ -1042,7 +1042,11 @@ fn lint_one_file_accumulating(
 ) -> FileTally {
     // Bind quiet so the PartiallyFixed arm can honour it (issue #43 / #173).
     let LintFlags {
-        fix, check, diff, quiet, ..
+        fix,
+        check,
+        diff,
+        quiet,
+        ..
     } = ctx.flags;
 
     // Compute a display path relative to the lint root so JSON `file` keys
@@ -1102,8 +1106,13 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            ctx.config,
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1160,7 +1169,13 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        match preview_fixes(&result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config) {
+        match preview_fixes(
+            &result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            ctx.config,
+        ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
                 if diff {
@@ -1244,8 +1259,13 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            ctx.config,
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1295,7 +1315,13 @@ fn lint_one_file_human(
         }
     } else if fix && (check || diff) {
         // Directory-mode preview — route through gated pipeline.
-        match preview_fixes(&result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config) {
+        match preview_fixes(
+            &result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            ctx.config,
+        ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
                 if diff {
@@ -1357,7 +1383,10 @@ fn emit_analysis_failure_json_or_stderr(e: &MdsError, format: LintFormat) {
             serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")
         ));
     } else {
-        eprintln!("{:?}", miette::Report::from(e.clone()));
+        // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
+        // source fragments that may contain raw ESC bytes (avoids terminal escape injection).
+        let rendered = format!("{:?}", miette::Report::from(e.clone()));
+        eprintln!("{}", mds::sanitize_control_chars(&rendered));
     }
 }
 
