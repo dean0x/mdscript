@@ -924,3 +924,187 @@ fn sm16_stale_map_not_smv3_preserved_with_warning() {
         "--quiet must suppress the warning; got stderr: {quiet_stderr:?}"
     );
 }
+
+// ── SM-14b: stdin --source-map sidecar relabels source to <stdin> ────────────
+//
+// After the STRING_SOURCE_MAP_LABEL fix, stdin builds emit "input.mds" in
+// sources[0].  relativize_source_path Rule 1 must relabel it to "<stdin>"
+// (AC-FUNC-12).  Verifies both the relabeling AND that "input.mds" / "<source>"
+// never leak into the sidecar map.
+
+#[test]
+fn sm14b_stdin_source_map_sidecar_relabels_source_to_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("stdin_out.md");
+    let map_path = dir.path().join("stdin_out.md.map");
+
+    let mut child = mds_bin()
+        .args(["build", "-", "--source-map", "-o", out.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .unwrap();
+
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "stdin --source-map sidecar should succeed"
+    );
+
+    let map_json = read_map_json(&map_path);
+    let sources = map_json["sources"]
+        .as_array()
+        .expect("sources must be array");
+
+    // Must use "<stdin>" — never "input.mds" or "<source>".
+    assert!(
+        sources.iter().any(|s| s.as_str() == Some("<stdin>")),
+        "stdin sidecar must label source as \"<stdin>\"; got: {sources:?}"
+    );
+    assert!(
+        !sources.iter().any(|s| s.as_str() == Some("input.mds")),
+        "\"input.mds\" must not leak into stdin sidecar sources[]; got: {sources:?}"
+    );
+    assert!(
+        !sources.iter().any(|s| s.as_str() == Some("<source>")),
+        "\"<source>\" must not appear in stdin sidecar sources[]; got: {sources:?}"
+    );
+}
+
+// ── SM-16: --inline -o - (stdout) produces relativized map, no absolute paths─
+//
+// Before the relativize_source_map_fields fix, the early return on None
+// output bypassed relativization entirely, leaking absolute filesystem paths
+// into inline data-URI source maps.  After the fix, map_dir = PathBuf::new()
+// so paths are relativized against CWD unconditionally.
+
+/// SM-16a: file input + --inline + -o - → stdout carrier has no absolute paths.
+#[test]
+fn sm16a_file_inline_stdout_no_absolute_paths() {
+    // Run the binary against a real fixture with --inline -o -
+    let result = mds_bin()
+        .args([
+            "build",
+            fixture("sm_basic.mds").to_str().unwrap(),
+            "--source-map",
+            "--inline",
+            "-o",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        result.status.success(),
+        "file --inline -o - must succeed; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    // Extract and decode the inline data-URI carrier.
+    let prefix = "<!--# sourceMappingURL=data:application/json;base64,";
+    let suffix = " -->";
+    let start = stdout
+        .find(prefix)
+        .expect("stdout must contain inline source-map carrier");
+    let rest = &stdout[start + prefix.len()..];
+    let end = rest
+        .find(suffix)
+        .expect("carrier must be closed with \" -->\"");
+    let b64 = &rest[..end];
+    let decoded = base64_decode(b64);
+    let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+
+    let sources = json["sources"].as_array().expect("sources must be array");
+    for src in sources {
+        let s = src.as_str().expect("source must be string");
+        // No absolute paths (AC-SEC-01 / PF-005 unconditional guard).
+        assert!(
+            !std::path::Path::new(s).is_absolute(),
+            "inline stdout source map must not contain absolute paths; found: {s:?}"
+        );
+        // Must not start with '/' or contain drive letters.
+        assert!(
+            !s.starts_with('/'),
+            "source must not start with '/'; got: {s:?}"
+        );
+    }
+
+    // `file` field must be absent for stdout output (no output filename).
+    assert!(
+        json.get("file").map(|v| v.is_null()).unwrap_or(true),
+        "`file` field must be absent or null for stdout inline map; got: {:?}",
+        json.get("file")
+    );
+}
+
+/// SM-16b: stdin + --inline + -o - → previously rejected, now allowed.
+///
+/// The false rejection "--inline cannot be used with -o -" was deleted.
+/// The inline carrier embeds in the output stream identically to file input.
+#[test]
+fn sm16b_stdin_inline_stdout_now_allowed() {
+    let mut child = mds_bin()
+        .args(["build", "-", "--source-map", "--inline", "-o", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Hello World!\n")
+        .unwrap();
+
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "stdin --inline -o - must succeed after removing the false rejection; \
+         stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    // Must contain an inline carrier.
+    assert!(
+        stdout.contains("<!--# sourceMappingURL=data:application/json;base64,"),
+        "stdin --inline -o - must embed a source-map carrier in stdout; stdout: {stdout:?}"
+    );
+
+    // Decode and verify no absolute paths in sources.
+    let prefix = "<!--# sourceMappingURL=data:application/json;base64,";
+    let suffix = " -->";
+    let start = stdout.find(prefix).unwrap();
+    let rest = &stdout[start + prefix.len()..];
+    let end = rest.find(suffix).unwrap();
+    let decoded = base64_decode(&rest[..end]);
+    let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let sources = json["sources"].as_array().expect("sources must be array");
+    // Stdin source should be "<stdin>" (Rule 1 of relativize_source_path).
+    assert!(
+        sources.iter().any(|s| s.as_str() == Some("<stdin>")),
+        "stdin --inline stdout must label source as \"<stdin>\"; got: {sources:?}"
+    );
+    for src in sources {
+        let s = src.as_str().expect("source must be string");
+        assert!(
+            !std::path::Path::new(s).is_absolute(),
+            "inline stdout source must not be absolute; found: {s:?}"
+        );
+    }
+}

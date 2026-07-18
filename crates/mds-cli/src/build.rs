@@ -970,24 +970,30 @@ pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: 
 /// Must be called before writing the map to disk or embedding it inline.
 /// - `output_path`: the path where the compiled output is written (used to
 ///   compute the map directory and the `file` basename).
-/// - When `output_path` is `None` (stdout), sources are left as-is and
-///   `file` remains as set by the core (no map-relative anchor exists).
+/// - When `output_path` is `None` (stdout / inline-to-stdout), the map is
+///   still relativized against the CWD (PF-005: the never-absolute-paths
+///   invariant must hold unconditionally, even for stdout output).
+///   `sm.file` is left `None` for stdout (no output filename to anchor).
 pub(crate) fn relativize_source_map_fields(
     sm: &mut mds::SourceMap,
     output_path: Option<&Path>,
     stdin_label: bool,
 ) {
-    let Some(out) = output_path else {
-        return;
+    let map_dir: PathBuf = match output_path {
+        Some(out) => {
+            // Set `file` to the output basename (sidecar / inline-to-file).
+            sm.file = out.file_name().map(|n| n.to_string_lossy().into_owned());
+            out.parent().unwrap_or(Path::new(".")).to_path_buf()
+        }
+        // Stdout: no `file` anchor; relativize against CWD so that absolute
+        // source paths are never embedded in inline data-URI maps (AC-SEC-01).
+        // PF-005: unconditional — the None early-return was the former bug.
+        None => PathBuf::new(),
     };
-    let map_dir = out.parent().unwrap_or(Path::new("."));
-
-    // Set `file` to the output basename.
-    sm.file = out.file_name().map(|n| n.to_string_lossy().into_owned());
 
     // Relativize each source.
     for src in &mut sm.sources {
-        *src = relativize_source_path(src, map_dir, stdin_label);
+        *src = relativize_source_path(src, &map_dir, stdin_label);
     }
 }
 
@@ -1127,13 +1133,6 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 "warning: --embed-sources with --inline ships full source text in the output \
                  (AC-SEC-02)"
             );
-        }
-
-        // Inline + stdout is not supported (there is no file to embed the carrier into).
-        if use_source_map && inline && output.as_deref() == Some("-") {
-            return Err(miette::miette!(
-                "--inline cannot be used with -o - (stdout has no file to embed the carrier into)"
-            ));
         }
 
         let opts = mds::CompileOptions {
@@ -1921,5 +1920,45 @@ mod tests {
         let map = result.expect("non-empty vars");
         assert_eq!(map.get("num"), Some(&mds::Value::Number(42.0)));
         assert_eq!(map.get("id"), Some(&mds::Value::String("007".to_string())));
+    }
+
+    // ── relativize_source_map_fields: None output now relativizes against CWD ─
+    //
+    // Before the fix the early return on None bypassed all relativization.
+    // The functions below test the fix through relativize_source_path (the inner
+    // worker) since SourceMap is #[non_exhaustive] and cannot be constructed in
+    // this crate. The SM-16 CLI integration tests cover the full stack.
+
+    #[test]
+    fn relativize_source_path_empty_map_dir_relativizes_absolute_against_cwd() {
+        // map_dir = PathBuf::new() (the value used for None output after the fix).
+        // An absolute source must be relativized against CWD — not leak as absolute.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/cwd"));
+        let abs_src = cwd.join("proj/template.mds");
+        let result = relativize_source_path(abs_src.to_str().unwrap(), &PathBuf::new(), false);
+        assert!(
+            !std::path::Path::new(&result).is_absolute(),
+            "absolute source must be relativized vs CWD when map_dir is empty; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relativize_source_path_empty_map_dir_stdin_label_becomes_stdin() {
+        // stdin_label=true + "input.mds" + empty map_dir → "<stdin>" (Rule 1 fires first).
+        let result = relativize_source_path("input.mds", &PathBuf::new(), true);
+        assert_eq!(
+            result, "<stdin>",
+            "stdin label with empty map_dir must become \"<stdin>\"; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn relativize_source_path_empty_map_dir_legacy_source_sentinel_becomes_stdin() {
+        // Defense-in-depth: the legacy "<source>" sentinel also becomes "<stdin>".
+        let result = relativize_source_path("<source>", &PathBuf::new(), true);
+        assert_eq!(
+            result, "<stdin>",
+            "legacy \"<source>\" sentinel with stdin_label=true must become \"<stdin>\"; got: {result:?}"
+        );
     }
 }
