@@ -25,22 +25,32 @@ def _find_cli() -> Path | None:
     """Locate a built `mds` CLI binary (the independent parity producer).
 
     Priority:
-    1. ``MDS_CLI_BIN`` environment variable (explicit override always wins).
+    1. ``MDS_CLI_BIN`` environment variable — if set, the path must exist as a
+       file; a non-existent or non-file path raises :class:`FileNotFoundError`
+       immediately rather than silently falling through to other candidates.
     2. The *freshest* of ``target/release/mds`` and ``target/debug/mds`` by
        mtime — prefers the binary that was compiled most recently so a fresh
        debug build is not shadowed by a stale release artifact.
     3. ``mds`` found anywhere on ``$PATH`` via :func:`shutil.which`.
     """
     env = os.environ.get("MDS_CLI_BIN")
-    if env and Path(env).is_file():
-        return Path(env)
+    if env:
+        p = Path(env)
+        if not p.is_file():
+            raise FileNotFoundError(
+                f"MDS_CLI_BIN={env!r} is set but points to a non-existent or "
+                "non-file path; remove it or correct the path"
+            )
+        return p
     exe = "mds.exe" if os.name == "nt" else "mds"
     candidates = [
         REPO_ROOT / "target" / profile / exe for profile in ("release", "debug")
     ]
     existing = [c for c in candidates if c.is_file()]
     if existing:
-        # Pick whichever binary was modified most recently.
+        # Pick whichever binary was modified most recently; ties resolve to
+        # release (candidates[0]) because Python's max() returns the first
+        # maximum encountered when keys are equal.
         return max(existing, key=lambda p: p.stat().st_mtime)
     found = shutil.which("mds")
     return Path(found) if found else None
