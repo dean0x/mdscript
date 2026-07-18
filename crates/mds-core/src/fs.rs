@@ -322,12 +322,9 @@ impl NativeFs {
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;
 
-        // Use effective_parent rather than path.parent().unwrap_or(".") because
-        // Path::parent() on a bare filename (e.g. "hello.mds") returns Some("") —
-        // an empty string — NOT None, so the unwrap_or fallback is dead code and
-        // "".canonicalize() fails with a file-not-found error on every bare-filename
-        // invocation of any subcommand.  effective_parent maps both Some("") and None
-        // to Path::new("."), making bare relative filenames work correctly.
+        // Use effective_parent: path.parent() returns Some("") for bare filenames
+        // (not None), so "".canonicalize() would fail on every bare-filename call.
+        // effective_parent maps empty parents to "." (PF-006).
         let parent = effective_parent(path);
         let canonical_parent = parent
             .canonicalize()

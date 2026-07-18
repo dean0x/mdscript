@@ -425,9 +425,7 @@ mod tests {
 
     /// The @elseif diagnostic span is anchored at the @elseif line, not the @if line.
     ///
-    /// Before the ElseifBranch AST change, the rule fell back to `b.offset` (the @if
-    /// position) because no per-branch offset was stored.  After the change the span
-    /// must point at the `@elseif` directive itself.
+    /// The span must point at the `@elseif` directive itself, via `ElseifBranch.offset`.
     ///
     /// Source layout (ASCII, all bytes):
     ///   "@if x:\nhello\n@elseif y:\n@end\n"
