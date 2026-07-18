@@ -65,7 +65,8 @@ Source-map options are **not accepted** — check does not generate output.
 Static analysis. Returns the canonical lint JSON:
 `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
 
-Options: `basePath` (lint/lintVirtual only), `vars`, `rules` (`Record<string, "off"|"info"|"warn"|"error">`).
+Options: `basePath` (lint only — lintFile derives the base from the file path; lintVirtual resolves against the module map), `vars`, `rules` (`Record<string, "off"|"info"|"warn"|"error">`).
+Unknown rule names in `rules` are silently accepted (a typo has no effect); unknown severity values throw `mds::invalid_options`.
 
 See `index.d.ts` for the full typed surface.
 

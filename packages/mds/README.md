@@ -77,7 +77,7 @@ try {
   compile(source);
 } catch (err) {
   if (isMdsError(err)) {
-    console.error(err.code);    // e.g. "mds::undefined_variable"
+    console.error(err.code);    // e.g. "mds::undefined_var"
     console.error(err.message);
     console.error(err.help);    // optional guidance string
     console.error(err.span);    // optional { offset, length, line, column }
@@ -119,8 +119,18 @@ interface CheckOptions {
   vars?: Record<string, unknown>;
 }
 
-// LintOptions / LintFileOptions
+// LintOptions — accepted by lint() (string-source)
 interface LintOptions {
+  vars?: Record<string, unknown>;
+  rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
+  basePath?: string; // base directory for @import resolution; required when the source
+                     // contains @import or @extends. Ignored by the WASM backend.
+}
+
+// LintFileOptions — accepted by lintFile() and lintVirtual()
+// basePath is NOT accepted: lintFile derives the base directory from the file path;
+// lintVirtual resolves imports against the caller-supplied module map, not the filesystem.
+interface LintFileOptions {
   vars?: Record<string, unknown>;
   rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
 }
@@ -138,6 +148,9 @@ and `lintVirtual`.
 
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
+
+**Lint `rules` map:** unknown rule names are silently accepted (a typo has no effect);
+unknown severity values throw `mds::invalid_options`.
 
 **Lint result shape:**
 ```ts

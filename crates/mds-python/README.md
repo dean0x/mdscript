@@ -69,6 +69,8 @@ keyword-only; `scan_imports` takes its argument positionally.
   the original source text in `sourcesContent[]` (requires `source_map=True`).
   ⚠ Privacy: `sources_content=True` embeds the full template source in the map.
 - `rules` is a mapping of rule name → severity string (`"off"`, `"info"`, `"warn"`, `"error"`).
+  Unknown severity values raise `MdsError(code="mds::invalid_options")`; unknown rule names
+  are silently accepted (the name simply has no effect — a typo will not configure the rule).
   `LintResult` exposes `.version`, `.truncated`, `.files`, `.to_dict()`, `.to_json()`.
 
 ### Result objects

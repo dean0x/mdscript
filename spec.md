@@ -1217,7 +1217,7 @@ A `tree-sitter-mds` grammar that extends Markdown parsing. Provides structural p
 
 A language server (Rust) providing diagnostics, completions, go-to-definition for `@import` paths, hover info for variables, and validation errors. Works across all editors that support LSP.
 
-**Markdown Preview**: The recommended approach is to compile `.mds` → `.md` and preview the output. The CLI supports this: `mds build input.mds | less` or pipe to any Markdown viewer.
+**Markdown Preview**: The recommended approach is to compile `.mds` → `.md` and preview the output. The CLI supports this: `mds build input.mds -o - | less` or pipe to any Markdown viewer. (`mds build` without `-o -` writes `input.md` beside the source and emits only a status line on stderr.)
 
 ---
 
