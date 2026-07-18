@@ -577,8 +577,7 @@ where
     let batch_source = apply_plan_unchecked(source, &plan);
     match reverify(&batch_source) {
         Ok(residual) => {
-            let residual_counts =
-                count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
+            let residual_counts = count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
             let regressed = regressed_rules(&residual_counts, &baseline);
             if regressed.is_empty() {
                 return FixOutcome::Fixed {
@@ -1558,9 +1557,7 @@ mod tests {
             overlap_rejected: false,
             truncated: false,
         };
-        let outcome = apply_fixes_incremental(source, plan, &original, |_| {
-            Ok(make_result(vec![]))
-        });
+        let outcome = apply_fixes_incremental(source, plan, &original, |_| Ok(make_result(vec![])));
         assert!(
             matches!(outcome, FixOutcome::Rejected { .. }),
             "unsorted edits must be rejected, not silently applied; got: {outcome:?}"
@@ -1606,7 +1603,9 @@ mod tests {
     #[test]
     fn fallback_max_edits_cap_rejects_large_plan() {
         // Build a plan with exactly FALLBACK_MAX_EDITS + 1 edits (one over the cap).
-        let lines: Vec<String> = (0..=FALLBACK_MAX_EDITS).map(|i| format!("L{i}\n")).collect();
+        let lines: Vec<String> = (0..=FALLBACK_MAX_EDITS)
+            .map(|i| format!("L{i}\n"))
+            .collect();
         let source = lines.concat();
         let mut offset = 0usize;
         let mut diags = Vec::new();
@@ -1659,7 +1658,11 @@ mod tests {
         let source = "LineA\n";
         let original = make_result(vec![make_diag("duplicate-import", 0, "LineA".len())]);
         let plan = plan_fixes_with_options(&original, source, false);
-        assert_eq!(plan.edits.len(), 1, "must have exactly 1 edit for this test");
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "must have exactly 1 edit for this test"
+        );
 
         // Reverify always fails with a distinctive message.
         let outcome = apply_fixes_incremental(source, plan, &original, |_| {

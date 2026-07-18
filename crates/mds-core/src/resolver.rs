@@ -906,12 +906,7 @@ impl ModuleCache {
             // evaluate_with_map derives file/source from builder (issue #58).
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
-            let (raw, returned) = evaluate_with_map(
-                &module.body,
-                &mut scope,
-                warnings,
-                builder,
-            )?;
+            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             apply_map_degradation(raw, returned, opts, warnings)
         } else {
@@ -1018,12 +1013,8 @@ impl ModuleCache {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
             // evaluate_with_map derives file/source from builder.current_src (issue #58).
-            let (body_raw, returned) = evaluate_with_map(
-                &module.body,
-                &mut scope,
-                warnings,
-                builder,
-            )?;
+            let (body_raw, returned) =
+                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
 
             // RUST-3 / PF-004 observability: propagate the segment-cap drop flag from
@@ -2506,7 +2497,9 @@ fn parse_frontmatter_mapping(
 /// `build_type_mismatch` in evaluator.rs).
 fn line_len_at(source: &str, offset: usize) -> usize {
     if source.is_char_boundary(offset) {
-        source[offset..].find('\n').unwrap_or(source[offset..].len())
+        source[offset..]
+            .find('\n')
+            .unwrap_or(source[offset..].len())
     } else {
         0
     }

@@ -1518,7 +1518,8 @@ fn source_map_extends_type_mismatch_span_not_misattributed_to_child() {
     // A type_mismatch in the BASE skeleton's @if fires with ctx.source = base content.
     // Any resulting span must fall within the base source, not the child source.
     let mut modules = HashMap::new();
-    let base_source = "---\nn: hi\n---\n@if n == 5:\nbase-if-branch\n@end\n@block body:\nbase default\n@end\n";
+    let base_source =
+        "---\nn: hi\n---\n@if n == 5:\nbase-if-branch\n@end\n@block body:\nbase default\n@end\n";
     modules.insert("base.mds".to_string(), base_source.to_string());
     modules.insert(
         "child.mds".to_string(),
@@ -1592,8 +1593,5 @@ fn source_map_standalone_type_mismatch_carries_span() {
         span.offset,
         src.len()
     );
-    assert!(
-        span.length > 0,
-        "span length must be > 0, got: {span:?}"
-    );
+    assert!(span.length > 0, "span length must be > 0, got: {span:?}");
 }

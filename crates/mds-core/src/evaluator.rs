@@ -130,8 +130,7 @@ pub(crate) fn evaluate_with_map(
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
-    let (output, map, _, _) =
-        evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0)?;
+    let (output, map, _, _) = evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0)?;
     Ok((output, map))
 }
 
