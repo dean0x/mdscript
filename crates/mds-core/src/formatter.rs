@@ -470,6 +470,39 @@ fn in_raw_content(raw_content: &[Range<usize>], offset: usize) -> bool {
     idx < raw_content.len() && raw_content[idx].start <= offset
 }
 
+/// Pop trailing `Text` tokens from `tokens` that contribute nothing to compiled output.
+///
+/// A tail `Text` token is insignificant when **all** three conditions hold:
+/// 1. Its source byte offset is **outside** every span in `raw_content` — inside a
+///    `@message`/`@define` body, a trailing blank line is real content that bypasses
+///    `clean_output` and reaches the compiled JSON verbatim, so it must not be discarded.
+/// 2. `crate::clean_output(text).is_empty()` — the token contributes nothing to compiled
+///    output (it is whitespace-only: `\n`, `\r\n`, space-only lines, etc.).
+/// 3. The token is at the **tail** of the stream. Interior tokens are never touched,
+///    so a real formatter bug (dropped interior blank line, dropped meaningful text)
+///    still trips the token-count or content-mismatch checks.
+///
+/// This helper is called on **both** the source and formatted token streams before the
+/// length comparison in `structural_equivalent`, which prevents R2's `trim_end()`
+/// deletion of a trailing blank-line `Text` token from producing a spurious token-count
+/// mismatch and a false `FormatterInvariant` error (RELEASE BLOCKER 3).
+fn strip_trailing_insignificant_text(tokens: &mut Vec<Token>, raw_content: &[Range<usize>]) {
+    loop {
+        let should_pop = match tokens.last() {
+            Some(Token::Text(text, offset)) => {
+                // Condition 1: offset must be outside every raw-content span.
+                // Condition 2: clean_output of the text must be empty.
+                !in_raw_content(raw_content, *offset) && crate::clean_output(text).is_empty()
+            }
+            _ => false, // Not a Text token — stop immediately.
+        };
+        if !should_pop {
+            break;
+        }
+        tokens.pop();
+    }
+}
+
 /// Rule-aware structural comparison used when neither `source` nor
 /// `formatted` can be compiled standalone (e.g. an undefined runtime
 /// variable). Re-tokenizes both and compares token-for-token: `Directive`
@@ -489,12 +522,30 @@ fn in_raw_content(raw_content: &[Range<usize>], offset: usize) -> bool {
 /// The raw-content span lookup uses [`in_raw_content`] (binary search, O(log S))
 /// rather than a linear scan, since spans are sorted by [`raw_content_spans`]
 /// and token offsets from the source tokenization are monotonically increasing.
+///
+/// Before the length check, [`strip_trailing_insignificant_text`] removes any
+/// tail `Text` tokens that are (a) outside raw-content spans and (b) contribute
+/// nothing to compiled output (whitespace-only, `clean_output`-empty). This
+/// prevents R2's `trim_end()` from producing a spurious count mismatch when a
+/// trailing blank line is deleted from the formatted output but still exists as
+/// a `Text` token in the source stream (RELEASE BLOCKER 3).
 fn structural_equivalent(source: &str, formatted: &str, raw_content: &[Range<usize>]) -> bool {
-    let (Ok(src_tokens), Ok(fmt_tokens)) =
+    let (Ok(mut src_tokens), Ok(mut fmt_tokens)) =
         (lexer::tokenize(source, ""), lexer::tokenize(formatted, ""))
     else {
         return false;
     };
+
+    // Recompute raw-content spans for the formatted stream: `raw_content` uses
+    // SOURCE byte offsets, which are not valid when searching against the offsets
+    // carried by tokens from the FORMATTED string.
+    let fmt_raw_content = raw_content_spans(&fmt_tokens, formatted);
+
+    // Drop trailing Text tokens that are outside raw-content spans and contribute
+    // nothing to compiled output (R2 may have deleted such a token from the
+    // formatted stream while it still exists in the source stream).
+    strip_trailing_insignificant_text(&mut src_tokens, raw_content);
+    strip_trailing_insignificant_text(&mut fmt_tokens, &fmt_raw_content);
 
     if src_tokens.len() != fmt_tokens.len() {
         return false;
@@ -681,6 +732,139 @@ mod tests {
     }
 
     // ── structural_equivalent ─────────────────────────────────────────────────
+
+    // ── strip_trailing_insignificant_text ─────────────────────────────────────
+
+    #[test]
+    fn strip_trailing_insignificant_text_removes_trailing_blank_text() {
+        // A tail Text token whose clean_output is empty must be popped.
+        let mut tokens = vec![
+            Token::Directive("@if x:".to_string(), 0),
+            Token::Text("\n".to_string(), 7), // meaningful interior line
+            Token::Directive("@end".to_string(), 9),
+            Token::Text("\n".to_string(), 14), // trailing blank — MUST be stripped
+        ];
+        let raw: Vec<Range<usize>> = vec![];
+        strip_trailing_insignificant_text(&mut tokens, &raw);
+        assert_eq!(
+            tokens.len(),
+            3,
+            "trailing blank Text must be removed, remaining: {tokens:?}"
+        );
+        assert!(
+            matches!(tokens.last(), Some(Token::Directive(..))),
+            "last token must be the @end directive after stripping"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_insignificant_text_keeps_meaningful_trailing_text() {
+        // A tail Text token with non-empty clean_output must NOT be popped.
+        let mut tokens = vec![
+            Token::Directive("@if x:".to_string(), 0),
+            Token::Text("Hello\n".to_string(), 7), // meaningful — clean_output = "Hello\n"
+        ];
+        let raw: Vec<Range<usize>> = vec![];
+        strip_trailing_insignificant_text(&mut tokens, &raw);
+        assert_eq!(tokens.len(), 2, "meaningful tail Text must NOT be removed");
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // intentional: Vec<Range<usize>> with one element
+    fn strip_trailing_insignificant_text_keeps_text_inside_raw_content() {
+        // A tail Text inside a raw-content span must NOT be popped, even if
+        // clean_output-empty, because @message bodies bypass clean_output entirely.
+        let mut tokens = vec![
+            Token::Directive("@message user:".to_string(), 0),
+            Token::Text("\n".to_string(), 15), // trailing blank INSIDE message body
+            Token::Directive("@end".to_string(), 16),
+        ];
+        // raw_content span covers offset 15 (the trailing \n inside the message body).
+        let raw = [0_usize..16_usize];
+        strip_trailing_insignificant_text(&mut tokens, &raw);
+        // The @end directive is not a Text token, so the loop breaks immediately.
+        // The Text("\n", 15) is NOT at the tail (Directive is); nothing is stripped.
+        assert_eq!(
+            tokens.len(),
+            3,
+            "nothing should be stripped when tail is Directive"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // intentional: array of one Range, not Vec<usize>
+    fn strip_trailing_insignificant_text_inside_raw_content_not_stripped() {
+        // Directly test: a tail Text inside a raw span must survive even if clean_output is empty.
+        let mut tokens = vec![
+            Token::Directive("@message user:".to_string(), 0),
+            Token::Text("\n".to_string(), 15), // offset 15 is inside raw span 0..20
+        ];
+        let raw = [0_usize..20_usize]; // covers offset 15
+        strip_trailing_insignificant_text(&mut tokens, &raw);
+        assert_eq!(
+            tokens.len(),
+            2,
+            "tail Text inside raw-content span must NOT be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_insignificant_text_crlf_is_insignificant() {
+        // Text("\r\n") — clean_output strips \r then trim_end → "" → insignificant.
+        let mut tokens = vec![
+            Token::Directive("@end".to_string(), 0),
+            Token::Text("\r\n".to_string(), 5),
+        ];
+        let raw: Vec<Range<usize>> = vec![];
+        strip_trailing_insignificant_text(&mut tokens, &raw);
+        assert_eq!(
+            tokens.len(),
+            1,
+            "CRLF-only trailing Text must be treated as insignificant"
+        );
+    }
+
+    // ── structural_equivalent now ignores trailing insignificant Text ─────────
+
+    #[test]
+    fn structural_equivalent_no_false_positive_on_trailing_blank_after_directive() {
+        // The exact RELEASE BLOCKER 3 repro:
+        // source has a trailing Text("\n") that R2 deletes in formatted.
+        // Before the fix, the token count mismatch caused a false FormatterInvariant.
+        let source = "@if undefined_var:\nx\n@end\n\n";
+        let formatted = "@if undefined_var:\nx\n@end\n";
+        let raw: Vec<Range<usize>> = vec![];
+        assert!(
+            structural_equivalent(source, formatted, &raw),
+            "trailing blank Text must not cause a false negative in structural_equivalent"
+        );
+    }
+
+    #[test]
+    fn structural_equivalent_still_rejects_dropped_meaningful_trailing_text() {
+        // A real formatter bug: meaningful trailing text was lost.
+        // structural_equivalent must still return false in this case.
+        let source = "@if undefined_var:\nx\n@end\nSome trailing text\n";
+        let formatted = "@if undefined_var:\nx\n@end\n"; // trailing text was dropped!
+        let raw: Vec<Range<usize>> = vec![];
+        assert!(
+            !structural_equivalent(source, formatted, &raw),
+            "dropped meaningful trailing text must still be detected as non-equivalent"
+        );
+    }
+
+    #[test]
+    fn structural_equivalent_still_rejects_interior_blank_removal() {
+        // A real formatter bug: interior blank line was removed.
+        // This must still be detected because strip only removes TAIL tokens.
+        let source = "@if undefined_var:\nx\n\ny\n@end\n";
+        let formatted = "@if undefined_var:\nx\ny\n@end\n"; // interior \n removed!
+        let raw: Vec<Range<usize>> = vec![];
+        assert!(
+            !structural_equivalent(source, formatted, &raw),
+            "interior blank line removal must still be detected as non-equivalent"
+        );
+    }
 
     #[test]
     fn structural_equivalent_inside_raw_span_is_byte_exact_not_clean_output() {

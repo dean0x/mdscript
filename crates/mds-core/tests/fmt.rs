@@ -343,6 +343,63 @@ fn syntax_error_unclosed_message_with_trailing_ws_is_syntax_not_formatter_invari
 
 // ── T1-gate-fallback: undefined-var source still formats; import source uses full gate ──
 
+// RELEASE BLOCKER 3: non-compiling source with trailing blank line after final
+// directive must NOT raise FormatterInvariant. R2 trims the trailing blank line,
+// producing a token count mismatch in structural_equivalent that was spuriously
+// reported as a formatter bug (ADR-001 gate false positive).
+#[test]
+fn gate_fallback_structural_equivalent_no_false_positive_on_trailing_blank_line() {
+    // Exact repro: undefined_var → structural_equivalent path; trailing \n after @end
+    // causes R2 to delete a Text("\n") token, creating a count mismatch before the fix.
+    let src = "@if undefined_var:\nx\n@end\n\n";
+    assert!(
+        mds::compile_str(src).is_err(),
+        "sanity: source must not compile standalone (undefined variable)"
+    );
+    let out = format_str(src).expect(
+        "format_str must NOT raise FormatterInvariant for trailing blank line after final directive"
+    );
+    assert_eq!(
+        out, "@if undefined_var:\nx\n@end\n",
+        "R2 should trim the trailing blank"
+    );
+    // Idempotence: formatting the result again must produce the same output.
+    let out2 = format_str(&out).expect("second format pass must succeed");
+    assert_eq!(out, out2, "format_str must be idempotent");
+}
+
+#[test]
+fn gate_fallback_no_false_positive_multiple_trailing_blank_lines() {
+    // Variant: multiple trailing blank lines — all are insignificant and should be stripped.
+    let src = "@for item in undefined_list:\n- {item}\n@end\n\n\n";
+    assert!(
+        mds::compile_str(src).is_err(),
+        "sanity: source must not compile standalone"
+    );
+    let out =
+        format_str(src).expect("multiple trailing blank lines must not produce FormatterInvariant");
+    assert_eq!(out, "@for item in undefined_list:\n- {item}\n@end\n");
+    let out2 = format_str(&out).expect("second pass must succeed");
+    assert_eq!(out, out2, "idempotent");
+}
+
+#[test]
+fn gate_fallback_no_false_positive_crlf_trailing_blank_line() {
+    // CRLF variant: \r\n trailing blank line — clean_output strips \r, still empty.
+    let src = "@if undefined_var:\nx\n@end\r\n\r\n";
+    assert!(
+        mds::compile_str(src).is_err(),
+        "sanity: source must not compile standalone"
+    );
+    let out = format_str(src).expect("CRLF trailing blank must not produce FormatterInvariant");
+    assert_eq!(
+        out, "@if undefined_var:\nx\n@end\n",
+        "R1 + R2 should normalise CRLF + trailing blank"
+    );
+    let out2 = format_str(&out).expect("second pass must succeed");
+    assert_eq!(out, out2, "idempotent");
+}
+
 #[test]
 fn gate_fallback_undefined_var_source_still_formats() {
     // `mds::compile_str` fails (undefined variable), so format_str_with must

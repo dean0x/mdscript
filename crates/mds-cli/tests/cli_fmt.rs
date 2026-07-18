@@ -980,3 +980,40 @@ fn dir_fmt_skips_node_modules() {
         "fmt should succeed; stderr: {stderr}"
     );
 }
+
+// ── RELEASE BLOCKER 3: formatter gate must not false-positive on trailing blank ──
+
+/// `mds fmt` on a non-compiling source (undefined variable → structural_equivalent
+/// fallback) with a trailing blank line after the final directive must exit 0 and
+/// write the formatted file — NOT exit 1 with "formatter_invariant".
+///
+/// Before the fix, R2's `trim_end()` deleted the trailing Text("\n") token from the
+/// formatted output while the source still had it, triggering a spurious
+/// FormatterInvariant error in structural_equivalent's token-count guard.
+#[test]
+fn gate_fallback_no_false_positive_on_trailing_blank_line_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("trailing_blank.mds");
+    // Non-compiling source (undefined_var): takes structural_equivalent path.
+    // Trailing blank line after @end: was the trigger for the false positive.
+    fs::write(&target, "@if undefined_var:\nx\n@end\n\n").unwrap();
+
+    let output = fmt_path(&target, &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("formatter_invariant") && !stderr.contains("file an issue"),
+        "trailing blank line must NOT produce a FormatterInvariant, got: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "fmt must succeed (exit 0) for a non-compiling source with trailing blank; stderr: {stderr}"
+    );
+
+    // The file must have been formatted (trailing blank trimmed).
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        after, "@if undefined_var:\nx\n@end\n",
+        "formatted file must have trailing blank removed"
+    );
+}
