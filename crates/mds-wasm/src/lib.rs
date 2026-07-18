@@ -394,6 +394,7 @@ fn extract_compile_options_wasm(obj: &js_sys::Object) -> Result<mds::CompileOpti
     let opts = mds::CompileOptions {
         source_map,
         include_sources_content,
+        ..Default::default()
     };
     opts.validate().map_err(|_| {
         options_error("option \"sourcesContent\" requires \"sourceMap\" to be true")
@@ -684,6 +685,7 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         let compile_opts = mds::CompileOptions {
             source_map: opts.source_map,
             include_sources_content: opts.include_sources_content,
+            ..Default::default()
         };
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let result =

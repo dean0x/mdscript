@@ -50,6 +50,7 @@ fn vfs_with_map(modules: HashMap<String, String>, entry: &str) -> CompileResult 
         CompileOptions {
             source_map: true,
             include_sources_content: true,
+            ..Default::default()
         },
     )
 }
@@ -1169,6 +1170,7 @@ fn d1_string_source_sources_label_is_input_mds() {
         CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect("should compile");
@@ -1207,6 +1209,7 @@ fn d1_s8_locally_defined_function_no_source_sentinel() {
         CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect("should compile");
@@ -1245,6 +1248,7 @@ fn d1_extends_from_string_no_source_sentinel() {
         CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect("should compile");

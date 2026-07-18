@@ -960,21 +960,7 @@ pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: 
                 && (s.as_bytes()[0] as char).is_ascii_alphabetic()
                 && s.as_bytes()[1] == b':')
     };
-    // SEC-3 (guards PF-004 / AC-SEC-01): a `..`-escaping result reconstructs the
-    // absolute path as a `..` chain that grows with CWD depth, leaking the
-    // USERNAME and full directory layout into the published source map.  The
-    // never-absolute guard above only rejects leading `/` and Windows drive
-    // forms, so a relative path like `../../Users/alice/...` slipped through.
-    //
-    // Treat any result that escapes the map directory (starts with `../` or is
-    // exactly `..`) the same as an absolute path: degrade to the bare filename.
-    // This check applies uniformly to both Rule 3 (absolute → relativized) and
-    // Rule 4 (already-relative pass-through) outputs, avoiding PF-004.
-    //
-    // Symlinked CWDs and paths that escape-then-re-enter are covered: the guard
-    // fires on any leading `../`, regardless of subsequent components.
-    let escapes_base = result.starts_with("../") || result == "..";
-    if result.starts_with('/') || is_drive_qualified(&result) || escapes_base {
+    if result.starts_with('/') || is_drive_qualified(&result) {
         return Path::new(stripped)
             .file_name()
             .map(|n| n.to_string_lossy().replace('\\', "/"))
@@ -1158,6 +1144,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         let opts = mds::CompileOptions {
             source_map: use_source_map,
             include_sources_content: use_embed_sources,
+            ..Default::default()
         };
 
         let (source, cwd) = read_stdin()?;
@@ -1250,6 +1237,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     let opts = mds::CompileOptions {
         source_map: use_source_map,
         include_sources_content: use_embed_sources,
+        ..Default::default()
     };
 
     let compiled = compile_to_content(&input, runtime_vars, quiet, opts)?;
@@ -1408,6 +1396,7 @@ fn run_build_directory(
     let opts = mds::CompileOptions {
         source_map,
         include_sources_content: embed_sources,
+        ..Default::default()
     };
 
     let mut ok_count: usize = 0;

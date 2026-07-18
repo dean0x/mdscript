@@ -107,6 +107,29 @@ pub trait FileSystem: Send + Sync {
     fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
         Ok(path.to_string())
     }
+
+    /// Return the established project root directory as a string, if any.
+    ///
+    /// Used by the source-map path-relativization choke-point
+    /// ([`crate::source_path::relativize_source`]) to determine whether a
+    /// resolved source path is contained within the project root and should be
+    /// emitted as a root-relative (or map-relative) reference rather than
+    /// degraded to a bare filename.
+    ///
+    /// # Default
+    ///
+    /// Returns `None` — suitable for virtual / in-memory filesystems
+    /// ([`VirtualFs`] / WASM) where there is no containment concept.
+    ///
+    /// # Override
+    ///
+    /// [`NativeFs`] returns the path established by `init_root` (the project
+    /// root found by walking up from the entry-point directory).  Returns
+    /// `None` if the root has not been established yet (before any
+    /// `normalize` or `set_root` call).
+    fn source_root(&self) -> Option<String> {
+        None
+    }
 }
 
 // ── VirtualFs shared segment logic ───────────────────────────────────────────
@@ -494,6 +517,10 @@ impl FileSystem for NativeFs {
                 }
                 other => other,
             })
+    }
+
+    fn source_root(&self) -> Option<String> {
+        self.root_dir.get().map(|p| p.display().to_string())
     }
 }
 
@@ -1373,6 +1400,67 @@ mod tests {
         assert!(
             output.contains("Hello World!"),
             "expected 'Hello World!' from custom fs import, got: {output}"
+        );
+    }
+
+    // ── source_root ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn native_source_root_none_before_any_normalize() {
+        // Before normalize() or set_root() is called, root has not been established.
+        let fs = NativeFs::new();
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "source_root() must be None before any normalize call"
+        );
+    }
+
+    #[test]
+    fn native_source_root_set_after_normalize() {
+        // After the first normalize() call the root is established and
+        // source_root() returns Some.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        fs.normalize("", &file.display().to_string()).unwrap();
+        let root = fs.source_root();
+        assert!(root.is_some(), "source_root() must be Some after normalize");
+        // The returned root must be an absolute path.
+        assert!(
+            root.as_deref().unwrap_or("").starts_with('/'),
+            "source_root() must be absolute, got {:?}",
+            root
+        );
+    }
+
+    #[test]
+    fn native_source_root_no_marker_falls_back_to_entry_dir() {
+        // In a temp directory with no .git / .mdsroot marker, the root should
+        // fall back to the entry-point directory itself (not a parent).
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        fs.normalize("", &file.display().to_string()).unwrap();
+        let root = fs.source_root().expect("root must be set after normalize");
+        // The root must be the temp dir (entry-point directory) or a parent of it.
+        // At minimum it must be an ancestor of the file.
+        let file_canon = file.canonicalize().unwrap();
+        let root_path = std::path::PathBuf::from(&root);
+        assert!(
+            file_canon.starts_with(&root_path),
+            "source_root {root:?} must be an ancestor of {file_canon:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_source_root_always_none() {
+        // VirtualFs has no containment concept — source_root() always returns None.
+        let fs = VirtualFs::new(std::collections::HashMap::new());
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "VirtualFs source_root() must always be None"
         );
     }
 }

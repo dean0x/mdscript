@@ -511,6 +511,7 @@ fn extract_compile_options_direct(env: &Env, obj: &Object) -> napi::Result<mds::
     let opts = mds::CompileOptions {
         source_map,
         include_sources_content,
+        ..Default::default()
     };
     opts.validate().map_err(|_| {
         throw_options_error(

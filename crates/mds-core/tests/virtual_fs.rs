@@ -1536,6 +1536,7 @@ fn source_map_extends_type_mismatch_span_not_misattributed_to_child() {
         mds::CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect_err("cross-type mismatch in an inherited @if must error");
@@ -1575,6 +1576,7 @@ fn source_map_standalone_type_mismatch_carries_span() {
         mds::CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect_err("cross-type == in @if must fail");

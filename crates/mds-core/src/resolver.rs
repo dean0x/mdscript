@@ -862,6 +862,18 @@ impl ModuleCache {
             let fm_prefix_len = final_str.len() - body_clean_len;
             let source_map =
                 map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+            // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
+            // relativize ALL sources[] entries so no absolute path can leak into
+            // the published map.  Unconditional — never opt-in, never debug_assert.
+            let source_map = source_map.map(|mut sm| {
+                let root_str = self.fs.source_root();
+                let root = root_str.as_deref().map(std::path::Path::new);
+                let base = opts.source_map_base.as_deref();
+                for src in &mut sm.sources {
+                    *src = crate::source_path::relativize_source(src, base, root);
+                }
+                sm
+            });
             return Ok((crate::CompiledOutput::Markdown(final_str), source_map));
         }
 
@@ -921,6 +933,18 @@ impl ModuleCache {
         let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
         let fm_prefix_len = final_str.len() - body_clean_len;
         let source_map = map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+        // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
+        // relativize ALL sources[] entries so no absolute path can leak into
+        // the published map.  Unconditional — never opt-in, never debug_assert.
+        let source_map = source_map.map(|mut sm| {
+            let root_str = self.fs.source_root();
+            let root = root_str.as_deref().map(std::path::Path::new);
+            let base = opts.source_map_base.as_deref();
+            for src in &mut sm.sources {
+                *src = crate::source_path::relativize_source(src, base, root);
+            }
+            sm
+        });
         Ok((crate::CompiledOutput::Markdown(final_str), source_map))
     }
 

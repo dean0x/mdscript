@@ -433,6 +433,16 @@ pub struct CompileOptions {
     /// space for callers that do not need embedded sources (CLI default unless
     /// `--embed-sources` is passed).
     pub include_sources_content: bool,
+    /// Directory that the source map file will be written to.
+    ///
+    /// Source Map v3 specifies that `sources[]` paths are relative to the map
+    /// file's location.  When `Some`, [`crate::source_path::relativize_source`]
+    /// emits paths relative to this directory; when `None` (the default), paths
+    /// are emitted relative to the project root (root-relative form).
+    ///
+    /// CLI sets this to the output file's parent directory (Coder B).
+    /// Binding surfaces (napi, Python, WASM) leave it `None`.
+    pub source_map_base: Option<std::path::PathBuf>,
 }
 
 /// Error returned by [`CompileOptions::validate`] when the field combination is invalid.
@@ -981,6 +991,7 @@ mod tests {
         let opts = CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         };
         assert!(
             opts.validate().is_ok(),
@@ -993,6 +1004,7 @@ mod tests {
         let opts = CompileOptions {
             source_map: true,
             include_sources_content: true,
+            ..Default::default()
         };
         assert!(
             opts.validate().is_ok(),
@@ -1005,6 +1017,7 @@ mod tests {
         let opts = CompileOptions {
             source_map: false,
             include_sources_content: true,
+            ..Default::default()
         };
         assert!(
             opts.validate().is_err(),

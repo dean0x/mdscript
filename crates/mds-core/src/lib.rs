@@ -53,6 +53,7 @@ pub(crate) mod options;
 pub(crate) mod parser;
 pub(crate) mod resolver;
 pub(crate) mod scope;
+pub(crate) mod source_path;
 pub(crate) mod sourcemap;
 pub(crate) mod validator;
 pub(crate) mod value;
@@ -64,6 +65,7 @@ pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };
 pub use resolver::ModuleCache;
+pub use source_path::relativize_source;
 pub use sourcemap::{CompileOptions, InvalidOptionsError, SourceMap, STRING_SOURCE_MAP_LABEL};
 
 /// A single structured message produced by a template containing `@message` blocks.
@@ -937,7 +939,7 @@ pub fn compile_virtual_with_deps(
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true, include_sources_content: false })?;
+/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() })?;
 /// if let Some(sm) = result.source_map { println!("{}", sm.to_json()); }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -981,7 +983,7 @@ pub fn compile_with_deps_opts(
 ///     "Hello!\n",
 ///     None,
 ///     None,
-///     mds::CompileOptions { source_map: true, include_sources_content: false },
+///     mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() },
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1022,7 +1024,7 @@ pub fn compile_str_with_deps_opts(
 ///     modules,
 ///     "main.mds",
 ///     None,
-///     mds::CompileOptions { source_map: true, include_sources_content: false },
+///     mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() },
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())

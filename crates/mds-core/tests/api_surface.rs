@@ -1325,6 +1325,7 @@ fn compile_options_has_source_map_and_include_sources_content() {
     let off = mds::CompileOptions {
         source_map: false,
         include_sources_content: false,
+        ..Default::default()
     };
     assert!(!off.source_map);
     assert!(!off.include_sources_content);
@@ -1332,6 +1333,7 @@ fn compile_options_has_source_map_and_include_sources_content() {
     let on = mds::CompileOptions {
         source_map: true,
         include_sources_content: true,
+        ..Default::default()
     };
     assert!(on.source_map);
     assert!(on.include_sources_content);
@@ -1357,6 +1359,7 @@ fn include_sources_content_false_omits_sources_content() {
         mds::CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect("should compile");
@@ -1382,6 +1385,7 @@ fn include_sources_content_true_includes_sources_content() {
         mds::CompileOptions {
             source_map: true,
             include_sources_content: true,
+            ..Default::default()
         },
     )
     .expect("should compile");
