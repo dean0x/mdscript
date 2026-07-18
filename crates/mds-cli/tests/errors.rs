@@ -467,3 +467,35 @@ fn if_negation_undefined_variable_is_error() {
         "error must mention the undefined variable, got: {err}"
     );
 }
+
+#[test]
+fn type_mismatch_cli_shows_miette_code_frame() {
+    // D2: a type mismatch in @if now carries a span, so the CLI renders a miette
+    // code frame with ╭─[file:line:col] (or the equivalent inline code block).
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("mismatch.mds");
+    // frontmatter: x is a YAML integer (number); condition compares to a string.
+    std::fs::write(
+        &input,
+        "---\nx: 3\n---\n@if x == \"3\":\nyes\n@else:\nno\n@end\n",
+    )
+    .unwrap();
+
+    let output = mds_bin()
+        .args(["build", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "D2: type mismatch must fail");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    // miette renders a code frame with ╭─[file:line:col] when a span is present.
+    assert!(
+        stderr.contains("type mismatch") || stderr.contains("mds::type_mismatch"),
+        "D2: stderr must mention type_mismatch; got: {stderr}"
+    );
+    // A span is present → miette shows the file path in the frame.
+    assert!(
+        stderr.contains("mismatch.mds") || stderr.contains(":4:") || stderr.contains("4 │"),
+        "D2: miette code frame must reference file or line 4; got: {stderr}"
+    );
+}

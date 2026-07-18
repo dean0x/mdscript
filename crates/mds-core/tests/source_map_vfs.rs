@@ -884,11 +884,11 @@ fn source_map_messages_mode_degrades_to_none() {
     );
 
     // A warning must be emitted explaining the degradation (AC-FUNC-07).
-    let has_warning = result.warnings.iter().any(|w| {
-        w.contains("messages-mode")
-            || w.contains("@message")
-            || w.contains("source_map will be None")
-    });
+    // The warning uses MSG_MODE_SOURCE_MAP_WARNING (surface-neutral wording).
+    let has_warning = result
+        .warnings
+        .iter()
+        .any(|w| w.contains("messages-mode output") && w.contains("source_map will be None"));
     assert!(
         has_warning,
         "AC-FUNC-07: must emit a warning for messages-mode + source_map=true; \

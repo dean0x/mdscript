@@ -67,15 +67,34 @@ pub(crate) struct EvalContext<'a> {
     ///
     /// Irrelevant (always `false`) when `map` is `None` — zero-cost path.
     fn_body_owned: bool,
+    /// Display path of the current module, used for `type_mismatch_at` spans.
+    ///
+    /// Matches the `file_str` field in `ModuleCtx` (resolver.rs).  Set to `""`
+    /// on the simple `evaluate()` path where no file context is available —
+    /// the `build_type_mismatch` helper degrades to spanless when this is empty
+    /// (ADR-005 / DECISIONS_CONTEXT: degrade rather than mis-attribute).
+    pub(crate) file: &'a str,
+    /// Raw source of the current module, used for span byte-offset computation.
+    ///
+    /// Set to `""` when no source context is threaded in (e.g. unit-test paths
+    /// that call `evaluate()` directly).  The `build_type_mismatch` helper checks
+    /// `source.is_empty()` before attempting span construction.
+    pub(crate) source: &'a str,
 }
 
 /// Evaluate a module body into a final rendered string.
 ///
 /// Warnings (e.g. empty `@include`) are appended to `warnings`.
+/// `file` and `source` are the display path and raw source of the module being
+/// evaluated; they are threaded into `EvalContext` so that diagnostics raised
+/// during condition evaluation (e.g. `mds::type_mismatch`) can carry source spans.
+/// Pass `""` for both when no source context is available (e.g. in unit tests).
 pub fn evaluate(
     nodes: &[Node],
     scope: &mut Scope,
     warnings: &mut Vec<String>,
+    file: &str,
+    source: &str,
 ) -> Result<String, MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
@@ -85,6 +104,8 @@ pub fn evaluate(
         map: None,
         fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
+        file,
+        source,
     };
     evaluate_nodes(nodes, scope, &mut ctx)
 }
@@ -96,6 +117,9 @@ pub fn evaluate(
 /// finalization stage.  The builder's `cursor` is guaranteed to equal
 /// `output.len() as u32` when this function returns.
 ///
+/// `file` and `source` are threaded into `EvalContext` for diagnostic spans
+/// (see [`evaluate`] for details).
+///
 /// Delegates to [`evaluate_with_map_seeded`] with seed counters of 0.
 /// Use [`evaluate_with_map_seeded`] directly when you need to carry cumulative
 /// resource budgets across multiple invocations (e.g. `@extends` regions).
@@ -104,8 +128,11 @@ pub(crate) fn evaluate_with_map(
     scope: &mut Scope,
     warnings: &mut Vec<String>,
     builder: crate::sourcemap::MapBuilder,
+    file: &str,
+    source: &str,
 ) -> Result<(String, crate::sourcemap::MapBuilder), MdsError> {
-    let (output, map, _, _) = evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0)?;
+    let (output, map, _, _) =
+        evaluate_with_map_seeded(nodes, scope, warnings, builder, 0, 0, file, source)?;
     Ok((output, map))
 }
 
@@ -116,11 +143,15 @@ pub(crate) fn evaluate_with_map(
 /// `@extends` regions).  Returns `(output, builder, total_iterations, total_msg_bytes)`
 /// so the caller can thread the running totals into the next invocation.
 ///
+/// `file` and `source` are threaded into `EvalContext` for diagnostic spans
+/// (see [`evaluate`] for details).
+///
 /// Used by `evaluate_regions_with_map` (resolver.rs) to enforce a single cumulative
 /// iteration cap across all spliced `@extends` regions (REL-1, applies PF-004).
 ///
 /// The `MapBuilder` is returned as a structured error rather than a panic if it
 /// disappears — aligns with PF-005 (don't rely on panic for invariants).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_with_map_seeded(
     nodes: &[Node],
     scope: &mut Scope,
@@ -128,6 +159,8 @@ pub(crate) fn evaluate_with_map_seeded(
     builder: crate::sourcemap::MapBuilder,
     seed_iterations: usize,
     seed_msg_bytes: usize,
+    file: &str,
+    source: &str,
 ) -> Result<(String, crate::sourcemap::MapBuilder, usize, usize), MdsError> {
     let mut ctx = EvalContext {
         call_stack: Vec::new(),
@@ -137,6 +170,8 @@ pub(crate) fn evaluate_with_map_seeded(
         map: Some(builder),
         fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
+        file,
+        source,
     };
     let output = evaluate_nodes(nodes, scope, &mut ctx)?;
     let map = ctx.map.take().ok_or_else(|| {
@@ -775,6 +810,36 @@ fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
     }
 }
 
+/// Build a `TypeMismatch` error, with or without a source span.
+///
+/// If `anchor` is `Some(offset)` and the offset falls within `ctx.source`,
+/// the error carries a span anchored to the entire enclosing `@if`/`@elseif`
+/// directive line (from `offset` to the first `\n`).  If the offset is out
+/// of bounds or the source is empty (e.g. a cross-source `@extends` splice
+/// where the condition's AST offset is relative to the base template, not the
+/// current module), the function degrades to a spanless error — never
+/// mis-attributes a span from a different source (DECISIONS_CONTEXT ADR-005 /
+/// general rule: degrade rather than misattribute).
+fn build_type_mismatch(
+    ctx: &EvalContext<'_>,
+    anchor: Option<usize>,
+    lhs_type: &str,
+    rhs_type: &str,
+) -> MdsError {
+    if let Some(off) = anchor {
+        if !ctx.source.is_empty() && off <= ctx.source.len() && ctx.source.is_char_boundary(off) {
+            // Span covers the full directive line (from `off` to just before `\n`).
+            let line_len = ctx.source[off..]
+                .find('\n')
+                .unwrap_or(ctx.source[off..].len());
+            return MdsError::type_mismatch_at(
+                lhs_type, rhs_type, ctx.file, ctx.source, off, line_len,
+            );
+        }
+    }
+    MdsError::type_mismatch(lhs_type, rhs_type)
+}
+
 /// Evaluate a condition to a boolean, resolving expressions from scope.
 ///
 /// `scope` is `&mut` because conditions can now contain arbitrary expressions
@@ -783,10 +848,17 @@ fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
 /// evaluation (`&&`, `||`) limits which operands are evaluated — the
 /// right-hand side of `&&` is skipped on a false left-hand side, and
 /// vice-versa for `||`.
+///
+/// `anchor` is the byte offset of the enclosing `@if`/`@elseif` directive in
+/// `ctx.source`.  It is passed through `And`/`Or` recursion unchanged so that
+/// nested comparisons always report the enclosing directive line, not a nested
+/// sub-expression location.  Pass `None` when no anchor is available (callers
+/// that do not thread file/source context into `ctx`).
 fn evaluate_condition(
     condition: &Condition,
     scope: &mut Scope,
     ctx: &mut EvalContext,
+    anchor: Option<usize>,
 ) -> Result<bool, MdsError> {
     match condition {
         Condition::Truthy(expr) => Ok(evaluate_expr(expr, scope, ctx)?.is_truthy()),
@@ -794,15 +866,18 @@ fn evaluate_condition(
         Condition::Eq(lhs, rhs) => {
             let lhs_val = evaluate_expr(lhs, scope, ctx)?;
             let rhs_val = evaluate_expr(rhs, scope, ctx)?;
-            values_equal_same_type(&lhs_val, &rhs_val)
-                .ok_or_else(|| MdsError::type_mismatch(lhs_val.type_name(), rhs_val.type_name()))
+            values_equal_same_type(&lhs_val, &rhs_val).ok_or_else(|| {
+                build_type_mismatch(ctx, anchor, lhs_val.type_name(), rhs_val.type_name())
+            })
         }
         Condition::NotEq(lhs, rhs) => {
             let lhs_val = evaluate_expr(lhs, scope, ctx)?;
             let rhs_val = evaluate_expr(rhs, scope, ctx)?;
             values_equal_same_type(&lhs_val, &rhs_val)
                 .map(|eq| !eq)
-                .ok_or_else(|| MdsError::type_mismatch(lhs_val.type_name(), rhs_val.type_name()))
+                .ok_or_else(|| {
+                    build_type_mismatch(ctx, anchor, lhs_val.type_name(), rhs_val.type_name())
+                })
         }
         // Short-circuit And: return false on first false operand.
         // Parser invariant: And operands are always leaf conditions (parse_and_level calls
@@ -817,7 +892,7 @@ fn evaluate_condition(
                     !matches!(operand, Condition::And(_) | Condition::Or(_)),
                     "And operand should be a leaf condition, not And/Or"
                 );
-                if !evaluate_condition(operand, scope, ctx)? {
+                if !evaluate_condition(operand, scope, ctx, anchor)? {
                     return Ok(false);
                 }
             }
@@ -834,7 +909,7 @@ fn evaluate_condition(
                     !matches!(operand, Condition::Or(_)),
                     "Or operand should not be Or (parser flattens same-level operators)"
                 );
-                if evaluate_condition(operand, scope, ctx)? {
+                if evaluate_condition(operand, scope, ctx, anchor)? {
                     return Ok(true);
                 }
             }
@@ -848,12 +923,14 @@ fn evaluate_if(
     scope: &mut Scope,
     ctx: &mut EvalContext,
 ) -> Result<String, MdsError> {
-    // Evaluate the primary condition
-    if evaluate_condition(&block.condition, scope, ctx)? {
+    // Evaluate the primary condition; anchor span on the @if directive line.
+    if evaluate_condition(&block.condition, scope, ctx, Some(block.offset))? {
         return evaluate_nodes(&block.then_body, scope, ctx);
     }
 
-    // Evaluate @elseif branches in order (short-circuit: first true branch wins)
+    // Evaluate @elseif branches in order (short-circuit: first true branch wins).
+    // Each branch's anchor is its own offset so type_mismatch points to the
+    // @elseif line that triggered the error, not the @if line.
     // Parser enforces MAX_ELSEIF_BRANCHES at construction time; assert the invariant
     // holds so evaluator correctness cannot silently depend on the parser limit alone.
     debug_assert!(
@@ -863,7 +940,7 @@ fn evaluate_if(
         MAX_ELSEIF_BRANCHES,
     );
     for branch in &block.elseif_branches {
-        if evaluate_condition(&branch.condition, scope, ctx)? {
+        if evaluate_condition(&branch.condition, scope, ctx, Some(branch.offset))? {
             return evaluate_nodes(&branch.body, scope, ctx);
         }
     }
@@ -1097,6 +1174,8 @@ pub fn evaluate_messages_intrinsic(
         map: None,
         fragment_remap_cache: std::collections::HashMap::new(),
         fn_body_owned: false,
+        file,
+        source,
     };
     let mut messages = Vec::new();
     collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;
@@ -1249,7 +1328,7 @@ fn collect_messages_from_if(
     file: &str,
     source: &str,
 ) -> Result<(), MdsError> {
-    if evaluate_condition(&block.condition, scope, ctx)? {
+    if evaluate_condition(&block.condition, scope, ctx, Some(block.offset))? {
         return collect_messages_strict(&block.then_body, scope, ctx, out, file, source);
     }
     // Parser enforces MAX_ELSEIF_BRANCHES at construction time; assert the invariant
@@ -1262,7 +1341,7 @@ fn collect_messages_from_if(
         MAX_ELSEIF_BRANCHES,
     );
     for branch in &block.elseif_branches {
-        if evaluate_condition(&branch.condition, scope, ctx)? {
+        if evaluate_condition(&branch.condition, scope, ctx, Some(branch.offset))? {
             return collect_messages_strict(&branch.body, scope, ctx, out, file, source);
         }
     }
@@ -1304,7 +1383,7 @@ mod tests {
         let mut scope = Scope::new();
         let mut warnings = vec![];
         assert_eq!(
-            evaluate(&nodes, &mut scope, &mut warnings).unwrap(),
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
             "Hello world!"
         );
     }
@@ -1324,7 +1403,7 @@ mod tests {
         let mut warnings = vec![];
         scope.set_var("name", Value::String("Alice".to_string()));
         assert_eq!(
-            evaluate(&nodes, &mut scope, &mut warnings).unwrap(),
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
             "Hello Alice!"
         );
     }
@@ -1338,7 +1417,7 @@ mod tests {
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
-        let err = evaluate(&nodes, &mut scope, &mut warnings).unwrap_err();
+        let err = evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("unknown"),
@@ -1359,7 +1438,10 @@ mod tests {
         let mut scope = Scope::new();
         let mut warnings = vec![];
         scope.set_var("flag", Value::Boolean(true));
-        assert_eq!(evaluate(&nodes, &mut scope, &mut warnings).unwrap(), "yes");
+        assert_eq!(
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
+            "yes"
+        );
     }
 
     #[test]
@@ -1375,7 +1457,10 @@ mod tests {
         let mut scope = Scope::new();
         let mut warnings = vec![];
         scope.set_var("flag", Value::Boolean(false));
-        assert_eq!(evaluate(&nodes, &mut scope, &mut warnings).unwrap(), "no");
+        assert_eq!(
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
+            "no"
+        );
     }
 
     #[test]
@@ -1405,7 +1490,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            evaluate(&nodes, &mut scope, &mut warnings).unwrap(),
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
             "- apple\n- banana\n"
         );
     }
@@ -1441,7 +1526,7 @@ mod tests {
         })];
         let mut warnings = vec![];
         assert_eq!(
-            evaluate(&nodes, &mut scope, &mut warnings).unwrap(),
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
             "Hello Bob!"
         );
     }
@@ -1456,7 +1541,7 @@ mod tests {
         let mut scope = Scope::new();
         let mut warnings = vec![];
         assert_eq!(
-            evaluate(&nodes, &mut scope, &mut warnings).unwrap(),
+            evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
             "Use {name} for interpolation"
         );
     }
@@ -1554,7 +1639,7 @@ mod tests {
             len: 4,
         })];
         let mut warnings = vec![];
-        let result = evaluate(&call_node, &mut scope, &mut warnings);
+        let result = evaluate(&call_node, &mut scope, &mut warnings, "", "");
         assert!(result.is_err(), "call chain of {n} must be rejected");
         let err = format!("{}", result.unwrap_err());
         assert!(
@@ -1720,7 +1805,7 @@ mod tests {
         let nodes = vec![text(&chunk), text(&chunk)];
         let mut scope = Scope::new();
         let mut warnings = vec![];
-        let result = evaluate(&nodes, &mut scope, &mut warnings);
+        let result = evaluate(&nodes, &mut scope, &mut warnings, "", "");
         assert!(
             result.is_err(),
             "output exceeding MAX_OUTPUT_SIZE must be rejected"
@@ -2026,7 +2111,7 @@ mod tests {
             len: 12,
         })];
         let mut warnings = vec![];
-        let err = evaluate(&nodes, &mut scope, &mut warnings)
+        let err = evaluate(&nodes, &mut scope, &mut warnings, "", "")
             .expect_err("should fail with arity mismatch");
 
         // Assert the span is None on the evaluator path (no source text available).
@@ -2062,7 +2147,7 @@ mod tests {
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
-        let err = evaluate(&nodes, &mut scope, &mut warnings)
+        let err = evaluate(&nodes, &mut scope, &mut warnings, "", "")
             .expect_err("upper() with 2 args should fail");
 
         match err {

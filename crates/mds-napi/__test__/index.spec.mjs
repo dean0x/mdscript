@@ -342,6 +342,23 @@ describe('error shape', () => {
       },
     );
   });
+
+  // D2: type_mismatch_at — cross-type @if comparison now carries a source span
+  test('D2: type_mismatch from @if cross-type comparison carries a non-null span', () => {
+    const src = '---\nx: 3\n---\n@if x == "3":\nyes\n@end\n';
+    assert.throws(
+      () => compile(src),
+      (err) => {
+        assert.equal(err.code, 'mds::type_mismatch', `D2: expected type_mismatch, got: ${err.code}`);
+        assert.ok(err.span !== undefined && err.span !== null, 'D2: type_mismatch must carry a span');
+        assert.ok(typeof err.span.offset === 'number', 'D2: span.offset must be a number');
+        assert.ok(err.span.length > 0, 'D2: span.length must be > 0');
+        assert.ok(typeof err.span.line === 'number', `D2: span.line must be a number, got: ${typeof err.span.line}`);
+        assert.ok(typeof err.span.column === 'number', `D2: span.column must be a number, got: ${typeof err.span.column}`);
+        return true;
+      },
+    );
+  });
 });
 
 // ── Options validation tests ──────────────────────────────────────────────────

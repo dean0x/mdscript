@@ -198,6 +198,15 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
 const SOURCE_LABEL: &str = "<source>";
 
+/// Warning emitted when `source_map: true` is used with a messages-mode template.
+///
+/// Source maps operate on a flat text stream; messages-mode boundaries
+/// (`@message` blocks) are not representable in the SMv3 segment model.
+/// The warning is surface-neutral (no mention of specific option names or APIs).
+const MSG_MODE_SOURCE_MAP_WARNING: &str =
+    "source maps are not supported for messages-mode output (@message blocks); \
+     source_map will be None for this compilation";
+
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.
@@ -686,13 +695,21 @@ impl ModuleCache {
                     builder,
                     running_iterations,
                     running_msg_bytes,
+                    origin.file.as_ref(),
+                    origin.source.as_ref(),
                 )?;
                 running_iterations = iters;
                 running_msg_bytes = bytes;
                 current_map = Some(returned_builder);
                 region_out
             } else {
-                evaluate(nodes, scope, warnings)?
+                evaluate(
+                    nodes,
+                    scope,
+                    warnings,
+                    origin.file.as_ref(),
+                    origin.source.as_ref(),
+                )?
             };
 
             // PF-004: cumulative size guard — same limit as the per-node check.
@@ -794,11 +811,7 @@ impl ModuleCache {
                 // The evaluator only has text-stream semantics; messages boundaries don't
                 // have stable byte offsets relative to the source.  Degrade gracefully.
                 if opts.source_map {
-                    warnings.push(
-                        "source_map: true is not supported for messages-mode templates \
-                         (@message blocks); source_map will be None"
-                            .to_string(),
-                    );
+                    warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
                 }
                 let messages = evaluate_messages_intrinsic(
                     &final_body,
@@ -833,7 +846,10 @@ impl ModuleCache {
                     None => (raw, None),
                 }
             } else {
-                (evaluate(&final_body, &mut scope, warnings)?, None)
+                (
+                    evaluate(&final_body, &mut scope, warnings, ctx.file_str, ctx.source)?,
+                    None,
+                )
             };
 
             let body_clean = crate::clean_output(&body_raw);
@@ -864,11 +880,7 @@ impl ModuleCache {
         if has_message_block(&module.body) {
             // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
             if opts.source_map {
-                warnings.push(
-                    "source_map: true is not supported for messages-mode templates \
-                     (@message blocks); source_map will be None"
-                        .to_string(),
-                );
+                warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
             }
             let messages = evaluate_messages_intrinsic(
                 &module.body,
@@ -888,11 +900,21 @@ impl ModuleCache {
         let (body_raw, map_out) = if opts.source_map {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
-            let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let (raw, returned) = evaluate_with_map(
+                &module.body,
+                &mut scope,
+                warnings,
+                builder,
+                ctx.file_str,
+                ctx.source,
+            )?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             apply_map_degradation(raw, returned, opts, warnings)
         } else {
-            (evaluate(&module.body, &mut scope, warnings)?, None)
+            (
+                evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?,
+                None,
+            )
         };
 
         let body_clean = crate::clean_output(&body_raw);
@@ -991,8 +1013,14 @@ impl ModuleCache {
         let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
-            let (body_raw, returned) =
-                evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
+            let (body_raw, returned) = evaluate_with_map(
+                &module.body,
+                &mut scope,
+                warnings,
+                builder,
+                ctx.file_str,
+                ctx.source,
+            )?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
 
             // RUST-3 / PF-004 observability: propagate the segment-cap drop flag from
@@ -1024,7 +1052,7 @@ impl ModuleCache {
             };
             (body, fmap)
         } else {
-            let body_raw = evaluate(&module.body, &mut scope, warnings)?;
+            let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
             (body, None)
         };
@@ -1316,7 +1344,7 @@ impl ModuleCache {
             merged_frontmatter,
         } = components;
 
-        let prompt_body = evaluate(&final_body, &mut scope, warnings)?;
+        let prompt_body = evaluate(&final_body, &mut scope, warnings, ctx.file_str, ctx.source)?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
         Ok(ResolvedModule {
@@ -1635,7 +1663,8 @@ impl ModuleCache {
                 defs.explicit_exports.insert(name.clone());
             }
             ExportDirective::Wildcard {
-                path: import_path, ..
+                path: import_path,
+                offset,
             } => {
                 // Re-export all exports from the target module. These are
                 // available to importers but NOT in the current file's scope.
@@ -1647,9 +1676,22 @@ impl ModuleCache {
                     ctx.runtime_vars,
                     warnings,
                 )?;
+                let line_len = if ctx.source.len() > *offset {
+                    ctx.source[*offset..]
+                        .find('\n')
+                        .unwrap_or(ctx.source[*offset..].len())
+                } else {
+                    0
+                };
                 for (name, func) in source_module.get_all_exports() {
                     if defs.functions.contains_key(&name) {
-                        return Err(MdsError::name_collision(name));
+                        return Err(MdsError::name_collision_at(
+                            &name,
+                            ctx.file_str,
+                            ctx.source,
+                            *offset,
+                            line_len,
+                        ));
                     }
                     defs.functions.insert(name.clone(), func);
                     defs.explicit_exports.insert(name);
@@ -1669,7 +1711,13 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         if scope.get_namespace(alias).is_some() {
-            return Err(MdsError::name_collision(alias.to_string()));
+            return Err(MdsError::name_collision_at(
+                alias,
+                ctx.file_str,
+                ctx.source,
+                offset,
+                alias.len(),
+            ));
         }
         let resolved = self
             .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
@@ -1757,9 +1805,22 @@ impl ModuleCache {
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
+        let line_len = if ctx.source.len() > offset {
+            ctx.source[offset..]
+                .find('\n')
+                .unwrap_or(ctx.source[offset..].len())
+        } else {
+            0
+        };
         for (name, func) in resolved.get_all_exports() {
             if scope.get_function(&name).is_some() {
-                return Err(MdsError::name_collision(name));
+                return Err(MdsError::name_collision_at(
+                    &name,
+                    ctx.file_str,
+                    ctx.source,
+                    offset,
+                    line_len,
+                ));
             }
             scope.set_function(&name, func);
         }
