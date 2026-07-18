@@ -625,8 +625,14 @@ fn run_lint_stdin(
     flags: LintFlags,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
 ) -> Result<()> {
+    // Bind all five flags — previously `check` and `diff` were silently dropped
+    // via `..`, causing `--fix --check` to apply fixes unconditionally (avoids PF-004).
     let LintFlags {
-        fix, quiet, format, ..
+        fix,
+        check,
+        diff,
+        quiet,
+        format,
     } = flags;
 
     let (source, cwd) = read_stdin()?;
@@ -651,7 +657,44 @@ fn run_lint_stdin(
     };
 
     if fix {
-        // --fix stdin: apply fixes, emit fixed source to stdout, diagnostics to stderr.
+        // ── Preview path: --fix --check and/or --fix --diff (never writes source) ───
+        // Mirrors run_lint_file's preview path so stdin honours --check / --diff the
+        // same way file targets do (PF-004: same gated pipeline as the write path).
+        if check || diff {
+            let preview = preview_fixes(&result, &source, &cwd, runtime_vars.clone(), &config);
+            match preview {
+                PreviewOutcome::WouldFix(ref fixed) => {
+                    if diff {
+                        let diff_str = render_diff_lint(&source, fixed, "stdin");
+                        let _ = write_stdout(&diff_str);
+                    }
+                    if check {
+                        if !quiet {
+                            eprintln!("Would fix: stdin");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                PreviewOutcome::Rejected(ref reason) => {
+                    if !quiet {
+                        eprintln!("fix rejected: {reason}");
+                    }
+                }
+                PreviewOutcome::NothingToFix => {}
+            }
+            // After diff-only preview, or when nothing would change / fix rejected:
+            // render diagnostics of the original result and exit by severity.
+            let named_source = if format == LintFormat::Human {
+                Some(("input.mds", source.as_str()))
+            } else {
+                None
+            };
+            emit_result(format, &result, quiet, named_source);
+            exit_by_severity(&result);
+            return Ok(());
+        }
+
+        // ── Write path: apply fixes, emit fixed source to stdout ─────────────────
         let fix_outcome = plan_and_apply_fixes(result, &source, &cwd, runtime_vars, &config);
         let (output_src, diag_result) = match fix_outcome {
             FixFileOutcome::Fixed {
@@ -664,10 +707,11 @@ fn run_lint_stdin(
                 applied_count,
                 total_count,
             } => {
-                eprintln!(
-                    "partial fix: {applied_count} of {total_count} fixes applied, \
-                     some edits individually rejected by the reverify gate"
-                );
+                if !quiet {
+                    eprintln!(
+                        "Partially fixed: stdin ({applied_count} of {total_count} fixes applied)"
+                    );
+                }
                 (new_source, residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
@@ -848,6 +892,20 @@ fn run_lint_file(
 
 // ── Directory mode ────────────────────────────────────────────────────────────
 
+/// Compile-time context for directory-mode lint.
+///
+/// Groups the parameters resolved once at the start of a directory lint run and
+/// threaded into every per-file call — removes the `#[allow(clippy::too_many_arguments)]`
+/// suppressions on `lint_one_file_accumulating` and `lint_one_file_human`
+/// (issue #6 / zero-warnings policy). Pattern mirrors `FileCompileCtx` / `DirWatchCtx`
+/// in watch.rs.
+struct LintDirCtx<'a> {
+    lint_root: &'a Path,
+    flags: LintFlags,
+    runtime_vars: &'a Option<std::collections::HashMap<String, mds::Value>>,
+    config: &'a mds::LintConfig,
+}
+
 /// Aggregate exit-code category for directory mode.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FileTally {
@@ -924,40 +982,32 @@ fn run_lint_directory(
 
     let mut any_would_fix = false;
 
+    let ctx = LintDirCtx {
+        lint_root: dir,
+        flags,
+        runtime_vars: &runtime_vars,
+        config: &config,
+    };
+
     for file in &files {
         let tally = if format == LintFormat::Json {
             lint_one_file_accumulating(
                 file,
-                dir,
-                flags,
-                &runtime_vars,
-                &config,
+                &ctx,
                 &mut json_files,
                 &mut any_truncated,
                 &mut any_would_fix,
             )
         } else {
-            lint_one_file_human(
-                file,
-                dir,
-                flags,
-                &runtime_vars,
-                &config,
-                &mut any_truncated,
-                &mut any_would_fix,
-            )
+            lint_one_file_human(file, &ctx, &mut any_truncated, &mut any_would_fix)
         };
         if tally > max_tally {
             max_tally = tally;
         }
     }
 
-    // --fix --check: exit 1 if any file would have been modified (accumulate-and-continue,
-    // so every file is checked before exiting).
-    if flags.check && any_would_fix {
-        std::process::exit(1);
-    }
-
+    // Emit JSON envelope BEFORE any early exit so consumers always receive parseable
+    // output regardless of exit code (AC-F-14 / issue #36).
     if format == LintFormat::Json {
         let json = serde_json::json!({
             "version": 1,
@@ -970,6 +1020,12 @@ fn run_lint_directory(
         ));
     }
 
+    // --fix --check: exit 1 if any file would have been modified (accumulate-and-continue,
+    // so every file is checked before exiting).
+    if flags.check && any_would_fix {
+        std::process::exit(1);
+    }
+
     if max_tally.exit_code() != 0 {
         std::process::exit(max_tally.exit_code());
     }
@@ -977,25 +1033,22 @@ fn run_lint_directory(
 }
 
 /// Lint one file in directory mode, accumulating results into a JSON array.
-#[allow(clippy::too_many_arguments)]
 fn lint_one_file_accumulating(
     file: &Path,
-    lint_root: &Path,
-    flags: LintFlags,
-    runtime_vars: &Option<std::collections::HashMap<String, mds::Value>>,
-    config: &mds::LintConfig,
+    ctx: &LintDirCtx<'_>,
     json_files: &mut Vec<serde_json::Value>,
     any_truncated: &mut bool,
     any_would_fix: &mut bool,
 ) -> FileTally {
+    // Bind quiet so the PartiallyFixed arm can honour it (issue #43 / #173).
     let LintFlags {
-        fix, check, diff, ..
-    } = flags;
+        fix, check, diff, quiet, ..
+    } = ctx.flags;
 
     // Compute a display path relative to the lint root so JSON `file` keys
     // are navigable and unique across the whole directory tree (not just basenames).
     let display_path = file
-        .strip_prefix(lint_root)
+        .strip_prefix(ctx.lint_root)
         .unwrap_or(file)
         .display()
         .to_string();
@@ -1005,7 +1058,7 @@ fn lint_one_file_accumulating(
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(file);
 
-    let mut result = match mds::lint(file, runtime_vars.clone(), config) {
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
@@ -1050,7 +1103,7 @@ fn lint_one_file_accumulating(
             }
         };
         let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, runtime_vars.clone(), config);
+            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1070,10 +1123,13 @@ fn lint_one_file_accumulating(
                 applied_count,
                 total_count,
             } => {
-                eprintln!(
-                    "{}: partial fix ({applied_count} of {total_count} fixes applied, some rejected by reverify gate)",
-                    file.display()
-                );
+                // Unified message + quiet guard (issue #43 / #173).
+                if !quiet {
+                    eprintln!(
+                        "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
+                        file.display()
+                    );
+                }
                 set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
@@ -1104,7 +1160,7 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        match preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config) {
+        match preview_fixes(&result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
                 if diff {
@@ -1127,13 +1183,9 @@ fn lint_one_file_accumulating(
 }
 
 /// Lint one file in directory mode, rendering diagnostics to stderr (human mode).
-#[allow(clippy::too_many_arguments)]
 fn lint_one_file_human(
     file: &Path,
-    lint_root: &Path,
-    flags: LintFlags,
-    runtime_vars: &Option<std::collections::HashMap<String, mds::Value>>,
-    config: &mds::LintConfig,
+    ctx: &LintDirCtx<'_>,
     any_truncated: &mut bool,
     any_would_fix: &mut bool,
 ) -> FileTally {
@@ -1143,11 +1195,11 @@ fn lint_one_file_human(
         diff,
         quiet,
         ..
-    } = flags;
+    } = ctx.flags;
 
     // Compute a display path relative to the lint root for human rendering.
     let display_path = file
-        .strip_prefix(lint_root)
+        .strip_prefix(ctx.lint_root)
         .unwrap_or(file)
         .display()
         .to_string();
@@ -1165,7 +1217,7 @@ fn lint_one_file_human(
     // Named source for span rendering: relative display path + source text.
     let named_source = Some((display_path.as_str(), source.as_str()));
 
-    let mut result = match mds::lint(file, runtime_vars.clone(), config) {
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
         Ok(r) => r,
         Err(ref e) => {
             eprintln!("{:?}", miette::Report::from(e.clone()));
@@ -1193,7 +1245,7 @@ fn lint_one_file_human(
 
     if fix && !check && !diff {
         let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, runtime_vars.clone(), config);
+            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1216,9 +1268,10 @@ fn lint_one_file_human(
                 applied_count,
                 total_count,
             } => {
+                // Unified message format (issue #43 / #173).
                 if !quiet {
                     eprintln!(
-                        "{}: partial fix ({applied_count} of {total_count} fixes applied, some rejected by reverify gate)",
+                        "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         file.display()
                     );
                 }
@@ -1242,7 +1295,7 @@ fn lint_one_file_human(
         }
     } else if fix && (check || diff) {
         // Directory-mode preview — route through gated pipeline.
-        match preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config) {
+        match preview_fixes(&result, &source, base_dir, ctx.runtime_vars.clone(), ctx.config) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
                 if diff {

@@ -1258,6 +1258,144 @@ fn auto_detect_hint_names_subcommand_lint_and_fmt() {
     }
 }
 
+// ── resolve-w2 regression tests ──────────────────────────────────────────────
+
+// ── resolve-w2 #36: dir --fix --check --format json emits JSON before exit ───
+//
+// Regression: the `any_would_fix` early `std::process::exit(1)` in
+// `run_lint_directory` was sequenced BEFORE the JSON envelope emit block, so
+// stdout was empty on exit. `JSON.parse("")` throws.
+//
+// Fix: emit the JSON envelope BEFORE the `any_would_fix` exit so that consumers
+// always receive parseable output regardless of the exit code (AC-F-14 / ADR-004).
+
+#[test]
+fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    // One fixable file — triggers any_would_fix = true.
+    fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // --fix --check exits 1 when fixes are pending.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check must exit 1 when fixes are pending; stderr: {stderr}"
+    );
+
+    // stdout must be parseable JSON — not empty.
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "--fix --check --format json must emit parseable JSON before exiting; \
+             parse error: {e}; stdout: '{stdout}'"
+        )
+    });
+    assert_eq!(json["version"], 1, "envelope must have version:1; got: {json}");
+    assert!(json["files"].is_array(), "envelope must have files[]; got: {json}");
+}
+
+// ── resolve-w2 #59: stdin --fix --check never writes fixed source ─────────────
+//
+// Regression: `run_lint_stdin` destructured `LintFlags` with `..`, silently
+// dropping `check` and `diff`. `mds lint - --fix --check` APPLIED FIXES AND WROTE
+// THE RESULT TO STDOUT instead of exiting 1 without mutating anything.
+// `--check` must never mutate (avoids PF-004).
+
+#[test]
+fn stdin_fix_check_exits_1_and_writes_nothing_to_stdout() {
+    // A fixable source — duplicate-export, Tier A.
+    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &["--fix", "--check"]);
+
+    // Must exit 1: fix is pending, --check signals "would change".
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check stdin must exit 1 when fixes are pending; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout must be EMPTY — --check never writes.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "--fix --check stdin must not write the fixed source to stdout; got: {stdout}"
+    );
+}
+
+// ── resolve-w2 #43: dir-mode and single-file-mode agree on --quiet for PartiallyFixed
+//
+// Regression: `lint_one_file_accumulating` destructured `LintFlags` without binding
+// `quiet`, so `mds lint dir/ --fix --format json --quiet` emitted "partial fix:"
+// lines to stderr that the single-file equivalent suppressed. Three different message
+// texts across four call sites was the root cause. Refs: issue #173.
+
+#[test]
+fn dir_and_single_file_agree_on_quiet_for_partially_fixed() {
+    // Case A: single-file mode --fix --quiet must suppress "Partially fixed" on stderr.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("partial.mds");
+        fs::copy(fixture("lint_partial_fix.mds"), &target).unwrap();
+
+        let out = lint_path(&target, &["--fix", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Partially fixed") && !stderr.to_lowercase().contains("partial fix"),
+            "single-file --fix --quiet must suppress 'Partially fixed'; got: {stderr}"
+        );
+    }
+
+    // Case B: directory-mode --fix --format json --quiet must ALSO suppress
+    // "Partially fixed" — this is the realized defect from #43.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_partial_fix.mds"), dir.path().join("partial.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Partially fixed") && !stderr.to_lowercase().contains("partial fix"),
+            "dir-mode --fix --format json --quiet must suppress 'Partially fixed'; got: {stderr}"
+        );
+
+        // Stdout must still be parseable JSON.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("dir-mode --quiet must still emit valid JSON; err: {e}; stdout: {stdout}")
+        });
+    }
+
+    // Case C (positive): without --quiet, both modes print the unified message.
+    // Uses fresh copies so the previous partial-fix writes don't interfere.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("partial.mds");
+        fs::copy(fixture("lint_partial_fix.mds"), &target).unwrap();
+
+        let out = lint_path(&target, &["--fix"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Partially fixed"),
+            "single-file --fix without --quiet must print 'Partially fixed'; got: {stderr}"
+        );
+    }
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_partial_fix.mds"), dir.path().join("partial.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Partially fixed"),
+            "dir-mode --fix --format json without --quiet must print 'Partially fixed'; got: {stderr}"
+        );
+    }
+}
+
 // ── Bare-filename regression (PF-006) ────────────────────────────────────────
 
 /// `mds lint --fix` on a bare filename must apply fixes in place.
