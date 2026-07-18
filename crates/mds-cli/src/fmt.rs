@@ -331,7 +331,9 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
         // the single-file --check path (which is fully silent under --quiet,
         // exiting 1 with no message when a file would change).
         if !flags.quiet || fail_count > 0 {
-            eprintln!("{changed_count} would reformat, {unchanged_count} unchanged, {fail_count} failed");
+            eprintln!(
+                "{changed_count} would reformat, {unchanged_count} unchanged, {fail_count} failed"
+            );
         }
     } else if !flags.quiet || fail_count > 0 {
         eprintln!("{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed");
