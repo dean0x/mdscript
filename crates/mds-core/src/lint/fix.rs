@@ -595,9 +595,20 @@ where
         };
     }
 
-    // invariant: accepted_count > 0 → at least one Ok(residual) was stored above
-    let residual = last_residual
-        .expect("accepted_count > 0 guarantees at least one successful reverify residual");
+    // invariant: accepted_count > 0 → at least one Ok(residual) was stored above,
+    // because reject_reason is None only when reverify_result is Ok(_). Fail closed
+    // rather than panic in case the invariant is ever violated.
+    let residual = match last_residual {
+        Some(r) => r,
+        None => {
+            return FixOutcome::Rejected {
+                source: source.to_string(),
+                reason: "internal: reverify residual missing despite accepted_count > 0; \
+                         fix aborted to preserve correctness"
+                    .to_string(),
+            };
+        }
+    };
 
     if rejected.is_empty() {
         FixOutcome::Fixed {

@@ -1432,36 +1432,6 @@ fn d2_type_mismatch_at_elseif_span_points_to_elseif_not_if() {
 }
 
 #[test]
-fn d2_type_mismatch_cross_source_extends_degrades_spanless() {
-    // When the evaluator is invoked with no source context (file="", source=""),
-    // the build_type_mismatch helper must degrade to a spanless error rather than
-    // panicking or mis-attributing a span. Simulate by calling compile_str where the
-    // template has @extends (the child's @elseif offset may fall outside the base
-    // template's source) and the cross-type occurs in an inherited condition.
-    //
-    // We model this simply: if the @if evaluator is called with anchor offset
-    // past the end of source it degrades gracefully.
-    // The simplest reproducible case is calling the API with a string-source that has
-    // an @if where the mismatch fires at offset 0 but source is empty — internal path.
-    // Since we can't reach evaluate() with empty source via public API directly,
-    // we verify the spanless path via the public compile_str with a normal mismatch
-    // and assert span is Some (we already test span present above). The cross-source
-    // degrade path is exercised by the `at()` function's OOB guard (unit-tested in
-    // error_tests.rs). What we verify here is the E2E error still surfaces:
-    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
-    let err = mds::compile_str(src).expect_err("D2: cross-type mismatch must error");
-    // The error must be a TypeMismatch regardless of span presence.
-    assert!(
-        matches!(err, mds::MdsError::TypeMismatch { .. }),
-        "D2: error must be TypeMismatch; got: {err:?}"
-    );
-    // If no source context is available, span is None — never mis-attributed.
-    // The degrade is guaranteed by build_type_mismatch's `source.is_empty()` guard.
-    // A full cross-source integration test would require an @extends fixture;
-    // the guard itself is tested via unit coverage in evaluator.rs.
-}
-
-#[test]
 fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
     // A type mismatch in a BASE skeleton `@if` condition (offset relative to the base
     // template) must NOT be attributed to the CHILD source. The flat
