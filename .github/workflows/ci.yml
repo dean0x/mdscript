@@ -134,6 +134,11 @@ jobs:
       - name: Build native addon (host)
         working-directory: crates/mds-napi
         run: npx napi build --platform --release --no-js
+      # Build the unsuffixed mds-napi.node that __test__/index.spec.mjs loads
+      # directly via require('../mds-napi.node'). cargo is a cache hit here;
+      # napi just renames the already-built artifact without recompiling.
+      - name: Build native addon (unsuffixed, napi spec test)
+        run: npm run build:native -w @mdscript/mds-napi
       # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
       - uses: ./.github/actions/setup-wasm
       - name: Build WASM (nodejs)
