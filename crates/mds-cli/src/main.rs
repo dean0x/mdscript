@@ -27,7 +27,7 @@ use build::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    /// Suppress status messages (for lint, also suppresses warning- and info-level diagnostics; errors always print)
+    /// Suppress status and diagnostic output; errors always print; exit codes unaffected
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
 }
@@ -65,7 +65,7 @@ enum Commands {
         /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3")
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
-        /// Generate a source map alongside the compiled output (sidecar: <output>.map).
+        /// Generate a source map alongside the compiled output (sidecar: <output-file>.map, e.g. -o out.md → out.md.map).
         /// Conflicts with --no-source-map.
         #[arg(long = "source-map", conflicts_with = "no_source_map")]
         source_map: bool,
@@ -124,13 +124,13 @@ enum Commands {
     },
     /// Check MDS files for style and correctness issues beyond `mds check`
     ///
-    /// Runs 9 static-analysis rules (3 error-level, 6 warning-level) on the file
+    /// Runs 9 static-analysis rules (3 error-level, 5 warning-level, 1 default-off) on the file
     /// without executing it. Partials and imported files are included in directory mode.
     ///
     /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors or analysis failure,
     /// 3 = resource limit.
     #[command(
-        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet template.mds       Suppress warnings; exit 2 on errors only\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
+        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet template.mds       Suppress output; exits 1 on warnings, 2 on errors\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
     )]
     Lint {
         /// Input .mds file, directory, or `-` for stdin (omit to auto-detect)
