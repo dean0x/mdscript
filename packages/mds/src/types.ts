@@ -82,7 +82,16 @@ export interface CheckResult {
   warnings: string[];
 }
 
-/** Options shared by compile and check operations. */
+/**
+ * Options for check-only operations (no source-map generation).
+ * Accepted by {@link MdsBaseBackend.check} and {@link MdsNodeBackend.checkFile}.
+ */
+export interface CheckOptions {
+  /** Runtime variables made available for interpolation in the template. */
+  vars?: Record<string, unknown>;
+}
+
+/** Options shared by compile operations. */
 export interface CompileOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
@@ -244,7 +253,7 @@ export interface InitOptions {
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;
-  check(source: string, options?: CompileOptions): CheckResult;
+  check(source: string, options?: CheckOptions): CheckResult;
   /**
    * Lint an MDS source string.
    * Runs the check gate first; returns a LintResult with per-rule findings.
@@ -264,7 +273,11 @@ export interface MdsBaseBackend {
  */
 export interface MdsNodeBackend extends MdsBaseBackend {
   compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
-  checkFile(path: string, options?: FileOptions): Promise<CheckResult>;
+  /**
+   * Validate an MDS file without rendering. Only `vars` is forwarded;
+   * source-map options are not applicable to check operations.
+   */
+  checkFile(path: string, options?: CheckOptions): Promise<CheckResult>;
   /** Lint an MDS file, resolving @import directives relative to the file. */
   lintFile(path: string, options?: LintFileOptions): Promise<LintResult>;
 }

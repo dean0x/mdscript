@@ -1,5 +1,6 @@
 import type {
   BackendType,
+  CheckOptions,
   CheckResult,
   CompileOptions,
   CompileResult,
@@ -89,7 +90,7 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
       return result as CompileResult;
     },
 
-    check(source: string, options?: CompileOptions): CheckResult {
+    check(source: string, options?: CheckOptions): CheckResult {
       const result: unknown = addon.check(source, varsOpt(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
@@ -101,7 +102,7 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
       return result as CompileResult;
     },
 
-    async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
+    async checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
       const result: unknown = await addon.checkFile(path, varsOpt(options));
       assertResultShape(result, 'check');
       return result as CheckResult;

@@ -1,5 +1,6 @@
 import type {
   BackendType,
+  CheckOptions,
   CheckResult,
   CompileOptions,
   CompileResult,
@@ -350,7 +351,7 @@ function compileOpts(
 
 /** Build the options object for check, merging vars when present. */
 function checkOpts(
-  options?: CompileOptions,
+  options?: CheckOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
   const vars = options?.vars;
   return vars != null
@@ -393,7 +394,7 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       return result as CompileResult;
     },
 
-    check(source: string, options?: CompileOptions): CheckResult {
+    check(source: string, options?: CheckOptions): CheckResult {
       const result: unknown = wasmModule.check(source, checkOpts(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
