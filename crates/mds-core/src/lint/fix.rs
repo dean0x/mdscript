@@ -74,6 +74,15 @@ pub struct ByteEdit {
     pub rule: String,
 }
 
+/// A fix edit that was rejected by the per-edit reverify gate in [`apply_fixes_incremental`].
+#[derive(Debug, Clone)]
+pub struct RejectedEdit {
+    /// The edit that was rejected.
+    pub edit: ByteEdit,
+    /// Human-readable reason for rejection.
+    pub reason: String,
+}
+
 /// A plan of fix edits for a single file's source.
 #[derive(Debug, Default)]
 pub struct FixPlan {
@@ -97,6 +106,20 @@ pub enum FixOutcome {
         source: String,
         /// Residual diagnostics after applying fixes (from reverify).
         residual: LintResult,
+    },
+    /// Some edits applied, some individually rejected by the per-edit reverify gate.
+    ///
+    /// Returned only by [`apply_fixes_incremental`] when the full batch is refused but at
+    /// least one individual edit passes the reverify gate.  The `source` field holds the
+    /// partially-fixed text; `residual` carries the residual diagnostics (from the last
+    /// successful per-edit reverify); `rejected` lists every edit that was turned down.
+    PartiallyFixed {
+        /// The partially-fixed source (accepted edits applied, rejected edits untouched).
+        source: String,
+        /// Residual diagnostics from the last successful per-edit reverify pass.
+        residual: LintResult,
+        /// Edits that were individually rejected by the reverify gate.
+        rejected: Vec<RejectedEdit>,
     },
     /// The edit batch was rejected (overlap detected or reverify failed).
     Rejected {
@@ -246,6 +269,44 @@ fn has_overlapping_edits(edits: &[ByteEdit]) -> bool {
     false
 }
 
+// ── Shared reverify helpers ───────────────────────────────────────────────────
+
+/// Count non-targeted diagnostics per rule (used for regression detection in the reverify gate).
+///
+/// Returns a `HashMap<String, usize>` mapping rule name → occurrence count for every diagnostic
+/// whose rule is NOT in `targeted`.  Used to build the pre-fix baseline and to count post-fix
+/// residuals so the two can be compared (AC-F-23).
+fn count_untargeted_per_rule(
+    diags: &[LintDiagnostic],
+    targeted: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for d in diags {
+        if !targeted.contains(&d.rule) {
+            *counts.entry(d.rule.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Return the sorted list of rule names whose count increased vs `baseline` (regressions).
+///
+/// A rule is regressed when its count in `residual_counts` is strictly greater than its count in
+/// `baseline`.  Pre-existing untargeted findings (same or lower count) are allowed through (AC-F-23).
+fn regressed_rules(
+    residual_counts: &std::collections::HashMap<String, usize>,
+    baseline: &std::collections::HashMap<String, usize>,
+) -> Vec<String> {
+    let mut regressed = Vec::new();
+    for (rule, &count) in residual_counts {
+        if count > baseline.get(rule.as_str()).copied().unwrap_or(0) {
+            regressed.push(rule.clone());
+        }
+    }
+    regressed.sort_unstable();
+    regressed
+}
+
 // ── Application ───────────────────────────────────────────────────────────────
 
 /// Apply a `FixPlan` to a source string, returning the fixed source.
@@ -362,25 +423,8 @@ where
     let fixed_source = apply_plan_unchecked(source, &plan);
 
     // Build the set of rules targeted by this fix batch.
-    let targeted_rules: std::collections::HashSet<&str> =
-        plan.edits.iter().map(|e| e.rule.as_str()).collect();
-
-    // Local helper: count non-targeted diagnostic occurrences per rule.
-    // Called for both the original baseline and the post-fix residual so the
-    // regression check (below) can compare the two counts in one place.
-    fn count_untargeted_per_rule<'a>(
-        diags: &'a [LintDiagnostic],
-        targeted: &std::collections::HashSet<&str>,
-    ) -> std::collections::HashMap<&'a str, usize> {
-        let mut counts = std::collections::HashMap::new();
-        for d in diags {
-            let rule = d.rule.as_str();
-            if !targeted.contains(rule) {
-                *counts.entry(rule).or_insert(0) += 1;
-            }
-        }
-        counts
-    }
+    let targeted_rules: std::collections::HashSet<String> =
+        plan.edits.iter().map(|e| e.rule.clone()).collect();
 
     // Baseline: per-rule count of NON-targeted diagnostics that were already present
     // before the fix. A pre-existing untargeted finding must not trip the gate — only
@@ -400,15 +444,9 @@ where
             // A regression is an untargeted rule whose count grew vs. the original —
             // i.e. a NEW problem the edit introduced (pre-existing findings survive
             // untouched and are allowed through, per AC-F-23).
-            let mut regressed: Vec<&str> = Vec::new();
-            for (rule, count) in &residual_counts {
-                if *count > baseline.get(rule).copied().unwrap_or(0) {
-                    regressed.push(rule);
-                }
-            }
+            let regressed = regressed_rules(&residual_counts, &baseline);
 
             if !regressed.is_empty() {
-                regressed.sort_unstable();
                 return FixOutcome::Rejected {
                     source: source.to_string(),
                     reason: format!(
@@ -422,6 +460,156 @@ where
                 source: fixed_source,
                 residual,
             }
+        }
+    }
+}
+
+/// Apply a `FixPlan` with a bounded per-edit fallback.
+///
+/// Attempts the full edit batch first (one reverify call). If the batch is rejected by the
+/// reverify gate, falls back to right-to-left per-edit retry: each edit is tested individually
+/// against the running (partially-fixed) source. Accepted edits accumulate; rejected edits are
+/// collected in [`RejectedEdit`] entries.
+///
+/// **Reverify call bound:** ≤ `plan.edits.len() + 1` total calls across both strategies
+/// (1 batch attempt + at most `edits.len()` individual retries).
+///
+/// **Right-to-left accumulation:** Edits are sorted ascending by offset (guaranteed by
+/// [`plan_fixes`]/[`plan_fixes_with_options`]). Per-edit retry processes them highest-offset-first
+/// (`iter().rev()`). Each accepted high-offset edit shortens the source at a higher byte position,
+/// leaving lower-offset bytes untouched — so subsequent lower-offset edits remain positionally valid.
+///
+/// Returns:
+/// - [`FixOutcome::Fixed`] — all edits accepted (full batch or all-per-edit passes).
+/// - [`FixOutcome::PartiallyFixed`] — at least one edit accepted and at least one rejected.
+/// - [`FixOutcome::Rejected`] — overlap detected, or ALL per-edit retries refused.
+/// - [`FixOutcome::NothingToFix`] — empty plan with no overlap.
+///
+/// Unlike [`apply_fixes`] which requires `F: FnOnce`, this function requires `F: Fn` because
+/// `reverify` may be called up to `plan.edits.len() + 1` times.
+#[must_use = "a dropped FixOutcome silently discards the fix result"]
+pub fn apply_fixes_incremental<F>(
+    source: &str,
+    plan: FixPlan,
+    original: &LintResult,
+    reverify: F,
+) -> FixOutcome
+where
+    F: Fn(&str) -> Result<LintResult, MdsError>,
+{
+    // Overlap is detected statically in plan_fixes; edits are cleared when overlap is found.
+    // Per-edit retry cannot rescue an overlap batch — refuse it fail-closed.
+    if plan.overlap_rejected {
+        return FixOutcome::Rejected {
+            source: source.to_string(),
+            reason: "Overlapping fix spans detected — batch rejected to avoid data corruption."
+                .to_string(),
+        };
+    }
+
+    if plan.edits.is_empty() {
+        return FixOutcome::NothingToFix;
+    }
+
+    let targeted_rules: std::collections::HashSet<String> =
+        plan.edits.iter().map(|e| e.rule.clone()).collect();
+    let baseline = count_untargeted_per_rule(&original.diagnostics, &targeted_rules);
+
+    // ── Batch attempt (one reverify call) ─────────────────────────────────────
+    // Saves per-edit calls for the common case where all edits are compatible.
+    let batch_source = apply_plan_unchecked(source, &plan);
+    let batch_ok = match reverify(&batch_source) {
+        Err(_) => false,
+        Ok(residual) => {
+            let residual_counts = count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
+            let regressed = regressed_rules(&residual_counts, &baseline);
+            if regressed.is_empty() {
+                return FixOutcome::Fixed {
+                    source: batch_source,
+                    residual,
+                };
+            }
+            false
+        }
+    };
+    let _ = batch_ok; // batch failed; fall through to per-edit retry
+
+    // ── Per-edit fallback (≤ edits.len() more reverify calls) ─────────────────
+    // Process right-to-left: previously accepted high-offset changes do not
+    // invalidate the byte positions of lower-offset edits processed next.
+    let mut running_source = source.to_string();
+    let mut last_residual: Option<LintResult> = None;
+    let mut rejected: Vec<RejectedEdit> = Vec::new();
+    let mut accepted_count: usize = 0;
+
+    for edit in plan.edits.iter().rev() {
+        let single_plan = FixPlan {
+            edits: vec![edit.clone()],
+            overlap_rejected: false,
+            truncated: false,
+        };
+        let test_source = apply_plan_unchecked(&running_source, &single_plan);
+
+        // Use a single-rule targeted set so the regression check is scoped to
+        // this edit's rule only — cross-rule baseline still applies.
+        let single_targeted: std::collections::HashSet<String> =
+            std::iter::once(edit.rule.clone()).collect();
+
+        let reverify_result = reverify(&test_source);
+        let reject_reason: Option<String> = match &reverify_result {
+            Err(err) => Some(format!(
+                "Reverify failed: fixed source does not compile: {err}"
+            )),
+            Ok(residual) => {
+                let residual_counts =
+                    count_untargeted_per_rule(&residual.diagnostics, &single_targeted);
+                let regressed = regressed_rules(&residual_counts, &baseline);
+                if !regressed.is_empty() {
+                    Some(format!(
+                        "Reverify produced new untargeted diagnostics: {regressed:?}. \
+                         Edit reverted."
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(reason) = reject_reason {
+            rejected.push(RejectedEdit {
+                edit: edit.clone(),
+                reason,
+            });
+        } else {
+            running_source = test_source;
+            if let Ok(residual) = reverify_result {
+                last_residual = Some(residual);
+            }
+            accepted_count += 1;
+        }
+    }
+
+    if accepted_count == 0 {
+        return FixOutcome::Rejected {
+            source: source.to_string(),
+            reason: "All fix edits were rejected by the per-edit reverify gate.".to_string(),
+        };
+    }
+
+    // invariant: accepted_count > 0 → at least one Ok(residual) was stored above
+    let residual = last_residual
+        .expect("accepted_count > 0 guarantees at least one successful reverify residual");
+
+    if rejected.is_empty() {
+        FixOutcome::Fixed {
+            source: running_source,
+            residual,
+        }
+    } else {
+        FixOutcome::PartiallyFixed {
+            source: running_source,
+            residual,
+            rejected,
         }
     }
 }
@@ -973,5 +1161,251 @@ mod tests {
             matches!(outcome, FixOutcome::Rejected { .. }),
             "apply_fixes must return Rejected when reverify detects an output delta; got: {outcome:?}"
         );
+    }
+
+    // ── apply_fixes_incremental ────────────────────────────────────────────────
+
+    /// INC-1: Empty plan with no overlap → NothingToFix (zero reverify calls).
+    #[test]
+    fn incremental_nothing_to_fix() {
+        let source = "Hello!\n";
+        let original = make_result(vec![]);
+        let plan = FixPlan {
+            edits: vec![],
+            overlap_rejected: false,
+            truncated: false,
+        };
+        let outcome = apply_fixes_incremental(source, plan, &original, |_| {
+            unreachable!("no calls expected")
+        });
+        assert!(
+            matches!(outcome, FixOutcome::NothingToFix),
+            "empty plan must return NothingToFix; got: {outcome:?}"
+        );
+    }
+
+    /// INC-2: overlap_rejected = true → Rejected immediately, no reverify calls.
+    #[test]
+    fn incremental_overlap_immediate_reject() {
+        let source = "Hello!\n";
+        let original = make_result(vec![]);
+        let plan = FixPlan {
+            edits: vec![],
+            overlap_rejected: true,
+            truncated: false,
+        };
+        let outcome = apply_fixes_incremental(source, plan, &original, |_| {
+            unreachable!("no calls expected")
+        });
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "overlap must return Rejected; got: {outcome:?}"
+        );
+    }
+
+    /// INC-3: Batch reverify passes → Fixed in exactly 1 reverify call (no per-edit loop).
+    #[test]
+    fn incremental_batch_success_single_call() {
+        // Two removable lines at known offsets.
+        let source = "LineA\nLineB\nKeep!\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "LineA".len()),
+            make_diag("duplicate-import", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert!(!plan.overlap_rejected);
+        assert_eq!(plan.edits.len(), 2, "both edits must be planned");
+
+        let call_count = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            call_count.set(call_count.get() + 1);
+            Ok(make_result(vec![]))
+        });
+
+        assert!(
+            matches!(outcome, FixOutcome::Fixed { .. }),
+            "batch success must return Fixed; got: {outcome:?}"
+        );
+        assert_eq!(
+            call_count.get(),
+            1,
+            "batch success must use exactly 1 reverify call; got: {}",
+            call_count.get()
+        );
+    }
+
+    /// INC-4: Batch fails, per-edit retry: one edit accepted, one rejected → PartiallyFixed.
+    ///
+    /// Source: "LineA\nLineB\n" (12 bytes).
+    /// edit[0] removes LineA (0..6), edit[1] removes LineB (6..12).
+    /// Reverify rejects empty strings → batch ("") fails.
+    /// Per-edit right-to-left: edit[1] first → "LineA\n" (passes); edit[0] → "" (fails).
+    /// Expected: PartiallyFixed { source: "LineA\n", rejected: [edit[0]] }.
+    #[test]
+    fn incremental_partial_batch_fail_per_edit_fallback() {
+        let source = "LineA\nLineB\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "LineA".len()),
+            make_diag("duplicate-import", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert!(!plan.overlap_rejected);
+        assert_eq!(plan.edits.len(), 2);
+
+        // Reverify: reject empty results (simulates "can't compile an empty file").
+        let call_count = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |fixed| {
+            call_count.set(call_count.get() + 1);
+            if fixed.trim().is_empty() {
+                Err(crate::error::MdsError::Io {
+                    message: "empty source rejected".to_string(),
+                })
+            } else {
+                Ok(make_result(vec![]))
+            }
+        });
+
+        match &outcome {
+            FixOutcome::PartiallyFixed {
+                source: fixed_src,
+                rejected,
+                ..
+            } => {
+                assert_eq!(
+                    fixed_src, "LineA\n",
+                    "accepted edit (LineB removal) should yield 'LineA\\n'; got: {fixed_src:?}"
+                );
+                assert_eq!(rejected.len(), 1, "exactly one edit should be rejected");
+                assert_eq!(
+                    rejected[0].edit.rule, "duplicate-import",
+                    "rejected edit must be the LineA removal"
+                );
+            }
+            other => panic!("expected PartiallyFixed; got: {other:?}"),
+        }
+
+        // Call count: 1 (batch) + 2 (per-edit for 2 edits) = 3 ≤ edits.len()+1+1
+        // (batch fails = 1 call; per-edit = 2 calls; total = 3 = 2+1 = edits.len()+1)
+        assert_eq!(
+            call_count.get(),
+            3,
+            "batch(1) + per-edit(2) = 3 calls for 2 edits; got: {}",
+            call_count.get()
+        );
+    }
+
+    /// INC-5: Batch fails, all per-edit retries fail → Rejected.
+    #[test]
+    fn incremental_all_rejected() {
+        let source = "LineA\nLineB\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "LineA".len()),
+            make_diag("duplicate-import", "LineA\n".len(), "LineB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert_eq!(plan.edits.len(), 2);
+
+        let call_count = std::cell::Cell::new(0usize);
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            call_count.set(call_count.get() + 1);
+            Err(crate::error::MdsError::Io {
+                message: "always-fail".to_string(),
+            })
+        });
+
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "all-rejected must return Rejected; got: {outcome:?}"
+        );
+        // 1 (batch) + 2 (per-edit) = 3 = edits.len()+1
+        assert_eq!(
+            call_count.get(),
+            3,
+            "call count must be edits.len()+1 = 3; got: {}",
+            call_count.get()
+        );
+    }
+
+    /// INC-6: Call count bound — N edits → ≤ N+1 total reverify calls.
+    #[test]
+    fn incremental_call_count_bounded() {
+        // Three-edit source: "A\nB\nC\n" (each line 2 bytes including \n).
+        let source = "A\nB\nC\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, 1),
+            make_diag("duplicate-import", 2, 1),
+            make_diag("duplicate-import", 4, 1),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert_eq!(plan.edits.len(), 3, "all three edits must be planned");
+
+        let call_count = std::cell::Cell::new(0usize);
+        // Batch always fails; per-edit always passes → all accepted.
+        let first_call = std::cell::Cell::new(true);
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            call_count.set(call_count.get() + 1);
+            if first_call.get() {
+                first_call.set(false);
+                Err(crate::error::MdsError::Io {
+                    message: "batch-fail".to_string(),
+                })
+            } else {
+                Ok(make_result(vec![]))
+            }
+        });
+
+        // Batch fails (1 call) + 3 per-edit (3 calls) = 4 = edits.len()+1.
+        assert!(
+            call_count.get() <= 3 + 1,
+            "call count must be ≤ edits.len()+1 = 4; got: {}",
+            call_count.get()
+        );
+        // All per-edit passed → Fixed.
+        assert!(
+            matches!(outcome, FixOutcome::Fixed { .. }),
+            "all edits accepted → Fixed; got: {outcome:?}"
+        );
+    }
+
+    /// INC-7: Right-to-left accumulation is correct — applying edits right-to-left
+    /// preserves lower-offset edit validity after higher-offset edits are accepted.
+    #[test]
+    fn incremental_right_to_left_accumulation() {
+        // Source: "AAAA\nBBBB\nKeep!\n"
+        // edit[0]: remove line 0 (AAAA\n, bytes 0..5)
+        // edit[1]: remove line 1 (BBBB\n, bytes 5..10)
+        // Batch fails; both pass individually.
+        // Expected fixed source: "Keep!\n" (both lines removed, right-to-left order maintained).
+        let source = "AAAA\nBBBB\nKeep!\n";
+        let original = make_result(vec![
+            make_diag("duplicate-import", 0, "AAAA".len()),
+            make_diag("duplicate-import", "AAAA\n".len(), "BBBB".len()),
+        ]);
+        let plan = plan_fixes_with_options(&original, source, false);
+        assert_eq!(plan.edits.len(), 2);
+
+        let first_call = std::cell::Cell::new(true);
+        let outcome = apply_fixes_incremental(source, plan, &original, |_fixed| {
+            if first_call.get() {
+                first_call.set(false);
+                Err(crate::error::MdsError::Io {
+                    message: "batch-fail".to_string(),
+                })
+            } else {
+                Ok(make_result(vec![]))
+            }
+        });
+
+        match &outcome {
+            FixOutcome::Fixed {
+                source: fixed_src, ..
+            } => {
+                assert_eq!(
+                    fixed_src, "Keep!\n",
+                    "both edits accepted right-to-left must yield 'Keep!\\n'; got: {fixed_src:?}"
+                );
+            }
+            other => panic!("expected Fixed; got: {other:?}"),
+        }
     }
 }

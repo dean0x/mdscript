@@ -1390,3 +1390,65 @@ fn include_sources_content_true_includes_sources_content() {
         "sourcesContent must be Some when include_sources_content=true"
     );
 }
+
+// ── Fix API surface pin (F-API-1) ─────────────────────────────────────────────
+
+/// F-API-1: apply_fixes_incremental and associated types exist on the public API surface.
+///
+/// Pins:
+/// - `mds::fix::apply_fixes_incremental` is callable with `F: Fn(&str) -> Result<LintResult, MdsError>`
+/// - `mds::fix::FixOutcome::PartiallyFixed` variant is exhaustively matchable
+/// - `mds::fix::RejectedEdit` struct has the expected `edit: ByteEdit` and `reason: String` fields
+#[test]
+fn fix_api_incremental_exists() {
+    use mds::fix::{apply_fixes_incremental, plan_fixes, ByteEdit, FixOutcome, RejectedEdit};
+
+    // PartiallyFixed variant is exhaustively matchable — compile-time check.
+    let outcome: FixOutcome = FixOutcome::NothingToFix;
+    #[allow(clippy::match_single_binding)]
+    match outcome {
+        FixOutcome::Fixed { .. }
+        | FixOutcome::PartiallyFixed { .. }
+        | FixOutcome::Rejected { .. }
+        | FixOutcome::NothingToFix => {}
+    }
+
+    // RejectedEdit struct has `edit` and `reason` fields.
+    let edit = ByteEdit {
+        start: 0,
+        end: 5,
+        rule: "duplicate-import".to_string(),
+    };
+    let rejected = RejectedEdit {
+        edit,
+        reason: "simulated reverify failure".to_string(),
+    };
+    assert_eq!(rejected.reason, "simulated reverify failure");
+    assert_eq!(rejected.edit.rule, "duplicate-import");
+
+    // apply_fixes_incremental is callable with F: Fn — compile-time and runtime check.
+    let source = "Hello!\n";
+    let original = LintResult {
+        diagnostics: vec![],
+        truncated: false,
+        is_standalone: false,
+    };
+    let plan = plan_fixes(&original, source);
+    let outcome = apply_fixes_incremental(
+        source,
+        plan,
+        &original,
+        |_s| -> Result<LintResult, MdsError> {
+            Ok(LintResult {
+                diagnostics: vec![],
+                truncated: false,
+                is_standalone: false,
+            })
+        },
+    );
+    // Empty source with no diagnostics → NothingToFix (no reverify called).
+    assert!(
+        matches!(outcome, FixOutcome::NothingToFix),
+        "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
+    );
+}

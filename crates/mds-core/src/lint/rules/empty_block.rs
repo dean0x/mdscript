@@ -76,7 +76,7 @@ fn check_nodes(
                     make_diag(
                         *severity,
                         filename,
-                        "@for body is empty".to_string(),
+                        "@for body is empty.".to_string(),
                         Some("Add content inside the @for block or remove it.".to_string()),
                         b.offset,
                         "@for".len(),
@@ -94,7 +94,7 @@ fn check_nodes(
                     make_diag(
                         *severity,
                         filename,
-                        format!("@define '{}' body is empty", b.name),
+                        format!("@define '{}' body is empty.", b.name),
                         Some("Add a body to the function or remove the definition.".to_string()),
                         b.offset,
                         "@define".len() + 1 + b.name.len(),
@@ -112,7 +112,7 @@ fn check_nodes(
                     make_diag(
                         *severity,
                         filename,
-                        "@message body is empty".to_string(),
+                        "@message body is empty.".to_string(),
                         Some(
                             "Add content to the message block or remove it. \
                              Empty @message is allowed for priming but often accidental."
@@ -155,7 +155,7 @@ fn check_if_block(
         make_diag(
             *severity,
             filename,
-            "@if then-body is empty".to_string(),
+            "@if then-body is empty.".to_string(),
             Some("Add content inside the @if block or remove it.".to_string()),
             b.offset,
             "@if".len(),
@@ -174,7 +174,7 @@ fn check_if_block(
             make_diag(
                 *severity,
                 filename,
-                "@elseif body is empty".to_string(),
+                "@elseif body is empty.".to_string(),
                 Some("Add content inside the @elseif block or remove it.".to_string()),
                 branch.offset,
                 "@elseif".len(),
@@ -195,7 +195,7 @@ fn check_if_block(
             make_diag(
                 *severity,
                 filename,
-                "@else body is empty".to_string(),
+                "@else body is empty.".to_string(),
                 Some("Add content inside the @else block or remove it.".to_string()),
                 b.else_offset.unwrap_or(b.offset),
                 "@else".len(),

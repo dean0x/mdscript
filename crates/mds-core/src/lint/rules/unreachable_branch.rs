@@ -111,7 +111,7 @@ fn check_if_block(
                 && !builder.push(make_diag(
                     *severity,
                     filename,
-                    "@if condition is always true — @elseif/@else branches are unreachable"
+                    "@if condition is always true — @elseif/@else branches are unreachable."
                         .to_string(),
                     Some(
                         "Replace the constant condition with a variable or remove later branches."
@@ -129,7 +129,7 @@ fn check_if_block(
             if !builder.push(make_diag(
                 *severity,
                 filename,
-                "@if condition is always false — the then-body is dead code".to_string(),
+                "@if condition is always false — the then-body is dead code.".to_string(),
                 Some(
                     "Replace the constant condition with a variable or remove the dead branch."
                         .to_string(),
@@ -176,7 +176,7 @@ fn check_if_block(
                     if !builder.push(make_diag(
                         *severity,
                         filename,
-                        "@elseif condition is always true".to_string(),
+                        "@elseif condition is always true.".to_string(),
                         Some("Replace the constant condition with a variable.".to_string()),
                         branch.offset,
                         "@elseif".len(),
@@ -188,7 +188,7 @@ fn check_if_block(
                     if !builder.push(make_diag(
                         *severity,
                         filename,
-                        "@elseif condition is always false — this branch is dead code".to_string(),
+                        "@elseif condition is always false — this branch is dead code.".to_string(),
                         Some(
                             "Replace the constant condition with a variable or remove the dead branch."
                                 .to_string(),
