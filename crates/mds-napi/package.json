@@ -5,6 +5,9 @@
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
+  "scripts": {
+    "build": "napi build --release --no-js"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dean0x/mdscript.git",

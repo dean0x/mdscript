@@ -22,15 +22,26 @@ def fixtures() -> Path:
 
 
 def _find_cli() -> Path | None:
-    """Locate a built `mds` CLI binary (the independent parity producer)."""
+    """Locate a built `mds` CLI binary (the independent parity producer).
+
+    Priority:
+    1. ``MDS_CLI_BIN`` environment variable (explicit override always wins).
+    2. The *freshest* of ``target/release/mds`` and ``target/debug/mds`` by
+       mtime — prefers the binary that was compiled most recently so a fresh
+       debug build is not shadowed by a stale release artifact.
+    3. ``mds`` found anywhere on ``$PATH`` via :func:`shutil.which`.
+    """
     env = os.environ.get("MDS_CLI_BIN")
     if env and Path(env).is_file():
         return Path(env)
     exe = "mds.exe" if os.name == "nt" else "mds"
-    for profile in ("release", "debug"):
-        cand = REPO_ROOT / "target" / profile / exe
-        if cand.is_file():
-            return cand
+    candidates = [
+        REPO_ROOT / "target" / profile / exe for profile in ("release", "debug")
+    ]
+    existing = [c for c in candidates if c.is_file()]
+    if existing:
+        # Pick whichever binary was modified most recently.
+        return max(existing, key=lambda p: p.stat().st_mtime)
     found = shutil.which("mds")
     return Path(found) if found else None
 
