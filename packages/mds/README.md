@@ -91,10 +91,13 @@ try {
 
 | Function | Description |
 |----------|-------------|
-| `compile(source, options?)` | Compile MDS source string to Markdown |
+| `compile(source, options?)` | Compile MDS source string to Markdown or messages |
 | `check(source, options?)` | Validate MDS source without rendering |
 | `compileFile(path, options?)` | Compile an MDS file, resolving imports |
 | `checkFile(path, options?)` | Validate an MDS file, resolving imports |
+| `lint(source, options?)` | Static analysis on a source string |
+| `lintFile(path, options?)` | Static analysis on a file |
+| `lintVirtual(modules, entry, options?)` | Static analysis on an in-memory module map |
 | `getBackend()` | Returns the active backend: `'native'` or `'wasm'` |
 | `init(options?)` | Initialize the WASM backend (browser/explicit WASM only) |
 | `isMdsError(err)` | Type guard for MDS compiler errors (requires `code` starting with `"mds::"`) |
@@ -102,9 +105,42 @@ try {
 ### Options
 
 ```ts
-// CompileOptions / FileOptions
-{ vars?: Record<string, unknown> }
+// CompileOptions — accepted by compile() and compileFile()
+interface CompileOptions {
+  vars?: Record<string, unknown>;
+  sourceMap?: boolean;      // generate Source Map v3; result gains a `sourceMap` field
+  sourcesContent?: boolean; // embed source text in map (requires sourceMap: true)
+                            // ⚠ Privacy: embeds the full template source
+}
+
+// CheckOptions — accepted by check() and checkFile() only
+// Source-map options are NOT accepted; passing them throws mds::invalid_options
+interface CheckOptions {
+  vars?: Record<string, unknown>;
+}
+
+// LintOptions / LintFileOptions
+interface LintOptions {
+  vars?: Record<string, unknown>;
+  rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
+}
 
 // InitOptions
-{ wasmUrl?: string | URL | Response | BufferSource }
+interface InitOptions {
+  wasmUrl?: string | URL | Response | BufferSource;
+}
+```
+
+**Strict unknown-option rejection:** passing any key not listed above throws
+`Error { code: 'mds::invalid_options' }` immediately, before calling the backend.
+This applies to `compile`, `compileFile`, `check`, `checkFile`, `lint`, `lintFile`,
+and `lintVirtual`.
+
+**Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
+map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
+
+**Lint result shape:**
+```ts
+{ version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean }
+// LintDiagnostic: { rule, severity, message, help?, fixable, span? }
 ```

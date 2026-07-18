@@ -18,8 +18,27 @@ Two builds, selected by package `exports` conditions:
 | `node` | `dist/node/mds_wasm.js` | CommonJS (`wasm-pack --target nodejs`) | none |
 | `browser` / `default` | `dist/web/mds_wasm.js` | ESM (`wasm-pack --target web`) | call `default()` with the `.wasm` URL |
 
-Each build exposes `compile(source, options)`, `check(source, options)`, and
-`scanImports(source)`.
+Each build exposes `compile(source, options)`, `check(source, options)`,
+`lint(source, options)`, `lintVirtual(modules, entry, options)`, and `scanImports(source)`.
+
+### Options
+
+```js
+// compile(source, options)
+// options.sourceMap — boolean; generate a Source Map v3 document.
+//   For string-source compiles, sources[0] is "input.mds".
+// options.sourcesContent — boolean; embed source text in map (requires sourceMap).
+//   ⚠ Privacy: embeds the full template source.
+// options.vars — { [key: string]: any } runtime variable overrides.
+const result = compile(source, { sourceMap: true, vars: { name: 'World' } });
+// result.sourceMap is a Source Map v3 object when sourceMap: true
+
+// lint(source, options)
+// options.vars — variable overrides.
+// options.rules — { [ruleName: string]: 'off' | 'info' | 'warn' | 'error' }
+const lintResult = lint(source, { rules: { 'shadow-variable': 'warn' } });
+// lintResult: { version: 1, files: [...], truncated: boolean }
+```
 
 ## Build
 

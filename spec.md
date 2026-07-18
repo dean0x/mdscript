@@ -72,6 +72,7 @@ Hello {name}!
 **Fence out-of-scope:**
 - 4-space indented code blocks (CommonMark style, without fence markers) are **not** recognized as passthrough regions — interpolation IS parsed inside them.
 - Leaving a blockquote does not implicitly close a blockquoted fence: `> ``` ... content without > prefix ... > ` ``` `` — the fence closes only on an explicit matching closer (`> ` `` ` or `> ~~~`). Without an explicit closer the fence extends to end-of-file.
+- **Unclosed code fence is a hard error** (`mds::syntax "unclosed code fence"`): a fence that is never closed by end-of-file causes compilation to fail rather than silently extend to end-of-file.
 
 ---
 
@@ -169,7 +170,7 @@ Free tier.
   - Maximum 16 leaf operands per logical expression
 - Falsy values: `false`, `null`, empty string `""`, empty array `[]`, empty object `{}`, `0`, `NaN`
 - Everything else is truthy
-- Equality is **strict**, no type coercion: comparing values of different types (e.g. `@if count == "3":` when `count` is the number `3`) is a **runtime error** (`mds::type_mismatch`). Convert explicitly: `@if str(count) == "3":` or `@if count == 3:`
+- Equality is **strict**, no type coercion: comparing values of different types (e.g. `@if count == "3":` when `count` is the number `3`) is a **runtime error** (`mds::type_mismatch`). Convert explicitly: `@if string(count) == "3":` or `@if count == 3:`
 - `NaN == NaN` is false (IEEE 754)
 - `@elseif` branches are evaluated in order; first matching branch wins (short-circuit)
 - `@elseif` must appear before `@else:`; `@else:` cannot be followed by `@elseif`
@@ -246,9 +247,13 @@ With default arguments:
 Hello {name}!
 @end
 
-{greet()}         @# → Hello World!
-{greet("Alice")}  @# → Hello Alice!
+{greet()}
+{greet("Alice")}
 ```
+
+> **Note — no comment syntax:** MDS has no comment syntax. Unknown `@directives` (any
+> `@word` not recognized by the compiler) are **syntax errors**, not comments. The `@#`
+> annotation style used in some older examples is not valid MDS.
 
 Invocation:
 
@@ -452,6 +457,12 @@ You have access to:
 
 Output:
 ```markdown
+---
+user: Alice
+tools: [search, code, browse]
+---
+
+
 Hello Alice!
 
 You have access to:

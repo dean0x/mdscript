@@ -90,7 +90,7 @@ Build/Watch options:
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
-  --source-map                Write a Source Map v3 sidecar (<output>.md.map); output is
+  --source-map                Write a Source Map v3 sidecar (<output>.map); output is
                               byte-identical to a no-flag build. Ignored for messages-mode
                               templates (no renderable output). See ⚠ privacy note below.
   --inline                    Embed the source map as a sourceMappingURL data-URI comment
@@ -179,7 +179,7 @@ mds fmt .                       # format every .mds file recursively (partials i
 mds fmt --check template.mds    # exit 1 if the file would change; never writes — for CI
 mds fmt --diff template.mds     # print a unified diff of pending changes; never writes
 mds fmt --check --diff .        # show diffs for every file that would change; exit 1 if any would
-echo 'Hello   {name}!' | mds fmt -   # format from stdin, write to stdout; creates no file
+printf '@if ready:   \nGo\n@end\n' | mds fmt -   # format from stdin, write to stdout; creates no file
 ```
 
 What it normalizes:

@@ -27,7 +27,7 @@ use build::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    /// Suppress status messages
+    /// Suppress status messages (for lint, also suppresses warning- and info-level diagnostics; errors always print)
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
 }
@@ -109,7 +109,7 @@ enum Commands {
     /// structure, whitespace-only lines), frontmatter / code-fence internals,
     /// or the byte-for-byte content of `@message` / `@define` bodies.
     #[command(
-        after_help = "Examples:\n  mds fmt                             Auto-detect and format the .mds file in current dir\n  mds fmt template.mds                Format a file in place\n  mds fmt .                           Format every .mds file recursively (incl. partials)\n  mds fmt --check template.mds        Exit 1 if the file would change; writes nothing\n  mds fmt --diff template.mds         Print a unified diff of pending changes; writes nothing\n  mds fmt --check --diff .            Show diffs for every file that would change, exit 1 if any would\n  echo \"Hello   {name}!\" | mds fmt -  Format from stdin, write to stdout; creates no file"
+        after_help = "Examples:\n  mds fmt                             Auto-detect and format the .mds file in current dir\n  mds fmt template.mds                Format a file in place\n  mds fmt .                           Format every .mds file recursively (incl. partials)\n  mds fmt --check template.mds        Exit 1 if the file would change; writes nothing\n  mds fmt --diff template.mds         Print a unified diff of pending changes; writes nothing\n  mds fmt --check --diff .            Show diffs for every file that would change, exit 1 if any would\n  printf '@if ready:   \\nGo\\n@end\\n' | mds fmt -  Format from stdin, write to stdout; creates no file"
     )]
     Fmt {
         /// Input .mds file, directory, or "-" for stdin (omit to auto-detect in current directory)
