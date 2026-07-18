@@ -1108,3 +1108,140 @@ fn sm16b_stdin_inline_stdout_now_allowed() {
         );
     }
 }
+
+// ── SM-SEC3: `..`-escape guard — deepCWD/output dir must not leak path layout ──
+
+/// Regression gate for the SEC-3 fix (ADR-005 / AC-SEC-01 / avoids PF-004).
+///
+/// Before the fix, `relativize_source_path` only guarded against paths that were
+/// still ABSOLUTE after relativization (starts with `/` or Windows drive form).
+/// A source file that lives OUTSIDE the map directory produces a `../`-escaping
+/// relative path whose `..` chain grows with the nesting depth — reconstructing
+/// the full absolute path and leaking USERNAME + directory layout.
+///
+/// Covers BOTH output modes to prevent the per-mode divergence PF-004 describes:
+/// - sidecar map: `map_dir = effective_parent(out_path)` (absolute, deep)
+/// - inline stdout: `map_dir = CWD` (process runs from a deep directory)
+///
+/// Assertion: no source entry contains `../` components, and no entry contains
+/// the random source-tempdir name that would confirm path reconstruction.
+#[test]
+fn sm_sec3_dotdot_escape_falls_back_to_basename() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+
+    // Record the random dir-name; if it appears in sources[] the path escaped.
+    let src_dir_name = src_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Source file is in src_dir — completely separate from the output tree.
+    let src_path = src_dir.path().join("input.mds");
+    std::fs::write(&src_path, "Hello SEC-3!\n").unwrap();
+
+    // Deep output directory — enough levels that the old relative_path() call
+    // produces a long `../../../...` chain back to src_dir under the old code.
+    let deep_out_dir = out_dir.path().join("a/b/c/d/e/f/g/h/i/j");
+    std::fs::create_dir_all(&deep_out_dir).unwrap();
+    let out_path = deep_out_dir.join("out.md");
+
+    // ── sidecar case ─────────────────────────────────────────────────────────
+    // map_dir = effective_parent(out_path) = deep_out_dir (absolute).
+    // relative_path(deep_out_dir, src_path) escapes via `../` under the old code.
+    let result = mds_bin()
+        .arg("build")
+        .arg(&src_path)
+        .arg("--source-map")
+        .arg("-o")
+        .arg(&out_path)
+        .output()
+        .expect("mds build (sidecar) should run");
+    assert!(
+        result.status.success(),
+        "sidecar build should succeed; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let map_path = deep_out_dir.join("out.md.map");
+    let v = read_map_json(&map_path);
+    let sidecar_sources = v["sources"].as_array().expect("sources must be array");
+
+    for src in sidecar_sources {
+        let s = src.as_str().expect("source must be string");
+        // SEC-3: must NOT start with `../` — the `..`-escape guard must have fired.
+        assert!(
+            !s.starts_with("../"),
+            "sidecar sources[] must not contain a `..`-escaping path \
+             (SEC-3 guard must fire); got: {s:?}"
+        );
+        assert_ne!(s, "..", "sidecar sources[] must not be bare `..`");
+        // Pre-existing guard: must NOT be an absolute path.
+        assert!(
+            !s.starts_with('/'),
+            "sidecar sources[] must not be absolute; got: {s:?}"
+        );
+        // Key assertion: the random src-tempdir name must NOT appear.  If it does,
+        // the `..` chain reconstructed the filesystem path — the exact leak the
+        // PR description claimed was fixed but was not.
+        assert!(
+            !s.contains(src_dir_name.as_str()),
+            "sidecar sources[] must not contain the source tempdir name \
+             (path reconstruction leak); dir={src_dir_name:?} entry={s:?}"
+        );
+    }
+
+    // ── inline stdout case ────────────────────────────────────────────────────
+    // map_dir = CWD when -o - is used (PathBuf::new() → abs_map_dir = current_dir).
+    // Running from deep_out_dir makes CWD == deep_out_dir, so the relative path
+    // from CWD to src_path escapes via `../` under the old code.
+    let inline_result = mds_bin()
+        .current_dir(&deep_out_dir)
+        .arg("build")
+        .arg(&src_path)
+        .args(["--source-map", "--inline", "-o", "-"])
+        .output()
+        .expect("mds build --inline should run");
+    assert!(
+        inline_result.status.success(),
+        "inline build should succeed; stderr: {}",
+        String::from_utf8_lossy(&inline_result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inline_result.stdout);
+    let prefix = "<!--# sourceMappingURL=data:application/json;base64,";
+    let suffix = " -->";
+    let start = stdout
+        .find(prefix)
+        .expect("stdout must contain inline source-map carrier");
+    let rest = &stdout[start + prefix.len()..];
+    let end = rest
+        .find(suffix)
+        .expect("carrier must be closed with \" -->\"");
+    let decoded = base64_decode(&rest[..end]);
+    let inline_json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let inline_sources = inline_json["sources"]
+        .as_array()
+        .expect("inline sources must be array");
+
+    for src in inline_sources {
+        let s = src.as_str().expect("source must be string");
+        assert!(
+            !s.starts_with("../"),
+            "inline sources[] must not contain a `..`-escaping path \
+             (SEC-3 guard must fire); got: {s:?}"
+        );
+        assert_ne!(s, "..", "inline sources[] must not be bare `..`");
+        assert!(
+            !s.starts_with('/'),
+            "inline sources[] must not be absolute; got: {s:?}"
+        );
+        assert!(
+            !s.contains(src_dir_name.as_str()),
+            "inline sources[] must not contain the source tempdir name \
+             (path reconstruction leak); dir={src_dir_name:?} entry={s:?}"
+        );
+    }
+}

@@ -937,7 +937,7 @@ pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: 
         stripped.replace('\\', "/")
     };
 
-    // AC-SEC-01: never leak an absolute path into sources[]. The relativization
+    // AC-SEC-01: never leak filesystem layout into sources[]. The relativization
     // above yields a relative path for same-root inputs; as defense-in-depth for
     // exotic cross-root cases (e.g. different Windows drives), degrade a
     // still-absolute result to the bare file name rather than panicking or
@@ -960,7 +960,21 @@ pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: 
                 && (s.as_bytes()[0] as char).is_ascii_alphabetic()
                 && s.as_bytes()[1] == b':')
     };
-    if result.starts_with('/') || is_drive_qualified(&result) {
+    // SEC-3 (guards PF-004 / AC-SEC-01): a `..`-escaping result reconstructs the
+    // absolute path as a `..` chain that grows with CWD depth, leaking the
+    // USERNAME and full directory layout into the published source map.  The
+    // never-absolute guard above only rejects leading `/` and Windows drive
+    // forms, so a relative path like `../../Users/alice/...` slipped through.
+    //
+    // Treat any result that escapes the map directory (starts with `../` or is
+    // exactly `..`) the same as an absolute path: degrade to the bare filename.
+    // This check applies uniformly to both Rule 3 (absolute → relativized) and
+    // Rule 4 (already-relative pass-through) outputs, avoiding PF-004.
+    //
+    // Symlinked CWDs and paths that escape-then-re-enter are covered: the guard
+    // fires on any leading `../`, regardless of subsequent components.
+    let escapes_base = result.starts_with("../") || result == "..";
+    if result.starts_with('/') || is_drive_qualified(&result) || escapes_base {
         return Path::new(stripped)
             .file_name()
             .map(|n| n.to_string_lossy().replace('\\', "/"))
