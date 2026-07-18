@@ -123,10 +123,13 @@ def test_sm_py4_messages_mode_degrades() -> None:
     # Messages-mode templates have no renderable output → no source map.
     assert result.source_map is None
     assert result.kind == "messages"
-    # The binding should emit a warning about source map being unavailable.
+    # The binding must emit MSG_MODE_SOURCE_MAP_WARNING (shared core constant).
+    # The assertion is anchored to a distinctive phrase from that constant so
+    # that any drift of the constant text is caught here (avoids PF-007).
     warnings = result.warnings
-    assert any("source map" in w.lower() or "not supported" in w for w in warnings), (
-        f"expected a source-map/messages-mode warning, got: {warnings}"
+    assert any("messages-mode templates" in w for w in warnings), (
+        f"expected MSG_MODE_SOURCE_MAP_WARNING (contains 'messages-mode templates'), "
+        f"got: {warnings}"
     )
 
 
