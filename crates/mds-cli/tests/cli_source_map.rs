@@ -105,6 +105,90 @@ fn read_map_json(map_path: &Path) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("map file is not valid JSON at {}: {e}", map_path.display()))
 }
 
+/// Assert that a `sources[]` entry is safe to embed in a shipped source map.
+///
+/// Verifies that `s` is:
+/// 1. Not a Windows `\\?\` verbatim-prefix path.
+/// 2. Not drive-qualified (`C:\…`, `C:/…`, or bare `C:`).
+/// 3. Not an absolute path (leading `/`).
+/// 4. Lexically contained within `root` (resolving against `base` or `root`).
+/// 5. Free of every component listed in `forbidden`.
+///
+/// Sentinels delimited by `<` and `>` (e.g. `<stdin>`) pass through — they are
+/// display labels, not filesystem paths, and never need containment checking.
+fn assert_source_is_contained(s: &str, root: &Path, base: &Path, forbidden: &[&str]) {
+    // Sentinels are display labels — not paths.
+    if s.starts_with('<') && s.ends_with('>') {
+        return;
+    }
+
+    let unified = s.replace('\\', "/");
+
+    // No verbatim prefix.
+    assert!(
+        !unified.starts_with("//?/"),
+        "source must not contain Windows verbatim prefix: {s:?}"
+    );
+
+    // No drive-qualified forms (ADR-005 / AC-SEC-01).
+    assert!(
+        !unified.contains(":\\"),
+        "source must not contain backslash-qualified Windows drive: {s:?}"
+    );
+    assert!(
+        !unified.contains(":/"),
+        "source must not contain forward-slash-qualified Windows drive: {s:?}"
+    );
+    let drive_lead = unified.len() >= 2
+        && (unified.as_bytes()[0] as char).is_ascii_alphabetic()
+        && unified.as_bytes()[1] == b':';
+    assert!(
+        !drive_lead,
+        "source must not start with a bare drive designator: {s:?}"
+    );
+
+    // Not absolute.
+    assert!(
+        !unified.starts_with('/'),
+        "source must not be an absolute path: {s:?}"
+    );
+
+    // Containment: accept either root-relative OR base-relative resolution.
+    // When `base` is outside `root`, core emits root-relative paths; when
+    // `base` is inside `root`, it emits base-relative paths.  Normalizing
+    // through both anchors lets this helper cover both cases.
+    let contained = [root, base].iter().any(|anchor| {
+        let joined = anchor.join(&unified);
+        let mut comps: Vec<_> = Vec::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    comps.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => comps.push(other),
+            }
+        }
+        let norm: std::path::PathBuf = comps.iter().collect();
+        norm.starts_with(root)
+    });
+    assert!(
+        contained,
+        "source path {s:?} is not contained in root {root:?} \
+         (tried root-join and base-join with {base:?})"
+    );
+
+    // No forbidden component names.
+    for comp in unified.split('/') {
+        for &f in forbidden {
+            assert_ne!(
+                comp, f,
+                "source path {s:?} contains forbidden component {f:?}"
+            );
+        }
+    }
+}
+
 // ── SM-1: --source-map creates a sidecar file (AC-FUNC-01) ───────────────────
 
 #[test]
@@ -168,23 +252,22 @@ fn sm3_sources_are_relative_not_absolute() {
     let map_path = dir.path().join("out.md.map");
     let v = read_map_json(&map_path);
 
+    // Workspace root: two levels up from crates/mds-cli (CARGO_MANIFEST_DIR).
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+    // Forbid the output temp-dir name — it must never appear as a path component.
+    let dir_name = dir
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
     for src in v["sources"].as_array().unwrap() {
         let s = src.as_str().unwrap();
-        // Must NOT be an absolute path.
-        assert!(
-            !s.starts_with('/'),
-            "source must not start with '/' (absolute): {s}"
-        );
-        // Must NOT be a Windows verbatim prefix (PF-003 / AC-SEC-01).
-        assert!(
-            !s.starts_with(r"\\?\"),
-            "source must not contain Windows verbatim prefix: {s}"
-        );
-        // Must NOT be a Windows absolute path.
-        assert!(
-            !s.contains(":\\"),
-            "source must not contain Windows drive letter: {s}"
-        );
+        assert_source_is_contained(s, workspace, workspace, &[dir_name]);
     }
 }
 
@@ -633,23 +716,20 @@ fn sm_det_sources_never_absolute_across_build_dirs() {
     let map_a = read_map_json(&dir_a.path().join("out_a.md.map"));
     let map_b = read_map_json(&dir_b.path().join("out_b.md.map"));
 
-    for (label, v) in [("dir_a", &map_a), ("dir_b", &map_b)] {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+
+    for (_label, v, dir_path) in [
+        ("dir_a", &map_a, dir_a.path()),
+        ("dir_b", &map_b, dir_b.path()),
+    ] {
+        let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         for src in v["sources"].as_array().unwrap() {
             let s = src.as_str().unwrap();
-            assert!(
-                !s.starts_with('/'),
-                "[{label}] source must not be absolute: {s}"
-            );
-            assert!(
-                !s.starts_with(r"\\?\"),
-                "[{label}] source must not have Windows verbatim prefix: {s}"
-            );
-            // No colons indicating a drive letter (e.g., C:\...).
-            let after_scheme = s.split_once(':').map(|(_, r)| r).unwrap_or("");
-            assert!(
-                !after_scheme.starts_with('\\'),
-                "[{label}] source must not be a Windows absolute path: {s}"
-            );
+            assert_source_is_contained(s, workspace, workspace, &[dir_name]);
         }
     }
 
@@ -1026,19 +1106,22 @@ fn sm16a_file_inline_stdout_no_absolute_paths() {
     let decoded = base64_decode(b64);
     let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
 
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home_name = std::path::Path::new(&home)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
     let sources = json["sources"].as_array().expect("sources must be array");
     for src in sources {
         let s = src.as_str().expect("source must be string");
-        // No absolute paths (AC-SEC-01 / PF-005 unconditional guard).
-        assert!(
-            !std::path::Path::new(s).is_absolute(),
-            "inline stdout source map must not contain absolute paths; found: {s:?}"
-        );
-        // Must not start with '/' or contain drive letters.
-        assert!(
-            !s.starts_with('/'),
-            "source must not start with '/'; got: {s:?}"
-        );
+        assert_source_is_contained(s, workspace, &cwd, &[home_name]);
     }
 
     // `file` field must be absent for stdout output (no output filename).
@@ -1094,18 +1177,28 @@ fn sm16b_stdin_inline_stdout_now_allowed() {
     let end = rest.find(suffix).unwrap();
     let decoded = base64_decode(&rest[..end]);
     let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home_name = std::path::Path::new(&home)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
     let sources = json["sources"].as_array().expect("sources must be array");
-    // Stdin source should be "<stdin>" (Rule 1 of relativize_source_path).
+    // Stdin source must be relabeled to "<stdin>" by apply_source_map_file_label.
     assert!(
         sources.iter().any(|s| s.as_str() == Some("<stdin>")),
         "stdin --inline stdout must label source as \"<stdin>\"; got: {sources:?}"
     );
     for src in sources {
         let s = src.as_str().expect("source must be string");
-        assert!(
-            !std::path::Path::new(s).is_absolute(),
-            "inline stdout source must not be absolute; found: {s:?}"
-        );
+        // "<stdin>" is a sentinel — assert_source_is_contained returns early for it.
+        assert_source_is_contained(s, workspace, &cwd, &[home_name]);
     }
 }
 

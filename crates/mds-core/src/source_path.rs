@@ -572,6 +572,85 @@ mod tests {
 
     // ── Property test over the full matrix ──
 
+    // ── Tests migrated from mds-cli/src/build.rs (AC-SEC-01) ──────────────────
+    //
+    // These tests were moved here when the CLI's `relativize_source_path` helper
+    // was deleted and its behaviour subsumed by this single choke-point (PF-004).
+    // Signatures are adapted to `relativize_source(source, base, root)`.
+
+    /// Both source and map directory share a common ancestor → clean map-relative path.
+    /// This was the discriminating assertion that `a7ef84f` accidentally regressed.
+    #[test]
+    fn relativize_absolute_source_with_absolute_mapdir_is_clean_relative() {
+        let got = relativize_source("/proj/src/a.mds", Some(p("/proj/build")), Some(p("/proj")));
+        assert_eq!(
+            got, "../src/a.mds",
+            "same-root absolute paths must relativize to a clean map-relative path"
+        );
+        check_output_invariants(&got, "/proj/src/a.mds");
+    }
+
+    /// Source outside the project root with any base → basename fallback, never absolute.
+    /// (Adapted from the `relative_mapdir` variant: the new guard catches it regardless
+    /// of whether the old map_dir was relative or absolute.)
+    #[test]
+    fn relativize_absolute_source_with_relative_mapdir_never_leaks_absolute() {
+        // Source `/tmp/deep/nested/abs_input.mds` is not under root `/proj` →
+        // containment fails → basename fallback.
+        let got = relativize_source(
+            "/tmp/deep/nested/abs_input.mds",
+            Some(p("/proj/build")),
+            Some(p("/proj")),
+        );
+        assert!(!got.starts_with('/'), "must not be absolute: {got}");
+        assert!(
+            got.ends_with("abs_input.mds"),
+            "must still resolve to the source filename: {got}"
+        );
+        check_output_invariants(&got, "/tmp/deep/nested/abs_input.mds");
+    }
+
+    /// Source outside root with no base (root-relative / binding mode) →
+    /// basename fallback, never absolute.
+    /// (Adapted from the `empty_mapdir` variant: `base = None` is the
+    /// canonical "no explicit map directory" encoding.)
+    #[test]
+    fn relativize_absolute_source_with_empty_mapdir_never_leaks_absolute() {
+        let got = relativize_source("/tmp/deep/abs_input.mds", None, Some(p("/proj")));
+        assert!(!got.starts_with('/'), "must not be absolute: {got}");
+        assert!(
+            got.ends_with("abs_input.mds"),
+            "must still resolve to the source filename: {got}"
+        );
+        check_output_invariants(&got, "/tmp/deep/abs_input.mds");
+    }
+
+    /// Forward-slash-normalised Windows drive path must degrade to basename (SEC-2).
+    /// `C:/secret/foo.mds` is not seen as absolute by `Path::is_absolute()` on
+    /// Unix, so a separator-only check would pass it through unchanged.
+    #[test]
+    fn relativize_forward_slashed_drive_path_degrades_to_filename() {
+        let got = relativize_source(
+            "C:/secret/foo.mds",
+            Some(p("/proj/build")),
+            Some(p("/proj")),
+        );
+        assert_eq!(
+            got, "foo.mds",
+            "forward-slashed drive path must degrade to filename"
+        );
+        check_output_invariants(&got, "C:/secret/foo.mds");
+    }
+
+    /// A cross-drive path suffix (`../../D:/x.mds`) containing `:/` must be
+    /// caught and degrade to the bare filename (SEC-2 — the `:/` gap).
+    #[test]
+    fn relativize_cross_drive_relative_path_degrades_to_filename() {
+        let got = relativize_source("../../D:/x.mds", Some(p("/proj/build")), Some(p("/proj")));
+        assert_eq!(got, "x.mds", "cross-drive :/ path must degrade to filename");
+        check_output_invariants(&got, "../../D:/x.mds");
+    }
+
     /// For every test case, the output must never be absolute and never drive-qualified.
     /// This property holds for all outputs including basename fallbacks and sentinels.
     #[test]
