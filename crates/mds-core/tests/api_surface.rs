@@ -1405,14 +1405,17 @@ fn include_sources_content_true_includes_sources_content() {
 fn fix_api_incremental_exists() {
     use mds::fix::{apply_fixes_incremental, plan_fixes, ByteEdit, FixOutcome, RejectedEdit};
 
-    // PartiallyFixed variant is exhaustively matchable — compile-time check.
+    // FixOutcome is #[non_exhaustive]: external matches need a wildcard arm.
+    // We still enumerate all known variants to pin their shapes at compile time.
     let outcome: FixOutcome = FixOutcome::NothingToFix;
     #[allow(clippy::match_single_binding)]
+    #[allow(unreachable_patterns)]
     match outcome {
         FixOutcome::Fixed { .. }
         | FixOutcome::PartiallyFixed { .. }
         | FixOutcome::Rejected { .. }
         | FixOutcome::NothingToFix => {}
+        _ => {} // required: FixOutcome is #[non_exhaustive]
     }
 
     // RejectedEdit struct has `edit` and `reason` fields.
