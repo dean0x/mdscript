@@ -518,21 +518,17 @@ where
     // ── Batch attempt (one reverify call) ─────────────────────────────────────
     // Saves per-edit calls for the common case where all edits are compatible.
     let batch_source = apply_plan_unchecked(source, &plan);
-    let batch_ok = match reverify(&batch_source) {
-        Err(_) => false,
-        Ok(residual) => {
-            let residual_counts = count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
-            let regressed = regressed_rules(&residual_counts, &baseline);
-            if regressed.is_empty() {
-                return FixOutcome::Fixed {
-                    source: batch_source,
-                    residual,
-                };
-            }
-            false
+    if let Ok(residual) = reverify(&batch_source) {
+        let residual_counts = count_untargeted_per_rule(&residual.diagnostics, &targeted_rules);
+        let regressed = regressed_rules(&residual_counts, &baseline);
+        if regressed.is_empty() {
+            return FixOutcome::Fixed {
+                source: batch_source,
+                residual,
+            };
         }
-    };
-    let _ = batch_ok; // batch failed; fall through to per-edit retry
+    }
+    // Batch failed; fall through to per-edit retry.
 
     // ── Per-edit fallback (≤ edits.len() more reverify calls) ─────────────────
     // Process right-to-left: previously accepted high-offset changes do not

@@ -202,7 +202,7 @@ fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
 /// (via `path.file_name()`). In directory mode the same basename appears for
 /// every file, so the JSON output groups all findings under the same key.
 /// This function replaces the field with the caller-supplied relative path so
-/// the JSON output uses distinct, navigable paths (bug 4 fix).
+/// the JSON output uses distinct, navigable paths.
 ///
 /// Call this immediately after every `mds::lint` that runs in directory mode.
 fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
@@ -420,9 +420,9 @@ fn plan_and_apply_fixes(
     let is_standalone = result.is_standalone;
     let plan = mds::fix::plan_fixes_with_options(&result, source, is_standalone);
 
-    // Bug 12 fix: treat overlap_rejected as "something to do" — don't short-circuit
-    // as NothingToFix when edits were rejected due to overlap.  The incremental
-    // fallback (per-edit retry) handles individual edits that survive the overlap check.
+    // Treat overlap_rejected as "something to do" — don't short-circuit as NothingToFix
+    // when edits were rejected due to overlap.  The incremental fallback (per-edit retry)
+    // handles individual edits that survive the overlap check.
     if plan.edits.is_empty() && !plan.overlap_rejected {
         return FixFileOutcome::NothingToFix { original: result };
     }
@@ -505,8 +505,8 @@ fn plan_and_apply_fixes(
 /// Outcome of the preview fix pipeline (`--fix --check` / `--fix --diff`).
 ///
 /// Distinguishes "would fix", "rejected by reverify gate", and "nothing to fix"
-/// so that callers can surface rejection reasons in `--fix --check` output (bug 5
-/// / PF-004: preview must use the same gated pipeline as apply and be equally honest
+/// so that callers can surface rejection reasons in `--fix --check` output
+/// (PF-004: preview must use the same gated pipeline as apply and be equally honest
 /// about outcomes).
 enum PreviewOutcome {
     /// At least one edit would be applied; contains the would-be fixed source.
@@ -648,7 +648,7 @@ fn run_lint_stdin(
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
-        // Stdin diagnostics: pass source text for span context rendering (bug 19).
+        // Stdin diagnostics: pass source text for span context rendering.
         let named_source = Some(("input.mds", output_src.as_str()));
         render_result_human(&diag_result, quiet, named_source);
         let _ = write_stdout(&output_src);
@@ -656,7 +656,7 @@ fn run_lint_stdin(
         return Ok(());
     }
 
-    // Report-only mode: pass stdin source for span context rendering (bug 19).
+    // Report-only mode: pass stdin source for span context rendering.
     let named_source = if format == LintFormat::Human {
         Some(("input.mds", source.as_str()))
     } else {
@@ -774,7 +774,7 @@ fn run_lint_file(
     }
 
     // ── Preview path: --fix --check and/or --fix --diff ───────────────────────
-    // Bug 5 fix: route preview through the same gated pipeline as the write path.
+    // Route preview through the same gated pipeline as the write path.
     // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
     // a diff or check result could misrepresent what --fix would actually do.
     if fix && (check || diff) {
@@ -952,7 +952,7 @@ fn lint_one_file_accumulating(
         fix, check, diff, ..
     } = flags;
 
-    // Bug 4: compute a display path relative to the lint root so JSON `file` keys
+    // Compute a display path relative to the lint root so JSON `file` keys
     // are navigable and unique across the whole directory tree (not just basenames).
     let display_path = file
         .strip_prefix(lint_root)
@@ -978,7 +978,7 @@ fn lint_one_file_accumulating(
             };
         }
     };
-    // Bug 4: remap basename-only file field → relative display path.
+    // Remap basename-only file field → relative display path.
     set_diag_display_path(&mut result, &display_path);
 
     if result.truncated {
@@ -1052,7 +1052,7 @@ fn lint_one_file_accumulating(
             }
         }
     } else if fix && (check || diff) {
-        // Bug 5: directory-mode preview — route through gated pipeline.
+        // Directory-mode preview — route through gated pipeline.
         let source = match read_source_file(file) {
             Ok(s) => s,
             Err(e) => {
@@ -1104,7 +1104,7 @@ fn lint_one_file_human(
         ..
     } = flags;
 
-    // Bug 4: compute a display path relative to the lint root for human rendering.
+    // Compute a display path relative to the lint root for human rendering.
     let display_path = file
         .strip_prefix(lint_root)
         .unwrap_or(file)
@@ -1134,7 +1134,7 @@ fn lint_one_file_human(
             };
         }
     };
-    // Bug 4: remap basename-only file field → relative display path.
+    // Remap basename-only file field → relative display path.
     set_diag_display_path(&mut result, &display_path);
 
     if result.truncated {
@@ -1199,7 +1199,7 @@ fn lint_one_file_human(
             }
         }
     } else if fix && (check || diff) {
-        // Bug 5: directory-mode preview — route through gated pipeline.
+        // Directory-mode preview — route through gated pipeline.
         match preview_fixes(&result, &source, base_dir, runtime_vars.clone(), config) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
