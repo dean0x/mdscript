@@ -902,7 +902,7 @@ mds fmt template.mds --check              # Exit non-zero if file would change
 mds fmt template.mds --diff               # Print unified diff without writing
 ```
 
-Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
+Formats `.mds` templates: normalizes CRLF to LF (everywhere, including inside frontmatter and code fences), strips trailing whitespace on directive lines, and ensures exactly one trailing newline. An empty or whitespace-only source formats to 0 bytes (an empty output file). Interior blank lines and blank-line structure within frontmatter and code fences are left verbatim (blank-line collapsing was removed in v0.4.0 to preserve the interior-verbatim whitespace contract). Body-text trailing whitespace (Markdown hard breaks) and the byte-for-byte content of `@message`/`@define` bodies are left untouched.
 
 Every rewrite is **safety-gated**: the formatter re-compiles both the original and formatted sources and refuses to write if compiled output would change (`mds::formatter_invariant`), so a formatting bug can never corrupt a template.
 
@@ -948,12 +948,20 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 
 | Code | Meaning |
 |------|---------|
-| `0` | Clean — no warning- or error-severity findings |
+| `0` | Clean — no warning- or error-severity findings (`info` findings never raise exit code) |
 | `1` | Warning-severity findings only (no errors) |
 | `2` | Any error-severity finding, analysis failure (parse/resolve/IO/config), or usage error |
 | `3` | Resource limit exceeded |
 
 With `--fix`, residual post-fix findings determine the exit code.
+
+**Config discovery in directory mode**: when linting a directory, `mds lint` locates
+the nearest `mds.json` by walking up from **each input file** independently (cached
+per directory, so a shared parent is not re-read). This means nested subdirectories
+can each carry their own rule overrides. A malformed config for one subtree produces
+a per-file error entry (with no diagnostics) and contributes to exit code 2 without
+aborting analysis of the rest of the tree. This differs from `mds build` directory
+mode, which uses a single config located from the directory argument.
 
 **JSON output format** (`--format json`):
 
@@ -1062,13 +1070,18 @@ Rules default to the severities shown below — **not all rules default to `warn
 | `duplicate-import` | **error** | yes (A) | A | The same file is imported more than once in a single file (modulo alias). |
 | `duplicate-export` | **error** | yes (A) | A | The same export name is defined more than once in a single file. |
 
-¹ **Tier B suggestion**: `unused-import` and `unused-function` fixes are suggestion-only in practice — neither is ever auto-applied by `--fix`. `unused-import` fires only on files that contain `@import` statements, which are by definition not standalone, so `fixable` is always `false`. `unused-function` can fire on a standalone file (`is_fixable` returns `true`), but a `@define` block always spans multiple lines; the block-span reverify gate (ADR-001) refuses the fix for the same reason as footnote ³. Set the rule to `"off"` in `mds.json` to silence it.
+¹ **`unused-import` is report-only in practice**: `fixable` is always `false` for this rule. A file that triggers `unused-import` contains at least one `@import` directive, making it non-*structural-standalone* (see below); Tier B fixes require a structural-standalone file. The rule is still useful — the warning clears as a side effect of applying other fixes (e.g. removing a duplicate import that was also the unused one). To silence it, set `"unused-import": "off"` in `mds.json`.
 
-² **`shadow-variable` is default-off**: it emits at `info` severity but is suppressed at the `info` level by default (only shown when explicitly enabled via `mds.json`). It never affects the exit code.
+² **`shadow-variable` is default-off**: it emits at `info` severity but is suppressed at the `info` level by default (only shown when explicitly enabled via `mds.json`). `info`-severity findings never affect the exit code.
 
-³ **Tier A block-spanning fixes are always refused**: The fix planner removes only the single directive line containing the span, leaving the matching `@end` orphaned. The reverify gate catches the resulting parse error and refuses the fix (fail-closed; applies ADR-001). As a result, all `empty-block` and `unreachable-branch` fixes that span multiple lines are always reported as suggestion-only — they are never written to disk. Single-directive blocks that reduce to a no-op on removal are not affected. Follow-up: #172.
+³ **Tier A block-spanning fixes**: The fix planner uses `end_offset` (threaded into `IfBlock`, `ForBlock`, `DefineBlock` AST nodes) to perform whole-block removal — the complete span from the opening directive through the matching `@end`. The reverify gate still applies fail-closed: if the resulting source does not recompile cleanly or produces different output, the fix is reported but not written to disk. Previously (before the `end_offset` work landed) the planner could only remove the opening directive line, leaving `@end` orphaned and causing the gate to always refuse; that limitation is now resolved.
 
-**Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). **Tier B** fixes apply only when the file is standalone (no `@import` / `@extends`). **Tier C** rules are report-only — never auto-fixed.
+**Tier concepts:**
+
+- **Structural-standalone** (gates Tier B `--fix`): a file with no `@import`, `@extends`, or use as a partial target. A file that triggers `unused-import` is, by definition, not structural-standalone.
+- **Compile-clean** (gates the output-equality reverify for Tier B): a file that compiles successfully without any runtime `--vars`. The reverify checks that removing the unused import or function produces byte-identical compiled output.
+
+**Tier A** fixes always apply (`--fix`) and are gated by a post-fix reverify (recompile-success + no-new-diagnostics + output byte-equality). **Tier B** fixes apply only when the file is structural-standalone. **Tier C** rules are report-only — never auto-fixed.
 
 ---
 

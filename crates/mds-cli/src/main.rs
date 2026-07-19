@@ -381,6 +381,7 @@ fn run_init(filename: PathBuf, force: bool, quiet: bool) -> Result<()> {
 name: World
 items: [one, two, three]
 ---
+<!-- Frontmatter above is emitted to output verbatim; runtime --set/--vars change only the body below -->
 
 Hello {name}!
 
