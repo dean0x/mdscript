@@ -896,8 +896,13 @@ fn compute_source_map_base(
                 Some(cwd())
             } else if let Some((cfg, config_dir)) = config {
                 if let Some(ref output_dir) = cfg.build.output_dir {
-                    // mds.json output_dir: config-directory-relative.
-                    Some(config_dir.join(output_dir))
+                    // mds.json output_dir: config-directory-relative.  `config_dir`
+                    // is canonical (load_config canonicalizes before walking up) so
+                    // the join is already absolute in practice; `abs` makes the
+                    // "result is always absolutized" contract above structural
+                    // rather than incidental — a relative base would silently
+                    // demote core's map-relative emission to root-relative.
+                    Some(abs(config_dir.join(output_dir)))
                 } else {
                     // Default: beside the source file.
                     Some(abs(effective_parent(input).to_path_buf()))
@@ -1478,6 +1483,75 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── compute_source_map_base ───────────────────────────────────────────────
+    //
+    // `source_map_base` is the anchor core's `relativize_source` uses to emit
+    // map-relative `sources[]` (ADR-005).  Core resolves it against an ABSOLUTE
+    // project root, so a relative base fails the containment check and silently
+    // demotes the result to root-relative — a `sources[]` entry that no longer
+    // resolves from the map file's directory.  The invariant is therefore
+    // "every branch returns Some(absolute)", asserted here per branch because
+    // the failure mode is silent (wrong paths, not an error).
+
+    #[test]
+    fn source_map_base_is_absolute_for_every_output_mode() {
+        let input = PathBuf::from("src/a.mds");
+        let cases: Vec<(&str, Option<String>, Option<PathBuf>)> = vec![
+            ("-o - (stdout)", Some("-".to_string()), None),
+            (
+                "-o relative/out.md",
+                Some("relative/out.md".to_string()),
+                None,
+            ),
+            ("-o bare.md", Some("bare.md".to_string()), None),
+            ("-o /abs/out.md", Some("/abs/out.md".to_string()), None),
+            ("--out-dir relative", None, Some(PathBuf::from("dist"))),
+            ("--out-dir /abs", None, Some(PathBuf::from("/abs/dist"))),
+            ("default (beside source)", None, None),
+        ];
+        for (label, output, out_dir) in cases {
+            let got = compute_source_map_base(&input, &output, &out_dir, &None)
+                .unwrap_or_else(|| panic!("{label}: source_map_base must never be None"));
+            assert!(
+                got.is_absolute(),
+                "{label}: source_map_base must be absolute so core's root-containment \
+                 check succeeds; got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_map_base_for_bare_filename_output_is_cwd() {
+        // PF-006: Path::parent() of a bare filename is Some("") not None, so a
+        // naive parent() would yield an empty (relative) base here.
+        let got = compute_source_map_base(
+            Path::new("src/a.mds"),
+            &Some("out.md".to_string()),
+            &None,
+            &None,
+        )
+        .expect("bare -o must still produce a base");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            got, cwd,
+            "`-o out.md` writes into the CWD, so the map base is the CWD"
+        );
+    }
+
+    #[test]
+    fn source_map_base_tracks_the_output_file_directory() {
+        // The map is written beside the output file, so the base must be the
+        // output file's directory — this is what makes sources[] map-relative.
+        let got = compute_source_map_base(
+            Path::new("src/a.mds"),
+            &Some("dist/nested/a.md".to_string()),
+            &None,
+            &None,
+        )
+        .expect("base must be Some");
+        assert_eq!(got, std::env::current_dir().unwrap().join("dist/nested"));
+    }
 
     #[test]
     fn parse_cli_value_nan_is_string() {

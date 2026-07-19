@@ -37,9 +37,10 @@ use std::path::Path;
 /// - `root` — established project root (from
 ///   [`crate::fs::FileSystem::source_root`]).  `None` for virtual / in-memory
 ///   filesystems ([`crate::fs::VirtualFs`] / WASM) where there is no
-///   containment concept; only separator unification and a lexical-escape
-///   check are applied in that case.  **This MUST preserve today's WASM
-///   `sources[]` output byte-for-byte** (ADR-005).
+///   containment concept; separator unification plus the escape / absolute /
+///   drive-qualified guards are applied in that case.  **This MUST preserve
+///   today's WASM `sources[]` output byte-for-byte** (ADR-005) — it does,
+///   because virtual keys are relative by construction, so no guard fires.
 ///
 /// # Invariants (PF-005 / ADR-005)
 ///
@@ -63,7 +64,8 @@ use std::path::Path;
 /// 4. Classify absolute: leading `/`, or drive-qualified (`C:\`, `C:/`, `C:`).
 /// 5. Lexically normalize into components (resolve `.`, `..`) — closes
 ///    `./../../` and interior-`..` bypasses.
-/// 6. If `root = None`: lexical-escape check only; return unified path.
+/// 6. If `root = None`: absolute / drive-qualified / lexical-escape checks all
+///    degrade to basename; otherwise return the unified path.
 /// 7. If not absolute: resolve against `base` (or `root`) before containment.
 /// 8. Containment: component-wise descendant of `root`?  If not → basename.
 /// 9. Emit relative to `b` (where `b = base` if `base` is inside `root`, else
@@ -104,14 +106,26 @@ pub fn relativize_source(source: &str, base: Option<&Path>, root: Option<&Path>)
     };
 
     // Step 6: root = None branch — VirtualFs / WASM.
-    // No containment concept; separator unification + lexical-escape check only.
-    // MUST preserve today's WASM `sources[]` output byte-for-byte (ADR-005).
+    // No containment concept, so containment (step 8) and map-relative emission
+    // (step 9) do not apply; only separator unification and the escape/absolute
+    // guards run.  Preserves today's WASM `sources[]` output byte-for-byte for
+    // every legitimate virtual key (ADR-005) — virtual keys are relative by
+    // construction (`buildModulesMap` emits project-root-relative slash paths),
+    // so neither guard below can fire on the shipped WASM path.
     let Some(root) = root else {
-        if !is_abs {
-            // A relative path whose first component is `..` escapes the virtual root.
-            if norm_comps.first().map(String::as_str) == Some("..") {
-                return basename_fallback(&norm_comps);
-            }
+        // An absolute or drive-qualified key still encodes filesystem layout
+        // even though there is no root to contain it against.  Degrade to the
+        // basename so the "never absolute / never drive-qualified" invariant
+        // documented above holds on THIS branch too (PF-005: a guarantee that
+        // is real only where a root happens to be established is not a
+        // guarantee — `FileSystem::source_root` is a defaulted method returning
+        // `None`, so any impl that does not override it lands here).
+        if is_abs {
+            return basename_fallback(&norm_comps);
+        }
+        // A relative path whose first component is `..` escapes the virtual root.
+        if norm_comps.first().map(String::as_str) == Some("..") {
+            return basename_fallback(&norm_comps);
         }
         let joined = norm_comps.join("/");
         return if joined.is_empty() {
@@ -528,6 +542,51 @@ mod tests {
         let out = relativize_source("../../escape/secret.mds", None, None);
         assert_eq!(out, "secret.mds");
         check_output_invariants(&out, "../../escape/secret.mds");
+    }
+
+    /// `root = None` must NOT be an escape hatch around the never-absolute
+    /// invariant.  `FileSystem::source_root` is a *defaulted* trait method
+    /// returning `None`, so an impl that forgets to override it lands on this
+    /// branch — it must still refuse to emit filesystem layout (PF-005).
+    #[test]
+    fn root_none_absolute_source_degrades_to_basename() {
+        let out = relativize_source("/Users/alice/proj/src/a.mds", None, None);
+        assert_eq!(
+            out, "a.mds",
+            "an absolute source with no root must degrade to its basename, \
+             never echo the directory chain"
+        );
+        check_output_invariants(&out, "/Users/alice/proj/src/a.mds");
+    }
+
+    /// Same as above for a drive-qualified key: without the guard the unified
+    /// string `C:/secret/foo.mds` was returned verbatim, which is exactly the
+    /// "never drive-qualified" invariant this module documents.
+    #[test]
+    fn root_none_drive_qualified_source_degrades_to_basename() {
+        let out = relativize_source(r"C:\secret\foo.mds", None, None);
+        assert_eq!(out, "foo.mds");
+        check_output_invariants(&out, r"C:\secret\foo.mds");
+    }
+
+    /// The guards above must be inert for every *legitimate* virtual key.
+    /// `buildModulesMap` emits project-root-relative slash paths, so WASM
+    /// `sources[]` output stays byte-identical (ADR-005 byte-parity clause).
+    #[test]
+    fn root_none_relative_keys_are_unchanged_by_the_absolute_guard() {
+        for key in [
+            "a.mds",
+            "src/a.mds",
+            "src/templates/deep/nested.mds",
+            "./src/a.mds",
+        ] {
+            let out = relativize_source(key, None, None);
+            let expected = key.strip_prefix("./").unwrap_or(key);
+            assert_eq!(
+                out, expected,
+                "legitimate virtual key {key:?} must pass through unchanged"
+            );
+        }
     }
 
     /// Degenerate: source = "/" → empty components → containment fails → "source".
