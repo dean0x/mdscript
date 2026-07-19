@@ -1438,18 +1438,25 @@ mod tests {
     fn native_source_root_no_marker_falls_back_to_entry_dir() {
         // In a temp directory with no .git / .mdsroot marker, the root should
         // fall back to the entry-point directory itself (not a parent).
+        //
+        // Exact equality is required: an ancestor check (starts_with) would
+        // pass even if find_project_root walked up to /tmp or /, which would
+        // silently widen the containment envelope the security guard rests on.
         let dir = TempDir::new().unwrap();
         let file = make_temp_file(&dir, "main.mds", "hello");
         let fs = NativeFs::new();
         fs.normalize("", &file.display().to_string()).unwrap();
         let root = fs.source_root().expect("root must be set after normalize");
-        // The root must be the temp dir (entry-point directory) or a parent of it.
-        // At minimum it must be an ancestor of the file.
         let file_canon = file.canonicalize().unwrap();
         let root_path = std::path::PathBuf::from(&root);
-        assert!(
-            file_canon.starts_with(&root_path),
-            "source_root {root:?} must be an ancestor of {file_canon:?}"
+        // Canonicalize root_path to resolve macOS /var → /private/var so the
+        // comparison is not flaky across platforms.
+        let root_canon = root_path.canonicalize().unwrap_or(root_path);
+        assert_eq!(
+            root_canon,
+            effective_parent(&file_canon),
+            "source_root must be exactly the entry-point directory (not a parent); \
+             root={root:?} file_canon={file_canon:?}"
         );
     }
 

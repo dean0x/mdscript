@@ -758,10 +758,10 @@ fn run_lint_file(
                 residual,
             } => {
                 emit_result(format, &residual, quiet, named_source);
+                atomic_write_file(path, &new_source)?;
                 if !quiet {
                     eprintln!("Fixed: {}", path.display());
                 }
-                atomic_write_file(path, &new_source)?;
                 exit_by_severity(&residual);
             }
             FixFileOutcome::PartiallyFixed {
@@ -1223,12 +1223,12 @@ fn lint_one_file_human(
             } => {
                 set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
-                if !quiet {
-                    eprintln!("Fixed: {}", file.display());
-                }
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {e}", file.display());
                     return FileTally::Error;
+                }
+                if !quiet {
+                    eprintln!("Fixed: {}", file.display());
                 }
                 tally_from_result(&residual)
             }

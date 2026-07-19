@@ -17,13 +17,56 @@
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdtemp, writeFile, rm, mkdir } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { existsSync, statSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { compile, compileFile, checkFile, lintFile, isMdsError, init } from '../dist/node.js';
 import { SIMPLE_MDS } from './helpers.mjs';
 import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 import { buildModulesMap } from '../dist/util/module-scanner.js';
+
+// ---------------------------------------------------------------------------
+// CF-SM helpers — locate CLI binary and Python interpreter for 4-surface
+// differential tests.  Both searches follow the same priority as conftest.py:
+// explicit env var > freshest build artifact > system PATH.
+// ---------------------------------------------------------------------------
+
+/** Absolute path to the repo root (three levels above this test file). */
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+
+/**
+ * Return the path to the `mds` CLI binary, or null if none can be found.
+ * Prefers the most recently modified of target/{release,debug}/mds.
+ */
+function findMdsCli() {
+  const envBin = process.env.MDS_CLI_BIN;
+  if (envBin) {
+    if (!existsSync(envBin)) throw new Error(`MDS_CLI_BIN=${envBin} does not exist`);
+    return envBin;
+  }
+  const exe = process.platform === 'win32' ? 'mds.exe' : 'mds';
+  const candidates = ['release', 'debug']
+    .map((p) => join(REPO_ROOT, 'target', p, exe))
+    .filter(existsSync);
+  if (!candidates.length) return null;
+  return candidates.reduce((a, b) => statSync(a).mtimeMs >= statSync(b).mtimeMs ? a : b);
+}
+
+/**
+ * Return the path to a Python interpreter that can import `mdscript`, or null.
+ * Prefers the repo-local venv's Python so the module installed by
+ * `maturin develop` is used.
+ */
+function findPythonForMdscript() {
+  const venvPy = join(REPO_ROOT, '.venv', 'bin', 'python3');
+  if (existsSync(venvPy)) return venvPy;
+  const res = spawnSync('which', ['python3'], { encoding: 'utf-8' });
+  if (res.status === 0 && res.stdout.trim()) return res.stdout.trim();
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Hand-rolled Base64-VLQ decoder (no external dependency)
@@ -616,6 +659,155 @@ describe('source maps — compileFile differential (CF-SM)', () => {
         src0.endsWith('hello.mds'),
         `sources[0] must end with "hello.mds"; got: ${src0}`,
       );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // CF-SM2: all four surfaces produce identical sources[] for a nested fixture
+  //
+  // Closes the remaining PF-007 gap: CF-SM1 only compared napi ↔ WASM; the
+  // CLI and Python surfaces each had per-surface goldens that could diverge
+  // without detection.  This test extends the differential to all four surfaces
+  // using a fixture that exercises cross-directory @import (not just a single
+  // root-level file), so path relativization from a non-root source is tested.
+  //
+  // Fixture layout:
+  //   <dir>/.mdsroot          ← project root marker
+  //   <dir>/src/entry.mds     ← entry: @import "../partials/greeting.mds" as g
+  //   <dir>/partials/greeting.mds ← @define greet(): Hello! @end @export greet
+  //
+  // CLI is invoked with -o <dir>/out.md so the sidecar map lands at the project
+  // root level, making sources[] root-relative — identical to the binding output
+  // (QA-verified byte-identical when map anchor equals project root).
+  //
+  // Python is invoked via the repo-local venv when available; the test is skipped
+  // for the Python surface only when no usable interpreter is found, so it never
+  // silently passes against a missing surface — the other three still run.
+  // -------------------------------------------------------------------------
+  test('CF-SM2: napi, WASM, CLI, and Python produce identical sources[] for nested @import fixture', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'cf-sm2-'));
+    try {
+      // -- Setup fixture -------------------------------------------------------
+      await writeFile(join(dir, '.mdsroot'), '');
+      await mkdir(join(dir, 'src'), { recursive: true });
+      await mkdir(join(dir, 'partials'), { recursive: true });
+      await writeFile(
+        join(dir, 'partials', 'greeting.mds'),
+        '@define greet():\nHello!\n@end\n@export greet\n',
+      );
+      await writeFile(
+        join(dir, 'src', 'entry.mds'),
+        '@import "../partials/greeting.mds" as g\n{g.greet()}\n',
+      );
+      const entryPath = join(dir, 'src', 'entry.mds');
+
+      // -- Surface 1: napi compileFile -----------------------------------------
+      const napiResult = await compileFile(entryPath, { sourceMap: true });
+      assert.ok(napiResult.sourceMap != null, 'napi compileFile must produce sourceMap');
+      const napiSources = napiResult.sourceMap.sources;
+
+      // -- Surface 2: WASM via buildModulesMap + wasmMod.compile ---------------
+      const { entryFilename, modules } = await buildModulesMap(
+        entryPath,
+        (src) => wasmMod.scanImports(src),
+      );
+      const entrySource = modules[entryFilename];
+      const wasmModules = { ...modules };
+      delete wasmModules[entryFilename];
+      const wasmResult = createWasmBackend(wasmMod).compile(entrySource, {
+        filename: entryFilename,
+        modules: wasmModules,
+        sourceMap: true,
+      });
+      assert.ok(wasmResult.sourceMap != null, 'WASM path must produce sourceMap');
+      const wasmSources = wasmResult.sourceMap.sources;
+
+      // -- Surface 3: CLI sidecar at project root -------------------------------
+      // Output at <dir>/out.md so the .map file anchors at the project root,
+      // making CLI sources[] root-relative and byte-identical to the bindings.
+      const mdsCli = findMdsCli();
+      assert.ok(
+        mdsCli != null,
+        'mds CLI binary not found — set MDS_CLI_BIN or run `cargo build -p mds-cli`',
+      );
+      const outFile = join(dir, 'out.md');
+      const mapFile = join(dir, 'out.md.map');
+      const cliProc = spawnSync(mdsCli, ['build', '--source-map', '-o', outFile, entryPath], {
+        encoding: 'utf-8',
+      });
+      assert.equal(
+        cliProc.status,
+        0,
+        `CLI build --source-map failed (rc=${cliProc.status}): ${cliProc.stderr}`,
+      );
+      assert.ok(existsSync(mapFile), `CLI did not write sidecar map at ${mapFile}`);
+      const cliMap = JSON.parse(readFileSync(mapFile, 'utf-8'));
+      const cliSources = cliMap.sources;
+
+      // -- Surface 4: Python binding compile_file -------------------------------
+      // Use the repo-local venv Python which has the mdscript module installed
+      // by `maturin develop`.  If no interpreter is found the Python surface is
+      // skipped with a clear diagnostic; the other three surfaces still run.
+      const python = findPythonForMdscript();
+      let pySources = null;
+      if (python == null) {
+        console.warn(
+          'CF-SM2: skipping Python surface — no Python interpreter found ' +
+          '(run `maturin develop` inside .venv to enable)',
+        );
+      } else {
+        const pyModulePath = join(REPO_ROOT, 'crates', 'mds-python', 'python');
+        // Pass fixture path and module path as argv so no escaping is needed.
+        const pyScript = [
+          'import json, sys',
+          'sys.path.insert(0, sys.argv[1])',
+          'import mdscript as m',
+          'result = m.compile_file(sys.argv[2], source_map=True)',
+          'print(json.dumps(result.source_map["sources"]))',
+        ].join('\n');
+        const pyProc = spawnSync(python, ['-c', pyScript, pyModulePath, entryPath], {
+          encoding: 'utf-8',
+        });
+        assert.equal(
+          pyProc.status,
+          0,
+          `Python compile_file failed (rc=${pyProc.status}): ${pyProc.stderr}`,
+        );
+        pySources = JSON.parse(pyProc.stdout.trim());
+      }
+
+      // -- Differential assertions --------------------------------------------
+      // All surfaces that ran must agree on sources[].
+      assert.deepEqual(
+        napiSources,
+        wasmSources,
+        `napi vs WASM sources[] mismatch (PF-007): ` +
+          `napi=${JSON.stringify(napiSources)} wasm=${JSON.stringify(wasmSources)}`,
+      );
+      assert.deepEqual(
+        napiSources,
+        cliSources,
+        `napi vs CLI sources[] mismatch: ` +
+          `napi=${JSON.stringify(napiSources)} cli=${JSON.stringify(cliSources)}`,
+      );
+      if (pySources != null) {
+        assert.deepEqual(
+          napiSources,
+          pySources,
+          `napi vs Python sources[] mismatch: ` +
+            `napi=${JSON.stringify(napiSources)} python=${JSON.stringify(pySources)}`,
+        );
+      }
+
+      // Extra invariant: all sources[] entries must be root-relative (not absolute).
+      for (const src of napiSources) {
+        assert.ok(
+          !src.startsWith('/') && !src.match(/^[A-Za-z]:[/\\]/),
+          `sources[] entry must be root-relative, not absolute: ${src}`,
+        );
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

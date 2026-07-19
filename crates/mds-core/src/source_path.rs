@@ -384,6 +384,7 @@ fn basename_fallback(comps: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn p(s: &'static str) -> &'static Path {
         Path::new(s)
@@ -629,8 +630,6 @@ mod tests {
         check_output_invariants(&out, "/proj/build/out.mds");
     }
 
-    // ── Property test over the full matrix ──
-
     // ── Tests migrated from mds-cli/src/build.rs (AC-SEC-01) ──────────────────
     //
     // These tests were moved here when the CLI's `relativize_source_path` helper
@@ -710,8 +709,31 @@ mod tests {
         check_output_invariants(&got, "../../D:/x.mds");
     }
 
-    /// For every test case, the output must never be absolute and never drive-qualified.
-    /// This property holds for all outputs including basename fallbacks and sentinels.
+    /// Lexically normalize `base/relative` without hitting the filesystem.
+    ///
+    /// Applies each `/`-delimited component of `relative` to `base`, resolving
+    /// `..` by popping and ignoring `.` / empty components.  Used in the
+    /// round-trip property assertion below.
+    fn lexical_join(base: &Path, relative: &str) -> PathBuf {
+        let mut result = base.to_path_buf();
+        for comp in relative.split('/') {
+            match comp {
+                "" | "." => {}
+                ".." => {
+                    let _ = result.pop();
+                }
+                c => result.push(c),
+            }
+        }
+        result
+    }
+
+    /// For every test case, the output must never be absolute and never
+    /// drive-qualified, and for non-sentinel outputs the round-trip
+    /// `normalize(effective_b.join(out))` must stay inside `root`.
+    ///
+    /// The round-trip invariant is enforced in production at
+    /// `source_path.rs:191-197`; this matrix catches regressions there.
     #[test]
     fn property_outputs_never_absolute_or_drive_qualified() {
         struct Case {
@@ -842,6 +864,26 @@ mod tests {
                     "output must not be empty (source={:?})",
                     c.source,
                 );
+
+                // Round-trip: normalize(effective_b.join(out)) must be inside root.
+                //
+                // `effective_b` mirrors the production logic (source_path.rs:170-180):
+                // use `base` when base is inside root, else fall back to root.
+                // This catches a regression in the round-trip guard at lines 191-197.
+                if let Some(r) = root {
+                    let effective_b: &Path = match base {
+                        Some(b) if b.starts_with(r) => b,
+                        _ => r,
+                    };
+                    let round_trip = lexical_join(effective_b, &out);
+                    assert!(
+                        round_trip.starts_with(r),
+                        "round-trip: normalize(effective_b.join(out)) must be inside root \
+                         (source={:?} out={out:?} effective_b={effective_b:?} root={r:?}): \
+                         got {round_trip:?}",
+                        c.source,
+                    );
+                }
             }
         }
     }

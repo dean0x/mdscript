@@ -1580,6 +1580,91 @@ fn lint_write_failure_includes_filename_in_stderr() {
     );
 }
 
+/// Regression gate (single-file mode): when `atomic_write_file` fails,
+/// stderr must NOT contain "Fixed: <file>" — the success label must only
+/// appear after a successful write, never before.
+///
+/// Previously `lint.rs` emitted `eprintln!("Fixed: ...")` BEFORE calling
+/// `atomic_write_file`, so a failed write printed "Fixed: …/e1.mds" followed
+/// immediately by "error writing …/e1.mds" — actively lying about the
+/// outcome.  `fmt.rs:284` already does this correctly (write first, label on
+/// `Ok(())`); this test locks in parity for both lint modes.
+#[cfg(unix)]
+#[test]
+fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("no_fixed_label.mds");
+    // Tier A auto-fixable content.
+    fs::write(
+        &target,
+        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+    )
+    .unwrap();
+
+    // Make the parent directory read-only so atomic_write_file fails.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = lint_path(&target, &["--fix"]);
+
+    // Restore writability before any assertions (ensures tempdir cleanup succeeds
+    // even if the test panics).
+    let _ = fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The write must have failed.
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "lint --fix must fail when the parent dir is read-only; stderr: {stderr}"
+    );
+
+    // "Fixed:" must NOT appear — emitting it before the write would be a lie.
+    assert!(
+        !stderr.contains("Fixed:"),
+        "stderr must not contain 'Fixed:' when the write failed; got: {stderr}"
+    );
+}
+
+/// Regression gate (directory mode): when `atomic_write_file` fails,
+/// stderr must NOT contain "Fixed: <file>" — mirrors the single-file check
+/// above for the `lint_one_file_human` code path (lint.rs:1227).
+#[cfg(unix)]
+#[test]
+fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("files");
+    fs::create_dir(&inner).unwrap();
+
+    let target = inner.join("no_fixed_label_dir.mds");
+    fs::write(
+        &target,
+        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+    )
+    .unwrap();
+
+    // Make the inner directory read-only so temp-file creation fails on write.
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Run lint --fix on the directory (directory mode routes through lint_one_file_human).
+    let out = lint_path(&inner, &["--fix"]);
+
+    let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The write must have failed (directory mode tallies the error and may still
+    // exit non-zero, but "Fixed:" must not appear for the failed file).
+    assert!(
+        !stderr.contains("Fixed:"),
+        "stderr must not contain 'Fixed:' when the directory-mode write failed; got: {stderr}"
+    );
+}
+
 /// Regression gate: `mds lint <dir>` (directory mode) must not emit raw ESC bytes to
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
