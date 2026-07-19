@@ -1714,3 +1714,51 @@ fn b1_two_level_chain_attributes_to_innermost_definer() {
     );
     assert!(span.length > 0, "B1 two-level: span.length must be > 0");
 }
+
+// ── B2: span-less syntax errors get upgraded to span-bearing errors ──────────
+
+/// A missing trailing `:` on `@if` should produce a span-bearing `mds::syntax` error
+/// that underlines the directive line, not a spanless message.
+#[test]
+fn b2_if_missing_colon_carries_span() {
+    let src = "Hello\n@if x == \"y\"\nworld\n@end\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src.clone());
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(s.code, "mds::syntax", "B2: expected mds::syntax, got: {}", s.code);
+    let span = s.span.expect("B2: @if missing colon must carry a span");
+    // The @if directive starts at byte 6 (after "Hello\n")
+    assert_eq!(span.offset, 6, "B2: span must point to @if directive offset");
+    assert!(span.length > 0, "B2: span.length must be > 0");
+}
+
+/// A missing trailing `:` on `@for` should produce a span-bearing `mds::syntax` error.
+#[test]
+fn b2_for_missing_colon_carries_span() {
+    let src = "@for x in items\nrow\n@end\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src.clone());
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(s.code, "mds::syntax", "B2: expected mds::syntax, got: {}", s.code);
+    let span = s.span.expect("B2: @for missing colon must carry a span");
+    // @for starts at offset 0
+    assert_eq!(span.offset, 0, "B2: span must point to @for directive offset");
+    assert!(span.length > 0, "B2: span.length must be > 0");
+}
+
+/// An unknown directive should produce a span-bearing `mds::syntax` error.
+#[test]
+fn b2_unknown_directive_carries_span() {
+    let src = "hello\n@unknown foo:\nworld\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src.clone());
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(s.code, "mds::syntax", "B2: expected mds::syntax, got: {}", s.code);
+    let span = s.span.expect("B2: unknown directive must carry a span");
+    // @unknown starts at byte 6 (after "hello\n")
+    assert_eq!(span.offset, 6, "B2: span must point to @unknown directive offset");
+    assert!(span.length > 0, "B2: span.length must be > 0");
+}

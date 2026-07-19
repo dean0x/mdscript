@@ -694,6 +694,30 @@ impl MdsError {
         }
     }
 
+    /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if
+    /// the error already carries a span (B2 — spanless syntax-error upgrades at call sites
+    /// that hold the directive offset but cannot thread it into the low-level helper).
+    ///
+    /// Passing `file/source/offset/len` that are out-of-bounds degrades gracefully (the
+    /// `at()` helper drops `src` and keeps only the raw offset in `span`, so miette
+    /// never renders an `OutOfBounds`).
+    pub(crate) fn or_span(
+        self,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        match self {
+            MdsError::Syntax {
+                span: None,
+                src: None,
+                message,
+            } => Self::syntax_at(message, file, source, offset, len),
+            other => other,
+        }
+    }
+
     pub(crate) fn io(message: impl Into<String>) -> Self {
         MdsError::Io {
             message: message.into(),
