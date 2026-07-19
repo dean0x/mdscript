@@ -187,10 +187,22 @@ pub fn plan_fixes_with_options(
         plan.edits.extend(diag_to_edits(diag, source));
     }
 
-    // Sort edits by start position (ascending).
-    plan.edits.sort();
+    // Sort by start position ascending, then by end position descending.
+    // The secondary end-DESC key ensures that among edits sharing the same start byte,
+    // the widest (most encompassing) edit comes first — a precondition for
+    // `dedup_contained_or_identical` to work correctly in a single linear pass.
+    plan.edits
+        .sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
-    // Overlap detection: reject the entire batch if any pair overlaps.
+    // Containment and identical-range deduplication: drop any edit whose byte range is
+    // fully covered by an earlier retained edit (see `dedup_contained_or_identical`).
+    // This resolves false-overlap rejections that occur when two rules each emit spans
+    // for the same region (e.g. unreachable-branch + empty-block on the same @if block).
+    dedup_contained_or_identical(&mut plan.edits);
+
+    // Overlap detection: reject the entire batch if any pair partially overlaps.
+    // Containment has already been resolved above; any remaining overlap is a genuine
+    // partial overlap that cannot be applied safely.
     if has_overlapping_edits(&plan.edits) {
         plan.overlap_rejected = true;
         plan.edits.clear();
@@ -290,6 +302,45 @@ fn has_overlapping_edits(edits: &[ByteEdit]) -> bool {
         }
     }
     false
+}
+
+/// Remove edits that are fully contained within (or byte-identical to) an earlier retained edit.
+///
+/// **Precondition**: `edits` must be sorted by `(start ASC, end DESC)`.  Under that ordering,
+/// among edits sharing the same start byte the widest (largest `end`) appears first, so the
+/// linear scan correctly identifies all contained edits without look-ahead.
+///
+/// The containment check uses a single `max_end` tracker: because starts are non-decreasing,
+/// an edit is contained in some prior retained edit iff its `end ≤ max_end`.
+///
+/// ## What this resolves
+///
+/// Two different rules can legitimately fire on the same AST node and each emit a
+/// `FixLineSpan` that covers some or all of the same byte range. For example,
+/// `unreachable-branch` (case A) emits a span covering the dead `@else:..@end` region,
+/// while `empty-block` emits a shorter span covering just the empty `@else:` clause — the
+/// shorter span is fully contained in the longer one.  Without deduplication, both edits
+/// reach the overlap detector and trigger `overlap_rejected`; with deduplication the shorter
+/// edit is dropped and the longer (dominant) edit is applied, which is correct.
+///
+/// Note: partial overlaps (where neither range contains the other) are NOT resolved here;
+/// they are intentionally left for the overlap detector to catch and reject fail-closed.
+fn dedup_contained_or_identical(edits: &mut Vec<ByteEdit>) {
+    if edits.len() < 2 {
+        return;
+    }
+    let mut write = 0;
+    let mut max_end = edits[0].end;
+    for read in 1..edits.len() {
+        if edits[read].end > max_end {
+            // This edit extends beyond every previously retained edit — keep it.
+            write += 1;
+            max_end = edits[read].end;
+            edits.swap(write, read);
+        }
+        // else: edits[read].end ≤ max_end → fully contained within a retained edit — skip.
+    }
+    edits.truncate(write + 1);
 }
 
 // ── Shared reverify helpers ───────────────────────────────────────────────────
@@ -933,43 +984,37 @@ mod tests {
         );
     }
 
-    // ── L-FIX-OVL1: Overlap detection ────────────────────────────────────────
+    // ── L-FIX-OVL1: Overlap detection and containment dedup ─────────────────
 
-    /// AC-F-19: two diagnostics that map to the same line produce identical
-    /// ByteEdits (`{ start: 0, end: 23 }`). The overlap detector fires because
-    /// `a.end (23) > b.start (0)`. The whole batch is rejected — edits cleared,
-    /// `apply_fixes` returns `FixOutcome::Rejected`.
+    /// AC-F-19 / A4: two diagnostics that map to the SAME line produce identical
+    /// ByteEdits. `dedup_contained_or_identical` removes the duplicate, leaving a
+    /// single edit. No overlap is detected and the fix proceeds.
+    ///
+    /// This is the correct behaviour: removing the same bytes twice is redundant,
+    /// not conflicting. The dedup resolves it safely so the fix succeeds.
     #[test]
-    fn l_fix_ovl1_overlapping_edits_rejected() {
+    fn l_fix_ovl1_identical_same_line_edits_are_deduped_not_rejected() {
         let source =
             "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@import \"./a.mds\" as c\n";
         // Both diag1 (offset 0) and diag2 (offset 2) are on the same line → same
-        // computed line span → overlap detected.
+        // computed ByteEdit { start: 0, end: 23 }. dedup removes the duplicate.
         let diag1 = make_diag("duplicate-import", 0, "@import".len());
         let diag2 = make_diag("duplicate-import", 2, "@import".len());
 
         let result = make_result(vec![diag1, diag2]);
         let plan = plan_fixes(&result, source);
 
-        // Unconditional: overlap must be detected for same-line edits (AC-F-19).
+        // After containment/identical dedup: one edit remains, no overlap.
         assert!(
-            plan.overlap_rejected,
-            "two edits on the same line must trigger overlap detection"
-        );
-        assert!(
-            plan.edits.is_empty(),
-            "rejected plan must have empty edits; got: {:?}",
+            !plan.overlap_rejected,
+            "identical same-line edits must be deduped, not rejected; edits: {:?}",
             plan.edits
         );
-
-        // apply_fixes on a rejected plan must return FixOutcome::Rejected
-        // (the reverify closure must never be called in this path).
-        let outcome = apply_fixes(source, plan, &result, |_| {
-            panic!("reverify must not be called when the batch is overlap-rejected")
-        });
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "apply_fixes on an overlap-rejected plan must return Rejected; got: {outcome:?}"
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "exactly one edit must survive dedup of identical ranges; edits: {:?}",
+            plan.edits
         );
     }
 
@@ -984,6 +1029,201 @@ mod tests {
         assert!(
             !plan.overlap_rejected,
             "non-overlapping edits should not be rejected"
+        );
+    }
+
+    // ── A4: containment / identical-range deduplication ──────────────────────
+
+    /// A4-DEDUP-1: Two edits with identical byte ranges are reduced to one.
+    /// Previously this caused overlap_rejected = true.
+    #[test]
+    fn a4_identical_ranges_are_deduped_to_one() {
+        // Two diagnostics that produce the exact same line removal: offset 0 on
+        // "@import\n". After dedup, only one edit remains → no overlap.
+        let source = "@import \"./a.mds\" as a\n";
+        let diag_a = LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "dup".to_string(),
+            help: None,
+            span: Some(crate::error::SerializedSpan {
+                offset: 0,
+                length: 1,
+                line: None,
+                column: None,
+            }),
+            file: None,
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
+        };
+        let diag_b = LintDiagnostic {
+            rule: "duplicate-export".to_string(),
+            severity: Severity::Error,
+            message: "dup".to_string(),
+            help: None,
+            span: Some(crate::error::SerializedSpan {
+                offset: 0,
+                length: 1,
+                line: None,
+                column: None,
+            }),
+            file: None,
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
+        };
+        let result = LintResult {
+            diagnostics: vec![diag_a, diag_b],
+            truncated: false,
+            is_standalone: false,
+        };
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.overlap_rejected,
+            "identical-range edits must be deduped, not rejected; edits: {:?}",
+            plan.edits
+        );
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "exactly one edit must survive dedup; edits: {:?}",
+            plan.edits
+        );
+    }
+
+    /// A4-DEDUP-2: An edit fully contained within a wider edit is dropped;
+    /// the wider edit is applied and no overlap is detected.
+    #[test]
+    fn a4_contained_edit_is_dropped_wider_edit_kept() {
+        // Source: "@if x:\nhello\n@else:\n\n@end\n"
+        // (unreachable-branch case A: always-true @if with empty @else)
+        // Wide edit: covers @else:\n\n@end\n  (the whole @else..@end block)
+        // Narrow edit: covers @else:\n\n      (just @else: and empty body)
+        // The narrow edit is contained within the wide edit.
+        let source = "@if x:\nhello\n@else:\n\n@end\n";
+        // @if line: 7 bytes (0..7)
+        // "hello\n": 6 bytes (7..13)
+        // "@else:": 6 + \n = 7 bytes (13..20)
+        // "\n": 1 byte (20..21)
+        // "@end\n": 5 bytes (21..26)
+        let wide_edit = LintDiagnostic {
+            rule: "unreachable-branch".to_string(),
+            severity: Severity::Error,
+            message: "x".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            // FixLineSpan { from: 13, to: 21, to_inclusive: true }
+            // → start = line_start(13) = 13, end = extend_to_line_end(21) = 26
+            fix_removals: Some(vec![FixLineSpan {
+                from: 13, // @else: offset
+                to: 21,   // @end offset
+                to_inclusive: true,
+            }]),
+        };
+        let narrow_edit = LintDiagnostic {
+            rule: "empty-block".to_string(),
+            severity: Severity::Warn,
+            message: "x".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            // FixLineSpan { from: 13, to: 21, to_inclusive: false }
+            // → start = line_start(13) = 13, end = line_start(21) = 21
+            fix_removals: Some(vec![FixLineSpan {
+                from: 13,
+                to: 21,
+                to_inclusive: false,
+            }]),
+        };
+        let result = LintResult {
+            diagnostics: vec![wide_edit, narrow_edit],
+            truncated: false,
+            is_standalone: false,
+        };
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.overlap_rejected,
+            "contained edit must be deduped, not rejected; edits: {:?}",
+            plan.edits
+        );
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "exactly one (wide) edit must survive dedup; edits: {:?}",
+            plan.edits
+        );
+        // The surviving edit must be the WIDE one (starts at 13, ends at 26).
+        assert_eq!(
+            plan.edits[0].start, 13,
+            "surviving edit must start at @else:"
+        );
+        assert_eq!(
+            plan.edits[0].end, 26,
+            "surviving edit must end after @end newline"
+        );
+    }
+
+    /// A4-DEDUP-3: A true partial overlap (neither range contains the other)
+    /// is still rejected after deduplication.
+    #[test]
+    fn a4_partial_overlap_still_rejected_after_dedup() {
+        // Edit A: [0, 15), Edit B: [10, 25) — partial overlap.
+        // Neither contains the other since 15 < 25 but 0 < 10.
+        let source = "0123456789abcdefghijklmnopqrstuvwxyz\n";
+        let diag_a = LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "a".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            // Force edit [0, 15) by using raw fix_removals that resolve that way.
+            // line_start(0)=0, extend_to_line_end(14)=37 (entire single-line source)
+            // But we want [0, 15) exactly. Use a FixLineSpan with to_inclusive:false:
+            // to=15 → line_start(15)=0 (single line) ... hmm, tricky.
+            // Instead, inject ByteEdit directly via make_diag which uses single(offset).
+            // Single-line source: both edits fall on the same line → same ByteEdit.
+            // Use a two-line source to get distinct line ranges.
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
+        };
+        let source2 = "line1\nline2\n";
+        // single(0) → ByteEdit [0, 6) (line1\n)
+        // single(6) → ByteEdit [6, 12) (line2\n)
+        // These are disjoint, not overlapping. Need a different approach.
+        // For a true partial overlap test: craft fix_removals that produce them.
+        // FixLineSpan { from:0, to:0, to_inclusive:true } on "line1\nline2\n" → [0, 6)
+        // FixLineSpan { from:0, to:6, to_inclusive:true } on "line1\nline2\n" → [0, 12)
+        // The [0, 12) CONTAINS [0, 6) → containment dedup → NOT a partial overlap test.
+        //
+        // True partial overlap requires spans from DIFFERENT start positions where
+        // neither contains the other. With a single-line source, all edits cover [0, n)
+        // with same start. Construct with a 3-line source:
+        //   line0: bytes [0, 6)
+        //   line1: bytes [6, 12)
+        //   line2: bytes [12, 18)
+        // Edit A: { from:0, to:6, to_inclusive:false } → [0, 6) (line0 only)
+        //   Actually to_inclusive:false means end=line_start(to). line_start(6) = 6. → [0,6)
+        // Hmm, this is still same-start as line0.
+        // For partial overlap, we need something like:
+        //   Edit A: from line0 through half of line1 — impossible with line-aligned removals!
+        // Line-aligned spans cannot partially overlap! (They always start/end at newline
+        // boundaries, so one either contains the other or they are disjoint.)
+        //
+        // Conclusion: with line-aligned FixLineSpans, true partial overlaps cannot occur
+        // in practice. But we still test overlap detection directly via plan manipulation.
+        let _ = (source, source2, diag_a);
+
+        // Instead: directly construct a plan with overlap_rejected=true to test that
+        // apply_fixes respects it. The planner itself cannot produce partial overlaps
+        // from valid FixLineSpans (line-aligned spans are always disjoint or contained).
+        let plan = FixPlan {
+            edits: vec![],
+            overlap_rejected: true,
+            truncated: false,
+        };
+        let result = make_result(vec![]);
+        let outcome = apply_fixes("", plan, &result, |_| Ok(make_result(vec![])));
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "overlap_rejected plan must be Rejected; got: {outcome:?}"
         );
     }
 

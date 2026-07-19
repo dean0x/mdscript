@@ -951,26 +951,26 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
     }
 }
 
-// ── Test (c): --fix --check on overlap-fix fixture → prints "fix rejected" ────
+// ── Test (c): --fix --check on overlap-fix fixture → "Would fix" after coalescing ──
 //
-// Pins bug-5 / PF-004 fix for the check path: preview_fixes now returns a
-// PreviewOutcome::Rejected so --fix --check can surface the rejection reason.
-//
-// Pre-Phase-B behavior: preview_fixes returned Option<String> and mapped Rejected
-// to None — --fix --check never printed "fix rejected" even when the reverify gate
-// refused the edit.
+// Pins bug-5 / PF-004 fix for the check path: preview_fixes returns a
+// PreviewOutcome::WouldFix so --fix --check reports what would change.
 //
 // Fixture: lint_overlap_fix.mds — @if "x" == "x": with "hello" then-body and an
 // empty @else body. Two rules fire simultaneously:
 //   • unreachable-branch (Tier A, Error): always-true @if with later @else branch.
-//     Generates two spans: remove @if line + remove @else..@end.
+//     Generates two spans: remove @if line + remove @else..@end (inclusive).
 //   • empty-block (Tier A, Warn): empty @else body.
-//     Generates one span: remove @else: line through (but not including) @end.
-// The @else: removal spans OVERLAP (both start at the same byte), so
-// plan_fixes_with_options sets overlap_rejected = true → Rejected fail-closed.
+//     Generates one span: remove @else: through @end (exclusive).
+//
+// The empty-block span is contained within the unreachable-branch span that covers
+// @else..@end. plan_fixes_with_options sorts by (start ASC, end DESC) and calls
+// dedup_contained_or_identical, which drops the shorter empty-block span. The
+// resulting two unreachable-branch spans are disjoint → no overlap_rejected.
+// The fix would succeed → "Would fix" printed; file unchanged (check mode).
 
 #[test]
-fn fix_check_refused_fix_prints_rejected_not_would_fix() {
+fn fix_check_coalesced_fix_prints_would_fix() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_overlap_fix.mds");
     fs::copy(fixture("lint_overlap_fix.mds"), &target).unwrap();
@@ -979,17 +979,17 @@ fn fix_check_refused_fix_prints_rejected_not_would_fix() {
     let out = lint_path(&target, &["--fix", "--check"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // "fix rejected" must appear: overlapping spans trigger the overlap guard.
+    // "Would fix" must appear: after containment dedup the fix is accepted.
     assert!(
-        stderr.contains("fix rejected"),
-        "--fix --check must print 'fix rejected' when overlapping spans are detected; \
+        stderr.contains("Would fix"),
+        "--fix --check must print 'Would fix' when coalescing resolves the overlap; \
          got stderr: {stderr}"
     );
 
-    // "Would fix" must NOT appear: the fix was rejected, not pending.
+    // "fix rejected" must NOT appear: containment dedup resolved the overlap.
     assert!(
-        !stderr.contains("Would fix"),
-        "--fix --check must NOT print 'Would fix' when fix is rejected; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "--fix --check must NOT print 'fix rejected' after coalescing; got stderr: {stderr}"
     );
 
     // File must be untouched — check mode never writes.
@@ -1075,22 +1075,27 @@ fn dir_fix_check_exits_1_when_any_file_fixable_exits_0_when_none() {
     );
 }
 
-// ── Test (f): Overlap fixture → visible "fix rejected"/overlap message ────────
+// ── Test (f): Overlap fixture → coalescing resolves it, fix succeeds ─────────
 //
-// Pins bug-12 / preview-honesty: when two Tier-A edits target the same line
-// (overlap detected), the fix is refused with "Overlapping fix spans detected"
-// and the output is NOT silent.
+// Pins Step 4 coalescing: when multiple Tier-A rules emit overlapping spans
+// (one span contained within another), dedup_contained_or_identical drops
+// the smaller span and the fix proceeds with the larger (dominant) span.
 //
-// Fixture: lint_overlap.mds — a @define containing an @if "a"=="a" block with
-// a @elseif "a"=="a" that is both unreachable AND has an empty body.  Both
-// empty-block and unreachable-branch fire on the same @elseif line → same byte
-// range → overlap detected → Rejected.
-//
-// Tests --fix (apply) path: the rejection message appears on stderr, the file is
-// untouched, and exit code reflects the residual diagnostics.
+// Fixture: lint_overlap.mds — a @define containing @if "a"=="a" with a
+// @elseif "a"=="a" that is both a duplicate AND has an empty body.  Three
+// rules emit edits on the @elseif line:
+//   • unreachable-branch case A (always-true @if): two spans — remove @if
+//     directive line + remove @elseif..@end inclusive.
+//   • unreachable-branch case G (duplicate @elseif): one span —
+//     remove @elseif..@end exclusive (contained within case-A span 2).
+//   • empty-block ⑥ (empty @elseif body): one span — same as case-G
+//     span (contained/identical).
+// After sort (start ASC, end DESC) and containment dedup, only two spans
+// survive: [remove-@if-line, remove-@elseif..@end-inclusive].
+// No overlap remains → fix is applied → file changed → exit 0.
 
 #[test]
-fn fix_overlap_surfaced_not_silent() {
+fn fix_overlap_coalesced_and_applied() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_overlap.mds");
     fs::copy(fixture("lint_overlap.mds"), &target).unwrap();
@@ -1099,23 +1104,34 @@ fn fix_overlap_surfaced_not_silent() {
     let out = lint_path(&target, &["--fix"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // "fix rejected" must appear — not silent.
+    // Fix must succeed: coalescing resolves the contained-span overlap.
     assert!(
-        stderr.contains("fix rejected"),
-        "--fix on overlap fixture must print 'fix rejected'; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "--fix on coalesced overlap fixture must NOT print 'fix rejected'; got stderr: {stderr}"
     );
 
-    // The overlap reason must mention "overlap" or "Overlapping".
-    assert!(
-        stderr.to_lowercase().contains("overlap"),
-        "rejection reason must mention 'overlap'; got stderr: {stderr}"
-    );
-
-    // File must be unchanged (fix was refused, no write).
+    // File must be changed.
     let after = fs::read_to_string(&target).unwrap();
-    assert_eq!(
+    assert_ne!(
         original, after,
-        "overlap-rejected file must be left unchanged"
+        "fix must change the file when coalescing resolves the overlap"
+    );
+
+    // The @if and @elseif blocks are gone; the then-body and outer @end remain.
+    assert!(
+        !after.contains("@if"),
+        "fixed file must not contain the removed @if; got:\n{after}"
+    );
+    assert!(
+        !after.contains("@elseif"),
+        "fixed file must not contain the removed @elseif; got:\n{after}"
+    );
+
+    // No residual diagnostics → exit 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no residual diagnostics after fix; got stderr: {stderr}"
     );
 }
 
@@ -1125,18 +1141,20 @@ fn fix_overlap_surfaced_not_silent() {
 // some fail, the CLI writes the partially-fixed file and emits a
 // "{applied} of {total} fixes applied" summary.
 //
-// Fixture: lint_partial_fix.mds — contains a multi-line empty @define (Tier A,
-// fix fails reverify because @end is orphaned after removing the @define line)
-// and a duplicate @export (Tier A, fix passes — just removes a line).
+// Fixture: lint_partial_fix.mds — a multi-line empty @define (Tier A, empty-block)
+// with a matching @export, plus a duplicate @export (Tier A, duplicate-export).
 //
-// Expected behaviour:
-// - Batch attempt: fails (empty-block removal + dup-export removal together →
-//   @end orphaned → reverify rejects).
-// - Per-edit fallback right-to-left:
-//   1. duplicate-export (higher offset) → applied, reverify passes.
-//   2. empty-block (lower offset) → reverify fails → rejected.
-// - File written with one @export greet remaining; empty @define still present.
-// - Stderr: "1 of 2 fixes applied" (or "Partially fixed: … (1 of 2 fixes applied)").
+// The empty-block fix removes @define empty_fn():..@end. This leaves @export empty_fn
+// in the file with no corresponding @define. The MDS compiler rejects this
+// ("cannot export 'empty_fn': not defined in this module"), so the reverify gate
+// refuses the empty-block fix fail-closed. The duplicate-export fix (remove second
+// @export greet) passes independently.
+//
+// Expected behaviour (per-edit fallback, right-to-left):
+//   1. duplicate-export (higher offset) → applied, reverify passes → Fixed.
+//   2. empty-block (lower offset) → reverify fails (orphaned @export) → rejected.
+// File written with one @export greet remaining; empty @define still present.
+// Stderr: "1 of 2 fixes applied" (or "Partially fixed: … (1 of 2 fixes applied)").
 
 #[test]
 fn partially_fixed_end_to_end_count_in_summary() {
@@ -1162,7 +1180,7 @@ fn partially_fixed_end_to_end_count_in_summary() {
         "file must have exactly one @export greet after partial fix; got:\n{after}"
     );
 
-    // The empty @define must still be present (empty-block fix was rejected).
+    // The empty @define must still be present (empty-block fix refused: orphaned @export).
     assert!(
         after.contains("@define empty_fn():"),
         "empty @define must still be present after partial fix; got:\n{after}"
