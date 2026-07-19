@@ -12,7 +12,7 @@
 //! - L-CLI-JSON5: --format json malformed mds.json → exit 2, JSON error envelope stdout (AC-F-14)
 //! - L-CLI-FIX1: --fix applies auto-fixable issues in place (Tier A)
 //! - L-CLI-FIX2: --fix --check exits 1 if fixes pending, never writes
-//! - L-CLI-FIX3: block-spanning --fix is refused fail-closed; file unchanged (TEST-3)
+//! - L-CLI-FIX3: block-spanning empty-block --fix applied; file changed, exit 0 (TEST-3)
 //! - L-CLI-STDIN1: stdin (no fix) → diagnostics to stderr, stdout empty
 //! - L-CLI-STDIN2: --fix stdin → fixed source to stdout, diagnostics to stderr
 //! - L-CLI-VARS: --set passes runtime variables to the gate check
@@ -20,7 +20,7 @@
 //! - L-CLI-DIR1: directory mode path-sorts and lints all files including partials
 //! - L-CLI-RESOURCE: nesting > MAX_NESTING_DEPTH (64) → exit 3 ResourceLimit (TEST-4)
 //! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
-//! - I-24: unreachable-branch --fix is refused (block-spanning); file unchanged, exit 2
+//! - I-24: unreachable-branch (always-true @if) --fix applied; file changed, exit 0
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
 
 mod common;

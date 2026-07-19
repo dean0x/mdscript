@@ -545,4 +545,193 @@ mod tests {
             "rule=off should produce no diagnostics"
         );
     }
+
+    // ── A3 case matrix: fix_removals descriptor for each coverage case ─────────
+    //
+    // Each test pins the fix_removals shape (Some/None, span count, to_inclusive)
+    // for every case handled by check_nodes / check_if_block. The cases follow
+    // the numbering in check_if_block's inline comments (①–⑧).
+
+    /// A3-①: empty @for → fix_removals = Some([whole-block, to_inclusive = true]).
+    #[test]
+    fn a3_case1_empty_for_fix_removals_is_whole_block_inclusive() {
+        let diags = lint_src("@for x in items:\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@for"))
+            .expect("expected empty @for diagnostic");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case ①: empty @for must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case ①: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            spans[0].to_inclusive,
+            "case ①: whole-block removal must be inclusive (to_inclusive = true); got: {spans:?}"
+        );
+    }
+
+    /// A3-②: empty @define → fix_removals = Some([whole-block, to_inclusive = true]).
+    #[test]
+    fn a3_case2_empty_define_fix_removals_is_whole_block_inclusive() {
+        let diags = lint_src("@define greet():\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@define"))
+            .expect("expected empty @define diagnostic");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case ②: empty @define must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case ②: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            spans[0].to_inclusive,
+            "case ②: whole-block removal must be inclusive; got: {spans:?}"
+        );
+    }
+
+    /// A3-③: empty @if with no other branches → fix_removals = Some([whole-block, to_inclusive = true]).
+    #[test]
+    fn a3_case3_empty_if_no_branches_fix_removals_is_whole_block_inclusive() {
+        let diags = lint_src("@if x:\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@if"))
+            .expect("expected empty @if (no branches) diagnostic");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case ③: empty @if (no branches) must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case ③: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            spans[0].to_inclusive,
+            "case ③: whole-block removal must be inclusive; got: {spans:?}"
+        );
+    }
+
+    /// A3-④: empty @if then-body when other branches present → fix_removals = None.
+    ///
+    /// Partial-block removal is unsafe when @else or @elseif branches exist;
+    /// the fix planner must refuse rather than silently drop live branches.
+    #[test]
+    fn a3_case4_empty_then_body_with_other_branches_fix_removals_is_none() {
+        // @if body is empty; @else has content — partial removal would drop @else.
+        let diags = lint_src("@if x:\n@else:\nhello\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@if"))
+            .expect("expected empty @if then-body diagnostic");
+        assert!(
+            d.fix_removals.is_none(),
+            "case ④: empty @if with other branches must have fix_removals = None \
+             (unsafe to auto-fix); got: {:?}",
+            d.fix_removals
+        );
+    }
+
+    /// A3-⑤: empty @else → fix_removals = Some([exclusive span, to_inclusive = false]).
+    ///
+    /// Removes from the @else: directive up to (not including) the @end line,
+    /// leaving the @end intact so the @if structure remains valid.
+    #[test]
+    fn a3_case5_empty_else_fix_removals_is_exclusive() {
+        // @if then-body has content; @else body is empty.
+        let diags = lint_src("@if x:\nhello\n@else:\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@else"))
+            .expect("expected empty @else diagnostic");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case ⑤: empty @else must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case ⑤: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            !spans[0].to_inclusive,
+            "case ⑤: @else removal must be exclusive (to_inclusive = false); got: {spans:?}"
+        );
+    }
+
+    /// A3-⑥: terminal empty @elseif (no @else follows) → fix_removals = Some([exclusive span]).
+    ///
+    /// Removes from the @elseif directive up to (not including) @end, leaving
+    /// the @end intact. "Terminal" = this is the last @elseif and there is no @else.
+    #[test]
+    fn a3_case6_terminal_empty_elseif_fix_removals_is_exclusive() {
+        // @if has content; @elseif body is empty; no @else.
+        let diags = lint_src("@if x:\nhello\n@elseif y:\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@elseif"))
+            .expect("expected terminal empty @elseif diagnostic");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case ⑥: terminal empty @elseif must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case ⑥: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            !spans[0].to_inclusive,
+            "case ⑥: terminal @elseif removal must be exclusive (to_inclusive = false); \
+             got: {spans:?}"
+        );
+    }
+
+    /// A3-⑦: non-terminal empty @elseif → fix_removals = None.
+    ///
+    /// When another @elseif or @else follows, removing just this branch would
+    /// create an invalid structure; the planner refuses (unsafe to auto-fix).
+    #[test]
+    fn a3_case7_nonterminal_empty_elseif_fix_removals_is_none() {
+        // @if has content; first @elseif body is empty but NOT terminal (another @elseif follows).
+        let diags = lint_src("@if x:\nhello\n@elseif y:\n@elseif z:\nworld\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@elseif"))
+            .expect("expected non-terminal empty @elseif diagnostic");
+        assert!(
+            d.fix_removals.is_none(),
+            "case ⑦: non-terminal empty @elseif must have fix_removals = None \
+             (unsafe to auto-fix); got: {:?}",
+            d.fix_removals
+        );
+    }
+
+    /// A3-⑧: empty @message → fix_removals = None (not auto-fixable by design).
+    ///
+    /// Empty @message may be intentional (priming turn). The rule fires but no
+    /// auto-fix is offered; the user must manually remove or populate it.
+    #[test]
+    fn a3_case8_empty_message_fix_removals_is_none() {
+        let diags = lint_src("@message user:\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("@message"))
+            .expect("expected empty @message diagnostic");
+        assert!(
+            d.fix_removals.is_none(),
+            "case ⑧: empty @message must have fix_removals = None \
+             (not auto-fixable by design); got: {:?}",
+            d.fix_removals
+        );
+    }
 }

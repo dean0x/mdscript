@@ -1,6 +1,7 @@
 //! Rule: `unused-import`
 //!
-//! **Severity**: Warn (default) | **Tier**: B (recompile-diff-proven)
+//! **Severity**: Warn (default) | **Tier**: B (report-only in practice — no
+//! `fix_removals` wired; a file with imports is never structural-standalone)
 //!
 //! An import that is never used in the module body wastes the resolver's work
 //! (and in partial-eval contexts, the loading of an external file).

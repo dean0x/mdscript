@@ -227,7 +227,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | Rule | Severity | Description |
 |------|----------|-------------|
 | `unused-variable` | warn | Frontmatter variable defined but never referenced in the body |
-| `unused-import` | warn | `@import` that is never referenced (Tier B: auto-fixed only for standalone files) |
+| `unused-import` | warn | `@import` that is never referenced (Tier B: report-only in practice — no `fix_removals` wired; a file with imports is never structural-standalone) |
 | `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
 | `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |

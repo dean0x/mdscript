@@ -565,4 +565,205 @@ mod tests {
         check(&module, &ctx, "test.mds", &config, &mut builder);
         assert!(builder.build(false).diagnostics.is_empty());
     }
+
+    // ── A3 case matrix: fix_removals descriptor for each case A–G ─────────────
+    //
+    // Each test pins the fix_removals shape (Some/None, span count, to_inclusive)
+    // for every removal case defined in check_if_block. The letter labels (A–G)
+    // follow the case labels in the source comments.
+
+    /// A3-Case A: always-true @if with later branches → fix_removals = Some(two spans).
+    ///
+    /// Span 1: FixLineSpan::single(b.offset)                          — remove @if directive line.
+    /// Span 2: FixLineSpan { from: first_later_offset, …, inclusive } — remove later branches + @end.
+    #[test]
+    fn a3_case_a_always_true_with_later_branches_fix_removals_is_two_span() {
+        // always-true @if "x"=="x" with @else branch.
+        let diags = lint_src("@if \"x\" == \"x\":\nhello\n@else:\nworld\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("always true"))
+            .expect("expected always-true @if diagnostic (case A)");
+        let spans = d.fix_removals.as_ref().expect(
+            "case A: always-true @if with later branches must have fix_removals = Some(...)",
+        );
+        assert_eq!(
+            spans.len(),
+            2,
+            "case A: expected exactly two removal spans (directive line + later-branches+@end); \
+             got: {spans:?}"
+        );
+        // Span 1 is a single-line removal (FixLineSpan::single → to_inclusive = true, from == to).
+        assert!(
+            spans[0].to_inclusive && spans[0].from == spans[0].to,
+            "case A: span 1 must be a single-line inclusive removal \
+             (from == to, to_inclusive = true); got: {:?}",
+            spans[0]
+        );
+        // Span 2 covers through @end (to_inclusive = true).
+        assert!(
+            spans[1].to_inclusive,
+            "case A: span 2 (later branches + @end) must be inclusive; got: {:?}",
+            spans[1]
+        );
+    }
+
+    /// A3-Case B: always-false @if, no other branches → fix_removals = Some([whole-block, inclusive]).
+    #[test]
+    fn a3_case_b_always_false_no_branches_fix_removals_is_whole_block_inclusive() {
+        let diags = lint_src("@if \"x\" == \"y\":\nhello\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("always false"))
+            .expect("expected always-false @if diagnostic (case B)");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case B: always-false @if (no branches) must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case B: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            spans[0].to_inclusive,
+            "case B: whole-block removal must be inclusive; got: {:?}",
+            spans[0]
+        );
+    }
+
+    /// A3-Case C: always-false @if with only @else → fix_removals = Some(two spans).
+    ///
+    /// Span 1: FixLineSpan { from: @if, to: @else, inclusive } — remove @if..@else: inclusive.
+    /// Span 2: FixLineSpan::single(@end)                       — remove @end line.
+    /// Result: else-body is unwrapped in the parent scope.
+    #[test]
+    fn a3_case_c_always_false_with_only_else_fix_removals_is_two_span() {
+        let diags = lint_src("@if \"x\" == \"y\":\nhello\n@else:\nworld\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("always false"))
+            .expect("expected always-false @if with @else diagnostic (case C)");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case C: always-false @if with @else must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            2,
+            "case C: expected exactly two removal spans (@if+@else directive, @end line); \
+             got: {spans:?}"
+        );
+        // Span 1 includes the @else: line (inclusive).
+        assert!(
+            spans[0].to_inclusive,
+            "case C: span 1 (@if..@else: inclusive) must be inclusive; got: {:?}",
+            spans[0]
+        );
+        // Span 2 is a single-line removal of @end (from == to, to_inclusive = true).
+        assert!(
+            spans[1].to_inclusive && spans[1].from == spans[1].to,
+            "case C: span 2 must be a single-line inclusive removal of @end \
+             (from == to, to_inclusive = true); got: {:?}",
+            spans[1]
+        );
+    }
+
+    /// A3-Case D: always-false @if with @elseif present → fix_removals = None.
+    ///
+    /// Auto-fix is too complex when @elseif branches exist (the planner would
+    /// need to decide which branch to hoist into the parent scope).
+    #[test]
+    fn a3_case_d_always_false_with_elseif_fix_removals_is_none() {
+        // @elseif uses a variable condition (not always-true/false) to avoid
+        // triggering additional unreachable-branch findings that would complicate lookup.
+        let diags = lint_src("@if \"x\" == \"y\":\nhello\n@elseif z == \"a\":\nworld\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("always false"))
+            .expect("expected always-false @if with @elseif diagnostic (case D)");
+        assert!(
+            d.fix_removals.is_none(),
+            "case D: always-false @if with @elseif must have fix_removals = None \
+             (too complex to auto-fix safely); got: {:?}",
+            d.fix_removals
+        );
+    }
+
+    /// A3-Case E: always-false @elseif → fix_removals = Some([exclusive span]).
+    ///
+    /// Removes from the @elseif directive up to (not including) the next boundary
+    /// (@else, next @elseif, or @end) — the boundary line is kept intact.
+    #[test]
+    fn a3_case_e_always_false_elseif_fix_removals_is_exclusive() {
+        // @if condition uses a variable (Unknown) so only the @elseif fires.
+        let diags = lint_src("@if z == \"a\":\nhello\n@elseif \"x\" == \"y\":\nworld\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("always false"))
+            .expect("expected always-false @elseif diagnostic (case E)");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case E: always-false @elseif must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case E: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            !spans[0].to_inclusive,
+            "case E: @elseif removal must be exclusive (to_inclusive = false); got: {:?}",
+            spans[0]
+        );
+    }
+
+    /// A3-Case F: always-true @elseif → fix_removals = None.
+    ///
+    /// Unwrapping the body would require complex restructuring; the planner
+    /// refuses to auto-fix (report-only for this case).
+    #[test]
+    fn a3_case_f_always_true_elseif_fix_removals_is_none() {
+        // @if condition uses a variable (Unknown); @elseif "x"=="x": is always-true.
+        let diags = lint_src("@if z == \"a\":\nhello\n@elseif \"x\" == \"x\":\nworld\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("always true"))
+            .expect("expected always-true @elseif diagnostic (case F)");
+        assert!(
+            d.fix_removals.is_none(),
+            "case F: always-true @elseif must have fix_removals = None \
+             (restructuring required, not auto-fixable); got: {:?}",
+            d.fix_removals
+        );
+    }
+
+    /// A3-Case G: duplicate @elseif condition → fix_removals = Some([exclusive span]).
+    ///
+    /// Removes from the duplicate @elseif directive up to (not including) the next
+    /// boundary, keeping whatever follows intact.
+    #[test]
+    fn a3_case_g_duplicate_elseif_fix_removals_is_exclusive() {
+        // @elseif x == "a" duplicates the @if condition → dead code.
+        let diags = lint_src("@if x == \"a\":\nfoo\n@elseif x == \"a\":\nbar\n@end\n");
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("structurally identical"))
+            .expect("expected duplicate @elseif diagnostic (case G)");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("case G: duplicate @elseif must have fix_removals = Some(...)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "case G: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            !spans[0].to_inclusive,
+            "case G: duplicate @elseif removal must be exclusive (to_inclusive = false); \
+             got: {:?}",
+            spans[0]
+        );
+    }
 }

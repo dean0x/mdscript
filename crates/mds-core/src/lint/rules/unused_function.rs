@@ -235,4 +235,38 @@ mod tests {
         check(&module, &ctx, "test.mds", &config, &mut builder);
         assert!(builder.build(false).diagnostics.is_empty());
     }
+
+    /// A3 (unused-function): fix_removals is a whole-@define block removal (to_inclusive = true).
+    ///
+    /// Tier B auto-fix removes the complete @define..@end span when the file is
+    /// structural-standalone. This test pins the descriptor shape so a change to the
+    /// fix_removals wiring causes an immediate test failure rather than a silent
+    /// regression in the fix pipeline.
+    #[test]
+    fn fix_removals_is_whole_define_block_inclusive() {
+        // `format_name` is defined but never exported or called (has_explicit_exports = true
+        // because `greet` is exported); the rule must fire for `format_name`.
+        let src =
+            "@define greet():\nhello\n@end\n@define format_name(x):\n{x}!\n@end\n@export greet\n";
+        let diags = lint_src(src);
+        let d = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("format_name"))
+            .expect("expected unused-function diagnostic for format_name");
+        let spans = d
+            .fix_removals
+            .as_ref()
+            .expect("unused-function must have fix_removals = Some(whole-@define block)");
+        assert_eq!(
+            spans.len(),
+            1,
+            "unused-function: expected exactly one removal span; got: {spans:?}"
+        );
+        assert!(
+            spans[0].to_inclusive,
+            "unused-function: whole-block removal must be inclusive (to_inclusive = true); \
+             got: {:?}",
+            spans[0]
+        );
+    }
 }

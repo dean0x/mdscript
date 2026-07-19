@@ -6,16 +6,26 @@
 //! |------|---------------------------------------------------|-----------|
 //! | A    | duplicate-import, duplicate-export,               | Auto-fixable (span-removal); gated by reverify |
 //! |      | unreachable-branch, empty-block                   |           |
-//! | B    | unused-import, unused-function                    | Fixable only in standalone mode (single-file; reverify applies) |
+//! | B    | unused-import, unused-function                    | Fixable only when structural-standalone (no imports/extends/partial; reverify applies) |
 //! | C    | unused-variable, redundant-else, shadow-variable  | Report-only; never fixed |
 //!
 //! **Tier B nuance:**
 //! - `unused-function` sets `fix_removals` to a whole-block [`FixLineSpan`] and is
-//!   applied when `include_tier_b = true` (standalone file). The reverify gate still
-//!   runs; if removing the function would cause a compile error the edit is rejected.
+//!   applied when `include_tier_b = true` (structural-standalone file). The reverify
+//!   gate still runs; if removing the function would cause a compile error the edit
+//!   is rejected.
 //! - `unused-import` leaves `fix_removals: None` (partial-name removal from an import
 //!   list is structurally ambiguous and unsafe). The rule is Tier B so it appears under
-//!   `--fix --standalone` output, but no edit is ever emitted.
+//!   `--fix --standalone` output, but no edit is ever emitted (report-only in practice).
+//!
+//! ## Terminology (spec §7.5)
+//!
+//! - **Structural-standalone**: a file with no `@import`, `@extends`, or use as a
+//!   partial target. This property gates Tier B `--fix`. A file that triggers
+//!   `unused-import` is, by definition, not structural-standalone.
+//! - **Compile-clean**: a file that compiles without any runtime `--vars`. This
+//!   property gates the output-equality reverify for Tier B fixes: removing an
+//!   unused import or function must produce byte-identical compiled output.
 //!
 //! ## Block-span fixes (FixLineSpan)
 //!
@@ -1473,6 +1483,52 @@ mod tests {
         assert!(
             matches!(outcome, FixOutcome::Rejected { .. }),
             "reverify failure should reject the fix"
+        );
+    }
+
+    /// A5: re-parse failure flows through the A5 path and produces the exact stable
+    /// rejection message (defined at apply_fixes / apply_fixes_incremental).
+    ///
+    /// Pins the stable prefix and suffix around the embedded error so the human-
+    /// readable message cannot drift without a test failure:
+    ///   "could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"
+    ///
+    /// The embedded `{err}` is asserted non-empty, confirming that a real error
+    /// was propagated rather than a blank placeholder.
+    #[test]
+    fn l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix() {
+        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
+        let diag = make_diag("duplicate-import", 23, "@import".len());
+        let result = make_result(vec![diag]);
+        let plan = plan_fixes(&result, source);
+
+        let outcome = apply_fixes(source, plan, &result, |_fixed| {
+            Err(MdsError::syntax("simulated compile failure after fix"))
+        });
+
+        let reason = match outcome {
+            FixOutcome::Rejected { reason, .. } => reason,
+            other => panic!("expected Rejected, got: {other:?}"),
+        };
+
+        const PREFIX: &str =
+            "could not verify fix \u{2014} the edited source did not re-parse cleanly (";
+        const SUFFIX: &str = "); leaving the file unchanged";
+
+        assert!(
+            reason.starts_with(PREFIX),
+            "A5 reason must start with the stable prefix;\n  reason: {reason:?}\n  prefix: {PREFIX:?}"
+        );
+        assert!(
+            reason.ends_with(SUFFIX),
+            "A5 reason must end with the stable suffix;\n  reason: {reason:?}\n  suffix: {SUFFIX:?}"
+        );
+        // The embedded error message must be non-empty.
+        let embedded = &reason[PREFIX.len()..reason.len() - SUFFIX.len()];
+        assert!(
+            !embedded.is_empty(),
+            "A5 reason must contain a non-empty embedded error between the stable \
+             prefix and suffix; got: {reason:?}"
         );
     }
 
