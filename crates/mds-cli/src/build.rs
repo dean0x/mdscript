@@ -443,7 +443,7 @@ pub(crate) struct RuntimeVarArgs {
 pub(crate) fn load_optional_vars_file(
     path: Option<PathBuf>,
 ) -> Result<Option<HashMap<String, mds::Value>>> {
-    path.map(|p| mds::load_vars_file(&p).map_err(|e| miette::miette!("{e}")))
+    path.map(|p| mds::load_vars_file(&p).map_err(miette::Error::from))
         .transpose()
 }
 

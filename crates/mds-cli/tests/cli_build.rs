@@ -890,6 +890,10 @@ fn vars_file_malformed_json_error_names_the_file() {
         stderr.contains("vars.json"),
         "error must name the vars file; got: {stderr}"
     );
+    assert!(
+        stderr.contains("mds::invalid_vars"),
+        "error code must be mds::invalid_vars; got: {stderr}"
+    );
 }
 
 /// `mds build --vars <file>` with a non-object JSON root (array) exits 1 and
@@ -928,6 +932,48 @@ fn vars_file_non_object_json_error_names_the_file() {
     assert!(
         stderr.contains("myvars.json"),
         "error must name the vars file; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::invalid_vars"),
+        "error code must be mds::invalid_vars; got: {stderr}"
+    );
+}
+
+/// `mds build --vars <missing-file>` exits 2 with `mds::file_not_found` (C1/F2).
+///
+/// Before this fix, `load_optional_vars_file` used `miette::miette!("{e}")` which
+/// wrapped the typed `MdsError::FileNotFound` in an opaque report; `exit_code`
+/// couldn't downcast it and fell through to exit 1 instead of 2.
+#[test]
+fn vars_file_missing_exits_2_with_file_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    // Point --vars at a path that doesn't exist.
+    let missing = dir.path().join("no_such_vars_file_12345.json");
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--vars",
+            missing.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing vars file must exit 2 (file-system error, not content error); got: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::file_not_found") || stderr.contains("file not found"),
+        "error must be file-not-found; got: {stderr}"
     );
 }
 

@@ -301,6 +301,18 @@ pub enum MdsError {
     #[diagnostic(code(mds::json))]
     JsonError { message: String },
 
+    /// Vars file exists but contains malformed JSON or a non-object top-level value.
+    ///
+    /// Distinct from `JsonError` (which covers other JSON sites) so the user gets
+    /// the specific help text pointing to the correct fix. Exit code stays 1
+    /// (content/semantic error, not a file-system error).
+    #[error("invalid vars file: {message}")]
+    #[diagnostic(
+        code(mds::invalid_vars),
+        help("vars file must be a JSON object mapping variable names to values")
+    )]
+    InvalidVars { message: String },
+
     #[error("recursion detected in function '{name}'")]
     #[diagnostic(
         code(mds::recursion),
@@ -748,6 +760,12 @@ impl MdsError {
         }
     }
 
+    pub(crate) fn invalid_vars(message: impl Into<String>) -> Self {
+        MdsError::InvalidVars {
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn extends_error_at(
         message: impl Into<String>,
         file: &str,
@@ -849,6 +867,7 @@ impl MdsError {
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
+            | MdsError::InvalidVars { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,
