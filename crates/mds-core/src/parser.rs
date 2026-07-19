@@ -100,7 +100,9 @@ impl Drop for BlockGuard<'_, '_> {
 /// is out of bounds or lands on a non-char-boundary, returns 0 rather than panicking.
 fn directive_line_len(source: &str, offset: usize) -> usize {
     if offset <= source.len() && source.is_char_boundary(offset) {
-        source[offset..].find('\n').unwrap_or(source[offset..].len())
+        source[offset..]
+            .find('\n')
+            .unwrap_or(source[offset..].len())
     } else {
         0
     }
@@ -237,7 +239,10 @@ impl Parser<'_> {
             Some(Token::Directive(d, off)) => {
                 let off = *off;
                 Err(MdsError::syntax_at(
-                    format!("expected @end to close {block_name} block, got '{}'", d.trim()),
+                    format!(
+                        "expected @end to close {block_name} block, got '{}'",
+                        d.trim()
+                    ),
                     self.file,
                     self.source,
                     off,
@@ -448,8 +453,14 @@ impl Parser<'_> {
         let condition_str = strip_trailing_directive_colon(trimmed)
             .ok_or_else(|| directive_colon_error("@if", trimmed, self.file, self.source, offset))?;
 
-        let condition = parse_condition(condition_str)
-            .map_err(|e| e.or_span(self.file, self.source, offset, directive_line_len(self.source, offset)))?;
+        let condition = parse_condition(condition_str).map_err(|e| {
+            e.or_span(
+                self.file,
+                self.source,
+                offset,
+                directive_line_len(self.source, offset),
+            )
+        })?;
 
         // Parse then-body; stops at @else:, @end, or any @elseif prefix
         let then_body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
@@ -524,11 +535,24 @@ impl Parser<'_> {
                 .strip_prefix("@elseif ")
                 .expect("loop guard guarantees @elseif prefix")
                 .trim();
-            let elseif_cond_str = strip_trailing_directive_colon(elseif_rest)
-                .ok_or_else(|| directive_colon_error("@elseif", elseif_rest, self.file, self.source, elseif_offset))?;
+            let elseif_cond_str = strip_trailing_directive_colon(elseif_rest).ok_or_else(|| {
+                directive_colon_error(
+                    "@elseif",
+                    elseif_rest,
+                    self.file,
+                    self.source,
+                    elseif_offset,
+                )
+            })?;
 
-            let condition = parse_condition(elseif_cond_str)
-                .map_err(|e| e.or_span(self.file, self.source, elseif_offset, directive_line_len(self.source, elseif_offset)))?;
+            let condition = parse_condition(elseif_cond_str).map_err(|e| {
+                e.or_span(
+                    self.file,
+                    self.source,
+                    elseif_offset,
+                    directive_line_len(self.source, elseif_offset),
+                )
+            })?;
             let body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
 
             branches.push(ElseifBranch {
@@ -544,8 +568,9 @@ impl Parser<'_> {
         self.enter_block()?;
 
         let trimmed = rest.trim();
-        let rest = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@for", trimmed, self.file, self.source, offset))?;
+        let rest = strip_trailing_directive_colon(trimmed).ok_or_else(|| {
+            directive_colon_error("@for", trimmed, self.file, self.source, offset)
+        })?;
 
         // Split on " in " to separate variable part from iterable part.
         // Supports both:
@@ -566,8 +591,14 @@ impl Parser<'_> {
         let (key_var, var) = parse_for_vars(var_part)?;
 
         // Parse iterable as a full expression (variable, dot-path, function call, etc.)
-        let iterable = parse_expr_inner(iterable_str)
-            .map_err(|e| e.or_span(self.file, self.source, offset, directive_line_len(self.source, offset)))?;
+        let iterable = parse_expr_inner(iterable_str).map_err(|e| {
+            e.or_span(
+                self.file,
+                self.source,
+                offset,
+                directive_line_len(self.source, offset),
+            )
+        })?;
         // Reject bare literals as iterables: @for x in "str": makes no sense.
         if matches!(
             iterable,
@@ -626,15 +657,23 @@ impl Parser<'_> {
         // Parse the role expression BEFORE mutating parser state so that a `?`
         // here leaves `inside_message` and `depth` untouched.
         let trimmed = rest.trim();
-        let role_str = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@message", trimmed, self.file, self.source, offset))?;
+        let role_str = strip_trailing_directive_colon(trimmed).ok_or_else(|| {
+            directive_colon_error("@message", trimmed, self.file, self.source, offset)
+        })?;
         let role_trimmed = role_str.trim();
 
         let role = if role_trimmed.starts_with('{') && role_trimmed.ends_with('}') {
             // Dynamic role expression: @message {role_var}:
             let inner = role_trimmed[1..role_trimmed.len() - 1].trim();
             parse_expr_inner(inner) // safe: state not yet mutated
-                .map_err(|e| e.or_span(self.file, self.source, offset, directive_line_len(self.source, offset)))?
+                .map_err(|e| {
+                    e.or_span(
+                        self.file,
+                        self.source,
+                        offset,
+                        directive_line_len(self.source, offset),
+                    )
+                })?
         } else {
             // Bare-word role: @message system: → literal string "system"
             if role_trimmed.is_empty() {
@@ -711,8 +750,9 @@ impl Parser<'_> {
 
         // Parse the name BEFORE mutating parser state, so a `?` leaves flags untouched.
         let trimmed = rest.trim();
-        let name_str = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@block", trimmed, self.file, self.source, offset))?;
+        let name_str = strip_trailing_directive_colon(trimmed).ok_or_else(|| {
+            directive_colon_error("@block", trimmed, self.file, self.source, offset)
+        })?;
         let name = name_str.trim().to_string();
         if name.is_empty() {
             return Err(MdsError::syntax_at(
@@ -757,13 +797,15 @@ impl Parser<'_> {
         // the final character of the directive is always the unambiguous directive colon.
         let rest = rest
             .strip_suffix(':')
-            .ok_or_else(|| MdsError::syntax_at(
-                "@define directive must end with ':'",
-                self.file,
-                self.source,
-                offset,
-                directive_line_len(self.source, offset),
-            ))?
+            .ok_or_else(|| {
+                MdsError::syntax_at(
+                    "@define directive must end with ':'",
+                    self.file,
+                    self.source,
+                    offset,
+                    directive_line_len(self.source, offset),
+                )
+            })?
             .trim();
 
         // Parse "name(params)"
@@ -776,15 +818,15 @@ impl Parser<'_> {
                 directive_line_len(self.source, offset),
             )
         })?;
-        let paren_end = rest
-            .find(')')
-            .ok_or_else(|| MdsError::syntax_at(
+        let paren_end = rest.find(')').ok_or_else(|| {
+            MdsError::syntax_at(
                 "@define: unclosed parenthesis",
                 self.file,
                 self.source,
                 offset,
                 directive_line_len(self.source, offset),
-            ))?;
+            )
+        })?;
 
         let name = rest[..paren_start].trim().to_string();
 

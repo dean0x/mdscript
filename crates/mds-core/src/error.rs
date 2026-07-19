@@ -221,7 +221,7 @@ pub enum MdsError {
     #[error("type mismatch: cannot compare {lhs_type} with {rhs_type}")]
     #[diagnostic(
         code(mds::type_mismatch),
-        help("left side is {lhs_type}, right side is {rhs_type}; use '@if x:' for truthiness or '--set-string KEY=VALUE' to pass a string")
+        help("left side is {lhs_type}, right side is {rhs_type}; compare against a {lhs_type} literal, use '@if x:' for truthiness, or pass a string with '--set-string KEY=VALUE'")
     )]
     TypeMismatch {
         lhs_type: String,
@@ -719,13 +719,7 @@ impl MdsError {
     /// Passing `file/source/offset/len` that are out-of-bounds degrades gracefully (the
     /// `at()` helper drops `src` and keeps only the raw offset in `span`, so miette
     /// never renders an `OutOfBounds`).
-    pub(crate) fn or_span(
-        self,
-        file: &str,
-        source: &str,
-        offset: usize,
-        len: usize,
-    ) -> Self {
+    pub(crate) fn or_span(self, file: &str, source: &str, offset: usize, len: usize) -> Self {
         match self {
             MdsError::Syntax {
                 span: None,

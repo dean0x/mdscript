@@ -1608,8 +1608,7 @@ fn compile_vfs_err(
     modules: std::collections::HashMap<String, String>,
     entry: &str,
 ) -> mds::MdsError {
-    mds::compile_virtual(modules, entry, None)
-        .expect_err("expected a compile error")
+    mds::compile_virtual(modules, entry, None).expect_err("expected a compile error")
 }
 
 #[test]
@@ -1685,10 +1684,8 @@ fn b1_two_level_chain_attributes_to_innermost_definer() {
     // a.mds imports b.mds which imports c.mds.  c.mds defines `inner(x)` with a
     // cross-type @if.  b.mds defines `mid(x)` that calls `inner(x)`.  a.mds calls
     // `{lib.mid(42)}`.  The error must carry a span indexing c_src.
-    let c_src =
-        "@define inner(x):\n@if x == \"yes\":\nok\n@else:\nno\n@end\n@end\n".to_string();
-    let b_src =
-        "@import \"./c.mds\" as c\n@define mid(x):\n{c.inner(x)}\n@end\n".to_string();
+    let c_src = "@define inner(x):\n@if x == \"yes\":\nok\n@else:\nno\n@end\n@end\n".to_string();
+    let b_src = "@import \"./c.mds\" as c\n@define mid(x):\n{c.inner(x)}\n@end\n".to_string();
     let mut modules = std::collections::HashMap::new();
     modules.insert("c.mds".to_string(), c_src.clone());
     modules.insert("b.mds".to_string(), b_src);
@@ -1726,10 +1723,17 @@ fn b2_if_missing_colon_carries_span() {
     modules.insert("main.mds".to_string(), src.clone());
     let err = compile_vfs_err(modules, "main.mds");
     let s = err.serialize();
-    assert_eq!(s.code, "mds::syntax", "B2: expected mds::syntax, got: {}", s.code);
+    assert_eq!(
+        s.code, "mds::syntax",
+        "B2: expected mds::syntax, got: {}",
+        s.code
+    );
     let span = s.span.expect("B2: @if missing colon must carry a span");
     // The @if directive starts at byte 6 (after "Hello\n")
-    assert_eq!(span.offset, 6, "B2: span must point to @if directive offset");
+    assert_eq!(
+        span.offset, 6,
+        "B2: span must point to @if directive offset"
+    );
     assert!(span.length > 0, "B2: span.length must be > 0");
 }
 
@@ -1741,10 +1745,17 @@ fn b2_for_missing_colon_carries_span() {
     modules.insert("main.mds".to_string(), src.clone());
     let err = compile_vfs_err(modules, "main.mds");
     let s = err.serialize();
-    assert_eq!(s.code, "mds::syntax", "B2: expected mds::syntax, got: {}", s.code);
+    assert_eq!(
+        s.code, "mds::syntax",
+        "B2: expected mds::syntax, got: {}",
+        s.code
+    );
     let span = s.span.expect("B2: @for missing colon must carry a span");
     // @for starts at offset 0
-    assert_eq!(span.offset, 0, "B2: span must point to @for directive offset");
+    assert_eq!(
+        span.offset, 0,
+        "B2: span must point to @for directive offset"
+    );
     assert!(span.length > 0, "B2: span.length must be > 0");
 }
 
@@ -1760,7 +1771,11 @@ fn b3_arity_mismatch_includes_signature_in_help() {
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");
     let s = err.serialize();
-    assert_eq!(s.code, "mds::arity", "B3: expected mds::arity, got: {}", s.code);
+    assert_eq!(
+        s.code, "mds::arity",
+        "B3: expected mds::arity, got: {}",
+        s.code
+    );
     let help = s.help.expect("B3: arity error must have help text");
     assert!(
         help.contains("foo(x, y)"),
@@ -1776,7 +1791,11 @@ fn b3_arity_mismatch_signature_shows_defaults() {
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");
     let s = err.serialize();
-    assert_eq!(s.code, "mds::arity", "B3: expected mds::arity, got: {}", s.code);
+    assert_eq!(
+        s.code, "mds::arity",
+        "B3: expected mds::arity, got: {}",
+        s.code
+    );
     let help = s.help.expect("B3: arity error must have help text");
     assert!(
         help.contains("greet(name, sep = \", \")"),
@@ -1793,12 +1812,45 @@ fn b3_builtin_arity_mismatch_no_signature_in_help() {
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");
     let s = err.serialize();
-    assert_eq!(s.code, "mds::arity", "B3 builtin: expected mds::arity, got: {}", s.code);
+    assert_eq!(
+        s.code, "mds::arity",
+        "B3 builtin: expected mds::arity, got: {}",
+        s.code
+    );
     let help = s.help.expect("B3 builtin: arity error must have help text");
     // Built-in help must NOT include "expected: upper(...)"
     assert!(
         !help.contains("expected: upper"),
         "B3 builtin: help should not include builtin signature, got: {help}"
+    );
+}
+
+// ── B4: TypeMismatch help text update (F8) ──────────────────────────────────
+
+/// TypeMismatch help should mention the lhs type, the --set-string flag, and
+/// the '@if x:' idiom, guiding the user toward all three resolution paths.
+#[test]
+fn b4_type_mismatch_help_mentions_lhs_type_and_both_idioms() {
+    // number (x=3) vs string literal "3"
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src).expect_err("B4: cross-type == must error");
+    let help = miette::Diagnostic::help(&err)
+        .map(|h| h.to_string())
+        .unwrap_or_default();
+    // Must still mention --set-string (existing contract, test at line ~1205)
+    assert!(
+        help.contains("--set-string"),
+        "B4: help must contain '--set-string'; got: {help}"
+    );
+    // Must now also mention comparing against a literal of the same type
+    assert!(
+        help.contains("number literal") || help.contains("compare against a number"),
+        "B4: help must guide toward literal comparison; got: {help}"
+    );
+    // Must still mention @if x: idiom
+    assert!(
+        help.contains("@if x:"),
+        "B4: help must mention @if x: idiom; got: {help}"
     );
 }
 
@@ -1810,9 +1862,16 @@ fn b2_unknown_directive_carries_span() {
     modules.insert("main.mds".to_string(), src.clone());
     let err = compile_vfs_err(modules, "main.mds");
     let s = err.serialize();
-    assert_eq!(s.code, "mds::syntax", "B2: expected mds::syntax, got: {}", s.code);
+    assert_eq!(
+        s.code, "mds::syntax",
+        "B2: expected mds::syntax, got: {}",
+        s.code
+    );
     let span = s.span.expect("B2: unknown directive must carry a span");
     // @unknown starts at byte 6 (after "hello\n")
-    assert_eq!(span.offset, 6, "B2: span must point to @unknown directive offset");
+    assert_eq!(
+        span.offset, 6,
+        "B2: span must point to @unknown directive offset"
+    );
     assert!(span.length > 0, "B2: span.length must be > 0");
 }
