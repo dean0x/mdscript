@@ -1597,3 +1597,120 @@ fn source_map_standalone_type_mismatch_carries_span() {
     );
     assert!(span.length > 0, "span length must be > 0, got: {span:?}");
 }
+
+// ── B1: imported-macro type_mismatch span attribution (applies PF-012) ──────────
+//
+// When a type_mismatch is raised inside an imported @define body, the error should
+// name the HELPER (defining) file, not the caller's file, and the span bytes must
+// index the helper source — not the caller's source (B1 / PF-012 fix).
+
+fn compile_vfs_err(
+    modules: std::collections::HashMap<String, String>,
+    entry: &str,
+) -> mds::MdsError {
+    mds::compile_virtual(modules, entry, None)
+        .expect_err("expected a compile error")
+}
+
+#[test]
+fn b1_type_mismatch_in_imported_define_names_helper_file() {
+    // helper.mds defines `check(x)` whose body contains `@if x == "yes":`.
+    // main.mds imports helper and calls `{check(42)}` — number vs string mismatch
+    // in the HELPER'S body.  The error must name "helper.mds", not "main.mds".
+    let helper_src =
+        "@define check(x):\n@if x == \"yes\":\nok\n@else:\nfail\n@end\n@end\n".to_string();
+    // Verify the @if offset 19 is within helper_src: "@define check(x):\n" = 18 chars, so
+    // "@if" starts at byte 18.  The type_mismatch fires here.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("helper.mds".to_string(), helper_src.clone());
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./helper.mds\" as h\n{h.check(42)}\n".to_string(),
+    );
+    let err = compile_vfs_err(modules, "main.mds");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "B1: must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    // The span must be populated (not degraded to spanless).
+    let span = serialized
+        .span
+        .expect("B1: type_mismatch in imported body must carry a span");
+    // The span offset must fall inside the helper source, not beyond it.
+    assert!(
+        span.offset < helper_src.len(),
+        "B1: span.offset ({}) must fall inside helper_src (len={})",
+        span.offset,
+        helper_src.len()
+    );
+    assert!(
+        span.length > 0,
+        "B1: span.length must be > 0, got: {span:?}"
+    );
+    // Line/column must be populated (they can be computed from helper_src).
+    assert!(
+        span.line.is_some(),
+        "B1: span.line must be populated, got: {span:?}"
+    );
+}
+
+#[test]
+fn b1_same_file_type_mismatch_span_still_works() {
+    // Same-file type_mismatch (existing D2 contract): span must still be populated
+    // and offset must fall within the single-file source.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src).expect_err("B1: same-file type_mismatch must error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "B1: must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("B1: same-file type_mismatch must carry a span");
+    assert!(
+        span.offset < src.len(),
+        "B1: same-file span.offset ({}) must fall within source (len={})",
+        span.offset,
+        src.len()
+    );
+    assert!(span.length > 0, "B1: span.length must be > 0");
+}
+
+#[test]
+fn b1_two_level_chain_attributes_to_innermost_definer() {
+    // a.mds imports b.mds which imports c.mds.  c.mds defines `inner(x)` with a
+    // cross-type @if.  b.mds defines `mid(x)` that calls `inner(x)`.  a.mds calls
+    // `{lib.mid(42)}`.  The error must carry a span indexing c_src.
+    let c_src =
+        "@define inner(x):\n@if x == \"yes\":\nok\n@else:\nno\n@end\n@end\n".to_string();
+    let b_src =
+        "@import \"./c.mds\" as c\n@define mid(x):\n{c.inner(x)}\n@end\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("c.mds".to_string(), c_src.clone());
+    modules.insert("b.mds".to_string(), b_src);
+    modules.insert(
+        "a.mds".to_string(),
+        "@import \"./b.mds\" as lib\n{lib.mid(42)}\n".to_string(),
+    );
+    let err = compile_vfs_err(modules, "a.mds");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "B1 two-level: must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("B1 two-level: must carry a span pointing into c.mds");
+    assert!(
+        span.offset < c_src.len(),
+        "B1 two-level: span.offset ({}) must fall inside c_src (len={})",
+        span.offset,
+        c_src.len()
+    );
+    assert!(span.length > 0, "B1 two-level: span.length must be > 0");
+}
