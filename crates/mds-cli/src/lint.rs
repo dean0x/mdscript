@@ -1097,13 +1097,8 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            &config,
-        );
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1262,13 +1257,8 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            &config,
-        );
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,

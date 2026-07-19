@@ -426,6 +426,78 @@ fn check_unknown_option_key_returns_error() {
     assert_eq!(code, "mds::invalid_options", "got: {code}");
 }
 
+// ── check() options-key strictness (B5/F9) ───────────────────────────────────
+//
+// check() only accepts filename/modules/vars. sourceMap and sourcesContent are
+// compile-only options; passing them must be rejected with mds::invalid_options.
+
+#[wasm_bindgen_test]
+fn check_rejects_source_map_option() {
+    // B5: check() must reject sourceMap — it is not a valid check() option.
+    let opts = to_js_object(&serde_json::json!({ "sourceMap": true }));
+    let err = mds_wasm::check("Hello!\n", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::invalid_options", "got: {code}");
+    let msg = get_str(&err, "message");
+    assert!(
+        msg.contains("sourceMap"),
+        "error message must name the unknown key, got: {msg}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn check_rejects_sources_content_option() {
+    // B5: check() must reject sourcesContent — it is not a valid check() option.
+    let opts = to_js_object(&serde_json::json!({ "sourcesContent": true }));
+    let err = mds_wasm::check("Hello!\n", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(code, "mds::invalid_options", "got: {code}");
+    let msg = get_str(&err, "message");
+    assert!(
+        msg.contains("sourcesContent"),
+        "error message must name the unknown key, got: {msg}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn check_still_accepts_filename_option() {
+    // check() must continue to accept the standard filename option.
+    let opts = filename_opts("my-check.mds");
+    let result = mds_wasm::check("Hello!\n", opts).unwrap();
+    let warnings = get_prop(&result, "warnings");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "check() with filename must still succeed"
+    );
+}
+
+#[wasm_bindgen_test]
+fn check_still_accepts_vars_option() {
+    // check() must continue to accept the vars option.
+    let opts = vars_opts(&serde_json::json!({ "name": "World" }));
+    let result = mds_wasm::check("Hello {name}!\n", opts).unwrap();
+    let warnings = get_prop(&result, "warnings");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "check() with vars must still succeed"
+    );
+}
+
+#[wasm_bindgen_test]
+fn check_still_accepts_modules_option() {
+    // check() must continue to accept the modules option.
+    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let opts = modules_opts(&serde_json::json!({
+        "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
+    }));
+    let result = mds_wasm::check(source, opts).unwrap();
+    let warnings = get_prop(&result, "warnings");
+    assert!(
+        js_sys::Array::is_array(&warnings),
+        "check() with modules must still succeed"
+    );
+}
+
 // ── scan_imports tests ────────────────────────────────────────────────────────
 
 /// Helper: get the JS array length.
