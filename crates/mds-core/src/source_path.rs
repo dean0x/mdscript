@@ -221,7 +221,19 @@ fn is_drive_qualified(s: &str) -> bool {
 
 /// Convert a `Path` to a `/`-unified string.
 fn path_to_unified(p: &Path) -> String {
-    p.to_str().unwrap_or("").replace('\\', "/")
+    let s = p.to_str().unwrap_or("").replace('\\', "/");
+    // Strip Windows verbatim-prefix variants (same normalization that
+    // `relativize_source` applies to source strings in step 3), so that the
+    // root component list is comparable to the stripped source component list.
+    // Without this, a canonicalize()-produced root `\\?\C:\proj` becomes
+    // `//?/C:/proj` after backslash unification and `normalize_abs` yields
+    // ["?", "C:", "proj"], which never matches source components ["C:", "proj", ...]
+    // → containment always fails → every source degrades to its basename.
+    let stripped = s
+        .strip_prefix("//?/UNC/")
+        .or_else(|| s.strip_prefix("//?/"))
+        .unwrap_or(&s);
+    stripped.to_string()
 }
 
 /// Normalize an **absolute** path string into a component list.
@@ -528,6 +540,37 @@ mod tests {
         let out = relativize_source("D:/other/file.mds", Some(p("C:/proj")), Some(p("C:/proj")));
         assert_eq!(out, "file.mds");
         check_output_invariants(&out, "D:/other/file.mds");
+    }
+
+    /// Windows verbatim UNC root (`\\?\C:\proj`) must relativize a co-located source
+    /// correctly.  On Windows, `std::fs::canonicalize()` returns verbatim paths and
+    /// `NativeFs::source_root()` forwards that via `display()`.  Without stripping
+    /// the `\\?\` prefix in `path_to_unified`, `normalize_abs` yields
+    /// `["?", "C:", "proj", ...]` which never matches the stripped source components
+    /// `["C:", "proj", ...]` → containment always fails → every entry degrades to
+    /// its basename (CF-SM2 failure on windows-latest).
+    #[test]
+    fn verbatim_root_relativizes_source_correctly() {
+        // Source also has verbatim prefix — step 3 strips it; root stripping is the fix.
+        let out = relativize_source(
+            r"\\?\C:\proj\src\entry.mds",
+            None,
+            Some(Path::new(r"\\?\C:\proj")),
+        );
+        assert_eq!(out, "src/entry.mds");
+        check_output_invariants(&out, r"\\?\C:\proj\src\entry.mds");
+    }
+
+    /// Same scenario with a nested import — two sources under a verbatim root.
+    #[test]
+    fn verbatim_root_nested_import_relativizes() {
+        let out = relativize_source(
+            r"\\?\C:\proj\partials\greeting.mds",
+            None,
+            Some(Path::new(r"\\?\C:\proj")),
+        );
+        assert_eq!(out, "partials/greeting.mds");
+        check_output_invariants(&out, r"\\?\C:\proj\partials\greeting.mds");
     }
 
     /// VirtualFs / WASM: `root = None` → pass-through with separator unification.
