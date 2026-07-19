@@ -880,8 +880,9 @@ impl<'a> LintDirCtx<'a> {
                 return Ok(Rc::clone(cfg));
             }
         }
-        let config = load_lint_config(base_dir)
-            .map_err(|e| MdsError::Io { message: format!("{e}") })?;
+        let config = load_lint_config(base_dir).map_err(|e| MdsError::Io {
+            message: format!("{e}"),
+        })?;
         let rc = Rc::new(config);
         self.config_cache
             .borrow_mut()
@@ -1052,7 +1053,7 @@ fn lint_one_file_accumulating(
         }
     };
 
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &*config) {
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
@@ -1101,7 +1102,7 @@ fn lint_one_file_accumulating(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            &*config,
+            &config,
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1164,7 +1165,7 @@ fn lint_one_file_accumulating(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            &*config,
+            &config,
         ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
@@ -1234,7 +1235,7 @@ fn lint_one_file_human(
     // Named source for span rendering: relative display path + source text.
     let named_source = Some((display_path.as_str(), source.as_str()));
 
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &*config) {
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(ref e) => {
             crate::output::eprint_error(miette::Report::from(e.clone()));
@@ -1266,7 +1267,7 @@ fn lint_one_file_human(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            &*config,
+            &config,
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1322,7 +1323,7 @@ fn lint_one_file_human(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            &*config,
+            &config,
         ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;

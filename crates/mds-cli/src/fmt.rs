@@ -474,8 +474,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("foo.txt");
         std::fs::write(&p, "").unwrap();
-        let err = ensure_existing_mds_file(&p)
-            .expect_err("existing .txt file must be rejected");
+        let err = ensure_existing_mds_file(&p).expect_err("existing .txt file must be rejected");
         // Extension error (not existence error).
         assert!(
             matches!(err, MdsError::NotMdsFile { .. }),
@@ -487,8 +486,7 @@ mod tests {
     fn ensure_existing_mds_file_rejects_missing_path() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("nonexistent.mds");
-        let err = ensure_existing_mds_file(&p)
-            .expect_err("nonexistent file must be rejected");
+        let err = ensure_existing_mds_file(&p).expect_err("nonexistent file must be rejected");
         // Existence error (not extension error) — even though extension is .mds.
         assert!(
             matches!(err, MdsError::FileNotFound { .. }),
@@ -502,8 +500,7 @@ mod tests {
         // existence is checked before extension.
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("nonexistent.txt");
-        let err = ensure_existing_mds_file(&p)
-            .expect_err("nonexistent .txt file must be rejected");
+        let err = ensure_existing_mds_file(&p).expect_err("nonexistent .txt file must be rejected");
         assert!(
             matches!(err, MdsError::FileNotFound { .. }),
             "must be FileNotFound (not NotMdsFile) for non-existent path; got: {err:?}"

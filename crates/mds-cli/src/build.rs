@@ -434,9 +434,9 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
 /// non-existent path without `.mds` receives a "file not found" error rather than
 /// the confusing "not an .mds file" error (C4/F6).
 pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
-    let exists = path
-        .try_exists()
-        .map_err(|e| MdsError::Io { message: format!("cannot check {}: {e}", path.display()) })?;
+    let exists = path.try_exists().map_err(|e| MdsError::Io {
+        message: format!("cannot check {}: {e}", path.display()),
+    })?;
     if !exists {
         return Err(MdsError::FileNotFound {
             path: path.display().to_string(),

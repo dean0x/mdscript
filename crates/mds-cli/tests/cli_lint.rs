@@ -1882,13 +1882,21 @@ fn lint_dir_nested_malformed_config_per_file_error() {
     let root = dir.path();
 
     // Clean file in root — no mds.json present, defaults apply.
-    fs::write(root.join("clean.mds"), "---\ngreeting: hi\n---\n{greeting} world!\n").unwrap();
+    fs::write(
+        root.join("clean.mds"),
+        "---\ngreeting: hi\n---\n{greeting} world!\n",
+    )
+    .unwrap();
 
     // Subdirectory with a malformed mds.json.
     let bad = root.join("bad");
     fs::create_dir(&bad).unwrap();
     fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
-    fs::write(bad.join("bad.mds"), "---\ngreeting: hi\n---\n{greeting} world!\n").unwrap();
+    fs::write(
+        bad.join("bad.mds"),
+        "---\ngreeting: hi\n---\n{greeting} world!\n",
+    )
+    .unwrap();
 
     let out = lint_path(root, &[]);
 

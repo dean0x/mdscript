@@ -1399,7 +1399,7 @@ fn sm19_config_source_map_sidecar_without_output_degrades_with_warning() {
     .unwrap();
 
     let result = mds_bin()
-        .args(["build", "-o", "-"])  // -o - routes to stdout (output_path=None)
+        .args(["build", "-o", "-"]) // -o - routes to stdout (output_path=None)
         .arg(&src)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1445,7 +1445,7 @@ fn sm19q_config_source_map_without_output_quiet_no_warning() {
     .unwrap();
 
     let result = mds_bin()
-        .args(["build", "--quiet", "-o", "-"])  // -o - routes to stdout
+        .args(["build", "--quiet", "-o", "-"]) // -o - routes to stdout
         .arg(&src)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
