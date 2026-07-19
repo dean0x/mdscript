@@ -363,22 +363,273 @@ impl CompileResult {
     }
 
     /// Return the canonical discriminated-union `dict` (the inactive payload key is
-    /// absent). Byte-identical to the Node.js and WASM bindings' wire output.
+    /// absent), with `"sourceMap"` always present as `None` when no map was generated.
+    ///
+    /// ## `to_dict()` vs `to_json()` asymmetry
+    ///
+    /// `to_dict()` always includes the `"sourceMap"` key, using Python `None` when no
+    /// source map was requested. This is the Python-idiomatic style (attribute always
+    /// exists; check `result.source_map is None` rather than `"sourceMap" in d`).
+    ///
+    /// `to_json()` omits the key when no map was generated — this is the canonical
+    /// wire format shared with the Node.js and WASM bindings. If you need byte-level
+    /// parity with those surfaces, use `to_json()` (or `json.loads(r.to_json())`),
+    /// not `to_dict()`.
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        value_to_py(py, &self.value)
+        // Clone and inject "sourceMap": None when the key is absent so the
+        // Python-level dict always has the key (Python-idiomatic always-present style).
+        let mut value = self.value.clone();
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.entry("sourceMap").or_insert(serde_json::Value::Null);
+        }
+        value_to_py(py, &value)
     }
 
     /// Return the canonical result as a JSON string.
+    ///
+    /// The `"sourceMap"` key is **omitted** when no map was generated — this is the
+    /// wire format shared with the Node.js and WASM bindings. See `to_dict()` for
+    /// the always-present Python-idiomatic variant.
     fn to_json(&self) -> String {
         self.value.to_string()
     }
 
     /// Reconstruct on unpickle via `CompileResult(canonical_dict)`.
+    ///
+    /// Uses the raw backing `value` (not `to_dict()`), so the null-sourceMap
+    /// injection from `to_dict()` is NOT included. This preserves round-trip
+    /// equality: original.value == restored.value.
     fn __reduce__<'py>(
         &self,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyType>, (Bound<'py, PyAny>,))> {
-        Ok((py.get_type::<CompileResult>(), (self.to_dict(py)?,)))
+        Ok((
+            py.get_type::<CompileResult>(),
+            (value_to_py(py, &self.value)?,),
+        ))
+    }
+}
+
+/// A single lint finding within a [`LintFileReport`].
+///
+/// Maps to the canonical wire-format diagnostic object
+/// `{ rule, severity, message, help?, fixable, span? }`.
+/// `help` is `None` when the rule emits no hint; `span` is `None` for rules
+/// that do not attach a source offset. Both fields are always set as Python
+/// attributes (never missing), so callers need not use `getattr` defaults.
+#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[derive(Clone, PartialEq, Eq)]
+pub struct LintDiagnostic {
+    #[pyo3(get)]
+    rule: String,
+    #[pyo3(get)]
+    severity: String,
+    #[pyo3(get)]
+    message: String,
+    #[pyo3(get)]
+    help: Option<String>,
+    #[pyo3(get)]
+    fixable: bool,
+    #[pyo3(get)]
+    span: Option<Span>,
+}
+
+/// The `(type, args)` shape returned by [`LintDiagnostic::__reduce__`].
+type LintDiagnosticReduce<'py> = (
+    Bound<'py, PyType>,
+    (
+        String,
+        String,
+        String,
+        Option<String>,
+        bool,
+        Option<Py<Span>>,
+    ),
+);
+
+#[pymethods]
+impl LintDiagnostic {
+    #[new]
+    #[pyo3(signature = (rule, severity, message, help=None, fixable=false, span=None))]
+    fn new(
+        py: Python<'_>,
+        rule: String,
+        severity: String,
+        message: String,
+        help: Option<String>,
+        fixable: bool,
+        // `Span` has `skip_from_py_object` so it cannot appear directly in
+        // a `#[new]` signature; accept `Py<Span>` (which implements
+        // `FromPyObject`) and clone the inner value via a GIL borrow.
+        span: Option<Py<Span>>,
+    ) -> Self {
+        let span = span.map(|py_span| py_span.borrow(py).clone());
+        LintDiagnostic {
+            rule,
+            severity,
+            message,
+            help,
+            fixable,
+            span,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LintDiagnostic(rule={:?}, severity={:?}, message={:?}, fixable={})",
+            self.rule, self.severity, self.message, self.fixable,
+        )
+    }
+
+    /// Return the diagnostic as a plain `dict`.
+    ///
+    /// `help` is omitted when `None`; `span` is omitted when `None` —
+    /// matching the canonical wire format produced by all other surfaces.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        value_to_py(py, &self.as_json())
+    }
+
+    /// Return the diagnostic as a canonical JSON string.
+    fn to_json(&self) -> String {
+        self.as_json().to_string()
+    }
+
+    /// Reconstruct on unpickle via `LintDiagnostic(rule, severity, message, help, fixable, span)`.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<LintDiagnosticReduce<'py>> {
+        let span_py = self
+            .span
+            .as_ref()
+            .map(|s| Py::new(py, s.clone()))
+            .transpose()?;
+        Ok((
+            py.get_type::<LintDiagnostic>(),
+            (
+                self.rule.clone(),
+                self.severity.clone(),
+                self.message.clone(),
+                self.help.clone(),
+                self.fixable,
+                span_py,
+            ),
+        ))
+    }
+}
+
+impl LintDiagnostic {
+    /// Canonical JSON value for this diagnostic (keys in wire-format alphabetical order).
+    fn as_json(&self) -> serde_json::Value {
+        // Keys are inserted in BTreeMap alphabetical order to match the canonical
+        // wire format emitted by `LintResult::to_canonical_json()` in mds-core.
+        let mut map = serde_json::Map::new();
+        map.insert("fixable".to_string(), serde_json::Value::Bool(self.fixable));
+        if let Some(help) = &self.help {
+            map.insert("help".to_string(), serde_json::Value::String(help.clone()));
+        }
+        map.insert(
+            "message".to_string(),
+            serde_json::Value::String(self.message.clone()),
+        );
+        map.insert(
+            "rule".to_string(),
+            serde_json::Value::String(self.rule.clone()),
+        );
+        map.insert(
+            "severity".to_string(),
+            serde_json::Value::String(self.severity.clone()),
+        );
+        if let Some(sp) = &self.span {
+            // Span keys: length, offset (alphabetical per wire format).
+            let mut span_map = serde_json::Map::new();
+            span_map.insert(
+                "length".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(sp.length)),
+            );
+            span_map.insert(
+                "offset".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(sp.offset)),
+            );
+            map.insert("span".to_string(), serde_json::Value::Object(span_map));
+        }
+        serde_json::Value::Object(map)
+    }
+}
+
+/// The `(type, args)` shape returned by [`LintFileReport::__reduce__`].
+type LintFileReportReduce<'py> = (Bound<'py, PyType>, (String, Vec<Py<LintDiagnostic>>));
+
+/// A per-file findings group from [`LintResult::files`].
+///
+/// Contains the file path (`file`) and a typed list of findings (`diagnostics`).
+/// Each diagnostic is a [`LintDiagnostic`] instance with fully-typed attributes.
+#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[derive(Clone, PartialEq, Eq)]
+pub struct LintFileReport {
+    #[pyo3(get)]
+    file: String,
+    #[pyo3(get)]
+    diagnostics: Vec<LintDiagnostic>,
+}
+
+#[pymethods]
+impl LintFileReport {
+    #[new]
+    fn new(py: Python<'_>, file: String, diagnostics: Bound<'_, PyAny>) -> PyResult<Self> {
+        let diags: Vec<LintDiagnostic> = diagnostics
+            .try_iter()
+            .map_err(|e| options_error(py, &format!("diagnostics must be iterable: {e}")))?
+            .map(|item| {
+                let item = item?;
+                let d = item.cast::<LintDiagnostic>().map_err(|e| {
+                    options_error(
+                        py,
+                        &format!("diagnostics must be a list of LintDiagnostic: {e}"),
+                    )
+                })?;
+                Ok(d.get().clone())
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(LintFileReport {
+            file,
+            diagnostics: diags,
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LintFileReport(file={:?}, diagnostics=<{} item(s)>)",
+            self.file,
+            self.diagnostics.len(),
+        )
+    }
+
+    /// Return the file report as a plain `dict` (matching the canonical wire shape).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        value_to_py(py, &self.as_json())
+    }
+
+    /// Return the file report as a canonical JSON string.
+    fn to_json(&self) -> String {
+        self.as_json().to_string()
+    }
+
+    /// Reconstruct on unpickle via `LintFileReport(file, diagnostics_list)`.
+    fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<LintFileReportReduce<'py>> {
+        let diags: Vec<Py<LintDiagnostic>> = self
+            .diagnostics
+            .iter()
+            .map(|d| Py::new(py, d.clone()))
+            .collect::<PyResult<_>>()?;
+        Ok((py.get_type::<LintFileReport>(), (self.file.clone(), diags)))
+    }
+}
+
+impl LintFileReport {
+    fn as_json(&self) -> serde_json::Value {
+        let diags: Vec<serde_json::Value> = self.diagnostics.iter().map(|d| d.as_json()).collect();
+        serde_json::json!({
+            "diagnostics": diags,
+            "file": self.file,
+        })
     }
 }
 
@@ -414,16 +665,72 @@ impl LintResult {
             .unwrap_or(1)
     }
 
-    /// Per-file finding groups as a list of dicts
-    /// (`[{"file": str, "diagnostics": [...]}, ...]`).
+    /// Per-file finding groups as a list of typed [`LintFileReport`] objects.
+    ///
+    /// Each report's `.file` is the path key; `.diagnostics` is a list of
+    /// [`LintDiagnostic`] instances with fully-typed `.rule`, `.severity`,
+    /// `.message`, `.help`, `.fixable`, and `.span` attributes.
+    ///
+    /// This getter supersedes the previous `list[dict]` return — callers that
+    /// need the plain dict shape can use `result.to_dict()["files"]` or call
+    /// `report.to_dict()` on individual file reports.
     #[getter]
-    fn files<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let files = self
+    fn files(&self, py: Python<'_>) -> PyResult<Vec<Py<LintFileReport>>> {
+        let arr = match self
             .value
             .get("files")
-            .cloned()
-            .unwrap_or(serde_json::Value::Array(vec![]));
-        value_to_py(py, &files)
+            .and_then(serde_json::Value::as_array)
+        {
+            Some(a) => a,
+            None => return Ok(vec![]),
+        };
+
+        arr.iter()
+            .map(|file_val| {
+                let file_key = json_str(file_val, "file");
+                let diagnostics: Vec<LintDiagnostic> = file_val
+                    .get("diagnostics")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|diags| {
+                        diags
+                            .iter()
+                            .map(|d| {
+                                let span = d.get("span").and_then(|s| {
+                                    Some(Span {
+                                        offset: s.get("offset")?.as_u64()? as usize,
+                                        length: s.get("length")?.as_u64()? as usize,
+                                        line: None,
+                                        column: None,
+                                    })
+                                });
+                                LintDiagnostic {
+                                    rule: json_str(d, "rule"),
+                                    severity: json_str(d, "severity"),
+                                    message: json_str(d, "message"),
+                                    help: d
+                                        .get("help")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned),
+                                    fixable: d
+                                        .get("fixable")
+                                        .and_then(serde_json::Value::as_bool)
+                                        .unwrap_or(false),
+                                    span,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Py::new(
+                    py,
+                    LintFileReport {
+                        file: file_key,
+                        diagnostics,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// `True` when the per-file diagnostic cap was hit; re-run after fixing.
@@ -935,16 +1242,30 @@ fn compile_virtual(
 /// Check (validate) an MDS template source string without rendering output.
 ///
 /// `vars` and `base_path` mirror [`compile`]. Returns a [`CheckResult`].
+///
+/// `source_map` and `sources_content` are **not** valid options for `check`
+/// — source maps are a compile-only concept. Passing either keyword raises
+/// `MdsError(code="mds::invalid_options")` immediately (mirrors the WASM and
+/// `packages/mds` `CheckOptions` split, B5/F9).
 #[pyfunction]
-#[pyo3(signature = (source, *, vars=None, base_path=None))]
+#[pyo3(signature = (source, *, vars=None, base_path=None, source_map=None, sources_content=None))]
 fn check(
     py: Python<'_>,
     source: String,
     vars: Option<Bound<'_, PyAny>>,
     base_path: Option<PathBuf>,
+    source_map: Option<bool>,
+    sources_content: Option<bool>,
 ) -> PyResult<CheckResult> {
     check_source_size(py, &source)?;
     check_base_path(py, &base_path)?;
+    if source_map.is_some() || sources_content.is_some() {
+        return Err(options_error(
+            py,
+            "source maps are not available for check(); use compile() instead \
+             (mds::invalid_options)",
+        ));
+    }
     let vars = extract_vars(py, vars.as_ref())?;
     let ((), warnings) = run_catching(py, move || {
         mds::check_str_collecting_warnings(&source, base_path.as_deref(), vars)
@@ -1079,6 +1400,8 @@ fn _mdscript(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Message>()?;
     m.add_class::<CheckResult>()?;
     m.add_class::<CompileResult>()?;
+    m.add_class::<LintDiagnostic>()?;
+    m.add_class::<LintFileReport>()?;
     m.add_class::<LintResult>()?;
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_function(wrap_pyfunction!(compile_file, m)?)?;

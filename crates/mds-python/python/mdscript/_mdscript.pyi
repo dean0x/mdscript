@@ -76,6 +76,11 @@ class CompileResult:
     ``source_map`` is a Source Map v3 ``dict`` when ``source_map=True`` was passed
     to the compile function and the result is Markdown; otherwise ``None``.
     The wire key in ``to_dict()`` / ``to_json()`` is ``"sourceMap"`` (camelCase).
+
+    **``to_dict()`` vs ``to_json()`` asymmetry**: ``to_dict()`` always includes
+    the ``"sourceMap"`` key (``None`` when no map was generated) for
+    Python-idiomatic always-present attribute access. ``to_json()`` omits the key
+    when absent — that is the canonical wire format shared with Node.js and WASM.
     """
 
     @property
@@ -97,11 +102,71 @@ class CompileResult:
     __hash__: None  # type: ignore[assignment]
 
 @final
+class LintDiagnostic:
+    """A single lint finding within a :class:`LintFileReport` (frozen, unhashable).
+
+    Attributes map directly to the canonical wire-format diagnostic object.
+    ``help`` is ``None`` when the rule emits no hint; ``span`` is ``None`` for
+    rules that do not attach a source offset. Both attributes are always present.
+    """
+
+    @property
+    def rule(self) -> str: ...
+    @property
+    def severity(self) -> str: ...
+    @property
+    def message(self) -> str: ...
+    @property
+    def help(self) -> str | None: ...
+    @property
+    def fixable(self) -> bool: ...
+    @property
+    def span(self) -> Span | None: ...
+    def __new__(
+        cls,
+        rule: str,
+        severity: str,
+        message: str,
+        help: str | None = ...,
+        fixable: bool = ...,
+        span: Span | None = ...,
+    ) -> LintDiagnostic: ...
+    def to_dict(self) -> dict[str, Any]: ...
+    def to_json(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    __hash__: None  # type: ignore[assignment]
+
+@final
+class LintFileReport:
+    """Per-file findings group from :attr:`LintResult.files` (frozen, unhashable).
+
+    ``file`` is the path key for this file's diagnostics; ``diagnostics`` is a
+    typed list of :class:`LintDiagnostic` objects with fully-typed attributes.
+    """
+
+    @property
+    def file(self) -> str: ...
+    @property
+    def diagnostics(self) -> list[LintDiagnostic]: ...
+    def __new__(
+        cls,
+        file: str,
+        diagnostics: list[LintDiagnostic],
+    ) -> LintFileReport: ...
+    def to_dict(self) -> dict[str, Any]: ...
+    def to_json(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    __hash__: None  # type: ignore[assignment]
+
+@final
 class LintResult:
     """The result of :func:`lint`, :func:`lint_file`, or :func:`lint_virtual`.
 
-    Canonical JSON shape: ``{"files": [...], "truncated": false, "version": 1}``.
+    Canonical JSON shape: ``{"files":[...],"truncated":false,"version":1}``.
     Keys are in BTreeMap (alphabetical) order — byte-identical across all surfaces.
+
+    ``files`` is a list of typed :class:`LintFileReport` objects. Each report
+    exposes ``.file`` (str) and ``.diagnostics`` (list[:class:`LintDiagnostic`]).
     """
 
     @property
@@ -109,7 +174,7 @@ class LintResult:
     @property
     def truncated(self) -> bool: ...
     @property
-    def files(self) -> list[dict[str, Any]]: ...
+    def files(self) -> list[LintFileReport]: ...
     def __new__(cls, canonical: Mapping[str, Any]) -> LintResult: ...
     def to_dict(self) -> dict[str, Any]: ...
     def to_json(self) -> str: ...
@@ -155,7 +220,17 @@ def check(
     *,
     vars: _Vars | None = ...,
     base_path: _StrPath | None = ...,
-) -> CheckResult: ...
+    source_map: None = ...,
+    sources_content: None = ...,
+) -> CheckResult:
+    """Validate without rendering.
+
+    ``source_map`` and ``sources_content`` are present in the signature so that
+    passing them raises ``MdsError(code="mds::invalid_options")`` rather than a
+    bare ``TypeError``. Callers should never pass these — use :func:`compile` for
+    source-map generation.
+    """
+    ...
 def check_file(path: _StrPath, *, vars: _Vars | None = ...) -> CheckResult: ...
 def check_virtual(
     modules: Mapping[str, str],

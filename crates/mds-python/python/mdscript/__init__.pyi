@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from ._mdscript import CheckResult as CheckResult
 from ._mdscript import CompileResult as CompileResult
+from ._mdscript import LintDiagnostic as LintDiagnostic
+from ._mdscript import LintFileReport as LintFileReport
 from ._mdscript import LintResult as LintResult
 from ._mdscript import MdsError as MdsError
 from ._mdscript import Message as Message
@@ -27,6 +29,8 @@ __version__: str
 __all__ = [
     "CheckResult",
     "CompileResult",
+    "LintDiagnostic",
+    "LintFileReport",
     "LintResult",
     "MdsError",
     "Message",

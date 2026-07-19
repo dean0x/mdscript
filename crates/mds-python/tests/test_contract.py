@@ -72,11 +72,14 @@ def test_c3_span_typed() -> None:
 
 
 def test_c4_markdown_to_dict_canonical() -> None:
+    # to_dict() always includes "sourceMap" as None (Python-idiomatic always-present).
+    # to_json() omits the key (canonical wire format). See CompileResult.to_dict docs.
     assert MD.to_dict() == {
         "kind": "markdown",
         "output": "Hello Alice!\n",
         "warnings": [],
         "dependencies": [],
+        "sourceMap": None,
     }
     assert "messages" not in MD.to_dict()
 
@@ -86,11 +89,23 @@ def test_c4_messages_to_dict_canonical() -> None:
     assert d["kind"] == "messages"
     assert "output" not in d
     assert d["messages"] == [{"role": "user", "content": "Hi"}]  # content is trimmed
+    # sourceMap is always present in to_dict() even for messages results.
+    assert "sourceMap" in d
+    assert d["sourceMap"] is None
 
 
 def test_c4_to_json_matches_to_dict() -> None:
+    # Deliberate asymmetry: to_dict() includes "sourceMap": None (Python-idiomatic);
+    # to_json() omits the key when absent (canonical wire format shared with other surfaces).
+    # Verify this documented difference rather than asserting equality.
     for r in (MD, MSG):
-        assert json.loads(r.to_json()) == r.to_dict()
+        from_json = json.loads(r.to_json())
+        d = r.to_dict()
+        # The wire JSON matches to_dict() after stripping null sourceMap.
+        d_without_null_sm = {
+            k: v for k, v in d.items() if not (k == "sourceMap" and v is None)
+        }
+        assert from_json == d_without_null_sm
 
 
 def test_c4_check_to_dict_json() -> None:

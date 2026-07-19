@@ -71,8 +71,10 @@ def test_par1_to_dict_matches_golden(
     name: str, src: str, vars: dict[str, object], expected: dict[str, object]
 ) -> None:
     result = m.compile(src, vars=vars or None)
-    assert result.to_dict() == expected
-    # to_json round-trips to the same value
+    # to_dict() always includes "sourceMap": None (Python-idiomatic always-present);
+    # the goldens capture the wire format without it.
+    assert result.to_dict() == {**expected, "sourceMap": None}
+    # to_json() is the canonical wire format — matches the golden byte-for-byte.
     assert json.loads(result.to_json()) == expected
 
 

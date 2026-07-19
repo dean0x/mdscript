@@ -23,6 +23,8 @@ from importlib import metadata as _metadata
 from ._mdscript import (
     CheckResult,
     CompileResult,
+    LintDiagnostic,
+    LintFileReport,
     LintResult,
     MdsError,
     Message,
@@ -52,6 +54,8 @@ except _metadata.PackageNotFoundError:  # pragma: no cover - source tree without
 __all__ = [
     "CheckResult",
     "CompileResult",
+    "LintDiagnostic",
+    "LintFileReport",
     "LintResult",
     "MdsError",
     "Message",
