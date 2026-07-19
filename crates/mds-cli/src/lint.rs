@@ -30,7 +30,10 @@ use std::path::{Path, PathBuf};
 use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
 
-use crate::build::{build_runtime_vars, load_config, read_stdin, resolve_input, RuntimeVarArgs};
+use crate::build::{
+    build_runtime_vars, ensure_existing_mds_file, load_config, read_stdin, resolve_input,
+    RuntimeVarArgs,
+};
 use crate::output::{atomic_write_file, collect_mds_files_detailed};
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -160,19 +163,15 @@ fn do_lint(args: LintArgs) -> Result<()> {
     }
 
     // Single-file mode.
-    ensure_mds_extension(&input)?;
-    run_lint_file(&input, flags, runtime_vars)
-}
-
-/// Reject non-.mds extension (exit 2 via caller catch).
-fn ensure_mds_extension(path: &Path) -> Result<()> {
-    if path.extension().and_then(|e| e.to_str()) == Some("mds") {
-        Ok(())
-    } else {
-        Err(miette::Error::from(MdsError::NotMdsFile {
-            path: path.display().to_string(),
-        }))
+    // Check existence first, then extension (C4/F6): a non-existent path must report
+    // mds::file_not_found, not mds::not_mds_file, regardless of the extension.
+    // Route through emit_analysis_failure_json_or_stderr so --format json produces the
+    // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
+    if let Err(mds_err) = ensure_existing_mds_file(&input) {
+        emit_analysis_failure_json_or_stderr(&mds_err, format);
+        std::process::exit(mds_error_exit_code(&mds_err));
     }
+    run_lint_file(&input, flags, runtime_vars)
 }
 
 // ── Config helpers ────────────────────────────────────────────────────────────

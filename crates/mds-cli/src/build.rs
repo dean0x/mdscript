@@ -424,6 +424,34 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
     }
 }
 
+// ── Input-validation helpers ──────────────────────────────────────────────────
+
+/// Validate `path` for single-file build/fmt/lint: existence is checked first
+/// (→ `mds::file_not_found`, exit 2) and then the `.mds` extension (→
+/// `mds::not_mds_file`, exit 2).
+///
+/// Existence-before-extension ordering is required so that a user pointing at a
+/// non-existent path without `.mds` receives a "file not found" error rather than
+/// the confusing "not an .mds file" error (C4/F6).
+pub(crate) fn ensure_existing_mds_file(path: &Path) -> Result<(), MdsError> {
+    let exists = path
+        .try_exists()
+        .map_err(|e| MdsError::Io { message: format!("cannot check {}: {e}", path.display()) })?;
+    if !exists {
+        return Err(MdsError::FileNotFound {
+            path: path.display().to_string(),
+            span: None,
+            src: None,
+        });
+    }
+    if path.extension().and_then(|e| e.to_str()) != Some("mds") {
+        return Err(MdsError::NotMdsFile {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
 // ── Runtime vars helpers ──────────────────────────────────────────────────────
 
 /// Bundled runtime-variable arguments from the CLI.

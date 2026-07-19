@@ -494,6 +494,65 @@ fn json_format_nonexistent_path_emits_error_envelope() {
     );
 }
 
+// ── C4/F6: existence-before-extension ordering for lint ──────────────────────
+
+/// A non-existent path that also lacks the `.mds` extension must report
+/// `mds::file_not_found`, NOT `mds::not_mds_file` (C4/F6).
+///
+/// Before this fix, `ensure_mds_extension` ran before the file was opened, so
+/// `/nonexistent.txt` produced a confusing "not an .mds file" diagnostic.
+/// Now `ensure_existing_mds_file` checks existence first.
+#[test]
+fn lint_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing_12345.txt");
+
+    let out = lint_path(&missing, &[]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "non-existent .txt file must exit 2; got: {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mds::file_not_found") || stderr.contains("file not found"),
+        "error must be file-not-found (not extension error); got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("mds::not_mds_file") && !stderr.contains("not an .mds"),
+        "must NOT report 'not an .mds file' for a non-existent path; got: {stderr:?}"
+    );
+}
+
+/// Same as above but in `--format json` mode: the error envelope must have
+/// code `mds::file_not_found`, not `mds::not_mds_file`.
+#[test]
+fn lint_nonexistent_non_mds_json_mode_reports_file_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing_12345.txt");
+
+    let out = lint_path(&missing, &["--format", "json"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--format json + nonexistent .txt must exit 2"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON (error envelope); parse error: {e}; stdout: {stdout}")
+    });
+    let code = parsed["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error.code must be a string; got: {parsed}"));
+    assert_eq!(
+        code, "mds::file_not_found",
+        "JSON envelope code must be mds::file_not_found (not mds::not_mds_file); got: {code}"
+    );
+}
+
 // ── L-CLI-FIX3: block-spanning --fix refusal (TEST-3) ────────────────────────
 //
 // Exercises the KB gotcha "block-spanning Tier A fixes are always refused":
