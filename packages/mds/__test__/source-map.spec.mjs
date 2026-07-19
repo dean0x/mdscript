@@ -57,10 +57,21 @@ function findMdsCli() {
 
 /**
  * Return the path to a Python interpreter that can import `mdscript`, or null.
- * Prefers the repo-local venv's Python so the module installed by
- * `maturin develop` is used.
+ *
+ * Resolution order:
+ *   1. MDS_PYTHON_BIN env var (set by CI to the pip-managed interpreter).
+ *   2. Repo-local venv at .venv/bin/python3 (set up by `maturin develop`).
+ *   3. System `python3` on PATH (best-effort fallback for local dev).
+ *
+ * Returns null only when none of the above is found.  In CI (process.env.CI)
+ * the caller must treat null as a hard failure — see PF-007.
  */
 function findPythonForMdscript() {
+  const envBin = process.env.MDS_PYTHON_BIN;
+  if (envBin) {
+    if (!existsSync(envBin)) throw new Error(`MDS_PYTHON_BIN=${envBin} does not exist`);
+    return envBin;
+  }
   const venvPy = join(REPO_ROOT, '.venv', 'bin', 'python3');
   if (existsSync(venvPy)) return venvPy;
   const res = spawnSync('which', ['python3'], { encoding: 'utf-8' });
@@ -748,11 +759,21 @@ describe('source maps — compileFile differential (CF-SM)', () => {
 
       // -- Surface 4: Python binding compile_file -------------------------------
       // Use the repo-local venv Python which has the mdscript module installed
-      // by `maturin develop`.  If no interpreter is found the Python surface is
-      // skipped with a clear diagnostic; the other three surfaces still run.
+      // by `maturin develop`, or the interpreter exported by MDS_PYTHON_BIN (CI).
+      // In CI all four surfaces must run — a missing surface is a hard failure
+      // (avoids PF-007: a gate that silently skips a surface reads as green).
+      // Locally, a missing interpreter warns and skips the Python leg only.
       const python = findPythonForMdscript();
       let pySources = null;
       if (python == null) {
+        if (process.env.CI) {
+          throw new Error(
+            'CF-SM2: Python surface is required in CI but no interpreter was found. ' +
+            'Set MDS_PYTHON_BIN to an interpreter that can import mdscript, or ' +
+            'install the binding with `pip install ./crates/mds-python`. ' +
+            'A missing surface silently breaks the PF-007 cross-surface parity gate.',
+          );
+        }
         console.warn(
           'CF-SM2: skipping Python surface — no Python interpreter found ' +
           '(run `maturin develop` inside .venv to enable)',
