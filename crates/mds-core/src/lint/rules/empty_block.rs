@@ -80,7 +80,11 @@ fn check_nodes(
                         Some("Add content inside the @for block or remove it.".to_string()),
                         b.offset,
                         "@for".len(),
-                        Some(vec![FixLineSpan::single(b.offset)]),
+                        Some(vec![FixLineSpan {
+                            from: b.offset,
+                            to: b.end_offset,
+                            to_inclusive: true,
+                        }]),
                     ),
                     builder,
                 ) {
@@ -99,7 +103,11 @@ fn check_nodes(
                         Some("Add a body to the function or remove the definition.".to_string()),
                         b.offset,
                         "@define".len() + 1 + b.name.len(),
-                        Some(vec![FixLineSpan::single(b.offset)]),
+                        Some(vec![FixLineSpan {
+                            from: b.offset,
+                            to: b.end_offset,
+                            to_inclusive: true,
+                        }]),
                     ),
                     builder,
                 ) {
@@ -151,6 +159,17 @@ fn check_if_block(
     builder: &mut LintResultBuilder,
 ) {
     // Check then-body.
+    // Case ③: no other branches → safe to remove the whole @if block.
+    // Case ④: other branches present → leave them intact; fix is unsafe.
+    let then_fix = if b.elseif_branches.is_empty() && b.else_body.is_none() {
+        Some(vec![FixLineSpan {
+            from: b.offset,
+            to: b.end_offset,
+            to_inclusive: true,
+        }])
+    } else {
+        None // ④ partial-block removal is unsafe
+    };
     if flag_if_empty(
         &b.then_body,
         filename,
@@ -162,7 +181,7 @@ fn check_if_block(
             Some("Add content inside the @if block or remove it.".to_string()),
             b.offset,
             "@if".len(),
-            Some(vec![FixLineSpan::single(b.offset)]),
+            then_fix,
         ),
         builder,
     ) {
@@ -170,7 +189,20 @@ fn check_if_block(
     }
 
     // Check @elseif branches.
-    for branch in &b.elseif_branches {
+    // Case ⑥: last branch with no @else → remove from elseif up to (not incl.) @end.
+    // Case ⑦: not the last branch, or @else follows → fix is unsafe.
+    for (i, branch) in b.elseif_branches.iter().enumerate() {
+        let is_last = i == b.elseif_branches.len() - 1;
+        let elseif_fix = if is_last && b.else_body.is_none() {
+            // Case ⑥: terminal empty @elseif with no @else — remove up to @end (exclusive).
+            Some(vec![FixLineSpan {
+                from: branch.offset,
+                to: b.end_offset,
+                to_inclusive: false,
+            }])
+        } else {
+            None // ⑦ non-terminal or followed by @else — unsafe
+        };
         if flag_if_empty(
             &branch.body,
             filename,
@@ -182,7 +214,7 @@ fn check_if_block(
                 Some("Add content inside the @elseif block or remove it.".to_string()),
                 branch.offset,
                 "@elseif".len(),
-                Some(vec![FixLineSpan::single(branch.offset)]),
+                elseif_fix,
             ),
             builder,
         ) {
@@ -191,6 +223,7 @@ fn check_if_block(
     }
 
     // Check @else body.
+    // Case ⑤: always safe to remove the @else clause (remove from @else: up to @end, exclusive).
     if let Some(else_body) = &b.else_body {
         let else_off = b.else_offset.unwrap_or(b.offset);
         // Last check in this function — no further work follows regardless of return.
@@ -205,7 +238,12 @@ fn check_if_block(
                 Some("Add content inside the @else block or remove it.".to_string()),
                 else_off,
                 "@else".len(),
-                Some(vec![FixLineSpan::single(else_off)]),
+                // Case ⑤: remove from @else: up to (not including) @end.
+                Some(vec![FixLineSpan {
+                    from: else_off,
+                    to: b.end_offset,
+                    to_inclusive: false,
+                }]),
             ),
             builder,
         );

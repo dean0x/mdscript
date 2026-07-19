@@ -87,7 +87,11 @@ pub(crate) fn check(
                 column: None,
             }),
             file: Some(filename.to_string()),
-            fix_removals: Some(vec![FixLineSpan::single(def.offset)]),
+            fix_removals: Some(vec![FixLineSpan {
+                from: def.offset,
+                to: def.end_offset,
+                to_inclusive: true,
+            }]),
         }) {
             return;
         }

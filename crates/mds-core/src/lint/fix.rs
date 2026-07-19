@@ -1175,12 +1175,11 @@ mod tests {
     /// exercised `plan_fixes_with_options(result, source, include_tier_b=true)` through
     /// `apply_fixes` on a REAL Tier B diagnostic with a real reverify closure.
     ///
-    /// **Why the refusal path**: `diag_to_edit` removes only the `@define dead():`
-    /// opening line, leaving the body (`World!\n`) and `@end` orphaned. The reverify
-    /// parse fails (`MdsError::Syntax`) and `apply_fixes` returns `Rejected`. This is
-    /// the correct fail-closed behavior documented in the KNOWLEDGE.md "block-spanning
-    /// fixes are always refused" gotcha — and exercises the reverify/output-neutrality
-    /// gate for Tier B explicitly.
+    /// **Why the Fixed path**: `fix_removals` now carries a `FixLineSpan` covering the
+    /// whole `@define dead():..@end` block (from `def.offset` to `def.end_offset`,
+    /// inclusive). The reverify parses the fixed source cleanly, confirms no output
+    /// delta (the dead function was never called so removal is output-neutral), and
+    /// `apply_fixes` returns `Fixed`.
     ///
     /// **Why unused-function, not unused-import**: a standalone file has no `@import`
     /// by definition (`is_standalone = !is_partial_or_extends && imports.is_empty()`),
@@ -1188,7 +1187,7 @@ mod tests {
     /// when `has_explicit_exports && !exported && !called` — achieved here with an
     /// explicit `@export greet` plus an unexported, uncalled `@define dead():`.
     #[test]
-    fn tier_b_unused_function_standalone_apply_is_refused() {
+    fn tier_b_unused_function_standalone_apply_succeeds() {
         // Standalone source: no @import, no @extends, has explicit @export.
         // `dead` is unexported and uncalled → fires unused-function (Tier B).
         let source =
@@ -1223,15 +1222,26 @@ mod tests {
         );
 
         // Step 3: apply with a real reverify closure.
-        // Removing only `@define dead():\n` leaves `World!\n@end` orphaned —
-        // the reverify parse fails (Syntax error) → apply_fixes returns Rejected.
+        // The block-span fix_removals removes the whole `@define dead():\nWorld!\n@end\n`
+        // block. The reverify parses the fixed source and confirms output-neutrality
+        // (dead() was never called, so output is unchanged) → Fixed.
         let outcome = apply_fixes(source, plan, &lint_result, crate::lint_str);
 
         assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "Tier B unused-function fix must be Rejected (block-span refusal: orphaned @end); \
+            matches!(outcome, FixOutcome::Fixed { .. }),
+            "Tier B unused-function fix must succeed with block-span fix_removals; \
              got: {outcome:?}"
         );
+        if let FixOutcome::Fixed { source: fixed, .. } = outcome {
+            assert!(
+                !fixed.contains("@define dead():"),
+                "fixed source must not contain the removed @define dead(); got: {fixed:?}"
+            );
+            assert!(
+                fixed.contains("@define greet():"),
+                "fixed source must retain the exported @define greet(); got: {fixed:?}"
+            );
+        }
     }
 
     /// L-FIX-REV1: A reverify closure that detects an output delta MUST cause

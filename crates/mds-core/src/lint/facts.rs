@@ -79,8 +79,6 @@ pub struct DefineFact {
     /// Byte offset of the `@define` token in the source.
     pub offset: usize,
     /// Byte offset of the `@end` token in the source (for fix span computation).
-    // Used in lint fix wiring (unused-function rule) — allow until that step lands.
-    #[allow(dead_code)]
     pub end_offset: usize,
 }
 

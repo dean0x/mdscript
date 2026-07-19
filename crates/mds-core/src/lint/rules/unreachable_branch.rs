@@ -107,8 +107,24 @@ fn check_if_block(
             // Appendix A: "always-true → LATER branches unreachable."
             // If there are no later branches, nothing is unreachable — do not flag (M2 FP fix).
             let has_later_branches = !b.elseif_branches.is_empty() || b.else_body.is_some();
-            if has_later_branches
-                && !builder.push(make_diag(
+            if has_later_branches {
+                // Case A: remove the @if directive line + the unreachable later branches
+                // through @end. Result: then-body unwrapped in parent scope.
+                let first_later_offset = b
+                    .elseif_branches
+                    .first()
+                    .map(|br| br.offset)
+                    .or(b.else_offset)
+                    .unwrap_or(b.end_offset);
+                let fix = Some(vec![
+                    FixLineSpan::single(b.offset),
+                    FixLineSpan {
+                        from: first_later_offset,
+                        to: b.end_offset,
+                        to_inclusive: true,
+                    },
+                ]);
+                if !builder.push(make_diag(
                     *severity,
                     filename,
                     "@if condition is always true — @elseif/@else branches are unreachable."
@@ -119,14 +135,39 @@ fn check_if_block(
                     ),
                     b.offset,
                     "@if".len(),
-                    Some(vec![FixLineSpan::single(b.offset)]),
-                ))
-            {
-                return;
+                    fix,
+                )) {
+                    return;
+                }
             }
         }
         ConditionClass::AlwaysFalse => {
             // Always-false primary condition → then-body is dead code, regardless of later branches.
+            let has_elseif = !b.elseif_branches.is_empty();
+            let has_else = b.else_body.is_some();
+            let fix = if !has_elseif && !has_else {
+                // Case B: no other branches → remove the whole block.
+                Some(vec![FixLineSpan {
+                    from: b.offset,
+                    to: b.end_offset,
+                    to_inclusive: true,
+                }])
+            } else if !has_elseif && has_else {
+                // Case C: only @else → remove @if..@else: (inclusive) + the @end line.
+                // Result: else-body unwrapped in parent scope.
+                let else_off = b.else_offset.unwrap_or(b.end_offset);
+                Some(vec![
+                    FixLineSpan {
+                        from: b.offset,
+                        to: else_off,
+                        to_inclusive: true,
+                    },
+                    FixLineSpan::single(b.end_offset),
+                ])
+            } else {
+                // Case D: @elseif branches present — too complex to auto-fix safely.
+                None
+            };
             if !builder.push(make_diag(
                 *severity,
                 filename,
@@ -137,7 +178,7 @@ fn check_if_block(
                 ),
                 b.offset,
                 "@if".len(),
-                Some(vec![FixLineSpan::single(b.offset)]),
+                fix,
             )) {
                 return;
             }
@@ -149,7 +190,16 @@ fn check_if_block(
     // Collect all seen conditions in order; flag a branch if its condition equals any prior one.
     let mut seen_conditions: Vec<&Condition> = vec![&b.condition];
 
-    for branch in &b.elseif_branches {
+    for (i, branch) in b.elseif_branches.iter().enumerate() {
+        // The removal boundary for this branch is the start of the NEXT branch.
+        // If this is the last @elseif, the boundary is @else: (if present) or @end.
+        let next_boundary = b
+            .elseif_branches
+            .get(i + 1)
+            .map(|next| next.offset)
+            .or(b.else_offset)
+            .unwrap_or(b.end_offset);
+
         let cond = &branch.condition;
         // Check if this @elseif condition duplicates any prior condition.
         let is_duplicate = seen_conditions
@@ -157,6 +207,13 @@ fn check_if_block(
             .any(|prior| conditions_eq(prior, cond));
 
         if is_duplicate {
+            // Case G: remove this duplicate @elseif branch up to the next boundary
+            // (exclusive) — keeps whatever follows intact.
+            let fix = Some(vec![FixLineSpan {
+                from: branch.offset,
+                to: next_boundary,
+                to_inclusive: false,
+            }]);
             // Emit ONE finding for the duplicate. Skip the always-true/false check below —
             // the duplicate detection already identifies this dead code (M4 dedup).
             if !builder.push(make_diag(
@@ -168,7 +225,7 @@ fn check_if_block(
                 Some("Remove the duplicate @elseif branch or change its condition.".to_string()),
                 branch.offset,
                 "@elseif".len(),
-                Some(vec![FixLineSpan::single(branch.offset)]),
+                fix,
             )) {
                 return;
             }
@@ -176,6 +233,8 @@ fn check_if_block(
             // Not a duplicate — check if this @elseif is always-true or always-false.
             match classify_condition(cond) {
                 ConditionClass::AlwaysTrue => {
+                    // Case F: always-true @elseif — later branches are unreachable.
+                    // Unwrapping the body safely requires complex restructuring; leave as None.
                     if !builder.push(make_diag(
                         *severity,
                         filename,
@@ -183,12 +242,18 @@ fn check_if_block(
                         Some("Replace the constant condition with a variable.".to_string()),
                         branch.offset,
                         "@elseif".len(),
-                        Some(vec![FixLineSpan::single(branch.offset)]),
+                        None, // Case F: restructuring needed — not auto-fixable
                     )) {
                         return;
                     }
                 }
                 ConditionClass::AlwaysFalse => {
+                    // Case E: remove this dead @elseif up to the next boundary (exclusive).
+                    let fix = Some(vec![FixLineSpan {
+                        from: branch.offset,
+                        to: next_boundary,
+                        to_inclusive: false,
+                    }]);
                     if !builder.push(make_diag(
                         *severity,
                         filename,
@@ -199,7 +264,7 @@ fn check_if_block(
                         ),
                         branch.offset,
                         "@elseif".len(),
-                        Some(vec![FixLineSpan::single(branch.offset)]),
+                        fix,
                     )) {
                         return;
                     }

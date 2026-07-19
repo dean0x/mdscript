@@ -497,18 +497,17 @@ fn json_format_nonexistent_path_emits_error_envelope() {
 // ── L-CLI-FIX3: block-spanning --fix refusal (TEST-3) ────────────────────────
 //
 // Exercises the KB gotcha "block-spanning Tier A fixes are always refused":
-// diag_to_edit() removes only the opening directive line (span-guided byte
-// removal per ADR-001), orphaning the @end. The reverify gate calls
-// lint_str_with on the edited source, which fails to parse (orphaned @end),
-// and refuses the entire fix batch fail-closed.
+// Block-span empty @define is now fixed correctly. The fix_removals field
+// carries a FixLineSpan covering the full @define..@end block. The reverify
+// gate parses the fixed source (empty file) cleanly, confirms no output delta,
+// and accepts the fix. (per ADR-001 block-span discipline)
 //
 // Fixture: lint_block_span_empty.mds — multi-line empty @define whose body is
 // a single blank line (whitespace-only Text node). The empty-block rule fires
-// (Tier A, Warn), the fix is attempted and refused, and the residual Warn
-// finding determines exit code 1. (applies ADR-001)
+// (Tier A, Warn). The fix removes the whole block → empty file → exit 0.
 
 #[test]
-fn fix_refused_for_block_spanning_empty_define_and_file_unchanged() {
+fn fix_applied_for_block_spanning_empty_define_and_file_changed() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_block_span_empty.mds");
     fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
@@ -522,25 +521,28 @@ fn fix_refused_for_block_spanning_empty_define_and_file_unchanged() {
     let out = lint_path(&target, &["--fix"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // The fix must be refused: removing the @define line orphans @end, which
-    // the reverify gate catches as a parse error and rejects fail-closed.
+    // The fix must succeed: block-span fix_removals removes the whole @define..@end block.
     assert!(
-        stderr.contains("fix rejected"),
-        "fix must be refused for block-spanning empty-block; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "block-spanning empty-block fix must now succeed; got stderr: {stderr}"
     );
 
-    // Residual finding: the original empty-block Warn survives → exit 1.
+    // No residual findings → clean exit.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "exit code must reflect residual warn finding after fix refusal; got stderr: {stderr}"
+        Some(0),
+        "exit code must be 0 after successful empty-block fix; got stderr: {stderr}"
     );
 
-    // Critical: the file on disk must be left UNCHANGED.
+    // The file on disk must be CHANGED — the empty @define block is removed.
     let after = fs::read_to_string(&target).unwrap();
-    assert_eq!(
+    assert_ne!(
         original, after,
-        "file must be left unchanged when --fix is refused"
+        "file must be changed when --fix succeeds for empty-block"
+    );
+    assert!(
+        !after.contains("@define empty_fn():"),
+        "fixed file must not contain the removed @define; got: {after:?}"
     );
 }
 
@@ -657,22 +659,21 @@ fn directory_json_files_array_is_deterministically_sorted() {
     );
 }
 
-// ── I-24: unreachable-branch --fix refusal (block-spanning, ADR-001) ─────────
+// ── I-24: unreachable-branch --fix succeeds for always-true @if + @else ───────
 //
-// unreachable-branch is Tier A (auto-fixable per tier.rs), but the fix is always
-// refused for @if blocks: diag_to_edit() removes only the opening @if directive
-// line (span-guided byte removal per ADR-001), orphaning @else/@end. The reverify
-// gate calls lint_str_with on the edited source, which fails to parse (orphaned
-// @else), and refuses the entire fix batch fail-closed.
+// unreachable-branch is Tier A (auto-fixable per tier.rs). With block-span
+// fix_removals wired, always-true @if (case A) generates two spans:
+//   • Span 1: remove the @if directive line (FixLineSpan::single(b.offset)).
+//   • Span 2: remove from the first unreachable branch through @end (inclusive).
+// The reverify gate parses the fixed source (just the then-body unwrapped),
+// confirms no output delta, and accepts the fix.
 //
 // Fixture: lint_unreachable_branch.mds — always-true @if "x" == "x": with a
-// later @else branch (the later branch makes unreachable-branch fire at its
-// default Error severity). After fix refusal the residual Error finding
-// determines exit 2. Non-vacuous: asserts "fix rejected" in stderr, exit 2,
-// AND file content byte-identical to before --fix. (applies ADR-001)
+// "hello" then-body and an @else: branch with "world". After fix: only "hello"
+// remains; exit 0 (no residual findings).
 
 #[test]
-fn fix_refused_for_unreachable_branch_and_file_unchanged() {
+fn fix_applied_for_unreachable_branch_and_file_changed() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_unreachable_branch.mds");
     fs::copy(fixture("lint_unreachable_branch.mds"), &target).unwrap();
@@ -690,25 +691,33 @@ fn fix_refused_for_unreachable_branch_and_file_unchanged() {
     let out = lint_path(&target, &["--fix"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // The fix must be refused: removing the @if line orphans @else/@end, caught
-    // by the reverify gate as a parse error and refused fail-closed (ADR-001).
+    // The fix must succeed: two-span case-A removal unwraps the then-body.
     assert!(
-        stderr.contains("fix rejected"),
-        "fix must be refused for block-spanning unreachable-branch; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "unreachable-branch fix must now succeed; got stderr: {stderr}"
     );
 
-    // Residual: unreachable-branch Error finding survives fix refusal → exit 2.
+    // No residual findings → clean exit.
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "residual Error finding after fix refusal must exit 2; got stderr: {stderr}"
+        Some(0),
+        "exit code must be 0 after successful unreachable-branch fix; got stderr: {stderr}"
     );
 
-    // Critical: file on disk must be left UNCHANGED.
+    // File is changed — the @if/@else/@end structure is removed, then-body unwrapped.
     let after = fs::read_to_string(&target).unwrap();
-    assert_eq!(
-        original, after,
-        "file must be unchanged when unreachable-branch --fix is refused"
+    assert_ne!(original, after, "file must be changed when --fix succeeds");
+    assert!(
+        !after.contains("@if"),
+        "fixed file must not contain the removed @if; got: {after:?}"
+    );
+    assert!(
+        !after.contains("@else"),
+        "fixed file must not contain the removed @else branch; got: {after:?}"
+    );
+    assert!(
+        after.contains("hello"),
+        "fixed file must retain the then-body content; got: {after:?}"
     );
 }
 
@@ -942,7 +951,7 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
     }
 }
 
-// ── Test (c): --fix --check on refused-fix fixture → prints "fix rejected" ───
+// ── Test (c): --fix --check on overlap-fix fixture → prints "fix rejected" ────
 //
 // Pins bug-5 / PF-004 fix for the check path: preview_fixes now returns a
 // PreviewOutcome::Rejected so --fix --check can surface the rejection reason.
@@ -951,23 +960,30 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
 // to None — --fix --check never printed "fix rejected" even when the reverify gate
 // refused the edit.
 //
-// Fixture: lint_block_span_empty.mds (multi-line empty @define). The fix removes
-// the opening @define line, orphaning @end → reverify gate fails → Rejected.
+// Fixture: lint_overlap_fix.mds — @if "x" == "x": with "hello" then-body and an
+// empty @else body. Two rules fire simultaneously:
+//   • unreachable-branch (Tier A, Error): always-true @if with later @else branch.
+//     Generates two spans: remove @if line + remove @else..@end.
+//   • empty-block (Tier A, Warn): empty @else body.
+//     Generates one span: remove @else: line through (but not including) @end.
+// The @else: removal spans OVERLAP (both start at the same byte), so
+// plan_fixes_with_options sets overlap_rejected = true → Rejected fail-closed.
 
 #[test]
 fn fix_check_refused_fix_prints_rejected_not_would_fix() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("lint_block_span_empty.mds");
-    fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
+    let target = dir.path().join("lint_overlap_fix.mds");
+    fs::copy(fixture("lint_overlap_fix.mds"), &target).unwrap();
     let original = fs::read_to_string(&target).unwrap();
 
     let out = lint_path(&target, &["--fix", "--check"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // "fix rejected" must appear: the reverify gate refused the empty-block removal.
+    // "fix rejected" must appear: overlapping spans trigger the overlap guard.
     assert!(
         stderr.contains("fix rejected"),
-        "--fix --check must print 'fix rejected' when the reverify gate refuses; got stderr: {stderr}"
+        "--fix --check must print 'fix rejected' when overlapping spans are detected; \
+         got stderr: {stderr}"
     );
 
     // "Would fix" must NOT appear: the fix was rejected, not pending.
