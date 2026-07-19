@@ -532,7 +532,10 @@ where
     match reverify(&fixed_source) {
         Err(err) => FixOutcome::Rejected {
             source: source.to_string(),
-            reason: format!("Reverify failed: fixed source does not compile: {err}"),
+            reason: format!(
+                "could not verify fix — the edited source did not re-parse cleanly \
+                 ({err}); leaving the file unchanged"
+            ),
         },
         Ok(residual) => {
             // Count untargeted diagnostics in the residual, per rule.
@@ -697,7 +700,8 @@ where
         let reverify_result = reverify(&test_source);
         let reject_reason: Option<String> = match &reverify_result {
             Err(err) => Some(format!(
-                "Reverify failed: fixed source does not compile: {err}"
+                "could not verify fix — the edited source did not re-parse cleanly \
+                 ({err}); leaving the file unchanged"
             )),
             Ok(residual) => {
                 // Use the full targeted_rules set (identical to the baseline) so the
