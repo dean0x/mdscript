@@ -1446,6 +1446,7 @@ mod tests {
             else_body: Some(vec![text("no")]),
             offset: 0,
             else_offset: None,
+            end_offset: 0,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1465,6 +1466,7 @@ mod tests {
             else_body: Some(vec![text("no")]),
             offset: 0,
             else_offset: None,
+            end_offset: 0,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1491,6 +1493,7 @@ mod tests {
                 text("\n"),
             ],
             offset: 0,
+            end_offset: 0,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1524,6 +1527,7 @@ mod tests {
                 text("!"),
             ],
             offset: 0,
+            end_offset: 0,
         };
         let mut scope = Scope::new();
         scope.set_function("greet", Arc::new(FunctionDef::from(&define)));
@@ -2109,6 +2113,7 @@ mod tests {
             params: vec![Param::required("x")],
             body: vec![text("ok")],
             offset: 0,
+            end_offset: 0,
         };
         let mut scope = Scope::new();
         scope.set_function("requires_one", Arc::new(FunctionDef::from(&define)));

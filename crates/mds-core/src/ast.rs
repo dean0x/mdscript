@@ -221,6 +221,11 @@ pub struct IfBlock {
     /// `None` when there is no `@else` clause. Used by lint rules to anchor
     /// diagnostics at the exact `@else` line rather than the enclosing `@if`.
     pub else_offset: Option<usize>,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    ///
+    /// This is a span annotation — intentionally excluded from structural
+    /// equality (see `structural_eq.rs`), similar to `ElseifBranch.offset`.
+    pub end_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +237,11 @@ pub struct ForBlock {
     pub iterable: Expr,
     pub body: Vec<Node>,
     pub offset: usize,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    ///
+    /// This is a span annotation — intentionally excluded from structural
+    /// equality (see `structural_eq.rs`), similar to `ElseifBranch.offset`.
+    pub end_offset: usize,
 }
 
 /// A parameter in a `@define` function definition.
@@ -281,6 +291,11 @@ pub struct DefineBlock {
     pub params: Vec<Param>,
     pub body: Vec<Node>,
     pub offset: usize,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    ///
+    /// This is a span annotation — intentionally excluded from structural
+    /// equality (see `structural_eq.rs`), similar to `ElseifBranch.offset`.
+    pub end_offset: usize,
 }
 
 #[derive(Debug, Clone)]

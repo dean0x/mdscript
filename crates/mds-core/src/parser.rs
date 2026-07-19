@@ -189,11 +189,16 @@ impl Parser<'_> {
     /// the `@if` that this `@end` must close). When the block is never closed
     /// the error is anchored at the opener so the user sees the unclosed line
     /// rather than EOF.
-    fn consume_end(&mut self, block_name: &str, opener_offset: usize) -> Result<(), MdsError> {
+    /// Consume the closing `@end` token, returning its byte offset on success.
+    ///
+    /// The returned `usize` is the byte offset of the `@end` token in the
+    /// source — used by lint rules to compute multi-line removal spans.
+    fn consume_end(&mut self, block_name: &str, opener_offset: usize) -> Result<usize, MdsError> {
         match self.tokens.get(self.pos) {
-            Some(Token::Directive(d, _)) if d.trim() == "@end" => {
+            Some(Token::Directive(d, end_off)) if d.trim() == "@end" => {
+                let end_offset = *end_off;
                 self.pos += 1;
-                Ok(())
+                Ok(end_offset)
             }
             Some(Token::Directive(d, _)) => Err(MdsError::syntax(format!(
                 "expected @end to close {block_name} block, got '{}'",
@@ -402,7 +407,7 @@ impl Parser<'_> {
             (None, None)
         };
 
-        self.consume_end("@if", offset)?;
+        let end_offset = self.consume_end("@if", offset)?;
 
         self.depth -= 1;
         Ok(Node::If(IfBlock {
@@ -412,6 +417,7 @@ impl Parser<'_> {
             else_body,
             offset,
             else_offset,
+            end_offset,
         }))
     }
 
@@ -500,7 +506,7 @@ impl Parser<'_> {
 
         let body = self.parse_body(&["@end"], &[])?;
 
-        self.consume_end("@for", offset)?;
+        let end_offset = self.consume_end("@for", offset)?;
 
         self.depth -= 1;
         Ok(Node::For(ForBlock {
@@ -509,6 +515,7 @@ impl Parser<'_> {
             iterable,
             body,
             offset,
+            end_offset,
         }))
     }
 
@@ -561,7 +568,7 @@ impl Parser<'_> {
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
 
-        _guard.0.consume_end("@message", offset)?;
+        let _end_offset = _guard.0.consume_end("@message", offset)?;
 
         // Guard drops here, restoring inside_message=false and depth-=1.
         Ok(Node::Message(MessageBlock { role, body, offset }))
@@ -623,7 +630,7 @@ impl Parser<'_> {
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
 
-        _guard.0.consume_end("@block", offset)?;
+        let _end_offset = _guard.0.consume_end("@block", offset)?;
 
         // Guard drops here, restoring inside_block=false and depth-=1.
         Ok(Node::Block(BlockNode { name, body, offset }))
@@ -662,7 +669,7 @@ impl Parser<'_> {
 
         let body = self.parse_body(&["@end"], &[])?;
 
-        self.consume_end("@define", offset)?;
+        let end_offset = self.consume_end("@define", offset)?;
 
         self.depth -= 1;
         Ok(Node::Define(DefineBlock {
@@ -670,6 +677,7 @@ impl Parser<'_> {
             params,
             body,
             offset,
+            end_offset,
         }))
     }
 }

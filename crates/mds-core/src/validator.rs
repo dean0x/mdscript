@@ -519,6 +519,7 @@ mod tests {
             params: vec![crate::ast::Param::required("name")],
             body,
             offset: 0,
+            end_offset: 0,
         });
         let mut scope = Scope::new();
         let result = validate(&[define], &mut scope, "test.mds", "");
@@ -541,6 +542,7 @@ mod tests {
             params: vec![crate::ast::Param::required("name")],
             body,
             offset: 0,
+            end_offset: 0,
         });
         let mut scope = Scope::new();
         let result = validate(&[define], &mut scope, "test.mds", "");
