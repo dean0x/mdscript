@@ -24,8 +24,11 @@
 //!
 //! With `--fix`, residual post-fix findings determine the exit code.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
@@ -849,11 +852,42 @@ fn run_lint_file(
 /// suppressions on `lint_one_file_accumulating` and `lint_one_file_human`
 /// (issue #6 / zero-warnings policy). Pattern mirrors `FileCompileCtx` / `DirWatchCtx`
 /// in watch.rs.
+///
+/// `config_cache` maps a directory path to the resolved `LintConfig` for that directory.
+/// The cache avoids re-loading the config for every file in the same directory; the
+/// `RefCell` provides interior mutability so per-file helpers can populate it through
+/// a shared `&LintDirCtx` reference (A6 / D20 decision).
 struct LintDirCtx<'a> {
     lint_root: &'a Path,
     flags: LintFlags,
-    runtime_vars: &'a Option<std::collections::HashMap<String, mds::Value>>,
-    config: &'a mds::LintConfig,
+    runtime_vars: &'a Option<HashMap<String, mds::Value>>,
+    config_cache: RefCell<HashMap<PathBuf, Rc<mds::LintConfig>>>,
+}
+
+impl<'a> LintDirCtx<'a> {
+    /// Return the `LintConfig` for the directory `base_dir`.
+    ///
+    /// On the first call for a given `base_dir`, the config is loaded by walking
+    /// up the directory tree (via `load_lint_config`). Subsequent calls return the
+    /// cached value; files in the same directory always share a config.
+    ///
+    /// On config-load failure, returns `Err(MdsError::Io{..})` so the caller can
+    /// record a per-file error and continue linting the rest of the tree.
+    fn config_for(&self, base_dir: &Path) -> Result<Rc<mds::LintConfig>, MdsError> {
+        {
+            let cache = self.config_cache.borrow();
+            if let Some(cfg) = cache.get(base_dir) {
+                return Ok(Rc::clone(cfg));
+            }
+        }
+        let config = load_lint_config(base_dir)
+            .map_err(|e| MdsError::Io { message: format!("{e}") })?;
+        let rc = Rc::new(config);
+        self.config_cache
+            .borrow_mut()
+            .insert(base_dir.to_path_buf(), Rc::clone(&rc));
+        Ok(rc)
+    }
 }
 
 /// Aggregate exit-code category for directory mode.
@@ -891,17 +925,9 @@ fn run_lint_directory(
     const MAX_DEPTH: usize = 64;
     let LintFlags { quiet, format, .. } = flags;
 
-    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(dir) {
-        Ok(c) => c,
-        Err(e) => {
-            let mds_err = MdsError::Io {
-                message: format!("{e}"),
-            };
-            emit_analysis_failure_json_or_stderr(&mds_err, format);
-            std::process::exit(2);
-        }
-    };
+    // A6/D20: config is now discovered per-file (each file walks up to its nearest
+    // mds.json). The single root config load is removed; config_cache in LintDirCtx
+    // amortises repeated loads for files in the same directory.
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
@@ -936,7 +962,7 @@ fn run_lint_directory(
         lint_root: dir,
         flags,
         runtime_vars: &runtime_vars,
-        config: &config,
+        config_cache: RefCell::new(HashMap::new()),
     };
 
     for file in &files {
@@ -1012,7 +1038,21 @@ fn lint_one_file_accumulating(
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(file);
 
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
+    // A6: per-file config discovery — load (and cache) the nearest mds.json for
+    // this file's directory. A config-load failure is a per-file error; the rest
+    // of the tree continues linting.
+    let config = match ctx.config_for(base_dir) {
+        Ok(c) => c,
+        Err(ref e) => {
+            json_files.push(serde_json::json!({
+                "file": display_path,
+                "error": e.serialize()
+            }));
+            return FileTally::Error;
+        }
+    };
+
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &*config) {
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
@@ -1061,7 +1101,7 @@ fn lint_one_file_accumulating(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            ctx.config,
+            &*config,
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1124,7 +1164,7 @@ fn lint_one_file_accumulating(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            ctx.config,
+            &*config,
         ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
@@ -1179,10 +1219,22 @@ fn lint_one_file_human(
 
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(file);
+
+    // A6: per-file config discovery — load (and cache) the nearest mds.json for
+    // this file's directory. A config-load failure is a per-file error; the rest
+    // of the tree continues linting.
+    let config = match ctx.config_for(base_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::output::eprint_error(miette::Report::from(e));
+            return FileTally::Error;
+        }
+    };
+
     // Named source for span rendering: relative display path + source text.
     let named_source = Some((display_path.as_str(), source.as_str()));
 
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &*config) {
         Ok(r) => r,
         Err(ref e) => {
             crate::output::eprint_error(miette::Report::from(e.clone()));
@@ -1214,7 +1266,7 @@ fn lint_one_file_human(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            ctx.config,
+            &*config,
         );
         match fix_outcome {
             FixFileOutcome::Fixed {
@@ -1270,7 +1322,7 @@ fn lint_one_file_human(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            ctx.config,
+            &*config,
         ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;

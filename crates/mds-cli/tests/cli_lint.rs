@@ -1796,3 +1796,120 @@ fn lint_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         &out.stdout[..out.stdout.len().min(512)]
     );
 }
+
+// ── A6: per-file config discovery ────────────────────────────────────────────
+
+/// A6: per-file config discovery — nested mds.json overrides parent for files
+/// in its subtree.
+///
+/// Layout:
+///   root/
+///     mds.json          {"lint": {"rules": {"shadow-variable": "off"}}}
+///     top.mds           (shadow-variable template — no diagnostic at root)
+///     sub/
+///       mds.json        {"lint": {"rules": {"shadow-variable": "error"}}}
+///       sub.mds         (same shadow-variable template — error in sub)
+///
+/// Without A6 (single root config for all): both files use root config
+/// (shadow-variable=off) → exit 0.
+/// With A6 (per-file config): sub.mds uses sub config (shadow-variable=error)
+/// → exit 2.
+#[test]
+fn lint_dir_nested_config_per_file_discovery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // Root config: shadow-variable=off (suppress diagnostic).
+    fs::write(
+        root.join("mds.json"),
+        r#"{"lint":{"rules":{"shadow-variable":"off"}}}"#,
+    )
+    .unwrap();
+
+    // Template that triggers shadow-variable: `item` declared in frontmatter,
+    // reused as the @for loop variable.
+    let shadow_template = "---\nitem: outer\nitems: [a, b]\n---\n\
+                           Before: {item}\n@for item in items:\n- {item}\n@end\nAfter: {item}\n";
+    fs::write(root.join("top.mds"), shadow_template).unwrap();
+
+    // Subdirectory with its own config: shadow-variable=error.
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(
+        sub.join("mds.json"),
+        r#"{"lint":{"rules":{"shadow-variable":"error"}}}"#,
+    )
+    .unwrap();
+    fs::write(sub.join("sub.mds"), shadow_template).unwrap();
+
+    let out = lint_path(root, &[]);
+
+    // sub.mds must trigger shadow-variable at error severity → exit 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "lint dir with nested config (shadow-variable=error in sub/) must exit 2; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // top.mds has shadow-variable=off — its presence in output must not carry
+    // an error-severity diagnostic, i.e. the error must originate from sub.mds.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sub.mds") || stderr.contains("sub"),
+        "stderr must mention sub.mds as the source of the error; got: {stderr}"
+    );
+}
+
+/// A6: per-file config discovery — a malformed mds.json in a subdirectory
+/// produces a per-file error for files in that subtree, but files outside the
+/// subtree continue linting normally.
+///
+/// Layout:
+///   root/
+///     clean.mds         (no issues — no root mds.json, defaults apply)
+///     bad/
+///       mds.json        (invalid JSON — parse failure)
+///       bad.mds         (clean template, but config load fails)
+///
+/// Expected: exit 2 (per-file config error for bad.mds); clean.mds is
+/// unaffected (its FileTally is Clean).
+#[test]
+fn lint_dir_nested_malformed_config_per_file_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // Clean file in root — no mds.json present, defaults apply.
+    fs::write(root.join("clean.mds"), "---\ngreeting: hi\n---\n{greeting} world!\n").unwrap();
+
+    // Subdirectory with a malformed mds.json.
+    let bad = root.join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
+    fs::write(bad.join("bad.mds"), "---\ngreeting: hi\n---\n{greeting} world!\n").unwrap();
+
+    let out = lint_path(root, &[]);
+
+    // Malformed config in bad/ must cause exit 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "lint dir with malformed nested mds.json must exit 2; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // The error must be reported — stderr or stdout should mention config or mds.json.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("mds.json") || combined.contains("config") || combined.contains("bad"),
+        "output must reference the malformed config source; got: {combined}"
+    );
+}
