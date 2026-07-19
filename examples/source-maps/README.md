@@ -41,6 +41,26 @@ The sidecar is standard [Source Map v3](https://tc39.es/ecma426/) JSON:
   `## Focus areas` heading from `_style.mds`) maps back to the *module* file,
   not the entry template.
 
+## Reading a map from JavaScript
+
+[`consume-map.mjs`](consume-map.mjs) compiles this template through the
+`@mdscript/mds` API with `sourceMap: true`, decodes the Base64-VLQ `mappings`,
+and traces individual output lines back to their source file and line:
+
+```bash
+node examples/source-maps/consume-map.mjs
+```
+
+It prints, for example, that generated line 14 (`## Focus areas`) maps back to
+`_style.mds` (the `section()` macro body) while its interpolated title maps to
+`annotated-prompt.mds`. The same script runs on either backend
+(`MDS_BACKEND=wasm node …`) and produces identical mappings.
+
+Binding results differ from the CLI sidecar in two documented ways: the
+`sourceMap.file` key is **absent** (bindings do not know the output path), and
+`sources` are **project-root-relative** (resolved via a `.git` / `.mdsroot`
+marker) rather than map-relative.
+
 ## Inline variant
 
 ```bash

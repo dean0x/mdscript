@@ -1,0 +1,33 @@
+---
+role: Release Notes Writer
+audience: end users
+tone: concise
+---
+
+# {role}
+
+You write changelog entries for {audience} in a {tone} voice.
+
+@define entry(kind, summary):
+- **{kind}:** {summary}
+@end
+
+## Rules
+
+{entry("Added", "New capabilities, described from the reader's point of view.")}
+{entry("Fixed", "User-visible bugs, with the symptom named first.")}
+{entry("Changed", "Behavior differences someone upgrading would notice.")}
+
+## Voice sample
+
+The formatter treats everything below a directive as body text and never
+rewrites it. The fenced block, its interior blank line, and this paragraph
+survive `mds fmt` byte-for-byte:
+
+```text
+Before: the thing was slow
+
+After:  the thing is fast
+```
+
+Keep entries short. One idea per line.

@@ -1,0 +1,33 @@
+---
+id: "007"
+---
+## `--set` vs `--set-string` — end-to-end (v0.4.0, #152)
+
+This file has one variable, `id`, defaulting to the string `"007"`. Override it
+on the CLI to watch type coercion change the outcome. Run all four:
+
+~~~bash
+# (1) default — id keeps the frontmatter string "007"
+mds build examples/edge-cases/30_set_string_cli.mds -o -
+
+# (2) --set coerces "007" to the NUMBER 7 (leading zeros lost). The
+#     `id == "007"` branch below then compares number-vs-string and RAISES
+#     mds::type_mismatch (exit 1) — the pitfall --set-string exists to avoid.
+mds build examples/edge-cases/30_set_string_cli.mds --set id=007 -o -
+
+# (3) --set-string keeps "007" a STRING byte-for-byte — same result as (1).
+mds build examples/edge-cases/30_set_string_cli.mds --set-string id=007 -o -
+
+# (4) the same key in BOTH flags is a hard error (exit 1)
+mds build examples/edge-cases/30_set_string_cli.mds --set id=1 --set-string id=007 -o -
+~~~
+
+Rendered id: {id}
+
+@if number(id) == 7:
+- `number(id) == 7` — bridging to a number yields 7 in every mode; leading zeros are gone.
+@end
+@if id == "007":
+- `id == "007"` — id is still the STRING "007" (invocation 1 or 3), leading zeros intact.
+  Under `--set id=007` this line is never reached: the comparison type-mismatches first.
+@end
