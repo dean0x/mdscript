@@ -169,13 +169,21 @@ pub enum MdsError {
     #[error("arity mismatch for '{name}': {}, got {got}", format_arity(*expected_min, *expected_max))]
     #[diagnostic(
         code(mds::arity),
-        help("check the call site — '{name}' requires a different number of arguments than were provided")
+        help("check the call site — '{name}' requires a different number of arguments than were provided{signature_note}")
     )]
     ArityMismatch {
         name: String,
         expected_min: usize,
         expected_max: usize,
         got: usize,
+        /// Formatted function signature for the help text (B3 — F7).
+        ///
+        /// When non-empty, miette appends it to the help text so the user sees
+        /// the expected signature without having to look up the `@define`.
+        ///
+        /// Format: `"\nexpected: name(param1, param2 = default)"`.
+        /// Empty string for built-in functions (their signatures live in docs).
+        signature_note: String,
         #[label("wrong number of arguments")]
         span: Option<SourceSpan>,
         #[source_code]
@@ -442,12 +450,17 @@ impl MdsError {
         expected_min: usize,
         expected_max: usize,
         got: usize,
+        signature: Option<String>,
     ) -> Self {
+        let signature_note = signature
+            .map(|s| format!("\nexpected: {s}"))
+            .unwrap_or_default();
         MdsError::ArityMismatch {
             name: name.into(),
             expected_min,
             expected_max,
             got,
+            signature_note,
             span: None,
             src: None,
         }
@@ -463,13 +476,18 @@ impl MdsError {
         source: &str,
         offset: usize,
         len: usize,
+        signature: Option<String>,
     ) -> Self {
+        let signature_note = signature
+            .map(|s| format!("\nexpected: {s}"))
+            .unwrap_or_default();
         let (span, src) = at(file, source, offset, len);
         MdsError::ArityMismatch {
             name: name.into(),
             expected_min,
             expected_max,
             got,
+            signature_note,
             span,
             src,
         }

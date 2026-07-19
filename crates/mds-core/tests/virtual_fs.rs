@@ -1748,6 +1748,60 @@ fn b2_for_missing_colon_carries_span() {
     assert!(span.length > 0, "B2: span.length must be > 0");
 }
 
+// ── B3: ArityMismatch help text includes function signature ──────────────────
+
+/// Calling a user-defined function with the wrong number of arguments should
+/// produce an `mds::arity` error whose help text includes the expected signature.
+#[test]
+fn b3_arity_mismatch_includes_signature_in_help() {
+    // Define foo(x, y) and call it with only one arg.
+    let src = "@define foo(x, y):\n{x} {y}\n@end\n{foo(\"a\")}\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(s.code, "mds::arity", "B3: expected mds::arity, got: {}", s.code);
+    let help = s.help.expect("B3: arity error must have help text");
+    assert!(
+        help.contains("foo(x, y)"),
+        "B3: help must include signature 'foo(x, y)', got: {help}"
+    );
+}
+
+/// Calling a user-defined function with optional defaults should show defaults in signature.
+#[test]
+fn b3_arity_mismatch_signature_shows_defaults() {
+    let src = "@define greet(name, sep = \", \"):\n{name}{sep}\n@end\n{greet()}\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(s.code, "mds::arity", "B3: expected mds::arity, got: {}", s.code);
+    let help = s.help.expect("B3: arity error must have help text");
+    assert!(
+        help.contains("greet(name, sep = \", \")"),
+        "B3: help must show defaults, got: {help}"
+    );
+}
+
+/// Calling a built-in function with the wrong arg count should NOT include a signature.
+#[test]
+fn b3_builtin_arity_mismatch_no_signature_in_help() {
+    // `upper` takes exactly 1 arg.
+    let src = "{upper(\"a\", \"b\")}\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(s.code, "mds::arity", "B3 builtin: expected mds::arity, got: {}", s.code);
+    let help = s.help.expect("B3 builtin: arity error must have help text");
+    // Built-in help must NOT include "expected: upper(...)"
+    assert!(
+        !help.contains("expected: upper"),
+        "B3 builtin: help should not include builtin signature, got: {help}"
+    );
+}
+
 /// An unknown directive should produce a span-bearing `mds::syntax` error.
 #[test]
 fn b2_unknown_directive_carries_span() {

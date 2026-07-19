@@ -1,6 +1,7 @@
 use crate::arity::check_arity;
 use crate::ast::{
-    required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock, MessageBlock, Node,
+    render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
+    MessageBlock, Node,
 };
 use crate::error::MdsError;
 use crate::scope::Scope;
@@ -275,7 +276,15 @@ fn validate_call_arity(
         let total = func.params.len();
         if !check_arity(arg_count, required, total) {
             return Err(MdsError::arity_at(
-                name, required, total, arg_count, file, source, offset, len,
+                name,
+                required,
+                total,
+                arg_count,
+                file,
+                source,
+                offset,
+                len,
+                Some(render_signature(name, &func.params)),
             ));
         }
         Ok(())
@@ -290,6 +299,7 @@ fn validate_call_arity(
                 source,
                 offset,
                 len,
+                None, // built-in signatures live in docs, not the error message
             ));
         }
         Ok(())
@@ -350,6 +360,7 @@ fn validate_expr(
                     source,
                     offset,
                     len,
+                    Some(render_signature(&qualified, &func.params)),
                 ));
             }
             validate_var_args(args, scope, file, source, offset, 0)

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::arity::check_arity;
 use crate::ast::{
-    required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock, IncludeDirective,
-    MessageBlock, Node,
+    render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
+    IncludeDirective, MessageBlock, Node,
 };
 use crate::error::MdsError;
 use crate::limits::{
@@ -606,7 +606,13 @@ fn invoke_function(
     let required = required_param_count(&func.params);
     let total = func.params.len();
     if !check_arity(args.len(), required, total) {
-        return Err(MdsError::arity(call_key, required, total, args.len()));
+        return Err(MdsError::arity(
+            call_key,
+            required,
+            total,
+            args.len(),
+            Some(render_signature(call_key, &func.params)),
+        ));
     }
     scope.push();
     // Restore captured lexical scope from definition site so the function body
@@ -793,6 +799,7 @@ fn call_function(
                 meta.min_args,
                 meta.max_args,
                 args.len(),
+                None, // built-in signatures live in docs, not the error message
             ));
         }
         // Call the handler directly using the meta reference we already hold,

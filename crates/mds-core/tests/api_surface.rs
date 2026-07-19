@@ -66,6 +66,7 @@ fn mds_error_variants_exist() {
         expected_min: 1,
         expected_max: 1,
         got: 2,
+        signature_note: String::new(),
         span: None,
         src: None,
     };
