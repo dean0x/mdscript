@@ -1262,6 +1262,151 @@ mod tests {
         );
     }
 
+    // ── Block-span fix tests (FixLineSpan → ByteEdit) ────────────────────────
+
+    /// fix_line_span_to_edit: single-line span (`to_inclusive: true`, from == to)
+    /// must produce a ByteEdit that removes the whole line including its '\n'.
+    #[test]
+    fn block_span_single_line_to_inclusive() {
+        // source: "line0\nline1\nline2\n"
+        //          0     6     12    18
+        let source = "line0\nline1\nline2\n";
+        let span = FixLineSpan::single(6); // any offset on "line1"
+        let edit = fix_line_span_to_edit(&span, source, "test-rule")
+            .expect("valid single-line span should produce an edit");
+        assert_eq!(edit.start, 6, "start must be BOL of line1");
+        assert_eq!(edit.end, 12, "end must include the trailing \\n of line1");
+        assert_eq!(&source[edit.start..edit.end], "line1\n");
+    }
+
+    /// fix_line_span_to_edit: multi-line `to_inclusive: true` span must cover
+    /// both boundary lines and the lines in between, including the trailing newline
+    /// of the `to` line.
+    #[test]
+    fn block_span_multi_line_to_inclusive() {
+        // "open\nbody\nend\n" — remove lines 0..=2 (the whole thing)
+        //  0    5    10   14
+        let source = "open\nbody\nend\n";
+        let span = FixLineSpan {
+            from: 0, // first char of "open"
+            to: 10,  // first char of "end"
+            to_inclusive: true,
+        };
+        let edit = fix_line_span_to_edit(&span, source, "empty-block")
+            .expect("valid multi-line span should produce an edit");
+        assert_eq!(edit.start, 0);
+        assert_eq!(edit.end, source.len(), "should consume the entire source");
+    }
+
+    /// fix_line_span_to_edit: `to_inclusive: false` must remove up to the START
+    /// of the `to` line — the `to` line itself is preserved.
+    #[test]
+    fn block_span_to_exclusive_stops_at_to_line_start() {
+        // "header\nbody\nkeep\n"
+        //  0      7    12    17
+        let source = "header\nbody\nkeep\n";
+        let span = FixLineSpan {
+            from: 0,
+            to: 12, // start of "keep"
+            to_inclusive: false,
+        };
+        let edit = fix_line_span_to_edit(&span, source, "unreachable-branch")
+            .expect("valid span should produce an edit");
+        assert_eq!(edit.start, 0);
+        assert_eq!(
+            edit.end, 12,
+            "should stop at start of 'keep' line, not consume it"
+        );
+        assert_eq!(
+            &source[edit.end..],
+            "keep\n",
+            "keep line must be intact after edit"
+        );
+    }
+
+    /// fix_removals: None produces no edits (report-only diagnostic path).
+    #[test]
+    fn block_span_none_fix_removals_emits_no_edits() {
+        use crate::error::SerializedSpan;
+        let diag = LintDiagnostic {
+            rule: "unused-import".to_string(),
+            severity: Severity::Error,
+            message: "unused".to_string(),
+            help: None,
+            span: Some(SerializedSpan {
+                offset: 0,
+                length: 5,
+                line: None,
+                column: None,
+            }),
+            file: Some("test.mds".to_string()),
+            fix_removals: None, // Tier B unused-import: no edit emitted
+        };
+        let result = make_result(vec![diag]);
+        // plan_fixes_with_options(include_tier_b=true) still produces no edit because
+        // fix_removals is None.
+        let plan = plan_fixes_with_options(&result, "hello\n", true);
+        assert!(
+            plan.edits.is_empty(),
+            "fix_removals: None must emit no ByteEdit; got: {:?}",
+            plan.edits
+        );
+    }
+
+    /// A diagnostic with two FixLineSpans (e.g. unreachable-branch case A: remove
+    /// opening `@if` line + trailing `@else..@end` region) must produce two
+    /// independent ByteEdits, both applied to remove the correct byte ranges.
+    #[test]
+    fn block_span_two_disjoint_spans_produce_two_edits() {
+        use crate::error::SerializedSpan;
+        // "line0\n@if:\nline2\n@else:\n@end\n"
+        //  0     6    11    18     25   30
+        let source = "line0\n@if:\nline2\n@else:\n@end\n";
+        //             0     6  10  17   23   29
+        // Byte offsets:
+        //   "line0\n"  → [0, 6)
+        //   "@if:\n"   → [6, 11)
+        //   "line2\n"  → [11, 17)
+        //   "@else:\n" → [17, 24)
+        //   "@end\n"   → [24, 29)
+        let diag = LintDiagnostic {
+            rule: "unreachable-branch".to_string(),
+            severity: Severity::Error,
+            message: "always-true".to_string(),
+            help: None,
+            span: Some(SerializedSpan {
+                offset: 6,
+                length: 4,
+                line: None,
+                column: None,
+            }),
+            file: Some("test.mds".to_string()),
+            fix_removals: Some(vec![
+                // Span 1: remove the opening "@if:" line only
+                FixLineSpan::single(6),
+                // Span 2: remove from "@else:" through "@end" (inclusive)
+                FixLineSpan {
+                    from: 17,
+                    to: 24,
+                    to_inclusive: true,
+                },
+            ]),
+        };
+        let result = make_result(vec![diag]);
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.overlap_rejected,
+            "disjoint spans must not trigger overlap rejection"
+        );
+        assert_eq!(plan.edits.len(), 2, "two disjoint spans → two edits");
+        // Edits are sorted by start ASC; first edit = span 1 (BOL of @if: = 6..11)
+        assert_eq!(plan.edits[0].start, 6);
+        assert_eq!(plan.edits[0].end, 11);
+        // Second edit = span 2 (BOL of @else: through end of @end\n = 17..29)
+        assert_eq!(plan.edits[1].start, 17);
+        assert_eq!(plan.edits[1].end, 29);
+    }
+
     // ── REL-1: slice-panic guard for non-char-boundary / out-of-range offsets ─
 
     /// REL-1 regression: a diagnostic with a non-char-boundary offset must NOT
