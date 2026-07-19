@@ -48,7 +48,7 @@
 //! for non-truncated results.
 
 use crate::error::MdsError;
-use crate::lint::diagnostic::{LintDiagnostic, LintResult, Severity};
+use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResult, Severity};
 
 // Tier classification lives in the leaf `tier` module to break the would-be
 // circular dependency (fix.rs → diagnostic.rs → fix.rs). Re-export here so
@@ -184,9 +184,7 @@ pub fn plan_fixes_with_options(
             continue;
         }
 
-        if let Some(edit) = diag_to_edit(diag, source) {
-            plan.edits.push(edit);
-        }
+        plan.edits.extend(diag_to_edits(diag, source));
     }
 
     // Sort edits by start position (ascending).
@@ -201,33 +199,53 @@ pub fn plan_fixes_with_options(
     plan
 }
 
-/// Convert a diagnostic to a byte edit, if the diagnostic has a span
-/// that maps to a complete removable line.
+/// Find the byte offset of the start of the line containing `offset`.
 ///
-/// For Tier A rules, the edit removes the entire directive line containing
-/// the span (including its line terminator — CRLF discipline, AC-F-24).
-fn diag_to_edit(diag: &LintDiagnostic, source: &str) -> Option<ByteEdit> {
-    let span = diag.span.as_ref()?;
-    let offset = span.offset;
-
-    // Find the start of the line containing `offset`.
-    // `str::get(..offset)` returns None for out-of-range or non-char-boundary
-    // offsets — fail-closed per ADR-001 rather than panicking on a bad span.
+/// Uses `str::get(..offset)` — returns `None` for out-of-range or
+/// non-char-boundary offsets (fail-closed per ADR-001; no panic).
+fn line_start(source: &str, offset: usize) -> Option<usize> {
     let prefix = source.get(..offset)?;
-    let line_start = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    Some(prefix.rfind('\n').map(|p| p + 1).unwrap_or(0))
+}
 
-    // Find the end of the line (including the terminator — CRLF or LF).
-    let line_end = extend_to_line_end(source, offset);
+/// Convert a `FixLineSpan` to a `ByteEdit`, or `None` when the span is invalid.
+///
+/// - `to_inclusive: true`  → remove `[line_start(from) .. extend_to_line_end(to))`
+/// - `to_inclusive: false` → remove `[line_start(from) .. line_start(to))`
+///
+/// Fail-closed per ADR-001: any span that resolves to a zero-length or
+/// out-of-range byte range produces `None` (edit silently skipped).
+fn fix_line_span_to_edit(span: &FixLineSpan, source: &str, rule: &str) -> Option<ByteEdit> {
+    let start = line_start(source, span.from)?;
+    let end = if span.to_inclusive {
+        extend_to_line_end(source, span.to)
+    } else {
+        line_start(source, span.to)?
+    };
 
-    if line_start >= line_end || line_end > source.len() {
+    if start >= end || end > source.len() {
         return None;
     }
 
     Some(ByteEdit {
-        start: line_start,
-        end: line_end,
-        rule: diag.rule.clone(),
+        start,
+        end,
+        rule: rule.to_string(),
     })
+}
+
+/// Convert a diagnostic's `fix_removals` into zero or more `ByteEdit`s.
+///
+/// Returns an empty `Vec` when `diag.fix_removals` is `None` (no-fix case)
+/// or when every span resolves to an invalid range (fail-closed per ADR-001).
+fn diag_to_edits(diag: &LintDiagnostic, source: &str) -> Vec<ByteEdit> {
+    let Some(removals) = &diag.fix_removals else {
+        return vec![];
+    };
+    removals
+        .iter()
+        .filter_map(|span| fix_line_span_to_edit(span, source, &diag.rule))
+        .collect()
 }
 
 /// Extend a byte position to include the complete line terminator at or after `pos`.
@@ -755,6 +773,9 @@ mod tests {
                 column: None,
             }),
             file: Some("test.mds".to_string()),
+            // fix_removals drives the planner (replaces span-based heuristic).
+            // Use a single-line removal at `offset` — mirrors old diag_to_edit behavior.
+            fix_removals: Some(vec![FixLineSpan::single(offset)]),
         }
     }
 

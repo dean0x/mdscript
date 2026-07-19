@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mds::{
-    CompileResult, CompiledOutput, FileSystem, LintConfig, LintDiagnostic, LintResult, MdsError,
-    ModuleCache, NativeFs, Severity, Value, VirtualFs, MAX_DIAGNOSTICS, MAX_FILE_SIZE,
+    CompileResult, CompiledOutput, FileSystem, FixLineSpan, LintConfig, LintDiagnostic, LintResult,
+    MdsError, ModuleCache, NativeFs, Severity, Value, VirtualFs, MAX_DIAGNOSTICS, MAX_FILE_SIZE,
     MAX_TRAVERSAL_DEPTH,
 };
 
@@ -1030,6 +1030,7 @@ fn lint_types_exist() {
         help: Some("Remove the frontmatter key or reference it in the body".to_string()),
         span: None,
         file: Some("test.mds".to_string()),
+        fix_removals: None,
     };
     assert_eq!(diag.rule, "unused-variable");
     assert_eq!(diag.severity, Severity::Warn);
@@ -1100,6 +1101,7 @@ fn lint_canonical_json_schema() {
                 column: Some(1),
             }),
             file: Some("test.mds".to_string()),
+            fix_removals: None,
         }],
         truncated: false,
         is_standalone: false,
@@ -1145,7 +1147,7 @@ fn lint_canonical_json_schema() {
 fn lint_canonical_json_fixable_semantics() {
     use mds::LintDiagnostic;
 
-    // Tier A rule (duplicate-import) → fixable regardless of is_standalone.
+    // Tier A rule (duplicate-import) with fix_removals → fixable regardless of is_standalone.
     let tier_a = LintResult {
         diagnostics: vec![LintDiagnostic {
             rule: "duplicate-import".to_string(),
@@ -1154,6 +1156,7 @@ fn lint_canonical_json_fixable_semantics() {
             help: None,
             span: None,
             file: Some("a.mds".to_string()),
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
         }],
         truncated: false,
         is_standalone: false, // even non-standalone Tier A is fixable
@@ -1161,15 +1164,17 @@ fn lint_canonical_json_fixable_semantics() {
     let json = tier_a.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
 
-    // Tier B rule (unused-import) → fixable only for standalone files.
+    // Tier B rule (unused-function) — fixable only for standalone files.
+    // fix_removals: Some(...) + non-standalone → fixable: false
     let tier_b_non_standalone = LintResult {
         diagnostics: vec![LintDiagnostic {
-            rule: "unused-import".to_string(),
+            rule: "unused-function".to_string(),
             severity: Severity::Warn,
-            message: "Unused import".to_string(),
+            message: "Unused function".to_string(),
             help: None,
             span: None,
             file: Some("b.mds".to_string()),
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
         }],
         truncated: false,
         is_standalone: false,
@@ -1177,14 +1182,16 @@ fn lint_canonical_json_fixable_semantics() {
     let json = tier_b_non_standalone.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
 
+    // fix_removals: Some(...) + standalone → fixable: true
     let tier_b_standalone = LintResult {
         diagnostics: vec![LintDiagnostic {
-            rule: "unused-import".to_string(),
+            rule: "unused-function".to_string(),
             severity: Severity::Warn,
-            message: "Unused import".to_string(),
+            message: "Unused function".to_string(),
             help: None,
             span: None,
             file: Some("c.mds".to_string()),
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
         }],
         truncated: false,
         is_standalone: true,
@@ -1192,7 +1199,7 @@ fn lint_canonical_json_fixable_semantics() {
     let json = tier_b_standalone.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
 
-    // Tier C rule (unused-variable) → never fixable.
+    // Tier C rule (unused-variable) → never fixable (fix_removals: None also → false).
     let tier_c = LintResult {
         diagnostics: vec![LintDiagnostic {
             rule: "unused-variable".to_string(),
@@ -1201,6 +1208,7 @@ fn lint_canonical_json_fixable_semantics() {
             help: None,
             span: None,
             file: Some("d.mds".to_string()),
+            fix_removals: None,
         }],
         truncated: false,
         is_standalone: true, // even standalone Tier C is not fixable

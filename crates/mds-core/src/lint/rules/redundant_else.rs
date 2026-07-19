@@ -83,6 +83,7 @@ fn check_nodes(
                                 column: None,
                             }),
                             file: Some(filename.to_string()),
+                            fix_removals: None,
                         })
                     {
                         return;

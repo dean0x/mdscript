@@ -29,7 +29,7 @@
 use crate::ast::Module;
 use crate::error::SerializedSpan;
 use crate::lint::config::LintConfig;
-use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
+use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResultBuilder, Severity};
 use crate::lint::facts::{AnalysisContext, ExportKind};
 
 pub(crate) const RULE: &str = "unused-function";
@@ -87,6 +87,7 @@ pub(crate) fn check(
                 column: None,
             }),
             file: Some(filename.to_string()),
+            fix_removals: Some(vec![FixLineSpan::single(def.offset)]),
         }) {
             return;
         }

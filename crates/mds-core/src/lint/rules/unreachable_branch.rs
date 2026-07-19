@@ -30,7 +30,7 @@
 use crate::ast::{Condition, IfBlock, Module, Node};
 use crate::error::SerializedSpan;
 use crate::lint::config::LintConfig;
-use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
+use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResultBuilder, Severity};
 use crate::lint::facts::AnalysisContext;
 use crate::lint::rules::structural_eq::{conditions_eq, exprs_eq, is_literal};
 
@@ -119,6 +119,7 @@ fn check_if_block(
                     ),
                     b.offset,
                     "@if".len(),
+                    Some(vec![FixLineSpan::single(b.offset)]),
                 ))
             {
                 return;
@@ -136,6 +137,7 @@ fn check_if_block(
                 ),
                 b.offset,
                 "@if".len(),
+                Some(vec![FixLineSpan::single(b.offset)]),
             )) {
                 return;
             }
@@ -166,6 +168,7 @@ fn check_if_block(
                 Some("Remove the duplicate @elseif branch or change its condition.".to_string()),
                 branch.offset,
                 "@elseif".len(),
+                Some(vec![FixLineSpan::single(branch.offset)]),
             )) {
                 return;
             }
@@ -180,6 +183,7 @@ fn check_if_block(
                         Some("Replace the constant condition with a variable.".to_string()),
                         branch.offset,
                         "@elseif".len(),
+                        Some(vec![FixLineSpan::single(branch.offset)]),
                     )) {
                         return;
                     }
@@ -195,6 +199,7 @@ fn check_if_block(
                         ),
                         branch.offset,
                         "@elseif".len(),
+                        Some(vec![FixLineSpan::single(branch.offset)]),
                     )) {
                         return;
                     }
@@ -244,6 +249,7 @@ fn make_diag(
     help: Option<String>,
     offset: usize,
     length: usize,
+    fix_removals: Option<Vec<FixLineSpan>>,
 ) -> LintDiagnostic {
     LintDiagnostic {
         rule: RULE.to_string(),
@@ -257,6 +263,7 @@ fn make_diag(
             column: None,
         }),
         file: Some(filename.to_string()),
+        fix_removals,
     }
 }
 

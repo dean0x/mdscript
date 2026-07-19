@@ -24,7 +24,7 @@
 use crate::ast::Module;
 use crate::error::SerializedSpan;
 use crate::lint::config::LintConfig;
-use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
+use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResultBuilder, Severity};
 use crate::lint::facts::{AnalysisContext, ExportKind};
 use crate::lint::tier::first_occurrence;
 
@@ -70,6 +70,7 @@ pub(crate) fn check(
                                 column: None,
                             }),
                             file: Some(filename.to_string()),
+                            fix_removals: Some(vec![FixLineSpan::single(exp.offset)]),
                         })
                     {
                         return;
@@ -96,6 +97,7 @@ pub(crate) fn check(
                                 column: None,
                             }),
                             file: Some(filename.to_string()),
+                            fix_removals: Some(vec![FixLineSpan::single(exp.offset)]),
                         })
                     {
                         return;

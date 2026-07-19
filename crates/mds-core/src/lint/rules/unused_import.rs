@@ -167,6 +167,7 @@ fn make_diag(
             column: None,
         }),
         file: Some(filename.to_string()),
+        fix_removals: None, // unused-import is report-only (partial-name removal unsafe)
     }
 }
 

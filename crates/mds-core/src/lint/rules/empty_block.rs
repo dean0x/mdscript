@@ -28,7 +28,7 @@
 use crate::ast::{IfBlock, Module, Node};
 use crate::error::SerializedSpan;
 use crate::lint::config::LintConfig;
-use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
+use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResultBuilder, Severity};
 use crate::lint::facts::AnalysisContext;
 
 pub(crate) const RULE: &str = "empty-block";
@@ -80,6 +80,7 @@ fn check_nodes(
                         Some("Add content inside the @for block or remove it.".to_string()),
                         b.offset,
                         "@for".len(),
+                        Some(vec![FixLineSpan::single(b.offset)]),
                     ),
                     builder,
                 ) {
@@ -98,6 +99,7 @@ fn check_nodes(
                         Some("Add a body to the function or remove the definition.".to_string()),
                         b.offset,
                         "@define".len() + 1 + b.name.len(),
+                        Some(vec![FixLineSpan::single(b.offset)]),
                     ),
                     builder,
                 ) {
@@ -120,6 +122,7 @@ fn check_nodes(
                         ),
                         b.offset,
                         "@message".len(),
+                        None, // @message: fix_removals = None (not auto-fixable by design)
                     ),
                     builder,
                 ) {
@@ -159,6 +162,7 @@ fn check_if_block(
             Some("Add content inside the @if block or remove it.".to_string()),
             b.offset,
             "@if".len(),
+            Some(vec![FixLineSpan::single(b.offset)]),
         ),
         builder,
     ) {
@@ -178,6 +182,7 @@ fn check_if_block(
                 Some("Add content inside the @elseif block or remove it.".to_string()),
                 branch.offset,
                 "@elseif".len(),
+                Some(vec![FixLineSpan::single(branch.offset)]),
             ),
             builder,
         ) {
@@ -187,6 +192,7 @@ fn check_if_block(
 
     // Check @else body.
     if let Some(else_body) = &b.else_body {
+        let else_off = b.else_offset.unwrap_or(b.offset);
         // Last check in this function — no further work follows regardless of return.
         flag_if_empty(
             else_body,
@@ -197,8 +203,9 @@ fn check_if_block(
                 filename,
                 "@else body is empty.".to_string(),
                 Some("Add content inside the @else block or remove it.".to_string()),
-                b.else_offset.unwrap_or(b.offset),
+                else_off,
                 "@else".len(),
+                Some(vec![FixLineSpan::single(else_off)]),
             ),
             builder,
         );
@@ -246,6 +253,7 @@ fn make_diag(
     help: Option<String>,
     offset: usize,
     length: usize,
+    fix_removals: Option<Vec<FixLineSpan>>,
 ) -> LintDiagnostic {
     LintDiagnostic {
         rule: RULE.to_string(),
@@ -259,6 +267,7 @@ fn make_diag(
             column: None,
         }),
         file: Some(filename.to_string()),
+        fix_removals,
     }
 }
 

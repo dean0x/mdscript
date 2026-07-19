@@ -269,6 +269,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
         help: diag.help.as_deref().map(mds::sanitize_control_chars),
         span: diag.span.clone(),
         file: diag.file.clone(),
+        fix_removals: diag.fix_removals.clone(),
     };
     // Attach the source code so miette can render the span with source context
     // (source line + caret underline). The labels() implementation on LintDiagnostic

@@ -33,7 +33,7 @@ pub(crate) mod rules;
 pub(crate) mod tier;
 
 pub use config::LintConfig;
-pub use diagnostic::{sanitize_control_chars, LintDiagnostic, LintResult, Severity};
+pub use diagnostic::{sanitize_control_chars, FixLineSpan, LintDiagnostic, LintResult, Severity};
 
 use crate::error::MdsError;
 use crate::{lexer, parser};
