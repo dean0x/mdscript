@@ -108,7 +108,6 @@ fn directive_line_len(source: &str, offset: usize) -> usize {
     }
 }
 
-
 impl Parser<'_> {
     fn parse_module(&mut self) -> Result<Module, MdsError> {
         let frontmatter = self.parse_frontmatter();
@@ -534,9 +533,12 @@ impl Parser<'_> {
         // Supports both:
         //   @for item in iterable:
         //   @for key, value in iterable:
-        let in_idx = rest
-            .find(" in ")
-            .ok_or_else(|| self.syntax_at("@for must follow pattern: @for <var> in <iterable>:", offset))?;
+        let in_idx = rest.find(" in ").ok_or_else(|| {
+            self.syntax_at(
+                "@for must follow pattern: @for <var> in <iterable>:",
+                offset,
+            )
+        })?;
         let var_part = rest[..in_idx].trim();
         let iterable_str = rest[in_idx + 4..].trim();
 
@@ -662,16 +664,10 @@ impl Parser<'_> {
         // Reject @block inside other blocks (top-level only — decision #5).
         // E9: @block-nesting → mds::syntax (correct; not mds::extends — per error-code mapping).
         if self.inside_block {
-            return Err(self.syntax_at(
-                "@block cannot be nested inside another @block",
-                offset,
-            ));
+            return Err(self.syntax_at("@block cannot be nested inside another @block", offset));
         }
         if self.inside_message {
-            return Err(self.syntax_at(
-                "@block cannot be nested inside a @message block",
-                offset,
-            ));
+            return Err(self.syntax_at("@block cannot be nested inside a @message block", offset));
         }
         // depth > 0 means we are inside @if, @for, or @define (top-level depth == 0).
         if self.depth > 0 {
@@ -727,9 +723,12 @@ impl Parser<'_> {
             .trim();
 
         // Parse "name(params)"
-        let paren_start = rest
-            .find('(')
-            .ok_or_else(|| self.syntax_at("@define must have parameter list: @define name(params):", offset))?;
+        let paren_start = rest.find('(').ok_or_else(|| {
+            self.syntax_at(
+                "@define must have parameter list: @define name(params):",
+                offset,
+            )
+        })?;
         let paren_end = rest
             .find(')')
             .ok_or_else(|| self.syntax_at("@define: unclosed parenthesis", offset))?;
