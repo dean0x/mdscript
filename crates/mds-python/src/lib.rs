@@ -518,8 +518,8 @@ impl LintDiagnostic {
 impl LintDiagnostic {
     /// Canonical JSON value for this diagnostic (keys in wire-format alphabetical order).
     fn as_json(&self) -> serde_json::Value {
-        // Keys are inserted in BTreeMap alphabetical order to match the canonical
-        // wire format emitted by `LintResult::to_canonical_json()` in mds-core.
+        // Keys are inserted in alphabetical order (serde_json::Map preserves insertion order)
+        // to produce a stable, predictable dict layout for callers that iterate keys.
         let mut map = serde_json::Map::new();
         map.insert("fixable".to_string(), serde_json::Value::Bool(self.fixable));
         if let Some(help) = &self.help {
