@@ -865,6 +865,14 @@ impl ModuleCache {
             // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
             // relativize ALL sources[] entries so no absolute path can leak into
             // the published map.  Unconditional — never opt-in, never debug_assert.
+            //
+            // Defense-in-depth: establish root from base_dir if it was not set by
+            // the entry-point normalize() / set_root() call (guards against a future
+            // alternate code path that bypasses root establishment — PF-004 shape).
+            // No-op for VirtualFs: its source_root() always returns None regardless.
+            if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
+                let _ = self.fs.set_root(ctx.base_dir);
+            }
             let source_map = source_map.map(|mut sm| {
                 let root_str = self.fs.source_root();
                 let root = root_str.as_deref().map(std::path::Path::new);
@@ -936,6 +944,14 @@ impl ModuleCache {
         // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
         // relativize ALL sources[] entries so no absolute path can leak into
         // the published map.  Unconditional — never opt-in, never debug_assert.
+        //
+        // Defense-in-depth: establish root from base_dir if it was not set by
+        // the entry-point normalize() / set_root() call (guards against a future
+        // alternate code path that bypasses root establishment — PF-004 shape).
+        // No-op for VirtualFs: its source_root() always returns None regardless.
+        if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
+            let _ = self.fs.set_root(ctx.base_dir);
+        }
         let source_map = source_map.map(|mut sm| {
             let root_str = self.fs.source_root();
             let root = root_str.as_deref().map(std::path::Path::new);

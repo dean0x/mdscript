@@ -330,9 +330,26 @@ const DEFAULT_COMPILE_OPTS = Object.freeze({
   modules: Object.freeze({} as Record<string, string>),
 });
 
+/**
+ * Extended options accepted by the internal WASM `compile` entry point.
+ *
+ * The public `CompileOptions` type omits `filename` and `modules` because
+ * callers of the high-level `compile(source, options)` wrapper do not need
+ * them — the WASM module uses sensible defaults for the string-compile path.
+ *
+ * This internal extension is used by `compileOpts()` so that callers who go
+ * through `createWasmBackend` directly (e.g. `wrapWithFileOps`, CF-SM1 test)
+ * and supply `filename`/`modules` explicitly get the expected WASM behaviour.
+ * The public API contract is unchanged: no public method accepts these keys.
+ */
+interface _WasmCompileInput extends CompileOptions {
+  filename?: string;
+  modules?: Record<string, string>;
+}
+
 /** Build the options object for compile, merging vars and source-map options when present. */
 function compileOpts(
-  options?: CompileOptions,
+  options?: _WasmCompileInput,
 ): {
   filename: string;
   modules: Record<string, string>;
@@ -341,12 +358,12 @@ function compileOpts(
   sourcesContent?: boolean;
 } {
   const extra = compileOpt(options);
-  if (extra == null) return DEFAULT_COMPILE_OPTS;
-  return {
-    filename: DEFAULT_COMPILE_OPTS.filename,
-    modules: DEFAULT_COMPILE_OPTS.modules,
-    ...extra,
-  };
+  const filename = options?.filename ?? DEFAULT_COMPILE_OPTS.filename;
+  const modules = options?.modules ?? DEFAULT_COMPILE_OPTS.modules;
+  if (extra == null && filename === DEFAULT_COMPILE_OPTS.filename && modules === DEFAULT_COMPILE_OPTS.modules) {
+    return DEFAULT_COMPILE_OPTS;
+  }
+  return { filename, modules, ...extra };
 }
 
 /** Build the options object for check, merging vars when present. */
@@ -389,7 +406,7 @@ export function fileOpts(
 export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const result: unknown = wasmModule.compile(source, compileOpts(options));
+      const result: unknown = wasmModule.compile(source, compileOpts(options as _WasmCompileInput));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
