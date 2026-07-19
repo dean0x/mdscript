@@ -27,7 +27,7 @@ use build::{
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    /// Suppress status messages
+    /// Suppress status and diagnostic output; errors always print; exit codes unaffected
     #[arg(long, short = 'q', global = true)]
     quiet: bool,
 }
@@ -65,7 +65,7 @@ enum Commands {
         /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3")
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
-        /// Generate a source map alongside the compiled output (sidecar: <output>.map).
+        /// Generate a source map alongside the compiled output (sidecar: <output-file>.map, e.g. -o out.md → out.md.map).
         /// Conflicts with --no-source-map.
         #[arg(long = "source-map", conflicts_with = "no_source_map")]
         source_map: bool,
@@ -109,7 +109,7 @@ enum Commands {
     /// structure, whitespace-only lines), frontmatter / code-fence internals,
     /// or the byte-for-byte content of `@message` / `@define` bodies.
     #[command(
-        after_help = "Examples:\n  mds fmt                             Auto-detect and format the .mds file in current dir\n  mds fmt template.mds                Format a file in place\n  mds fmt .                           Format every .mds file recursively (incl. partials)\n  mds fmt --check template.mds        Exit 1 if the file would change; writes nothing\n  mds fmt --diff template.mds         Print a unified diff of pending changes; writes nothing\n  mds fmt --check --diff .            Show diffs for every file that would change, exit 1 if any would\n  echo \"Hello   {name}!\" | mds fmt -  Format from stdin, write to stdout; creates no file"
+        after_help = "Examples:\n  mds fmt                             Auto-detect and format the .mds file in current dir\n  mds fmt template.mds                Format a file in place\n  mds fmt .                           Format every .mds file recursively (incl. partials)\n  mds fmt --check template.mds        Exit 1 if the file would change; writes nothing\n  mds fmt --diff template.mds         Print a unified diff of pending changes; writes nothing\n  mds fmt --check --diff .            Show diffs for every file that would change, exit 1 if any would\n  printf '@if ready:   \\nGo\\n@end\\n' | mds fmt -  Format from stdin, write to stdout; creates no file"
     )]
     Fmt {
         /// Input .mds file, directory, or "-" for stdin (omit to auto-detect in current directory)
@@ -124,13 +124,13 @@ enum Commands {
     },
     /// Check MDS files for style and correctness issues beyond `mds check`
     ///
-    /// Runs 9 static-analysis rules (3 error-level, 6 warning-level) on the file
+    /// Runs 9 static-analysis rules (3 error-level, 5 warning-level, 1 default-off) on the file
     /// without executing it. Partials and imported files are included in directory mode.
     ///
     /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors or analysis failure,
     /// 3 = resource limit.
     #[command(
-        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet template.mds       Suppress warnings; exit 2 on errors only\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
+        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet template.mds       Suppress output; exits 1 on warnings, 2 on errors\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
     )]
     Lint {
         /// Input .mds file, directory, or `-` for stdin (omit to auto-detect)
@@ -225,7 +225,11 @@ fn main() {
 
     let result = run(cli);
     if let Err(e) = result {
-        eprintln!("{e:?}");
+        // Sanitize at the last-resort render boundary: every subcommand's error propagates
+        // here, and MdsError::Syntax embeds user-controlled source fragments that may contain
+        // raw ESC bytes. Guarding here makes the protection hold by construction for any
+        // future error path, not just the ones we remember to sanitize individually (PF-004).
+        eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
         process::exit(exit_code(&e));
     }
 }
@@ -246,7 +250,7 @@ fn run_check(
 
     // Resolve the input: explicit path/stdin, or auto-detect from cwd.
     // run_check does not print a banner on auto-detect — check is a silent validation.
-    let (input, _) = resolve_input(input)?;
+    let (input, _) = resolve_input(input, "check")?;
 
     // Directory mode: validate every non-partial .mds file in the tree.
     if input != std::path::Path::new("-") && input.is_dir() {
@@ -297,13 +301,23 @@ fn run_check_directory(
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     quiet: bool,
 ) -> Result<()> {
-    use output::{collect_mds_files, is_partial};
+    use output::{collect_mds_files_detailed, is_partial};
 
     const MAX_DEPTH: usize = 64;
 
-    let files = collect_mds_files(dir, MAX_DEPTH, None);
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
+    let files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // Always emit — not suppressed by --quiet (avoids silent CI green pass).
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was checked",
+                walk.excluded_by_default
+            );
+            std::process::exit(1);
+        }
         if !quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }
@@ -329,14 +343,16 @@ fn run_check_directory(
                 ok_count += 1;
             }
             Err(e) => {
-                eprintln!("{e:?}");
+                // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
+                // source fragments that may contain raw ESC bytes (PF-004 parallel-path guard).
+                eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
                 fail_count += 1;
             }
         }
     }
 
     if !quiet || fail_count > 0 {
-        eprintln!("{ok_count} checked, {fail_count} failed");
+        eprintln!("{ok_count} passed, {fail_count} failed");
     }
 
     if fail_count > 0 {

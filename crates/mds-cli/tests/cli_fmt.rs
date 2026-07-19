@@ -944,3 +944,350 @@ fn pre_existing_config_without_fmt_section_still_loads() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── Walker default exclusion: node_modules ────────────────────────────────────
+
+/// `mds fmt <dir>` must leave files inside `node_modules/` untouched.
+/// The summary must not count the `node_modules` file in the formatted/unchanged
+/// total — the directory is simply not traversed.
+#[test]
+fn dir_fmt_skips_node_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    // One normal file that needs formatting (has \r so it changes).
+    fs::write(dir.path().join("main.mds"), "Hello \r\nworld\r\n").unwrap();
+    // File inside node_modules — must not be touched.
+    let nm = dir.path().join("node_modules");
+    std::fs::create_dir(&nm).unwrap();
+    fs::write(nm.join("lib.mds"), "lib content\r\n").unwrap();
+
+    let output = fmt_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The node_modules file must not have been modified.
+    let nm_content = fs::read_to_string(nm.join("lib.mds")).unwrap();
+    assert_eq!(
+        nm_content, "lib content\r\n",
+        "node_modules/lib.mds must not be reformatted"
+    );
+
+    // Summary must say "1 formatted" (only the root-level main.mds), not "2".
+    assert!(
+        stderr.contains("1 formatted"),
+        "summary must show exactly 1 formatted file (node_modules excluded); got: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "fmt should succeed; stderr: {stderr}"
+    );
+}
+
+// ── RELEASE BLOCKER 3: formatter gate must not false-positive on trailing blank ──
+
+/// `mds fmt` on a non-compiling source (undefined variable → structural_equivalent
+/// fallback) with a trailing blank line after the final directive must exit 0 and
+/// write the formatted file — NOT exit 1 with "formatter_invariant".
+///
+/// Before the fix, R2's `trim_end()` deleted the trailing Text("\n") token from the
+/// formatted output while the source still had it, triggering a spurious
+/// FormatterInvariant error in structural_equivalent's token-count guard.
+#[test]
+fn gate_fallback_no_false_positive_on_trailing_blank_line_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("trailing_blank.mds");
+    // Non-compiling source (undefined_var): takes structural_equivalent path.
+    // Trailing blank line after @end: was the trigger for the false positive.
+    fs::write(&target, "@if undefined_var:\nx\n@end\n\n").unwrap();
+
+    let output = fmt_path(&target, &[]);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("formatter_invariant") && !stderr.contains("file an issue"),
+        "trailing blank line must NOT produce a FormatterInvariant, got: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "fmt must succeed (exit 0) for a non-compiling source with trailing blank; stderr: {stderr}"
+    );
+
+    // The file must have been formatted (trailing blank trimmed).
+    let after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        after, "@if undefined_var:\nx\n@end\n",
+        "formatted file must have trailing blank removed"
+    );
+}
+
+// ── format_str_named: file path appears in error output ───────────────────────
+
+/// Single-file mode: when the source has a genuine syntax error (unclosed @if),
+/// `mds fmt` must show the file path in stderr so the user can locate the problem.
+/// The file name must appear regardless of whether it is a lex- or parse-level error.
+#[test]
+fn single_file_syntax_error_includes_path_in_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("broken.mds");
+    fs::write(&target, "@if cond:\nHello\n").unwrap(); // unclosed @if -> parse-level Syntax
+
+    let output = fmt_path(&target, &[]);
+
+    assert!(
+        !output.status.success(),
+        "fmt must fail (exit non-zero) on syntax error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("broken.mds"),
+        "stderr must contain the file name so the user can locate the problem; got: {stderr}"
+    );
+}
+
+/// Directory mode: each failing file should be identified in stderr.
+/// The file path prefix (`{file}: `) must appear before the error so large
+/// directory runs show which file triggered each failure.
+#[test]
+fn dir_mode_format_error_includes_file_prefix_in_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = dir.path().join("bad.mds");
+    let good = dir.path().join("good.mds");
+    fs::write(&bad, "@if cond:\nHello\n").unwrap(); // unclosed @if -> format error
+    fs::write(&good, "Hello!\n").unwrap();
+
+    let output = fmt_path(dir.path(), &[]);
+
+    // Exit non-zero because bad.mds failed.
+    assert!(
+        !output.status.success(),
+        "fmt should exit non-zero when a file in the directory fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The bad file's name must appear in stderr (either as a {file}: prefix or in the error).
+    assert!(
+        stderr.contains("bad.mds"),
+        "dir-mode stderr must identify the failing file; got: {stderr}"
+    );
+}
+
+/// `mds fmt --check` summary includes the unchanged count alongside the would-reformat count.
+/// New format: `{changed} would reformat, {unchanged} unchanged, {fail} failed`
+#[test]
+fn dir_check_summary_includes_unchanged_count() {
+    let dir = tempfile::tempdir().unwrap();
+    // One dirty file (would reformat) + one already-clean file (unchanged).
+    fs::write(
+        dir.path().join("dirty.mds"),
+        read_fixture("fmt_unformatted.mds"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("clean.mds"),
+        read_fixture("fmt_formatted.mds"),
+    )
+    .unwrap();
+
+    let output = fmt_path(dir.path(), &["--check"]);
+    assert!(
+        !output.status.success(),
+        "dir --check with a dirty file must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("would reformat") && stderr.contains("unchanged"),
+        "check summary must include both 'would reformat' and 'unchanged'; got: {stderr}"
+    );
+    // Verify the exact format: "N would reformat, M unchanged, K failed"
+    assert!(
+        stderr.contains("1 would reformat") && stderr.contains("1 unchanged"),
+        "expected '1 would reformat' and '1 unchanged' in summary; got: {stderr}"
+    );
+}
+
+// ── Bare-filename regression (PF-006) ────────────────────────────────────────
+
+/// A syntax error in a bare-filename source must exit non-zero and propagate
+/// the syntax diagnostic.
+///
+/// Regression for PF-006: `path.parent()` on a bare filename returns `Some("")`.
+/// `NativeFs::canonicalize("")` failed with `MdsError::Io`, which the
+/// `assert_equivalent` fallback path silently swallowed (fell through to
+/// `structural_equivalent`) instead of propagating the `MdsError::Syntax` error.
+/// After the `resolve_base_dir` + `effective_parent` fix the syntax error must
+/// surface as a non-zero exit.
+///
+/// Uses `.current_dir(tempdir)` with a bare argument — absolute paths go through
+/// a different code path and never triggered the bug.
+#[test]
+fn fmt_bare_filename_propagates_syntax_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // An unclosed @message block is a parse-level syntax error (missing @end).
+    // This same source is used by unclosed_directive_block_exits_one_with_syntax_not_formatter_invariant
+    // (which passes an absolute path); our test exercises the bare-filename path.
+    let src = "@message user:\nHi there\n";
+    fs::write(dir.path().join("broken.mds"), src).unwrap();
+
+    let output = mds_bin()
+        .arg("fmt")
+        .arg("broken.mds") // bare filename — the only form that triggered the bug
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "fmt of a bare broken filename must exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("syntax") || stderr.contains("@end"),
+        "stderr must name the syntax problem; got: {stderr}"
+    );
+    // File must be untouched — the formatter must never write garbled output.
+    let after = fs::read_to_string(dir.path().join("broken.mds")).unwrap();
+    assert_eq!(after, src, "broken file must be left untouched");
+}
+
+// ── ESC injection regression — mds fmt (issue #5 / ESC-INJECTION) ────────────
+
+/// Regression gate: `mds fmt <file>` (single-file mode) must not emit raw ESC
+/// bytes to stderr when the source file contains a raw ESC byte that reaches
+/// `MdsError::Syntax`.
+///
+/// Single-file fmt errors propagate to `main()` via `?`, which is the
+/// last-resort sanitizer boundary at `main.rs`.  This test validates that
+/// boundary for the fmt subcommand specifically.
+#[test]
+fn fmt_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("esc_fmt.mds");
+    fs::write(&path, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = fmt_path(&path, &[]);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "fmt with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (fmt single-file); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout (fmt single-file); \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
+    );
+}
+
+// ── Permission preservation (issue #25 — atomic write regression gate) ──────
+
+/// Regression gate: `mds fmt <file>` (single-file mode) must preserve the
+/// original Unix file mode after formatting.
+///
+/// The write path was changed from bare `std::fs::write` (which truncates the
+/// existing file in place, keeping its permissions) to `atomic_write_file` (temp
+/// file + rename).  `tempfile::Builder` defaults to mode 0600; without permission
+/// preservation the rename would silently turn a 0644 source file into owner-only.
+///
+/// `atomic_write_file` already handles this (commit c5aa086 hardened the lint
+/// path) — this test locks in the same guarantee for the fmt path.
+#[cfg(unix)]
+#[test]
+fn fmt_single_file_preserves_mode_0644() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("perm_test.mds");
+    // Write unformatted content that fmt will actually rewrite.
+    fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
+    // Set 0644 explicitly (some systems may default differently).
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let output = fmt_path(&target, &[]);
+    assert!(
+        output.status.success(),
+        "fmt should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "fmt single-file must preserve file mode 0644 after atomic write; got 0{mode:o}"
+    );
+}
+
+/// Regression gate: `mds fmt <dir>` (directory mode) must preserve the original
+/// Unix file mode after formatting.
+///
+/// Directory mode routes through `format_one_file` → `atomic_write_file`.
+/// Same tempfile-0600 hazard as the single-file path above.
+#[cfg(unix)]
+#[test]
+fn fmt_directory_mode_preserves_mode_0644() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("perm_dir_test.mds");
+    fs::write(&target, read_fixture("fmt_unformatted.mds")).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Run fmt on the DIRECTORY — exercises format_one_file, not run_fmt_file.
+    let output = fmt_path(dir.path(), &[]);
+    assert!(
+        output.status.success(),
+        "fmt dir should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "fmt directory mode must preserve file mode 0644 after atomic write; got 0{mode:o}"
+    );
+}
+
+/// Regression gate: `mds fmt <dir>` (directory mode) must not emit raw ESC bytes
+/// to stderr when a source file contains a raw ESC byte that reaches `MdsError::Syntax`.
+///
+/// Directory mode routes through `format_one_file`, which previously called
+/// `eprintln!("{file_name}: {e:?}")` without sanitization.  That path is now
+/// guarded by `crate::output::eprint_error` (avoids PF-004 parallel-path gap).
+#[test]
+fn fmt_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    // Raw ESC byte (0x1B) on the error line so miette renders it in the source context frame.
+    fs::write(
+        dir.path().join("esc_fmt_dir.mds"),
+        b"@define \x1bfoo:\nhello\n",
+    )
+    .unwrap();
+
+    let out = fmt_path(dir.path(), &[]);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "fmt dir with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (fmt directory); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+    assert!(
+        !out.stdout.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not appear in stdout (fmt directory); \
+         got (hex): {:02x?}",
+        &out.stdout[..out.stdout.len().min(512)]
+    );
+}

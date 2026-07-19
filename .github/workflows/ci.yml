@@ -134,12 +134,40 @@ jobs:
       - name: Build native addon (host)
         working-directory: crates/mds-napi
         run: npx napi build --platform --release --no-js
+      # Build the unsuffixed mds-napi.node that __test__/index.spec.mjs loads
+      # directly via require('../mds-napi.node'). cargo is a cache hit here;
+      # napi just renames the already-built artifact without recompiling.
+      - name: Build native addon (unsuffixed, napi spec test)
+        run: npm run build:native -w @mdscript/mds-napi
       # Build the WASM pkg so the WASM fallback (and wasm-backend tests) work.
       - uses: ./.github/actions/setup-wasm
       - name: Build WASM (nodejs)
         run: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg
       - name: Build TS packages
         run: npm run build --workspaces --if-present
+      # Build the mds CLI binary so CF-SM2 can invoke it as the third parity
+      # surface.  target/debug/mds is auto-discovered by findMdsCli(); no env
+      # var needed.  The Rust toolchain + cache are already set up above, so
+      # this is an incremental build sharing the dep graph with the napi addon
+      # (avoids PF-007: CLI surface must actually run in CI, not skip silently).
+      - name: Build mds CLI (CF-SM2 parity producer)
+        run: cargo build -p mds-cli
+      # Install Python + the mdscript binding so CF-SM2 can compare the Python
+      # output as the fourth parity surface (avoids PF-007).  pip uses the
+      # maturin PEP 517 build backend declared in crates/mds-python/pyproject.toml;
+      # no pre-installed maturin needed.  MDS_PYTHON_BIN is set to the exact
+      # executable that owns the installed module so findPythonForMdscript()
+      # picks it up cross-platform (bin/ on Unix, Scripts/ on Windows).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python binding (CF-SM2 parity surface)
+        run: python -m pip install ./crates/mds-python
+      - name: Export MDS_PYTHON_BIN
+        shell: bash
+        run: |
+          PY=$(python -c "import sys; print(sys.executable)")
+          echo "MDS_PYTHON_BIN=$PY" >> "$GITHUB_ENV"
       - name: Test
         run: npm test --workspaces --if-present
 

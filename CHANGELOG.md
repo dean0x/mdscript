@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace
+### Security
+
+- **Source Map v3 `sources[]` no longer leaks absolute filesystem paths** across
+  all surfaces. Previously, `compileFile` on napi and Python emitted the absolute
+  filesystem path (e.g. `/home/user/project/src/foo.mds`) as `sources[0]` in the
+  generated Source Map v3. Shipped source maps and inline maps embedded with
+  `--inline` could expose the full path of the machine that compiled the template,
+  a privacy-significant information disclosure. Fixed by the `relativize_source`
+  choke-point in `crates/mds-core/src/source_path.rs` (ADR-005 Phase A): all
+  surfaces now emit root-relative paths (e.g. `src/foo.mds`) relative to the
+  project root (located via `.mdsroot` / `.git` walk-up), and `..`-escaping
+  references outside the project root fall back to the basename. (#3)
+
+### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
 
 These changes alter observable runtime behavior and compiled output. Templates relying
 on the previous (buggy) behavior must be updated.
@@ -19,7 +32,7 @@ vs. a string, or a boolean vs. null) now raises `mds::type_mismatch` at runtime
 instead of silently returning `false` (for `==`) or `true` (for `!=`).
 
 **Migration:** add an explicit conversion before comparing:
-- `@if str(count) == "3":` — convert number to string
+- `@if string(count) == "3":` — convert number to string
 - `@if count == 3:` — compare number to number literal
 
 #### Cross-flag duplicate keys in `--set` / `--set-string` are now a hard error (#152)
@@ -38,6 +51,67 @@ now appear in the compiled output.
 
 **Migration:** if your pipeline depends on base frontmatter keys being absent from the
 compiled output, strip them downstream or move them to a non-frontmatter location.
+
+#### Interior-verbatim whitespace contract for block bodies and `mds fmt` (#150, #151)
+
+Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
+`mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
+The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
+equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
+exactly one final newline).
+
+**Migration:** compiled outputs may gain blank lines that were previously collapsed or
+stripped; templates relying on this collapse must remove the extra blank lines at the
+source level.
+
+#### `FileSystem` trait now requires `normalize_in_dir` and `parent_dir` (#146)
+
+`FileSystem` now requires two new methods — `normalize_in_dir` and `parent_dir` — that
+replace the internal `<source>` path-sentinel pattern. String-source `@import`/`@extends`
+resolution is now directly directory-anchored: `ctx.base_dir` carries the importing
+directory explicitly, with no synthetic filename appended. No behavior change for
+`compile`/`check` users; only affects code that implements the `FileSystem` trait
+directly via `ModuleCache::with_fs`.
+
+### **BREAKING** — Options validation, directory walker, source-map labels, check API (#196)
+
+- **`@mdscript/mds` now rejects unknown option keys** with
+  `Error { code: 'mds::invalid_options' }` before forwarding to the backend. Previously
+  unrecognized keys were silently passed through (napi and WASM backends would reject
+  them, but the universal JS wrapper did not validate). Callers with typos in option
+  objects will now get immediate, accurate error messages. (#196)
+
+- **`CheckOptions` is now split from `CompileOptions`** in `@mdscript/mds`.
+  `check()` and `checkFile()` accept only `{ vars? }` — source-map options
+  (`sourceMap`, `sourcesContent`) are not valid for check calls and are rejected with
+  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`.
+  TS interface implementers: `check`/`checkFile` signatures narrow to `CheckOptions`. (#196)
+
+- **String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
+  across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
+  output for `compile(src, {sourceMap:true})` / `compile_str*` / WASM `compile` now reads
+  `"input.mds"` instead of `"<source>"`. CLI stdin builds use `"<stdin>"` (unchanged).
+  Code inspecting `sources[0]` for the string `"<source>"` must be updated. (#196)
+
+- **Directory walker now excludes hidden directories and `node_modules` by default**
+  across all subcommands (`mds build`, `mds check`, `mds watch`, `mds fmt`,
+  `mds lint`). Directories whose name starts with `.` (e.g. `.git`, `.venv`) and
+  `node_modules` are silently skipped during recursive traversal. Templates inside these
+  directories are no longer compiled, formatted, or linted in directory mode. (#196)
+
+- **`mds check` summary wording changed** from `N checked` to `N passed, M
+  failed`. Scripts parsing CLI output must be updated. (#196)
+
+- **lint `--format json` `"file"` keys are now full relative paths** in directory mode.
+  When running `mds lint --format json .`, the `"file"` key in each JSON result is now
+  the path relative to the lint root (e.g. `"src/template.mds"`) rather than just the
+  basename (e.g. `"template.mds"`). This prevents key collisions when two different
+  files have the same filename. (#196)
+
+- **`mds-core::CompileOptions` gained `source_map_base: Option<PathBuf>`**.  Rust code
+  that initializes `CompileOptions` with a struct literal must either add
+  `source_map_base: None` or use the `..Default::default()` tail.  Binding surfaces
+  (napi, Python, WASM) are not affected. (#3)
 
 ### Added
 
@@ -127,7 +201,7 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
 - **Source Map v3** (#62). Compile calls can now produce a [Source Map v3](https://sourcemaps.info/spec.html)
   document alongside the rendered output.
 
-  **CLI** (`mds build`): `--source-map` writes a `<output>.md.map` sidecar and leaves
+  **CLI** (`mds build`): `--source-map` writes a `<output>.map` sidecar and leaves
   the compiled output byte-identical to a no-flag build (ADR-002). `--inline` embeds
   the map as a `<!--# sourceMappingURL=data:... -->` HTML comment at the end of the
   output; no sidecar is written (requires `--source-map`). `--no-source-map` suppresses
@@ -159,26 +233,129 @@ compiled output, strip them downstream or move them to a non-frontmatter locatio
   includes the full original template source in the map file — including any hardcoded
   secrets or PII. Only use in trusted build environments.
 
+- **Partial fix application** for `mds lint --fix`: when a batch of fixes partially
+  applies (some edits are accepted, some are rejected due to post-fix regression),
+  the CLI now reports `"N of M fixes applied"` and writes the best accumulated state
+  to the file. Previously, a partial batch was all-or-nothing (either all or nothing
+  applied). (#196)
+
+- **`type_mismatch` errors now carry a source span** (file + line + column) pointing
+  to the `@if` or `@elseif` directive that triggered the comparison. The span is
+  propagated through all surfaces (CLI miette code frame, napi `.span`, Python
+  `.span`, WASM error object). (#196)
+
+- **Spans on `mds::name_collision` errors** in `@export *` (wildcard), alias-import,
+  and merge-import paths. The error now points to the collision site instead of the
+  file root. (#196)
+
+- **Spans on unclosed-block errors**: `@if`/`@for`/`@define`/`@message` blocks that
+  are never closed now produce `mds::syntax` errors anchored at the opening directive.
+  (#196)
+
+- **`\{` escape hint on unclosed interpolation brace**: when the compiler encounters
+  an unclosed `{` (brace without a matching `}`), the error now includes the hint
+  "to include a literal `{`, escape it as `\{`". (#196)
+
+- **`ArityMismatch` help text**: function-call arity errors now include a help string
+  pointing users to check the call site and the `@define` signature. (#196)
+
+- **Per-branch `@elseif` offset** in the AST (`ElseifBranch.offset`): lint diagnostics
+  for `empty-block`, `unreachable-branch`, and `duplicate-@elseif` now anchor at the
+  `@elseif` directive span rather than the parent `@if` opener. (#196)
+
+- **`format_str_named(source, base_dir, file_name)`** — new public `mds-core` API that
+  threads a caller-supplied file name through the formatter so that any `mds::syntax`
+  errors emitted during formatting name the file rather than using a generic sentinel.
+  `mds-cli`'s `mds fmt` uses this to show the actual file path in error output. (#196)
+
+- **`mds fmt --check` summary now includes unchanged count**: the directory-mode summary
+  under `--check` is now `"N would reformat, M unchanged, K failed"` (previously `"N
+  would reformat, K failed"`). (#196)
+
+- **napi workspace `build` script**: `crates/mds-napi/package.json` gains a `build`
+  script (`napi build --release --no-js`) for local development. (#196)
+
 ### Changed
 
-- **BREAKING:** Interior-verbatim whitespace contract for block bodies and `mds fmt`.
-  Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
-  `mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
-  The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
-  equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
-  exactly one final newline). **Migration:** compiled outputs may gain blank lines that
-  were previously collapsed or stripped; templates relying on this collapse must remove
-  the extra blank lines at the source level. (#150, #151)
+- **napi and Python `compileFile` / `compile_file` now emit root-relative
+  `sources[]`** in Source Map v3 output. Previously these surfaces emitted the
+  absolute filesystem path as `sources[0]` (e.g. `/home/user/project/src/foo.mds`);
+  now they emit a slash-separated path relative to the project root found via
+  `.mdsroot` / `.git` walk-up (e.g. `src/foo.mds`). The `@mdscript/mds`
+  universal package's `compileFile` previously returned different `sources[]`
+  depending on which backend `init()` loaded (absolute on native, root-relative via
+  `buildModulesMap` on WASM); both backends now produce identical root-relative paths.
+  Code that compares `sources[0]` to an absolute path must be updated. (#3)
 
-- **BREAKING:** `FileSystem` trait now requires two new methods — `normalize_in_dir`
-  and `parent_dir` — that replace the internal `<source>` path-sentinel pattern.
-  String-source `@import`/`@extends` resolution is now directly directory-anchored:
-  `ctx.base_dir` carries the importing directory explicitly, with no synthetic
-  filename appended. No behavior change for `compile`/`check` users; only affects
-  code that implements the `FileSystem` trait directly via `ModuleCache::with_fs`.
-  (#146)
+- **Inline stdout source-map absolute-path leak fixed**: `mds build --source-map
+  --inline -o -` and `mds build --source-map -o -` no longer leak absolute filesystem
+  paths in the embedded `sourceMappingURL` data-URI; sources are relativized against
+  the current working directory. Previously the output path was `None` for stdout
+  builds, causing the relativization step to short-circuit and leave absolute paths.
+  (#196)
+
+- **`mds build --inline -o -` for stdin input is now allowed**: previously rejected
+  with an error. Inline and sidecar source maps now work identically for stdin and
+  file inputs. The `sources[0]` label is `"<stdin>"` for stdin builds. (#196)
+
+- **lint `--fix --check` and `--fix --diff` are now honest gated previews**: the
+  preview pass runs through the same reverify gate as apply. Fixes that would be
+  rejected (overlap, post-fix regression) are reported as `"fix rejected: <reason>"`
+  rather than silently shown as `"would fix"`. Directory mode `--fix --check` exits 1
+  when any file has fixable issues. (#196)
+
+- **Overlap-rejected fix plans are now surfaced**: when `lint --fix` finds overlapping
+  byte ranges (two rules targeting the same span), the plan is no longer silently
+  abandoned. The overlap is reported so users know a fix exists but could not be auto-
+  applied. (#196)
+
+- **`mds fmt` errors name the file**: formatting errors emitted to stderr now include
+  the file path as a prefix (e.g. `"src/foo.mds: formatter_invariant: …"`). Previously
+  file context was absent, making batch `mds fmt .` errors hard to trace. (#196)
+
+- **`--vars` JSON errors name the file**: when a `--vars` JSON file is malformed or
+  does not contain a top-level object, the error message now includes the file path.
+  (#196)
+
+- **stdin `mds lint` code frames**: lint diagnostics for stdin input now include a
+  miette code frame with `"input.mds"` as the source label. Previously stdin lint
+  diagnostics lacked source context. (#196)
+
+- **Bare relative filenames now work** for all subcommands and the `compile_str`
+  binding family. Running `mds build foo.mds` (without a `./` prefix) from the file's
+  directory previously failed on some platforms because the parent-path resolution
+  produced an empty path instead of `.`. Fixed by `effective_parent` in `fs.rs`. (#196)
+
+- **`mds fmt` formatter-invariant gate false positive on trailing blank lines is
+  fixed**: templates containing trailing blank lines (e.g. `@if … @end\n\n`) were
+  incorrectly rejected by the safety gate with `mds::formatter_invariant` after being
+  formatted. The gate now correctly ignores insignificant trailing whitespace. (#196)
+
+- **Lint diagnostic messages now consistently end with a period** (G3 message-copy
+  consistency): all `empty-block` and `unreachable-branch` rule messages are
+  punctuated uniformly. (#196)
+
+- **Messages-mode source-map warning reworded and deduplicated**: the warning emitted
+  when `sourceMap: true` is requested on a messages-mode template now reads "source
+  maps are not supported for messages-mode templates (@message blocks); no source map
+  will be generated" across all surfaces. The warning is emitted exactly once per
+  compilation (previously it could appear twice for some template shapes). (#196)
+
+- **`mds::syntax` error label no longer duplicates the message**: the miette diagnostic
+  label was previously set to `{message}` (same as the headline), producing redundant
+  output in code-frame renderings. It now reads `"syntax error occurred here"`. (#196)
 
 ### Fixed
+
+- **`mds build -o build/out.md` with sources in `src/` again emits map-relative
+  paths** (e.g. `../src/foo.mds`) in the sidecar `.map` file and inline source map.
+  The `source_map_base` field added to `CompileOptions` tells `relativize_source`
+  to emit paths relative to the map file's parent directory (as the Source Map v3
+  spec requires) rather than root-relative. Without this, a source `src/foo.mds`
+  compiled to `build/out.md` with `--source-map` would emit `src/foo.mds` in the
+  map instead of the spec-correct `../src/foo.mds`. Root-relative emission
+  (`source_map_base: None`) is now the default for all binding surfaces (napi,
+  Python, WASM), which never write map files to disk. (#3)
 
 - **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
   as passthrough regions. Previously only `` ``` ``-fences that started at column 1
@@ -443,7 +620,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dean0x/mdscript/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dean0x/mdscript/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.1.0
-[0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0

@@ -31,8 +31,42 @@ declared as `optionalDependencies`, filtered by `os`/`cpu`/`libc`:
 ## API
 
 ```js
-const { compile, check, compileFile, checkFile } = require('@mdscript/mds-napi');
+const { compile, compileFile, check, checkFile, lint, lintFile, lintVirtual } = require('@mdscript/mds-napi');
 ```
+
+### `compile(source, opts?)`
+
+Compile an MDS source string. Returns a discriminated-union result object:
+
+- Markdown: `{ kind: "markdown", output: string, warnings: string[], dependencies: string[], sourceMap?: object }`
+- Messages: `{ kind: "messages", messages: [{role,content},...], warnings: string[], dependencies: string[] }`
+
+Options:
+- `basePath` (string) — base directory for `@import` resolution; defaults to cwd.
+- `vars` (object) — runtime variable overrides.
+- `sourceMap` (boolean) — generate a Source Map v3 document; result gains `sourceMap`.
+  For string-source compiles `sources[0]` is `"input.mds"`.
+- `sourcesContent` (boolean) — embed original source text in the map (requires `sourceMap`).
+  ⚠ Privacy: embeds the full template source.
+
+### `compileFile(path, opts?)`
+
+Same result shape as `compile`. Options: `vars`, `sourceMap`, `sourcesContent`.
+`basePath` is not accepted — the base directory is derived from the file path.
+
+### `check(source, opts?)` / `checkFile(path, opts?)`
+
+Validate without rendering. Returns `{ warnings: string[] }`.
+Options: `basePath`, `vars` (check only; checkFile: `vars` only).
+Source-map options are **not accepted** — check does not generate output.
+
+### `lint(source, opts?)` / `lintFile(path, opts?)` / `lintVirtual(modules, entry, opts?)`
+
+Static analysis. Returns the canonical lint JSON:
+`{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
+
+Options: `basePath` (lint only — lintFile derives the base from the file path; lintVirtual resolves against the module map), `vars`, `rules` (`Record<string, "off"|"info"|"warn"|"error">`).
+Unknown rule names in `rules` are silently accepted (a typo has no effect); unknown severity values throw `mds::invalid_options`.
 
 See `index.d.ts` for the full typed surface.
 

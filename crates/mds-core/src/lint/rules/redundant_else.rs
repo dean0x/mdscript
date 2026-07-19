@@ -91,8 +91,8 @@ fn check_nodes(
 
                 // Recurse into all branches.
                 check_nodes(&b.then_body, filename, severity, builder);
-                for (_, branch_body) in &b.elseif_branches {
-                    check_nodes(branch_body, filename, severity, builder);
+                for branch in &b.elseif_branches {
+                    check_nodes(&branch.body, filename, severity, builder);
                 }
                 if let Some(else_body) = &b.else_body {
                     check_nodes(else_body, filename, severity, builder);

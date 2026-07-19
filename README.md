@@ -80,7 +80,7 @@ mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (9 rules; --fix, --format j
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
-  -q, --quiet                 Suppress status messages (applies to all commands)
+  -q, --quiet                 Suppress status and diagnostic output; errors always print; exit codes unaffected
 
 Build/Watch options:
   -o, --output <PATH>         Output file, or "-" for stdout (build and single-file watch only;
@@ -90,7 +90,7 @@ Build/Watch options:
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
-  --source-map                Write a Source Map v3 sidecar (<output>.md.map); output is
+  --source-map                Write a Source Map v3 sidecar (<output-file>.map, e.g. -o out.md → out.md.map); output is
                               byte-identical to a no-flag build. Ignored for messages-mode
                               templates (no renderable output). See ⚠ privacy note below.
   --inline                    Embed the source map as a sourceMappingURL data-URI comment
@@ -124,7 +124,7 @@ Exit codes:
   3   Resource limit exceeded
 ```
 
-**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary is printed and the exit code is non-zero if any file fails. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
+**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary is printed and the exit code is non-zero if any file fails. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) still exits 0 with a "No .mds files found" message. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 
 `mds fmt <dir>` follows the same directory-mode conventions (recursive, symlinks rejected, continue-on-error, non-zero exit summary) with one deliberate difference: it formats `_`-prefixed **partials too** — formatting rewrites source, not compiled output, and a partial's source is just as much a candidate for reformatting as any other file.
 
@@ -179,7 +179,7 @@ mds fmt .                       # format every .mds file recursively (partials i
 mds fmt --check template.mds    # exit 1 if the file would change; never writes — for CI
 mds fmt --diff template.mds     # print a unified diff of pending changes; never writes
 mds fmt --check --diff .        # show diffs for every file that would change; exit 1 if any would
-echo 'Hello   {name}!' | mds fmt -   # format from stdin, write to stdout; creates no file
+printf '@if ready:   \nGo\n@end\n' | mds fmt -   # format from stdin, write to stdout; creates no file
 ```
 
 What it normalizes:
@@ -199,7 +199,7 @@ What it deliberately leaves untouched:
 
 Directory mode formats every `.mds` file recursively, **including `_`-prefixed partials**,
 continuing past per-file errors and printing a summary
-(`N formatted, M unchanged, K failed`, or `N would reformat, K failed` under `--check`). A file
+(`N formatted, M unchanged, K failed`, or `N would reformat, M unchanged, K failed` under `--check`). A file
 is only written (and its mtime touched) when its content actually changes. Status lines and
 summaries go to stderr; `--diff` output and stdin filter-mode content go to stdout; `--quiet`
 suppresses status but never errors. Reads a `fmt` section from `mds.json`
@@ -215,7 +215,7 @@ mds lint template.mds           # lint a single file
 mds lint .                      # lint all .mds files recursively (partials included)
 mds lint --fix template.mds     # auto-fix fixable issues in place
 mds lint --format json .        # machine-readable JSON output (stdout)
-mds lint --quiet template.mds   # suppress warnings; exit 2 on errors only
+mds lint --quiet template.mds   # suppress output; exits 1 on warnings, 2 on errors
 ```
 
 Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
@@ -232,7 +232,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
 | `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
 
-Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit.
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, output is suppressed but exit codes are unaffected.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Bundler Integration

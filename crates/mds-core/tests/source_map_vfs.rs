@@ -50,6 +50,7 @@ fn vfs_with_map(modules: HashMap<String, String>, entry: &str) -> CompileResult 
         CompileOptions {
             source_map: true,
             include_sources_content: true,
+            ..Default::default()
         },
     )
 }
@@ -884,15 +885,28 @@ fn source_map_messages_mode_degrades_to_none() {
     );
 
     // A warning must be emitted explaining the degradation (AC-FUNC-07).
-    let has_warning = result.warnings.iter().any(|w| {
-        w.contains("messages-mode")
-            || w.contains("@message")
-            || w.contains("source_map will be None")
-    });
+    // The warning uses MSG_MODE_SOURCE_MAP_WARNING (surface-neutral wording).
+    let matching_warnings: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("messages-mode") && w.contains("no source map will be generated"))
+        .collect();
     assert!(
-        has_warning,
+        !matching_warnings.is_empty(),
         "AC-FUNC-07: must emit a warning for messages-mode + source_map=true; \
          got warnings: {:?}",
+        result.warnings
+    );
+    // Deduplicated: the warning must appear EXACTLY ONCE per compilation.
+    // (Previously the same literal string was present in two code paths; MSG_MODE_SOURCE_MAP_WARNING
+    // const was introduced to enforce a single canonical string — this test guards against regression
+    // where both paths fire for the same input.)
+    assert_eq!(
+        matching_warnings.len(),
+        1,
+        "AC-FUNC-07: messages-mode degradation warning must appear exactly once; \
+         got {} occurrences in warnings: {:?}",
+        matching_warnings.len(),
         result.warnings
     );
 }
@@ -950,9 +964,7 @@ fn source_map_segment_cap_degrades_to_none() {
     );
 
     // A warning must be emitted.
-    let has_warning = warnings
-        .iter()
-        .any(|w| w.contains("segment cap") || w.contains("source_map will be None"));
+    let has_warning = warnings.iter().any(|w| w.contains("segment cap"));
     assert!(
         has_warning,
         "AC-PERF-03: must emit a warning when segment cap is exceeded; \
@@ -1136,5 +1148,124 @@ fn for_max_total_iterations_across_extends_regions_source_map() {
     assert!(
         format!("{err}").contains("total loop iterations exceeded maximum"),
         "REL-1: expected total-iterations resource_limit error, got: {err}"
+    );
+}
+
+// ── D1: STRING_SOURCE_MAP_LABEL cross-surface parity (PF-007) ────────────────
+//
+// These tests verify that the choke-point fix in MapBuilder::new and
+// source_index ensures the "<source>" diagnostic sentinel never appears in
+// sources[] for any code path.
+
+/// D1-CORE-1: string-source compile with sourceMap → sources[0] == "input.mds".
+///
+/// Verifies the MapBuilder::new choke-point: map_source_label("<source>") →
+/// STRING_SOURCE_MAP_LABEL so the default string-source label matches WASM.
+#[test]
+fn d1_string_source_sources_label_is_input_mds() {
+    let result = mds::compile_str_with_deps_opts(
+        "Hello World!\n",
+        None,
+        None,
+        CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+            ..Default::default()
+        },
+    )
+    .expect("should compile");
+    let sm = result.source_map.expect("source_map must be present");
+    assert_eq!(
+        sm.sources,
+        vec!["input.mds"],
+        "string-source sources[0] must be \"input.mds\" after map_source_label fix; got: {:?}",
+        sm.sources
+    );
+}
+
+/// D1-CORE-2: S8 function-body attribution — locally-defined function in a
+/// string-source template must not add a second "<source>" entry to sources[].
+///
+/// Without the source_index choke-point fix:
+///   - MapBuilder::new("<source>") was stored as "<source>" at index 0.
+///   - S8 path called source_index("<source>", ...) → found it → OK.
+///   - After the MapBuilder::new fix alone:
+///     - MapBuilder::new("<source>") → stores "input.mds" at index 0.
+///     - S8 path called source_index("<source>", ...) → NOT found → added
+///       as a NEW entry "input.mds"... but with old code it would have been
+///       "<source>" at index 1.
+///   - With both choke-points fixed: source_index("<source>") →
+///     map_source_label → "input.mds" → found at index 0 → no new entry.
+#[test]
+fn d1_s8_locally_defined_function_no_source_sentinel() {
+    // Define a function in the entry (string-source) template and call it.
+    // In S8 path: source_index(func.origin.file) is called with "<source>".
+    // After the fix both MapBuilder::new and source_index canonicalize it to
+    // "input.mds", so sources must be exactly ["input.mds"] — no duplicates.
+    let result = mds::compile_str_with_deps_opts(
+        "@define greet():\nHello!\n@end\n{greet()}\n",
+        None,
+        None,
+        CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+            ..Default::default()
+        },
+    )
+    .expect("should compile");
+    let sm = result.source_map.expect("source_map must be present");
+    assert_eq!(
+        sm.sources,
+        vec!["input.mds"],
+        "S8 path must not add a second \"<source>\" entry; got: {:?}",
+        sm.sources
+    );
+}
+
+/// D1-CORE-3: @extends child that is a string-source → no "<source>" sentinel
+/// in sources[].
+///
+/// The child's origin (file="<source>") flows into override_origin for any
+/// blocks it overrides. When evaluate_with_map_seeded processes spliced regions
+/// it calls source_index(origin.file, ...) for each region. After the fix,
+/// origin.file="<source>" → map_source_label → "input.mds" at index 0 (the
+/// same entry already seeded by MapBuilder::new with skeleton_origin.file).
+#[test]
+fn d1_extends_from_string_no_source_sentinel() {
+    let dir = tempfile::tempdir().unwrap();
+    // Write the base template to disk so @extends can resolve it.
+    std::fs::write(
+        dir.path().join("base.mds"),
+        "@block content:\ndefault content\n@end\n",
+    )
+    .unwrap();
+
+    let child = "@extends \"./base.mds\"\n@block content:\noverridden\n@end\n";
+    let result = mds::compile_str_with_deps_opts(
+        child,
+        Some(dir.path()),
+        None,
+        CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+            ..Default::default()
+        },
+    )
+    .expect("should compile");
+    let sm = result.source_map.expect("source_map must be present");
+    // "<source>" must not appear anywhere in sources[].
+    for src in &sm.sources {
+        assert_ne!(
+            src.as_str(),
+            "<source>",
+            "\"<source>\" must not appear in sources[] after map_source_label fix; got: {:?}",
+            sm.sources
+        );
+    }
+    // The child's blocks should be attributed to "input.mds" (not "<source>").
+    assert!(
+        sm.sources.contains(&"input.mds".to_string()),
+        "child source must be labeled \"input.mds\"; got: {:?}",
+        sm.sources
     );
 }

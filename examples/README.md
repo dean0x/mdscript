@@ -7,6 +7,24 @@ any `.mds` file with the CLI:
 mds build examples/ai-agent/system-prompt.mds -o -
 ```
 
+## New in v0.4.0
+
+Four capabilities shipped with v0.4.0 — each has a dedicated example:
+
+```bash
+# Safety-gated formatter — rewrites directive lines only, never body text
+mds fmt --check examples/
+
+# Static analysis — 9 rules, human and JSON output, --fix --diff preview
+mds lint examples/linting/
+
+# Source Map v3 — sidecar .map file, --inline data-URI, or --embed-sources
+mds build examples/source-maps/annotated-prompt.mds --source-map -o /tmp/out.md
+
+# String variables without type coercion (e.g. preserve leading zeros)
+mds build template.mds --set-string zip_code=02134
+```
+
 ## Templates
 
 | Directory | What it shows |
@@ -16,8 +34,10 @@ mds build examples/ai-agent/system-prompt.mds -o -
 | [`blog-generator/`](blog-generator/) | A blog post template driven by frontmatter variables |
 | [`prompt-library/`](prompt-library/) | A reusable prompt library using `@export`/`@import` (personas, formatting, guardrails) |
 | [`inheritance/`](inheritance/) | Template inheritance with `@extends`/`@block` — one base agent skeleton specialized into a data analyst and a code reviewer |
-| [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports |
+| [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports; v0.4.0 adds interior blank-line preservation, typed comparisons, and `@extends` frontmatter merge |
 | [`stress-test/`](stress-test/) | A large, deeply-composed template tree exercising the resolver and evaluator |
+| [`linting/`](linting/) | A deliberately-messy template that trips four lint rules; shows `mds lint` human and JSON output, `--fix --diff` preview, and exit-code semantics |
+| [`source-maps/`](source-maps/) | Source Map v3 generation via `mds build --source-map` — sidecar map, `--inline` data-URI embed, and `--embed-sources` self-contained variant |
 
 Some examples take runtime variables — pass the accompanying `vars.json`:
 
@@ -49,6 +69,8 @@ mds build examples/ --out-dir dist/
 # Check a whole directory without writing output
 mds check examples/
 ```
+
+Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design because `examples/linting/demo.mds` deliberately triggers error-level findings.
 
 `@message` detection is **static**: a `@message` block anywhere in the template
 (even inside `@if false:`) makes it a messages template. **Mixed content** —

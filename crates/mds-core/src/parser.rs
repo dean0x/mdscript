@@ -10,7 +10,7 @@
 //! - **`parser_tests.rs`** — integration and unit tests for both modules.
 
 use crate::ast::{
-    BlockNode, Condition, DefineBlock, Expr, ExtendsDirective, ForBlock, Frontmatter, IfBlock,
+    BlockNode, DefineBlock, ElseifBranch, Expr, ExtendsDirective, ForBlock, Frontmatter, IfBlock,
     IncludeDirective, MessageBlock, Module, Node, TextNode,
 };
 use crate::error::MdsError;
@@ -183,7 +183,13 @@ impl Parser<'_> {
     }
 
     /// Consume the closing `@end` token, returning an error if absent or wrong.
-    fn consume_end(&mut self, block_name: &str) -> Result<(), MdsError> {
+    /// Consume the `@end` token that closes `block_name`, or emit a syntax error.
+    ///
+    /// `opener_offset` is the byte offset of the OPENING directive token (e.g.
+    /// the `@if` that this `@end` must close). When the block is never closed
+    /// the error is anchored at the opener so the user sees the unclosed line
+    /// rather than EOF.
+    fn consume_end(&mut self, block_name: &str, opener_offset: usize) -> Result<(), MdsError> {
         match self.tokens.get(self.pos) {
             Some(Token::Directive(d, _)) if d.trim() == "@end" => {
                 self.pos += 1;
@@ -193,9 +199,13 @@ impl Parser<'_> {
                 "expected @end to close {block_name} block, got '{}'",
                 d.trim()
             ))),
-            _ => Err(MdsError::syntax(format!(
-                "unclosed {block_name} block (missing @end)"
-            ))),
+            _ => Err(MdsError::syntax_at(
+                format!("unclosed {block_name} block (missing @end)"),
+                self.file,
+                self.source,
+                opener_offset,
+                block_name.len(),
+            )),
         }
     }
 
@@ -378,15 +388,21 @@ impl Parser<'_> {
 
         let elseif_branches = self.collect_elseif_branches()?;
 
-        let else_body = if matches!(self.peek(), Some(Token::Directive(d, _)) if d.trim() == "@else:")
-        {
-            self.pos += 1; // skip @else:
-            Some(self.parse_body(&["@end"], &[])?)
+        // Capture the @else: offset for accurate lint spans, then parse the body.
+        let (else_body, else_offset) = if let Some(Token::Directive(d, else_off)) = self.peek() {
+            if d.trim() == "@else:" {
+                let captured_offset = *else_off;
+                self.pos += 1; // skip @else:
+                let body = self.parse_body(&["@end"], &[])?;
+                (Some(body), Some(captured_offset))
+            } else {
+                (None, None)
+            }
         } else {
-            None
+            (None, None)
         };
 
-        self.consume_end("@if")?;
+        self.consume_end("@if", offset)?;
 
         self.depth -= 1;
         Ok(Node::If(IfBlock {
@@ -395,16 +411,20 @@ impl Parser<'_> {
             then_body,
             else_body,
             offset,
+            else_offset,
         }))
     }
 
     /// Consume all consecutive `@elseif` directive tokens and return the parsed branches.
     ///
+    /// Each branch carries its byte offset (the position of the `@elseif` token) so
+    /// lint rules can anchor diagnostics at the exact `@elseif` line (#181).
+    ///
     /// The limit check runs **before** parsing each branch body so that adversarial
     /// input that exceeds `MAX_ELSEIF_BRANCHES` cannot force unbounded parse work.
-    fn collect_elseif_branches(&mut self) -> Result<Vec<(Condition, Vec<Node>)>, MdsError> {
-        let mut branches: Vec<(Condition, Vec<Node>)> = Vec::with_capacity(4);
-        while let Some(Token::Directive(d, _)) = self.peek() {
+    fn collect_elseif_branches(&mut self) -> Result<Vec<ElseifBranch>, MdsError> {
+        let mut branches: Vec<ElseifBranch> = Vec::with_capacity(4);
+        while let Some(Token::Directive(d, off)) = self.peek() {
             if !d.trim().starts_with("@elseif ") {
                 break;
             }
@@ -416,8 +436,10 @@ impl Parser<'_> {
                 )));
             }
 
-            // Consume the @elseif directive token.
+            // d and off are borrowed from self.tokens[self.pos] via peek(); clone
+            // before advancing pos so the borrows end before the mutable advance.
             let elseif_dir = d.clone();
+            let elseif_offset = *off;
             self.pos += 1;
 
             // Extract condition string: strip "@elseif " prefix and trailing ":".
@@ -430,10 +452,14 @@ impl Parser<'_> {
             let elseif_cond_str = strip_trailing_directive_colon(elseif_rest)
                 .ok_or_else(|| directive_colon_error("@elseif", elseif_rest))?;
 
-            let elseif_cond = parse_condition(elseif_cond_str)?;
-            let elseif_body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
+            let condition = parse_condition(elseif_cond_str)?;
+            let body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
 
-            branches.push((elseif_cond, elseif_body));
+            branches.push(ElseifBranch {
+                condition,
+                body,
+                offset: elseif_offset,
+            });
         }
         Ok(branches)
     }
@@ -474,7 +500,7 @@ impl Parser<'_> {
 
         let body = self.parse_body(&["@end"], &[])?;
 
-        self.consume_end("@for")?;
+        self.consume_end("@for", offset)?;
 
         self.depth -= 1;
         Ok(Node::For(ForBlock {
@@ -535,7 +561,7 @@ impl Parser<'_> {
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
 
-        _guard.0.consume_end("@message")?;
+        _guard.0.consume_end("@message", offset)?;
 
         // Guard drops here, restoring inside_message=false and depth-=1.
         Ok(Node::Message(MessageBlock { role, body, offset }))
@@ -597,7 +623,7 @@ impl Parser<'_> {
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
 
-        _guard.0.consume_end("@block")?;
+        _guard.0.consume_end("@block", offset)?;
 
         // Guard drops here, restoring inside_block=false and depth-=1.
         Ok(Node::Block(BlockNode { name, body, offset }))
@@ -636,7 +662,7 @@ impl Parser<'_> {
 
         let body = self.parse_body(&["@end"], &[])?;
 
-        self.consume_end("@define")?;
+        self.consume_end("@define", offset)?;
 
         self.depth -= 1;
         Ok(Node::Define(DefineBlock {

@@ -511,6 +511,7 @@ fn extract_compile_options_direct(env: &Env, obj: &Object) -> napi::Result<mds::
     let opts = mds::CompileOptions {
         source_map,
         include_sources_content,
+        ..Default::default()
     };
     opts.validate().map_err(|_| {
         throw_options_error(
@@ -631,6 +632,9 @@ fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
 
 /// Compile an MDS template source string and return a structured result.
 ///
+/// For string-source compiles the `sources[0]` field in any generated source map is
+/// `"input.mds"`.
+///
 /// ## Arguments
 ///
 /// - `source`: MDS template source text.
@@ -638,11 +642,17 @@ fn build_canonical_result(result: mds::CompileResult) -> serde_json::Value {
 ///   - `basePath` (string): base directory for resolving `@import` paths.
 ///     Defaults to the current working directory.
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `sourceMap` (boolean, default `false`): generate a Source Map v3 document.
+///     The result gains a `sourceMap` key when this is `true`. Silently ignored for
+///     messages-mode templates (source maps are not supported for them).
+///   - `sourcesContent` (boolean, default `false`): embed the original source text
+///     in `sourcesContent[]`. Requires `sourceMap: true`; raises `mds::invalid_options`
+///     otherwise. ⚠ Privacy: embeds the full template source in the map.
 ///
 /// ## Returns
 ///
 /// On success:
-/// - Markdown: `{ kind: "markdown", output: string, warnings: string[], dependencies: string[] }`
+/// - Markdown: `{ kind: "markdown", output: string, warnings: string[], dependencies: string[], sourceMap?: object }`
 /// - Messages: `{ kind: "messages", messages: [{role:string,content:string},...], warnings: string[], dependencies: string[] }`
 ///
 /// The inactive payload field is absent from the returned object.
@@ -674,6 +684,9 @@ pub fn compile(env: Env, source: String, opts: Option<Object>) -> napi::Result<s
 /// - `path`: path to the `.mds` file to compile.
 /// - `opts`: optional configuration object:
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///   - `sourceMap` (boolean, default `false`): generate a Source Map v3 document.
+///   - `sourcesContent` (boolean, default `false`): embed original source text in the
+///     map (requires `sourceMap: true`).
 ///
 /// `basePath` is not accepted — the base directory is derived from the file's
 /// own directory.
@@ -703,7 +716,13 @@ pub fn compile_file(
 /// ## Arguments
 ///
 /// - `source`: MDS template source text.
-/// - `opts`: optional configuration object (same fields as `compile`).
+/// - `opts`: optional configuration object:
+///   - `basePath` (string): base directory for resolving `@import` paths.
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///
+/// Source-map options (`sourceMap`, `sourcesContent`) are **not** accepted — `check`
+/// does not generate output so maps are irrelevant and passing them is a hard error
+/// (`mds::invalid_options`).
 ///
 /// ## Returns
 ///
@@ -733,6 +752,9 @@ pub fn check(env: Env, source: String, opts: Option<Object>) -> napi::Result<Che
 /// - `path`: path to the `.mds` file to validate.
 /// - `opts`: optional configuration object:
 ///   - `vars` (`Record<string, any>`): runtime variable overrides.
+///
+/// `basePath` is not accepted (base directory is derived from the file path).
+/// Source-map options are not accepted — see `check`.
 ///
 /// ## Returns
 ///

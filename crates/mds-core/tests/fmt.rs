@@ -10,7 +10,7 @@
 //! per the plan's own instruction to verify claims against live code. See the
 //! `r3_*` and `r4_*` tests and their comments for the specific behavior locked in.
 
-use mds::{format_str, format_str_with, MdsError};
+use mds::{format_str, format_str_named, format_str_with, MdsError};
 
 // ── Small corpus of representative, syntactically-valid MDS snippets ─────────
 //
@@ -342,6 +342,63 @@ fn syntax_error_unclosed_message_with_trailing_ws_is_syntax_not_formatter_invari
 }
 
 // ── T1-gate-fallback: undefined-var source still formats; import source uses full gate ──
+
+// RELEASE BLOCKER 3: non-compiling source with trailing blank line after final
+// directive must NOT raise FormatterInvariant. R2 trims the trailing blank line,
+// producing a token count mismatch in structural_equivalent that was spuriously
+// reported as a formatter bug (ADR-001 gate false positive).
+#[test]
+fn gate_fallback_structural_equivalent_no_false_positive_on_trailing_blank_line() {
+    // Exact repro: undefined_var → structural_equivalent path; trailing \n after @end
+    // causes R2 to delete a Text("\n") token, creating a count mismatch before the fix.
+    let src = "@if undefined_var:\nx\n@end\n\n";
+    assert!(
+        mds::compile_str(src).is_err(),
+        "sanity: source must not compile standalone (undefined variable)"
+    );
+    let out = format_str(src).expect(
+        "format_str must NOT raise FormatterInvariant for trailing blank line after final directive"
+    );
+    assert_eq!(
+        out, "@if undefined_var:\nx\n@end\n",
+        "R2 should trim the trailing blank"
+    );
+    // Idempotence: formatting the result again must produce the same output.
+    let out2 = format_str(&out).expect("second format pass must succeed");
+    assert_eq!(out, out2, "format_str must be idempotent");
+}
+
+#[test]
+fn gate_fallback_no_false_positive_multiple_trailing_blank_lines() {
+    // Variant: multiple trailing blank lines — all are insignificant and should be stripped.
+    let src = "@for item in undefined_list:\n- {item}\n@end\n\n\n";
+    assert!(
+        mds::compile_str(src).is_err(),
+        "sanity: source must not compile standalone"
+    );
+    let out =
+        format_str(src).expect("multiple trailing blank lines must not produce FormatterInvariant");
+    assert_eq!(out, "@for item in undefined_list:\n- {item}\n@end\n");
+    let out2 = format_str(&out).expect("second pass must succeed");
+    assert_eq!(out, out2, "idempotent");
+}
+
+#[test]
+fn gate_fallback_no_false_positive_crlf_trailing_blank_line() {
+    // CRLF variant: \r\n trailing blank line — clean_output strips \r, still empty.
+    let src = "@if undefined_var:\nx\n@end\r\n\r\n";
+    assert!(
+        mds::compile_str(src).is_err(),
+        "sanity: source must not compile standalone"
+    );
+    let out = format_str(src).expect("CRLF trailing blank must not produce FormatterInvariant");
+    assert_eq!(
+        out, "@if undefined_var:\nx\n@end\n",
+        "R1 + R2 should normalise CRLF + trailing blank"
+    );
+    let out2 = format_str(&out).expect("second pass must succeed");
+    assert_eq!(out, out2, "idempotent");
+}
 
 #[test]
 fn gate_fallback_undefined_var_source_still_formats() {
@@ -734,4 +791,50 @@ fn format_str_with_none_base_dir_matches_format_str() {
             ),
         }
     }
+}
+
+// ── format_str_named: file name threads through errors ────────────────────────
+
+#[test]
+fn format_str_named_happy_path_matches_format_str_with() {
+    // format_str_named("<source>") must produce the same result as format_str_with.
+    let src = "Hello!\r\n\r\n\r\nBye.\r\n";
+    let via_with = format_str_with(src, None).unwrap();
+    let via_named = format_str_named(src, None, "<source>").unwrap();
+    assert_eq!(
+        via_with, via_named,
+        "format_str_named must agree with format_str_with"
+    );
+}
+
+#[test]
+fn format_str_named_lexer_syntax_error_src_shows_file_name() {
+    // Unclosed interpolation -> lexer-level Syntax error.
+    // format_str_named must thread file_name into tokenize so the NamedSource carries it.
+    let err = format_str_named("Hello {name\n", None, "my_template.mds").unwrap_err();
+    assert!(
+        matches!(err, MdsError::Syntax { .. }),
+        "unclosed interpolation must be a Syntax error, got: {err:?}"
+    );
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("my_template.mds"),
+        "NamedSource must carry the file name passed to format_str_named; debug repr: {debug}"
+    );
+}
+
+#[test]
+fn format_str_named_parser_syntax_error_src_shows_file_name() {
+    // Unclosed @if -> tokenizes OK but fails at compile time with Syntax.
+    // assert_equivalent must rebuild the Syntax error src with the provided file_name.
+    let err = format_str_named("@if cond:\nHello\n", None, "partials/_block.mds").unwrap_err();
+    assert!(
+        matches!(err, MdsError::Syntax { .. }),
+        "unclosed @if must be a Syntax error, got: {err:?}"
+    );
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("partials/_block.mds"),
+        "NamedSource in parse-level Syntax error must carry the file name; debug repr: {debug}"
+    );
 }

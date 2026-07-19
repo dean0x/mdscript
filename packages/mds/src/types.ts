@@ -82,10 +82,22 @@ export interface CheckResult {
   warnings: string[];
 }
 
-/** Options shared by compile and check operations. */
-export interface CompileOptions {
+/**
+ * Options for check-only operations (no source-map generation).
+ * Accepted by {@link MdsBaseBackend.check} and {@link MdsNodeBackend.checkFile}.
+ */
+export interface CheckOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
+}
+
+/**
+ * Options for compile operations.
+ *
+ * Extends {@link CheckOptions}: check accepts a strict subset of compile's options.
+ * The `vars` field is inherited from {@link CheckOptions}.
+ */
+export interface CompileOptions extends CheckOptions {
   /**
    * When `true`, appends a {@link SourceMapV3} document to the result as
    * `result.sourceMap`. Ignored for `@message`-mode templates (no renderable
@@ -104,21 +116,14 @@ export interface CompileOptions {
   sourcesContent?: boolean;
 }
 
-/** Options shared by file-based compile and check operations. */
-export interface FileOptions {
-  /** Runtime variables made available for interpolation in the template. */
-  vars?: Record<string, unknown>;
-  /**
-   * When `true`, appends a {@link SourceMapV3} document to the result as
-   * `result.sourceMap`. Ignored for `@message`-mode templates. Defaults to `false`.
-   */
-  sourceMap?: boolean;
-  /**
-   * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
-   * Requires `sourceMap: true`. Defaults to `false`.
-   */
-  sourcesContent?: boolean;
-}
+/**
+ * Options for file-based compile operations.
+ *
+ * Structurally identical to {@link CompileOptions} (inherits `vars`, `sourceMap`,
+ * `sourcesContent`). Kept as a distinct named type so `compileFile` and
+ * `checkFile` can evolve their option sets independently.
+ */
+export interface FileOptions extends CompileOptions {}
 
 // ---------------------------------------------------------------------------
 // Lint types
@@ -244,7 +249,7 @@ export interface InitOptions {
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;
-  check(source: string, options?: CompileOptions): CheckResult;
+  check(source: string, options?: CheckOptions): CheckResult;
   /**
    * Lint an MDS source string.
    * Runs the check gate first; returns a LintResult with per-rule findings.
@@ -264,7 +269,11 @@ export interface MdsBaseBackend {
  */
 export interface MdsNodeBackend extends MdsBaseBackend {
   compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
-  checkFile(path: string, options?: FileOptions): Promise<CheckResult>;
+  /**
+   * Validate an MDS file without rendering. Only `vars` is forwarded;
+   * source-map options are not applicable to check operations.
+   */
+  checkFile(path: string, options?: CheckOptions): Promise<CheckResult>;
   /** Lint an MDS file, resolving @import directives relative to the file. */
   lintFile(path: string, options?: LintFileOptions): Promise<LintResult>;
 }

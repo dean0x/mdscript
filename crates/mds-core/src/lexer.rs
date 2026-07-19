@@ -272,7 +272,7 @@ impl<'a> Lexer<'a> {
         }
         if depth != 0 {
             return Err(MdsError::syntax_at(
-                "unclosed interpolation brace",
+                "unclosed interpolation brace — to include a literal `{`, escape it as `\\{`",
                 self.file,
                 self.source,
                 start,

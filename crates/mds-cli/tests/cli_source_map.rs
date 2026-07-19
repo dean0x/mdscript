@@ -105,6 +105,90 @@ fn read_map_json(map_path: &Path) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("map file is not valid JSON at {}: {e}", map_path.display()))
 }
 
+/// Assert that a `sources[]` entry is safe to embed in a shipped source map.
+///
+/// Verifies that `s` is:
+/// 1. Not a Windows `\\?\` verbatim-prefix path.
+/// 2. Not drive-qualified (`C:\…`, `C:/…`, or bare `C:`).
+/// 3. Not an absolute path (leading `/`).
+/// 4. Lexically contained within `root` (resolving against `base` or `root`).
+/// 5. Free of every component listed in `forbidden`.
+///
+/// Sentinels delimited by `<` and `>` (e.g. `<stdin>`) pass through — they are
+/// display labels, not filesystem paths, and never need containment checking.
+fn assert_source_is_contained(s: &str, root: &Path, base: &Path, forbidden: &[&str]) {
+    // Sentinels are display labels — not paths.
+    if s.starts_with('<') && s.ends_with('>') {
+        return;
+    }
+
+    let unified = s.replace('\\', "/");
+
+    // No verbatim prefix.
+    assert!(
+        !unified.starts_with("//?/"),
+        "source must not contain Windows verbatim prefix: {s:?}"
+    );
+
+    // No drive-qualified forms (ADR-005 / AC-SEC-01).
+    assert!(
+        !unified.contains(":\\"),
+        "source must not contain backslash-qualified Windows drive: {s:?}"
+    );
+    assert!(
+        !unified.contains(":/"),
+        "source must not contain forward-slash-qualified Windows drive: {s:?}"
+    );
+    let drive_lead = unified.len() >= 2
+        && (unified.as_bytes()[0] as char).is_ascii_alphabetic()
+        && unified.as_bytes()[1] == b':';
+    assert!(
+        !drive_lead,
+        "source must not start with a bare drive designator: {s:?}"
+    );
+
+    // Not absolute.
+    assert!(
+        !unified.starts_with('/'),
+        "source must not be an absolute path: {s:?}"
+    );
+
+    // Containment: accept either root-relative OR base-relative resolution.
+    // When `base` is outside `root`, core emits root-relative paths; when
+    // `base` is inside `root`, it emits base-relative paths.  Normalizing
+    // through both anchors lets this helper cover both cases.
+    let contained = [root, base].iter().any(|anchor| {
+        let joined = anchor.join(&unified);
+        let mut comps: Vec<_> = Vec::new();
+        for c in joined.components() {
+            match c {
+                std::path::Component::ParentDir => {
+                    comps.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => comps.push(other),
+            }
+        }
+        let norm: std::path::PathBuf = comps.iter().collect();
+        norm.starts_with(root)
+    });
+    assert!(
+        contained,
+        "source path {s:?} is not contained in root {root:?} \
+         (tried root-join and base-join with {base:?})"
+    );
+
+    // No forbidden component names.
+    for comp in unified.split('/') {
+        for &f in forbidden {
+            assert_ne!(
+                comp, f,
+                "source path {s:?} contains forbidden component {f:?}"
+            );
+        }
+    }
+}
+
 // ── SM-1: --source-map creates a sidecar file (AC-FUNC-01) ───────────────────
 
 #[test]
@@ -168,23 +252,22 @@ fn sm3_sources_are_relative_not_absolute() {
     let map_path = dir.path().join("out.md.map");
     let v = read_map_json(&map_path);
 
+    // Workspace root: two levels up from crates/mds-cli (CARGO_MANIFEST_DIR).
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+    // Forbid the output temp-dir name — it must never appear as a path component.
+    let dir_name = dir
+        .path()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
     for src in v["sources"].as_array().unwrap() {
         let s = src.as_str().unwrap();
-        // Must NOT be an absolute path.
-        assert!(
-            !s.starts_with('/'),
-            "source must not start with '/' (absolute): {s}"
-        );
-        // Must NOT be a Windows verbatim prefix (PF-003 / AC-SEC-01).
-        assert!(
-            !s.starts_with(r"\\?\"),
-            "source must not contain Windows verbatim prefix: {s}"
-        );
-        // Must NOT be a Windows absolute path.
-        assert!(
-            !s.contains(":\\"),
-            "source must not contain Windows drive letter: {s}"
-        );
+        assert_source_is_contained(s, workspace, workspace, &[dir_name]);
     }
 }
 
@@ -633,23 +716,20 @@ fn sm_det_sources_never_absolute_across_build_dirs() {
     let map_a = read_map_json(&dir_a.path().join("out_a.md.map"));
     let map_b = read_map_json(&dir_b.path().join("out_b.md.map"));
 
-    for (label, v) in [("dir_a", &map_a), ("dir_b", &map_b)] {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+
+    for (_label, v, dir_path) in [
+        ("dir_a", &map_a, dir_a.path()),
+        ("dir_b", &map_b, dir_b.path()),
+    ] {
+        let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         for src in v["sources"].as_array().unwrap() {
             let s = src.as_str().unwrap();
-            assert!(
-                !s.starts_with('/'),
-                "[{label}] source must not be absolute: {s}"
-            );
-            assert!(
-                !s.starts_with(r"\\?\"),
-                "[{label}] source must not have Windows verbatim prefix: {s}"
-            );
-            // No colons indicating a drive letter (e.g., C:\...).
-            let after_scheme = s.split_once(':').map(|(_, r)| r).unwrap_or("");
-            assert!(
-                !after_scheme.starts_with('\\'),
-                "[{label}] source must not be a Windows absolute path: {s}"
-            );
+            assert_source_is_contained(s, workspace, workspace, &[dir_name]);
         }
     }
 
@@ -923,4 +1003,338 @@ fn sm16_stale_map_not_smv3_preserved_with_warning() {
         !quiet_stderr.contains("warning:"),
         "--quiet must suppress the warning; got stderr: {quiet_stderr:?}"
     );
+}
+
+// ── SM-14b: stdin --source-map sidecar relabels source to <stdin> ────────────
+//
+// After the STRING_SOURCE_MAP_LABEL fix, stdin builds emit "input.mds" in
+// sources[0].  relativize_source_path Rule 1 must relabel it to "<stdin>"
+// (AC-FUNC-12).  Verifies both the relabeling AND that "input.mds" / "<source>"
+// never leak into the sidecar map.
+
+#[test]
+fn sm14b_stdin_source_map_sidecar_relabels_source_to_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("stdin_out.md");
+    let map_path = dir.path().join("stdin_out.md.map");
+
+    let mut child = mds_bin()
+        .args(["build", "-", "--source-map", "-o", out.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .unwrap();
+
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "stdin --source-map sidecar should succeed"
+    );
+
+    let map_json = read_map_json(&map_path);
+    let sources = map_json["sources"]
+        .as_array()
+        .expect("sources must be array");
+
+    // Must use "<stdin>" — never "input.mds" or "<source>".
+    assert!(
+        sources.iter().any(|s| s.as_str() == Some("<stdin>")),
+        "stdin sidecar must label source as \"<stdin>\"; got: {sources:?}"
+    );
+    assert!(
+        !sources.iter().any(|s| s.as_str() == Some("input.mds")),
+        "\"input.mds\" must not leak into stdin sidecar sources[]; got: {sources:?}"
+    );
+    assert!(
+        !sources.iter().any(|s| s.as_str() == Some("<source>")),
+        "\"<source>\" must not appear in stdin sidecar sources[]; got: {sources:?}"
+    );
+}
+
+// ── SM-16: --inline -o - (stdout) produces relativized map, no absolute paths─
+//
+// Before the relativize_source_map_fields fix, the early return on None
+// output bypassed relativization entirely, leaking absolute filesystem paths
+// into inline data-URI source maps.  After the fix, map_dir = PathBuf::new()
+// so paths are relativized against CWD unconditionally.
+
+/// SM-16a: file input + --inline + -o - → stdout carrier has no absolute paths.
+#[test]
+fn sm16a_file_inline_stdout_no_absolute_paths() {
+    // Run the binary against a real fixture with --inline -o -
+    let result = mds_bin()
+        .args([
+            "build",
+            fixture("sm_basic.mds").to_str().unwrap(),
+            "--source-map",
+            "--inline",
+            "-o",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        result.status.success(),
+        "file --inline -o - must succeed; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    // Extract and decode the inline data-URI carrier.
+    let prefix = "<!--# sourceMappingURL=data:application/json;base64,";
+    let suffix = " -->";
+    let start = stdout
+        .find(prefix)
+        .expect("stdout must contain inline source-map carrier");
+    let rest = &stdout[start + prefix.len()..];
+    let end = rest
+        .find(suffix)
+        .expect("carrier must be closed with \" -->\"");
+    let b64 = &rest[..end];
+    let decoded = base64_decode(b64);
+    let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home_name = std::path::Path::new(&home)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let sources = json["sources"].as_array().expect("sources must be array");
+    for src in sources {
+        let s = src.as_str().expect("source must be string");
+        assert_source_is_contained(s, workspace, &cwd, &[home_name]);
+    }
+
+    // `file` field must be absent for stdout output (no output filename).
+    assert!(
+        json.get("file").map(|v| v.is_null()).unwrap_or(true),
+        "`file` field must be absent or null for stdout inline map; got: {:?}",
+        json.get("file")
+    );
+}
+
+/// SM-16b: stdin + --inline + -o - → previously rejected, now allowed.
+///
+/// The false rejection "--inline cannot be used with -o -" was deleted.
+/// The inline carrier embeds in the output stream identically to file input.
+#[test]
+fn sm16b_stdin_inline_stdout_now_allowed() {
+    let mut child = mds_bin()
+        .args(["build", "-", "--source-map", "--inline", "-o", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("mds binary should spawn");
+
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Hello World!\n")
+        .unwrap();
+
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "stdin --inline -o - must succeed after removing the false rejection; \
+         stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    // Must contain an inline carrier.
+    assert!(
+        stdout.contains("<!--# sourceMappingURL=data:application/json;base64,"),
+        "stdin --inline -o - must embed a source-map carrier in stdout; stdout: {stdout:?}"
+    );
+
+    // Decode and verify no absolute paths in sources.
+    let prefix = "<!--# sourceMappingURL=data:application/json;base64,";
+    let suffix = " -->";
+    let start = stdout.find(prefix).unwrap();
+    let rest = &stdout[start + prefix.len()..];
+    let end = rest.find(suffix).unwrap();
+    let decoded = base64_decode(&rest[..end]);
+    let json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace = crate_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root must be two levels above crate dir");
+    let cwd = std::env::current_dir().unwrap_or_else(|_| workspace.to_path_buf());
+    let home = std::env::var("HOME").unwrap_or_default();
+    let home_name = std::path::Path::new(&home)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    let sources = json["sources"].as_array().expect("sources must be array");
+    // Stdin source must be relabeled to "<stdin>" by apply_source_map_file_label.
+    assert!(
+        sources.iter().any(|s| s.as_str() == Some("<stdin>")),
+        "stdin --inline stdout must label source as \"<stdin>\"; got: {sources:?}"
+    );
+    for src in sources {
+        let s = src.as_str().expect("source must be string");
+        // "<stdin>" is a sentinel — assert_source_is_contained returns early for it.
+        assert_source_is_contained(s, workspace, &cwd, &[home_name]);
+    }
+}
+
+// ── SM-SEC3: `..`-escape guard — deepCWD/output dir must not leak path layout ──
+
+/// Regression gate for the SEC-3 fix (ADR-005 / AC-SEC-01 / avoids PF-004).
+///
+/// Before the fix, `relativize_source_path` only guarded against paths that were
+/// still ABSOLUTE after relativization (starts with `/` or Windows drive form).
+/// A source file that lives OUTSIDE the map directory produces a `../`-escaping
+/// relative path whose `..` chain grows with the nesting depth — reconstructing
+/// the full absolute path and leaking USERNAME + directory layout.
+///
+/// Covers BOTH output modes to prevent the per-mode divergence PF-004 describes:
+/// - sidecar map: `map_dir = effective_parent(out_path)` (absolute, deep)
+/// - inline stdout: `map_dir = CWD` (process runs from a deep directory)
+///
+/// Assertion: no source entry contains `../` components, and no entry contains
+/// the random source-tempdir name that would confirm path reconstruction.
+#[test]
+fn sm_sec3_dotdot_escape_falls_back_to_basename() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+
+    // Record the random dir-name; if it appears in sources[] the path escaped.
+    let src_dir_name = src_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    // Source file is in src_dir — completely separate from the output tree.
+    let src_path = src_dir.path().join("input.mds");
+    std::fs::write(&src_path, "Hello SEC-3!\n").unwrap();
+
+    // Deep output directory — enough levels that the old relative_path() call
+    // produces a long `../../../...` chain back to src_dir under the old code.
+    let deep_out_dir = out_dir.path().join("a/b/c/d/e/f/g/h/i/j");
+    std::fs::create_dir_all(&deep_out_dir).unwrap();
+    let out_path = deep_out_dir.join("out.md");
+
+    // ── sidecar case ─────────────────────────────────────────────────────────
+    // map_dir = effective_parent(out_path) = deep_out_dir (absolute).
+    // relative_path(deep_out_dir, src_path) escapes via `../` under the old code.
+    let result = mds_bin()
+        .arg("build")
+        .arg(&src_path)
+        .arg("--source-map")
+        .arg("-o")
+        .arg(&out_path)
+        .output()
+        .expect("mds build (sidecar) should run");
+    assert!(
+        result.status.success(),
+        "sidecar build should succeed; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let map_path = deep_out_dir.join("out.md.map");
+    let v = read_map_json(&map_path);
+    let sidecar_sources = v["sources"].as_array().expect("sources must be array");
+
+    for src in sidecar_sources {
+        let s = src.as_str().expect("source must be string");
+        // SEC-3: must NOT start with `../` — the `..`-escape guard must have fired.
+        assert!(
+            !s.starts_with("../"),
+            "sidecar sources[] must not contain a `..`-escaping path \
+             (SEC-3 guard must fire); got: {s:?}"
+        );
+        assert_ne!(s, "..", "sidecar sources[] must not be bare `..`");
+        // Pre-existing guard: must NOT be an absolute path.
+        assert!(
+            !s.starts_with('/'),
+            "sidecar sources[] must not be absolute; got: {s:?}"
+        );
+        // Key assertion: the random src-tempdir name must NOT appear.  If it does,
+        // the `..` chain reconstructed the filesystem path — the exact leak the
+        // PR description claimed was fixed but was not.
+        assert!(
+            !s.contains(src_dir_name.as_str()),
+            "sidecar sources[] must not contain the source tempdir name \
+             (path reconstruction leak); dir={src_dir_name:?} entry={s:?}"
+        );
+    }
+
+    // ── inline stdout case ────────────────────────────────────────────────────
+    // map_dir = CWD when -o - is used (PathBuf::new() → abs_map_dir = current_dir).
+    // Running from deep_out_dir makes CWD == deep_out_dir, so the relative path
+    // from CWD to src_path escapes via `../` under the old code.
+    let inline_result = mds_bin()
+        .current_dir(&deep_out_dir)
+        .arg("build")
+        .arg(&src_path)
+        .args(["--source-map", "--inline", "-o", "-"])
+        .output()
+        .expect("mds build --inline should run");
+    assert!(
+        inline_result.status.success(),
+        "inline build should succeed; stderr: {}",
+        String::from_utf8_lossy(&inline_result.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&inline_result.stdout);
+    let prefix = "<!--# sourceMappingURL=data:application/json;base64,";
+    let suffix = " -->";
+    let start = stdout
+        .find(prefix)
+        .expect("stdout must contain inline source-map carrier");
+    let rest = &stdout[start + prefix.len()..];
+    let end = rest
+        .find(suffix)
+        .expect("carrier must be closed with \" -->\"");
+    let decoded = base64_decode(&rest[..end]);
+    let inline_json: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+    let inline_sources = inline_json["sources"]
+        .as_array()
+        .expect("inline sources must be array");
+
+    for src in inline_sources {
+        let s = src.as_str().expect("source must be string");
+        assert!(
+            !s.starts_with("../"),
+            "inline sources[] must not contain a `..`-escaping path \
+             (SEC-3 guard must fire); got: {s:?}"
+        );
+        assert_ne!(s, "..", "inline sources[] must not be bare `..`");
+        assert!(
+            !s.starts_with('/'),
+            "inline sources[] must not be absolute; got: {s:?}"
+        );
+        assert!(
+            !s.contains(src_dir_name.as_str()),
+            "inline sources[] must not contain the source tempdir name \
+             (path reconstruction leak); dir={src_dir_name:?} entry={s:?}"
+        );
+    }
 }

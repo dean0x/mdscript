@@ -25,11 +25,12 @@
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
-use mds::{FileSystem, MdsError};
+use mds::{effective_parent, FileSystem, MdsError};
 use miette::Result;
 
 use crate::build::{load_config, read_stdin, resolve_input};
-use crate::output::collect_mds_files;
+use crate::output::atomic_write_file;
+use crate::output::collect_mds_files_detailed;
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -55,7 +56,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
         quiet,
     } = args;
 
-    let (input, auto_detected) = resolve_input(input)?;
+    let (input, auto_detected) = resolve_input(input, "fmt")?;
     if auto_detected && !quiet {
         eprintln!("Formatting {}", input.display());
     }
@@ -125,8 +126,17 @@ struct FmtResult {
     changed: bool,
 }
 
-fn format_source(source: &str, base_dir: Option<&Path>) -> Result<FmtResult> {
-    let formatted = mds::format_str_with(source, base_dir).map_err(miette::Error::from)?;
+/// Format `source` and return a [`FmtResult`] with change detection.
+///
+/// `file_name` is threaded into lexer and safety-gate errors so diagnostics
+/// name the file rather than showing a blank path.
+fn format_source_named(
+    source: &str,
+    base_dir: Option<&Path>,
+    file_name: &str,
+) -> Result<FmtResult> {
+    let formatted =
+        mds::format_str_named(source, base_dir, file_name).map_err(miette::Error::from)?;
     let changed = formatted != source;
     Ok(FmtResult { formatted, changed })
 }
@@ -136,7 +146,7 @@ fn format_source(source: &str, base_dir: Option<&Path>) -> Result<FmtResult> {
 fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
     let FmtFlags { check, diff, quiet } = flags;
     let (source, cwd) = read_stdin()?;
-    let result = format_source(&source, Some(&cwd))?;
+    let result = format_source_named(&source, Some(&cwd), "<stdin>")?;
 
     if diff {
         print_diff(&render_diff(&source, &result.formatted, "<stdin>"))?;
@@ -159,8 +169,13 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
 fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let FmtFlags { check, diff, quiet } = flags;
     let source = read_source_file(path)?;
-    let base_dir = path.parent();
-    let result = format_source(&source, base_dir)?;
+    // effective_parent maps "" (bare filename) to "." so that resolve_base_dir
+    // (called by format_str_named → assert_equivalent) receives a canonicalisable
+    // path and does not silently fall through to the structural_equivalent fallback
+    // that would swallow a genuine mds::syntax error. avoids PF-006, applies ADR-001.
+    let base_dir = Some(effective_parent(path));
+    let file_name = path.display().to_string();
+    let result = format_source_named(&source, base_dir, &file_name)?;
 
     if diff && result.changed {
         let label = path.display().to_string();
@@ -170,8 +185,10 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let read_only = check || diff;
     if !read_only {
         if result.changed {
-            std::fs::write(path, &result.formatted)
-                .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
+            // Atomic write preserves file permissions and avoids truncate-then-write
+            // data loss on crash or full disk (avoids the issue fixed for lint by
+            // commit c5aa086 — both write paths now share the same helper).
+            atomic_write_file(path, &result.formatted)?;
             if !quiet {
                 eprintln!("Formatted: {}", path.display());
             }
@@ -221,26 +238,32 @@ enum FileOutcome {
 /// read and format errors are treated in the surrounding loop.
 fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     let FmtFlags { check, diff, quiet } = flags;
+    let file_name = file.display().to_string();
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("{e:?}");
+            // File path is embedded in the miette report; sanitize for ESC injection safety
+            // (avoids PF-004 parallel-path gap — uses the shared render helper).
+            crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
     };
-    let base_dir = file.parent();
-    let result = match format_source(&source, base_dir) {
+    // effective_parent maps "" (bare filename) to "." — avoids PF-006, applies ADR-001.
+    let base_dir = Some(effective_parent(file));
+    let result = match format_source_named(&source, base_dir, &file_name) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("{e:?}");
+            // MdsError::Syntax embeds user-controlled source fragments that may contain
+            // raw ESC bytes; file_name is threaded into the report by format_source_named.
+            crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
     };
 
     if diff && result.changed {
-        let label = file.display().to_string();
+        let label = file_name.clone();
         if let Err(e) = print_diff(&render_diff(&source, &result.formatted, &label)) {
-            eprintln!("{e:?}");
+            crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
     }
@@ -255,7 +278,10 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
     } else if !result.changed {
         FileOutcome::Unchanged
     } else {
-        match std::fs::write(file, &result.formatted) {
+        // Atomic write preserves file permissions and avoids truncate-then-write
+        // data loss on crash or full disk — same guarantee as lint --fix (avoids
+        // the divergence introduced after commit c5aa086 hardened the lint path).
+        match atomic_write_file(file, &result.formatted) {
             Ok(()) => {
                 if !quiet {
                     eprintln!("Formatted: {}", file.display());
@@ -263,7 +289,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
                 FileOutcome::Formatted
             }
             Err(e) => {
-                eprintln!("error: cannot write {}: {e}", file.display());
+                crate::output::eprint_error(e);
                 FileOutcome::Failed
             }
         }
@@ -290,9 +316,19 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
     // malformed config rather than silently ignoring it.
     let _ = load_config(dir)?;
 
-    let files = collect_mds_files(dir, MAX_DEPTH, None);
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
+    let files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // Always emit — not suppressed by --quiet (avoids silent CI green pass).
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was formatted",
+                walk.excluded_by_default
+            );
+            std::process::exit(1);
+        }
         if !flags.quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }
@@ -320,7 +356,9 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
         // the single-file --check path (which is fully silent under --quiet,
         // exiting 1 with no message when a file would change).
         if !flags.quiet || fail_count > 0 {
-            eprintln!("{changed_count} would reformat, {fail_count} failed");
+            eprintln!(
+                "{changed_count} would reformat, {unchanged_count} unchanged, {fail_count} failed"
+            );
         }
     } else if !flags.quiet || fail_count > 0 {
         eprintln!("{changed_count} formatted, {unchanged_count} unchanged, {fail_count} failed");
@@ -447,14 +485,15 @@ mod tests {
 
     #[test]
     fn format_source_detects_no_change() {
-        let result = format_source("Hello!\n", None).unwrap();
+        let result = format_source_named("Hello!\n", None, "<source>").unwrap();
         assert!(!result.changed);
         assert_eq!(result.formatted, "Hello!\n");
     }
 
     #[test]
     fn format_source_detects_change() {
-        let result = format_source("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None).unwrap();
+        let result =
+            format_source_named("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None, "<source>").unwrap();
         assert!(result.changed);
         assert!(!result.formatted.contains('\r'));
     }

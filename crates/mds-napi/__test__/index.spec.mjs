@@ -162,6 +162,36 @@ describe('compileFile', () => {
       assert.ok(result.output.includes('Hello Alice!'), `got: ${result.output}`);
     }
   });
+
+  test('F-CF7: bare filename (no separator, no ./ prefix) resolves from cwd (avoids PF-006)', () => {
+    // PF-006: Path::parent() returns Some("") for a bare name like "simple.mds".
+    // "".canonicalize() fails with file_not_found unless effective_parent maps it
+    // to ".".  This test exercises exactly that path — a bare filename with NO
+    // separator character and NO "./" prefix — by chdir-ing into the fixtures
+    // directory so the bare name is resolvable.
+    // F-CF6 uses path.relative() which always produces a SEPARATOR-CONTAINING
+    // relative path (e.g. "../../fixtures/simple.mds"), bypassing the bug entirely.
+    // This test is the genuine bare-filename gate.
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(FIXTURES);
+      const result = compileFile('simple.mds'); // no separator, no './' prefix
+      assert.equal(result.kind, 'markdown', 'F-CF7: kind must be markdown');
+      assert.ok(
+        result.output.includes('Hello Alice!'),
+        `F-CF7: bare-filename compileFile must produce compiled content; got: ${result.output}`,
+      );
+      // Dependencies must be absolute paths even when the entry was a bare filename.
+      for (const dep of result.dependencies) {
+        assert.ok(
+          path.isAbsolute(dep),
+          `F-CF7: dependency must be absolute; got: ${dep}`,
+        );
+      }
+    } finally {
+      process.chdir(originalCwd);
+    }
+  });
 });
 
 // ── Check tests ───────────────────────────────────────────────────────────────
@@ -338,6 +368,23 @@ describe('error shape', () => {
       () => compile('Hello!\n', { unknownKey: true }),
       (err) => {
         assert.equal(err.code, 'mds::invalid_options', `got: ${err.code}`);
+        return true;
+      },
+    );
+  });
+
+  // D2: type_mismatch_at — cross-type @if comparison now carries a source span
+  test('D2: type_mismatch from @if cross-type comparison carries a non-null span', () => {
+    const src = '---\nx: 3\n---\n@if x == "3":\nyes\n@end\n';
+    assert.throws(
+      () => compile(src),
+      (err) => {
+        assert.equal(err.code, 'mds::type_mismatch', `D2: expected type_mismatch, got: ${err.code}`);
+        assert.ok(err.span !== undefined && err.span !== null, 'D2: type_mismatch must carry a span');
+        assert.ok(typeof err.span.offset === 'number', 'D2: span.offset must be a number');
+        assert.ok(err.span.length > 0, 'D2: span.length must be > 0');
+        assert.ok(typeof err.span.line === 'number', `D2: span.line must be a number, got: ${typeof err.span.line}`);
+        assert.ok(typeof err.span.column === 'number', `D2: span.column must be a number, got: ${typeof err.span.column}`);
         return true;
       },
     );
@@ -1020,6 +1067,9 @@ describe('source maps (F-SM)', () => {
     assert.equal(sm.version, 3, 'sourceMap.version must be 3');
     assert.ok(Array.isArray(sm.sources), 'sourceMap.sources must be an array');
     assert.ok(sm.sources.length > 0, 'sourceMap.sources must be non-empty');
+    // String-source uses "input.mds" (STRING_SOURCE_MAP_LABEL) — unified with WASM.
+    assert.equal(sm.sources[0], 'input.mds',
+      `sources[0] must be "input.mds" after map_source_label fix; got: ${JSON.stringify(sm.sources[0])}`);
     assert.ok(Array.isArray(sm.names), 'sourceMap.names must be an array');
     assert.equal(sm.names.length, 0, 'sourceMap.names must be empty');
     assert.equal(typeof sm.mappings, 'string', 'sourceMap.mappings must be a string');
@@ -1105,7 +1155,14 @@ describe('source maps (F-SM)', () => {
   });
 
   // F-SM7: structural validity of sourceMap from compileFile
-  test('F-SM7: compileFile produces structurally valid sourceMap', () => {
+  //
+  // After the ADR-005 Phase A choke-point fix (source_path.rs::relativize_source),
+  // compileFile emits ROOT-RELATIVE paths in sources[] — NOT absolute filesystem
+  // paths.  The value is slash-separated relative to the project root (found via
+  // .mdsroot / .git walk-up).  The assertion below checks the path ends with the
+  // fixture basename; for a stronger cross-surface parity assertion see CF-SM1 in
+  // packages/mds/__test__/source-map.spec.mjs.
+  test('F-SM7: compileFile produces structurally valid sourceMap with root-relative sources[]', () => {
     const result = compileFile(SIMPLE_MDS, { sourceMap: true });
     assert.equal(result.kind, 'markdown');
     const sm = result.sourceMap;
@@ -1116,6 +1173,15 @@ describe('source maps (F-SM)', () => {
     assert.ok(sm.mappings.length > 0, 'mappings must be non-empty');
     // file is absent (bindings do not set file)
     assert.ok(!('file' in sm), 'file must be absent (bindings do not set file)');
+    // sources[0] must be root-relative (not an absolute path).
+    assert.ok(
+      !sm.sources[0].startsWith('/') && !sm.sources[0].match(/^[A-Za-z]:\\/),
+      `sources[0] must be root-relative, not an absolute path; got: ${JSON.stringify(sm.sources[0])}`,
+    );
+    assert.ok(
+      sm.sources[0].endsWith('.mds'),
+      `sources[0] must end with .mds extension; got: ${JSON.stringify(sm.sources[0])}`,
+    );
     // Validate mappings contains only valid Base64-VLQ chars
     assert.ok(
       /^[A-Za-z0-9+/,;]*$/.test(sm.mappings),

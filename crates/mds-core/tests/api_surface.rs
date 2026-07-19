@@ -11,8 +11,10 @@ use mds::{
 fn public_functions_exist() {
     let _: fn(&str) -> Result<String, MdsError> = mds::format_str;
     let _: fn(&str, Option<&Path>) -> Result<String, MdsError> = mds::format_str_with;
+    let _: fn(&str, Option<&Path>, &str) -> Result<String, MdsError> = mds::format_str_named;
     let _ = mds::format_str("Hello!\n");
     let _ = mds::format_str_with("Hello!\n", None);
+    let _ = mds::format_str_named("Hello!\n", None, "<test>");
     let _ = mds::compile_str("---\nname: World\n---\nHello {name}!\n");
     let _ = mds::compile_str_with("Hello!\n", None, None);
     let _ = mds::compile_str_collecting_warnings("Hello!\n", None, None);
@@ -1323,6 +1325,7 @@ fn compile_options_has_source_map_and_include_sources_content() {
     let off = mds::CompileOptions {
         source_map: false,
         include_sources_content: false,
+        ..Default::default()
     };
     assert!(!off.source_map);
     assert!(!off.include_sources_content);
@@ -1330,6 +1333,7 @@ fn compile_options_has_source_map_and_include_sources_content() {
     let on = mds::CompileOptions {
         source_map: true,
         include_sources_content: true,
+        ..Default::default()
     };
     assert!(on.source_map);
     assert!(on.include_sources_content);
@@ -1355,6 +1359,7 @@ fn include_sources_content_false_omits_sources_content() {
         mds::CompileOptions {
             source_map: true,
             include_sources_content: false,
+            ..Default::default()
         },
     )
     .expect("should compile");
@@ -1380,6 +1385,7 @@ fn include_sources_content_true_includes_sources_content() {
         mds::CompileOptions {
             source_map: true,
             include_sources_content: true,
+            ..Default::default()
         },
     )
     .expect("should compile");
@@ -1388,5 +1394,86 @@ fn include_sources_content_true_includes_sources_content() {
     assert!(
         sm.sources_content.is_some(),
         "sourcesContent must be Some when include_sources_content=true"
+    );
+}
+
+// ── Fix API surface pin (F-API-1) ─────────────────────────────────────────────
+
+/// F-API-1: apply_fixes_incremental and associated types exist on the public API surface.
+///
+/// Pins:
+/// - `mds::fix::apply_fixes_incremental` is callable with `F: Fn(&str) -> Result<LintResult, MdsError>`
+/// - `mds::fix::FixOutcome::PartiallyFixed` variant is exhaustively matchable
+/// - `mds::fix::RejectedEdit` struct has the expected `edit: ByteEdit` and `reason: String` fields
+#[test]
+fn fix_api_incremental_exists() {
+    use mds::fix::{apply_fixes_incremental, plan_fixes, ByteEdit, FixOutcome, RejectedEdit};
+
+    // FixOutcome is #[non_exhaustive]: external matches need a wildcard arm.
+    // We still enumerate all known variants to pin their shapes at compile time.
+    let outcome: FixOutcome = FixOutcome::NothingToFix;
+    #[allow(clippy::match_single_binding)]
+    #[allow(unreachable_patterns)]
+    match outcome {
+        FixOutcome::Fixed { .. }
+        | FixOutcome::PartiallyFixed { .. }
+        | FixOutcome::Rejected { .. }
+        | FixOutcome::NothingToFix => {}
+        _ => {} // required: FixOutcome is #[non_exhaustive]
+    }
+
+    // RejectedEdit struct has `edit` and `reason` fields.
+    let edit = ByteEdit {
+        start: 0,
+        end: 5,
+        rule: "duplicate-import".to_string(),
+    };
+    let rejected = RejectedEdit {
+        edit,
+        reason: "simulated reverify failure".to_string(),
+    };
+    assert_eq!(rejected.reason, "simulated reverify failure");
+    assert_eq!(rejected.edit.rule, "duplicate-import");
+
+    // apply_fixes_incremental is callable with F: Fn — compile-time and runtime check.
+    let source = "Hello!\n";
+    let original = LintResult {
+        diagnostics: vec![],
+        truncated: false,
+        is_standalone: false,
+    };
+    let plan = plan_fixes(&original, source);
+    let outcome = apply_fixes_incremental(
+        source,
+        plan,
+        &original,
+        |_s| -> Result<LintResult, MdsError> {
+            Ok(LintResult {
+                diagnostics: vec![],
+                truncated: false,
+                is_standalone: false,
+            })
+        },
+    );
+    // Empty source with no diagnostics → NothingToFix (no reverify called).
+    assert!(
+        matches!(outcome, FixOutcome::NothingToFix),
+        "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
+    );
+}
+
+/// Regression gate (issue #9): `STRING_SOURCE_MAP_LABEL` must be reachable from
+/// the public `mds` API so every surface can import it rather than redeclaring
+/// the literal (avoids PF-007 per-surface re-declaration defeating cross-surface
+/// byte-parity; applies ADR-005).
+///
+/// This test fails to COMPILE if the constant reverts to `pub(crate)`.
+#[test]
+fn string_source_map_label_is_in_public_api() {
+    let label: &str = mds::STRING_SOURCE_MAP_LABEL;
+    assert_eq!(
+        label, "input.mds",
+        "STRING_SOURCE_MAP_LABEL must equal \"input.mds\"; changing it requires \
+         updating every surface that uses it"
     );
 }

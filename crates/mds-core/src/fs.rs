@@ -107,6 +107,29 @@ pub trait FileSystem: Send + Sync {
     fn canonicalize(&self, path: &str) -> Result<String, MdsError> {
         Ok(path.to_string())
     }
+
+    /// Return the established project root directory as a string, if any.
+    ///
+    /// Used by the source-map path-relativization choke-point
+    /// ([`crate::source_path::relativize_source`]) to determine whether a
+    /// resolved source path is contained within the project root and should be
+    /// emitted as a root-relative (or map-relative) reference rather than
+    /// degraded to a bare filename.
+    ///
+    /// # Default
+    ///
+    /// Returns `None` — suitable for virtual / in-memory filesystems
+    /// ([`VirtualFs`] / WASM) where there is no containment concept.
+    ///
+    /// # Override
+    ///
+    /// [`NativeFs`] returns the path established by `init_root` (the project
+    /// root found by walking up from the entry-point directory).  Returns
+    /// `None` if the root has not been established yet (before any
+    /// `normalize` or `set_root` call).
+    fn source_root(&self) -> Option<String> {
+        None
+    }
 }
 
 // ── VirtualFs shared segment logic ───────────────────────────────────────────
@@ -272,6 +295,26 @@ pub struct NativeFs {
     root_dir: OnceLock<PathBuf>,
 }
 
+/// Return the effective parent directory of `path`, always resolving to
+/// `Path::new(".")` for bare filenames.
+///
+/// `Path::parent()` returns `Some("")` (an empty path) for bare relative
+/// filenames like `"hello.mds"`, NOT `None`. An empty path fails
+/// `canonicalize()` with a file-not-found error, which is the root cause of
+/// the bare-filename release blocker.  This function maps both `Some("")` and
+/// `None` to `Path::new(".")` so that `check_symlink` resolves bare filenames
+/// against the current working directory, matching the behaviour users expect.
+///
+/// Absolute paths and paths with a non-empty parent component are returned
+/// unchanged.
+pub fn effective_parent(path: &Path) -> &Path {
+    match path.parent() {
+        None => Path::new("."),
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+    }
+}
+
 impl NativeFs {
     /// Create a new `NativeFs` with no root directory set.
     ///
@@ -302,7 +345,10 @@ impl NativeFs {
             .file_name()
             .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;
 
-        let parent = path.parent().unwrap_or(Path::new("."));
+        // Use effective_parent: path.parent() returns Some("") for bare filenames
+        // (not None), so "".canonicalize() would fail on every bare-filename call.
+        // effective_parent maps empty parents to "." (PF-006).
+        let parent = effective_parent(path);
         let canonical_parent = parent
             .canonicalize()
             .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
@@ -397,14 +443,16 @@ impl FileSystem for NativeFs {
             // Root entry point: treat `relative` as a filesystem path.
             let canonical = Self::check_symlink(Path::new(relative))?;
             // Anchor the security root on first entry-point resolution.
-            let entry_dir = canonical.parent().unwrap_or(Path::new("."));
+            // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
+            let entry_dir = effective_parent(&canonical);
             self.init_root(entry_dir);
             self.check_path_traversal(&canonical)?;
             Ok(canonical.display().to_string())
         } else {
             // Import from within a resolved module: resolve against the parent
             // directory of `base` via the Path-typed helper (no String round-trip).
-            let base_dir = Path::new(base).parent().unwrap_or(Path::new("."));
+            // effective_parent guards against an empty parent — avoids PF-006.
+            let base_dir = effective_parent(Path::new(base));
             self.normalize_in_dir_impl(base_dir, relative)
         }
     }
@@ -469,6 +517,10 @@ impl FileSystem for NativeFs {
                 }
                 other => other,
             })
+    }
+
+    fn source_root(&self) -> Option<String> {
+        self.root_dir.get().map(|p| p.display().to_string())
     }
 }
 
@@ -1251,6 +1303,77 @@ mod tests {
         }
     }
 
+    // ── effective_parent ──────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_parent_bare_name_returns_dot() {
+        // "hello.mds" — no directory component; Path::parent() returns Some("").
+        // effective_parent must return Path::new("."), not the empty path.
+        assert_eq!(effective_parent(Path::new("hello.mds")), Path::new("."));
+    }
+
+    #[test]
+    fn effective_parent_dot_slash_prefix_returns_dot() {
+        // "./hello.mds" — parent is "." (non-empty); returned as-is.
+        assert_eq!(effective_parent(Path::new("./hello.mds")), Path::new("."));
+    }
+
+    #[test]
+    fn effective_parent_subdir_path_unchanged() {
+        // "sub/hello.mds" — parent is "sub"; returned unchanged.
+        assert_eq!(
+            effective_parent(Path::new("sub/hello.mds")),
+            Path::new("sub")
+        );
+    }
+
+    #[test]
+    fn effective_parent_absolute_path_unchanged() {
+        // Absolute path: parent is the directory, which is non-empty.
+        let p = Path::new("/tmp/hello.mds");
+        assert_eq!(effective_parent(p), Path::new("/tmp"));
+    }
+
+    // ── check_symlink unit tests (absolute paths) ─────────────────────────────
+    //
+    // Note: bare-filename (PF-006) integration testing lives at CLI level in
+    // cli_build::build_load_config_finds_grandparent_mds_json,
+    // cli_fmt::fmt_bare_filename_propagates_syntax_error, and
+    // cli_lint::lint_fix_bare_filename_applies_fix.
+
+    #[test]
+    fn check_symlink_real_absolute_file_is_accepted() {
+        // A real file reached via an absolute path must succeed.
+        // Uses an absolute path to avoid mutating std::env::current_dir (process-global,
+        // races under nextest); this is the same code path that effective_parent enables
+        // for a bare filename resolved from cwd.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "bare.mds", "hello");
+        let result = NativeFs::check_symlink(&file);
+        assert!(
+            result.is_ok(),
+            "check_symlink should succeed for a real absolute-path file: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_symlink_symlinked_file_is_rejected() {
+        // A symlinked file must be rejected, regardless of whether it is reached
+        // via a bare name or an absolute path.
+        let dir = TempDir::new().unwrap();
+        let target = make_temp_file(&dir, "target.mds", "hello");
+        let link_path = dir.path().join("link.mds");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+        let result = NativeFs::check_symlink(&link_path);
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinks"),
+            "expected symlink rejection, got: {msg}"
+        );
+    }
+
     #[test]
     fn external_impl_resolves_import_via_with_fs() {
         use crate::resolver::ModuleCache;
@@ -1277,6 +1400,74 @@ mod tests {
         assert!(
             output.contains("Hello World!"),
             "expected 'Hello World!' from custom fs import, got: {output}"
+        );
+    }
+
+    // ── source_root ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn native_source_root_none_before_any_normalize() {
+        // Before normalize() or set_root() is called, root has not been established.
+        let fs = NativeFs::new();
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "source_root() must be None before any normalize call"
+        );
+    }
+
+    #[test]
+    fn native_source_root_set_after_normalize() {
+        // After the first normalize() call the root is established and
+        // source_root() returns Some.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        fs.normalize("", &file.display().to_string()).unwrap();
+        let root = fs.source_root();
+        assert!(root.is_some(), "source_root() must be Some after normalize");
+        // The returned root must be an absolute path.
+        assert!(
+            root.as_deref().unwrap_or("").starts_with('/'),
+            "source_root() must be absolute, got {:?}",
+            root
+        );
+    }
+
+    #[test]
+    fn native_source_root_no_marker_falls_back_to_entry_dir() {
+        // In a temp directory with no .git / .mdsroot marker, the root should
+        // fall back to the entry-point directory itself (not a parent).
+        //
+        // Exact equality is required: an ancestor check (starts_with) would
+        // pass even if find_project_root walked up to /tmp or /, which would
+        // silently widen the containment envelope the security guard rests on.
+        let dir = TempDir::new().unwrap();
+        let file = make_temp_file(&dir, "main.mds", "hello");
+        let fs = NativeFs::new();
+        fs.normalize("", &file.display().to_string()).unwrap();
+        let root = fs.source_root().expect("root must be set after normalize");
+        let file_canon = file.canonicalize().unwrap();
+        let root_path = std::path::PathBuf::from(&root);
+        // Canonicalize root_path to resolve macOS /var → /private/var so the
+        // comparison is not flaky across platforms.
+        let root_canon = root_path.canonicalize().unwrap_or(root_path);
+        assert_eq!(
+            root_canon,
+            effective_parent(&file_canon),
+            "source_root must be exactly the entry-point directory (not a parent); \
+             root={root:?} file_canon={file_canon:?}"
+        );
+    }
+
+    #[test]
+    fn vfs_source_root_always_none() {
+        // VirtualFs has no containment concept — source_root() always returns None.
+        let fs = VirtualFs::new(std::collections::HashMap::new());
+        assert_eq!(
+            fs.source_root(),
+            None,
+            "VirtualFs source_root() must always be None"
         );
     }
 }

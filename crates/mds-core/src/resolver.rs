@@ -198,6 +198,15 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
 const SOURCE_LABEL: &str = "<source>";
 
+/// Warning emitted when `source_map: true` is used with a messages-mode template.
+///
+/// Source maps operate on a flat text stream; messages-mode boundaries
+/// (`@message` blocks) are not representable in the SMv3 segment model.
+/// The warning is surface-neutral (no mention of specific option names or APIs).
+const MSG_MODE_SOURCE_MAP_WARNING: &str =
+    "source maps are not supported for messages-mode templates (@message blocks); \
+     no source map will be generated";
+
 /// Module cache to avoid re-resolving the same file or virtual key.
 ///
 /// Supports multiple filesystem backends via the [`FileSystem`] trait.
@@ -679,6 +688,8 @@ impl ModuleCache {
             }
 
             let region_output = if let Some(builder) = current_map.take() {
+                // builder.current_src was set to origin's source index above;
+                // evaluate_with_map_seeded derives file/source from it (issue #58).
                 let (region_out, returned_builder, iters, bytes) = evaluate_with_map_seeded(
                     nodes,
                     scope,
@@ -692,7 +703,13 @@ impl ModuleCache {
                 current_map = Some(returned_builder);
                 region_out
             } else {
-                evaluate(nodes, scope, warnings)?
+                evaluate(
+                    nodes,
+                    scope,
+                    warnings,
+                    origin.file.as_ref(),
+                    origin.source.as_ref(),
+                )?
             };
 
             // PF-004: cumulative size guard — same limit as the per-node check.
@@ -790,15 +807,11 @@ impl ModuleCache {
             } = components;
 
             if has_message_block(&final_body) {
-                // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+                // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
                 // The evaluator only has text-stream semantics; messages boundaries don't
                 // have stable byte offsets relative to the source.  Degrade gracefully.
                 if opts.source_map {
-                    warnings.push(
-                        "source_map: true is not supported for messages-mode templates \
-                         (@message blocks); source_map will be None"
-                            .to_string(),
-                    );
+                    warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
                 }
                 let messages = evaluate_messages_intrinsic(
                     &final_body,
@@ -833,7 +846,14 @@ impl ModuleCache {
                     None => (raw, None),
                 }
             } else {
-                (evaluate(&final_body, &mut scope, warnings)?, None)
+                // `final_body` is spliced from base-skeleton nodes (base-relative
+                // offsets) and child block overrides (child-relative offsets), so no
+                // single source can attribute every node's offset. Pass empty file/source
+                // so `build_type_mismatch` degrades a `type_mismatch` to spanless rather
+                // than anchoring a base-relative offset against the child source (ADR-005
+                // "degrade rather than mis-attribute"). The source-map branch above keeps
+                // spans correct by evaluating per-region with each region's own origin.
+                (evaluate(&final_body, &mut scope, warnings, "", "")?, None)
             };
 
             let body_clean = crate::clean_output(&body_raw);
@@ -842,6 +862,26 @@ impl ModuleCache {
             let fm_prefix_len = final_str.len() - body_clean_len;
             let source_map =
                 map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+            // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
+            // relativize ALL sources[] entries so no absolute path can leak into
+            // the published map.  Unconditional — never opt-in, never debug_assert.
+            //
+            // Defense-in-depth: establish root from base_dir if it was not set by
+            // the entry-point normalize() / set_root() call (guards against a future
+            // alternate code path that bypasses root establishment — PF-004 shape).
+            // No-op for VirtualFs: its source_root() always returns None regardless.
+            if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
+                let _ = self.fs.set_root(ctx.base_dir);
+            }
+            let source_map = source_map.map(|mut sm| {
+                let root_str = self.fs.source_root();
+                let root = root_str.as_deref().map(std::path::Path::new);
+                let base = opts.source_map_base.as_deref();
+                for src in &mut sm.sources {
+                    *src = crate::source_path::relativize_source(src, base, root);
+                }
+                sm
+            });
             return Ok((crate::CompiledOutput::Markdown(final_str), source_map));
         }
 
@@ -862,13 +902,9 @@ impl ModuleCache {
         validator::validate(&module.body, &mut scope, ctx.file_str, ctx.source)?;
 
         if has_message_block(&module.body) {
-            // AC-FUNC-07: source_map=true is incompatible with messages-mode output.
+            // AC-FUNC-07: source_map=true is incompatible with messages-mode templates.
             if opts.source_map {
-                warnings.push(
-                    "source_map: true is not supported for messages-mode templates \
-                     (@message blocks); source_map will be None"
-                        .to_string(),
-                );
+                warnings.push(MSG_MODE_SOURCE_MAP_WARNING.to_string());
             }
             let messages = evaluate_messages_intrinsic(
                 &module.body,
@@ -886,13 +922,18 @@ impl ModuleCache {
         }
 
         let (body_raw, map_out) = if opts.source_map {
+            // Builder seeds current_src=0 pointing to ctx.file_str/ctx.source;
+            // evaluate_with_map derives file/source from builder (issue #58).
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
             let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             apply_map_degradation(raw, returned, opts, warnings)
         } else {
-            (evaluate(&module.body, &mut scope, warnings)?, None)
+            (
+                evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?,
+                None,
+            )
         };
 
         let body_clean = crate::clean_output(&body_raw);
@@ -900,6 +941,26 @@ impl ModuleCache {
         let final_str = crate::prepend_frontmatter(raw_frontmatter.as_deref(), body_clean);
         let fm_prefix_len = final_str.len() - body_clean_len;
         let source_map = map_out.map(|b| b.finalize(&body_raw, &final_str, fm_prefix_len, None));
+        // Step 5 — single choke-point (PF-005 / PF-004 / ADR-005):
+        // relativize ALL sources[] entries so no absolute path can leak into
+        // the published map.  Unconditional — never opt-in, never debug_assert.
+        //
+        // Defense-in-depth: establish root from base_dir if it was not set by
+        // the entry-point normalize() / set_root() call (guards against a future
+        // alternate code path that bypasses root establishment — PF-004 shape).
+        // No-op for VirtualFs: its source_root() always returns None regardless.
+        if self.fs.source_root().is_none() && !ctx.base_dir.is_empty() {
+            let _ = self.fs.set_root(ctx.base_dir);
+        }
+        let source_map = source_map.map(|mut sm| {
+            let root_str = self.fs.source_root();
+            let root = root_str.as_deref().map(std::path::Path::new);
+            let base = opts.source_map_base.as_deref();
+            for src in &mut sm.sources {
+                *src = crate::source_path::relativize_source(src, base, root);
+            }
+            sm
+        });
         Ok((crate::CompiledOutput::Markdown(final_str), source_map))
     }
 
@@ -991,6 +1052,7 @@ impl ModuleCache {
         let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
             let builder =
                 crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            // evaluate_with_map derives file/source from builder.current_src (issue #58).
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
@@ -1002,7 +1064,7 @@ impl ModuleCache {
             let fmap = if returned.segments_dropped {
                 warnings.push(format!(
                     "source map segment cap ({} segments) exceeded in imported module '{}'; \
-                     source_map will be None for this compilation",
+                     no source map will be generated",
                     crate::limits::MAX_SOURCEMAP_SEGMENTS,
                     ctx.file_str,
                 ));
@@ -1024,7 +1086,7 @@ impl ModuleCache {
             };
             (body, fmap)
         } else {
-            let body_raw = evaluate(&module.body, &mut scope, warnings)?;
+            let body_raw = evaluate(&module.body, &mut scope, warnings, ctx.file_str, ctx.source)?;
             let body = (!body_raw.trim().is_empty()).then_some(body_raw);
             (body, None)
         };
@@ -1316,7 +1378,13 @@ impl ModuleCache {
             merged_frontmatter,
         } = components;
 
-        let prompt_body = evaluate(&final_body, &mut scope, warnings)?;
+        // `final_body` splices base-skeleton nodes (base-relative offsets) with child
+        // block overrides (child-relative offsets); a single `ctx.source` cannot attribute
+        // both. Pass empty file/source so a `type_mismatch` in an inherited condition
+        // degrades to spanless instead of mis-attributing a base-relative offset onto the
+        // child source (ADR-005 "degrade rather than mis-attribute"). Per-region source
+        // attribution for `@extends` is deferred to S8; spanless is the safe interim.
+        let prompt_body = evaluate(&final_body, &mut scope, warnings, "", "")?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
         Ok(ResolvedModule {
@@ -1635,7 +1703,8 @@ impl ModuleCache {
                 defs.explicit_exports.insert(name.clone());
             }
             ExportDirective::Wildcard {
-                path: import_path, ..
+                path: import_path,
+                offset,
             } => {
                 // Re-export all exports from the target module. These are
                 // available to importers but NOT in the current file's scope.
@@ -1647,9 +1716,16 @@ impl ModuleCache {
                     ctx.runtime_vars,
                     warnings,
                 )?;
+                let line_len = line_len_at(ctx.source, *offset);
                 for (name, func) in source_module.get_all_exports() {
                     if defs.functions.contains_key(&name) {
-                        return Err(MdsError::name_collision(name));
+                        return Err(MdsError::name_collision_at(
+                            &name,
+                            ctx.file_str,
+                            ctx.source,
+                            *offset,
+                            line_len,
+                        ));
                     }
                     defs.functions.insert(name.clone(), func);
                     defs.explicit_exports.insert(name);
@@ -1669,7 +1745,13 @@ impl ModuleCache {
         warnings: &mut Vec<String>,
     ) -> Result<(), MdsError> {
         if scope.get_namespace(alias).is_some() {
-            return Err(MdsError::name_collision(alias.to_string()));
+            return Err(MdsError::name_collision_at(
+                alias,
+                ctx.file_str,
+                ctx.source,
+                offset,
+                alias.len(),
+            ));
         }
         let resolved = self
             .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
@@ -1757,9 +1839,16 @@ impl ModuleCache {
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
         // Per spec: only functions and the prompt body are imported via merge.
         // Frontmatter variables from the imported module are NOT brought into scope.
+        let line_len = line_len_at(ctx.source, offset);
         for (name, func) in resolved.get_all_exports() {
             if scope.get_function(&name).is_some() {
-                return Err(MdsError::name_collision(name));
+                return Err(MdsError::name_collision_at(
+                    &name,
+                    ctx.file_str,
+                    ctx.source,
+                    offset,
+                    line_len,
+                ));
             }
             scope.set_function(&name, func);
         }
@@ -1781,9 +1870,7 @@ impl ModuleCache {
         let resolved = self
             .resolve_import_from(ctx.base_dir, path, ctx.runtime_vars, warnings)
             .map_err(|e| attach_import_span(e, path, ctx.file_str, ctx.source, offset))?;
-        let line_len = ctx.source[offset..]
-            .find('\n')
-            .unwrap_or(ctx.source[offset..].len());
+        let line_len = line_len_at(ctx.source, offset);
         let not_exported = |name: &str| {
             MdsError::import_error_at(
                 format!("'{name}' is not exported from '{path}'"),
@@ -1988,7 +2075,7 @@ fn apply_map_degradation(
     if builder.segments_dropped {
         warnings.push(format!(
             "source map segment cap ({} segments) exceeded; \
-             source_map will be None for this compilation",
+             no source map will be generated",
             crate::limits::MAX_SOURCEMAP_SEGMENTS,
         ));
         return (raw, None);
@@ -2020,7 +2107,7 @@ fn has_message_block(nodes: &[Node]) -> bool {
                 || block
                     .elseif_branches
                     .iter()
-                    .any(|(_, body)| has_message_block(body))
+                    .any(|branch| has_message_block(&branch.body))
                 || block
                     .else_body
                     .as_deref()
@@ -2439,6 +2526,22 @@ fn parse_frontmatter_mapping(
         Ok(Some(map))
     } else {
         Ok(None)
+    }
+}
+
+/// Returns the byte count from `offset` to just before the next `\n` (or
+/// to the end of the string when there is no newline). Returns `0` when
+/// `offset` is out of bounds or falls on a non-UTF-8 char boundary so callers
+/// degrade gracefully rather than panic (ADR-005 — degrade rather than
+/// mis-attribute; consistent with the `is_char_boundary` guard in
+/// `build_type_mismatch` in evaluator.rs).
+fn line_len_at(source: &str, offset: usize) -> usize {
+    if source.is_char_boundary(offset) {
+        source[offset..]
+            .find('\n')
+            .unwrap_or(source[offset..].len())
+    } else {
+        0
     }
 }
 

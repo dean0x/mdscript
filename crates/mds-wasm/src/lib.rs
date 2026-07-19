@@ -62,7 +62,11 @@ const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
 // ── Defaults ─────────────────────────────────────────────────────────────────
 
 /// Default filename used when the caller does not supply `options.filename`.
-const DEFAULT_FILENAME: &str = "input.mds";
+///
+/// This is the canonical label for all string-source compilations across every
+/// surface — imported from `mds_core` so cross-surface `sources[0]` parity
+/// (PF-007 / AC-API-06) is enforced by the compiler rather than by comment.
+const DEFAULT_FILENAME: &str = mds::STRING_SOURCE_MAP_LABEL;
 
 // ── JS interop primitives ─────────────────────────────────────────────────────
 
@@ -390,6 +394,7 @@ fn extract_compile_options_wasm(obj: &js_sys::Object) -> Result<mds::CompileOpti
     let opts = mds::CompileOptions {
         source_map,
         include_sources_content,
+        ..Default::default()
     };
     opts.validate().map_err(|_| {
         options_error("option \"sourcesContent\" requires \"sourceMap\" to be true")
@@ -680,6 +685,7 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         let compile_opts = mds::CompileOptions {
             source_map: opts.source_map,
             include_sources_content: opts.include_sources_content,
+            ..Default::default()
         };
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let result =

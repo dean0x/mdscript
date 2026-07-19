@@ -1360,6 +1360,123 @@ fn issue_149_indented_fence_inside_list_item_with_braces() {
     );
 }
 
+// ── D2: type_mismatch_at — span threaded from @if/@elseif directive ──────────────
+//
+// These tests verify that a cross-type comparison (e.g. string == number) in an
+// @if or @elseif condition now carries a source span pointing to the directive line,
+// and that the cross-source @extends case degrades gracefully to spanless.
+
+#[test]
+fn d2_type_mismatch_at_if_carries_span() {
+    // A type mismatch in the primary @if condition must carry a span whose offset
+    // falls within the source and whose line/column are computed (non-None).
+    // Source: "@if x == \"3\":\nyes\n@end\n" where x=3 (number from frontmatter).
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err =
+        mds::compile_str(src).expect_err("D2: cross-type == in @if must be a TypeMismatch error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "D2: error must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("D2: @if type_mismatch must carry a span");
+    // Offset should point to the start of "@if x == \"3\":" — after the 14-byte frontmatter prefix.
+    // The exact offset doesn't matter here, but line/column must be populated.
+    assert!(
+        span.line.is_some(),
+        "D2: type_mismatch span must have a line number, got: {span:?}"
+    );
+    assert!(
+        span.column.is_some(),
+        "D2: type_mismatch span must have a column, got: {span:?}"
+    );
+    assert!(
+        span.length > 0,
+        "D2: type_mismatch span length must be > 0, got: {span:?}"
+    );
+}
+
+#[test]
+fn d2_type_mismatch_at_elseif_span_points_to_elseif_not_if() {
+    // A type mismatch in an @elseif branch must carry a span anchored to the
+    // @elseif directive line, NOT to the @if line.
+    // Layout:
+    // line 4 = "@if x == 5:" — valid but always false (x=3 ≠ 5, same type → no mismatch here)
+    // line 5 = "no"
+    // line 6 = "@elseif x == \"3\":" — this is where the type_mismatch fires (int vs string)
+    // Note: bare `@if false:` is rejected by the parser; use a variable comparison instead.
+    let src = "---\nx: 3\n---\n@if x == 5:\nno\n@elseif x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src)
+        .expect_err("D2: cross-type == in @elseif must be a TypeMismatch error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "D2: error must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("D2: @elseif type_mismatch must carry a span");
+    // The span must point to "@elseif x == \"3\":" (line 6 in this 8-line source).
+    // We verify: line >= 5 (at least past the @if line at line 4).
+    let line = span.line.expect("D2: @elseif span must have a line number");
+    assert!(
+        line >= 5,
+        "D2: type_mismatch span from @elseif must point past the @if line; got line={line}"
+    );
+    // Also verify the @if line (4) is NOT the anchor: line must be >= 5 for the @elseif.
+    // (It's line 6 in this 8-line source; we just check >= 5 to avoid hard-coding offset arithmetic.)
+}
+
+#[test]
+fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
+    // A type mismatch in a BASE skeleton `@if` condition (offset relative to the base
+    // template) must NOT be attributed to the CHILD source. The flat
+    // `evaluate(&final_body, …, ctx.source)` path in the `@extends` pipeline evaluates a
+    // body spliced from base-skeleton nodes (base-relative offsets) and child block
+    // overrides (child-relative offsets) against a single `ctx.source` (the child). A
+    // base-relative offset that happens to land within the child source at a char
+    // boundary would otherwise anchor the `type_mismatch` span onto the child's
+    // `@extends` line — mis-attribution to a foreign source. The contract
+    // (`build_type_mismatch` doc / ADR-005) is to degrade to spanless rather than
+    // mis-attribute, exactly as the flat non-`@extends` path never faces this because its
+    // offsets and `ctx.source` share one origin.
+    let mut modules = HashMap::new();
+    modules.insert(
+        "base.mds".to_string(),
+        // `n` is a string; `@if n == 5` is a string-vs-number mismatch that fires at eval
+        // time (the validator cannot type-check it). The `@if` lives in the base SKELETON
+        // (not inside a `@block`), so its offset (14) is base-relative. The `@block`
+        // placeholder lets `child.mds` be a valid extender.
+        "---\nn: hi\n---\n@if n == 5:\nbase-if-branch\n@end\n@block body:\nbase default\n@end\n"
+            .to_string(),
+    );
+    modules.insert(
+        "child.mds".to_string(),
+        // Long enough that the base `@if` offset (14) falls inside the child source at a
+        // valid char boundary — the exact condition that triggered mis-attribution.
+        "@extends \"./base.mds\"\n@block body:\nThis override body is intentionally long so the base skeleton offset lands inside the child source.\n@end\n"
+            .to_string(),
+    );
+    let err = compile_vfs(modules, "child.mds")
+        .expect_err("cross-type mismatch in an inherited @if must error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "must surface as mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    assert!(
+        serialized.span.is_none(),
+        "cross-source @extends type_mismatch must degrade to spanless (never mis-attributed \
+         to the child source); got span: {:?}",
+        serialized.span
+    );
+}
+
 // ── Integration repro: #153 — invalid interpolation hint says \{ not \{{ ───────
 
 #[test]
@@ -1378,4 +1495,105 @@ fn issue_153_invalid_interpolation_hint_text() {
         !msg.contains("\\{{"),
         "#153: error hint must NOT say \\{{{{  (double brace); got: {msg}"
     );
+}
+
+// ── Issue #58: evaluate_with_map file/source single source of truth ───────────
+//
+// Regression guard for the c5a4d65 bug class: `file` and `source` previously
+// traveled as BOTH explicit parameters AND EvalContext fields in the source-map
+// path.  The fix (#58) derives them from `builder.current_src` — the single
+// source of truth — so a caller cannot accidentally pass mismatched values.
+//
+// These tests compile with source_map=true and verify that type_mismatch spans
+// are attributed to the correct source, never to the wrong module.
+
+#[test]
+fn source_map_extends_type_mismatch_span_not_misattributed_to_child() {
+    // With source_map=true, the @extends pipeline uses evaluate_regions_with_map,
+    // which sets builder.current_src to the region's origin before each call.
+    // After issue #58, evaluate_with_map_seeded derives ctx.file/ctx.source from
+    // that builder entry rather than from explicit params — so the region's own
+    // source is always in scope for span attribution.
+    //
+    // A type_mismatch in the BASE skeleton's @if fires with ctx.source = base content.
+    // Any resulting span must fall within the base source, not the child source.
+    let mut modules = HashMap::new();
+    let base_source =
+        "---\nn: hi\n---\n@if n == 5:\nbase-if-branch\n@end\n@block body:\nbase default\n@end\n";
+    modules.insert("base.mds".to_string(), base_source.to_string());
+    modules.insert(
+        "child.mds".to_string(),
+        // Long enough that the base @if offset (14) lands inside the child source at
+        // a valid char boundary — the exact condition that triggered mis-attribution
+        // before c5a4d65 and that #58 structurally prevents.
+        "@extends \"./base.mds\"\n@block body:\nThis override body is intentionally long enough that the base skeleton @if offset falls inside the child source.\n@end\n"
+            .to_string(),
+    );
+    let err = mds::compile_virtual_with_deps_opts(
+        modules,
+        "child.mds",
+        None,
+        mds::CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("cross-type mismatch in an inherited @if must error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "must surface as mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    // In the source_map path, evaluate_regions_with_map evaluates the skeleton
+    // with the base's origin, so the span (if present) must fall within the base
+    // source.  If it degrades to spanless (ADR-005), that is also correct.
+    // What is NOT correct: a span with offset >= base_source.len() pointing into
+    // child territory.
+    if let Some(span) = &serialized.span {
+        assert!(
+            span.offset < base_source.len(),
+            "type_mismatch span (offset={}) must fall within base source (len={}); \
+             a larger offset would indicate mis-attribution to the child source",
+            span.offset,
+            base_source.len()
+        );
+    }
+}
+
+#[test]
+fn source_map_standalone_type_mismatch_carries_span() {
+    // Standalone (non-@extends) compile with source_map=true: the builder is seeded
+    // with the module's own file/source at current_src=0.  After issue #58,
+    // evaluate_with_map derives ctx.file and ctx.source from that entry.
+    // A type_mismatch in the @if must carry a span whose offset falls within the source.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str_with_deps_opts(
+        src,
+        None,
+        None,
+        mds::CompileOptions {
+            source_map: true,
+            include_sources_content: false,
+            ..Default::default()
+        },
+    )
+    .expect_err("cross-type == in @if must fail");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "must surface as mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("standalone source_map type_mismatch must carry a span");
+    assert!(
+        span.offset < src.len(),
+        "span offset ({}) must fall within the source (len={})",
+        span.offset,
+        src.len()
+    );
+    assert!(span.length > 0, "span length must be > 0, got: {span:?}");
 }

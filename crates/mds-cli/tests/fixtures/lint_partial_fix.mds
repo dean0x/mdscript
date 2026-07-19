@@ -1,0 +1,12 @@
+@define empty_fn():
+
+@end
+
+@export empty_fn
+
+@define greet(name):
+  Hello {name}!
+@end
+
+@export greet
+@export greet

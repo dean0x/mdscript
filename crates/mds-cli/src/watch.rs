@@ -39,8 +39,8 @@ use crate::build::{
     resolve_output_path_for_kind, write_output, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
-    canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
-    probe_and_remove_stale, resolve_output_base, OutputBase,
+    canonicalize_out_dir, collect_mds_files, is_partial, is_within_default_excluded_dir,
+    output_base_no_ext, output_path_for, probe_and_remove_stale, resolve_output_base, OutputBase,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -87,14 +87,11 @@ pub(crate) fn dirs_to_watch(
     let mut dirs = BTreeSet::new();
 
     let push_parent = |path: &Path, set: &mut BTreeSet<PathBuf>| {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                set.insert(parent.to_path_buf());
-            } else {
-                // Relative path with no directory component: watch "."
-                set.insert(PathBuf::from("."));
-            }
-        }
+        // Route through mds::effective_parent so that bare filenames — where
+        // Path::parent() returns Some("") rather than None — are handled by the
+        // single canonical implementation rather than an inline re-implementation.
+        // Avoids PF-006: one owner, one place to maintain or regress.
+        set.insert(mds::effective_parent(path).to_path_buf());
     };
 
     push_parent(entry, &mut dirs);
@@ -200,12 +197,15 @@ pub(crate) fn graph_key(p: &Path) -> PathBuf {
     if let Ok(c) = p.canonicalize() {
         return c;
     }
-    // File doesn't exist (just deleted): canonicalize parent + rejoin filename.
-    if let Some(parent) = p.parent() {
-        if let Ok(cp) = parent.canonicalize() {
-            if let Some(name) = p.file_name() {
-                return cp.join(name);
-            }
+    // File doesn't exist (just deleted): canonicalize effective parent + rejoin filename.
+    // mds::effective_parent maps Some("") (bare filename, e.g. "hello.mds") to
+    // Path::new(".") so that "".canonicalize() never runs — avoids PF-006 in the
+    // graph-key lookup-miss path: without this guard a bare-named file that is
+    // deleted cannot be matched against the absolute-path keys stored in forward_deps.
+    let parent = mds::effective_parent(p);
+    if let Ok(cp) = parent.canonicalize() {
+        if let Some(name) = p.file_name() {
+            return cp.join(name);
         }
     }
     p.to_path_buf()
@@ -525,7 +525,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<()> {
 
     // Resolve the input path (may trigger auto-detect).
     let resolved_input = match input {
-        None => auto_detect_mds_file()?,
+        None => auto_detect_mds_file("watch")?,
         Some(p) => p,
     };
 
@@ -1539,6 +1539,13 @@ fn handle_fs_event_dir(
         changed.retain(|p| !p.starts_with(od));
     }
 
+    // PF-004: drop events from default-excluded subdirectories (hidden dirs and
+    // node_modules/) inside the watch root.  The initial walker never seeds files
+    // from those dirs, so they are not in the dep graph and processing their
+    // events would cause spurious rebuilds (e.g. npm install writing to
+    // node_modules/ triggers a full re-scan on every package update).
+    changed.retain(|p| !is_within_default_excluded_dir(&ctx.root, p));
+
     // Check if the vars file changed.
     let vars_changed = ctx
         .vars_path
@@ -2038,6 +2045,12 @@ fn process_dir_batch_incremental(
     for src in &affected {
         // External-only deps are graph nodes but never emit output (DD3).
         let is_in_root = src.starts_with(root);
+        // PF-004: paths inside default-excluded subdirs (hidden dirs, node_modules/)
+        // that happen to be under root are treated as external deps — they get a quiet
+        // dep-refresh compile but never emit output.  This is the same invariant as the
+        // initial walker (which never recurses into those dirs), applied here on the
+        // parallel event-processing path so the two paths stay consistent.
+        let is_excluded_in_root = is_in_root && is_within_default_excluded_dir(root, src);
         let is_known_external = state
             .external_dep_dirs
             .iter()
@@ -2065,8 +2078,9 @@ fn process_dir_batch_incremental(
             continue;
         }
 
-        // External deps are graph nodes but never emit their own output (DD3).
-        if !is_in_root {
+        // External deps (out-of-root) AND excluded-in-root paths (node_modules/, .git/,
+        // hidden dirs) are graph nodes but never emit their own output (DD3 pattern).
+        if !is_in_root || is_excluded_in_root {
             // Compile to refresh deps only; suppress output by using quiet=true.
             match compile_to_content(
                 src,

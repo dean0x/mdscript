@@ -2,6 +2,7 @@ import type {
   BackendType,
   MdsBaseBackend,
   MdsNodeBackend,
+  CheckOptions,
   CompileResult,
   CheckResult,
   CompileOptions,
@@ -15,6 +16,7 @@ import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
 import { buildModulesMap } from './util/module-scanner.js';
+import { assertKnownKeys } from './util/options.js';
 
 // Read MDS_BACKEND at module scope — sync, deterministic, no I/O.
 const rawBackend = process.env['MDS_BACKEND'];
@@ -94,7 +96,7 @@ function wrapWithFileOps(
       return result as CompileResult;
     },
 
-    async checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
+    async checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
       const { source, opts } = await prepareFileArgs(path, options);
       const result: unknown = wasmModule.check(source, opts);
       assertResultShape(result, 'check');
@@ -240,31 +242,41 @@ function assertReady(): MdsNodeBackend {
 
 /** Compile an MDS source string. Returns a discriminated-union CompileResult (kind: 'markdown' | 'messages'). Requires init() to have been called and awaited first. */
 export function compile(source: string, options?: CompileOptions): CompileResult {
+  if (options != null) assertKnownKeys(options, 'compile');
   return assertReady().compile(source, options);
 }
 
 /** Validate an MDS source string without rendering. Requires init() to have been called and awaited first. */
-export function check(source: string, options?: CompileOptions): CheckResult {
+export function check(source: string, options?: CheckOptions): CheckResult {
+  if (options != null) assertKnownKeys(options, 'check');
   return assertReady().check(source, options);
 }
 
 /** Compile an MDS file, resolving @import directives relative to the file. Returns a discriminated-union CompileResult. Requires init() to have been called and awaited first. */
 export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
+  if (options != null) assertKnownKeys(options, 'compileFile');
   return assertReady().compileFile(path, options);
 }
 
-/** Validate an MDS file without rendering, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
-export function checkFile(path: string, options?: FileOptions): Promise<CheckResult> {
+/**
+ * Validate an MDS file without rendering, resolving @import directives relative to the file.
+ * Only `vars` is forwarded; source-map options are not applicable to check operations.
+ * Requires init() to have been called and awaited first.
+ */
+export function checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
+  if (options != null) assertKnownKeys(options, 'checkFile');
   return assertReady().checkFile(path, options);
 }
 
 /** Lint an MDS source string. Returns a LintResult with per-rule findings. Requires init() to have been called and awaited first. */
 export function lint(source: string, options?: LintOptions): LintResult {
+  if (options != null) assertKnownKeys(options, 'lint');
   return assertReady().lint(source, options);
 }
 
 /** Lint an MDS file, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
 export function lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+  if (options != null) assertKnownKeys(options, 'lintFile');
   return assertReady().lintFile(path, options);
 }
 
@@ -274,6 +286,7 @@ export function lintVirtual(
   entry: string,
   options?: LintFileOptions,
 ): LintResult {
+  if (options != null) assertKnownKeys(options, 'lintVirtual');
   return assertReady().lintVirtual(modules, entry, options);
 }
 
@@ -285,6 +298,7 @@ export function getBackend(): BackendType {
 export { isMdsError } from './types.js';
 export type {
   BackendType,
+  CheckOptions,
   CheckResult,
   CompileOptions,
   CompileResult,

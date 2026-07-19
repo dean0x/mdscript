@@ -7,7 +7,10 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use mds::{CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH};
+use mds::{
+    effective_parent, sanitize_control_chars, CompiledOutput, MdsError, MAX_FILE_SIZE,
+    MAX_TRAVERSAL_DEPTH, STRING_SOURCE_MAP_LABEL,
+};
 use miette::Result;
 use serde::Deserialize;
 
@@ -110,16 +113,20 @@ const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 /// resolve relative `output_dir` values.
 pub(crate) fn load_config(start: &Path) -> Result<Option<(MdsConfig, PathBuf)>> {
     // Walk upward from `start` (which may be a file; begin at its parent).
-    let start_dir = if start.is_dir() {
+    // avoids PF-006: a relative start_dir (e.g. "" or ".") causes current.parent()
+    // to return None after just 1–2 iterations, making grandparent mds.json
+    // unreachable even when MAX_TRAVERSAL_DEPTH would allow it.  Canonicalize
+    // to an absolute path first so every parent() step advances one real directory.
+    let raw_start_dir = if start.is_dir() {
         start.to_path_buf()
     } else {
-        start
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+        effective_parent(start).to_path_buf()
     };
 
-    let mut current = start_dir;
+    let mut current = match raw_start_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => raw_start_dir,
+    };
     // Cap prevents unbounded traversal on unusual filesystems.
     for _ in 0..MAX_TRAVERSAL_DEPTH {
         let candidate = current.join("mds.json");
@@ -331,7 +338,8 @@ pub(crate) fn resolve_output_path_for_kind(
     match input_path {
         Some(p) => {
             let filename = derive_output_filename_for_kind(p, kind);
-            let dir = p.parent().unwrap_or(Path::new("."));
+            // effective_parent maps "" (bare filename) to "." — avoids PF-006.
+            let dir = effective_parent(p);
             Ok(Some(dir.join(filename)))
         }
         // Should not reach here (auto-detect always sets Some), but stdout as safe fallback.
@@ -546,7 +554,7 @@ pub(crate) fn write_output(
 ///
 /// Returns `Ok(path)` if exactly one `.mds` file is found, or an `Err` describing
 /// why auto-detection failed (zero files, multiple files, or I/O error).
-pub(crate) fn auto_detect_mds_file() -> Result<PathBuf> {
+pub(crate) fn auto_detect_mds_file(subcommand: &str) -> Result<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|e| miette::miette!("cannot determine current directory: {e}"))?;
 
@@ -573,7 +581,7 @@ pub(crate) fn auto_detect_mds_file() -> Result<PathBuf> {
             names.sort();
             Err(miette::miette!(
                 "multiple .mds files found: {}\n  \
-                 hint: specify which file to compile, e.g. 'mds build {}'",
+                 hint: specify which file, e.g. 'mds {subcommand} {}'",
                 names.join(", "),
                 names.first().map(|s| s.as_str()).unwrap_or("<file>.mds"),
             ))
@@ -740,11 +748,14 @@ pub(crate) struct BuildArgs {
 
 /// Resolve the input path: use the explicit value, or auto-detect from cwd.
 ///
+/// `subcommand` is the CLI verb (e.g. `"build"`, `"lint"`, `"fmt"`, `"check"`, `"watch"`)
+/// used in the auto-detect error hint so the user sees a correct example command.
+///
 /// Returns `(path, auto_detected)`.
-pub(crate) fn resolve_input(input: Option<PathBuf>) -> Result<(PathBuf, bool)> {
+pub(crate) fn resolve_input(input: Option<PathBuf>, subcommand: &str) -> Result<(PathBuf, bool)> {
     match input {
         Some(p) => Ok((p, false)),
-        None => auto_detect_mds_file().map(|p| (p, true)),
+        None => auto_detect_mds_file(subcommand).map(|p| (p, true)),
     }
 }
 
@@ -834,154 +845,108 @@ pub(crate) fn embed_carrier(content: String, map_json: &str) -> String {
     format!("{base}{sep}{}\n", carrier_line(map_json))
 }
 
-/// Compute a relative path from `base_dir` to `target` using forward slashes.
+/// Compute the directory to use as `source_map_base` in [`mds::CompileOptions`].
 ///
-/// Used to relativize `sources[]` entries in the source map so they are
-/// map-relative rather than absolute (AC-FUNC-05 / AC-SEC-01).
+/// This is the map-file directory: the anchor against which core's
+/// `relativize_source` relativizes every `sources[]` entry (ADR-005 / PF-004 —
+/// single choke-point in core).  Must be called BEFORE constructing
+/// `CompileOptions` so `source_map_base` can be set on the options struct.
 ///
-/// Falls back to the absolute path (forward-slash converted) when a relative
-/// path cannot be computed (e.g. different drive roots on Windows).
-pub(crate) fn relative_path(base_dir: &Path, target: &Path) -> String {
-    // Use `pathdiff` logic inline so we don't add a dependency.
-    // Build the relative path by walking up from base_dir to the common ancestor,
-    // then down to target.
-    let base = base_dir;
-    let mut base_comps: Vec<_> = base.components().collect();
-    let mut target_comps: Vec<_> = target.components().collect();
-
-    // Strip common prefix.
-    let common = base_comps
-        .iter()
-        .zip(target_comps.iter())
-        .take_while(|(b, t)| b == t)
-        .count();
-    base_comps.drain(..common);
-    target_comps.drain(..common);
-
-    if base_comps.is_empty() && target_comps.is_empty() {
-        return ".".to_string();
-    }
-
-    let mut parts: Vec<String> = Vec::new();
-    for _ in &base_comps {
-        parts.push("..".to_string());
-    }
-    for c in &target_comps {
-        parts.push(c.as_os_str().to_string_lossy().into_owned());
-    }
-
-    let rel = parts.join("/");
-    // Guard: if rel somehow became empty use ".".
-    if rel.is_empty() {
-        ".".to_string()
-    } else {
-        rel
-    }
-}
-
-/// Relativize and sanitize a single source path for use in `sources[]`.
+/// The result is always absolutized against the current working directory so
+/// that core's root-containment check works correctly against the absolute
+/// project root.
 ///
-/// Rules (AC-FUNC-05 / AC-SEC-01 / PF-003):
-/// 1. `<source>` sentinel → relabeled to `<stdin>` (AC-FUNC-12) when
-///    the caller explicitly passes `stdin_label = true`.
-/// 2. Windows `\\?\` verbatim-prefix paths → stripped before further processing.
-/// 3. Absolute paths → relativized against `map_dir`.
-/// 4. Relative paths → left as-is (already relative).
-/// 5. All backslashes → forward slashes (AC-FUNC-05).
-/// 6. Result MUST NOT be an absolute path (enforced by assertion).
-pub(crate) fn relativize_source_path(source: &str, map_dir: &Path, stdin_label: bool) -> String {
-    // Rule 1: stdin sentinel relabeling.
-    if source == "<source>" && stdin_label {
-        return "<stdin>".to_string();
-    }
-    // Pass through non-path sentinels unchanged (e.g. "<source>" in non-stdin builds).
-    if source.starts_with('<') && source.ends_with('>') {
-        return source.to_string();
-    }
-
-    // Rule 2: strip Windows \\?\ verbatim prefix (PF-003 / AC-SEC-01).
-    let stripped = source.strip_prefix(r"\\?\").unwrap_or(source);
-
-    // Normalize to a Path.
-    let p = Path::new(stripped);
-
-    let result = if p.is_absolute() {
-        // Rule 3: relativize the absolute source against the map directory.
-        // `map_dir` derives from the caller's `-o` value and may itself be
-        // relative (or empty when `-o` is a bare filename). Absolutize it
-        // against the CWD first so both paths share one coordinate space —
-        // otherwise the component diff embeds the source's absolute path
-        // verbatim (`..//abs/...`) or produces a leading-`/` result, leaking
-        // the filesystem path into sources[] (AC-SEC-01).
-        let abs_map_dir = if map_dir.is_absolute() {
-            map_dir.to_path_buf()
+/// Mirrors the output-directory rules of [`resolve_output_path_for_kind`]:
+/// - `-o -` or stdin-with-no-output → current working directory.
+/// - `-o <file>` → directory of that file (absolutized if relative).
+/// - `--out-dir <dir>` → that directory (absolutized if relative).
+/// - mds.json `output_dir` → config-directory-relative.
+/// - Default → beside the source file.
+fn compute_source_map_base(
+    input: &Path,
+    output: &Option<String>,
+    out_dir: &Option<PathBuf>,
+    config: &Option<(MdsConfig, PathBuf)>,
+) -> Option<PathBuf> {
+    let cwd = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let abs = |p: PathBuf| -> PathBuf {
+        if p.is_absolute() {
+            p
         } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(map_dir)
-        };
-        relative_path(&abs_map_dir, p)
-    } else {
-        // Rule 4: already relative — convert separators only.
-        stripped.replace('\\', "/")
+            cwd().join(p)
+        }
     };
 
-    // AC-SEC-01: never leak an absolute path into sources[]. The relativization
-    // above yields a relative path for same-root inputs; as defense-in-depth for
-    // exotic cross-root cases (e.g. different Windows drives), degrade a
-    // still-absolute result to the bare file name rather than panicking or
-    // leaking a filesystem path. Runtime guard (not debug_assert) so the
-    // guarantee holds in release builds too.
-    //
-    // SEC-2 (guards PF-005 theme / AC-SEC-01): broaden the Windows drive-path
-    // guard beyond the backslash-only check.  `relative_path` and Rule 4 both
-    // normalise separators to `/`, so a forward-slashed drive path such as
-    // `C:/secret/foo.mds` or a cross-drive relative result like `../../D:/x.mds`
-    // contains `:/` rather than `:\\` and slipped through the old guard.  The
-    // three conditions below together catch all three forms:
-    //   • `:\` — classic backslash-qualified Windows drive path
-    //   • `:/` — forward-slash-normalised Windows drive path (SEC-2 gap)
-    //   • leading `<letter>:` — bare drive designator without a separator
-    let is_drive_qualified = |s: &str| -> bool {
-        s.contains(":\\")
-            || s.contains(":/")
-            || (s.len() >= 2
-                && (s.as_bytes()[0] as char).is_ascii_alphabetic()
-                && s.as_bytes()[1] == b':')
-    };
-    if result.starts_with('/') || is_drive_qualified(&result) {
-        return Path::new(stripped)
-            .file_name()
-            .map(|n| n.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|| "source".to_string());
+    match output.as_deref() {
+        Some("-") => {
+            // -o - : stdout; relativize against CWD (PF-005: unconditional).
+            Some(cwd())
+        }
+        Some(o) => {
+            // -o <file>: map lives beside the output file.
+            // effective_parent maps "" (bare filename) to "." — PF-006.
+            Some(abs(effective_parent(Path::new(o)).to_path_buf()))
+        }
+        None => {
+            if let Some(dir) = out_dir {
+                // --out-dir <dir>: absolutize if relative.
+                Some(abs(dir.clone()))
+            } else if input == Path::new("-") {
+                // Stdin with no -o or --out-dir → stdout → relativize against CWD.
+                Some(cwd())
+            } else if let Some((cfg, config_dir)) = config {
+                if let Some(ref output_dir) = cfg.build.output_dir {
+                    // mds.json output_dir: config-directory-relative.  `config_dir`
+                    // is canonical (load_config canonicalizes before walking up) so
+                    // the join is already absolute in practice; `abs` makes the
+                    // "result is always absolutized" contract above structural
+                    // rather than incidental — a relative base would silently
+                    // demote core's map-relative emission to root-relative.
+                    Some(abs(config_dir.join(output_dir)))
+                } else {
+                    // Default: beside the source file.
+                    Some(abs(effective_parent(input).to_path_buf()))
+                }
+            } else {
+                // No config, no -o, no --out-dir: beside the source file.
+                Some(abs(effective_parent(input).to_path_buf()))
+            }
+        }
     }
-
-    result
 }
 
-/// Relativize `sources[]` and set `file` in a [`mds::SourceMap`] in place.
+/// Set the SMv3 `file` field and relabel the stdin source in a [`mds::SourceMap`].
 ///
-/// Must be called before writing the map to disk or embedding it inline.
-/// - `output_path`: the path where the compiled output is written (used to
-///   compute the map directory and the `file` basename).
-/// - When `output_path` is `None` (stdout), sources are left as-is and
-///   `file` remains as set by the core (no map-relative anchor exists).
-pub(crate) fn relativize_source_map_fields(
+/// These are the CLI's two genuinely CLI-only post-processing jobs after core
+/// has already applied `relativize_source` at both finalize sites (ADR-005 /
+/// PF-004 — single choke-point in core):
+///
+/// 1. `sm.file = output_basename` — the SMv3 `file` field names the generated
+///    artifact; core always emits `file: None` because it has no notion of the
+///    output path.
+/// 2. The `<stdin>` relabel: maps `STRING_SOURCE_MAP_LABEL` (`"input.mds"`) →
+///    `"<stdin>"` for stdin builds.  Core canonicalizes the source entry at
+///    `MapBuilder::new`/`source_index`, so the exact-string check here always
+///    matches the canonicalized value.  This is a pure label swap — no path
+///    logic.
+pub(crate) fn apply_source_map_file_label(
     sm: &mut mds::SourceMap,
     output_path: Option<&Path>,
     stdin_label: bool,
 ) {
-    let Some(out) = output_path else {
-        return;
-    };
-    let map_dir = out.parent().unwrap_or(Path::new("."));
+    // Job 1: set the `file` field for file output.
+    if let Some(out) = output_path {
+        sm.file = out.file_name().map(|n| n.to_string_lossy().into_owned());
+    }
+    // `sm.file` stays None for stdout output (no output filename to anchor).
 
-    // Set `file` to the output basename.
-    sm.file = out.file_name().map(|n| n.to_string_lossy().into_owned());
-
-    // Relativize each source.
-    for src in &mut sm.sources {
-        *src = relativize_source_path(src, map_dir, stdin_label);
+    // Job 2: relabel the stdin source entry.
+    if stdin_label {
+        for src in &mut sm.sources {
+            if src == STRING_SOURCE_MAP_LABEL {
+                *src = "<stdin>".to_string();
+            }
+        }
     }
 }
 
@@ -1058,7 +1023,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
     // Resolve the input: explicit path, or auto-detect from cwd.
     // When auto-detected, print a "Building {path}" banner so users know which file was selected.
-    let (input, auto_detected) = resolve_input(input)?;
+    let (input, auto_detected) = resolve_input(input, "build")?;
     if auto_detected && !quiet {
         eprintln!("Building {}", input.display());
     }
@@ -1123,16 +1088,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             );
         }
 
-        // Inline + stdout is not supported (there is no file to embed the carrier into).
-        if use_source_map && inline && output.as_deref() == Some("-") {
-            return Err(miette::miette!(
-                "--inline cannot be used with -o - (stdout has no file to embed the carrier into)"
-            ));
-        }
-
+        let source_map_base = compute_source_map_base(Path::new("-"), &output, &out_dir, &None);
         let opts = mds::CompileOptions {
             source_map: use_source_map,
             include_sources_content: use_embed_sources,
+            source_map_base,
         };
 
         let (source, cwd) = read_stdin()?;
@@ -1153,8 +1113,8 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             resolve_output_path_for_kind(&Some(input), &output, &out_dir, &None, kind, quiet)?;
 
         if let Some(ref mut sm) = source_map {
-            // Relabel <source> → <stdin> for stdin builds (AC-FUNC-12).
-            relativize_source_map_fields(sm, output_path.as_deref(), true);
+            // Set `file` field and relabel source entry for stdin builds (AC-FUNC-12).
+            apply_source_map_file_label(sm, output_path.as_deref(), true);
         }
 
         if use_source_map {
@@ -1222,9 +1182,11 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         );
     }
 
+    let source_map_base = compute_source_map_base(&input, &output, &out_dir, &config);
     let opts = mds::CompileOptions {
         source_map: use_source_map,
         include_sources_content: use_embed_sources,
+        source_map_base,
     };
 
     let compiled = compile_to_content(&input, runtime_vars, quiet, opts)?;
@@ -1239,7 +1201,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
     let mut source_map = compiled.source_map;
     if let Some(ref mut sm) = source_map {
-        relativize_source_map_fields(sm, output_path.as_deref(), false);
+        apply_source_map_file_label(sm, output_path.as_deref(), false);
     }
 
     if use_source_map {
@@ -1332,8 +1294,8 @@ fn run_build_directory(
     inline: bool,
 ) -> Result<()> {
     use crate::output::{
-        canonicalize_out_dir, collect_mds_files, is_partial, output_base_no_ext, output_path_for,
-        probe_and_remove_stale, resolve_output_base, OutputBase,
+        canonicalize_out_dir, collect_mds_files_detailed, is_partial, output_base_no_ext,
+        output_path_for, probe_and_remove_stale, resolve_output_base, OutputBase,
     };
 
     const MAX_DEPTH: usize = 64;
@@ -1358,19 +1320,27 @@ fn run_build_directory(
         _ => None,
     };
 
-    let files = collect_mds_files(dir, MAX_DEPTH, exclude_prefix.as_deref());
+    let walk = collect_mds_files_detailed(dir, MAX_DEPTH, exclude_prefix.as_deref());
+    let files = walk.files;
 
     if files.is_empty() {
+        if walk.excluded_by_default > 0 {
+            // All candidates were inside default-excluded directories.  Emit the
+            // diagnostic even under --quiet (avoids a silent CI green pass — avoids
+            // PF-004 enforcement gap where the limit is real on one path and absent
+            // on another).
+            eprintln!(
+                "{} .mds file(s) found but all are under default-excluded directories \
+                 (hidden dirs, node_modules); nothing was built",
+                walk.excluded_by_default
+            );
+            std::process::exit(1);
+        }
         if !quiet {
             eprintln!("No .mds files found in {}", dir.display());
         }
         return Ok(());
     }
-
-    let opts = mds::CompileOptions {
-        source_map,
-        include_sources_content: embed_sources,
-    };
 
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
@@ -1389,8 +1359,23 @@ fn run_build_directory(
             continue;
         }
 
+        // Per-file source_map_base: the output directory for this file, computed
+        // from the kind-independent directory oracle (avoids calling
+        // prepare_output_dir_for_kind here — an early create_dir_all would leave
+        // an empty directory on compile failure; Step 6 Caveat 1 / PF-004).
+        let base_no_ext = output_base_no_ext(file, dir, &output_base);
+        let source_map_base = base_no_ext
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let opts = mds::CompileOptions {
+            source_map,
+            include_sources_content: embed_sources,
+            source_map_base: Some(source_map_base),
+        };
+
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
-        match compile_to_content(file, runtime_vars.clone(), quiet, opts.clone()) {
+        match compile_to_content(file, runtime_vars.clone(), quiet, opts) {
             Ok(mut compiled) => {
                 let ext = compiled.kind.extension();
                 let out_path = output_path_for(file, dir, &output_base, ext);
@@ -1409,9 +1394,9 @@ fn run_build_directory(
                     }
                 }
 
-                // Relativize source map fields for this output path.
+                // Set `file` field for this output path (sources already relativized by core).
                 if let Some(ref mut sm) = compiled.source_map {
-                    relativize_source_map_fields(sm, Some(&out_path), false);
+                    apply_source_map_file_label(sm, Some(&out_path), false);
                 }
 
                 // Determine final content (inline embeds the carrier).
@@ -1477,7 +1462,9 @@ fn run_build_directory(
                 }
             }
             Err(e) => {
-                eprintln!("{e:?}");
+                // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
+                // source fragments that may contain raw ESC bytes (avoids terminal escape injection).
+                eprintln!("{}", sanitize_control_chars(&format!("{e:?}")));
                 fail_count += 1;
             }
         }
@@ -1496,6 +1483,75 @@ fn run_build_directory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── compute_source_map_base ───────────────────────────────────────────────
+    //
+    // `source_map_base` is the anchor core's `relativize_source` uses to emit
+    // map-relative `sources[]` (ADR-005).  Core resolves it against an ABSOLUTE
+    // project root, so a relative base fails the containment check and silently
+    // demotes the result to root-relative — a `sources[]` entry that no longer
+    // resolves from the map file's directory.  The invariant is therefore
+    // "every branch returns Some(absolute)", asserted here per branch because
+    // the failure mode is silent (wrong paths, not an error).
+
+    #[test]
+    fn source_map_base_is_absolute_for_every_output_mode() {
+        let input = PathBuf::from("src/a.mds");
+        let cases: Vec<(&str, Option<String>, Option<PathBuf>)> = vec![
+            ("-o - (stdout)", Some("-".to_string()), None),
+            (
+                "-o relative/out.md",
+                Some("relative/out.md".to_string()),
+                None,
+            ),
+            ("-o bare.md", Some("bare.md".to_string()), None),
+            ("-o /abs/out.md", Some("/abs/out.md".to_string()), None),
+            ("--out-dir relative", None, Some(PathBuf::from("dist"))),
+            ("--out-dir /abs", None, Some(PathBuf::from("/abs/dist"))),
+            ("default (beside source)", None, None),
+        ];
+        for (label, output, out_dir) in cases {
+            let got = compute_source_map_base(&input, &output, &out_dir, &None)
+                .unwrap_or_else(|| panic!("{label}: source_map_base must never be None"));
+            assert!(
+                got.is_absolute(),
+                "{label}: source_map_base must be absolute so core's root-containment \
+                 check succeeds; got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_map_base_for_bare_filename_output_is_cwd() {
+        // PF-006: Path::parent() of a bare filename is Some("") not None, so a
+        // naive parent() would yield an empty (relative) base here.
+        let got = compute_source_map_base(
+            Path::new("src/a.mds"),
+            &Some("out.md".to_string()),
+            &None,
+            &None,
+        )
+        .expect("bare -o must still produce a base");
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            got, cwd,
+            "`-o out.md` writes into the CWD, so the map base is the CWD"
+        );
+    }
+
+    #[test]
+    fn source_map_base_tracks_the_output_file_directory() {
+        // The map is written beside the output file, so the base must be the
+        // output file's directory — this is what makes sources[] map-relative.
+        let got = compute_source_map_base(
+            Path::new("src/a.mds"),
+            &Some("dist/nested/a.md".to_string()),
+            &None,
+            &None,
+        )
+        .expect("base must be Some");
+        assert_eq!(got, std::env::current_dir().unwrap().join("dist/nested"));
+    }
 
     #[test]
     fn parse_cli_value_nan_is_string() {
@@ -1785,84 +1841,6 @@ mod tests {
             map.get("id"),
             Some(&mds::Value::String("009".to_string())),
             "last --set-string wins within the same flag"
-        );
-    }
-
-    // ── AC-SEC-01: source-path relativization must never leak an absolute path ──
-
-    #[test]
-    fn relativize_absolute_source_with_absolute_mapdir_is_clean_relative() {
-        // Both absolute, sharing a common ancestor → clean map-relative path.
-        let got = relativize_source_path("/proj/src/a.mds", Path::new("/proj/build"), false);
-        assert_eq!(
-            got, "../src/a.mds",
-            "same-root absolute paths relativize cleanly"
-        );
-    }
-
-    #[test]
-    fn relativize_absolute_source_with_relative_mapdir_never_leaks_absolute() {
-        // Regression: a relative `-o` (relative map_dir) diffed against an
-        // absolute source previously produced `..//abs/...` (or a leading-'/'
-        // result that panicked the debug_assert), leaking the absolute path.
-        // After absolutizing map_dir against the CWD the result must be a clean
-        // relative path — never absolute, never an embedded absolute prefix.
-        let got =
-            relativize_source_path("/tmp/deep/nested/abs_input.mds", Path::new("build"), false);
-        assert!(!got.starts_with('/'), "must not be absolute: {got}");
-        assert!(
-            !got.contains("//"),
-            "must not embed a raw absolute path: {got}"
-        );
-        assert!(
-            !got.contains(":\\"),
-            "must not embed a Windows drive path: {got}"
-        );
-        assert!(
-            got.ends_with("abs_input.mds"),
-            "must still resolve to the source file: {got}"
-        );
-    }
-
-    #[test]
-    fn relativize_absolute_source_with_empty_mapdir_never_leaks_absolute() {
-        // `-o out.md` (bare filename) yields an EMPTY map_dir. Previously this
-        // produced a leading-'/' result (`//abs/...`) that panicked in debug and
-        // leaked an absolute path in release. Must now be a clean relative path.
-        let got = relativize_source_path("/tmp/deep/abs_input.mds", Path::new(""), false);
-        assert!(!got.starts_with('/'), "must not be absolute: {got}");
-        assert!(
-            !got.contains("//"),
-            "must not embed a raw absolute path: {got}"
-        );
-        assert!(
-            got.ends_with("abs_input.mds"),
-            "must still resolve to the source file: {got}"
-        );
-    }
-
-    // SEC-2: forward-slashed Windows drive paths must also degrade to filename.
-    // (The old guard only checked ":\\" — "C:/" slipped through.)
-
-    #[test]
-    fn relativize_forward_slashed_drive_path_degrades_to_filename() {
-        // `C:/secret/foo.mds` on Unix is not seen as absolute by Path, so it
-        // went through Rule 4 unchanged and slipped past the old `":\\"` guard.
-        let got = relativize_source_path("C:/secret/foo.mds", Path::new("build"), false);
-        assert_eq!(
-            got, "foo.mds",
-            "forward-slashed drive path must degrade to filename: {got}"
-        );
-    }
-
-    #[test]
-    fn relativize_cross_drive_relative_path_degrades_to_filename() {
-        // A cross-drive path suffix (`../../D:/x.mds`) that passes through
-        // Rule 4 contains `:/ ` not `:\\` and previously slipped through.
-        let got = relativize_source_path("../../D:/x.mds", Path::new("build"), false);
-        assert_eq!(
-            got, "x.mds",
-            "cross-drive :/ path must degrade to filename: {got}"
         );
     }
 

@@ -64,8 +64,9 @@ def test_sm_py1_compile_produces_source_map() -> None:
     sm = result.source_map
     assert sm is not None, "source_map getter should be non-None"
     _check_sm_structure(sm)
-    # String-source compilation uses "<source>" as the entry label.
-    assert sm["sources"] == ["<source>"]
+    # String-source compilation uses "input.mds" (STRING_SOURCE_MAP_LABEL) as
+    # the entry label — unified with the WASM backend via the choke-point fix.
+    assert sm["sources"] == ["input.mds"]
 
 
 def test_sm_py1_compile_virtual_produces_source_map() -> None:
@@ -122,10 +123,13 @@ def test_sm_py4_messages_mode_degrades() -> None:
     # Messages-mode templates have no renderable output → no source map.
     assert result.source_map is None
     assert result.kind == "messages"
-    # The binding should emit a warning about source map being unavailable.
+    # The binding must emit MSG_MODE_SOURCE_MAP_WARNING (shared core constant).
+    # The assertion is anchored to a distinctive phrase from that constant so
+    # that any drift of the constant text is caught here (avoids PF-007).
     warnings = result.warnings
-    assert any("source_map" in w or "messages-mode" in w for w in warnings), (
-        f"expected a source_map/messages-mode warning, got: {warnings}"
+    assert any("messages-mode templates" in w for w in warnings), (
+        f"expected MSG_MODE_SOURCE_MAP_WARNING (contains 'messages-mode templates'), "
+        f"got: {warnings}"
     )
 
 
@@ -290,9 +294,17 @@ def test_sm_py10_compile_file_source_map() -> None:
     sm = result.source_map
     assert sm is not None
     _check_sm_structure(sm)
-    # compile_file uses the absolute path as the source label.
+    # compile_file now emits root-relative paths in sources[] (ADR-005 Phase A
+    # choke-point fix in source_path.rs::relativize_source).  The value is a
+    # slash-separated path relative to the project root (located via .mdsroot /
+    # .git walk-up), NOT the absolute filesystem path.  Since the fixtures dir
+    # is the project root for this test, sources[0] ends with "simple.mds".
     assert len(sm["sources"]) == 1
     assert sm["sources"][0].endswith("simple.mds")
+    # Must be root-relative, NOT an absolute filesystem path (ADR-005 security fix).
+    assert not sm["sources"][0].startswith("/"), (
+        f"sources[0] must not be an absolute path; got: {sm['sources'][0]!r}"
+    )
     # No file key in binding output.
     assert "file" not in sm
 

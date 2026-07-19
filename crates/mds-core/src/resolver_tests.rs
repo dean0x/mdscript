@@ -3174,3 +3174,76 @@ fn parent_dir_drives_nested_file_import_resolution() {
         "nested import must produce expected output (parent_dir resolved sub/ correctly): {output}"
     );
 }
+
+// ── line_len_at — UTF-8 char-boundary safety (issue #29) ─────────────────────
+//
+// These tests verify `line_len_at` degrades to 0 rather than panicking on
+// non-boundary or out-of-bounds offsets, matching the guard in
+// `build_type_mismatch` (evaluator.rs) per ADR-005.
+
+#[test]
+fn line_len_at_out_of_bounds_returns_zero() {
+    // offset past the end of source must return 0, never panic.
+    assert_eq!(
+        line_len_at("hello", 10),
+        0,
+        "out-of-bounds offset must return 0"
+    );
+}
+
+#[test]
+fn line_len_at_non_boundary_multibyte_returns_zero() {
+    // "é" is a 2-byte UTF-8 sequence (0xC3 0xA9).
+    // offset 1 is the second byte — not a char boundary.
+    let s = "é\nmore";
+    assert_eq!(
+        line_len_at(s, 1),
+        0,
+        "offset inside a multi-byte char must return 0, not panic"
+    );
+}
+
+#[test]
+fn line_len_at_valid_boundary_returns_line_length() {
+    // "héllo\nworld": h=1, é=2, l=1, l=1, o=1 → 6 bytes before '\n'.
+    let s = "héllo\nworld";
+    assert_eq!(
+        line_len_at(s, 0),
+        6,
+        "offset 0 must return bytes to the first newline"
+    );
+}
+
+#[test]
+fn line_len_at_mid_string_boundary() {
+    // offset 3 (after "hé" = 3 bytes) is on a char boundary.
+    // remaining: "llo\nworld" → 3 bytes to '\n'.
+    let s = "héllo\nworld";
+    assert_eq!(
+        line_len_at(s, 3),
+        3,
+        "offset at a mid-string char boundary must return bytes to the next newline"
+    );
+}
+
+#[test]
+fn line_len_at_no_newline_returns_remaining_len() {
+    let s = "hello";
+    assert_eq!(
+        line_len_at(s, 0),
+        5,
+        "when no newline exists, must return the remaining length"
+    );
+}
+
+#[test]
+fn line_len_at_offset_at_end_returns_zero() {
+    // offset == source.len() is a valid char boundary (end of string).
+    // The slice [len..] is empty, so find('\n') is None and .len() is 0.
+    let s = "hello";
+    assert_eq!(
+        line_len_at(s, 5),
+        0,
+        "offset == source.len() must return 0 (empty trailing slice)"
+    );
+}

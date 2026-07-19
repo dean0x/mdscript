@@ -627,6 +627,91 @@ test('kind: messages template with zero messages emits empty array', () => {
   assert(result.messages.length === 0, `expected 0 messages, got ${result.messages.length}`);
 });
 
+// ─── Tests: lint API (v0.4.0) ────────────────────────────────────
+
+test('lint: canonical shape + unused-variable finding', () => {
+  const result = mds.lint('---\nused: yes\nnever_used: 1\n---\n# Doc\n\nValue: {used}\n');
+  assert(result.version === 1, `lint result version must be 1, got ${result.version}`);
+  assert(Array.isArray(result.files), 'lint result must have files array');
+  assert(result.truncated === false, 'lint result truncated must be false');
+  assert(result.files.length === 1, `expected 1 file with findings, got ${result.files.length}`);
+  assert(result.files[0].file === 'input.mds', `string-source lint file key must be input.mds, got ${result.files[0].file}`);
+  const diag = result.files[0].diagnostics.find((d) => d.rule === 'unused-variable');
+  assert(diag, 'should report unused-variable for never_used');
+  assert(diag.severity === 'warn', `unused-variable severity must be warn, got ${diag.severity}`);
+  assert(diag.message.includes('never_used'), 'diagnostic message should name the variable');
+  assert(typeof diag.fixable === 'boolean', 'diagnostic must have boolean fixable');
+  assert(diag.span && typeof diag.span.offset === 'number', 'diagnostic should carry a span');
+});
+
+test('lintVirtual: duplicate-import finding across a 2-module map', () => {
+  const result = mds.lintVirtual(
+    {
+      'main.mds': '@import "./lib.mds"\n@import "./lib.mds"\n\n# Main\n',
+      'lib.mds': '## Lib\n',
+    },
+    'main.mds',
+  );
+  assert(result.version === 1 && result.truncated === false, 'canonical lint envelope');
+  assert(result.files[0].file === 'main.mds', `file key must be the caller entry name, got ${result.files[0].file}`);
+  const diag = result.files[0].diagnostics.find((d) => d.rule === 'duplicate-import');
+  assert(diag, 'should report duplicate-import');
+  assert(diag.severity === 'error', `duplicate-import severity must be error, got ${diag.severity}`);
+  assert(diag.fixable === true, 'duplicate-import must be auto-fixable');
+});
+
+test('lintFile: canonical shape on a real template', async () => {
+  const result = await mds.lintFile(
+    resolve(__dirname, 'prompt-library/personas.mds'),
+  );
+  assert(result.version === 1, `lint result version must be 1, got ${result.version}`);
+  assert(Array.isArray(result.files), 'lintFile result must have files array');
+  assert(result.truncated === false, 'lintFile result truncated must be false');
+  for (const f of result.files) {
+    assert(typeof f.file === 'string' && Array.isArray(f.diagnostics), 'each file entry has file + diagnostics');
+  }
+});
+
+// ─── Tests: source maps (v0.4.0) ─────────────────────────────────
+
+test('compile with sourceMap: version 3 + mappings', () => {
+  const source = '---\nname: Mapper\n---\n# Hello {name}\n\nLine two.\n';
+  const result = mds.compile(source, { sourceMap: true });
+  assert(result.kind === 'markdown', 'sourceMap test template is markdown-kind');
+  assert(result.sourceMap, 'result.sourceMap must be present when sourceMap: true');
+  assert(result.sourceMap.version === 3, `sourceMap version must be 3, got ${result.sourceMap.version}`);
+  assert(typeof result.sourceMap.mappings === 'string' && result.sourceMap.mappings.length > 0, 'mappings must be a non-empty string');
+  assert(Array.isArray(result.sourceMap.sources) && result.sourceMap.sources.length === 1, 'sources must list the single string-source entry');
+  assert(Array.isArray(result.sourceMap.names), 'names must be an array');
+  assert(!('sourcesContent' in result.sourceMap), 'sourcesContent must be absent unless requested');
+});
+
+test('compile with sourceMap + sourcesContent embeds the source', () => {
+  const source = '---\nname: Mapper\n---\n# Hello {name}\n';
+  const result = mds.compile(source, { sourceMap: true, sourcesContent: true });
+  assert(Array.isArray(result.sourceMap.sourcesContent), 'sourcesContent must be present when requested');
+  assert(result.sourceMap.sourcesContent[0] === source, 'sourcesContent[0] must be the exact original source');
+});
+
+test('sourcesContent without sourceMap throws mds::invalid_options', () => {
+  try {
+    mds.compile('# Hi\n', { sourcesContent: true });
+    assert(false, 'should have thrown mds::invalid_options');
+  } catch (err) {
+    assert(mds.isMdsError(err), `expected MDS error, got ${err}`);
+    assert(err.code === 'mds::invalid_options', `expected mds::invalid_options, got ${err.code}`);
+  }
+});
+
+test('messages template: sourceMap degrades to a warning', () => {
+  const source = '@message user:\nHello!\n@end\n';
+  const result = mds.compile(source, { sourceMap: true });
+  assert(result.kind === 'messages', `expected kind==='messages', got ${result.kind}`);
+  assert(!('sourceMap' in result), 'messages result must not carry a sourceMap');
+  assert(result.warnings.length > 0, 'requesting a sourceMap on a messages template must surface a warning');
+  assert(result.warnings.some((w) => w.includes('not supported')), 'warning should explain sourceMap is unsupported for messages templates');
+});
+
 // ─── Run all tests ───────────────────────────────────────────────
 console.log(`\nRunning ${tests.length} tests...\n`);
 

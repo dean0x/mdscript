@@ -5,6 +5,10 @@
   "main": "index.js",
   "types": "index.d.ts",
   "license": "MIT",
+  "scripts": {
+    "build:native": "napi build --release --no-js",
+    "test": "node --test __test__/index.spec.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dean0x/mdscript.git",

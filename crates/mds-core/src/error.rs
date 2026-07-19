@@ -134,7 +134,7 @@ pub enum MdsError {
     #[diagnostic(code(mds::syntax))]
     Syntax {
         message: String,
-        #[label("{message}")]
+        #[label("syntax error occurred here")]
         span: Option<SourceSpan>,
         #[source_code]
         src: Option<Arc<miette::NamedSource<String>>>,
@@ -167,7 +167,10 @@ pub enum MdsError {
     },
 
     #[error("arity mismatch for '{name}': {}, got {got}", format_arity(*expected_min, *expected_max))]
-    #[diagnostic(code(mds::arity))]
+    #[diagnostic(
+        code(mds::arity),
+        help("check the call site — '{name}' requires a different number of arguments than were provided")
+    )]
     ArityMismatch {
         name: String,
         expected_min: usize,
@@ -525,6 +528,23 @@ impl MdsError {
             rhs_type: rhs_type.into(),
             span: None,
             src: None,
+        }
+    }
+
+    pub(crate) fn type_mismatch_at(
+        lhs_type: impl Into<String>,
+        rhs_type: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::TypeMismatch {
+            lhs_type: lhs_type.into(),
+            rhs_type: rhs_type.into(),
+            span,
+            src,
         }
     }
 

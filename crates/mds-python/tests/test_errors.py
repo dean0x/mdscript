@@ -147,6 +147,8 @@ def test_e5_span_offset_and_line_column_single_line() -> None:
         # 1-indexed character column (ASCII → char offset == byte offset)
         assert e.span.column == e.span.offset + 1
         assert isinstance(e.span.offset, int)  # Python int — no truncation
+    else:
+        pytest.fail("expected MdsError")
 
 
 def test_e5_span_line_increments_on_multiline() -> None:
@@ -157,6 +159,8 @@ def test_e5_span_line_increments_on_multiline() -> None:
         assert e.span is not None
         assert e.span.line == 2
         assert e.span.column and e.span.column > 1
+    else:
+        pytest.fail("expected MdsError")
 
 
 def test_e5_span_none_when_core_reports_none() -> None:
@@ -165,3 +169,27 @@ def test_e5_span_none_when_core_reports_none() -> None:
         m.compile("x" * (10 * 1024 * 1024 + 1))
     except m.MdsError as e:
         assert e.span is None
+    else:
+        pytest.fail("expected MdsError")
+
+
+# ── D2: type_mismatch_at — span present on @if cross-type comparison ─────────────
+
+
+def test_d2_type_mismatch_span_is_not_none() -> None:
+    """D2: cross-type == in @if now carries a source span via type_mismatch_at."""
+    src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n"
+    try:
+        m.compile(src)
+    except m.MdsError as e:
+        assert e.code == "mds::type_mismatch", f"expected type_mismatch, got: {e.code}"
+        assert e.span is not None, (
+            "D2: type_mismatch from @if must carry a span (type_mismatch_at)"
+        )
+        assert isinstance(e.span.offset, int), "span.offset must be an int"
+        assert e.span.length > 0, "span.length must be > 0"
+        # line/column must be populated (the error points at the @if line).
+        assert e.span.line is not None, "span.line must be present for @if type_mismatch"
+        assert e.span.column is not None, "span.column must be present for @if type_mismatch"
+    else:
+        pytest.fail("expected MdsError")

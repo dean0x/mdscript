@@ -758,3 +758,370 @@ fn build_mds_json_discovery_walks_up() {
         md_path.display()
     );
 }
+
+// ── Bare-filename regression tests (release blocker — effective_parent fix) ──
+
+/// `mds build hello.mds` from the directory containing `hello.mds` must succeed.
+/// Before the effective_parent fix, Path::parent() returned Some("") for a bare
+/// filename, causing "".canonicalize() to fail with file_not_found on EVERY
+/// subcommand when the user passed a bare relative filename as the argument.
+#[test]
+fn build_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["build", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds build <bare-filename> from cwd should succeed; stderr: {stderr}"
+    );
+    assert!(
+        dir.path().join("hello.md").exists(),
+        "hello.md should be created next to hello.mds"
+    );
+}
+
+/// `mds check hello.mds` from the directory containing it must succeed.
+#[test]
+fn check_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["check", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds check <bare-filename> from cwd should succeed; stderr: {stderr}"
+    );
+}
+
+/// `mds fmt hello.mds` from the directory containing it must succeed.
+#[test]
+fn fmt_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["fmt", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds fmt <bare-filename> from cwd should succeed; stderr: {stderr}"
+    );
+}
+
+/// `mds lint hello.mds` from the directory containing it must succeed (exit 0 for clean file).
+#[test]
+fn lint_bare_filename_from_cwd_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Clean file: no lint findings expected.
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+
+    let output = mds_bin()
+        .current_dir(dir.path())
+        .args(["lint", "hello.mds"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "mds lint <bare-filename> from cwd should succeed for a clean file; stderr: {stderr}"
+    );
+}
+
+/// `mds build --vars <file>` with a malformed JSON vars file exits 1 and the
+/// error message names the vars file so the user knows which file to fix.
+#[test]
+fn vars_file_malformed_json_error_names_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    let vars = dir.path().join("vars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    // Write intentionally invalid JSON.
+    std::fs::write(&vars, "{ not valid json }").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "malformed vars JSON should cause a non-zero exit"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed vars JSON should exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("vars.json"),
+        "error must name the vars file; got: {stderr}"
+    );
+}
+
+/// `mds build --vars <file>` with a non-object JSON root (array) exits 1 and
+/// the error message names the vars file.
+#[test]
+fn vars_file_non_object_json_error_names_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    let vars = dir.path().join("myvars.json");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    // Write a JSON array — valid JSON but not a JSON object.
+    std::fs::write(&vars, r#"["a", "b"]"#).unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--vars",
+            vars.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "non-object vars JSON should cause a non-zero exit"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "non-object vars JSON should exit 1"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("myvars.json"),
+        "error must name the vars file; got: {stderr}"
+    );
+}
+
+// ── Bare-filename regression (PF-006 / issue #11) ────────────────────────────
+
+/// `mds watch hello.mds` from the directory containing `hello.mds` must start up,
+/// complete the initial compile, and write `hello.md` with the correct content.
+///
+/// PF-006 fifth sibling: bare-filename watch invocation.  The other four siblings
+/// (build / check / fmt / lint) are above.  Watch is the one subcommand that
+/// resolves parents through its own call sites; this test locks in that startup path.
+///
+/// Only asserts the INITIAL BUILD (bounded 10-second wait) — no event-timing
+/// assertions that would be timing-flaky on Linux CI.
+#[test]
+fn watch_bare_filename_from_cwd_succeeds() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    // RAII guard — kills + waits the child on drop so the test never leaks processes.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // Use a distinguishable sentinel so "exit 0 + empty file" can't pass.
+    std::fs::write(dir.path().join("hello.mds"), "Hello from watch!\n").unwrap();
+    let out = dir.path().join("hello.md");
+
+    let _child = ChildGuard(
+        mds_bin()
+            .current_dir(dir.path())
+            .args(["watch", "hello.mds", "--debounce", "0", "-q"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn mds watch"),
+    );
+
+    // Poll until the output file appears and contains the compiled content.
+    // Bounded to 10 s; the initial compile typically finishes in < 100 ms.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let found = loop {
+        if let Ok(content) = std::fs::read_to_string(&out) {
+            if content.contains("Hello from watch!") {
+                break true;
+            }
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        found,
+        "mds watch <bare-filename> from cwd should complete initial compile and write hello.md \
+         containing 'Hello from watch!'"
+    );
+}
+
+/// `load_config` must find `mds.json` in a grandparent directory when building
+/// from a bare filename in a deeply nested subdirectory.
+///
+/// Regression for issue #11: a relative `start_dir` (`"."`) caused
+/// `current.parent()` to return `None` after just one iteration, making any
+/// `mds.json` beyond the immediate parent unreachable even when
+/// `MAX_TRAVERSAL_DEPTH` would allow it.
+///
+/// Verifier: we configure `build.output_dir = "out"` in the root `mds.json`.
+/// If `load_config` finds the config, output lands in `root/out/hello.md`.
+/// If it silently skips it, output falls back to the input directory
+/// (`root/sub/nested/hello.md`), failing the assertion.
+#[test]
+fn build_load_config_finds_grandparent_mds_json() {
+    let root = tempfile::tempdir().unwrap();
+    // Create: root/sub/nested/hello.mds
+    let nested = root.path().join("sub").join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("hello.mds"), "Hello!\n").unwrap();
+    // Place mds.json at root/ with an output_dir that differs from the input dir.
+    std::fs::write(
+        root.path().join("mds.json"),
+        r#"{"build": {"output_dir": "out"}}"#,
+    )
+    .unwrap();
+
+    let output = mds_bin()
+        .arg("build")
+        .arg("hello.mds") // bare filename — not an absolute path
+        .current_dir(&nested)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "build from bare filename in nested dir must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // `load_config` found root/mds.json → output goes to root/out/hello.md.
+    // Without the fix it would fall back to root/sub/nested/hello.md.
+    let config_output = root.path().join("out").join("hello.md");
+    assert!(
+        config_output.exists(),
+        "output must be in root/out/ (per grandparent mds.json); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
+
+/// Regression gate: `mds build` (single-file mode) must not emit raw ESC bytes to
+/// stderr when the source file embeds a raw ESC byte (U+001B) in content that reaches
+/// `MdsError::Syntax`.
+///
+/// Single-file builds do not go through the per-file handler in `run_build_directory`;
+/// the error propagates all the way to `main()`, which is the last-resort render boundary.
+/// This test validates that boundary specifically.
+///
+/// Companion to `build_esc_byte_in_syntax_error_is_sanitized_on_stderr` which covers
+/// directory mode (the first guarded path). Both paths must be sanitized to prevent
+/// terminal escape injection from untrusted source files (PF-004 / ESC-INJECTION).
+#[test]
+fn build_single_file_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("esc.mds");
+    // Raw ESC byte (0x1B) in a .mds file that has a syntax error (unclosed @define).
+    // The ESC is on the error line so miette renders it inside the source context frame.
+    std::fs::write(&path, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(&path) // single-file mode (not a directory)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // Build must fail (syntax error in the file).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "build with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Raw ESC byte (0x1B) must not appear anywhere in stderr.
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr (single-file mode); \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+}
+
+/// Regression gate: `mds build` (directory mode) must not emit raw ESC bytes to
+/// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
+/// `MdsError::Syntax`.
+///
+/// Uses directory mode so the error is rendered by the per-file error handler in
+/// `run_build_directory` (the `build.rs` render boundary that was vulnerable).
+/// For single-file builds the error propagates through `main`; this test
+/// validates the directory-mode path specifically.
+#[test]
+fn build_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    // Raw ESC byte (0x1B) in a .mds file that has a syntax error (unclosed @define).
+    // The ESC is on the error line so miette renders it inside the source context frame.
+    std::fs::write(dir.path().join("esc.mds"), b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // Build must fail (syntax error in the file).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "build with syntax error should fail; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Raw ESC byte (0x1B) must not appear anywhere in stderr.
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized before writing to stderr; \
+         got (hex): {:02x?}",
+        &out.stderr[..out.stderr.len().min(512)]
+    );
+}

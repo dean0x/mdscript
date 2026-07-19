@@ -53,18 +53,20 @@ pub(crate) mod options;
 pub(crate) mod parser;
 pub(crate) mod resolver;
 pub(crate) mod scope;
+pub(crate) mod source_path;
 pub(crate) mod sourcemap;
 pub(crate) mod validator;
 pub(crate) mod value;
 
-pub use formatter::{format_str, format_str_with};
-pub use fs::{FileSystem, NativeFs, VirtualFs};
+pub use formatter::{format_str, format_str_named, format_str_with};
+pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{fix, sanitize_control_chars, LintConfig, LintDiagnostic, LintResult, Severity};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };
 pub use resolver::ModuleCache;
-pub use sourcemap::{CompileOptions, InvalidOptionsError, SourceMap};
+pub use source_path::relativize_source;
+pub use sourcemap::{CompileOptions, InvalidOptionsError, SourceMap, STRING_SOURCE_MAP_LABEL};
 
 /// A single structured message produced by a template containing `@message` blocks.
 ///
@@ -411,18 +413,53 @@ pub fn check_str(source: &str) -> Result<(), MdsError> {
 /// This is one of two UTF-8 boundary enforcement points; the other is
 /// [`path_to_str`], which handles the entry-point `path` argument.
 fn resolve_base_dir(base_dir: Option<&Path>) -> Result<String, MdsError> {
+    // Canonicalize to an absolute path so NativeFs::canonicalize() always
+    // receives a path whose file_name() is non-None.
+    //
+    // Path::parent() on a bare filename (e.g. "hello.mds") returns Some(""),
+    // and effective_parent normalises that to Some("."). Neither "" nor "."
+    // survive NativeFs::canonicalize() because check_symlink() calls
+    // file_name() on them, which returns None, causing a FileNotFound error
+    // that assert_equivalent's Err(_) arm then silently swallows via
+    // structural_equivalent. avoids PF-006.
     match base_dir {
-        Some(d) => d
-            .to_str()
-            .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
-            .map(str::to_owned),
+        // None and the empty-string sentinel both mean "current working directory".
         None => std::env::current_dir()
             .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
-            .and_then(|p| {
-                p.to_str()
+            .and_then(|cwd| {
+                cwd.to_str()
                     .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
                     .map(str::to_owned)
             }),
+        Some(d) if d.as_os_str().is_empty() => std::env::current_dir()
+            .map_err(|e| MdsError::io(format!("cannot determine current directory: {e}")))
+            .and_then(|cwd| {
+                cwd.to_str()
+                    .ok_or_else(|| MdsError::io("current directory path is not valid UTF-8"))
+                    .map(str::to_owned)
+            }),
+        // Canonicalize resolves "." → absolute cwd, relative → absolute, and
+        // strips trailing separators so the last component is a real directory name.
+        // UTF-8 boundary check runs first so that invalid bytes produce a clear
+        // error rather than a confusing "No such file" from canonicalize.
+        Some(d) => {
+            if d.to_str().is_none() {
+                return Err(MdsError::io("base_dir path is not valid UTF-8"));
+            }
+            d.canonicalize()
+                .map_err(|e| {
+                    MdsError::io(format!(
+                        "cannot resolve base directory {}: {e}",
+                        d.display()
+                    ))
+                })
+                .and_then(|canonical| {
+                    canonical
+                        .to_str()
+                        .ok_or_else(|| MdsError::io("base_dir path is not valid UTF-8"))
+                        .map(str::to_owned)
+                })
+        }
     }
 }
 
@@ -902,7 +939,7 @@ pub fn compile_virtual_with_deps(
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true, include_sources_content: false })?;
+/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() })?;
 /// if let Some(sm) = result.source_map { println!("{}", sm.to_json()); }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -946,7 +983,7 @@ pub fn compile_with_deps_opts(
 ///     "Hello!\n",
 ///     None,
 ///     None,
-///     mds::CompileOptions { source_map: true, include_sources_content: false },
+///     mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() },
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -987,7 +1024,7 @@ pub fn compile_str_with_deps_opts(
 ///     modules,
 ///     "main.mds",
 ///     None,
-///     mds::CompileOptions { source_map: true, include_sources_content: false },
+///     mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() },
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1142,9 +1179,11 @@ pub fn lint_str_with(
         cache.resolve_source_intrinsic(source, &dir, &vars, &mut warnings)?;
     }
     // Step 2: lint the entry source.
-    // Use the same default filename as the WASM backend so lint(source) produces
-    // a byte-identical "file" key across all surfaces (AC-API-06).
-    lint::lint_source(source, "input.mds", config)
+    // Use STRING_SOURCE_MAP_LABEL ("input.mds") — the shared const that both
+    // the source-map choke-point (sourcemap.rs) and the WASM DEFAULT_FILENAME
+    // agree on — so lint(source) produces a byte-identical "file" key across
+    // all surfaces (AC-API-06).
+    lint::lint_source(source, crate::sourcemap::STRING_SOURCE_MAP_LABEL, config)
 }
 
 /// Lint an MDS file.
@@ -1353,11 +1392,13 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
     }
     let content = String::from_utf8(bytes)
         .map_err(|e| MdsError::io(format!("invalid UTF-8 in vars file {path_str}: {e}")))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| MdsError::json_error(e.to_string()))?;
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| MdsError::json_error(format!("{path_str}: {e}")))?;
 
     let serde_json::Value::Object(map) = json else {
-        return Err(MdsError::json_error("vars file must contain a JSON object"));
+        return Err(MdsError::json_error(format!(
+            "{path_str}: vars file must contain a JSON object"
+        )));
     };
 
     map.into_iter()

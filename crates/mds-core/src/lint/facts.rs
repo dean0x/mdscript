@@ -520,9 +520,9 @@ fn walk_if_block(
 ) -> Result<(), MdsError> {
     extract_condition_refs(&b.condition, ctx);
     walk_nodes(&b.then_body, ctx, scope, depth + 1)?;
-    for (cond, branch_body) in &b.elseif_branches {
-        extract_condition_refs(cond, ctx);
-        walk_nodes(branch_body, ctx, scope, depth + 1)?;
+    for branch in &b.elseif_branches {
+        extract_condition_refs(&branch.condition, ctx);
+        walk_nodes(&branch.body, ctx, scope, depth + 1)?;
     }
     if let Some(else_body) = &b.else_body {
         walk_nodes(else_body, ctx, scope, depth + 1)?;
@@ -727,6 +727,7 @@ mod tests {
                 elseif_branches: vec![],
                 else_body: None,
                 offset: 0,
+                else_offset: None,
             })];
         }
         let module = Module {

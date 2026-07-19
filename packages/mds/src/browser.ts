@@ -1,9 +1,11 @@
-import type { BackendType, CheckResult, CompileOptions, CompileResult, InitOptions, MdsBaseBackend } from './types.js';
+import type { BackendType, CheckOptions, CheckResult, CompileOptions, CompileResult, InitOptions, MdsBaseBackend } from './types.js';
 import { initWasmBrowser, createWasmBackend } from './backend/wasm.js';
+import { assertKnownKeys } from './util/options.js';
 
 export { isMdsError } from './types.js';
 export type {
   BackendType,
+  CheckOptions,
   CheckResult,
   CompileOptions,
   CompileResult,
@@ -80,11 +82,13 @@ function assertReady(): MdsBaseBackend {
 
 /** Compile an MDS source string. Returns a discriminated-union CompileResult (kind: 'markdown' | 'messages'). Requires init() to have been called and awaited first. */
 export function compile(source: string, options?: CompileOptions): CompileResult {
+  if (options != null) assertKnownKeys(options, 'compile');
   return assertReady().compile(source, options);
 }
 
 /** Validate an MDS source string without rendering. Requires init() to have been called and awaited first. */
-export function check(source: string, options?: CompileOptions): CheckResult {
+export function check(source: string, options?: CheckOptions): CheckResult {
+  if (options != null) assertKnownKeys(options, 'check');
   return assertReady().check(source, options);
 }
 

@@ -369,7 +369,7 @@ fn dir_check_validates_tree_exits_zero_on_all_ok() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("checked"),
+        stderr.contains("passed"),
         "stderr should contain check summary; got: {stderr}"
     );
 }
@@ -392,7 +392,7 @@ fn dir_check_continues_on_error_nonzero_exit() {
     // Summary should show counts.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("checked") || stderr.contains("failed"),
+        stderr.contains("passed") || stderr.contains("failed"),
         "stderr must contain check summary; got: {stderr}"
     );
 }
@@ -498,5 +498,293 @@ fn dir_build_empty_dir_exits_zero() {
     assert!(
         stderr.contains("No .mds files") || stderr.contains("no .mds"),
         "stderr should mention no .mds files; got: {stderr}"
+    );
+}
+
+// ── Additional test helpers for lint/fmt subcommands ─────────────────────────
+
+fn lint_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .arg("lint")
+        .arg(dir)
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+fn fmt_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {
+    mds_bin()
+        .arg("fmt")
+        .arg(dir)
+        .args(extra_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+// ── T-CLI-ALL-EXCLUDED: all candidates in excluded dirs exits non-zero ────────
+//
+// Covers issue #2: when every .mds file is under a default-excluded directory
+// (hidden dir or node_modules), the subcommand must:
+//   (a) exit non-zero, not 0 — distinguishing from a genuinely empty tree
+//   (b) emit a distinct message carrying the skip count
+//   (c) emit the message even under --quiet (the CI guard case)
+
+#[test]
+fn dir_build_all_excluded_exits_nonzero() {
+    let src = tempfile::tempdir().unwrap();
+
+    // .github/prompts/ is a prime template location for prompt-template compilers.
+    let hidden = src.path().join(".github");
+    fs::create_dir_all(hidden.join("prompts")).unwrap();
+    fs::write(hidden.join("prompts").join("system.mds"), "Hello!\n").unwrap();
+
+    let output = build_dir(src.path(), &[]);
+
+    assert!(
+        !output.status.success(),
+        "build with all candidates in excluded dirs must exit non-zero; exit: {:?}; stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Message must be distinct from "No .mds files found" and carry the skip count.
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "stderr must mention excluded directories; got: {stderr}"
+    );
+    assert!(
+        stderr.contains('1'),
+        "stderr must carry the skip count (1 file excluded); got: {stderr}"
+    );
+}
+
+#[test]
+fn dir_build_all_excluded_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let nm = src.path().join("node_modules");
+    fs::create_dir(&nm).unwrap();
+    fs::write(nm.join("lib.mds"), "Hello!\n").unwrap();
+    fs::write(nm.join("other.mds"), "World!\n").unwrap();
+
+    // --quiet must NOT suppress the all-excluded diagnostic — this is the exact
+    // CI invocation where a silent green pass is the danger.
+    let output = build_dir(src.path(), &["--quiet"]);
+
+    assert!(
+        !output.status.success(),
+        "build with all candidates excluded must exit non-zero even under --quiet"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty(),
+        "stderr must not be empty under --quiet when all candidates are excluded"
+    );
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "all-excluded diagnostic must appear under --quiet; got: {stderr}"
+    );
+    // Skip count must appear in message.
+    assert!(
+        stderr.contains('2'),
+        "stderr must report 2 skipped files; got: {stderr}"
+    );
+}
+
+#[test]
+fn dir_build_genuinely_empty_still_exits_zero() {
+    // Regression guard: a genuinely empty directory (no .mds files anywhere)
+    // must still exit 0 — only the all-excluded case exits non-zero.
+    let src = tempfile::tempdir().unwrap();
+
+    let output = build_dir(src.path(), &[]);
+
+    assert!(
+        output.status.success(),
+        "genuinely empty dir must still exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Message must be the original "no files" message, not the excluded diagnostic.
+    assert!(
+        stderr.contains("No .mds files") || stderr.contains("no .mds"),
+        "empty-dir message should mention no .mds files; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("excluded"),
+        "empty-dir must NOT show the excluded diagnostic; got: {stderr}"
+    );
+}
+
+#[test]
+fn dir_build_mixed_excluded_and_normal_processes_normal() {
+    // Non-excluded files must still be processed even when some are in excluded dirs.
+    let src = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    // Normal file — must be built.
+    create_plain_mds(src.path(), "normal.mds");
+
+    // Excluded file — must be skipped.
+    let hidden = src.path().join(".prompts");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("excluded.mds"), "Hello!\n").unwrap();
+
+    let output = build_dir(src.path(), &["--out-dir", out.path().to_str().unwrap()]);
+
+    // The build must succeed since normal.mds was found and processed.
+    assert!(
+        output.status.success(),
+        "build with mixed excluded+normal files must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // normal.mds → out/normal.md
+    assert!(
+        out.path().join("normal.md").exists(),
+        "normal.md must be built"
+    );
+
+    // .prompts/excluded.md must NOT exist (excluded subdir was skipped).
+    assert!(
+        !out.path().join(".prompts").join("excluded.md").exists(),
+        "excluded.md must not be built"
+    );
+}
+
+#[test]
+fn dir_check_all_excluded_exits_nonzero() {
+    let src = tempfile::tempdir().unwrap();
+
+    let hidden = src.path().join(".claude");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("prompt.mds"), "Hello!\n").unwrap();
+
+    let output = check_dir(src.path(), &[]);
+
+    assert!(
+        !output.status.success(),
+        "check with all candidates in excluded dirs must exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "stderr must mention excluded directories; got: {stderr}"
+    );
+    assert!(
+        stderr.contains('1'),
+        "stderr must carry the skip count; got: {stderr}"
+    );
+}
+
+#[test]
+fn dir_check_all_excluded_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let hidden = src.path().join(".cursor");
+    fs::create_dir_all(hidden.join("rules")).unwrap();
+    fs::write(hidden.join("rules").join("rule.mds"), "Hello!\n").unwrap();
+
+    let output = check_dir(src.path(), &["--quiet"]);
+
+    assert!(
+        !output.status.success(),
+        "check with all candidates excluded must exit non-zero even under --quiet"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty() && (stderr.contains("excluded") || stderr.contains("default-excluded")),
+        "all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+}
+
+#[test]
+fn dir_lint_all_excluded_exits_nonzero() {
+    let src = tempfile::tempdir().unwrap();
+
+    let nm = src.path().join("node_modules");
+    fs::create_dir(&nm).unwrap();
+    fs::write(nm.join("template.mds"), "Hello!\n").unwrap();
+
+    let output = lint_dir(src.path(), &[]);
+
+    assert!(
+        !output.status.success(),
+        "lint with all candidates in excluded dirs must exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "stderr must mention excluded directories; got: {stderr}"
+    );
+}
+
+#[test]
+fn dir_lint_all_excluded_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let hidden = src.path().join(".github");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("workflow.mds"), "Hello!\n").unwrap();
+
+    let output = lint_dir(src.path(), &["--quiet"]);
+
+    assert!(
+        !output.status.success(),
+        "lint with all candidates excluded must exit non-zero even under --quiet"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty() && (stderr.contains("excluded") || stderr.contains("default-excluded")),
+        "all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+}
+
+#[test]
+fn dir_fmt_all_excluded_exits_nonzero() {
+    let src = tempfile::tempdir().unwrap();
+
+    let hidden = src.path().join(".prompts");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("system.mds"), "Hello!\n").unwrap();
+
+    let output = fmt_dir(src.path(), &[]);
+
+    assert!(
+        !output.status.success(),
+        "fmt with all candidates in excluded dirs must exit non-zero; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "stderr must mention excluded directories; got: {stderr}"
+    );
+}
+
+#[test]
+fn dir_fmt_all_excluded_quiet_still_emits_diagnostic() {
+    let src = tempfile::tempdir().unwrap();
+
+    let nm = src.path().join("node_modules");
+    fs::create_dir(&nm).unwrap();
+    fs::write(nm.join("component.mds"), "Hello!\n").unwrap();
+
+    let output = fmt_dir(src.path(), &["--quiet"]);
+
+    assert!(
+        !output.status.success(),
+        "fmt with all candidates excluded must exit non-zero even under --quiet"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty() && (stderr.contains("excluded") || stderr.contains("default-excluded")),
+        "all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
     );
 }

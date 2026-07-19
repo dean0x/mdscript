@@ -223,7 +223,20 @@ export async function buildModulesMap(
   const maxModules = options?.maxModules ?? DEFAULT_MAX_MODULES;
   const maxAggregateSize = options?.maxAggregateSize ?? DEFAULT_MAX_AGGREGATE_SIZE;
 
-  const absoluteEntry = resolve(entryPath);
+  // Resolve the parent directory to its canonical form before computing the
+  // project root and security boundaries.  This eliminates false-positive
+  // "possible symlink" errors on platforms with OS-level directory symlinks
+  // (e.g. macOS /var → /private/var), where realpath(absolutePath) differs
+  // from absolutePath even for a regular non-symlink file.
+  //
+  // Only the PARENT directory is canonicalized, NOT the final path component.
+  // A symlink at the file level is still caught by O_NOFOLLOW (openNoFollow)
+  // and the post-open realpath mismatch check inside openAndValidateModule.
+  // This mirrors the pattern in NativeFs::check_symlink (Rust): canonicalize
+  // the parent, join the filename, then check the file for symlinks.
+  const rawAbsoluteEntry = resolve(entryPath);
+  const canonicalParentDir = await realpath(dirname(rawAbsoluteEntry));
+  const absoluteEntry = canonicalParentDir + sep + rawAbsoluteEntry.slice(rawAbsoluteEntry.lastIndexOf(sep) + 1);
   const projectRoot = findProjectRoot(dirname(absoluteEntry));
   // Virtual keys are always slash-separated to mirror Rust's VirtualFs; on
   // Windows `relative` yields backslashes, so normalize to '/'.

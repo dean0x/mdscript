@@ -48,19 +48,30 @@ keyword-only; `scan_imports` takes its argument positionally.
 
 | Function | Signature |
 |----------|-----------|
-| `compile` | `compile(source, *, vars=None, base_path=None) -> CompileResult` |
-| `compile_file` | `compile_file(path, *, vars=None) -> CompileResult` |
-| `compile_virtual` | `compile_virtual(modules, entry, *, vars=None) -> CompileResult` |
+| `compile` | `compile(source, *, vars=None, base_path=None, source_map=False, sources_content=False) -> CompileResult` |
+| `compile_file` | `compile_file(path, *, vars=None, source_map=False, sources_content=False) -> CompileResult` |
+| `compile_virtual` | `compile_virtual(modules, entry, *, vars=None, source_map=False, sources_content=False) -> CompileResult` |
 | `check` | `check(source, *, vars=None, base_path=None) -> CheckResult` |
 | `check_file` | `check_file(path, *, vars=None) -> CheckResult` |
 | `check_virtual` | `check_virtual(modules, entry, *, vars=None) -> CheckResult` |
 | `scan_imports` | `scan_imports(source, /) -> list[str]` |
+| `lint` | `lint(source, *, vars=None, base_path=None, rules=None) -> LintResult` |
+| `lint_file` | `lint_file(path, *, vars=None, rules=None) -> LintResult` |
+| `lint_virtual` | `lint_virtual(modules, entry, *, vars=None, rules=None) -> LintResult` |
 
 - `path` / `base_path` accept `str` or `os.PathLike`.
 - `vars` is a mapping of string keys to JSON-compatible values; a non-mapping raises
   `MdsError(code="mds::invalid_options")`.
-- `compile_virtual` / `check_virtual` resolve imports against an in-memory map;
-  `entry` must be a key in `modules` (no source injection occurs).
+- `compile_virtual` / `check_virtual` / `lint_virtual` resolve imports against an in-memory
+  map; `entry` must be a key in `modules`.
+- `source_map=True` generates a Source Map v3 document; `result.source_map` is a `dict`.
+  For string-source compiles `sources[0]` is `"input.mds"`. `sources_content=True` embeds
+  the original source text in `sourcesContent[]` (requires `source_map=True`).
+  ⚠ Privacy: `sources_content=True` embeds the full template source in the map.
+- `rules` is a mapping of rule name → severity string (`"off"`, `"info"`, `"warn"`, `"error"`).
+  Unknown severity values raise `MdsError(code="mds::invalid_options")`; unknown rule names
+  are silently accepted (the name simply has no effect — a typo will not configure the rule).
+  `LintResult` exposes `.version`, `.truncated`, `.files`, `.to_dict()`, `.to_json()`.
 
 ### Result objects
 
