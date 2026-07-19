@@ -779,16 +779,22 @@ describe('source maps — compileFile differential (CF-SM)', () => {
           '(run `maturin develop` inside .venv to enable)',
         );
       } else {
-        const pyModulePath = join(REPO_ROOT, 'crates', 'mds-python', 'python');
-        // Pass fixture path and module path as argv so no escaping is needed.
+        // Import mdscript from the Python environment directly (site-packages).
+        // Do NOT insert the source tree into sys.path: with `pip install`, the
+        // compiled extension (_mdscript.so) lands in site-packages, not in the
+        // source crates/mds-python/python/ directory, so prepending the source
+        // path causes `from ._mdscript import` to fail (it finds __init__.py in
+        // the source tree but the .so is elsewhere).  Importing from site-packages
+        // works for both `pip install ./crates/mds-python` (CI) and
+        // `maturin develop` (local), since both make `mdscript` importable from
+        // the standard path.  Pass entryPath as argv so no shell escaping is needed.
         const pyScript = [
           'import json, sys',
-          'sys.path.insert(0, sys.argv[1])',
           'import mdscript as m',
-          'result = m.compile_file(sys.argv[2], source_map=True)',
+          'result = m.compile_file(sys.argv[1], source_map=True)',
           'print(json.dumps(result.source_map["sources"]))',
         ].join('\n');
-        const pyProc = spawnSync(python, ['-c', pyScript, pyModulePath, entryPath], {
+        const pyProc = spawnSync(python, ['-c', pyScript, entryPath], {
           encoding: 'utf-8',
         });
         assert.equal(
