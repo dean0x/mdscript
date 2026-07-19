@@ -1062,6 +1062,14 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
         let use_embed_sources = flag_embed_sources || cfg_embed_sources;
 
+        // C3/D6: embed_sources without source_map is a no-op (applies PF-004 — all paths).
+        if use_embed_sources && !use_source_map && !quiet {
+            eprintln!(
+                "warning: embed_sources has no effect without source maps; \
+                 set build.source_map=true or pass --source-map"
+            );
+        }
+
         return run_build_directory(
             &input,
             out_dir,
@@ -1079,6 +1087,15 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         // Stdin: no project config; effective flags from CLI only.
         let use_source_map = flag_source_map && !no_source_map;
         let use_embed_sources = flag_embed_sources;
+
+        // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
+        // why their output contains no sourcesContent (applies PF-004 — both paths checked).
+        if use_embed_sources && !use_source_map && !quiet {
+            eprintln!(
+                "warning: embed_sources has no effect without source maps; \
+                 set build.source_map=true or pass --source-map"
+            );
+        }
 
         // AC-SEC-02: warn when shipping full source text in a distributable artifact.
         if use_embed_sources && inline && !quiet {
@@ -1131,10 +1148,16 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                 // Sidecar: write output first (byte-identical to no-flag; ADR-002).
                 match &output_path {
                     None => {
-                        // Sidecar + stdout: cannot write a sidecar without a file path.
+                        // Sidecar + stdout: three-case ladder (stdin has no config, so cases 1–2).
+                        if source_map.is_none() {
+                            // Case 1 — messages mode: compiler produced no map; write to stdout.
+                            return write_output(None, &content, quiet, true);
+                        }
+                        // Case 2 — explicit --source-map flag: hard error.
                         return Err(miette::miette!(
-                            "--source-map (sidecar) requires an output file; \
-                             use -o <file> or --out-dir, or use --inline for stdout"
+                            "--source-map (sidecar) requires an output file; use -o <file> or \
+                             --out-dir, --inline to embed the map for stdout, or --no-source-map \
+                             to skip it"
                         ));
                     }
                     Some(out) => {
@@ -1173,6 +1196,15 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 
     let use_source_map = (flag_source_map || cfg_source_map) && !no_source_map;
     let use_embed_sources = flag_embed_sources || cfg_embed_sources;
+
+    // C3/D6: embed_sources without source_map is a no-op; warn so users don't wonder
+    // why their output contains no sourcesContent (applies PF-004 — both paths checked).
+    if use_embed_sources && !use_source_map && !quiet {
+        eprintln!(
+            "warning: embed_sources has no effect without source maps; \
+             set build.source_map=true or pass --source-map"
+        );
+    }
 
     // AC-SEC-02: warn when shipping full source text in a distributable artifact.
     if use_embed_sources && inline && !quiet {
@@ -1230,11 +1262,32 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             // Sidecar: write output byte-identical to no-flag build (ADR-002).
             match &output_path {
                 None => {
-                    // Sidecar + stdout: not supported.
-                    return Err(miette::miette!(
-                        "--source-map (sidecar) requires an output file; \
-                         use -o <file> or --out-dir, or use --inline for stdout"
-                    ));
+                    // Sidecar + stdout: three-case ladder.
+                    if source_map.is_none() {
+                        // Case 1 — messages mode: compiler produced no map; write to stdout.
+                        return write_output(None, &compiled.content, quiet, true);
+                    }
+                    if flag_source_map {
+                        // Case 2 — explicit --source-map flag: hard error.
+                        return Err(miette::miette!(
+                            "--source-map (sidecar) requires an output file; use -o <file> or \
+                             --out-dir, --inline to embed the map for stdout, or --no-source-map \
+                             to skip it"
+                        ));
+                    }
+                    // Case 3 — config-sourced source_map: degrade gracefully.
+                    if !quiet {
+                        let cfg_path = config
+                            .as_ref()
+                            .map(|(_, p)| p.display().to_string())
+                            .unwrap_or_else(|| "mds.json".to_owned());
+                        eprintln!(
+                            "warning: source_map in {cfg_path} has no effect when writing to \
+                             stdout (sidecar requires -o <file> or --out-dir); use --inline to \
+                             embed the map, or --no-source-map to silence this warning"
+                        );
+                    }
+                    return write_output(None, &compiled.content, quiet, true);
                 }
                 Some(out) => {
                     write_output(Some(out.clone()), &compiled.content, quiet, true)?;
