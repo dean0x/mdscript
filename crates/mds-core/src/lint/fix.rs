@@ -6,8 +6,29 @@
 //! |------|---------------------------------------------------|-----------|
 //! | A    | duplicate-import, duplicate-export,               | Auto-fixable (span-removal); gated by reverify |
 //! |      | unreachable-branch, empty-block                   |           |
-//! | B    | unused-import, unused-function                    | Fixable only when a recompile-diff proves output-neutral |
-//! | C    | unused-variable, redundant-else, shadow-variable  | NEVER fixed (report-only) |
+//! | B    | unused-import, unused-function                    | Fixable only in standalone mode (single-file; reverify applies) |
+//! | C    | unused-variable, redundant-else, shadow-variable  | Report-only; never fixed |
+//!
+//! **Tier B nuance:**
+//! - `unused-function` sets `fix_removals` to a whole-block [`FixLineSpan`] and is
+//!   applied when `include_tier_b = true` (standalone file). The reverify gate still
+//!   runs; if removing the function would cause a compile error the edit is rejected.
+//! - `unused-import` leaves `fix_removals: None` (partial-name removal from an import
+//!   list is structurally ambiguous and unsafe). The rule is Tier B so it appears under
+//!   `--fix --standalone` output, but no edit is ever emitted.
+//!
+//! ## Block-span fixes (FixLineSpan)
+//!
+//! Block-spanning rules (`empty-block`, `unreachable-branch`, `unused-function`)
+//! express their fix plan as a `Vec<FixLineSpan>` stored in
+//! [`LintDiagnostic::fix_removals`] rather than deriving edits from the diagnostic
+//! span alone. Each [`FixLineSpan`] encodes which lines to remove:
+//!
+//! - `to_inclusive: true`  — remove lines from `from` through (and including) `to`
+//! - `to_inclusive: false` — remove lines from `from` up to (not including) `to`
+//!
+//! This lets a single diagnostic drive removal of the complete block plus its closing
+//! `@end` without the planner needing to understand block structure.
 //!
 //! ## ADR-001 discipline
 //!
@@ -20,17 +41,26 @@
 //! Line-removal spans must consume the COMPLETE line terminator (`\r\n`, `\r`,
 //! or `\n`). A `\n`-only assumption leaves stray `\r` bytes that the reverify
 //! gate cannot catch (the compiled output would be output-equivalent).
-//! See [`extend_span_to_line_end`].
+//! See [`extend_to_line_end`].
 //!
 //! ## fix.rs is pure (no I/O)
 //!
 //! File I/O and atomic writes are the CLI's responsibility. `fix.rs` operates
 //! entirely on in-memory byte slices. The caller owns the file read and write.
 //!
+//! ## Containment deduplication (AC-F-26)
+//!
+//! Before overlap detection, [`dedup_contained_or_identical`] removes any edit
+//! whose byte range is fully contained within an earlier retained edit. This handles
+//! the common case where two rules fire on the same block (e.g. `unreachable-branch`
+//! and `empty-block` both targeting the same `@if`): the wider edit subsumes the
+//! narrower one and a single correct removal is applied.
+//!
 //! ## Overlap detection (AC-F-19)
 //!
-//! Edit spans may not overlap. Overlapping edits are rejected fail-closed — when
-//! any overlap is detected, the ENTIRE batch is abandoned (no partial write).
+//! After containment deduplication, any remaining pair of edits that partially
+//! overlap (neither contains the other) is a genuine conflict. In that case the
+//! ENTIRE batch is abandoned fail-closed — no partial write.
 //!
 //! ## Reverify gate (AC-F-20)
 //!
@@ -86,10 +116,11 @@ pub struct RejectedEdit {
 /// A plan of fix edits for a single file's source.
 #[derive(Debug, Default)]
 pub struct FixPlan {
-    /// Sorted, non-overlapping byte edits to apply right-to-left.
-    /// `None` before planning; `Some(edits)` after `plan_fixes` succeeds.
+    /// Sorted (start ASC, end DESC), deduplicated, non-overlapping byte edits
+    /// to apply right-to-left. Populated by [`plan_fixes`] / [`plan_fixes_with_options`].
     pub edits: Vec<ByteEdit>,
-    /// `true` if overlap detection rejected the batch.
+    /// `true` when the batch was cleared because a genuine partial overlap survived
+    /// containment deduplication (see module-level "Overlap detection" note).
     pub overlap_rejected: bool,
     /// `true` if the source `LintResult` was truncated (idempotence caveat).
     pub truncated: bool,
