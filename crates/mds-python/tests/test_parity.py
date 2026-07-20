@@ -71,8 +71,10 @@ def test_par1_to_dict_matches_golden(
     name: str, src: str, vars: dict[str, object], expected: dict[str, object]
 ) -> None:
     result = m.compile(src, vars=vars or None)
-    assert result.to_dict() == expected
-    # to_json round-trips to the same value
+    # to_dict() always includes "sourceMap": None (Python-idiomatic always-present);
+    # the goldens capture the wire format without it.
+    assert result.to_dict() == {**expected, "sourceMap": None}
+    # to_json() is the canonical wire format — matches the golden byte-for-byte.
     assert json.loads(result.to_json()) == expected
 
 
@@ -186,6 +188,64 @@ def test_par4_lint_virtual_matches_golden(
         f"  got:    {result.to_json()}\n"
         f"  expect: {golden}"
     )
+
+
+# ── PAR6: LintFileReport / LintDiagnostic .to_dict() parity when help and span are None ──
+#
+# PF-007 (cross-surface-parity): LintDiagnostic.as_json() previously omitted the
+# "help" and "span" keys entirely when they were None, but to_canonical_json() always
+# emits them as JSON null. This diverged report.to_dict() from result.to_dict()["files"][i]
+# for any diagnostic with a null help or span.
+#
+# None of the current 9 lint rules produce null help or span in production, so the
+# divergence was invisible to the existing LINT_GOLDENS. This test constructs a
+# LintResult directly from a canonical dict (via LintResult.__new__) to exercise the
+# null-help / null-span path explicitly, providing a non-circular differential check.
+
+
+def test_par6_file_report_to_dict_parity_null_help_span() -> None:
+    """LintFileReport.to_dict() and LintDiagnostic.to_dict() must match the canonical
+    wire format even when help and span are None (PF-007 cross-surface-parity fix)."""
+    canonical: dict[str, object] = {
+        "version": 1,
+        "truncated": False,
+        "files": [
+            {
+                "file": "test.mds",
+                "diagnostics": [
+                    {
+                        "rule": "unused-variable",
+                        "severity": "warn",
+                        "message": "Variable 'x' is never used.",
+                        "help": None,
+                        "fixable": False,
+                        "span": None,
+                    }
+                ],
+            }
+        ],
+    }
+    result = m.LintResult(canonical)
+
+    # file-level: LintFileReport.to_dict() must equal the canonical file dict
+    report = result.files[0]
+    assert report.to_dict() == result.to_dict()["files"][0], (
+        "LintFileReport.to_dict() must match result.to_dict()['files'][i] "
+        "when diagnostic has null help and span"
+    )
+
+    # diagnostic-level: LintDiagnostic.to_dict() must equal the canonical diagnostic dict
+    diag = report.diagnostics[0]
+    assert diag.to_dict() == result.to_dict()["files"][0]["diagnostics"][0], (
+        "LintDiagnostic.to_dict() must match canonical diagnostic dict "
+        "when help and span are None"
+    )
+    # Confirm the null values are present as Python None (not absent)
+    diag_dict = diag.to_dict()
+    assert "help" in diag_dict, "to_dict() must always include 'help' key"
+    assert diag_dict["help"] is None, "help must be None (not absent) when not set"
+    assert "span" in diag_dict, "to_dict() must always include 'span' key"
+    assert diag_dict["span"] is None, "span must be None (not absent) when not set"
 
 
 def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> None:

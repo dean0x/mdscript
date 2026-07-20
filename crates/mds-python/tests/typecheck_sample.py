@@ -11,7 +11,16 @@ import pathlib
 from typing import Any
 
 import mdscript
-from mdscript import CheckResult, CompileResult, LintResult, MdsError, Message, Span
+from mdscript import (
+    CheckResult,
+    CompileResult,
+    LintDiagnostic,
+    LintFileReport,
+    LintResult,
+    MdsError,
+    Message,
+    Span,
+)
 
 
 def render_markdown() -> str:
@@ -79,9 +88,29 @@ def lint_source(source: str) -> int:
     result: LintResult = mdscript.lint(source)
     version: int = result.version
     truncated: bool = result.truncated
-    files: list[dict[str, Any]] = result.files
+    files: list[LintFileReport] = result.files
     _ = (version, truncated)
     return len(files)
+
+
+def lint_typed_access(source: str) -> list[str]:
+    """Demonstrate fully-typed attribute access on lint results (B6/F10)."""
+    result: LintResult = mdscript.lint(source)
+    rules: list[str] = []
+    report: LintFileReport
+    for report in result.files:
+        file_key: str = report.file
+        diag: LintDiagnostic
+        for diag in report.diagnostics:
+            rule: str = diag.rule
+            severity: str = diag.severity
+            message: str = diag.message
+            help_text: str | None = diag.help
+            fixable: bool = diag.fixable
+            span: Span | None = diag.span
+            _ = (file_key, severity, message, help_text, fixable, span)
+            rules.append(rule)
+    return rules
 
 
 def lint_source_with_options(source: str) -> str:
@@ -116,7 +145,7 @@ def lint_virtual_graph() -> bool:
         vars={"name": "world"},
         rules={"shadow-variable": "warn"},
     )
-    files: list[dict[str, Any]] = result.files
+    files: list[LintFileReport] = result.files
     j: str = result.to_json()
     _ = (files, j)
     return result.truncated

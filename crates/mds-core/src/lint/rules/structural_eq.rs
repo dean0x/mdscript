@@ -283,6 +283,7 @@ mod tests {
                 else_body: None,
                 offset: 0,
                 else_offset: None,
+                end_offset: 0, // span annotation — excluded from structural equality
             })
         };
         let a = make_if(9);

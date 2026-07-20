@@ -1291,3 +1291,36 @@ fn fmt_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         &out.stdout[..out.stdout.len().min(512)]
     );
 }
+
+// ── C4/F6: existence-before-extension ordering for fmt ───────────────────────
+
+/// A non-existent path that also lacks the `.mds` extension must report
+/// `mds::file_not_found` (exit 2), NOT `mds::not_mds_file` (exit 2).
+///
+/// Before C4/F6, `ensure_mds_extension` ran before existence was checked, so
+/// a user pointing at `/nonexistent.txt` got "not an .mds file" — confusing
+/// because the path doesn't exist at all.
+#[test]
+fn fmt_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
+    let dir = tempfile::tempdir().unwrap();
+    // Path that does not exist AND has a non-.mds extension.
+    let missing = dir.path().join("missing_file_12345.txt");
+
+    let output = fmt_path(&missing, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "non-existent file must exit 2; got: {:?}",
+        output.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("mds::file_not_found") || stderr.contains("file not found"),
+        "error must be file-not-found (not extension error); got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("mds::not_mds_file") && !stderr.contains("not an .mds"),
+        "must NOT report 'not an .mds file' for a non-existent path; got: {stderr:?}"
+    );
+}

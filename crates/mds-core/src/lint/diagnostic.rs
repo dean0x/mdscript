@@ -51,6 +51,48 @@ impl fmt::Display for Severity {
     }
 }
 
+// ── FixLineSpan ───────────────────────────────────────────────────────────────
+
+/// A line-range descriptor for a single lint auto-fix removal.
+///
+/// Encodes which lines to remove from the raw source to apply the fix. Byte
+/// offsets point into any character within the target line — the planner
+/// computes exact start/end positions (via `line_start` / `extend_to_line_end`).
+///
+/// - `from`: byte offset within the first line to remove.
+/// - `to`: byte offset within the boundary line.
+/// - `to_inclusive: true` → remove through the END of the line containing `to`.
+/// - `to_inclusive: false` → remove only UP TO the START of the line containing
+///   `to` (i.e. the `to` line is kept; this is used for partial-block removals
+///   where the closing `@end` must remain).
+///
+/// **Single-line helper**: use `FixLineSpan::single(offset)` to remove exactly
+/// the one line that contains `offset`.
+#[derive(Debug, Clone)]
+pub struct FixLineSpan {
+    /// Byte offset of any character in the first line to remove.
+    pub from: usize,
+    /// Byte offset of the boundary line (inclusive or exclusive per `to_inclusive`).
+    pub to: usize,
+    /// When `true`, the line containing `to` is removed along with all lines
+    /// between `from` and `to`. When `false`, removal stops at the START of the
+    /// line containing `to` (the `to` line itself is kept).
+    pub to_inclusive: bool,
+}
+
+impl FixLineSpan {
+    /// Remove exactly the one line that contains `offset`.
+    ///
+    /// Equivalent to `FixLineSpan { from: offset, to: offset, to_inclusive: true }`.
+    pub fn single(offset: usize) -> Self {
+        FixLineSpan {
+            from: offset,
+            to: offset,
+            to_inclusive: true,
+        }
+    }
+}
+
 // ── LintDiagnostic ────────────────────────────────────────────────────────────
 
 /// A single lint finding.
@@ -84,6 +126,14 @@ pub struct LintDiagnostic {
     pub span: Option<SerializedSpan>,
     /// Source file path (for per-file JSON grouping and miette NamedSource).
     pub file: Option<String>,
+    /// Concrete fix plan for this diagnostic: `Some(spans)` when an auto-fix is
+    /// available for this specific instance; `None` when the rule does not support
+    /// fixing this case (e.g. partially-reducible blocks, report-only rules).
+    ///
+    /// Used by the fix planner (`plan_fixes_with_options`) instead of the legacy
+    /// span-based heuristic. The `fixable` field in the JSON wire format is
+    /// `fix_removals.is_some() && tier::is_fixable(rule, is_standalone)`.
+    pub fix_removals: Option<Vec<FixLineSpan>>,
 }
 
 impl fmt::Debug for LintDiagnostic {
@@ -95,6 +145,7 @@ impl fmt::Debug for LintDiagnostic {
             .field("help", &self.help)
             .field("span", &self.span)
             .field("file", &self.file)
+            .field("fix_removals", &self.fix_removals.as_ref().map(|v| v.len()))
             .finish()
     }
 }
@@ -229,7 +280,7 @@ impl LintResult {
                 "severity": diag.severity.to_string(),
                 "message": diag.message,
                 "help": diag.help,
-                "fixable": super::tier::is_fixable(&diag.rule, self.is_standalone),
+                "fixable": diag.fix_removals.is_some() && super::tier::is_fixable(&diag.rule, self.is_standalone),
                 "span": span_json,
             });
 
@@ -394,6 +445,7 @@ mod tests {
                 help: None,
                 span: None,
                 file: Some("f.mds".to_string()),
+                fix_removals: None,
             }],
             truncated: false,
             is_standalone: false,
@@ -427,6 +479,7 @@ mod tests {
                 help: None,
                 span: None,
                 file: None,
+                fix_removals: None,
             });
             assert!(accepted, "diagnostic {i} should be accepted");
         }
@@ -438,6 +491,7 @@ mod tests {
             help: None,
             span: None,
             file: None,
+            fix_removals: None,
         });
         assert!(!rejected, "push beyond cap should return false");
 
@@ -462,6 +516,7 @@ mod tests {
                 help: None,
                 span: None,
                 file: Some("f.mds".to_string()),
+                fix_removals: None,
             });
         }
         let result = builder.build(false);
@@ -495,6 +550,7 @@ mod tests {
             help: None,
             span: None,
             file: None,
+            fix_removals: None,
         };
         let code = diag.code().unwrap().to_string();
         assert_eq!(code, "mds::lint::unused-variable");
@@ -511,6 +567,7 @@ mod tests {
             help: None,
             span: None,
             file: None,
+            fix_removals: None,
         };
         assert_eq!(warn.severity(), Some(miette::Severity::Warning));
 
@@ -521,6 +578,7 @@ mod tests {
             help: None,
             span: None,
             file: None,
+            fix_removals: None,
         };
         assert_eq!(info.severity(), Some(miette::Severity::Advice));
 
@@ -531,6 +589,7 @@ mod tests {
             help: None,
             span: None,
             file: None,
+            fix_removals: None,
         };
         assert_eq!(err.severity(), Some(miette::Severity::Error));
     }

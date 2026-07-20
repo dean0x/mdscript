@@ -1,0 +1,19 @@
+---
+role: admin
+roles:
+  - admin
+  - editor
+deprecated_flag: false
+audit: true
+---
+Primary role: {role}
+
+@for role in roles:
+- {role}
+@end
+
+@if audit:
+Audit logging is enabled.
+@else:
+Audit logging is enabled.
+@end

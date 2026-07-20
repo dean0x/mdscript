@@ -9,8 +9,17 @@
 //! |------|---------------------------------------------------|-----------|
 //! | A    | duplicate-import, duplicate-export,               | Auto-fixable; gated by reverify |
 //! |      | unreachable-branch, empty-block                   |           |
-//! | B    | unused-import, unused-function                    | Fixable only when standalone |
+//! | B    | unused-import, unused-function                    | Fixable only when structural-standalone |
 //! | C    | unused-variable, redundant-else, shadow-variable  | Never fixed |
+//!
+//! ## Terminology (spec §7.5)
+//!
+//! - **Structural-standalone**: a file with no `@import`, `@extends`, or use as a
+//!   partial target. This property gates Tier B `--fix`. A file that triggers
+//!   `unused-import` is, by definition, not structural-standalone.
+//! - **Compile-clean**: a file that compiles without any runtime `--vars`. This
+//!   property gates the output-equality reverify for Tier B fixes: removing an
+//!   unused import or function must produce byte-identical compiled output.
 
 /// Fix tier for a lint rule.
 #[derive(Debug, Clone, PartialEq, Eq)]

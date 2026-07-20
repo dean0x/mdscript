@@ -221,6 +221,11 @@ pub struct IfBlock {
     /// `None` when there is no `@else` clause. Used by lint rules to anchor
     /// diagnostics at the exact `@else` line rather than the enclosing `@if`.
     pub else_offset: Option<usize>,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    ///
+    /// This is a span annotation — intentionally excluded from structural
+    /// equality (see `structural_eq.rs`), similar to `ElseifBranch.offset`.
+    pub end_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -232,6 +237,11 @@ pub struct ForBlock {
     pub iterable: Expr,
     pub body: Vec<Node>,
     pub offset: usize,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    ///
+    /// This is a span annotation — intentionally excluded from structural
+    /// equality (see `structural_eq.rs`), similar to `ElseifBranch.offset`.
+    pub end_offset: usize,
 }
 
 /// A parameter in a `@define` function definition.
@@ -275,12 +285,61 @@ pub(crate) fn required_param_count(params: &[Param]) -> usize {
     params.iter().filter(|p| p.default.is_none()).count()
 }
 
+/// Render a function signature as a human-readable string for arity-mismatch help (B3 — F7).
+///
+/// Output format: `name(param1, param2 = default)`.
+/// Required params are shown by name only; optional params include their default.
+/// Used by `MdsError::arity` / `arity_at` to populate `signature_note`.
+pub(crate) fn render_signature(name: &str, params: &[Param]) -> String {
+    let args = params
+        .iter()
+        .map(render_param)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({args})")
+}
+
+/// Render a single parameter for `render_signature`.
+fn render_param(p: &Param) -> String {
+    match &p.default {
+        None => p.name.clone(),
+        Some(expr) => format!("{} = {}", p.name, render_default(expr)),
+    }
+}
+
+/// Render a literal default-value expression as a compact string.
+///
+/// The parser guarantees that parameter defaults are always literal expressions
+/// (the validator rejects function calls and variable references as defaults).
+/// Complex or future expression forms fall back to `"…"`.
+pub(crate) fn render_default(expr: &Expr) -> String {
+    match expr {
+        Expr::StringLiteral(s) => format!("\"{s}\""),
+        Expr::NumberLiteral(n) => {
+            if n.fract() == 0.0 {
+                format!("{}", *n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        Expr::BooleanLiteral(b) => b.to_string(),
+        Expr::NullLiteral => "null".to_string(),
+        // Guarded fallback — parser currently rejects non-literal defaults.
+        _ => "\u{2026}".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DefineBlock {
     pub name: String,
     pub params: Vec<Param>,
     pub body: Vec<Node>,
     pub offset: usize,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    ///
+    /// This is a span annotation — intentionally excluded from structural
+    /// equality (see `structural_eq.rs`), similar to `ElseifBranch.offset`.
+    pub end_offset: usize,
 }
 
 #[derive(Debug, Clone)]

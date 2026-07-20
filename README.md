@@ -11,19 +11,27 @@ Built for AI engineers who manage prompt libraries across agents, models, and en
 
 ## Quick Start
 
-**Install via npm** (Node or browser):
-
-```bash
-npm install @mdscript/mds
-```
-
-**Or install the CLI** (Rust):
+**Install the CLI** (Rust):
 
 ```bash
 cargo install mds-cli
 ```
 
-**Create a prompt template** (`system.mds`):
+**Or install via npm** (Node or browser):
+
+```bash
+npm install @mdscript/mds
+```
+
+**Create and compile a starter template**:
+
+```bash
+mds init                       # creates hello.mds
+mds build hello.mds            # compiles to hello.md
+mds build hello.mds -o -       # stdout
+```
+
+**For multi-file prompt libraries**, templates compose via `@import` — for example:
 
 ```
 ---
@@ -49,12 +57,8 @@ Use extended thinking for complex tasks.
 @end
 ```
 
-**Compile it**:
-
-```bash
-mds build system.mds          # writes system.md
-mds build system.mds -o -     # stdout
-```
+See [`examples/prompt-library/`](examples/prompt-library/) for a complete reusable
+prompt library using `@export`/`@import` (personas, formatting, guardrails).
 
 Unlike general-purpose template engines, MDS is Markdown-native: no delimiters to escape, no runtime to configure. The compiler catches undefined variables, import cycles, and arity mismatches at build time, not in production.
 
@@ -147,7 +151,7 @@ mds watch src/ --out-dir dist   # mirror source subtree under dist/
                                 # src/a/b/foo.mds → dist/a/b/foo.md  (not dist/foo.md)
 ```
 
-> **Breaking change (next release):** Directory mode with `--out-dir` or `mds.json output_dir`
+> **Changed in v0.4.0:** Directory mode with `--out-dir` or `mds.json output_dir`
 > now mirrors the source subtree instead of writing flat stems. Old flat outputs are
 > orphaned and must be removed manually.
 
@@ -223,7 +227,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | Rule | Severity | Description |
 |------|----------|-------------|
 | `unused-variable` | warn | Frontmatter variable defined but never referenced in the body |
-| `unused-import` | warn | `@import` that is never referenced (Tier B: auto-fixed only for standalone files) |
+| `unused-import` | warn | `@import` that is never referenced (Tier B: report-only in practice — no `fix_removals` wired; a file with imports is never structural-standalone) |
 | `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
 | `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
@@ -232,7 +236,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
 | `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
 
-Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, output is suppressed but exit codes are unaffected.
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, output is suppressed but exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Bundler Integration

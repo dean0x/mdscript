@@ -24,13 +24,19 @@
 //!
 //! With `--fix`, residual post-fix findings determine the exit code.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
 
-use crate::build::{build_runtime_vars, load_config, read_stdin, resolve_input, RuntimeVarArgs};
+use crate::build::{
+    build_runtime_vars, ensure_existing_mds_file, load_config, read_stdin, resolve_input,
+    RuntimeVarArgs,
+};
 use crate::output::{atomic_write_file, collect_mds_files_detailed};
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -160,19 +166,15 @@ fn do_lint(args: LintArgs) -> Result<()> {
     }
 
     // Single-file mode.
-    ensure_mds_extension(&input)?;
-    run_lint_file(&input, flags, runtime_vars)
-}
-
-/// Reject non-.mds extension (exit 2 via caller catch).
-fn ensure_mds_extension(path: &Path) -> Result<()> {
-    if path.extension().and_then(|e| e.to_str()) == Some("mds") {
-        Ok(())
-    } else {
-        Err(miette::Error::from(MdsError::NotMdsFile {
-            path: path.display().to_string(),
-        }))
+    // Check existence first, then extension (C4/F6): a non-existent path must report
+    // mds::file_not_found, not mds::not_mds_file, regardless of the extension.
+    // Route through emit_analysis_failure_json_or_stderr so --format json produces the
+    // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
+    if let Err(mds_err) = ensure_existing_mds_file(&input) {
+        emit_analysis_failure_json_or_stderr(&mds_err, format);
+        std::process::exit(mds_error_exit_code(&mds_err));
     }
+    run_lint_file(&input, flags, runtime_vars)
 }
 
 // ── Config helpers ────────────────────────────────────────────────────────────
@@ -269,6 +271,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
         help: diag.help.as_deref().map(mds::sanitize_control_chars),
         span: diag.span.clone(),
         file: diag.file.clone(),
+        fix_removals: diag.fix_removals.clone(),
     };
     // Attach the source code so miette can render the span with source context
     // (source line + caret underline). The labels() implementation on LintDiagnostic
@@ -849,11 +852,43 @@ fn run_lint_file(
 /// suppressions on `lint_one_file_accumulating` and `lint_one_file_human`
 /// (issue #6 / zero-warnings policy). Pattern mirrors `FileCompileCtx` / `DirWatchCtx`
 /// in watch.rs.
+///
+/// `config_cache` maps a directory path to the resolved `LintConfig` for that directory.
+/// The cache avoids re-loading the config for every file in the same directory; the
+/// `RefCell` provides interior mutability so per-file helpers can populate it through
+/// a shared `&LintDirCtx` reference (A6 / D20 decision).
 struct LintDirCtx<'a> {
     lint_root: &'a Path,
     flags: LintFlags,
-    runtime_vars: &'a Option<std::collections::HashMap<String, mds::Value>>,
-    config: &'a mds::LintConfig,
+    runtime_vars: &'a Option<HashMap<String, mds::Value>>,
+    config_cache: RefCell<HashMap<PathBuf, Rc<mds::LintConfig>>>,
+}
+
+impl<'a> LintDirCtx<'a> {
+    /// Return the `LintConfig` for the directory `base_dir`.
+    ///
+    /// On the first call for a given `base_dir`, the config is loaded by walking
+    /// up the directory tree (via `load_lint_config`). Subsequent calls return the
+    /// cached value; files in the same directory always share a config.
+    ///
+    /// On config-load failure, returns `Err(MdsError::Io{..})` so the caller can
+    /// record a per-file error and continue linting the rest of the tree.
+    fn config_for(&self, base_dir: &Path) -> Result<Rc<mds::LintConfig>, MdsError> {
+        {
+            let cache = self.config_cache.borrow();
+            if let Some(cfg) = cache.get(base_dir) {
+                return Ok(Rc::clone(cfg));
+            }
+        }
+        let config = load_lint_config(base_dir).map_err(|e| MdsError::Io {
+            message: format!("{e}"),
+        })?;
+        let rc = Rc::new(config);
+        self.config_cache
+            .borrow_mut()
+            .insert(base_dir.to_path_buf(), Rc::clone(&rc));
+        Ok(rc)
+    }
 }
 
 /// Aggregate exit-code category for directory mode.
@@ -891,17 +926,9 @@ fn run_lint_directory(
     const MAX_DEPTH: usize = 64;
     let LintFlags { quiet, format, .. } = flags;
 
-    // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(dir) {
-        Ok(c) => c,
-        Err(e) => {
-            let mds_err = MdsError::Io {
-                message: format!("{e}"),
-            };
-            emit_analysis_failure_json_or_stderr(&mds_err, format);
-            std::process::exit(2);
-        }
-    };
+    // A6/D20: config is now discovered per-file (each file walks up to its nearest
+    // mds.json). The single root config load is removed; config_cache in LintDirCtx
+    // amortises repeated loads for files in the same directory.
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
@@ -936,7 +963,7 @@ fn run_lint_directory(
         lint_root: dir,
         flags,
         runtime_vars: &runtime_vars,
-        config: &config,
+        config_cache: RefCell::new(HashMap::new()),
     };
 
     for file in &files {
@@ -1012,7 +1039,21 @@ fn lint_one_file_accumulating(
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(file);
 
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
+    // A6: per-file config discovery — load (and cache) the nearest mds.json for
+    // this file's directory. A config-load failure is a per-file error; the rest
+    // of the tree continues linting.
+    let config = match ctx.config_for(base_dir) {
+        Ok(c) => c,
+        Err(ref e) => {
+            json_files.push(serde_json::json!({
+                "file": display_path,
+                "error": e.serialize()
+            }));
+            return FileTally::Error;
+        }
+    };
+
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
@@ -1056,13 +1097,8 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            ctx.config,
-        );
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1124,7 +1160,7 @@ fn lint_one_file_accumulating(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            ctx.config,
+            &config,
         ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
@@ -1179,10 +1215,22 @@ fn lint_one_file_human(
 
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(file);
+
+    // A6: per-file config discovery — load (and cache) the nearest mds.json for
+    // this file's directory. A config-load failure is a per-file error; the rest
+    // of the tree continues linting.
+    let config = match ctx.config_for(base_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::output::eprint_error(miette::Report::from(e));
+            return FileTally::Error;
+        }
+    };
+
     // Named source for span rendering: relative display path + source text.
     let named_source = Some((display_path.as_str(), source.as_str()));
 
-    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), ctx.config) {
+    let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(ref e) => {
             crate::output::eprint_error(miette::Report::from(e.clone()));
@@ -1209,13 +1257,8 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(
-            result,
-            &source,
-            base_dir,
-            ctx.runtime_vars.clone(),
-            ctx.config,
-        );
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -1270,7 +1313,7 @@ fn lint_one_file_human(
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
-            ctx.config,
+            &config,
         ) {
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
@@ -1404,4 +1447,88 @@ fn colorize_unified_diff(unified: &str) -> String {
         }
     }
     out
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{preview_fixes, PreviewOutcome};
+    use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
+    use std::path::Path;
+
+    /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
+    /// the current 9 rules.  Every pair of real-rule fix spans is either disjoint
+    /// (different AST blocks) or in a containment relationship (same block, different
+    /// rules) — the latter is resolved by `dedup_contained_or_identical` before the
+    /// overlap detector is reached.  No MDS fixture can drive `overlap_rejected=true`
+    /// through the CLI binary.
+    ///
+    /// This unit test covers rejection surfacing at the deepest level reachable from
+    /// the CLI crate: `preview_fixes` with a crafted `LintResult` whose `fix_removals`
+    /// produce the same genuine partial overlap used in the mds-core ISS-02 regression
+    /// test (fix.rs: `a4_partial_overlap_still_rejected_after_dedup`).
+    ///
+    /// Math (identical to ISS-02):
+    ///   source = "line0\nline1\nline2\n"
+    ///   Edit A: FixLineSpan { from: 0, to: 6,  to_inclusive: true } → ByteEdit [0,  12)
+    ///   Edit B: FixLineSpan { from: 6, to: 12, to_inclusive: true } → ByteEdit [6,  18)
+    ///   A.end=12 > B.start=6, B.end=18 > A.end=12 → partial overlap → overlap_rejected.
+    ///
+    /// `preview_fixes` must return `PreviewOutcome::Rejected` — the rejection must be
+    /// surfaced (not silently swallowed as `NothingToFix`).  This pins PF-004: the
+    /// preview path uses the same gated pipeline as the write path and is equally
+    /// honest about overlap refusals.
+    #[test]
+    fn preview_fixes_surfaces_rejected_on_overlap() {
+        let source = "line0\nline1\nline2\n";
+        // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
+        let diag_a = LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "a".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 0, // inside line0
+                to: 6,   // inside line1; extend_to_line_end(6) = 12
+                to_inclusive: true,
+            }]),
+        };
+        // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
+        // Partially overlaps A at [6, 12).
+        let diag_b = LintDiagnostic {
+            rule: "empty-block".to_string(),
+            severity: Severity::Warn,
+            message: "b".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 6, // inside line1
+                to: 12,  // inside line2; extend_to_line_end(12) = 18
+                to_inclusive: true,
+            }]),
+        };
+        let result = LintResult {
+            diagnostics: vec![diag_a, diag_b],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        let outcome = preview_fixes(
+            &result,
+            source,
+            Path::new("."),
+            None,
+            &mds::LintConfig::default(),
+        );
+
+        assert!(
+            matches!(outcome, PreviewOutcome::Rejected(_)),
+            "preview_fixes must return Rejected for an overlap_rejected plan, \
+             not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
+        );
+    }
 }

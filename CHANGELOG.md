@@ -52,13 +52,14 @@ now appear in the compiled output.
 **Migration:** if your pipeline depends on base frontmatter keys being absent from the
 compiled output, strip them downstream or move them to a non-frontmatter location.
 
-#### Interior-verbatim whitespace contract for block bodies and `mds fmt` (#150, #151)
+#### Interior-verbatim whitespace contract for `@block` bodies and `mds fmt` (#150, #151)
 
-Leading blank lines and interior blank runs inside `@block` / `@define` bodies and
+Leading blank lines and interior blank runs inside `@block` bodies and
 `mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
 The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
 equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
-exactly one final newline).
+exactly one final newline). `@message` and `@define` bodies continue to edge-trim —
+leading and trailing blank lines are stripped — and are not covered by this contract.
 
 **Migration:** compiled outputs may gain blank lines that were previously collapsed or
 stripped; templates relying on this collapse must remove the extra blank lines at the
@@ -275,6 +276,44 @@ directly via `ModuleCache::with_fs`.
 - **napi workspace `build` script**: `crates/mds-napi/package.json` gains a `build`
   script (`napi build --release --no-js`) for local development. (#196)
 
+- **Block-span lint fixes — `--fix` now removes whole blocks** (`@if`/`@for`/`@define`
+  spans) for the `empty-block`, `unreachable-branch`, and `unused-function` rules.
+  Previously the fixer could only remove a single directive line, leaving the
+  matching `@end` orphaned; the reverify gate would catch the resulting parse error and
+  decline the fix, making these rules report-only in practice (tracked as limitation
+  in #172). The implementation now threads `end_offset` through the AST
+  (`IfBlock`, `ForBlock`, `DefineBlock`) and uses a `FixLineSpan` descriptor
+  (byte range of the full block) to perform whole-block removal. Containment dedup
+  in the planner coalesces overlapping spans and deduplicates identical fix ranges
+  across rules. JSON `"fixable"` is now `true` only when an actual `FixLineSpan`
+  is deliverable and the tier gate passes. The reverify gate still applies
+  fail-closed — if recompile fails, the fix is reported not applied.
+
+- **Per-file `mds.json` discovery in `mds lint` directory mode**: when linting a
+  directory, the nearest `mds.json` is now located by walking up from **each input
+  file** independently (with a cached walk-up per directory). Previously a single
+  config at the lint-root directory was applied to all files. A malformed config in
+  a subdirectory now produces a per-file error entry and contributes to exit code 2
+  rather than aborting the entire run.
+
+- **`mds::invalid_vars`** — new error code for malformed or non-object `--vars`
+  JSON (exits 1). A missing `--vars` file continues to use `mds::file_not_found`
+  (exits 2). The two failure modes were previously reported as the same generic error.
+
+- **Python typed lint result classes** (`crates/mds-python`): `LintDiagnostic` and
+  `LintFileReport` are now typed, frozen `#[pyclass]` instances. `LintResult.files`
+  returns a list of `LintFileReport` objects rather than raw dicts. Stubs
+  (`.pyi` files) and the `mypy`/`pyright` typecheck sample are updated accordingly.
+
+- **Python `CompileResult.to_dict()` always includes `"sourceMap"` key**: the key is
+  present with value `None` when no source map was generated, and with the map dict
+  when one was. `to_json()` stays canonical (omits the key when absent) — the
+  asymmetry is intentional and documented.
+
+- **WASM CI size guard raised from 800 K to 850 K**: the branch's core growth
+  (span attribution machinery, `end_offset` fields, `FixLineSpan` planner) pushed
+  the optimized WASM binary to ~808 KB. The guard in `ci.yml` was raised accordingly.
+
 ### Changed
 
 - **napi and Python `compileFile` / `compile_file` now emit root-relative
@@ -345,6 +384,73 @@ directly via `ModuleCache::with_fs`.
   label was previously set to `{message}` (same as the headline), producing redundant
   output in code-frame renderings. It now reads `"syntax error occurred here"`. (#196)
 
+- **Imported-macro `type_mismatch` errors now point to the defining file**: when a
+  type mismatch is raised inside a `@define` body that was imported from another file,
+  the error frame now names the helper file and shows the relevant line (e.g.
+  `helper.mds:3:5`) rather than pointing at the call site in the importing file.
+  Implemented via `FunctionDef.origin` (always-populated, one `Arc::from(source)` per
+  module) and `EvalContext.body_origin` (LIFO swap around body evaluation). The
+  performance trade-off (one Arc per module instead of zero) is an explicit
+  AC-PERF-01 relaxation accepted for span correctness.
+
+- **Parser syntax errors now carry directive-line spans**: approximately 20 previously
+  spanless `mds::syntax` errors now include a source span pointing at the directive
+  line that caused the error (implemented via `MdsError::or_span`). This affects
+  common mistakes such as unclosed strings in frontmatter and malformed directive
+  arguments.
+
+- **`ArityMismatch` help now shows the expected signature**: the help text for a
+  wrong-argument-count error now includes the function's expected call form (e.g.
+  `pair(a, b)` or `f(x, y="admin")`), rendered from the `@define` parameter list.
+  Previously it only said to check the call site.
+
+- **`TypeMismatch` help text rewritten**: the help message now distinguishes three
+  scenarios — comparing a variable to a literal of a different type (suggests an
+  explicit conversion), using a non-boolean value in an `@if` truthiness check (notes
+  that any non-null, non-false value is truthy), and confusion from `--set` type
+  coercion (suggests `--set-string` to keep a string value byte-for-byte).
+
+- **`--vars` missing file exits 2 with `mds::file_not_found`**: previously a missing
+  `--vars` path produced a generic I/O error. It now exits 2 (I/O error) with a
+  structured `mds::file_not_found` diagnostic including a help note.
+
+- **Config-sourced `source_map=true` degrades gracefully on stdout output**: when
+  `build.source_map=true` is set in `mds.json` and the output is stdout (`-o -`),
+  the build now proceeds with exit 0 and a single warning naming the config file
+  (suggesting `--no-source-map` or `-o <file>`). Previously this combination produced
+  a confusing double-error. An explicit `--source-map -o -` flag combination still
+  hard-errors with an extended message (`-o <file>` / `--out-dir` / `--inline` /
+  `--no-source-map`).
+
+- **Config `embed_sources=true` without `source_map=true` now warns** at all merge
+  sites (mds.json merge, `--vars` merge, CLI flag merge). Previously the warning was
+  emitted inconsistently.
+
+- **`mds fmt` and `mds lint` check path existence before checking the `.mds`
+  extension**: a path that does not exist now exits 2 with `mds::file_not_found`
+  (rather than the "not an MDS file" extension error). `mds lint` preserves the JSON
+  envelope for a missing-file error in `--format json` mode.
+
+- **WASM `check()` rejects `sourceMap`, `sourcesContent`, and unknown option keys**
+  with `mds::invalid_options`. Previously these keys were silently ignored by the
+  WASM backend's `check` function.
+
+- **Python `check()` rejects `source_map` and `sources_content` options** with
+  `mds::invalid_options`. These options are valid for `compile()` but not for
+  `check()`.
+
+- **Fix-rejection message is now actionable**: when the reverify gate declines a fix
+  (because the edited source fails to reparse or produces different output), the
+  message now reads "could not verify fix — the edited source did not re-parse
+  cleanly (reason); leaving the file unchanged" rather than a generic internal note.
+
+- **`unused-import` documented as report-only in practice**: the JSON `"fixable"` key
+  for `unused-import` findings is always `false`. A file that triggers this rule has
+  at least one `@import` directive, which makes it non-standalone; Tier B fixes
+  require a standalone file, so the fix is never delivered. The rule is worth keeping
+  for awareness — it clears as a side effect of applying other fixes (e.g. removing a
+  duplicate import that was also the unused one).
+
 ### Fixed
 
 - **`mds build -o build/out.md` with sources in `src/` again emits map-relative
@@ -355,7 +461,11 @@ directly via `ModuleCache::with_fs`.
   compiled to `build/out.md` with `--source-map` would emit `src/foo.mds` in the
   map instead of the spec-correct `../src/foo.mds`. Root-relative emission
   (`source_map_base: None`) is now the default for all binding surfaces (napi,
-  Python, WASM), which never write map files to disk. (#3)
+  Python, WASM), which never write map files to disk. Map-relative paths are emitted
+  only when the sidecar map file is written inside the project root (located via
+  `.mdsroot` / `.git` walk-up); when the map lands outside the root, paths remain
+  root-relative, and a `..`-escaping reference (a source outside the project root)
+  falls back to the basename. (#3)
 
 - **Code fences: tilde (`~~~`), indented, and blockquoted variants are now recognized**
   as passthrough regions. Previously only `` ``` ``-fences that started at column 1
@@ -382,6 +492,11 @@ directly via `ModuleCache::with_fs`.
   `compile`/`check(src, base_path=...)`, and CLI `mds build -` / `mds check -`
   (stdin) — all share the same resolution path. POSIX behavior is unchanged. (#133,
   #146)
+
+- **Messages-mode stdout no longer produces a double-error**: previously, when a
+  messages-mode template was built with a stdout output path (`-o -`) and
+  `source_map=true` (from config), two overlapping errors could fire. The
+  messages-mode stdout path now emits exactly one warning.
 
 ## [0.3.0] — 2026-06-28
 

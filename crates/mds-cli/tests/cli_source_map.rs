@@ -1338,3 +1338,207 @@ fn sm_sec3_dotdot_escape_falls_back_to_basename() {
         );
     }
 }
+
+// ── SM-18: explicit --source-map without -o → hard error (C2/F3) ─────────────
+
+/// `mds build <file> --source-map -o -` (sidecar + stdout) must fail with a clear
+/// message explaining that sidecar mode requires an output file path (C2/F3 explicit-flag case).
+///
+/// `-o -` routes output to stdout so `output_path` is `None`; without it, builds
+/// write next to the source file and no error fires.
+#[test]
+fn sm18_explicit_sidecar_flag_without_output_hard_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    std::fs::write(&src, "# Hello\n").unwrap();
+
+    // -o - routes output to stdout, making output_path=None and triggering the hard error.
+    let result = mds_bin()
+        .args(["build", "--source-map", "-o", "-"])
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        !result.status.success(),
+        "explicit --source-map -o - must fail (sidecar cannot write to stdout); stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("sidecar") || stderr.contains("output file") || stderr.contains("-o"),
+        "error must mention sidecar / output-file / -o; got: {stderr:?}"
+    );
+    // Must also mention alternatives so the user knows what to do.
+    assert!(
+        stderr.contains("--inline") || stderr.contains("--no-source-map"),
+        "error must mention --inline or --no-source-map as alternatives; got: {stderr:?}"
+    );
+}
+
+// ── SM-19: config source_map without -o → warning + stdout (C2/F3) ───────────
+
+/// `mds build <file> -o -` with `mds.json` setting `source_map=true` must degrade
+/// gracefully: write compiled content to stdout, emit a warning on stderr naming the
+/// config file, and exit 0 (C2/F3 config-sourced case).
+///
+/// `-o -` routes output to stdout, making `output_path=None` and triggering the
+/// config-degrade path. Without `-o -`, a file build writes next to the source.
+#[test]
+fn sm19_config_source_map_sidecar_without_output_degrades_with_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    std::fs::write(&src, "# Hello\n").unwrap();
+    // Place an mds.json that sets source_map=true in the same directory.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"build": {"source_map": true}}"#,
+    )
+    .unwrap();
+
+    let result = mds_bin()
+        .args(["build", "-o", "-"]) // -o - routes to stdout (output_path=None)
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        result.status.success(),
+        "config-sourced source_map with -o - must exit 0 (degrade gracefully); \
+         stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // Compiled content should appear on stdout.
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        !stdout.is_empty(),
+        "compiled content must be written to stdout; stdout was empty"
+    );
+    // A degradation warning must appear on stderr.
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("source_map") || stderr.contains("mds.json"),
+        "warning must mention source_map or mds.json; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("warning") || stderr.contains("no effect"),
+        "output must look like a warning, not an error; got: {stderr:?}"
+    );
+}
+
+// ── SM-19q: same but --quiet suppresses the warning ──────────────────────────
+
+/// Same as SM-19 but with `--quiet`: content goes to stdout, no warning emitted.
+#[test]
+fn sm19q_config_source_map_without_output_quiet_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    std::fs::write(&src, "# Hello\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"build": {"source_map": true}}"#,
+    )
+    .unwrap();
+
+    let result = mds_bin()
+        .args(["build", "--quiet", "-o", "-"]) // -o - routes to stdout
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        result.status.success(),
+        "--quiet config-sourced source_map with -o - must exit 0; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.is_empty(),
+        "--quiet must suppress the degradation warning; got: {stderr:?}"
+    );
+}
+
+// ── SM-20: --embed-sources without --source-map → warning (C3/D6) ────────────
+
+/// When `mds.json` sets `embed_sources=true` but `source_map` is not enabled
+/// (neither in config nor via `--source-map`), the build must warn that embed_sources
+/// has no effect and still succeed (C3/D6).
+///
+/// Note: the CLI `--embed-sources` flag requires `--source-map` (Clap enforces this),
+/// so the only way embed_sources can be active without source_map is via the config file.
+#[test]
+fn sm20_embed_sources_without_source_map_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    let out = dir.path().join("out.md");
+    std::fs::write(&src, "# Hello\n").unwrap();
+    // Config has embed_sources=true but no source_map=true.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"build": {"embed_sources": true}}"#,
+    )
+    .unwrap();
+
+    let result = mds_bin()
+        .args(["build", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        result.status.success(),
+        "config embed_sources without source_map must still succeed (warning only); \
+         stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("embed_sources") && stderr.contains("no effect"),
+        "stderr must warn that embed_sources has no effect without source maps; got: {stderr:?}"
+    );
+}
+
+/// Config `embed_sources=true` WITH `source_map=true` must NOT emit the embed_sources
+/// warning (the combination is valid and should produce sourcesContent in the map).
+#[test]
+fn sm20b_embed_sources_with_source_map_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("hello.mds");
+    let out = dir.path().join("out.md");
+    std::fs::write(&src, "# Hello\n").unwrap();
+    // Both embed_sources and source_map are true — no warning expected.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"build": {"embed_sources": true, "source_map": true}}"#,
+    )
+    .unwrap();
+
+    let result = mds_bin()
+        .args(["build", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("mds binary should run");
+
+    assert!(
+        result.status.success(),
+        "config embed_sources+source_map must succeed; stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !stderr.contains("no effect"),
+        "embed_sources+source_map must NOT warn about no effect; got: {stderr:?}"
+    );
+}

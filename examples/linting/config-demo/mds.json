@@ -1,0 +1,9 @@
+{
+  "lint": {
+    "rules": {
+      "shadow-variable": "info",
+      "unused-variable": "error",
+      "redundant-else": "off"
+    }
+  }
+}

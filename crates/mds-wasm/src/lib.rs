@@ -537,6 +537,43 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
     })
 }
 
+/// Parse the JS options for the `check` function.
+///
+/// `check` performs validation only — it does not produce a Source Map.
+/// Passing `sourceMap` or `sourcesContent` is therefore a caller error:
+/// both keys are rejected with `mds::invalid_options`, matching the
+/// `packages/mds` `CheckOptions` type split (V-11) and napi behaviour.
+///
+/// Valid keys: `filename`, `modules`, `vars`.
+fn parse_check_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
+    // null / undefined → all defaults.
+    if options.is_null() || options.is_undefined() {
+        return Ok(ParsedOptions::default());
+    }
+
+    // Reject non-objects (including arrays).
+    if !options.is_object() || js_sys::Array::is_array(&options) {
+        return Err(options_error("options must be a plain object"));
+    }
+
+    // SAFETY: we verified options.is_object() above.
+    let obj: js_sys::Object = options.unchecked_into();
+
+    reject_unknown_wasm_keys(&obj, &["filename", "modules", "vars"])?;
+
+    let filename = extract_filename(&obj)?;
+    let extra_modules = extract_modules(&obj)?;
+    let vars = extract_vars(&obj)?;
+
+    Ok(ParsedOptions {
+        filename,
+        extra_modules,
+        vars,
+        source_map: false,
+        include_sources_content: false,
+    })
+}
+
 /// Parse the JS options for `lint_virtual` (no `filename` or `modules` — those are
 /// explicit parameters).
 ///
@@ -701,13 +738,22 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// ## Arguments
 ///
 /// - `source`: MDS template source text.
-/// - `options`: optional configuration object (same fields as [`compile`]).
+/// - `options`: optional configuration object with the following optional fields:
+///   - `filename` (string, default `"input.mds"`): the entry module key.
+///   - `modules` (`Record<string, string>`): additional virtual modules for import resolution.
+///   - `vars` (`Record<string, any>`): runtime variable overrides.
 ///
 /// ## Returns
 ///
 /// On success, a JS object `{ warnings: string[] }`.
 ///
 /// On failure, throws a JS `Error` with the same structure as [`compile`].
+///
+/// ## Notes
+///
+/// `check` does **not** accept `sourceMap` or `sourcesContent` — source maps
+/// are a compile-only concept. Passing either key is rejected with
+/// `code = "mds::invalid_options"`.
 ///
 /// ## Example (JavaScript)
 ///
@@ -723,7 +769,7 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     let source = source.to_string();
 
     catch_panic(AssertUnwindSafe(move || {
-        let opts = parse_options(options)?;
+        let opts = parse_check_options(options)?;
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let ((), warnings) =
             mds::check_virtual_collecting_warnings(modules, &opts.filename, opts.vars)

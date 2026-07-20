@@ -169,13 +169,21 @@ pub enum MdsError {
     #[error("arity mismatch for '{name}': {}, got {got}", format_arity(*expected_min, *expected_max))]
     #[diagnostic(
         code(mds::arity),
-        help("check the call site — '{name}' requires a different number of arguments than were provided")
+        help("check the call site — '{name}' requires a different number of arguments than were provided{signature_note}")
     )]
     ArityMismatch {
         name: String,
         expected_min: usize,
         expected_max: usize,
         got: usize,
+        /// Formatted function signature for the help text (B3 — F7).
+        ///
+        /// When non-empty, miette appends it to the help text so the user sees
+        /// the expected signature without having to look up the `@define`.
+        ///
+        /// Format: `"\nexpected: name(param1, param2 = default)"`.
+        /// Empty string for built-in functions (their signatures live in docs).
+        signature_note: String,
         #[label("wrong number of arguments")]
         span: Option<SourceSpan>,
         #[source_code]
@@ -213,7 +221,7 @@ pub enum MdsError {
     #[error("type mismatch: cannot compare {lhs_type} with {rhs_type}")]
     #[diagnostic(
         code(mds::type_mismatch),
-        help("left side is {lhs_type}, right side is {rhs_type}; use '@if x:' for truthiness or '--set-string KEY=VALUE' to pass a string")
+        help("left side is {lhs_type}, right side is {rhs_type}; compare against a {lhs_type} literal, use '@if x:' for truthiness, or pass a string with '--set-string KEY=VALUE'")
     )]
     TypeMismatch {
         lhs_type: String,
@@ -292,6 +300,18 @@ pub enum MdsError {
     #[error("JSON parse error: {message}")]
     #[diagnostic(code(mds::json))]
     JsonError { message: String },
+
+    /// Vars file exists but contains malformed JSON or a non-object top-level value.
+    ///
+    /// Distinct from `JsonError` (which covers other JSON sites) so the user gets
+    /// the specific help text pointing to the correct fix. Exit code stays 1
+    /// (content/semantic error, not a file-system error).
+    #[error("invalid vars file: {message}")]
+    #[diagnostic(
+        code(mds::invalid_vars),
+        help("vars file must be a JSON object mapping variable names to values")
+    )]
+    InvalidVars { message: String },
 
     #[error("recursion detected in function '{name}'")]
     #[diagnostic(
@@ -442,12 +462,17 @@ impl MdsError {
         expected_min: usize,
         expected_max: usize,
         got: usize,
+        signature: Option<String>,
     ) -> Self {
+        let signature_note = signature
+            .map(|s| format!("\nexpected: {s}"))
+            .unwrap_or_default();
         MdsError::ArityMismatch {
             name: name.into(),
             expected_min,
             expected_max,
             got,
+            signature_note,
             span: None,
             src: None,
         }
@@ -463,13 +488,18 @@ impl MdsError {
         source: &str,
         offset: usize,
         len: usize,
+        signature: Option<String>,
     ) -> Self {
+        let signature_note = signature
+            .map(|s| format!("\nexpected: {s}"))
+            .unwrap_or_default();
         let (span, src) = at(file, source, offset, len);
         MdsError::ArityMismatch {
             name: name.into(),
             expected_min,
             expected_max,
             got,
+            signature_note,
             span,
             src,
         }
@@ -694,6 +724,24 @@ impl MdsError {
         }
     }
 
+    /// Upgrade a spanless `Syntax` error with a span; no-op for other variants or if
+    /// the error already carries a span (B2 — spanless syntax-error upgrades at call sites
+    /// that hold the directive offset but cannot thread it into the low-level helper).
+    ///
+    /// Passing `file/source/offset/len` that are out-of-bounds degrades gracefully (the
+    /// `at()` helper drops `src` and keeps only the raw offset in `span`, so miette
+    /// never renders an `OutOfBounds`).
+    pub(crate) fn or_span(self, file: &str, source: &str, offset: usize, len: usize) -> Self {
+        match self {
+            MdsError::Syntax {
+                span: None,
+                src: None,
+                message,
+            } => Self::syntax_at(message, file, source, offset, len),
+            other => other,
+        }
+    }
+
     pub(crate) fn io(message: impl Into<String>) -> Self {
         MdsError::Io {
             message: message.into(),
@@ -708,6 +756,12 @@ impl MdsError {
 
     pub(crate) fn json_error(message: impl Into<String>) -> Self {
         MdsError::JsonError {
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn invalid_vars(message: impl Into<String>) -> Self {
+        MdsError::InvalidVars {
             message: message.into(),
         }
     }
@@ -813,6 +867,7 @@ impl MdsError {
             | MdsError::ResourceLimit { .. }
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
+            | MdsError::InvalidVars { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,

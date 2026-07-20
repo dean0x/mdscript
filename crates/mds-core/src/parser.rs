@@ -94,17 +94,17 @@ impl Drop for BlockGuard<'_, '_> {
     }
 }
 
-/// Build the appropriate parse error when a directive's trailing `:` is missing.
+/// Return the byte length of the line in `source` that starts at `offset`.
 ///
-/// Produces a targeted "unterminated string literal" message when the input contains
-/// an unclosed quote, or a generic "must end with ':'" message otherwise.
-fn directive_colon_error(directive: &str, rest: &str) -> MdsError {
-    if has_unterminated_string(rest) {
-        MdsError::syntax(format!(
-            "unterminated string literal in {directive} condition"
-        ))
+/// Used to bound the miette underline when anchoring directive errors. If `offset`
+/// is out of bounds or lands on a non-char-boundary, returns 0 rather than panicking.
+fn directive_line_len(source: &str, offset: usize) -> usize {
+    if offset <= source.len() && source.is_char_boundary(offset) {
+        source[offset..]
+            .find('\n')
+            .unwrap_or(source[offset..].len())
     } else {
-        MdsError::syntax(format!("{directive} directive must end with ':'"))
+        0
     }
 }
 
@@ -146,8 +146,9 @@ impl Parser<'_> {
                         // Parse the path.
                         let rest = trimmed.strip_prefix("@extends").unwrap_or("").trim();
                         if rest.is_empty() {
-                            return Err(MdsError::syntax(
+                            return Err(self.syntax_at(
                                 "@extends requires a quoted path: @extends \"./base.mds\"",
+                                offset,
                             ));
                         }
                         let path = parse_quoted_path(rest)?;
@@ -182,23 +183,61 @@ impl Parser<'_> {
         Ok(())
     }
 
-    /// Consume the closing `@end` token, returning an error if absent or wrong.
-    /// Consume the `@end` token that closes `block_name`, or emit a syntax error.
+    /// Build a span-bearing syntax error anchored at `offset` in this parser's source.
+    ///
+    /// Replaces the 5-argument `MdsError::syntax_at(msg, self.file, self.source, offset,
+    /// directive_line_len(self.source, offset))` pattern that appears throughout this file.
+    fn syntax_at(&self, message: impl Into<String>, offset: usize) -> MdsError {
+        MdsError::syntax_at(
+            message,
+            self.file,
+            self.source,
+            offset,
+            directive_line_len(self.source, offset),
+        )
+    }
+
+    /// Build a missing-colon error for `directive` with a source span at `offset`.
+    ///
+    /// Emits a targeted "unterminated string literal" message when `rest` contains an
+    /// unclosed quote; otherwise emits the generic "must end with ':'" message (B2).
+    fn colon_error(&self, directive: &str, rest: &str, offset: usize) -> MdsError {
+        if has_unterminated_string(rest) {
+            self.syntax_at(
+                format!("unterminated string literal in {directive} condition"),
+                offset,
+            )
+        } else {
+            self.syntax_at(format!("{directive} directive must end with ':'"), offset)
+        }
+    }
+
+    /// Consume the `@end` token that closes `block_name`, returning its byte offset on success.
     ///
     /// `opener_offset` is the byte offset of the OPENING directive token (e.g.
     /// the `@if` that this `@end` must close). When the block is never closed
     /// the error is anchored at the opener so the user sees the unclosed line
     /// rather than EOF.
-    fn consume_end(&mut self, block_name: &str, opener_offset: usize) -> Result<(), MdsError> {
+    ///
+    /// The returned `usize` is the byte offset of the `@end` token in the
+    /// source — used by lint rules to compute multi-line removal spans.
+    fn consume_end(&mut self, block_name: &str, opener_offset: usize) -> Result<usize, MdsError> {
         match self.tokens.get(self.pos) {
-            Some(Token::Directive(d, _)) if d.trim() == "@end" => {
+            Some(Token::Directive(d, end_off)) if d.trim() == "@end" => {
+                let end_offset = *end_off;
                 self.pos += 1;
-                Ok(())
+                Ok(end_offset)
             }
-            Some(Token::Directive(d, _)) => Err(MdsError::syntax(format!(
-                "expected @end to close {block_name} block, got '{}'",
-                d.trim()
-            ))),
+            Some(Token::Directive(d, off)) => {
+                let off = *off;
+                Err(self.syntax_at(
+                    format!(
+                        "expected @end to close {block_name} block, got '{}'",
+                        d.trim()
+                    ),
+                    off,
+                ))
+            }
             _ => Err(MdsError::syntax_at(
                 format!("unclosed {block_name} block (missing @end)"),
                 self.file,
@@ -324,9 +363,7 @@ impl Parser<'_> {
         if let Some(rest) = trimmed.strip_prefix("@include ") {
             let alias = rest.trim().to_string();
             if !is_valid_identifier(&alias) {
-                return Err(MdsError::syntax(format!(
-                    "invalid include alias: '{alias}'"
-                )));
+                return Err(self.syntax_at(format!("invalid include alias: '{alias}'"), offset));
             }
             return Ok(Node::Include(IncludeDirective { alias, offset }));
         }
@@ -339,20 +376,22 @@ impl Parser<'_> {
 
         // Give a targeted hint if the user wrote @else without the required colon
         if trimmed == "@else" {
-            return Err(MdsError::syntax(
+            return Err(self.syntax_at(
                 "found '@else' without colon — use '@else:' (with trailing colon)",
+                offset,
             ));
         }
 
         // Give targeted hints for @elseif used outside an @if block
         if trimmed.starts_with("@elseif ") || trimmed == "@elseif" {
-            return Err(MdsError::syntax("@elseif must appear inside an @if block"));
+            return Err(self.syntax_at("@elseif must appear inside an @if block", offset));
         }
 
         // Give a targeted hint for @elseif: (missing condition after the colon)
         if trimmed.starts_with("@elseif:") {
-            return Err(MdsError::syntax(
+            return Err(self.syntax_at(
                 "found '@elseif:' without a condition — use '@elseif <condition>:' (condition required)",
+                offset,
             ));
         }
 
@@ -369,9 +408,10 @@ impl Parser<'_> {
             ));
         }
 
-        Err(MdsError::syntax(format!(
-            "unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message, @block, @extends"
-        )))
+        Err(self.syntax_at(
+            format!("unknown directive: {trimmed}. Valid directives: @if, @elseif, @else:, @end, @for, @define, @import, @export, @include, @message, @block, @extends"),
+            offset,
+        ))
     }
 
     fn parse_if_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
@@ -379,9 +419,16 @@ impl Parser<'_> {
 
         let trimmed = rest.trim();
         let condition_str = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@if", trimmed))?;
+            .ok_or_else(|| self.colon_error("@if", trimmed, offset))?;
 
-        let condition = parse_condition(condition_str)?;
+        let condition = parse_condition(condition_str).map_err(|e| {
+            e.or_span(
+                self.file,
+                self.source,
+                offset,
+                directive_line_len(self.source, offset),
+            )
+        })?;
 
         // Parse then-body; stops at @else:, @end, or any @elseif prefix
         let then_body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
@@ -402,7 +449,7 @@ impl Parser<'_> {
             (None, None)
         };
 
-        self.consume_end("@if", offset)?;
+        let end_offset = self.consume_end("@if", offset)?;
 
         self.depth -= 1;
         Ok(Node::If(IfBlock {
@@ -412,6 +459,7 @@ impl Parser<'_> {
             else_body,
             offset,
             else_offset,
+            end_offset,
         }))
     }
 
@@ -429,17 +477,20 @@ impl Parser<'_> {
                 break;
             }
 
-            // Enforce the branch limit before doing any parse work for this iteration.
-            if branches.len() >= MAX_ELSEIF_BRANCHES {
-                return Err(MdsError::syntax(format!(
-                    "@if block has more than {MAX_ELSEIF_BRANCHES} @elseif branches"
-                )));
-            }
-
             // d and off are borrowed from self.tokens[self.pos] via peek(); clone
             // before advancing pos so the borrows end before the mutable advance.
+            // Capture elseif_offset BEFORE the limit check so the span is available.
             let elseif_dir = d.clone();
             let elseif_offset = *off;
+
+            // Enforce the branch limit before doing any parse work for this iteration.
+            if branches.len() >= MAX_ELSEIF_BRANCHES {
+                return Err(self.syntax_at(
+                    format!("@if block has more than {MAX_ELSEIF_BRANCHES} @elseif branches"),
+                    elseif_offset,
+                ));
+            }
+
             self.pos += 1;
 
             // Extract condition string: strip "@elseif " prefix and trailing ":".
@@ -450,9 +501,16 @@ impl Parser<'_> {
                 .expect("loop guard guarantees @elseif prefix")
                 .trim();
             let elseif_cond_str = strip_trailing_directive_colon(elseif_rest)
-                .ok_or_else(|| directive_colon_error("@elseif", elseif_rest))?;
+                .ok_or_else(|| self.colon_error("@elseif", elseif_rest, elseif_offset))?;
 
-            let condition = parse_condition(elseif_cond_str)?;
+            let condition = parse_condition(elseif_cond_str).map_err(|e| {
+                e.or_span(
+                    self.file,
+                    self.source,
+                    elseif_offset,
+                    directive_line_len(self.source, elseif_offset),
+                )
+            })?;
             let body = self.parse_body(&["@else:", "@end"], &["@elseif "])?;
 
             branches.push(ElseifBranch {
@@ -469,14 +527,17 @@ impl Parser<'_> {
 
         let trimmed = rest.trim();
         let rest = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@for", trimmed))?;
+            .ok_or_else(|| self.colon_error("@for", trimmed, offset))?;
 
         // Split on " in " to separate variable part from iterable part.
         // Supports both:
         //   @for item in iterable:
         //   @for key, value in iterable:
         let in_idx = rest.find(" in ").ok_or_else(|| {
-            MdsError::syntax("@for must follow pattern: @for <var> in <iterable>:")
+            self.syntax_at(
+                "@for must follow pattern: @for <var> in <iterable>:",
+                offset,
+            )
         })?;
         let var_part = rest[..in_idx].trim();
         let iterable_str = rest[in_idx + 4..].trim();
@@ -484,7 +545,14 @@ impl Parser<'_> {
         let (key_var, var) = parse_for_vars(var_part)?;
 
         // Parse iterable as a full expression (variable, dot-path, function call, etc.)
-        let iterable = parse_expr_inner(iterable_str)?;
+        let iterable = parse_expr_inner(iterable_str).map_err(|e| {
+            e.or_span(
+                self.file,
+                self.source,
+                offset,
+                directive_line_len(self.source, offset),
+            )
+        })?;
         // Reject bare literals as iterables: @for x in "str": makes no sense.
         if matches!(
             iterable,
@@ -493,14 +561,15 @@ impl Parser<'_> {
                 | Expr::BooleanLiteral(_)
                 | Expr::NullLiteral
         ) {
-            return Err(MdsError::syntax(format!(
-                "cannot use a literal value as @for iterable: '{iterable_str}' — use a variable or function call"
-            )));
+            return Err(self.syntax_at(
+                format!("cannot use a literal value as @for iterable: '{iterable_str}' — use a variable or function call"),
+                offset,
+            ));
         }
 
         let body = self.parse_body(&["@end"], &[])?;
 
-        self.consume_end("@for", offset)?;
+        let end_offset = self.consume_end("@for", offset)?;
 
         self.depth -= 1;
         Ok(Node::For(ForBlock {
@@ -509,6 +578,7 @@ impl Parser<'_> {
             iterable,
             body,
             offset,
+            end_offset,
         }))
     }
 
@@ -526,8 +596,9 @@ impl Parser<'_> {
     /// both are restored on every exit path — including future early-return `?`s.
     fn parse_message_block(&mut self, rest: &str, offset: usize) -> Result<Node, MdsError> {
         if self.inside_message {
-            return Err(MdsError::syntax(
+            return Err(self.syntax_at(
                 "@message blocks cannot be nested inside another @message block",
+                offset,
             ));
         }
 
@@ -535,18 +606,27 @@ impl Parser<'_> {
         // here leaves `inside_message` and `depth` untouched.
         let trimmed = rest.trim();
         let role_str = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@message", trimmed))?;
+            .ok_or_else(|| self.colon_error("@message", trimmed, offset))?;
         let role_trimmed = role_str.trim();
 
         let role = if role_trimmed.starts_with('{') && role_trimmed.ends_with('}') {
             // Dynamic role expression: @message {role_var}:
             let inner = role_trimmed[1..role_trimmed.len() - 1].trim();
-            parse_expr_inner(inner)? // safe: state not yet mutated
+            parse_expr_inner(inner) // safe: state not yet mutated
+                .map_err(|e| {
+                    e.or_span(
+                        self.file,
+                        self.source,
+                        offset,
+                        directive_line_len(self.source, offset),
+                    )
+                })?
         } else {
             // Bare-word role: @message system: → literal string "system"
             if role_trimmed.is_empty() {
-                return Err(MdsError::syntax(
+                return Err(self.syntax_at(
                     "@message role must not be empty — use e.g. @message system:",
+                    offset,
                 ));
             }
             Expr::StringLiteral(role_trimmed.to_string())
@@ -561,7 +641,7 @@ impl Parser<'_> {
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
 
-        _guard.0.consume_end("@message", offset)?;
+        let _end_offset = _guard.0.consume_end("@message", offset)?;
 
         // Guard drops here, restoring inside_message=false and depth-=1.
         Ok(Node::Message(MessageBlock { role, body, offset }))
@@ -584,36 +664,35 @@ impl Parser<'_> {
         // Reject @block inside other blocks (top-level only — decision #5).
         // E9: @block-nesting → mds::syntax (correct; not mds::extends — per error-code mapping).
         if self.inside_block {
-            return Err(MdsError::syntax(
-                "@block cannot be nested inside another @block",
-            ));
+            return Err(self.syntax_at("@block cannot be nested inside another @block", offset));
         }
         if self.inside_message {
-            return Err(MdsError::syntax(
-                "@block cannot be nested inside a @message block",
-            ));
+            return Err(self.syntax_at("@block cannot be nested inside a @message block", offset));
         }
         // depth > 0 means we are inside @if, @for, or @define (top-level depth == 0).
         if self.depth > 0 {
-            return Err(MdsError::syntax(
+            return Err(self.syntax_at(
                 "@block is top-level only — it cannot appear inside @if, @for, or @define",
+                offset,
             ));
         }
 
         // Parse the name BEFORE mutating parser state, so a `?` leaves flags untouched.
         let trimmed = rest.trim();
         let name_str = strip_trailing_directive_colon(trimmed)
-            .ok_or_else(|| directive_colon_error("@block", trimmed))?;
+            .ok_or_else(|| self.colon_error("@block", trimmed, offset))?;
         let name = name_str.trim().to_string();
         if name.is_empty() {
-            return Err(MdsError::syntax(
+            return Err(self.syntax_at(
                 "@block name must not be empty — use e.g. @block instructions:",
+                offset,
             ));
         }
         if !is_valid_identifier(&name) {
-            return Err(MdsError::syntax(format!(
-                "invalid @block name: '{name}' — must be a valid identifier"
-            )));
+            return Err(self.syntax_at(
+                format!("invalid @block name: '{name}' — must be a valid identifier"),
+                offset,
+            ));
         }
 
         // Name is valid — now commit to the block and set flags.
@@ -623,7 +702,7 @@ impl Parser<'_> {
 
         let body = _guard.0.parse_body(&["@end"], &[])?;
 
-        _guard.0.consume_end("@block", offset)?;
+        let _end_offset = _guard.0.consume_end("@block", offset)?;
 
         // Guard drops here, restoring inside_block=false and depth-=1.
         Ok(Node::Block(BlockNode { name, body, offset }))
@@ -640,21 +719,24 @@ impl Parser<'_> {
         // the final character of the directive is always the unambiguous directive colon.
         let rest = rest
             .strip_suffix(':')
-            .ok_or_else(|| MdsError::syntax("@define directive must end with ':'"))?
+            .ok_or_else(|| self.syntax_at("@define directive must end with ':'", offset))?
             .trim();
 
         // Parse "name(params)"
         let paren_start = rest.find('(').ok_or_else(|| {
-            MdsError::syntax("@define must have parameter list: @define name(params):")
+            self.syntax_at(
+                "@define must have parameter list: @define name(params):",
+                offset,
+            )
         })?;
         let paren_end = rest
             .find(')')
-            .ok_or_else(|| MdsError::syntax("@define: unclosed parenthesis"))?;
+            .ok_or_else(|| self.syntax_at("@define: unclosed parenthesis", offset))?;
 
         let name = rest[..paren_start].trim().to_string();
 
         if !is_valid_identifier(&name) {
-            return Err(MdsError::syntax(format!("invalid function name: '{name}'")));
+            return Err(self.syntax_at(format!("invalid function name: '{name}'"), offset));
         }
 
         let params_str = &rest[paren_start + 1..paren_end];
@@ -662,7 +744,7 @@ impl Parser<'_> {
 
         let body = self.parse_body(&["@end"], &[])?;
 
-        self.consume_end("@define", offset)?;
+        let end_offset = self.consume_end("@define", offset)?;
 
         self.depth -= 1;
         Ok(Node::Define(DefineBlock {
@@ -670,6 +752,7 @@ impl Parser<'_> {
             params,
             body,
             offset,
+            end_offset,
         }))
     }
 }

@@ -1630,24 +1630,24 @@ impl ModuleCache {
             block_names: HashSet::new(),
         };
 
-        // S7: build the defining-module Origin ONCE per module, cloned cheaply
-        // into each FunctionDef — only when source-map mode is active (AC-PERF-01).
-        // O(1) Arc construction per module; each clone in collect_define is two
-        // refcount bumps.
-        let module_origin: Option<Origin> = if self.source_map_mode {
-            Some(Origin {
-                file: Arc::from(ctx.file_str),
-                source: Arc::from(ctx.source),
-            })
-        } else {
-            None
-        };
+        // S7 (extended by B1): lazily build module_origin — at most one Arc::from per
+        // module, only when a @define block is encountered. Define-free modules (the
+        // common template shape) pay zero allocation; modules with @defines still
+        // satisfy the one-origin-per-module invariant for correct cross-source span
+        // attribution (PF-012). Correctness is unchanged: every FunctionDef.origin
+        // carries the same Arc<str> bytes as before — same ctx.source, same
+        // ctx.file_str. (Applies PF-012; ISS-08)
+        let mut module_origin: Option<Origin> = None;
 
         let mut block_count: usize = 0;
         for node in body {
             match node {
                 Node::Define(def) => {
-                    collect_define(def, &mut defs, scope, ctx, module_origin.as_ref())?
+                    let origin = module_origin.get_or_insert_with(|| Origin {
+                        file: Arc::from(ctx.file_str),
+                        source: Arc::from(ctx.source),
+                    });
+                    collect_define(def, &mut defs, scope, ctx, Some(origin))?
                 }
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,

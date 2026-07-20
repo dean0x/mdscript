@@ -71,15 +71,24 @@ keyword-only; `scan_imports` takes its argument positionally.
 - `rules` is a mapping of rule name → severity string (`"off"`, `"info"`, `"warn"`, `"error"`).
   Unknown severity values raise `MdsError(code="mds::invalid_options")`; unknown rule names
   are silently accepted (the name simply has no effect — a typo will not configure the rule).
-  `LintResult` exposes `.version`, `.truncated`, `.files`, `.to_dict()`, `.to_json()`.
+  `LintResult` exposes `.version`, `.truncated`, `.to_dict()`, `.to_json()`, and `.files`
+  — a `list[LintFileReport]`. Each `LintFileReport` has `.file` (`str`) and `.diagnostics`
+  (`list[LintDiagnostic]`). `LintDiagnostic` carries `.rule`, `.severity`, `.message`,
+  `.help` (`str | None`), `.fixable` (`bool`), and `.span` (`Span | None`).
+  `LintFileReport` and `LintDiagnostic` are frozen, picklable, and comparable by value.
 
 ### Result objects
 
 `CompileResult` exposes `.kind` (`"markdown"` | `"messages"`), `.output` (`str | None`),
-`.messages` (`list[Message] | None`), `.warnings`, and `.dependencies`. `CheckResult`
-exposes `.warnings`. Both offer `.to_dict()` (the canonical discriminated-union dict,
-inactive key absent) and `.to_json()`. Results are frozen, comparable by value,
-intentionally unhashable, and picklable.
+`.messages` (`list[Message] | None`), `.warnings`, `.dependencies`, and `.source_map`
+(`dict | None`). `CheckResult` exposes `.warnings`. Both offer `.to_dict()` and `.to_json()`.
+
+> **`to_dict()` vs `to_json()` asymmetry (source maps):** `CompileResult.to_dict()` always
+> includes `"sourceMap": None` when no source map was generated — Python-idiomatic
+> always-present. `to_json()` omits the key when absent, matching the canonical wire format
+> shared with the CLI, napi, and WASM surfaces for byte-identical cross-surface parity.
+
+Results are frozen, comparable by value, intentionally unhashable, and picklable.
 
 ### Errors
 

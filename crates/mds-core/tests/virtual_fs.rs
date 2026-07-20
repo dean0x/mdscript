@@ -1597,3 +1597,334 @@ fn source_map_standalone_type_mismatch_carries_span() {
     );
     assert!(span.length > 0, "span length must be > 0, got: {span:?}");
 }
+
+// ── B1: imported-macro type_mismatch span attribution (applies PF-012) ──────────
+//
+// When a type_mismatch is raised inside an imported @define body, the error should
+// name the HELPER (defining) file, not the caller's file, and the span bytes must
+// index the helper source — not the caller's source (B1 / PF-012 fix).
+
+fn compile_vfs_err(
+    modules: std::collections::HashMap<String, String>,
+    entry: &str,
+) -> mds::MdsError {
+    mds::compile_virtual(modules, entry, None).expect_err("expected a compile error")
+}
+
+#[test]
+fn b1_type_mismatch_in_imported_define_names_helper_file() {
+    // helper.mds defines `check(x)` whose body contains `@if x == "yes":`.
+    // main.mds imports helper and calls `{check(42)}` — number vs string mismatch
+    // in the HELPER'S body.  The error must name "helper.mds", not "main.mds".
+    let helper_src =
+        "@define check(x):\n@if x == \"yes\":\nok\n@else:\nfail\n@end\n@end\n".to_string();
+    // Verify the @if offset 19 is within helper_src: "@define check(x):\n" = 18 chars, so
+    // "@if" starts at byte 18.  The type_mismatch fires here.
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("helper.mds".to_string(), helper_src.clone());
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./helper.mds\" as h\n{h.check(42)}\n".to_string(),
+    );
+    let err = compile_vfs_err(modules, "main.mds");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "B1: must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    // B1 primary attribution check — the only discriminating assertion (avoids PF-012).
+    //
+    // SerializedSpan carries no source identity: span.offset == 18 falls within BOTH
+    // helper_src (59 B) and main.mds (42 B), so `span.offset < helper_src.len()` alone
+    // cannot distinguish definer vs caller attribution.  Direct inspection of the
+    // NamedSource embedded in MdsError::TypeMismatch is required.
+    //
+    // Discriminating power: pre-fix regression (body_origin NOT swapped) would have
+    // MdsError::TypeMismatch::src naming "main.mds" → assert_eq! below fails.
+    let definer_file = match &err {
+        MdsError::TypeMismatch { src, .. } => src
+            .as_ref()
+            .expect("B1: TypeMismatch must carry a NamedSource for file attribution")
+            .name()
+            .to_string(),
+        _ => panic!("B1: expected TypeMismatch, got: {err:?}"),
+    };
+    assert_eq!(
+        definer_file, "helper.mds",
+        "B1: error must name 'helper.mds' (definer), not the caller; \
+         pre-fix regression would name 'main.mds'"
+    );
+    // The span must be populated (not degraded to spanless).
+    let span = serialized
+        .span
+        .expect("B1: type_mismatch in imported body must carry a span");
+    // The span offset must fall inside the helper source, not beyond it.
+    assert!(
+        span.offset < helper_src.len(),
+        "B1: span.offset ({}) must fall inside helper_src (len={})",
+        span.offset,
+        helper_src.len()
+    );
+    assert!(
+        span.length > 0,
+        "B1: span.length must be > 0, got: {span:?}"
+    );
+    // Secondary discriminator: @if is on line 2 of helper_src (after "@define check(x):\n"),
+    // but on line 1 of main.mds (byte 18 precedes main.mds's only newline at byte 28).
+    assert_eq!(
+        span.line,
+        Some(2),
+        "B1: span must be on line 2 of helper_src (@if directive); \
+         caller-attributed regression span would land on line 1 (import line)"
+    );
+}
+
+#[test]
+fn b1_same_file_type_mismatch_span_still_works() {
+    // Same-file type_mismatch (existing D2 contract): span must still be populated
+    // and offset must fall within the single-file source.
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src).expect_err("B1: same-file type_mismatch must error");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "B1: must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    let span = serialized
+        .span
+        .expect("B1: same-file type_mismatch must carry a span");
+    assert!(
+        span.offset < src.len(),
+        "B1: same-file span.offset ({}) must fall within source (len={})",
+        span.offset,
+        src.len()
+    );
+    assert!(span.length > 0, "B1: span.length must be > 0");
+}
+
+#[test]
+fn b1_two_level_chain_attributes_to_innermost_definer() {
+    // a.mds imports b.mds which imports c.mds.  c.mds defines `inner(x)` with a
+    // cross-type @if.  b.mds defines `mid(x)` that calls `inner(x)`.  a.mds calls
+    // `{lib.mid(42)}`.  The error must carry a span indexing c_src.
+    let c_src = "@define inner(x):\n@if x == \"yes\":\nok\n@else:\nno\n@end\n@end\n".to_string();
+    let b_src = "@import \"./c.mds\" as c\n@define mid(x):\n{c.inner(x)}\n@end\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("c.mds".to_string(), c_src.clone());
+    modules.insert("b.mds".to_string(), b_src);
+    modules.insert(
+        "a.mds".to_string(),
+        "@import \"./b.mds\" as lib\n{lib.mid(42)}\n".to_string(),
+    );
+    let err = compile_vfs_err(modules, "a.mds");
+    let serialized = err.serialize();
+    assert_eq!(
+        serialized.code, "mds::type_mismatch",
+        "B1 two-level: must be mds::type_mismatch, got: {}",
+        serialized.code
+    );
+    // B1 two-level primary attribution check (avoids PF-012).
+    //
+    // span.offset == 18 falls within a.mds (39 B) and b.mds, so `span.offset < c_src.len()`
+    // alone does not discriminate definer vs caller attribution.  Direct NamedSource
+    // inspection is required.
+    //
+    // Discriminating power: regression would name "a.mds" or "b.mds" → assert_eq! fails.
+    let definer_file = match &err {
+        MdsError::TypeMismatch { src, .. } => src
+            .as_ref()
+            .expect("B1 two-level: TypeMismatch must carry a NamedSource")
+            .name()
+            .to_string(),
+        _ => panic!("B1 two-level: expected TypeMismatch, got: {err:?}"),
+    };
+    assert_eq!(
+        definer_file, "c.mds",
+        "B1 two-level: error must name 'c.mds' (innermost definer), not 'a.mds'/'b.mds'; \
+         pre-fix regression would fail here"
+    );
+    let span = serialized
+        .span
+        .expect("B1 two-level: must carry a span pointing into c.mds");
+    assert!(
+        span.offset < c_src.len(),
+        "B1 two-level: span.offset ({}) must fall inside c_src (len={})",
+        span.offset,
+        c_src.len()
+    );
+    assert!(span.length > 0, "B1 two-level: span.length must be > 0");
+    // Secondary discriminator: @if is on line 2 of c_src (after "@define inner(x):\n"),
+    // but on line 1 of a.mds (byte 18 precedes a.mds's only newline at byte 24).
+    assert_eq!(
+        span.line,
+        Some(2),
+        "B1 two-level: span must be on line 2 of c_src (@if directive); \
+         caller-attributed regression span would land on line 1 (import line)"
+    );
+}
+
+// ── B2: span-less syntax errors get upgraded to span-bearing errors ──────────
+
+/// A missing trailing `:` on `@if` should produce a span-bearing `mds::syntax` error
+/// that underlines the directive line, not a spanless message.
+#[test]
+fn b2_if_missing_colon_carries_span() {
+    let src = "Hello\n@if x == \"y\"\nworld\n@end\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src.clone());
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::syntax",
+        "B2: expected mds::syntax, got: {}",
+        s.code
+    );
+    let span = s.span.expect("B2: @if missing colon must carry a span");
+    // The @if directive starts at byte 6 (after "Hello\n")
+    assert_eq!(
+        span.offset, 6,
+        "B2: span must point to @if directive offset"
+    );
+    assert!(span.length > 0, "B2: span.length must be > 0");
+}
+
+/// A missing trailing `:` on `@for` should produce a span-bearing `mds::syntax` error.
+#[test]
+fn b2_for_missing_colon_carries_span() {
+    let src = "@for x in items\nrow\n@end\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src.clone());
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::syntax",
+        "B2: expected mds::syntax, got: {}",
+        s.code
+    );
+    let span = s.span.expect("B2: @for missing colon must carry a span");
+    // @for starts at offset 0
+    assert_eq!(
+        span.offset, 0,
+        "B2: span must point to @for directive offset"
+    );
+    assert!(span.length > 0, "B2: span.length must be > 0");
+}
+
+// ── B3: ArityMismatch help text includes function signature ──────────────────
+
+/// Calling a user-defined function with the wrong number of arguments should
+/// produce an `mds::arity` error whose help text includes the expected signature.
+#[test]
+fn b3_arity_mismatch_includes_signature_in_help() {
+    // Define foo(x, y) and call it with only one arg.
+    let src = "@define foo(x, y):\n{x} {y}\n@end\n{foo(\"a\")}\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::arity",
+        "B3: expected mds::arity, got: {}",
+        s.code
+    );
+    let help = s.help.expect("B3: arity error must have help text");
+    assert!(
+        help.contains("foo(x, y)"),
+        "B3: help must include signature 'foo(x, y)', got: {help}"
+    );
+}
+
+/// Calling a user-defined function with optional defaults should show defaults in signature.
+#[test]
+fn b3_arity_mismatch_signature_shows_defaults() {
+    let src = "@define greet(name, sep = \", \"):\n{name}{sep}\n@end\n{greet()}\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::arity",
+        "B3: expected mds::arity, got: {}",
+        s.code
+    );
+    let help = s.help.expect("B3: arity error must have help text");
+    assert!(
+        help.contains("greet(name, sep = \", \")"),
+        "B3: help must show defaults, got: {help}"
+    );
+}
+
+/// Calling a built-in function with the wrong arg count should NOT include a signature.
+#[test]
+fn b3_builtin_arity_mismatch_no_signature_in_help() {
+    // `upper` takes exactly 1 arg.
+    let src = "{upper(\"a\", \"b\")}\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::arity",
+        "B3 builtin: expected mds::arity, got: {}",
+        s.code
+    );
+    let help = s.help.expect("B3 builtin: arity error must have help text");
+    // Built-in help must NOT include "expected: upper(...)"
+    assert!(
+        !help.contains("expected: upper"),
+        "B3 builtin: help should not include builtin signature, got: {help}"
+    );
+}
+
+// ── B4: TypeMismatch help text update (F8) ──────────────────────────────────
+
+/// TypeMismatch help should mention the lhs type, the --set-string flag, and
+/// the '@if x:' idiom, guiding the user toward all three resolution paths.
+#[test]
+fn b4_type_mismatch_help_mentions_lhs_type_and_both_idioms() {
+    // number (x=3) vs string literal "3"
+    let src = "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n";
+    let err = mds::compile_str(src).expect_err("B4: cross-type == must error");
+    let help = miette::Diagnostic::help(&err)
+        .map(|h| h.to_string())
+        .unwrap_or_default();
+    // Must still mention --set-string (existing contract, test at line ~1205)
+    assert!(
+        help.contains("--set-string"),
+        "B4: help must contain '--set-string'; got: {help}"
+    );
+    // Must now also mention comparing against a literal of the same type
+    assert!(
+        help.contains("number literal") || help.contains("compare against a number"),
+        "B4: help must guide toward literal comparison; got: {help}"
+    );
+    // Must still mention @if x: idiom
+    assert!(
+        help.contains("@if x:"),
+        "B4: help must mention @if x: idiom; got: {help}"
+    );
+}
+
+/// An unknown directive should produce a span-bearing `mds::syntax` error.
+#[test]
+fn b2_unknown_directive_carries_span() {
+    let src = "hello\n@unknown foo:\nworld\n".to_string();
+    let mut modules = std::collections::HashMap::new();
+    modules.insert("main.mds".to_string(), src.clone());
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::syntax",
+        "B2: expected mds::syntax, got: {}",
+        s.code
+    );
+    let span = s.span.expect("B2: unknown directive must carry a span");
+    // @unknown starts at byte 6 (after "hello\n")
+    assert_eq!(
+        span.offset, 6,
+        "B2: span must point to @unknown directive offset"
+    );
+    assert!(span.length > 0, "B2: span.length must be > 0");
+}

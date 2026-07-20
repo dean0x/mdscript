@@ -1,0 +1,33 @@
+---
+lang: Python
+---
+## Wide and nested code fences (v0.4.0, #149)
+
+A fence opens on a line of three-or-more backticks (or tildes) and closes only
+on a line with a matching run of *at least as many* of the same character. A
+wider fence can therefore wrap a narrower one verbatim — exactly what you need
+to document fenced code that itself contains fences. No interpolation or
+directives are parsed anywhere inside.
+
+### A four-backtick fence wrapping a three-backtick block
+
+````markdown
+```python
+print("{lang} is NOT interpolated in here")
+```
+````
+
+The inner three-backtick line above does not close the four-backtick fence;
+only a run of four-or-more backticks does. Back in the body, {lang} interpolates.
+
+### Mismatched markers never cross-close
+
+A tilde run never closes a backtick fence, so the tildes below stay literal:
+
+```
+~~~
+{lang} stays literal — the tildes did not close the backtick fence.
+~~~
+```
+
+After the backtick fence: {lang}.

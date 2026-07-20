@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::arity::check_arity;
 use crate::ast::{
-    required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock, IncludeDirective,
-    MessageBlock, Node,
+    render_signature, required_param_count, Arg, BlockNode, Condition, Expr, ForBlock, IfBlock,
+    IncludeDirective, MessageBlock, Node,
 };
 use crate::error::MdsError;
 use crate::limits::{
@@ -80,6 +80,18 @@ pub(crate) struct EvalContext<'a> {
     /// that call `evaluate()` directly).  The `build_type_mismatch` helper checks
     /// `source.is_empty()` before attempting span construction.
     pub(crate) source: &'a str,
+    /// Provenance of the *currently evaluating* function body (B1 — applies PF-012).
+    ///
+    /// Set to `func.origin.clone()` by `invoke_function` when entering a body and
+    /// restored via `std::mem::replace` on ALL exit paths (LIFO-correct for nested
+    /// cross-file define chains: A calls B calls C → C's origin is innermost).
+    ///
+    /// `build_type_mismatch` selects `(file, source)` from this when `Some`, so
+    /// a type mismatch raised inside an imported `@define` body names the helper
+    /// file rather than the caller's file (avoids the PF-012 mis-attribution class).
+    ///
+    /// `None` when not currently evaluating any function body.
+    body_origin: Option<crate::sourcemap::Origin>,
 }
 
 /// Evaluate a module body into a final rendered string.
@@ -106,6 +118,7 @@ pub fn evaluate(
         fn_body_owned: false,
         file,
         source,
+        body_origin: None,
     };
     evaluate_nodes(nodes, scope, &mut ctx)
 }
@@ -184,6 +197,7 @@ pub(crate) fn evaluate_with_map_seeded(
         fn_body_owned: false,
         file: &file_owned,
         source: &source_owned,
+        body_origin: None,
     };
     let output = evaluate_nodes(nodes, scope, &mut ctx)?;
     let map = ctx.map.take().ok_or_else(|| {
@@ -592,7 +606,13 @@ fn invoke_function(
     let required = required_param_count(&func.params);
     let total = func.params.len();
     if !check_arity(args.len(), required, total) {
-        return Err(MdsError::arity(call_key, required, total, args.len()));
+        return Err(MdsError::arity(
+            call_key,
+            required,
+            total,
+            args.len(),
+            Some(render_signature(call_key, &func.params)),
+        ));
     }
     scope.push();
     // Restore captured lexical scope from definition site so the function body
@@ -617,13 +637,20 @@ fn invoke_function(
         scope.set_var(&param.name, value);
     }
 
+    // B1 (applies PF-012): swap body_origin to the function's defining file so
+    // build_type_mismatch inside the body attributes spans to the correct source.
+    // Restore on ALL exit paths via explicit restore in both S8 and S3 arms
+    // (LIFO-correct for nested cross-file define chains: A calls B calls C →
+    // C's origin is innermost, A's is restored when C's call returns, etc.).
+    let prev_body_origin = std::mem::replace(&mut ctx.body_origin, func.origin.clone());
+
     // S8 path: fine-grained function body source attribution.
     //
     // Conditions for S8 (all must hold):
     //  1. A map is present (source-map mode active, AC-PERF-01).
     //  2. suppress == 0 — we are not already inside a suppressed body.
     //  3. func.origin is Some — the function has provenance metadata (populated
-    //     by the resolver when source_map_mode=true, S7).
+    //     unconditionally since B1 dropped the source_map_mode gate, S7).
     //
     // On this path, instead of suppressing the body, we:
     //  - Switch MapBuilder::current_src to the definition file.
@@ -656,6 +683,8 @@ fn invoke_function(
                 // map and origin borrows released here; ctx is usable below.
             } else {
                 // Unreachable: use_s8 verified both are Some above.
+                // Restore body_origin before early return to maintain LIFO invariant.
+                ctx.body_origin = prev_body_origin;
                 return Err(MdsError::syntax(
                     "internal: S8 invariant violated — map or origin unexpectedly None",
                 ));
@@ -669,6 +698,8 @@ fn invoke_function(
         if let Some(ref mut map) = ctx.map {
             map.current_src = saved_src;
         }
+        // B1: restore body_origin before `?` so LIFO is correct even on error paths.
+        ctx.body_origin = prev_body_origin;
 
         let lifo_result = if popped.as_deref() == Some(call_key) {
             Ok(())
@@ -737,6 +768,9 @@ fn invoke_function(
             )))
         };
         let pop_result = scope.pop();
+        // B1: restore body_origin before returning so LIFO is correct even on error
+        // paths (prefer_first_error returns the render error, not a panic).
+        ctx.body_origin = prev_body_origin;
         // On double-fault, preserve the render error — it carries the actionable
         // source-span diagnostic for the user. LIFO/pop failures are compiler
         // bugs and surface as secondary errors.
@@ -765,6 +799,7 @@ fn call_function(
                 meta.min_args,
                 meta.max_args,
                 args.len(),
+                None, // built-in signatures live in docs, not the error message
             ));
         }
         // Call the handler directly using the meta reference we already hold,
@@ -824,30 +859,42 @@ fn values_equal_same_type(lhs: &Value, rhs: &Value) -> Option<bool> {
 
 /// Build a `TypeMismatch` error, with or without a source span.
 ///
-/// If `anchor` is `Some(offset)` and the offset falls within `ctx.source`,
+/// Source selection (applies PF-012 — avoids cross-source offset mis-attribution):
+/// - When inside an imported `@define` body (`ctx.body_origin` is `Some`), use
+///   the body's defining file/source — the AST offsets index THAT source.
+/// - Otherwise use `ctx.file`/`ctx.source` (the top-level module's context).
+///
+/// If `anchor` is `Some(offset)` and the offset falls within the selected source,
 /// the error carries a span anchored to the entire enclosing `@if`/`@elseif`
-/// directive line (from `offset` to the first `\n`).  If the offset is out
-/// of bounds or the source is empty (e.g. a cross-source `@extends` splice
-/// where the condition's AST offset is relative to the base template, not the
-/// current module), the function degrades to a spanless error — never
-/// mis-attributes a span from a different source (DECISIONS_CONTEXT ADR-005 /
-/// general rule: degrade rather than misattribute).
+/// directive line (from `offset` to the first `\n`).  If the offset is out of
+/// bounds or the source is empty (e.g. a cross-source `@extends` splice where the
+/// condition's AST offset is relative to the base template, not the current
+/// module), the function degrades to a spanless error — never mis-attributes a
+/// span from a different source (DECISIONS_CONTEXT ADR-005 / PF-012: degrade
+/// rather than mis-attribute).
 fn build_type_mismatch(
     ctx: &EvalContext<'_>,
     anchor: Option<usize>,
     lhs_type: &str,
     rhs_type: &str,
 ) -> MdsError {
-    if let Some(off) = anchor {
-        if !ctx.source.is_empty() && off <= ctx.source.len() && ctx.source.is_char_boundary(off) {
-            // Span covers the full directive line (from `off` to just before `\n`).
-            let line_len = ctx.source[off..]
-                .find('\n')
-                .unwrap_or(ctx.source[off..].len());
-            return MdsError::type_mismatch_at(
-                lhs_type, rhs_type, ctx.file, ctx.source, off, line_len,
-            );
-        }
+    let off = match anchor {
+        Some(off) => off,
+        None => return MdsError::type_mismatch(lhs_type, rhs_type),
+    };
+
+    // Select (file, source) from body_origin when inside a function body,
+    // else fall back to the top-level module context (applies PF-012).
+    let (file, source) = if let Some(ref origin) = ctx.body_origin {
+        (origin.file.as_ref(), origin.source.as_ref())
+    } else {
+        (ctx.file, ctx.source)
+    };
+
+    if !source.is_empty() && off <= source.len() && source.is_char_boundary(off) {
+        // Span covers the full directive line (from `off` to just before `\n`).
+        let line_len = source[off..].find('\n').unwrap_or(source[off..].len());
+        return MdsError::type_mismatch_at(lhs_type, rhs_type, file, source, off, line_len);
     }
     MdsError::type_mismatch(lhs_type, rhs_type)
 }
@@ -1188,6 +1235,7 @@ pub fn evaluate_messages_intrinsic(
         fn_body_owned: false,
         file,
         source,
+        body_origin: None,
     };
     let mut messages = Vec::new();
     collect_messages_strict(nodes, scope, &mut ctx, &mut messages, file, source)?;
@@ -1446,6 +1494,7 @@ mod tests {
             else_body: Some(vec![text("no")]),
             offset: 0,
             else_offset: None,
+            end_offset: 0,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1465,6 +1514,7 @@ mod tests {
             else_body: Some(vec![text("no")]),
             offset: 0,
             else_offset: None,
+            end_offset: 0,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1491,6 +1541,7 @@ mod tests {
                 text("\n"),
             ],
             offset: 0,
+            end_offset: 0,
         })];
         let mut scope = Scope::new();
         let mut warnings = vec![];
@@ -1524,6 +1575,7 @@ mod tests {
                 text("!"),
             ],
             offset: 0,
+            end_offset: 0,
         };
         let mut scope = Scope::new();
         scope.set_function("greet", Arc::new(FunctionDef::from(&define)));
@@ -2109,6 +2161,7 @@ mod tests {
             params: vec![Param::required("x")],
             body: vec![text("ok")],
             offset: 0,
+            end_offset: 0,
         };
         let mut scope = Scope::new();
         scope.set_function("requires_one", Arc::new(FunctionDef::from(&define)));

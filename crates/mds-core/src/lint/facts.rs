@@ -78,6 +78,8 @@ pub struct DefineFact {
     pub name: String,
     /// Byte offset of the `@define` token in the source.
     pub offset: usize,
+    /// Byte offset of the `@end` token in the source (for fix span computation).
+    pub end_offset: usize,
 }
 
 /// A frontmatter variable key fact with approximate source span.
@@ -482,6 +484,7 @@ fn collect_define_fact(
     ctx.defines.push(DefineFact {
         name: b.name.clone(),
         offset: b.offset,
+        end_offset: b.end_offset,
     });
 
     // Shadow detection: @define params over FM keys or @for vars.
@@ -728,6 +731,7 @@ mod tests {
                 else_body: None,
                 offset: 0,
                 else_offset: None,
+                end_offset: 0,
             })];
         }
         let module = Module {

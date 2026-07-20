@@ -6,8 +6,39 @@
 //! |------|---------------------------------------------------|-----------|
 //! | A    | duplicate-import, duplicate-export,               | Auto-fixable (span-removal); gated by reverify |
 //! |      | unreachable-branch, empty-block                   |           |
-//! | B    | unused-import, unused-function                    | Fixable only when a recompile-diff proves output-neutral |
-//! | C    | unused-variable, redundant-else, shadow-variable  | NEVER fixed (report-only) |
+//! | B    | unused-import, unused-function                    | Fixable only when structural-standalone (no imports/extends/partial; reverify applies) |
+//! | C    | unused-variable, redundant-else, shadow-variable  | Report-only; never fixed |
+//!
+//! **Tier B nuance:**
+//! - `unused-function` sets `fix_removals` to a whole-block [`FixLineSpan`] and is
+//!   applied when `include_tier_b = true` (structural-standalone file). The reverify
+//!   gate still runs; if removing the function would cause a compile error the edit
+//!   is rejected.
+//! - `unused-import` leaves `fix_removals: None` (partial-name removal from an import
+//!   list is structurally ambiguous and unsafe). The rule is Tier B so it appears under
+//!   `--fix --standalone` output, but no edit is ever emitted (report-only in practice).
+//!
+//! ## Terminology (spec §7.5)
+//!
+//! - **Structural-standalone**: a file with no `@import`, `@extends`, or use as a
+//!   partial target. This property gates Tier B `--fix`. A file that triggers
+//!   `unused-import` is, by definition, not structural-standalone.
+//! - **Compile-clean**: a file that compiles without any runtime `--vars`. This
+//!   property gates the output-equality reverify for Tier B fixes: removing an
+//!   unused import or function must produce byte-identical compiled output.
+//!
+//! ## Block-span fixes (FixLineSpan)
+//!
+//! Block-spanning rules (`empty-block`, `unreachable-branch`, `unused-function`)
+//! express their fix plan as a `Vec<FixLineSpan>` stored in
+//! [`LintDiagnostic::fix_removals`] rather than deriving edits from the diagnostic
+//! span alone. Each [`FixLineSpan`] encodes which lines to remove:
+//!
+//! - `to_inclusive: true`  — remove lines from `from` through (and including) `to`
+//! - `to_inclusive: false` — remove lines from `from` up to (not including) `to`
+//!
+//! This lets a single diagnostic drive removal of the complete block plus its closing
+//! `@end` without the planner needing to understand block structure.
 //!
 //! ## ADR-001 discipline
 //!
@@ -20,17 +51,26 @@
 //! Line-removal spans must consume the COMPLETE line terminator (`\r\n`, `\r`,
 //! or `\n`). A `\n`-only assumption leaves stray `\r` bytes that the reverify
 //! gate cannot catch (the compiled output would be output-equivalent).
-//! See [`extend_span_to_line_end`].
+//! See [`extend_to_line_end`].
 //!
 //! ## fix.rs is pure (no I/O)
 //!
 //! File I/O and atomic writes are the CLI's responsibility. `fix.rs` operates
 //! entirely on in-memory byte slices. The caller owns the file read and write.
 //!
+//! ## Containment deduplication (AC-F-26)
+//!
+//! Before overlap detection, [`dedup_contained_or_identical`] removes any edit
+//! whose byte range is fully contained within an earlier retained edit. This handles
+//! the common case where two rules fire on the same block (e.g. `unreachable-branch`
+//! and `empty-block` both targeting the same `@if`): the wider edit subsumes the
+//! narrower one and a single correct removal is applied.
+//!
 //! ## Overlap detection (AC-F-19)
 //!
-//! Edit spans may not overlap. Overlapping edits are rejected fail-closed — when
-//! any overlap is detected, the ENTIRE batch is abandoned (no partial write).
+//! After containment deduplication, any remaining pair of edits that partially
+//! overlap (neither contains the other) is a genuine conflict. In that case the
+//! ENTIRE batch is abandoned fail-closed — no partial write.
 //!
 //! ## Reverify gate (AC-F-20)
 //!
@@ -48,7 +88,7 @@
 //! for non-truncated results.
 
 use crate::error::MdsError;
-use crate::lint::diagnostic::{LintDiagnostic, LintResult, Severity};
+use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResult, Severity};
 
 // Tier classification lives in the leaf `tier` module to break the would-be
 // circular dependency (fix.rs → diagnostic.rs → fix.rs). Re-export here so
@@ -86,10 +126,11 @@ pub struct RejectedEdit {
 /// A plan of fix edits for a single file's source.
 #[derive(Debug, Default)]
 pub struct FixPlan {
-    /// Sorted, non-overlapping byte edits to apply right-to-left.
-    /// `None` before planning; `Some(edits)` after `plan_fixes` succeeds.
+    /// Sorted (start ASC, end DESC), deduplicated, non-overlapping byte edits
+    /// to apply right-to-left. Populated by [`plan_fixes`] / [`plan_fixes_with_options`].
     pub edits: Vec<ByteEdit>,
-    /// `true` if overlap detection rejected the batch.
+    /// `true` when the batch was cleared because a genuine partial overlap survived
+    /// containment deduplication (see module-level "Overlap detection" note).
     pub overlap_rejected: bool,
     /// `true` if the source `LintResult` was truncated (idempotence caveat).
     pub truncated: bool,
@@ -184,15 +225,25 @@ pub fn plan_fixes_with_options(
             continue;
         }
 
-        if let Some(edit) = diag_to_edit(diag, source) {
-            plan.edits.push(edit);
-        }
+        plan.edits.extend(diag_to_edits(diag, source));
     }
 
-    // Sort edits by start position (ascending).
-    plan.edits.sort();
+    // Sort by start position ascending, then by end position descending.
+    // The secondary end-DESC key ensures that among edits sharing the same start byte,
+    // the widest (most encompassing) edit comes first — a precondition for
+    // `dedup_contained_or_identical` to work correctly in a single linear pass.
+    plan.edits
+        .sort_by(|a, b| a.start.cmp(&b.start).then(b.end.cmp(&a.end)));
 
-    // Overlap detection: reject the entire batch if any pair overlaps.
+    // Containment and identical-range deduplication: drop any edit whose byte range is
+    // fully covered by an earlier retained edit (see `dedup_contained_or_identical`).
+    // This resolves false-overlap rejections that occur when two rules each emit spans
+    // for the same region (e.g. unreachable-branch + empty-block on the same @if block).
+    dedup_contained_or_identical(&mut plan.edits);
+
+    // Overlap detection: reject the entire batch if any pair partially overlaps.
+    // Containment has already been resolved above; any remaining overlap is a genuine
+    // partial overlap that cannot be applied safely.
     if has_overlapping_edits(&plan.edits) {
         plan.overlap_rejected = true;
         plan.edits.clear();
@@ -201,33 +252,53 @@ pub fn plan_fixes_with_options(
     plan
 }
 
-/// Convert a diagnostic to a byte edit, if the diagnostic has a span
-/// that maps to a complete removable line.
+/// Find the byte offset of the start of the line containing `offset`.
 ///
-/// For Tier A rules, the edit removes the entire directive line containing
-/// the span (including its line terminator — CRLF discipline, AC-F-24).
-fn diag_to_edit(diag: &LintDiagnostic, source: &str) -> Option<ByteEdit> {
-    let span = diag.span.as_ref()?;
-    let offset = span.offset;
-
-    // Find the start of the line containing `offset`.
-    // `str::get(..offset)` returns None for out-of-range or non-char-boundary
-    // offsets — fail-closed per ADR-001 rather than panicking on a bad span.
+/// Uses `str::get(..offset)` — returns `None` for out-of-range or
+/// non-char-boundary offsets (fail-closed per ADR-001; no panic).
+fn line_start(source: &str, offset: usize) -> Option<usize> {
     let prefix = source.get(..offset)?;
-    let line_start = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    Some(prefix.rfind('\n').map(|p| p + 1).unwrap_or(0))
+}
 
-    // Find the end of the line (including the terminator — CRLF or LF).
-    let line_end = extend_to_line_end(source, offset);
+/// Convert a `FixLineSpan` to a `ByteEdit`, or `None` when the span is invalid.
+///
+/// - `to_inclusive: true`  → remove `[line_start(from) .. extend_to_line_end(to))`
+/// - `to_inclusive: false` → remove `[line_start(from) .. line_start(to))`
+///
+/// Fail-closed per ADR-001: any span that resolves to a zero-length or
+/// out-of-range byte range produces `None` (edit silently skipped).
+fn fix_line_span_to_edit(span: &FixLineSpan, source: &str, rule: &str) -> Option<ByteEdit> {
+    let start = line_start(source, span.from)?;
+    let end = if span.to_inclusive {
+        extend_to_line_end(source, span.to)
+    } else {
+        line_start(source, span.to)?
+    };
 
-    if line_start >= line_end || line_end > source.len() {
+    if start >= end || end > source.len() {
         return None;
     }
 
     Some(ByteEdit {
-        start: line_start,
-        end: line_end,
-        rule: diag.rule.clone(),
+        start,
+        end,
+        rule: rule.to_string(),
     })
+}
+
+/// Convert a diagnostic's `fix_removals` into zero or more `ByteEdit`s.
+///
+/// Returns an empty `Vec` when `diag.fix_removals` is `None` (no-fix case)
+/// or when every span resolves to an invalid range (fail-closed per ADR-001).
+fn diag_to_edits(diag: &LintDiagnostic, source: &str) -> Vec<ByteEdit> {
+    let Some(removals) = &diag.fix_removals else {
+        return vec![];
+    };
+    removals
+        .iter()
+        .filter_map(|span| fix_line_span_to_edit(span, source, &diag.rule))
+        .collect()
 }
 
 /// Extend a byte position to include the complete line terminator at or after `pos`.
@@ -272,6 +343,45 @@ fn has_overlapping_edits(edits: &[ByteEdit]) -> bool {
         }
     }
     false
+}
+
+/// Remove edits that are fully contained within (or byte-identical to) an earlier retained edit.
+///
+/// **Precondition**: `edits` must be sorted by `(start ASC, end DESC)`.  Under that ordering,
+/// among edits sharing the same start byte the widest (largest `end`) appears first, so the
+/// linear scan correctly identifies all contained edits without look-ahead.
+///
+/// The containment check uses a single `max_end` tracker: because starts are non-decreasing,
+/// an edit is contained in some prior retained edit iff its `end ≤ max_end`.
+///
+/// ## What this resolves
+///
+/// Two different rules can legitimately fire on the same AST node and each emit a
+/// `FixLineSpan` that covers some or all of the same byte range. For example,
+/// `unreachable-branch` (case A) emits a span covering the dead `@else:..@end` region,
+/// while `empty-block` emits a shorter span covering just the empty `@else:` clause — the
+/// shorter span is fully contained in the longer one.  Without deduplication, both edits
+/// reach the overlap detector and trigger `overlap_rejected`; with deduplication the shorter
+/// edit is dropped and the longer (dominant) edit is applied, which is correct.
+///
+/// Note: partial overlaps (where neither range contains the other) are NOT resolved here;
+/// they are intentionally left for the overlap detector to catch and reject fail-closed.
+fn dedup_contained_or_identical(edits: &mut Vec<ByteEdit>) {
+    if edits.len() < 2 {
+        return;
+    }
+    let mut write = 0;
+    let mut max_end = edits[0].end;
+    for read in 1..edits.len() {
+        if edits[read].end > max_end {
+            // This edit extends beyond every previously retained edit — keep it.
+            write += 1;
+            max_end = edits[read].end;
+            edits.swap(write, read);
+        }
+        // else: edits[read].end ≤ max_end → fully contained within a retained edit — skip.
+    }
+    edits.truncate(write + 1);
 }
 
 // ── Shared reverify helpers ───────────────────────────────────────────────────
@@ -463,7 +573,10 @@ where
     match reverify(&fixed_source) {
         Err(err) => FixOutcome::Rejected {
             source: source.to_string(),
-            reason: format!("Reverify failed: fixed source does not compile: {err}"),
+            reason: format!(
+                "could not verify fix — the edited source did not re-parse cleanly \
+                 ({err}); leaving the file unchanged"
+            ),
         },
         Ok(residual) => {
             // Count untargeted diagnostics in the residual, per rule.
@@ -628,7 +741,8 @@ where
         let reverify_result = reverify(&test_source);
         let reject_reason: Option<String> = match &reverify_result {
             Err(err) => Some(format!(
-                "Reverify failed: fixed source does not compile: {err}"
+                "could not verify fix — the edited source did not re-parse cleanly \
+                 ({err}); leaving the file unchanged"
             )),
             Ok(residual) => {
                 // Use the full targeted_rules set (identical to the baseline) so the
@@ -755,6 +869,8 @@ mod tests {
                 column: None,
             }),
             file: Some("test.mds".to_string()),
+            // fix_removals drives the planner; FixLineSpan::single(offset) covers one line.
+            fix_removals: Some(vec![FixLineSpan::single(offset)]),
         }
     }
 
@@ -912,43 +1028,37 @@ mod tests {
         );
     }
 
-    // ── L-FIX-OVL1: Overlap detection ────────────────────────────────────────
+    // ── L-FIX-OVL1: Overlap detection and containment dedup ─────────────────
 
-    /// AC-F-19: two diagnostics that map to the same line produce identical
-    /// ByteEdits (`{ start: 0, end: 23 }`). The overlap detector fires because
-    /// `a.end (23) > b.start (0)`. The whole batch is rejected — edits cleared,
-    /// `apply_fixes` returns `FixOutcome::Rejected`.
+    /// AC-F-19 / A4: two diagnostics that map to the SAME line produce identical
+    /// ByteEdits. `dedup_contained_or_identical` removes the duplicate, leaving a
+    /// single edit. No overlap is detected and the fix proceeds.
+    ///
+    /// This is the correct behaviour: removing the same bytes twice is redundant,
+    /// not conflicting. The dedup resolves it safely so the fix succeeds.
     #[test]
-    fn l_fix_ovl1_overlapping_edits_rejected() {
+    fn l_fix_ovl1_identical_same_line_edits_are_deduped_not_rejected() {
         let source =
             "@import \"./a.mds\" as a\n@import \"./b.mds\" as b\n@import \"./a.mds\" as c\n";
         // Both diag1 (offset 0) and diag2 (offset 2) are on the same line → same
-        // computed line span → overlap detected.
+        // computed ByteEdit { start: 0, end: 23 }. dedup removes the duplicate.
         let diag1 = make_diag("duplicate-import", 0, "@import".len());
         let diag2 = make_diag("duplicate-import", 2, "@import".len());
 
         let result = make_result(vec![diag1, diag2]);
         let plan = plan_fixes(&result, source);
 
-        // Unconditional: overlap must be detected for same-line edits (AC-F-19).
+        // After containment/identical dedup: one edit remains, no overlap.
         assert!(
-            plan.overlap_rejected,
-            "two edits on the same line must trigger overlap detection"
-        );
-        assert!(
-            plan.edits.is_empty(),
-            "rejected plan must have empty edits; got: {:?}",
+            !plan.overlap_rejected,
+            "identical same-line edits must be deduped, not rejected; edits: {:?}",
             plan.edits
         );
-
-        // apply_fixes on a rejected plan must return FixOutcome::Rejected
-        // (the reverify closure must never be called in this path).
-        let outcome = apply_fixes(source, plan, &result, |_| {
-            panic!("reverify must not be called when the batch is overlap-rejected")
-        });
-        assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "apply_fixes on an overlap-rejected plan must return Rejected; got: {outcome:?}"
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "exactly one edit must survive dedup of identical ranges; edits: {:?}",
+            plan.edits
         );
     }
 
@@ -964,6 +1074,367 @@ mod tests {
             !plan.overlap_rejected,
             "non-overlapping edits should not be rejected"
         );
+    }
+
+    // ── A4: containment / identical-range deduplication ──────────────────────
+
+    /// A4-DEDUP-1: Two edits with identical byte ranges are reduced to one.
+    /// Previously this caused overlap_rejected = true.
+    #[test]
+    fn a4_identical_ranges_are_deduped_to_one() {
+        // Two diagnostics that produce the exact same line removal: offset 0 on
+        // "@import\n". After dedup, only one edit remains → no overlap.
+        let source = "@import \"./a.mds\" as a\n";
+        let diag_a = LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "dup".to_string(),
+            help: None,
+            span: Some(crate::error::SerializedSpan {
+                offset: 0,
+                length: 1,
+                line: None,
+                column: None,
+            }),
+            file: None,
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
+        };
+        let diag_b = LintDiagnostic {
+            rule: "duplicate-export".to_string(),
+            severity: Severity::Error,
+            message: "dup".to_string(),
+            help: None,
+            span: Some(crate::error::SerializedSpan {
+                offset: 0,
+                length: 1,
+                line: None,
+                column: None,
+            }),
+            file: None,
+            fix_removals: Some(vec![FixLineSpan::single(0)]),
+        };
+        let result = LintResult {
+            diagnostics: vec![diag_a, diag_b],
+            truncated: false,
+            is_standalone: false,
+        };
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.overlap_rejected,
+            "identical-range edits must be deduped, not rejected; edits: {:?}",
+            plan.edits
+        );
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "exactly one edit must survive dedup; edits: {:?}",
+            plan.edits
+        );
+    }
+
+    /// A4-DEDUP-2: An edit fully contained within a wider edit is dropped;
+    /// the wider edit is applied and no overlap is detected.
+    #[test]
+    fn a4_contained_edit_is_dropped_wider_edit_kept() {
+        // Source: "@if x:\nhello\n@else:\n\n@end\n"
+        // (unreachable-branch case A: always-true @if with empty @else)
+        // Wide edit: covers @else:\n\n@end\n  (the whole @else..@end block)
+        // Narrow edit: covers @else:\n\n      (just @else: and empty body)
+        // The narrow edit is contained within the wide edit.
+        let source = "@if x:\nhello\n@else:\n\n@end\n";
+        // @if line: 7 bytes (0..7)
+        // "hello\n": 6 bytes (7..13)
+        // "@else:": 6 + \n = 7 bytes (13..20)
+        // "\n": 1 byte (20..21)
+        // "@end\n": 5 bytes (21..26)
+        let wide_edit = LintDiagnostic {
+            rule: "unreachable-branch".to_string(),
+            severity: Severity::Error,
+            message: "x".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            // FixLineSpan { from: 13, to: 21, to_inclusive: true }
+            // → start = line_start(13) = 13, end = extend_to_line_end(21) = 26
+            fix_removals: Some(vec![FixLineSpan {
+                from: 13, // @else: offset
+                to: 21,   // @end offset
+                to_inclusive: true,
+            }]),
+        };
+        let narrow_edit = LintDiagnostic {
+            rule: "empty-block".to_string(),
+            severity: Severity::Warn,
+            message: "x".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            // FixLineSpan { from: 13, to: 21, to_inclusive: false }
+            // → start = line_start(13) = 13, end = line_start(21) = 21
+            fix_removals: Some(vec![FixLineSpan {
+                from: 13,
+                to: 21,
+                to_inclusive: false,
+            }]),
+        };
+        let result = LintResult {
+            diagnostics: vec![wide_edit, narrow_edit],
+            truncated: false,
+            is_standalone: false,
+        };
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.overlap_rejected,
+            "contained edit must be deduped, not rejected; edits: {:?}",
+            plan.edits
+        );
+        assert_eq!(
+            plan.edits.len(),
+            1,
+            "exactly one (wide) edit must survive dedup; edits: {:?}",
+            plan.edits
+        );
+        // The surviving edit must be the WIDE one (starts at 13, ends at 26).
+        assert_eq!(
+            plan.edits[0].start, 13,
+            "surviving edit must start at @else:"
+        );
+        assert_eq!(
+            plan.edits[0].end, 26,
+            "surviving edit must end after @end newline"
+        );
+    }
+
+    /// A4-DEDUP-3: A genuine partial overlap (neither range contains the other)
+    /// drives the real planner path — `dedup_contained_or_identical` retains both
+    /// edits because neither is contained, and `has_overlapping_edits` fires —
+    /// producing `overlap_rejected = true`, edits cleared, and `FixOutcome::Rejected`
+    /// from `apply_fixes`.
+    ///
+    /// Math: source = "line0\nline1\nline2\n"
+    ///   line0 → bytes [0,  6)
+    ///   line1 → bytes [6,  12)
+    ///   line2 → bytes [12, 18)
+    ///
+    /// Edit A: `FixLineSpan { from: 0, to: 6, to_inclusive: true }`
+    ///   start = `line_start(0)` = 0
+    ///   end   = `extend_to_line_end(6)` = 12  (scans through "line1\n")
+    ///   → ByteEdit [0, 12)
+    ///
+    /// Edit B: `FixLineSpan { from: 6, to: 12, to_inclusive: true }`
+    ///   start = `line_start(6)` = 6
+    ///   end   = `extend_to_line_end(12)` = 18 (scans through "line2\n")
+    ///   → ByteEdit [6, 18)
+    ///
+    /// After sort (start ASC, end DESC): A first (start=0), then B (start=6).
+    /// `dedup_contained_or_identical`: B.end=18 > max_end(12) → B is not contained,
+    /// both edits are retained.
+    /// `has_overlapping_edits`: A.end=12 > B.start=6 → partial overlap → rejected.
+    #[test]
+    fn a4_partial_overlap_still_rejected_after_dedup() {
+        let source = "line0\nline1\nline2\n";
+
+        // Edit A covers bytes [0, 12): spans line0 (start) through line1 (end inclusive).
+        let diag_a = LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "a".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 0, // offset inside line0
+                to: 6,   // offset inside line1; extend_to_line_end(6) = 12
+                to_inclusive: true,
+            }]),
+        };
+        // Edit B covers bytes [6, 18): spans line1 (start) through line2 (end inclusive).
+        // B.start=6 < A.end=12, B.end=18 > A.end=12 → genuine partial overlap.
+        let diag_b = LintDiagnostic {
+            rule: "empty-block".to_string(),
+            severity: Severity::Warn,
+            message: "b".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 6, // offset inside line1
+                to: 12,  // offset inside line2; extend_to_line_end(12) = 18
+                to_inclusive: true,
+            }]),
+        };
+        let result = LintResult {
+            diagnostics: vec![diag_a, diag_b],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        // Drive through the real planner: dedup cannot collapse this (B extends beyond A),
+        // so has_overlapping_edits fires → overlap_rejected = true, edits cleared.
+        let plan = plan_fixes(&result, source);
+        assert!(
+            plan.overlap_rejected,
+            "partial overlap must drive overlap_rejected=true via the real planner; \
+             edits after dedup: {:?}",
+            plan.edits
+        );
+        assert!(
+            plan.edits.is_empty(),
+            "overlap_rejected must clear all edits; got: {:?}",
+            plan.edits
+        );
+
+        // apply_fixes must surface FixOutcome::Rejected (fail-closed, ADR-004).
+        let outcome = apply_fixes(source, plan, &result, |_| Ok(make_result(vec![])));
+        assert!(
+            matches!(outcome, FixOutcome::Rejected { .. }),
+            "overlap_rejected plan must surface FixOutcome::Rejected; got: {outcome:?}"
+        );
+    }
+
+    // ── Block-span fix tests (FixLineSpan → ByteEdit) ────────────────────────
+
+    /// fix_line_span_to_edit: single-line span (`to_inclusive: true`, from == to)
+    /// must produce a ByteEdit that removes the whole line including its '\n'.
+    #[test]
+    fn block_span_single_line_to_inclusive() {
+        // source: "line0\nline1\nline2\n"
+        //          0     6     12    18
+        let source = "line0\nline1\nline2\n";
+        let span = FixLineSpan::single(6); // any offset on "line1"
+        let edit = fix_line_span_to_edit(&span, source, "test-rule")
+            .expect("valid single-line span should produce an edit");
+        assert_eq!(edit.start, 6, "start must be BOL of line1");
+        assert_eq!(edit.end, 12, "end must include the trailing \\n of line1");
+        assert_eq!(&source[edit.start..edit.end], "line1\n");
+    }
+
+    /// fix_line_span_to_edit: multi-line `to_inclusive: true` span must cover
+    /// both boundary lines and the lines in between, including the trailing newline
+    /// of the `to` line.
+    #[test]
+    fn block_span_multi_line_to_inclusive() {
+        // "open\nbody\nend\n" — remove lines 0..=2 (the whole thing)
+        //  0    5    10   14
+        let source = "open\nbody\nend\n";
+        let span = FixLineSpan {
+            from: 0, // first char of "open"
+            to: 10,  // first char of "end"
+            to_inclusive: true,
+        };
+        let edit = fix_line_span_to_edit(&span, source, "empty-block")
+            .expect("valid multi-line span should produce an edit");
+        assert_eq!(edit.start, 0);
+        assert_eq!(edit.end, source.len(), "should consume the entire source");
+    }
+
+    /// fix_line_span_to_edit: `to_inclusive: false` must remove up to the START
+    /// of the `to` line — the `to` line itself is preserved.
+    #[test]
+    fn block_span_to_exclusive_stops_at_to_line_start() {
+        // "header\nbody\nkeep\n"
+        //  0      7    12    17
+        let source = "header\nbody\nkeep\n";
+        let span = FixLineSpan {
+            from: 0,
+            to: 12, // start of "keep"
+            to_inclusive: false,
+        };
+        let edit = fix_line_span_to_edit(&span, source, "unreachable-branch")
+            .expect("valid span should produce an edit");
+        assert_eq!(edit.start, 0);
+        assert_eq!(
+            edit.end, 12,
+            "should stop at start of 'keep' line, not consume it"
+        );
+        assert_eq!(
+            &source[edit.end..],
+            "keep\n",
+            "keep line must be intact after edit"
+        );
+    }
+
+    /// fix_removals: None produces no edits (report-only diagnostic path).
+    #[test]
+    fn block_span_none_fix_removals_emits_no_edits() {
+        use crate::error::SerializedSpan;
+        let diag = LintDiagnostic {
+            rule: "unused-import".to_string(),
+            severity: Severity::Error,
+            message: "unused".to_string(),
+            help: None,
+            span: Some(SerializedSpan {
+                offset: 0,
+                length: 5,
+                line: None,
+                column: None,
+            }),
+            file: Some("test.mds".to_string()),
+            fix_removals: None, // Tier B unused-import: no edit emitted
+        };
+        let result = make_result(vec![diag]);
+        // plan_fixes_with_options(include_tier_b=true) still produces no edit because
+        // fix_removals is None.
+        let plan = plan_fixes_with_options(&result, "hello\n", true);
+        assert!(
+            plan.edits.is_empty(),
+            "fix_removals: None must emit no ByteEdit; got: {:?}",
+            plan.edits
+        );
+    }
+
+    /// A diagnostic with two FixLineSpans (e.g. unreachable-branch case A: remove
+    /// opening `@if` line + trailing `@else..@end` region) must produce two
+    /// independent ByteEdits, both applied to remove the correct byte ranges.
+    #[test]
+    fn block_span_two_disjoint_spans_produce_two_edits() {
+        use crate::error::SerializedSpan;
+        // "line0\n@if:\nline2\n@else:\n@end\n"
+        //  0     6    11    18     25   30
+        let source = "line0\n@if:\nline2\n@else:\n@end\n";
+        //             0     6  10  17   23   29
+        // Byte offsets:
+        //   "line0\n"  → [0, 6)
+        //   "@if:\n"   → [6, 11)
+        //   "line2\n"  → [11, 17)
+        //   "@else:\n" → [17, 24)
+        //   "@end\n"   → [24, 29)
+        let diag = LintDiagnostic {
+            rule: "unreachable-branch".to_string(),
+            severity: Severity::Error,
+            message: "always-true".to_string(),
+            help: None,
+            span: Some(SerializedSpan {
+                offset: 6,
+                length: 4,
+                line: None,
+                column: None,
+            }),
+            file: Some("test.mds".to_string()),
+            fix_removals: Some(vec![
+                // Span 1: remove the opening "@if:" line only
+                FixLineSpan::single(6),
+                // Span 2: remove from "@else:" through "@end" (inclusive)
+                FixLineSpan {
+                    from: 17,
+                    to: 24,
+                    to_inclusive: true,
+                },
+            ]),
+        };
+        let result = make_result(vec![diag]);
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.overlap_rejected,
+            "disjoint spans must not trigger overlap rejection"
+        );
+        assert_eq!(plan.edits.len(), 2, "two disjoint spans → two edits");
+        // Edits are sorted by start ASC; first edit = span 1 (BOL of @if: = 6..11)
+        assert_eq!(plan.edits[0].start, 6);
+        assert_eq!(plan.edits[0].end, 11);
+        // Second edit = span 2 (BOL of @else: through end of @end\n = 17..29)
+        assert_eq!(plan.edits[1].start, 17);
+        assert_eq!(plan.edits[1].end, 29);
     }
 
     // ── REL-1: slice-panic guard for non-char-boundary / out-of-range offsets ─
@@ -1032,6 +1503,52 @@ mod tests {
         assert!(
             matches!(outcome, FixOutcome::Rejected { .. }),
             "reverify failure should reject the fix"
+        );
+    }
+
+    /// A5: re-parse failure flows through the A5 path and produces the exact stable
+    /// rejection message (defined at apply_fixes / apply_fixes_incremental).
+    ///
+    /// Pins the stable prefix and suffix around the embedded error so the human-
+    /// readable message cannot drift without a test failure:
+    ///   "could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"
+    ///
+    /// The embedded `{err}` is asserted non-empty, confirming that a real error
+    /// was propagated rather than a blank placeholder.
+    #[test]
+    fn l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix() {
+        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
+        let diag = make_diag("duplicate-import", 23, "@import".len());
+        let result = make_result(vec![diag]);
+        let plan = plan_fixes(&result, source);
+
+        let outcome = apply_fixes(source, plan, &result, |_fixed| {
+            Err(MdsError::syntax("simulated compile failure after fix"))
+        });
+
+        let reason = match outcome {
+            FixOutcome::Rejected { reason, .. } => reason,
+            other => panic!("expected Rejected, got: {other:?}"),
+        };
+
+        const PREFIX: &str =
+            "could not verify fix \u{2014} the edited source did not re-parse cleanly (";
+        const SUFFIX: &str = "); leaving the file unchanged";
+
+        assert!(
+            reason.starts_with(PREFIX),
+            "A5 reason must start with the stable prefix;\n  reason: {reason:?}\n  prefix: {PREFIX:?}"
+        );
+        assert!(
+            reason.ends_with(SUFFIX),
+            "A5 reason must end with the stable suffix;\n  reason: {reason:?}\n  suffix: {SUFFIX:?}"
+        );
+        // The embedded error message must be non-empty.
+        let embedded = &reason[PREFIX.len()..reason.len() - SUFFIX.len()];
+        assert!(
+            !embedded.is_empty(),
+            "A5 reason must contain a non-empty embedded error between the stable \
+             prefix and suffix; got: {reason:?}"
         );
     }
 
@@ -1154,12 +1671,11 @@ mod tests {
     /// exercised `plan_fixes_with_options(result, source, include_tier_b=true)` through
     /// `apply_fixes` on a REAL Tier B diagnostic with a real reverify closure.
     ///
-    /// **Why the refusal path**: `diag_to_edit` removes only the `@define dead():`
-    /// opening line, leaving the body (`World!\n`) and `@end` orphaned. The reverify
-    /// parse fails (`MdsError::Syntax`) and `apply_fixes` returns `Rejected`. This is
-    /// the correct fail-closed behavior documented in the KNOWLEDGE.md "block-spanning
-    /// fixes are always refused" gotcha — and exercises the reverify/output-neutrality
-    /// gate for Tier B explicitly.
+    /// **Why the Fixed path**: `fix_removals` now carries a `FixLineSpan` covering the
+    /// whole `@define dead():..@end` block (from `def.offset` to `def.end_offset`,
+    /// inclusive). The reverify parses the fixed source cleanly, confirms no output
+    /// delta (the dead function was never called so removal is output-neutral), and
+    /// `apply_fixes` returns `Fixed`.
     ///
     /// **Why unused-function, not unused-import**: a standalone file has no `@import`
     /// by definition (`is_standalone = !is_partial_or_extends && imports.is_empty()`),
@@ -1167,7 +1683,7 @@ mod tests {
     /// when `has_explicit_exports && !exported && !called` — achieved here with an
     /// explicit `@export greet` plus an unexported, uncalled `@define dead():`.
     #[test]
-    fn tier_b_unused_function_standalone_apply_is_refused() {
+    fn tier_b_unused_function_standalone_apply_succeeds() {
         // Standalone source: no @import, no @extends, has explicit @export.
         // `dead` is unexported and uncalled → fires unused-function (Tier B).
         let source =
@@ -1202,15 +1718,26 @@ mod tests {
         );
 
         // Step 3: apply with a real reverify closure.
-        // Removing only `@define dead():\n` leaves `World!\n@end` orphaned —
-        // the reverify parse fails (Syntax error) → apply_fixes returns Rejected.
+        // The block-span fix_removals removes the whole `@define dead():\nWorld!\n@end\n`
+        // block. The reverify parses the fixed source and confirms output-neutrality
+        // (dead() was never called, so output is unchanged) → Fixed.
         let outcome = apply_fixes(source, plan, &lint_result, crate::lint_str);
 
         assert!(
-            matches!(outcome, FixOutcome::Rejected { .. }),
-            "Tier B unused-function fix must be Rejected (block-span refusal: orphaned @end); \
+            matches!(outcome, FixOutcome::Fixed { .. }),
+            "Tier B unused-function fix must succeed with block-span fix_removals; \
              got: {outcome:?}"
         );
+        if let FixOutcome::Fixed { source: fixed, .. } = outcome {
+            assert!(
+                !fixed.contains("@define dead():"),
+                "fixed source must not contain the removed @define dead(); got: {fixed:?}"
+            );
+            assert!(
+                fixed.contains("@define greet():"),
+                "fixed source must retain the exported @define greet(); got: {fixed:?}"
+            );
+        }
     }
 
     /// L-FIX-REV1: A reverify closure that detects an output delta MUST cause

@@ -27,15 +27,19 @@ pub struct FunctionDef {
     pub body: Vec<crate::ast::Node>,
     /// Lexical closure captures populated by the resolver at definition time.
     pub captured: CapturedScope,
-    /// Source provenance for source-map attribution (S7).
+    /// Source provenance for source-map attribution (S7) and diagnostic span
+    /// attribution (B1 — applies PF-012).
     ///
-    /// Populated by the resolver when `CompileOptions::source_map` is `true`.
-    /// Carries the defining module's display path and raw source so that
-    /// `invoke_function` (S8 path) can switch `MapBuilder::current_src` to the
-    /// definition file and attribute body-output segments there.
+    /// Always populated by the resolver (unconditional since B1 dropped the
+    /// `source_map_mode` gate — AC-PERF-01 relaxation for correctness).
+    /// Carries the defining module's display path and raw source so that:
+    /// - `invoke_function` (S8 path) can switch `MapBuilder::current_src` to the
+    ///   definition file and attribute body-output segments there.
+    /// - `build_type_mismatch` can select the correct source when raising a
+    ///   span-bearing error inside an imported `@define` body (PF-012).
     ///
-    /// `None` when source-map mode is disabled (zero-cost, AC-PERF-01) or when
-    /// the function was not collected through the opts-aware resolver path.
+    /// `None` only when the `FunctionDef` was constructed outside the resolver
+    /// path (e.g. via `FunctionDef::from(&DefineBlock)` in tests).
     pub(crate) origin: Option<Origin>,
 }
 

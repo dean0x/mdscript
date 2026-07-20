@@ -25,10 +25,10 @@
 use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
-use mds::{effective_parent, FileSystem, MdsError};
+use mds::{effective_parent, FileSystem};
 use miette::Result;
 
-use crate::build::{load_config, read_stdin, resolve_input};
+use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
 use crate::output::atomic_write_file;
 use crate::output::collect_mds_files_detailed;
 
@@ -82,23 +82,8 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
         return run_fmt_directory(&input, flags);
     }
 
-    ensure_mds_extension(&input)?;
+    ensure_existing_mds_file(&input).map_err(miette::Error::from)?;
     run_fmt_file(&input, flags)
-}
-
-/// Reject an explicit-file input whose extension isn't `.mds` (AC-CF, exit 2).
-///
-/// `MdsError::NotMdsFile` already maps to exit code 2 via `exit_code` — reused
-/// rather than inventing a new error shape.
-fn ensure_mds_extension(path: &Path) -> Result<()> {
-    let is_mds = path.extension().and_then(|e| e.to_str()) == Some("mds");
-    if is_mds {
-        Ok(())
-    } else {
-        Err(miette::Error::from(MdsError::NotMdsFile {
-            path: path.display().to_string(),
-        }))
-    }
 }
 
 /// Read the raw source of `path` for formatting: symlink-checked, size-capped,
@@ -471,16 +456,55 @@ fn colorize_unified_diff(unified: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mds::MdsError;
 
     #[test]
-    fn ensure_mds_extension_accepts_dot_mds() {
-        assert!(ensure_mds_extension(Path::new("foo.mds")).is_ok());
+    fn ensure_existing_mds_file_accepts_existing_mds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("foo.mds");
+        std::fs::write(&p, "").unwrap();
+        assert!(
+            ensure_existing_mds_file(&p).is_ok(),
+            "existing .mds file must pass"
+        );
     }
 
     #[test]
-    fn ensure_mds_extension_rejects_other_extensions() {
-        assert!(ensure_mds_extension(Path::new("foo.txt")).is_err());
-        assert!(ensure_mds_extension(Path::new("foo")).is_err());
+    fn ensure_existing_mds_file_rejects_non_mds_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("foo.txt");
+        std::fs::write(&p, "").unwrap();
+        let err = ensure_existing_mds_file(&p).expect_err("existing .txt file must be rejected");
+        // Extension error (not existence error).
+        assert!(
+            matches!(err, MdsError::NotMdsFile { .. }),
+            "error must be NotMdsFile for existing .txt; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_existing_mds_file_rejects_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nonexistent.mds");
+        let err = ensure_existing_mds_file(&p).expect_err("nonexistent file must be rejected");
+        // Existence error (not extension error) — even though extension is .mds.
+        assert!(
+            matches!(err, MdsError::FileNotFound { .. }),
+            "error must be FileNotFound for missing path; got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_existing_mds_file_missing_non_mds_reports_not_found() {
+        // Non-existent path with wrong extension must still report FileNotFound (C4/F6):
+        // existence is checked before extension.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nonexistent.txt");
+        let err = ensure_existing_mds_file(&p).expect_err("nonexistent .txt file must be rejected");
+        assert!(
+            matches!(err, MdsError::FileNotFound { .. }),
+            "must be FileNotFound (not NotMdsFile) for non-existent path; got: {err:?}"
+        );
     }
 
     #[test]

@@ -196,7 +196,7 @@ def test_lr3_lint_result_repr() -> None:
 
 
 def test_lr4_lint_result_diagnostic_shape() -> None:
-    """Each diagnostic in a LintResult has the required fields."""
+    """Each diagnostic in a LintResult has the required fields (via to_dict)."""
     r = m.lint(UNUSED_SOURCE)
     diags = _all_diags(r)
     assert diags, "expected at least one diagnostic"
@@ -206,3 +206,154 @@ def test_lr4_lint_result_diagnostic_shape() -> None:
     assert "message" in d
     assert "help" in d
     assert "fixable" in d
+
+
+# ── B6/F10: Typed LintFileReport / LintDiagnostic attribute access ───────────────
+
+
+def test_lr5_typed_file_report_attributes() -> None:
+    """LintResult.files returns LintFileReport objects with typed attributes (B6/F10)."""
+    r = m.lint(UNUSED_SOURCE)
+    files = r.files
+    assert isinstance(files, list)
+    assert len(files) >= 1, "expected at least one LintFileReport"
+    report = files[0]
+    assert isinstance(report, m.LintFileReport)
+    assert isinstance(report.file, str)
+    assert isinstance(report.diagnostics, list)
+    assert len(report.diagnostics) >= 1, "expected at least one LintDiagnostic"
+
+
+def test_lr6_typed_diagnostic_attributes() -> None:
+    """LintDiagnostic exposes fully-typed .rule/.severity/.message/.help/.fixable/.span."""
+    r = m.lint(UNUSED_SOURCE)
+    assert r.files, "expected at least one file report"
+    diag = r.files[0].diagnostics[0]
+    assert isinstance(diag, m.LintDiagnostic)
+    # Typed attribute access (not dict indexing).
+    assert isinstance(diag.rule, str) and len(diag.rule) > 0
+    assert isinstance(diag.severity, str) and diag.severity in ("info", "warn", "error")
+    assert isinstance(diag.message, str) and len(diag.message) > 0
+    assert diag.help is None or isinstance(diag.help, str)
+    assert isinstance(diag.fixable, bool)
+    assert diag.span is None or isinstance(diag.span, m.Span)
+
+
+def test_lr7_diagnostic_with_span() -> None:
+    """A diagnostic with a span produces a typed Span object (not None)."""
+    r = m.lint(UNUSED_SOURCE)
+    assert r.files, "expected file reports"
+    diag = r.files[0].diagnostics[0]
+    # unused-variable emits a span over the frontmatter key.
+    assert diag.span is not None, "unused-variable diagnostic must have a span"
+    sp = diag.span
+    assert isinstance(sp, m.Span)
+    assert isinstance(sp.offset, int) and sp.offset >= 0
+    assert isinstance(sp.length, int) and sp.length > 0
+    # Lint diagnostics do not resolve line/column (SPAN-1: only offset+length in wire).
+    assert sp.line is None
+    assert sp.column is None
+
+
+def test_lr8_lint_file_report_to_dict() -> None:
+    """LintFileReport.to_dict() matches the canonical wire shape for the file entry."""
+    r = m.lint_virtual({"main.mds": UNUSED_SOURCE}, "main.mds")
+    assert r.files
+    report = r.files[0]
+    d = report.to_dict()
+    assert d["file"] == "main.mds"
+    assert isinstance(d["diagnostics"], list)
+    assert len(d["diagnostics"]) >= 1
+    diag_d = d["diagnostics"][0]
+    assert "rule" in diag_d and "severity" in diag_d and "fixable" in diag_d
+
+
+def test_lr9_lint_diagnostic_to_dict() -> None:
+    """LintDiagnostic.to_dict() produces a canonical wire-format dict."""
+    r = m.lint(UNUSED_SOURCE)
+    assert r.files
+    diag = r.files[0].diagnostics[0]
+    d = diag.to_dict()
+    assert "rule" in d
+    assert "severity" in d
+    assert "message" in d
+    assert "fixable" in d
+    # help and span are always present in to_dict() — None when not set (PF-007 fix).
+    assert "help" in d
+    assert "span" in d
+    if diag.span is not None:
+        assert d["span"] is not None
+        assert "offset" in d["span"] and "length" in d["span"]
+    else:
+        assert d["span"] is None
+
+
+def test_lr10_lint_file_report_pickle() -> None:
+    """LintFileReport pickle round-trip preserves all attributes."""
+    import pickle
+
+    r = m.lint(UNUSED_SOURCE)
+    assert r.files
+    report = r.files[0]
+    restored = pickle.loads(pickle.dumps(report))
+    assert isinstance(restored, m.LintFileReport)
+    assert restored == report
+    assert restored.file == report.file
+    assert len(restored.diagnostics) == len(report.diagnostics)
+
+
+def test_lr11_lint_diagnostic_pickle() -> None:
+    """LintDiagnostic pickle round-trip preserves all attributes."""
+    import pickle
+
+    r = m.lint(UNUSED_SOURCE)
+    assert r.files
+    diag = r.files[0].diagnostics[0]
+    restored = pickle.loads(pickle.dumps(diag))
+    assert isinstance(restored, m.LintDiagnostic)
+    assert restored == diag
+    assert restored.rule == diag.rule
+    assert restored.severity == diag.severity
+    assert restored.fixable == diag.fixable
+
+
+def test_lr12_clean_source_empty_files() -> None:
+    """Clean source produces no LintFileReport objects (files list is empty)."""
+    r = m.lint(CLEAN_SOURCE)
+    assert r.files == [], "clean source must produce empty files list"
+
+
+# ── B6: check() rejects source_map / sources_content (Python binding) ───────────
+
+
+def test_check_rejects_source_map_kwarg() -> None:
+    """check() must raise MdsError(mds::invalid_options) when source_map is passed."""
+    with pytest.raises(m.MdsError) as ei:
+        m.check("Hello!\n", source_map=True)  # type: ignore[call-overload]
+    assert ei.value.code == "mds::invalid_options"
+
+
+def test_check_rejects_sources_content_kwarg() -> None:
+    """check() must raise MdsError(mds::invalid_options) when sources_content is passed."""
+    with pytest.raises(m.MdsError) as ei:
+        m.check("Hello!\n", sources_content=True)  # type: ignore[call-overload]
+    assert ei.value.code == "mds::invalid_options"
+
+
+# ── to_dict() sourceMap always-present (B6/F10) ─────────────────────────────────
+
+
+def test_compile_to_dict_sourcemap_none_when_absent() -> None:
+    """compile().to_dict()['sourceMap'] is None when source_map was not requested."""
+    r = m.compile("Hello World!\n")
+    d = r.to_dict()
+    assert "sourceMap" in d, "to_dict() must always include 'sourceMap'"
+    assert d["sourceMap"] is None, "sourceMap must be None when not requested"
+
+
+def test_compile_to_dict_sourcemap_present_when_requested() -> None:
+    """compile().to_dict()['sourceMap'] is a dict when source_map=True."""
+    r = m.compile("Hello World!\n", source_map=True)
+    d = r.to_dict()
+    assert "sourceMap" in d
+    assert isinstance(d["sourceMap"], dict), "sourceMap must be a dict when generated"

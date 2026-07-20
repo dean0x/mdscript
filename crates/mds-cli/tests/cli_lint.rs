@@ -12,7 +12,7 @@
 //! - L-CLI-JSON5: --format json malformed mds.json → exit 2, JSON error envelope stdout (AC-F-14)
 //! - L-CLI-FIX1: --fix applies auto-fixable issues in place (Tier A)
 //! - L-CLI-FIX2: --fix --check exits 1 if fixes pending, never writes
-//! - L-CLI-FIX3: block-spanning --fix is refused fail-closed; file unchanged (TEST-3)
+//! - L-CLI-FIX3: block-spanning empty-block --fix applied; file changed, exit 0 (TEST-3)
 //! - L-CLI-STDIN1: stdin (no fix) → diagnostics to stderr, stdout empty
 //! - L-CLI-STDIN2: --fix stdin → fixed source to stdout, diagnostics to stderr
 //! - L-CLI-VARS: --set passes runtime variables to the gate check
@@ -20,7 +20,7 @@
 //! - L-CLI-DIR1: directory mode path-sorts and lints all files including partials
 //! - L-CLI-RESOURCE: nesting > MAX_NESTING_DEPTH (64) → exit 3 ResourceLimit (TEST-4)
 //! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
-//! - I-24: unreachable-branch --fix is refused (block-spanning); file unchanged, exit 2
+//! - I-24: unreachable-branch (always-true @if) --fix applied; file changed, exit 0
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
 
 mod common;
@@ -494,21 +494,79 @@ fn json_format_nonexistent_path_emits_error_envelope() {
     );
 }
 
+// ── C4/F6: existence-before-extension ordering for lint ──────────────────────
+
+/// A non-existent path that also lacks the `.mds` extension must report
+/// `mds::file_not_found`, NOT `mds::not_mds_file` (C4/F6).
+///
+/// Before this fix, `ensure_mds_extension` ran before the file was opened, so
+/// `/nonexistent.txt` produced a confusing "not an .mds file" diagnostic.
+/// Now `ensure_existing_mds_file` checks existence first.
+#[test]
+fn lint_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing_12345.txt");
+
+    let out = lint_path(&missing, &[]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "non-existent .txt file must exit 2; got: {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mds::file_not_found") || stderr.contains("file not found"),
+        "error must be file-not-found (not extension error); got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("mds::not_mds_file") && !stderr.contains("not an .mds"),
+        "must NOT report 'not an .mds file' for a non-existent path; got: {stderr:?}"
+    );
+}
+
+/// Same as above but in `--format json` mode: the error envelope must have
+/// code `mds::file_not_found`, not `mds::not_mds_file`.
+#[test]
+fn lint_nonexistent_non_mds_json_mode_reports_file_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing_12345.txt");
+
+    let out = lint_path(&missing, &["--format", "json"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--format json + nonexistent .txt must exit 2"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON (error envelope); parse error: {e}; stdout: {stdout}")
+    });
+    let code = parsed["error"]["code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error.code must be a string; got: {parsed}"));
+    assert_eq!(
+        code, "mds::file_not_found",
+        "JSON envelope code must be mds::file_not_found (not mds::not_mds_file); got: {code}"
+    );
+}
+
 // ── L-CLI-FIX3: block-spanning --fix refusal (TEST-3) ────────────────────────
 //
 // Exercises the KB gotcha "block-spanning Tier A fixes are always refused":
-// diag_to_edit() removes only the opening directive line (span-guided byte
-// removal per ADR-001), orphaning the @end. The reverify gate calls
-// lint_str_with on the edited source, which fails to parse (orphaned @end),
-// and refuses the entire fix batch fail-closed.
+// Block-span empty @define is now fixed correctly. The fix_removals field
+// carries a FixLineSpan covering the full @define..@end block. The reverify
+// gate parses the fixed source (empty file) cleanly, confirms no output delta,
+// and accepts the fix. (per ADR-001 block-span discipline)
 //
 // Fixture: lint_block_span_empty.mds — multi-line empty @define whose body is
 // a single blank line (whitespace-only Text node). The empty-block rule fires
-// (Tier A, Warn), the fix is attempted and refused, and the residual Warn
-// finding determines exit code 1. (applies ADR-001)
+// (Tier A, Warn). The fix removes the whole block → empty file → exit 0.
 
 #[test]
-fn fix_refused_for_block_spanning_empty_define_and_file_unchanged() {
+fn fix_applied_for_block_spanning_empty_define_and_file_changed() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_block_span_empty.mds");
     fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
@@ -522,25 +580,28 @@ fn fix_refused_for_block_spanning_empty_define_and_file_unchanged() {
     let out = lint_path(&target, &["--fix"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // The fix must be refused: removing the @define line orphans @end, which
-    // the reverify gate catches as a parse error and rejects fail-closed.
+    // The fix must succeed: block-span fix_removals removes the whole @define..@end block.
     assert!(
-        stderr.contains("fix rejected"),
-        "fix must be refused for block-spanning empty-block; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "block-spanning empty-block fix must now succeed; got stderr: {stderr}"
     );
 
-    // Residual finding: the original empty-block Warn survives → exit 1.
+    // No residual findings → clean exit.
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "exit code must reflect residual warn finding after fix refusal; got stderr: {stderr}"
+        Some(0),
+        "exit code must be 0 after successful empty-block fix; got stderr: {stderr}"
     );
 
-    // Critical: the file on disk must be left UNCHANGED.
+    // The file on disk must be CHANGED — the empty @define block is removed.
     let after = fs::read_to_string(&target).unwrap();
-    assert_eq!(
+    assert_ne!(
         original, after,
-        "file must be left unchanged when --fix is refused"
+        "file must be changed when --fix succeeds for empty-block"
+    );
+    assert!(
+        !after.contains("@define empty_fn():"),
+        "fixed file must not contain the removed @define; got: {after:?}"
     );
 }
 
@@ -657,22 +718,21 @@ fn directory_json_files_array_is_deterministically_sorted() {
     );
 }
 
-// ── I-24: unreachable-branch --fix refusal (block-spanning, ADR-001) ─────────
+// ── I-24: unreachable-branch --fix succeeds for always-true @if + @else ───────
 //
-// unreachable-branch is Tier A (auto-fixable per tier.rs), but the fix is always
-// refused for @if blocks: diag_to_edit() removes only the opening @if directive
-// line (span-guided byte removal per ADR-001), orphaning @else/@end. The reverify
-// gate calls lint_str_with on the edited source, which fails to parse (orphaned
-// @else), and refuses the entire fix batch fail-closed.
+// unreachable-branch is Tier A (auto-fixable per tier.rs). With block-span
+// fix_removals wired, always-true @if (case A) generates two spans:
+//   • Span 1: remove the @if directive line (FixLineSpan::single(b.offset)).
+//   • Span 2: remove from the first unreachable branch through @end (inclusive).
+// The reverify gate parses the fixed source (just the then-body unwrapped),
+// confirms no output delta, and accepts the fix.
 //
 // Fixture: lint_unreachable_branch.mds — always-true @if "x" == "x": with a
-// later @else branch (the later branch makes unreachable-branch fire at its
-// default Error severity). After fix refusal the residual Error finding
-// determines exit 2. Non-vacuous: asserts "fix rejected" in stderr, exit 2,
-// AND file content byte-identical to before --fix. (applies ADR-001)
+// "hello" then-body and an @else: branch with "world". After fix: only "hello"
+// remains; exit 0 (no residual findings).
 
 #[test]
-fn fix_refused_for_unreachable_branch_and_file_unchanged() {
+fn fix_applied_for_unreachable_branch_and_file_changed() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_unreachable_branch.mds");
     fs::copy(fixture("lint_unreachable_branch.mds"), &target).unwrap();
@@ -690,25 +750,33 @@ fn fix_refused_for_unreachable_branch_and_file_unchanged() {
     let out = lint_path(&target, &["--fix"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // The fix must be refused: removing the @if line orphans @else/@end, caught
-    // by the reverify gate as a parse error and refused fail-closed (ADR-001).
+    // The fix must succeed: two-span case-A removal unwraps the then-body.
     assert!(
-        stderr.contains("fix rejected"),
-        "fix must be refused for block-spanning unreachable-branch; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "unreachable-branch fix must now succeed; got stderr: {stderr}"
     );
 
-    // Residual: unreachable-branch Error finding survives fix refusal → exit 2.
+    // No residual findings → clean exit.
     assert_eq!(
         out.status.code(),
-        Some(2),
-        "residual Error finding after fix refusal must exit 2; got stderr: {stderr}"
+        Some(0),
+        "exit code must be 0 after successful unreachable-branch fix; got stderr: {stderr}"
     );
 
-    // Critical: file on disk must be left UNCHANGED.
+    // File is changed — the @if/@else/@end structure is removed, then-body unwrapped.
     let after = fs::read_to_string(&target).unwrap();
-    assert_eq!(
-        original, after,
-        "file must be unchanged when unreachable-branch --fix is refused"
+    assert_ne!(original, after, "file must be changed when --fix succeeds");
+    assert!(
+        !after.contains("@if"),
+        "fixed file must not contain the removed @if; got: {after:?}"
+    );
+    assert!(
+        !after.contains("@else"),
+        "fixed file must not contain the removed @else branch; got: {after:?}"
+    );
+    assert!(
+        after.contains("hello"),
+        "fixed file must retain the then-body content; got: {after:?}"
     );
 }
 
@@ -942,38 +1010,45 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
     }
 }
 
-// ── Test (c): --fix --check on refused-fix fixture → prints "fix rejected" ───
+// ── Test (c): --fix --check on overlap-fix fixture → "Would fix" after coalescing ──
 //
-// Pins bug-5 / PF-004 fix for the check path: preview_fixes now returns a
-// PreviewOutcome::Rejected so --fix --check can surface the rejection reason.
+// Pins bug-5 / PF-004 fix for the check path: preview_fixes returns a
+// PreviewOutcome::WouldFix so --fix --check reports what would change.
 //
-// Pre-Phase-B behavior: preview_fixes returned Option<String> and mapped Rejected
-// to None — --fix --check never printed "fix rejected" even when the reverify gate
-// refused the edit.
+// Fixture: lint_overlap_fix.mds — @if "x" == "x": with "hello" then-body and an
+// empty @else body. Two rules fire simultaneously:
+//   • unreachable-branch (Tier A, Error): always-true @if with later @else branch.
+//     Generates two spans: remove @if line + remove @else..@end (inclusive).
+//   • empty-block (Tier A, Warn): empty @else body.
+//     Generates one span: remove @else: through @end (exclusive).
 //
-// Fixture: lint_block_span_empty.mds (multi-line empty @define). The fix removes
-// the opening @define line, orphaning @end → reverify gate fails → Rejected.
+// The empty-block span is contained within the unreachable-branch span that covers
+// @else..@end. plan_fixes_with_options sorts by (start ASC, end DESC) and calls
+// dedup_contained_or_identical, which drops the shorter empty-block span. The
+// resulting two unreachable-branch spans are disjoint → no overlap_rejected.
+// The fix would succeed → "Would fix" printed; file unchanged (check mode).
 
 #[test]
-fn fix_check_refused_fix_prints_rejected_not_would_fix() {
+fn fix_check_coalesced_fix_prints_would_fix() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("lint_block_span_empty.mds");
-    fs::copy(fixture("lint_block_span_empty.mds"), &target).unwrap();
+    let target = dir.path().join("lint_overlap_fix.mds");
+    fs::copy(fixture("lint_overlap_fix.mds"), &target).unwrap();
     let original = fs::read_to_string(&target).unwrap();
 
     let out = lint_path(&target, &["--fix", "--check"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // "fix rejected" must appear: the reverify gate refused the empty-block removal.
+    // "Would fix" must appear: after containment dedup the fix is accepted.
     assert!(
-        stderr.contains("fix rejected"),
-        "--fix --check must print 'fix rejected' when the reverify gate refuses; got stderr: {stderr}"
+        stderr.contains("Would fix"),
+        "--fix --check must print 'Would fix' when coalescing resolves the overlap; \
+         got stderr: {stderr}"
     );
 
-    // "Would fix" must NOT appear: the fix was rejected, not pending.
+    // "fix rejected" must NOT appear: containment dedup resolved the overlap.
     assert!(
-        !stderr.contains("Would fix"),
-        "--fix --check must NOT print 'Would fix' when fix is rejected; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "--fix --check must NOT print 'fix rejected' after coalescing; got stderr: {stderr}"
     );
 
     // File must be untouched — check mode never writes.
@@ -1059,22 +1134,27 @@ fn dir_fix_check_exits_1_when_any_file_fixable_exits_0_when_none() {
     );
 }
 
-// ── Test (f): Overlap fixture → visible "fix rejected"/overlap message ────────
+// ── Test (f): Overlap fixture → coalescing resolves it, fix succeeds ─────────
 //
-// Pins bug-12 / preview-honesty: when two Tier-A edits target the same line
-// (overlap detected), the fix is refused with "Overlapping fix spans detected"
-// and the output is NOT silent.
+// Pins Step 4 coalescing: when multiple Tier-A rules emit overlapping spans
+// (one span contained within another), dedup_contained_or_identical drops
+// the smaller span and the fix proceeds with the larger (dominant) span.
 //
-// Fixture: lint_overlap.mds — a @define containing an @if "a"=="a" block with
-// a @elseif "a"=="a" that is both unreachable AND has an empty body.  Both
-// empty-block and unreachable-branch fire on the same @elseif line → same byte
-// range → overlap detected → Rejected.
-//
-// Tests --fix (apply) path: the rejection message appears on stderr, the file is
-// untouched, and exit code reflects the residual diagnostics.
+// Fixture: lint_overlap.mds — a @define containing @if "a"=="a" with a
+// @elseif "a"=="a" that is both a duplicate AND has an empty body.  Three
+// rules emit edits on the @elseif line:
+//   • unreachable-branch case A (always-true @if): two spans — remove @if
+//     directive line + remove @elseif..@end inclusive.
+//   • unreachable-branch case G (duplicate @elseif): one span —
+//     remove @elseif..@end exclusive (contained within case-A span 2).
+//   • empty-block ⑥ (empty @elseif body): one span — same as case-G
+//     span (contained/identical).
+// After sort (start ASC, end DESC) and containment dedup, only two spans
+// survive: [remove-@if-line, remove-@elseif..@end-inclusive].
+// No overlap remains → fix is applied → file changed → exit 0.
 
 #[test]
-fn fix_overlap_surfaced_not_silent() {
+fn fix_overlap_coalesced_and_applied() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("lint_overlap.mds");
     fs::copy(fixture("lint_overlap.mds"), &target).unwrap();
@@ -1083,23 +1163,34 @@ fn fix_overlap_surfaced_not_silent() {
     let out = lint_path(&target, &["--fix"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // "fix rejected" must appear — not silent.
+    // Fix must succeed: coalescing resolves the contained-span overlap.
     assert!(
-        stderr.contains("fix rejected"),
-        "--fix on overlap fixture must print 'fix rejected'; got stderr: {stderr}"
+        !stderr.contains("fix rejected"),
+        "--fix on coalesced overlap fixture must NOT print 'fix rejected'; got stderr: {stderr}"
     );
 
-    // The overlap reason must mention "overlap" or "Overlapping".
-    assert!(
-        stderr.to_lowercase().contains("overlap"),
-        "rejection reason must mention 'overlap'; got stderr: {stderr}"
-    );
-
-    // File must be unchanged (fix was refused, no write).
+    // File must be changed.
     let after = fs::read_to_string(&target).unwrap();
-    assert_eq!(
+    assert_ne!(
         original, after,
-        "overlap-rejected file must be left unchanged"
+        "fix must change the file when coalescing resolves the overlap"
+    );
+
+    // The @if and @elseif blocks are gone; the then-body and outer @end remain.
+    assert!(
+        !after.contains("@if"),
+        "fixed file must not contain the removed @if; got:\n{after}"
+    );
+    assert!(
+        !after.contains("@elseif"),
+        "fixed file must not contain the removed @elseif; got:\n{after}"
+    );
+
+    // No residual diagnostics → exit 0.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no residual diagnostics after fix; got stderr: {stderr}"
     );
 }
 
@@ -1109,18 +1200,20 @@ fn fix_overlap_surfaced_not_silent() {
 // some fail, the CLI writes the partially-fixed file and emits a
 // "{applied} of {total} fixes applied" summary.
 //
-// Fixture: lint_partial_fix.mds — contains a multi-line empty @define (Tier A,
-// fix fails reverify because @end is orphaned after removing the @define line)
-// and a duplicate @export (Tier A, fix passes — just removes a line).
+// Fixture: lint_partial_fix.mds — a multi-line empty @define (Tier A, empty-block)
+// with a matching @export, plus a duplicate @export (Tier A, duplicate-export).
 //
-// Expected behaviour:
-// - Batch attempt: fails (empty-block removal + dup-export removal together →
-//   @end orphaned → reverify rejects).
-// - Per-edit fallback right-to-left:
-//   1. duplicate-export (higher offset) → applied, reverify passes.
-//   2. empty-block (lower offset) → reverify fails → rejected.
-// - File written with one @export greet remaining; empty @define still present.
-// - Stderr: "1 of 2 fixes applied" (or "Partially fixed: … (1 of 2 fixes applied)").
+// The empty-block fix removes @define empty_fn():..@end. This leaves @export empty_fn
+// in the file with no corresponding @define. The MDS compiler rejects this
+// ("cannot export 'empty_fn': not defined in this module"), so the reverify gate
+// refuses the empty-block fix fail-closed. The duplicate-export fix (remove second
+// @export greet) passes independently.
+//
+// Expected behaviour (per-edit fallback, right-to-left):
+//   1. duplicate-export (higher offset) → applied, reverify passes → Fixed.
+//   2. empty-block (lower offset) → reverify fails (orphaned @export) → rejected.
+// File written with one @export greet remaining; empty @define still present.
+// Stderr: "1 of 2 fixes applied" (or "Partially fixed: … (1 of 2 fixes applied)").
 
 #[test]
 fn partially_fixed_end_to_end_count_in_summary() {
@@ -1146,7 +1239,7 @@ fn partially_fixed_end_to_end_count_in_summary() {
         "file must have exactly one @export greet after partial fix; got:\n{after}"
     );
 
-    // The empty @define must still be present (empty-block fix was rejected).
+    // The empty @define must still be present (empty-block fix refused: orphaned @export).
     assert!(
         after.contains("@define empty_fn():"),
         "empty @define must still be present after partial fix; got:\n{after}"
@@ -1701,5 +1794,130 @@ fn lint_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         "raw ESC byte (0x1B) must not appear in stdout; \
          got (hex): {:02x?}",
         &out.stdout[..out.stdout.len().min(512)]
+    );
+}
+
+// ── A6: per-file config discovery ────────────────────────────────────────────
+
+/// A6: per-file config discovery — nested mds.json overrides parent for files
+/// in its subtree.
+///
+/// Layout:
+///   root/
+///     mds.json          {"lint": {"rules": {"shadow-variable": "off"}}}
+///     top.mds           (shadow-variable template — no diagnostic at root)
+///     sub/
+///       mds.json        {"lint": {"rules": {"shadow-variable": "error"}}}
+///       sub.mds         (same shadow-variable template — error in sub)
+///
+/// Without A6 (single root config for all): both files use root config
+/// (shadow-variable=off) → exit 0.
+/// With A6 (per-file config): sub.mds uses sub config (shadow-variable=error)
+/// → exit 2.
+#[test]
+fn lint_dir_nested_config_per_file_discovery() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // Root config: shadow-variable=off (suppress diagnostic).
+    fs::write(
+        root.join("mds.json"),
+        r#"{"lint":{"rules":{"shadow-variable":"off"}}}"#,
+    )
+    .unwrap();
+
+    // Template that triggers shadow-variable: `item` declared in frontmatter,
+    // reused as the @for loop variable.
+    let shadow_template = "---\nitem: outer\nitems: [a, b]\n---\n\
+                           Before: {item}\n@for item in items:\n- {item}\n@end\nAfter: {item}\n";
+    fs::write(root.join("top.mds"), shadow_template).unwrap();
+
+    // Subdirectory with its own config: shadow-variable=error.
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(
+        sub.join("mds.json"),
+        r#"{"lint":{"rules":{"shadow-variable":"error"}}}"#,
+    )
+    .unwrap();
+    fs::write(sub.join("sub.mds"), shadow_template).unwrap();
+
+    let out = lint_path(root, &[]);
+
+    // sub.mds must trigger shadow-variable at error severity → exit 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "lint dir with nested config (shadow-variable=error in sub/) must exit 2; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // top.mds has shadow-variable=off — its presence in output must not carry
+    // an error-severity diagnostic, i.e. the error must originate from sub.mds.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sub.mds") || stderr.contains("sub"),
+        "stderr must mention sub.mds as the source of the error; got: {stderr}"
+    );
+}
+
+/// A6: per-file config discovery — a malformed mds.json in a subdirectory
+/// produces a per-file error for files in that subtree, but files outside the
+/// subtree continue linting normally.
+///
+/// Layout:
+///   root/
+///     clean.mds         (no issues — no root mds.json, defaults apply)
+///     bad/
+///       mds.json        (invalid JSON — parse failure)
+///       bad.mds         (clean template, but config load fails)
+///
+/// Expected: exit 2 (per-file config error for bad.mds); clean.mds is
+/// unaffected (its FileTally is Clean).
+#[test]
+fn lint_dir_nested_malformed_config_per_file_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    // Clean file in root — no mds.json present, defaults apply.
+    fs::write(
+        root.join("clean.mds"),
+        "---\ngreeting: hi\n---\n{greeting} world!\n",
+    )
+    .unwrap();
+
+    // Subdirectory with a malformed mds.json.
+    let bad = root.join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
+    fs::write(
+        bad.join("bad.mds"),
+        "---\ngreeting: hi\n---\n{greeting} world!\n",
+    )
+    .unwrap();
+
+    let out = lint_path(root, &[]);
+
+    // Malformed config in bad/ must cause exit 2.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "lint dir with malformed nested mds.json must exit 2; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+
+    // The error must be reported — stderr or stdout should mention config or mds.json.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("mds.json") || combined.contains("config") || combined.contains("bad"),
+        "output must reference the malformed config source; got: {combined}"
     );
 }

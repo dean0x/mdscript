@@ -84,9 +84,15 @@ def test_sm_py1_compile_virtual_produces_source_map() -> None:
 def test_sm_py2_default_no_source_map() -> None:
     result = m.compile(_SIMPLE_SRC)
     assert result.source_map is None
-    # to_dict() must not contain the "sourceMap" key.
+    # to_dict() always includes "sourceMap" (Python-idiomatic always-present key);
+    # the value is None when no map was generated. to_json() omits the key entirely
+    # (canonical wire format). This deliberate asymmetry is documented in to_dict().
     d = result.to_dict()
-    assert "sourceMap" not in d
+    assert "sourceMap" in d, "to_dict() must include 'sourceMap' key (even when None)"
+    assert d["sourceMap"] is None, "sourceMap must be None when not requested"
+    # to_json() omits the key.
+    from_json = json.loads(result.to_json())
+    assert "sourceMap" not in from_json, "to_json() must omit 'sourceMap' when not generated"
 
 
 def test_sm_py2_explicit_false_no_source_map() -> None:
@@ -215,13 +221,19 @@ def test_sm_py8_golden_structure(
     )
     d = result.to_dict()
     if not sm:
-        assert "sourceMap" not in d, "sourceMap must be absent when not requested"
+        # to_dict() always includes "sourceMap" (None when absent) — Python-idiomatic.
+        assert "sourceMap" in d, "to_dict() must include 'sourceMap' key (even when None)"
+        assert d["sourceMap"] is None, "sourceMap must be None when not requested"
     else:
         assert "sourceMap" in d, "sourceMap must be present when requested"
         _check_sm_structure(d["sourceMap"], has_sources_content=sc)
-    # JSON round-trip is consistent with to_dict()
+    # JSON round-trip: to_json() is canonical (omits sourceMap when None).
     from_json = json.loads(result.to_json())
-    assert from_json == d
+    # Strip null sourceMap from to_dict() before comparing with to_json() output.
+    d_canonical = {
+        k: v for k, v in d.items() if not (k == "sourceMap" and v is None)
+    }
+    assert from_json == d_canonical
 
 
 # ── SM-PY-9: live CLI sidecar parity ──────────────────────────────────────

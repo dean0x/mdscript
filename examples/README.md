@@ -23,6 +23,15 @@ mds build examples/source-maps/annotated-prompt.mds --source-map -o /tmp/out.md
 
 # String variables without type coercion (e.g. preserve leading zeros)
 mds build template.mds --set-string zip_code=02134
+
+# Decode a Source Map v3 and trace output lines back to their source
+node examples/source-maps/consume-map.mjs
+
+# Python bindings tour — compile, source maps, MdsError handling, lint
+source .venv/bin/activate && python examples/python/demo.py
+
+# Per-rule severity overrides via mds.json in config-demo/ (exits 2 by design)
+mds lint examples/linting/config-demo/loop-shadow.mds
 ```
 
 ## Templates
@@ -34,10 +43,12 @@ mds build template.mds --set-string zip_code=02134
 | [`blog-generator/`](blog-generator/) | A blog post template driven by frontmatter variables |
 | [`prompt-library/`](prompt-library/) | A reusable prompt library using `@export`/`@import` (personas, formatting, guardrails) |
 | [`inheritance/`](inheritance/) | Template inheritance with `@extends`/`@block` — one base agent skeleton specialized into a data analyst and a code reviewer |
-| [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports; v0.4.0 adds interior blank-line preservation, typed comparisons, and `@extends` frontmatter merge |
+| [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports; v0.4.0 adds interior blank-line preservation, typed comparisons, and `@extends` frontmatter merge; `30_set_string_cli.mds` demos `--set` (coerces to number, may raise `mds::type_mismatch`) vs `--set-string` (keeps string bytes byte-for-byte), and both flags on the same key as a hard error; `31_wide_and_nested_fences.mds` shows a 4-backtick fence wrapping a 3-backtick block verbatim, and mismatched ``` / ~~~ markers that never cross-close |
 | [`stress-test/`](stress-test/) | A large, deeply-composed template tree exercising the resolver and evaluator |
-| [`linting/`](linting/) | A deliberately-messy template that trips four lint rules; shows `mds lint` human and JSON output, `--fix --diff` preview, and exit-code semantics |
+| [`linting/`](linting/) | A deliberately-messy template that trips four lint rules; shows `mds lint` human and JSON output, `--fix` tiers (A auto-applies, B standalone-only, C report-only), `--diff` preview, exit-code semantics, and per-rule severity overrides via `mds.json` (`config-demo/` — enables `shadow-variable`, promotes `unused-variable` to error, silences `redundant-else`) |
 | [`source-maps/`](source-maps/) | Source Map v3 generation via `mds build --source-map` — sidecar map, `--inline` data-URI embed, and `--embed-sources` self-contained variant |
+| [`formatting/`](formatting/) | Auto-formatter demo (`mds fmt`) — write, `--check`, `--diff`, and stdin filter modes; what fmt normalizes (directive trailing whitespace, line endings, final newline) vs. preserves byte-for-byte (body text, `@message`/`@define` bodies); the safety gate that refuses any rewrite changing compiled output; exit codes |
+| [`python/`](python/) | Native Python bindings (`mdscript`, built with PyO3) — compile strings and files with `mdscript.compile`/`compile_file`, generate Source Map v3 with `source_map=True`, handle `MdsError` (`.code`, `.help`, `.span`), and lint with `mdscript.lint`; requires a virtualenv + `maturin develop` (`source .venv/bin/activate`) |
 
 Some examples take runtime variables — pass the accompanying `vars.json`:
 
@@ -70,7 +81,7 @@ mds build examples/ --out-dir dist/
 mds check examples/
 ```
 
-Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design because `examples/linting/demo.mds` deliberately triggers error-level findings.
+Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design because `examples/linting/demo.mds` and `examples/linting/config-demo/loop-shadow.mds` both deliberately trigger error-level findings.
 
 `@message` detection is **static**: a `@message` block anywhere in the template
 (even inside `@if false:`) makes it a messages template. **Mixed content** —
