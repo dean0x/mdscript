@@ -60,8 +60,8 @@ r.to_json()     # JSON string; omits "sourceMap" key when absent (canonical wire
 # Compile a file, resolving @import relative to it.
 mdscript.compile_file(path, vars=None, source_map=False, sources_content=False)
 
-# Validate without rendering. Note: check() takes NO source_map argument —
-# passing one raises TypeError, since source maps are a compile-only concept.
+# Validate without rendering. Passing source_map or sources_content raises
+# MdsError(code="mds::invalid_options") — source maps are a compile-only concept.
 mdscript.check(source, vars=None, base_path=None)
 
 # Lint. LintResult.files returns typed LintFileReport objects (B6/F10).

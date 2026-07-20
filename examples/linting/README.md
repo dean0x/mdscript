@@ -19,8 +19,8 @@ All commands below are run from the repository root.
 |------|------------------|------|------------------|
 | `duplicate-import`   | error | A | Auto-fixed — removes the duplicate `@import` line. |
 | `duplicate-export`   | error | A | Auto-fixed — removes the duplicate `@export` line. |
-| `unreachable-branch` | error | A | Reported (block-span fix deferred, see note). |
-| `empty-block`        | warn  | A | Reported (block-span fix deferred, see note). |
+| `unreachable-branch` | error | A | Auto-fixed — removes the dead block or branch span. |
+| `empty-block`        | warn  | A | Auto-fixed — removes the empty block or branch span. |
 | `unused-import`      | warn  | B | Fixable only on a *standalone* file.† |
 | `unused-function`    | warn  | B | Fixable only on a *standalone* file.† |
 | `unused-variable`    | warn  | C | Never auto-fixed (report-only). |
@@ -36,13 +36,13 @@ must produce byte-identical output. Note that a file which trips `unused-import`
 necessarily *has* an import, so it is never standalone — such warnings clear as a
 side effect of another fix (e.g. removing a duplicate import) rather than directly.
 
-**Block-span fixes are deferred (#172).** `empty-block` and `unreachable-branch`
-(and the block form of `unused-function`) need to remove a whole `@if…@end` /
-`@define…@end` span. That work is deferred: today the fixer only removes the
-directive line, which would orphan the trailing `@end`/`@else:`. The re-verify gate
-catches the resulting parse error and declines the fix, so these rules are *reported*
-but left for you to fix by hand. Only `duplicate-import` and `duplicate-export`
-(single-line removals) auto-apply today.
+**Tier A block-spanning fixes.** `empty-block` and `unreachable-branch` auto-fix by
+removing the complete block span (`@if…@end`, `@for…@end`, or `@define…@end`).
+`unused-function` (Tier B, standalone) removes the whole `@define…@end` block the
+same way. The reverify gate still applies fail-closed — if the edited source does not
+recompile cleanly or produces different output, the fix is declined and the diagnostic
+is left for you to resolve by hand. A few sub-cases (e.g. an `@if` with an empty
+*then*-body but non-empty branches) emit no fix span and are always report-only.
 
 ## Human output
 
