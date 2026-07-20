@@ -1630,23 +1630,24 @@ impl ModuleCache {
             block_names: HashSet::new(),
         };
 
-        // S7 (extended by B1): always populate module_origin — one Arc::from per module,
-        // not per @define. The prior AC-PERF-01 source_map_mode gate is deliberately
-        // dropped: without an origin, type_mismatch inside an imported @define body
-        // mis-attributes its span to the caller's source (PF-012 — cross-source offset
-        // mismatch is silent in bounds, renders wrong file:line). Cost = one Arc::from
-        // per module — the deliberate AC-PERF-01 relaxation noted in the B1 plan.
-        // (Applies PF-012)
-        let module_origin = Origin {
-            file: Arc::from(ctx.file_str),
-            source: Arc::from(ctx.source),
-        };
+        // S7 (extended by B1): lazily build module_origin — at most one Arc::from per
+        // module, only when a @define block is encountered. Define-free modules (the
+        // common template shape) pay zero allocation; modules with @defines still
+        // satisfy the one-origin-per-module invariant for correct cross-source span
+        // attribution (PF-012). Correctness is unchanged: every FunctionDef.origin
+        // carries the same Arc<str> bytes as before — same ctx.source, same
+        // ctx.file_str. (Applies PF-012; ISS-08)
+        let mut module_origin: Option<Origin> = None;
 
         let mut block_count: usize = 0;
         for node in body {
             match node {
                 Node::Define(def) => {
-                    collect_define(def, &mut defs, scope, ctx, Some(&module_origin))?
+                    let origin = module_origin.get_or_insert_with(|| Origin {
+                        file: Arc::from(ctx.file_str),
+                        source: Arc::from(ctx.source),
+                    });
+                    collect_define(def, &mut defs, scope, ctx, Some(origin))?
                 }
                 Node::Import(import) => self.resolve_import(import, scope, ctx, warnings)?,
                 Node::Export(export) => self.collect_export(export, &mut defs, ctx, warnings)?,
