@@ -1633,6 +1633,28 @@ fn b1_type_mismatch_in_imported_define_names_helper_file() {
         "B1: must be mds::type_mismatch, got: {}",
         serialized.code
     );
+    // B1 primary attribution check — the only discriminating assertion (avoids PF-012).
+    //
+    // SerializedSpan carries no source identity: span.offset == 18 falls within BOTH
+    // helper_src (59 B) and main.mds (42 B), so `span.offset < helper_src.len()` alone
+    // cannot distinguish definer vs caller attribution.  Direct inspection of the
+    // NamedSource embedded in MdsError::TypeMismatch is required.
+    //
+    // Discriminating power: pre-fix regression (body_origin NOT swapped) would have
+    // MdsError::TypeMismatch::src naming "main.mds" → assert_eq! below fails.
+    let definer_file = match &err {
+        MdsError::TypeMismatch { src, .. } => src
+            .as_ref()
+            .expect("B1: TypeMismatch must carry a NamedSource for file attribution")
+            .name()
+            .to_string(),
+        _ => panic!("B1: expected TypeMismatch, got: {err:?}"),
+    };
+    assert_eq!(
+        definer_file, "helper.mds",
+        "B1: error must name 'helper.mds' (definer), not the caller; \
+         pre-fix regression would name 'main.mds'"
+    );
     // The span must be populated (not degraded to spanless).
     let span = serialized
         .span
@@ -1648,10 +1670,13 @@ fn b1_type_mismatch_in_imported_define_names_helper_file() {
         span.length > 0,
         "B1: span.length must be > 0, got: {span:?}"
     );
-    // Line/column must be populated (they can be computed from helper_src).
-    assert!(
-        span.line.is_some(),
-        "B1: span.line must be populated, got: {span:?}"
+    // Secondary discriminator: @if is on line 2 of helper_src (after "@define check(x):\n"),
+    // but on line 1 of main.mds (byte 18 precedes main.mds's only newline at byte 28).
+    assert_eq!(
+        span.line,
+        Some(2),
+        "B1: span must be on line 2 of helper_src (@if directive); \
+         caller-attributed regression span would land on line 1 (import line)"
     );
 }
 
@@ -1700,6 +1725,26 @@ fn b1_two_level_chain_attributes_to_innermost_definer() {
         "B1 two-level: must be mds::type_mismatch, got: {}",
         serialized.code
     );
+    // B1 two-level primary attribution check (avoids PF-012).
+    //
+    // span.offset == 18 falls within a.mds (39 B) and b.mds, so `span.offset < c_src.len()`
+    // alone does not discriminate definer vs caller attribution.  Direct NamedSource
+    // inspection is required.
+    //
+    // Discriminating power: regression would name "a.mds" or "b.mds" → assert_eq! fails.
+    let definer_file = match &err {
+        MdsError::TypeMismatch { src, .. } => src
+            .as_ref()
+            .expect("B1 two-level: TypeMismatch must carry a NamedSource")
+            .name()
+            .to_string(),
+        _ => panic!("B1 two-level: expected TypeMismatch, got: {err:?}"),
+    };
+    assert_eq!(
+        definer_file, "c.mds",
+        "B1 two-level: error must name 'c.mds' (innermost definer), not 'a.mds'/'b.mds'; \
+         pre-fix regression would fail here"
+    );
     let span = serialized
         .span
         .expect("B1 two-level: must carry a span pointing into c.mds");
@@ -1710,6 +1755,14 @@ fn b1_two_level_chain_attributes_to_innermost_definer() {
         c_src.len()
     );
     assert!(span.length > 0, "B1 two-level: span.length must be > 0");
+    // Secondary discriminator: @if is on line 2 of c_src (after "@define inner(x):\n"),
+    // but on line 1 of a.mds (byte 18 precedes a.mds's only newline at byte 24).
+    assert_eq!(
+        span.line,
+        Some(2),
+        "B1 two-level: span must be on line 2 of c_src (@if directive); \
+         caller-attributed regression span would land on line 1 (import line)"
+    );
 }
 
 // ── B2: span-less syntax errors get upgraded to span-bearing errors ──────────
