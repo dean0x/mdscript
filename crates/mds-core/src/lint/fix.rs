@@ -1206,13 +1206,36 @@ mod tests {
         );
     }
 
-    /// A4-DEDUP-3: A true partial overlap (neither range contains the other)
-    /// is still rejected after deduplication.
+    /// A4-DEDUP-3: A genuine partial overlap (neither range contains the other)
+    /// drives the real planner path — `dedup_contained_or_identical` retains both
+    /// edits because neither is contained, and `has_overlapping_edits` fires —
+    /// producing `overlap_rejected = true`, edits cleared, and `FixOutcome::Rejected`
+    /// from `apply_fixes`.
+    ///
+    /// Math: source = "line0\nline1\nline2\n"
+    ///   line0 → bytes [0,  6)
+    ///   line1 → bytes [6,  12)
+    ///   line2 → bytes [12, 18)
+    ///
+    /// Edit A: `FixLineSpan { from: 0, to: 6, to_inclusive: true }`
+    ///   start = `line_start(0)` = 0
+    ///   end   = `extend_to_line_end(6)` = 12  (scans through "line1\n")
+    ///   → ByteEdit [0, 12)
+    ///
+    /// Edit B: `FixLineSpan { from: 6, to: 12, to_inclusive: true }`
+    ///   start = `line_start(6)` = 6
+    ///   end   = `extend_to_line_end(12)` = 18 (scans through "line2\n")
+    ///   → ByteEdit [6, 18)
+    ///
+    /// After sort (start ASC, end DESC): A first (start=0), then B (start=6).
+    /// `dedup_contained_or_identical`: B.end=18 > max_end(12) → B is not contained,
+    /// both edits are retained.
+    /// `has_overlapping_edits`: A.end=12 > B.start=6 → partial overlap → rejected.
     #[test]
     fn a4_partial_overlap_still_rejected_after_dedup() {
-        // Edit A: [0, 15), Edit B: [10, 25) — partial overlap.
-        // Neither contains the other since 15 < 25 but 0 < 10.
-        let source = "0123456789abcdefghijklmnopqrstuvwxyz\n";
+        let source = "line0\nline1\nline2\n";
+
+        // Edit A covers bytes [0, 12): spans line0 (start) through line1 (end inclusive).
         let diag_a = LintDiagnostic {
             rule: "duplicate-import".to_string(),
             severity: Severity::Error,
@@ -1220,55 +1243,53 @@ mod tests {
             help: None,
             span: None,
             file: None,
-            // Force edit [0, 15) by using raw fix_removals that resolve that way.
-            // line_start(0)=0, extend_to_line_end(14)=37 (entire single-line source)
-            // But we want [0, 15) exactly. Use a FixLineSpan with to_inclusive:false:
-            // to=15 → line_start(15)=0 (single line) ... hmm, tricky.
-            // Instead, inject ByteEdit directly via make_diag which uses single(offset).
-            // Single-line source: both edits fall on the same line → same ByteEdit.
-            // Use a two-line source to get distinct line ranges.
-            fix_removals: Some(vec![FixLineSpan::single(0)]),
+            fix_removals: Some(vec![FixLineSpan {
+                from: 0, // offset inside line0
+                to: 6,   // offset inside line1; extend_to_line_end(6) = 12
+                to_inclusive: true,
+            }]),
         };
-        let source2 = "line1\nline2\n";
-        // single(0) → ByteEdit [0, 6) (line1\n)
-        // single(6) → ByteEdit [6, 12) (line2\n)
-        // These are disjoint, not overlapping. Need a different approach.
-        // For a true partial overlap test: craft fix_removals that produce them.
-        // FixLineSpan { from:0, to:0, to_inclusive:true } on "line1\nline2\n" → [0, 6)
-        // FixLineSpan { from:0, to:6, to_inclusive:true } on "line1\nline2\n" → [0, 12)
-        // The [0, 12) CONTAINS [0, 6) → containment dedup → NOT a partial overlap test.
-        //
-        // True partial overlap requires spans from DIFFERENT start positions where
-        // neither contains the other. With a single-line source, all edits cover [0, n)
-        // with same start. Construct with a 3-line source:
-        //   line0: bytes [0, 6)
-        //   line1: bytes [6, 12)
-        //   line2: bytes [12, 18)
-        // Edit A: { from:0, to:6, to_inclusive:false } → [0, 6) (line0 only)
-        //   Actually to_inclusive:false means end=line_start(to). line_start(6) = 6. → [0,6)
-        // Hmm, this is still same-start as line0.
-        // For partial overlap, we need something like:
-        //   Edit A: from line0 through half of line1 — impossible with line-aligned removals!
-        // Line-aligned spans cannot partially overlap! (They always start/end at newline
-        // boundaries, so one either contains the other or they are disjoint.)
-        //
-        // Conclusion: with line-aligned FixLineSpans, true partial overlaps cannot occur
-        // in practice. But we still test overlap detection directly via plan manipulation.
-        let _ = (source, source2, diag_a);
-
-        // Instead: directly construct a plan with overlap_rejected=true to test that
-        // apply_fixes respects it. The planner itself cannot produce partial overlaps
-        // from valid FixLineSpans (line-aligned spans are always disjoint or contained).
-        let plan = FixPlan {
-            edits: vec![],
-            overlap_rejected: true,
+        // Edit B covers bytes [6, 18): spans line1 (start) through line2 (end inclusive).
+        // B.start=6 < A.end=12, B.end=18 > A.end=12 → genuine partial overlap.
+        let diag_b = LintDiagnostic {
+            rule: "empty-block".to_string(),
+            severity: Severity::Warn,
+            message: "b".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 6, // offset inside line1
+                to: 12,  // offset inside line2; extend_to_line_end(12) = 18
+                to_inclusive: true,
+            }]),
+        };
+        let result = LintResult {
+            diagnostics: vec![diag_a, diag_b],
             truncated: false,
+            is_standalone: false,
         };
-        let result = make_result(vec![]);
-        let outcome = apply_fixes("", plan, &result, |_| Ok(make_result(vec![])));
+
+        // Drive through the real planner: dedup cannot collapse this (B extends beyond A),
+        // so has_overlapping_edits fires → overlap_rejected = true, edits cleared.
+        let plan = plan_fixes(&result, source);
+        assert!(
+            plan.overlap_rejected,
+            "partial overlap must drive overlap_rejected=true via the real planner; \
+             edits after dedup: {:?}",
+            plan.edits
+        );
+        assert!(
+            plan.edits.is_empty(),
+            "overlap_rejected must clear all edits; got: {:?}",
+            plan.edits
+        );
+
+        // apply_fixes must surface FixOutcome::Rejected (fail-closed, ADR-004).
+        let outcome = apply_fixes(source, plan, &result, |_| Ok(make_result(vec![])));
         assert!(
             matches!(outcome, FixOutcome::Rejected { .. }),
-            "overlap_rejected plan must be Rejected; got: {outcome:?}"
+            "overlap_rejected plan must surface FixOutcome::Rejected; got: {outcome:?}"
         );
     }
 

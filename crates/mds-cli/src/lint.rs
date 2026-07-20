@@ -1448,3 +1448,87 @@ fn colorize_unified_diff(unified: &str) -> String {
     }
     out
 }
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{preview_fixes, PreviewOutcome};
+    use mds::{FixLineSpan, LintDiagnostic, LintResult, Severity};
+    use std::path::Path;
+
+    /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
+    /// the current 9 rules.  Every pair of real-rule fix spans is either disjoint
+    /// (different AST blocks) or in a containment relationship (same block, different
+    /// rules) — the latter is resolved by `dedup_contained_or_identical` before the
+    /// overlap detector is reached.  No MDS fixture can drive `overlap_rejected=true`
+    /// through the CLI binary.
+    ///
+    /// This unit test covers rejection surfacing at the deepest level reachable from
+    /// the CLI crate: `preview_fixes` with a crafted `LintResult` whose `fix_removals`
+    /// produce the same genuine partial overlap used in the mds-core ISS-02 regression
+    /// test (fix.rs: `a4_partial_overlap_still_rejected_after_dedup`).
+    ///
+    /// Math (identical to ISS-02):
+    ///   source = "line0\nline1\nline2\n"
+    ///   Edit A: FixLineSpan { from: 0, to: 6,  to_inclusive: true } → ByteEdit [0,  12)
+    ///   Edit B: FixLineSpan { from: 6, to: 12, to_inclusive: true } → ByteEdit [6,  18)
+    ///   A.end=12 > B.start=6, B.end=18 > A.end=12 → partial overlap → overlap_rejected.
+    ///
+    /// `preview_fixes` must return `PreviewOutcome::Rejected` — the rejection must be
+    /// surfaced (not silently swallowed as `NothingToFix`).  This pins PF-004: the
+    /// preview path uses the same gated pipeline as the write path and is equally
+    /// honest about overlap refusals.
+    #[test]
+    fn preview_fixes_surfaces_rejected_on_overlap() {
+        let source = "line0\nline1\nline2\n";
+        // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
+        let diag_a = LintDiagnostic {
+            rule: "duplicate-import".to_string(),
+            severity: Severity::Error,
+            message: "a".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 0, // inside line0
+                to: 6,   // inside line1; extend_to_line_end(6) = 12
+                to_inclusive: true,
+            }]),
+        };
+        // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
+        // Partially overlaps A at [6, 12).
+        let diag_b = LintDiagnostic {
+            rule: "empty-block".to_string(),
+            severity: Severity::Warn,
+            message: "b".to_string(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: Some(vec![FixLineSpan {
+                from: 6, // inside line1
+                to: 12,  // inside line2; extend_to_line_end(12) = 18
+                to_inclusive: true,
+            }]),
+        };
+        let result = LintResult {
+            diagnostics: vec![diag_a, diag_b],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        let outcome = preview_fixes(
+            &result,
+            source,
+            Path::new("."),
+            None,
+            &mds::LintConfig::default(),
+        );
+
+        assert!(
+            matches!(outcome, PreviewOutcome::Rejected(_)),
+            "preview_fixes must return Rejected for an overlap_rejected plan, \
+             not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
+        );
+    }
+}
