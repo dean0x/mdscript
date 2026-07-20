@@ -28,7 +28,7 @@ jobs:
           components: rustfmt, clippy
       # mds-python (pyo3, abi3-py311) is compiled by `clippy --all-targets` and
       # `test --workspace`; a 3.11+ interpreter makes the pyo3 build deterministic.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - uses: Swatinem/rust-cache@v2
@@ -51,7 +51,7 @@ jobs:
       # mds-python is added to the MSRV gate: its pyo3/abi3 build must compile on
       # the workspace floor (Rust 1.88 ≥ pyo3 0.28 MSRV 1.83). setup-python gives
       # the pyo3 build script a 3.11+ interpreter.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - uses: Swatinem/rust-cache@v2
@@ -163,7 +163,7 @@ jobs:
       # no pre-installed maturin needed.  MDS_PYTHON_BIN is set to the exact
       # executable that owns the installed module so findPythonForMdscript()
       # picks it up cross-platform (bin/ on Unix, Scripts/ on Windows).
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install Python binding (CF-SM2 parity surface)
@@ -191,7 +191,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install test tooling
@@ -219,7 +219,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Install build tooling
