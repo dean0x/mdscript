@@ -278,12 +278,14 @@ def test_lr9_lint_diagnostic_to_dict() -> None:
     assert "severity" in d
     assert "message" in d
     assert "fixable" in d
-    # span is present when the diagnostic carries a span.
+    # help and span are always present in to_dict() — None when not set (PF-007 fix).
+    assert "help" in d
+    assert "span" in d
     if diag.span is not None:
-        assert "span" in d
+        assert d["span"] is not None
         assert "offset" in d["span"] and "length" in d["span"]
     else:
-        assert "span" not in d
+        assert d["span"] is None
 
 
 def test_lr10_lint_file_report_pickle() -> None:

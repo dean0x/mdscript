@@ -483,8 +483,9 @@ impl LintDiagnostic {
 
     /// Return the diagnostic as a plain `dict`.
     ///
-    /// `help` is omitted when `None`; `span` is omitted when `None` —
-    /// matching the canonical wire format produced by all other surfaces.
+    /// `help` is `None` (Python) when the rule emits no hint; `span` is `None` (Python)
+    /// when the rule emits no span — matching the canonical wire format produced by
+    /// `to_canonical_json()` and all other surfaces.
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         value_to_py(py, &self.as_json())
     }
@@ -517,14 +518,23 @@ impl LintDiagnostic {
 
 impl LintDiagnostic {
     /// Canonical JSON value for this diagnostic (keys in wire-format alphabetical order).
+    ///
+    /// `help` and `span` are always emitted — as JSON `null` when `None` — to match
+    /// `to_canonical_json()` exactly and satisfy the cross-surface byte-parity invariant
+    /// (PF-007).
     fn as_json(&self) -> serde_json::Value {
         // Keys are inserted in alphabetical order (serde_json::Map preserves insertion order)
         // to produce a stable, predictable dict layout for callers that iterate keys.
         let mut map = serde_json::Map::new();
         map.insert("fixable".to_string(), serde_json::Value::Bool(self.fixable));
-        if let Some(help) = &self.help {
-            map.insert("help".to_string(), serde_json::Value::String(help.clone()));
-        }
+        // Emit help unconditionally (null when None) to match to_canonical_json exactly.
+        map.insert(
+            "help".to_string(),
+            self.help
+                .as_deref()
+                .map(|h| serde_json::Value::String(h.to_owned()))
+                .unwrap_or(serde_json::Value::Null),
+        );
         map.insert(
             "message".to_string(),
             serde_json::Value::String(self.message.clone()),
@@ -537,7 +547,8 @@ impl LintDiagnostic {
             "severity".to_string(),
             serde_json::Value::String(self.severity.clone()),
         );
-        if let Some(sp) = &self.span {
+        // Emit span unconditionally (null when None) to match to_canonical_json exactly.
+        let span_val = self.span.as_ref().map(|sp| {
             // Span keys: length, offset (alphabetical per wire format).
             let mut span_map = serde_json::Map::new();
             span_map.insert(
@@ -548,8 +559,12 @@ impl LintDiagnostic {
                 "offset".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(sp.offset)),
             );
-            map.insert("span".to_string(), serde_json::Value::Object(span_map));
-        }
+            serde_json::Value::Object(span_map)
+        });
+        map.insert(
+            "span".to_string(),
+            span_val.unwrap_or(serde_json::Value::Null),
+        );
         serde_json::Value::Object(map)
     }
 }
@@ -1262,8 +1277,7 @@ fn check(
     if source_map.is_some() || sources_content.is_some() {
         return Err(options_error(
             py,
-            "source maps are not available for check(); use compile() instead \
-             (mds::invalid_options)",
+            "source maps are not available for check(); use compile() instead",
         ));
     }
     let vars = extract_vars(py, vars.as_ref())?;
