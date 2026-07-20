@@ -531,8 +531,8 @@ impl LintDiagnostic {
         map.insert(
             "help".to_string(),
             self.help
-                .as_deref()
-                .map(|h| serde_json::Value::String(h.to_owned()))
+                .clone()
+                .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
         map.insert(

@@ -869,8 +869,7 @@ mod tests {
                 column: None,
             }),
             file: Some("test.mds".to_string()),
-            // fix_removals drives the planner (replaces span-based heuristic).
-            // Use a single-line removal at `offset` — mirrors old diag_to_edit behavior.
+            // fix_removals drives the planner; FixLineSpan::single(offset) covers one line.
             fix_removals: Some(vec![FixLineSpan::single(offset)]),
         }
     }
