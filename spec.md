@@ -50,7 +50,7 @@ config:
 - Standard YAML between `---` fences at file start
 - Types supported: string, number, boolean, array, object (nested YAML mappings)
 - Runtime vars (CLI `--vars vars.json`) override frontmatter values
-- Object values support dot-notation field access: `{config.key}`, `{a.b.c}`
+- Object values support dot-notation field access: `{{config.key}}`, `{{a.b.c}}`
 - Objects cannot be interpolated directly; access a specific field instead
 
 ---
@@ -58,16 +58,21 @@ config:
 ### 4.2 Interpolation
 
 ```mds
-Hello {name}!
+Hello {{name}}!
 ```
 
 **Rules:**
 
-- Single braces: `{identifier}` or dot path `{obj.field}`
-- Valid interpolation: a valid identifier (`[a-zA-Z_][a-zA-Z0-9_]*`), dot path (`{config.key}`, `{a.b.c}`), or function call
-- Escaping: `\{` produces a literal `{` in output; `\}` produces a literal `}` in output
+- Double braces: `{{identifier}}` or dot path `{{obj.field}}`
+- Valid interpolation: a valid identifier (`[a-zA-Z_][a-zA-Z0-9_]*`), dot path (`{{config.key}}`, `{{a.b.c}}`), or function call
+- A single `{` or `}` is always literal text — no escaping needed for lone braces
+- Escaping: `\{{` produces a literal `{{` in output (no `\}}` escape — a lone `}}` is just two `}` characters)
+- Non-recursive: interpolated values are never re-scanned — the output of `{{x}}` is always plain text, never further interpreted as MDS
+- Escape adjacency: `\` immediately before `{{` is claimed by the `\{{` escape — `\{{x}}` emits literal `{{` followed by the text `x}}`. To get a backslash followed by an interpolated value, write `\ {{x}}` (backslash, space, then `{{x}}`).
 - Inside fenced code blocks (triple backtick or tilde; also indented or blockquoted fences): no interpolation occurs (raw passthrough)
 - Undefined variable → compilation error (not silent empty string)
+
+**Migration from single-brace syntax:** run `mds lint --fix` (applies the `legacy-interpolation` rule to auto-convert `{x}` → `{{x}}`), then `mds fmt` to normalize formatting.
 
 **Fence out-of-scope:**
 - 4-space indented code blocks (CommonMark style, without fence markers) are **not** recognized as passthrough regions — interpolation IS parsed inside them.
@@ -207,7 +212,7 @@ Free tier.
 
 ```mds
 @for item in items:
-- {item}
+- {{item}}
 @end
 ```
 
@@ -215,7 +220,7 @@ Key-value iteration over objects:
 
 ```mds
 @for key, value in config:
-{key} = {value}
+{{key}} = {{value}}
 @end
 ```
 
@@ -236,7 +241,7 @@ Definition:
 
 ```mds
 @define greet(name):
-Hello {name}, welcome!
+Hello {{name}}, welcome!
 @end
 ```
 
@@ -244,11 +249,11 @@ With default arguments:
 
 ```mds
 @define greet(name = "World"):
-Hello {name}!
+Hello {{name}}!
 @end
 
-{greet()}
-{greet("Alice")}
+{{greet()}}
+{{greet("Alice")}}
 ```
 
 > **Note — no comment syntax:** MDS has no comment syntax. Unknown `@directives` (any
@@ -258,7 +263,7 @@ Hello {name}!
 Invocation:
 
 ```mds
-{greet("Alice")}
+{{greet("Alice")}}
 ```
 
 **Rules:**
@@ -310,7 +315,7 @@ MDS supports three import styles:
 ```mds
 @import "./utils.mds" as utils
 
-{utils.greet("Alice")}
+{{utils.greet("Alice")}}
 ```
 
 **Merge import** - exports merge directly into current scope:
@@ -318,7 +323,7 @@ MDS supports three import styles:
 ```mds
 @import "./base.mds"
 
-{greet("Alice")}
+{{greet("Alice")}}
 ```
 
 **Selective import** - pick specific exports by name:
@@ -326,14 +331,14 @@ MDS supports three import styles:
 ```mds
 @import { greet, farewell } from "./utils.mds"
 
-{greet("Alice")}
-{farewell("Alice")}
+{{greet("Alice")}}
+{{farewell("Alice")}}
 ```
 
 **Rules:**
 
 - Relative paths only (no bare module names)
-- `as alias` namespaces all exports: access via `{alias.name}`
+- `as alias` namespaces all exports: access via `{{alias.name}}`
 - Without alias (merge): exports enter current scope (name collision → compilation error)
 - Selective: only listed names are brought into scope
 - Circular imports → compilation error
@@ -349,7 +354,7 @@ MDS supports three export styles:
 
 ```mds
 @define greet(name):
-Hello {name}!
+Hello {{name}}!
 @end
 
 @export greet
@@ -405,11 +410,11 @@ A complete barrel/index file example:
 ```mds
 # prompts/greetings.mds
 @define hello(name):
-Hello {name}!
+Hello {{name}}!
 @end
 
 @define welcome(name, role):
-Welcome {name}, you're joining as {role}.
+Welcome {{name}}, you're joining as {{role}}.
 @end
 
 @export hello
@@ -420,13 +425,13 @@ Welcome {name}, you're joining as {role}.
 # prompts/formatting.mds
 @define bullet_list(items):
 @for item in items:
-- {item}
+- {{item}}
 @end
 @end
 
 @define numbered_list(items):
 @for item in items:
-1. {item}
+1. {{item}}
 @end
 @end
 
@@ -449,10 +454,10 @@ tools: [search, code, browse]
 
 @import "./prompts/index.mds" as prompts
 
-{prompts.hello(user)}
+{{prompts.hello(user)}}
 
 You have access to:
-{prompts.bullet_list(tools)}
+{{prompts.bullet_list(tools)}}
 ```
 
 Output:
@@ -492,14 +497,14 @@ Hello!
 | Form | Meaning |
 |------|---------|
 | `@message system:` | Bare word — the role is the literal string `"system"` |
-| `@message {role}:` | Expression — the role is evaluated at runtime from the variable |
+| `@message {{role}}:` | Expression — the role is evaluated at runtime from the variable |
 
 ```mds
 ---
 role: assistant
 ---
 
-@message {role}:
+@message {{role}}:
 This role comes from the variable.
 @end
 ```
@@ -549,7 +554,7 @@ rather than silently dropped or auto-wrapped. There is no "text mode" that rende
 - Role must be a non-empty string; an empty or whitespace-only bare-word role is
   a parse error
 - Bare-word roles are always literal strings — they never look up variables
-- Dynamic roles (`{expr}`) must evaluate to a non-empty, non-whitespace string at
+- Dynamic roles (`{{expr}}`) must evaluate to a non-empty, non-whitespace string at
   runtime: a non-string value → type error; a string that trims to empty →
   type error (the same rejection applies at runtime as at parse time)
 - Outer whitespace of the body is trimmed; inner whitespace is preserved
@@ -574,7 +579,7 @@ You have admin privileges.
 @end
 Available tools:
 @for tool in tools:
-- {tool}
+- {{tool}}
 @end
 @end
 ```
@@ -606,7 +611,7 @@ The compiler splices overridden blocks into the base skeleton, validates and eva
 
 ```mds
 # base.mds — defines three placeholder blocks
-You are a {role} assistant.
+You are a {{role}} assistant.
 
 @block instructions:
 Analyze data carefully.
@@ -703,7 +708,7 @@ Example — messages template via inheritance (base contains `@message` inside `
 # base.mds
 @block context:
 @message system:
-You are a {role} assistant.
+You are a {{role}} assistant.
 No additional context.
 @end
 @end
@@ -717,7 +722,7 @@ role: research
 @extends "./base.mds"
 @block context:
 @message system:
-You are a {role} assistant.
+You are a {{role}} assistant.
 Focus on peer-reviewed sources.
 @end
 @end
@@ -793,9 +798,9 @@ mds::undefined_var
 
   × undefined variable 'username'
    ╭─[src/welcome.mds:1:7]
- 1 │ Hello {username}!
-   ·       ────┬───
-   ·           ╰── not defined
+ 1 │ Hello {{username}}!
+   ·        ────┬────
+   ·            ╰── not defined
    ╰────
   help: define 'username' in frontmatter or imports
 ```
@@ -840,7 +845,7 @@ mds build template.mds --out-dir dist      # Markdown → dist/template.md; mess
 mds build template.mds --vars vars.json    # With variable overrides from JSON file
 mds build template.mds --set name=Alice    # Set a single variable
 mds build template.mds --set name=Alice --set count=3  # Multiple variables
-echo "Hello {name}!" | mds build -         # Compile from stdin → stdout
+echo "Hello {{name}}!" | mds build -         # Compile from stdin → stdout
 mds build src/                             # Compile every non-partial .mds in the tree (next to source)
 mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dist/a/b.md (or .json)
 ```
@@ -1102,14 +1107,14 @@ debug: false
 
 @define list(items):
 @for item in items:
-- {item}
+- {{item}}
 @end
 @end
 
-Hello {name}!
+Hello {{name}}!
 
 Your items:
-{list(items)}
+{{list(items)}}
 
 @if tier == "premium":
 Thanks for being a premium member!
@@ -1120,7 +1125,7 @@ Upgrade for premium features.
 @end
 
 @if !debug:
-You have {count} items.
+You have {{count}} items.
 @end
 
 @include footer
@@ -1206,7 +1211,7 @@ type: mds
 name: Alice
 ---
 
-Hello {name}!
+Hello {{name}}!
 ```
 
 The compiler uses this detection order:
@@ -1216,11 +1221,11 @@ The compiler uses this detection order:
 
 ### 9.3 MDS-Specific Highlighting (Roadmap)
 
-File association gives standard Markdown highlighting, but `@` directives and `{var}` interpolation appear as plain text. Full MDS highlighting requires dedicated editor support:
+File association gives standard Markdown highlighting, but `@` directives and `{{var}}` interpolation appear as plain text. Full MDS highlighting requires dedicated editor support:
 
 **Phase 1 - TextMate injection grammar (VS Code, Sublime Text)**
 
-A single JSON file (`mds.tmLanguage.json`) that injects into the Markdown grammar scope, adding keyword highlighting for `@import`, `@if`, `@elseif`, `@else`, `@for`, `@define`, `@end`, `@export`, `@include` and interpolation highlighting for `{var}`. Shipped as a VS Code extension.
+A single JSON file (`mds.tmLanguage.json`) that injects into the Markdown grammar scope, adding keyword highlighting for `@import`, `@if`, `@elseif`, `@else`, `@for`, `@define`, `@end`, `@export`, `@include` and interpolation highlighting for `{{var}}`. Shipped as a VS Code extension.
 
 **Phase 2 - Tree-sitter grammar (Neovim, Helix, Zed)**
 
@@ -1285,20 +1290,20 @@ loop_vars       := identifier | identifier "," identifier
 message_block   := "@message" role ":" body "@end"
 block           := "@block" identifier ":" body "@end"
                    (* grammar is context-free; `@block` is additionally constrained to top-level only by the parser — see §4.11 Rules *)
-role            := bare_role | "{" message_role_expr "}"
+role            := bare_role | "{{" message_role_expr "}}"
 bare_role       := <any non-empty text up to the trailing ":"> (* literal string; no identifier validation *)
 message_role_expr := qualified_call | member_access | function_call | identifier
 
-text            := (raw_text | interpolation | escaped_brace)*
-interpolation   := "{" (qualified_call | member_access | function_call | identifier) "}"
+text          := (raw_text | interpolation | escaped_open)*
+raw_text      := <any run containing no "{{" and no "\{{"; single "{"/"}" is ordinary text>
+interpolation := "{{" ws (qualified_call | member_access | function_call | identifier) ws "}}"
+escaped_open  := "\{{"        (* emits literal "{{" *)
 qualified_call  := identifier "." identifier "(" arguments? ")"
 member_access   := identifier ("." identifier)+
 function_call   := identifier "(" arguments? ")"
 arguments       := argument ("," argument)*
 argument        := quoted_string | number | "true" | "false" | "null" | function_call | member_access | identifier
 dot_path        := identifier ("." identifier)*
-escaped_brace   := "\{" | "\}"
-
 identifier      := [a-zA-Z_][a-zA-Z0-9_]*
 identifier_list := identifier ("," identifier)*
 quoted_string   := "\"" dq_chars "\"" | "'" sq_chars "'"
@@ -1312,7 +1317,7 @@ quoted_path     := "\"" path_chars "\""
 
 ## 12. Status
 
-v0.4.0 - Breaking fixes release. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Interior whitespace in block bodies and `mds fmt` output now follows the **interior-verbatim with trailing-edge normalization** contract — leading blank lines and interior blank runs are preserved verbatim; only the trailing edge normalizes to one final newline. (`@message` and `@define` bodies still edge-trim via `.trim()` — they strip leading and trailing blank lines.) The `mds fmt` blank-line collapsing rule (R3) has been removed (#150, #151). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion; using a key in both `--set` and `--set-string` is now a hard error (#152). Interpolation errors now suggest `\{` in the help text (#153). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154).
+v0.4.0 - Breaking change release. **Interpolation syntax changed from `{x}` to `{{x}}`** — single `{`/`}` are now always literal text, and `\{{` is the escape for a literal `{{`; run `mds lint --fix` to auto-migrate legacy templates (the `legacy-interpolation` lint rule). `@message {{role}}:` dynamic role syntax updated to use double braces; new `fix_edits` field on `LintDiagnostic` across all binding surfaces. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Interior whitespace in block bodies and `mds fmt` output now follows the **interior-verbatim with trailing-edge normalization** contract — leading blank lines and interior blank runs are preserved verbatim; only the trailing edge normalizes to one final newline. (`@message` and `@define` bodies still edge-trim via `.trim()` — they strip leading and trailing blank lines.) The `mds fmt` blank-line collapsing rule (R3) has been removed (#150, #151). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion; using a key in both `--set` and `--set-string` is now a hard error (#152). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154).
 
 v0.3.0 - Auto-formatter (`mds fmt`), intrinsic output format (Markdown vs JSON messages decided by content not a flag), native Python bindings (PyO3).
 

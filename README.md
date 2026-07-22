@@ -42,14 +42,14 @@ tools: [search, calculator]
 @import "./safety.mds" as guard
 @import "./personas.mds" as persona
 
-{persona.code_reviewer("TypeScript")}
+{{persona.code_reviewer("TypeScript")}}
 
-{guard.safety_rules()}
+{{guard.safety_rules()}}
 
 ## Available Tools
 
 @for tool in tools:
-- **{tool}**
+- **{{tool}}**
 @end
 
 @if model == "claude-sonnet":
@@ -269,7 +269,7 @@ import { init, compile, compileFile, isMdsError } from '@mdscript/mds';
 await init();
 
 // Compile a string — result is a discriminated union based on template content
-const result = compile('---\nname: World\n---\nHello {name}!\n');
+const result = compile('---\nname: World\n---\nHello {{name}}!\n');
 if (result.kind === 'markdown') {
   console.log(result.output);      // string
 } else {
@@ -298,7 +298,7 @@ const smWithContent = compile(source, { sourceMap: true, sourcesContent: true })
 
 // Error handling
 try {
-  compile('Hello {undefined_var}!');
+  compile('Hello {{undefined_var}}!');
 } catch (err) {
   if (isMdsError(err)) console.error(err.code, err.span);
 }
@@ -310,8 +310,8 @@ try {
 
 ```rust
 let output = mds::compile(Path::new("template.mds"), None)?;
-let output = mds::compile_str("---\nname: World\n---\nHello {name}!\n")?;
-let formatted = mds::format_str("Hello   {name}!\n")?;
+let output = mds::compile_str("---\nname: World\n---\nHello {{name}}!\n")?;
+let formatted = mds::format_str("Hello   {{name}}!\n")?;
 ```
 
 ## Examples

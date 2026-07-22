@@ -459,6 +459,7 @@ type LintDiagnosticReduce<'py> = (
 impl LintDiagnostic {
     #[new]
     #[pyo3(signature = (rule, severity, message, help=None, fixable=false, span=None, fix_edits_json=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         rule: String,
@@ -477,7 +478,7 @@ impl LintDiagnostic {
         let span = span.map(|py_span| py_span.borrow(py).clone());
         let fix_edits = fix_edits_json
             .as_deref()
-            .map(|s| serde_json::from_str::<Vec<serde_json::Value>>(s))
+            .map(serde_json::from_str::<Vec<serde_json::Value>>)
             .transpose()
             .map_err(|e| {
                 pyo3::exceptions::PyValueError::new_err(format!(

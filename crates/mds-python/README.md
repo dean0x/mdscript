@@ -23,7 +23,7 @@ pip install mdscript
 import mdscript
 
 # Markdown template
-r = mdscript.compile("Hello {name}!", vars={"name": "Alice"})
+r = mdscript.compile("Hello {{name}}!", vars={"name": "Alice"})
 assert r.kind == "markdown"
 assert r.output == "Hello Alice!"
 
@@ -34,7 +34,7 @@ assert r.messages[0].role == "user"
 assert r.output is None            # inactive payload is None
 
 # Validate without rendering
-mdscript.check("Hello {name}!", vars={"name": "Bob"})
+mdscript.check("Hello {{name}}!", vars={"name": "Bob"})
 
 # Compile a file (dependencies come back as absolute paths)
 r = mdscript.compile_file("prompts/agent.mds")
@@ -96,7 +96,7 @@ Every failure raises `mdscript.MdsError` (a subclass of `Exception`):
 
 ```python
 try:
-    mdscript.compile("Hello {undefined}!")
+    mdscript.compile("Hello {{undefined}}!")
 except mdscript.MdsError as e:
     print(e.code)          # "mds::undefined_var"
     print(str(e))          # == e.message

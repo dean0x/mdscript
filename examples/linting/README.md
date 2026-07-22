@@ -13,19 +13,20 @@ module it imports twice. `config-demo/` is a self-contained sub-example showing
 
 All commands below are run from the repository root.
 
-## The nine rules
+## The ten rules
 
 | Rule | Default severity | Tier | `--fix` behavior |
 |------|------------------|------|------------------|
-| `duplicate-import`   | error | A | Auto-fixed — removes the duplicate `@import` line. |
-| `duplicate-export`   | error | A | Auto-fixed — removes the duplicate `@export` line. |
-| `unreachable-branch` | error | A | Auto-fixed — removes the dead block or branch span. |
-| `empty-block`        | warn  | A | Auto-fixed — removes the empty block or branch span. |
-| `unused-import`      | warn  | B | Fixable only on a *standalone* file.† |
-| `unused-function`    | warn  | B | Fixable only on a *standalone* file.† |
-| `unused-variable`    | warn  | C | Never auto-fixed (report-only). |
-| `redundant-else`     | warn  | C | Never auto-fixed (report-only). |
-| `shadow-variable`    | off   | C | Never auto-fixed; off by default (see config demo). |
+| `duplicate-import`      | error | A | Auto-fixed — removes the duplicate `@import` line. |
+| `duplicate-export`      | error | A | Auto-fixed — removes the duplicate `@export` line. |
+| `unreachable-branch`    | error | A | Auto-fixed — removes the dead block or branch span. |
+| `empty-block`           | warn  | A | Auto-fixed — removes the empty block or branch span. |
+| `legacy-interpolation`  | warn  | A | Auto-fixed — rewrites `{x}` → `{{x}}` (migration helper). |
+| `unused-import`         | warn  | B | Fixable only on a *standalone* file.† |
+| `unused-function`       | warn  | B | Fixable only on a *standalone* file.† |
+| `unused-variable`       | warn  | C | Never auto-fixed (report-only). |
+| `redundant-else`        | warn  | C | Never auto-fixed (report-only). |
+| `shadow-variable`       | off   | C | Never auto-fixed; off by default (see config demo). |
 
 **Tiers.** Tier **A** fixes apply always (gated by a re-verify recompile); Tier **B**
 fixes apply only when the file is *standalone*; Tier **C** rules are report-only.
@@ -59,7 +60,7 @@ mds::lint::redundant-else
  16 │ @if audience == "developers":
     · ─┬─
     ·  ╰── The @else body is identical to the @if body — the conditional produces the same output regardless of the condition.
- 17 │ Thanks for reading, {audience}.
+ 17 │ Thanks for reading, {{audience}}.
     ╰────
   help: Remove the @else branch or make its content different from the @if
         body.

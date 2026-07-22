@@ -40,7 +40,7 @@ enum Commands {
     /// All other templates compile to Markdown (.md).
     /// The output extension is derived automatically from the compiled kind.
     #[command(
-        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build chat.mds                         Compile @message template to chat.json\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md or dist/template.json\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  echo \"Hello {name}!\" | mds build -         Compile from stdin (writes to stdout)"
+        after_help = "Examples:\n  mds build                                  Auto-detect the .mds file in current dir\n  mds build template.mds                     Compile to template.md (next to source)\n  mds build chat.mds                         Compile @message template to chat.json\n  mds build template.mds -o -               Compile to stdout\n  mds build template.mds -o output.md       Compile to specific file\n  mds build template.mds --out-dir dist     Compile to dist/template.md or dist/template.json\n  mds build template.mds --vars vars.json   With variable overrides\n  mds build template.mds --set name=Alice   Set a single variable\n  echo \"Hello {{name}}!\" | mds build -       Compile from stdin (writes to stdout)"
     )]
     Build {
         /// Input .mds file (use "-" for stdin; omit to auto-detect in current directory)
@@ -383,11 +383,11 @@ items: [one, two, three]
 ---
 <!-- Frontmatter above is emitted to output verbatim; runtime --set/--vars change only the body below -->
 
-Hello {name}!
+Hello {{name}}!
 
 Your items:
 @for item in items:
-- {item}
+- {{item}}
 @end
 ";
     std::fs::write(&filename, starter)
