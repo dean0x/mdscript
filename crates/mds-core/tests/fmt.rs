@@ -25,7 +25,13 @@ const CORPUS: &[&str] = &[
     "```python\ndef f():\n    pass\n```\n",
     "@define greet(x):\nHello {{x}}!\n@end\n{{greet(\"World\")}}\n",
     "@message user:\nHi!\n@end\n",
+    // Old \{ syntax is now plain literal text in MDS v2 — single-brace is no
+    // longer an interpolation trigger. Exercises body-content pass-through.
     "Line with \\{escaped\\} braces.\n",
+    // \{{ escape: prevents double-brace interpolation, renders as {{ literally.
+    "Escaped: \\{{not_interpolated}} and more \\{{text}}.\n",
+    // Literal single braces are plain text in MDS v2 (no interpolation).
+    "Single {literal} brace is plain text.\n",
     "",
     "   \n",
     "No trailing newline",

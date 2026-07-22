@@ -481,4 +481,22 @@ mod tests {
             "full span replaced atomically"
         );
     }
+
+    /// Rule=off suppresses all findings (AC-F23: suppressible via config).
+    #[test]
+    fn rule_off_suppresses() {
+        // Source with multiple legacy-interpolation patterns: single-brace var,
+        // dot-path, and old backslash-escape — all must be suppressed by Off.
+        let src = "Hello {name}! Value: {user.id}. Old escape: \\{x}.";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let mut builder = LintResultBuilder::new();
+        let config = LintConfig {
+            rules: [(RULE.to_string(), Severity::Off)].into_iter().collect(),
+        };
+        check(&tokens, src, "test.mds", &config, &mut builder);
+        assert!(
+            builder.build(true).diagnostics.is_empty(),
+            "rule=off must suppress all legacy-interpolation findings"
+        );
+    }
 }
