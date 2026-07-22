@@ -124,7 +124,7 @@ enum Commands {
     },
     /// Check MDS files for style and correctness issues beyond `mds check`
     ///
-    /// Runs 9 static-analysis rules (3 error-level, 5 warning-level, 1 default-off) on the file
+    /// Runs 10 static-analysis rules (3 error-level, 6 warning-level, 1 default-off) on the file
     /// without executing it. Partials and imported files are included in directory mode.
     ///
     /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors or analysis failure,
