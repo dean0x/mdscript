@@ -2,8 +2,6 @@
 
 Shared transform utilities for MDS bundler plugins (Vite, Rollup, Webpack).
 
-> **Note:** This package is pre-release and not yet published to npm.
-
 ## Installation
 
 ```sh

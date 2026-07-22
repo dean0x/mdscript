@@ -8,8 +8,6 @@ JavaScript/TypeScript bindings for the [MDS](../../README.md) compiler.
 npm install @mdscript/mds
 ```
 
-> **Note:** This package is pre-release and not yet published to npm.
-
 ## Node.js usage (zero-config)
 
 Node.js auto-selects the native addon and falls back to WASM if unavailable.
