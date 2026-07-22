@@ -92,6 +92,7 @@ pub(crate) fn check(
                 to: def.end_offset,
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         }) {
             return;
         }
@@ -189,7 +190,7 @@ mod tests {
     fn self_recursive_function_not_flagged() {
         // `count` calls itself → in used_calls → treated as called.
         let src =
-            "@define count(n):\n{count(n)}\n@end\n@export greet\n@define greet():\nhello\n@end\n";
+            "@define count(n):\n{{count(n)}}\n@end\n@export greet\n@define greet():\nhello\n@end\n";
         let diags = lint_src(src);
         assert!(
             !diags

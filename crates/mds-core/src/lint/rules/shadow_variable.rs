@@ -80,6 +80,7 @@ pub(crate) fn check(
             }),
             file: Some(filename.to_string()),
             fix_removals: None,
+            fix_edits: None,
         }) {
             return;
         }

@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn collects_var_uses_from_interpolation() {
-        let src = "{name}\n";
+        let src = "{{name}}\n";
         let ctx = facts(src);
         assert!(
             ctx.used_vars.contains("name"),
@@ -802,14 +802,14 @@ mod tests {
 
     #[test]
     fn collects_call_from_interpolation() {
-        let src = "{greet(\"world\")}\n";
+        let src = "{{greet(\"world\")}}\n";
         let ctx = facts(src);
         assert!(ctx.used_calls.contains("greet"), "should collect Call ref");
     }
 
     #[test]
     fn collects_namespace_from_qualified_call() {
-        let src = "@import \"./lib.mds\" as lib\n{lib.greet(\"world\")}\n";
+        let src = "@import \"./lib.mds\" as lib\n{{lib.greet(\"world\")}}\n";
         let ctx = facts(src);
         assert!(
             ctx.used_namespaces.contains("lib"),

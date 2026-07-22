@@ -272,6 +272,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
         span: diag.span.clone(),
         file: diag.file.clone(),
         fix_removals: diag.fix_removals.clone(),
+        fix_edits: diag.fix_edits.clone(),
     };
     // Attach the source code so miette can render the span with source context
     // (source line + caret underline). The labels() implementation on LintDiagnostic
@@ -1495,6 +1496,7 @@ mod tests {
                 to: 6,   // inside line1; extend_to_line_end(6) = 12
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
         // Partially overlaps A at [6, 12).
@@ -1510,6 +1512,7 @@ mod tests {
                 to: 12,  // inside line2; extend_to_line_end(12) = 18
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         let result = LintResult {
             diagnostics: vec![diag_a, diag_b],

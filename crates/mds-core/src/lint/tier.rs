@@ -36,9 +36,11 @@ pub enum FixTier {
 /// Classify a rule into its fix tier.
 pub fn rule_tier(rule: &str) -> FixTier {
     match rule {
-        "duplicate-import" | "duplicate-export" | "unreachable-branch" | "empty-block" => {
-            FixTier::A
-        }
+        "duplicate-import"
+        | "duplicate-export"
+        | "unreachable-branch"
+        | "empty-block"
+        | "legacy-interpolation" => FixTier::A,
         "unused-import" | "unused-function" => FixTier::B,
         _ => FixTier::C, // unused-variable, redundant-else, shadow-variable, unknown
     }
@@ -83,16 +85,17 @@ mod tests {
 
     /// ARC-3: Every registered rule name must map to its documented FixTier.
     ///
-    /// Enumerating all 9 rules explicitly means that a newly-added rule which
+    /// Enumerating all 10 rules explicitly means that a newly-added rule which
     /// falls silently into the `_ => FixTier::C` catch-all arm will cause this
     /// test to fail (once its expected tier is added here), preventing silent
     /// misclassification in the JSON `fixable` field and the fix planner.
     ///
-    /// Tier A: duplicate-import, duplicate-export, unreachable-branch, empty-block
+    /// Tier A: duplicate-import, duplicate-export, unreachable-branch, empty-block,
+    ///         legacy-interpolation
     /// Tier B: unused-import, unused-function
     /// Tier C: unused-variable, redundant-else, shadow-variable
     #[test]
-    fn all_nine_rules_map_to_expected_tier() {
+    fn all_ten_rules_map_to_expected_tier() {
         // Tier A — auto-fixable with reverify gate
         assert_eq!(
             rule_tier("duplicate-import"),
@@ -110,6 +113,11 @@ mod tests {
             "unreachable-branch"
         );
         assert_eq!(rule_tier("empty-block"), FixTier::A, "empty-block");
+        assert_eq!(
+            rule_tier("legacy-interpolation"),
+            FixTier::A,
+            "legacy-interpolation"
+        );
         // Tier B — standalone-only fixable
         assert_eq!(rule_tier("unused-import"), FixTier::B, "unused-import");
         assert_eq!(rule_tier("unused-function"), FixTier::B, "unused-function");

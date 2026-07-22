@@ -33,7 +33,7 @@ pub(crate) mod rules;
 pub(crate) mod tier;
 
 pub use config::LintConfig;
-pub use diagnostic::{sanitize_control_chars, FixLineSpan, LintDiagnostic, LintResult, Severity};
+pub use diagnostic::{sanitize_control_chars, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit};
 
 use crate::error::MdsError;
 use crate::{lexer, parser};
@@ -62,7 +62,7 @@ pub(crate) fn is_partial_by_name(path: &str) -> bool {
 ///
 /// `source` is the raw entry source string (already used for the check gate).
 /// `filename` is the display name used in diagnostics and JSON grouping.
-/// Returns `Ok(LintResult)` with diagnostics produced by all 9 rules.
+/// Returns `Ok(LintResult)` with diagnostics produced by all 10 rules.
 pub(crate) fn lint_source(
     source: &str,
     filename: &str,
@@ -84,19 +84,21 @@ pub(crate) fn lint_source(
 
     // Rule dispatch — non-generic plain-fn dispatch (AC-PERF-02, no monomorphization).
     let mut builder = LintResultBuilder::new();
-    run_rules(&module, &ctx, filename, config, &mut builder);
+    run_rules(&module, &ctx, &tokens, source, filename, config, &mut builder);
 
     Ok(builder.build(is_standalone))
 }
 
-/// Apply all 9 lint rules over the module and facts context.
+/// Apply all 10 lint rules over the module and facts context.
 ///
 /// Non-generic dispatch: each rule is a plain function call with no monomorphization.
 /// Rules are listed in the same order as the implementation steps (local-AST first,
-/// semantic second) for readability.
+/// semantic second, token-based last) for readability.
 fn run_rules(
     module: &crate::ast::Module,
     ctx: &facts::AnalysisContext,
+    tokens: &[crate::lexer::Token],
+    source: &str,
     filename: &str,
     config: &LintConfig,
     builder: &mut LintResultBuilder,
@@ -113,6 +115,9 @@ fn run_rules(
     rules::unused_import::check(module, ctx, filename, config, builder);
     rules::unused_function::check(module, ctx, filename, config, builder);
     rules::shadow_variable::check(module, ctx, filename, config, builder);
+
+    // Step 6 — token-based rules (require raw token stream)
+    rules::legacy_interpolation::check(tokens, source, filename, config, builder);
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

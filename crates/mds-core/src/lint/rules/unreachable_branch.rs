@@ -329,6 +329,7 @@ fn make_diag(
         }),
         file: Some(filename.to_string()),
         fix_removals,
+        fix_edits: None,
     }
 }
 

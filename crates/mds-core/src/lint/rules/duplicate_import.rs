@@ -65,6 +65,7 @@ pub(crate) fn check(
                 }),
                 file: Some(filename.to_string()),
                 fix_removals: Some(vec![FixLineSpan::single(imp.offset)]),
+                fix_edits: None,
             })
         {
             return;
