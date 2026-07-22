@@ -710,7 +710,7 @@ describe('source maps — compileFile differential (CF-SM)', () => {
       );
       await writeFile(
         join(dir, 'src', 'entry.mds'),
-        '@import "../partials/greeting.mds" as g\n{g.greet()}\n',
+        '@import "../partials/greeting.mds" as g\n{{g.greet()}}\n',
       );
       const entryPath = join(dir, 'src', 'entry.mds');
 

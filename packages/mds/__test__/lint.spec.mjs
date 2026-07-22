@@ -228,7 +228,7 @@ describe('lint canonical JSON goldens', () => {
 
   test('U-LG2: lintVirtual unused-variable source matches canonical golden', () => {
     const UNUSED_GOLDEN =
-      '{"files":[{"diagnostics":[{"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.",' +
+      '{"files":[{"diagnostics":[{"fix_edits":null,"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.",' +
       '"message":"Variable \'unused_key\' is defined in frontmatter but never referenced in the body.",' +
       '"rule":"unused-variable","severity":"warn","span":{"length":10,"offset":4}}],"file":"main.mds"}],"truncated":false,"version":1}';
     const result = lintVirtual({ 'main.mds': UNUSED_SOURCE }, 'main.mds');

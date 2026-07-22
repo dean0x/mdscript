@@ -59,28 +59,28 @@ describe('compile', () => {
   });
 
   test('F-C5: compile with frontmatter vars', () => {
-    const source = '---\nname: Alice\n---\nHello {name}!\n';
+    const source = '---\nname: Alice\n---\nHello {{name}}!\n';
     const result = compile(source);
     assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Alice!'), `expected "Hello Alice!" in: ${result.output}`);
   });
 
   test('F-C6: compile with runtime vars', () => {
-    const source = 'Hello {name}!\n';
+    const source = 'Hello {{name}}!\n';
     const result = compile(source, { vars: { name: 'Bob' } });
     assert.equal(result.kind, 'markdown');
     assert.equal(result.output, 'Hello Bob!\n');
   });
 
   test('F-C7: runtime vars override frontmatter', () => {
-    const source = '---\nname: Alice\n---\nHello {name}!\n';
+    const source = '---\nname: Alice\n---\nHello {{name}}!\n';
     const result = compile(source, { vars: { name: 'Override' } });
     assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Override!'), `got: ${result.output}`);
   });
 
   test('F-C8: compile with basePath for import resolution', () => {
-    const source = `@import { greet } from "./import_provider.mds"\n\n{greet("Test")}\n`;
+    const source = `@import { greet } from "./import_provider.mds"\n\n{{greet("Test")}}\n`;
     const result = compile(source, { basePath: FIXTURES });
     assert.equal(result.kind, 'markdown');
     assert.ok(result.output.includes('Hello Test!'), `got: ${result.output}`);
@@ -575,7 +575,7 @@ describe('compilation parity', () => {
   });
 
   test('P-2: compile and compileFile agree on same source + basePath', () => {
-    const source = '---\nname: Alice\ncount: 3\n---\n\nHello {name}! You have {count} items.\n';
+    const source = '---\nname: Alice\ncount: 3\n---\n\nHello {{name}}! You have {{count}} items.\n';
     const compileResult = compile(source, { basePath: FIXTURES });
     const fileResult = compileFile(SIMPLE_MDS);
     assert.equal(compileResult.kind, 'markdown');
@@ -807,7 +807,7 @@ describe('intrinsic output shape', () => {
 
   // K-VARS-1: vars round-trip through @message content survives FFI
   test('K-VARS-1: vars with special chars survive the FFI round-trip in messages mode', () => {
-    const source = '@message user:\n{data}\n@end\n';
+    const source = '@message user:\n{{data}}\n@end\n';
     const specialValue = 'say "hello"\\ here\nnewline\u{1F600}';
     const result = compile(source, { vars: { data: specialValue } });
     assert.equal(result.kind, 'messages');
@@ -821,7 +821,7 @@ describe('intrinsic output shape', () => {
 
   // K-VARS-2: empty dynamic role via FFI throws (evaluator rejects it)
   test('K-VARS-2: empty dynamic role via FFI throws mds:: error', () => {
-    const source = '@message {role}:\nHello!\n@end\n';
+    const source = '@message {{role}}:\nHello!\n@end\n';
     assert.throws(
       () => compile(source, { vars: { role: '' } }),
       (err) => {
@@ -1040,7 +1040,7 @@ describe('lint parity (AC-API-06 guard)', () => {
 
   test('P-L-3: lintVirtual unused-variable source matches canonical golden', () => {
     const UNUSED_GOLDEN =
-      '{"files":[{"diagnostics":[{"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.",' +
+      '{"files":[{"diagnostics":[{"fix_edits":null,"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.",' +
       '"message":"Variable \'unused_key\' is defined in frontmatter but never referenced in the body.",' +
       '"rule":"unused-variable","severity":"warn","span":{"length":10,"offset":4}}],"file":"main.mds"}],"truncated":false,"version":1}';
     const result = lintVirtual(
