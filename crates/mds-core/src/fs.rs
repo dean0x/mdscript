@@ -1380,11 +1380,11 @@ mod tests {
         let modules = std::collections::HashMap::from([
             (
                 "main.mds".to_string(),
-                "@import \"./lib.mds\" as lib\n{lib.greet(\"World\")}\n".to_string(),
+                "@import \"./lib.mds\" as lib\n{{lib.greet(\"World\")}}\n".to_string(),
             ),
             (
                 "lib.mds".to_string(),
-                "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+                "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
             ),
         ]);
         let fs = Box::new(TestFs::new(modules));

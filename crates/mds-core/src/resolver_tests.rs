@@ -359,7 +359,7 @@ fn f1_worked_example_byte_exact() {
     // child.mds: overrides instructions+tools, inherits output_format default
     // role=data analysis from child frontmatter
     let base = concat!(
-        "You are a {role} assistant.\n",
+        "You are a {{role}} assistant.\n",
         "\n",
         "@block instructions:\n",
         "Analyze data carefully.\n",
@@ -416,7 +416,7 @@ fn f2_standalone_base_compiles_with_defaults() {
         "---\n",
         "role: general\n",
         "---\n",
-        "You are a {role} assistant.\n",
+        "You are a {{role}} assistant.\n",
         "@block instructions:\n",
         "Help the user.\n",
         "@end\n",
@@ -473,7 +473,7 @@ fn f2_standalone_base_compiles_with_defaults() {
 fn f2_cache_nonpoisoning_base_then_child() {
     // Compile the base FIRST (as standalone), THEN compile child.
     // The cached entry for base must serve the child's skeleton needs.
-    let base = "You are a {role} assistant.\n@block instructions:\nDefault.\n@end\n";
+    let base = "You are a {{role}} assistant.\n@block instructions:\nDefault.\n@end\n";
     let child = concat!(
         "---\nrole: expert\n---\n",
         "@extends \"./base.mds\"\n",
@@ -496,7 +496,7 @@ fn f2_cache_nonpoisoning_base_then_child() {
     // Now compile base standalone — should work independently (cache returns entry).
     // Base has {role} undefined without frontmatter, so it would fail standalone unless
     // cached entry with skeleton (prompt_body=None) is returned. We use a base WITH frontmatter.
-    let base_with_fm = "---\nrole: default\n---\nYou are a {role}.\n@block b:\nBody.\n@end\n";
+    let base_with_fm = "---\nrole: default\n---\nYou are a {{role}}.\n@block b:\nBody.\n@end\n";
     let child2 = concat!(
         "---\nrole: override\n---\n",
         "@extends \"./base2.mds\"\n",
@@ -538,7 +538,7 @@ fn f2_cache_nonpoisoning_skeleton_then_standalone_reverse_order() {
     // which caches the base as a SKELETON (prompt_body=None, never validated/evaluated
     // standalone). A subsequent standalone resolve of that SAME base from the SAME cache
     // must NOT return the empty skeleton entry — it must render the base's own defaults.
-    let base = "---\nrole: default\n---\nYou are a {role}.\n@block b:\nBody.\n@end\n";
+    let base = "---\nrole: default\n---\nYou are a {{role}}.\n@block b:\nBody.\n@end\n";
     let child = concat!(
         "---\nrole: override\n---\n",
         "@extends \"./base.mds\"\n",
@@ -595,7 +595,7 @@ fn f2_cache_nonpoisoning_skeleton_then_standalone_reverse_order() {
 /// each), so byte 16 may land mid-codepoint in the child source — this was
 /// the panic trigger.
 fn utf8_boundary_extends_fixture() -> (&'static str, &'static str, &'static str) {
-    let base = "@block content:\n{undefined_var}\n@end\n";
+    let base = "@block content:\n{{undefined_var}}\n@end\n";
     let child = "@extends \"./ああb.mds\"\n";
     // The key must match the path literal in the child source.
     let base_key = "ああb.mds";
@@ -750,10 +750,10 @@ fn f5_diamond_inheritance_cache_not_polluted() {
 fn f12_base_define_resolves_in_child() {
     let base = concat!(
         "@define greet(name):\n",
-        "Hello, {name}!\n",
+        "Hello, {{name}}!\n",
         "@end\n",
         "@block content:\n",
-        "{greet(\"World\")}\n",
+        "{{greet(\"World\")}}\n",
         "@end\n",
     );
     let child = "@extends \"./base.mds\"\n";
@@ -1037,7 +1037,7 @@ fn e12_base_default_undefined_var_caught_at_leaf() {
     // Base has a default block referencing {undefined_var} which is NOT in the
     // base's frontmatter and NOT provided by the child. This should produce an
     // undefined-var error (caught against the merged scope at the leaf).
-    let base = "@block content:\n{undefined_var}\n@end\n";
+    let base = "@block content:\n{{undefined_var}}\n@end\n";
     let child = "@extends \"./base.mds\"\n"; // No frontmatter, no runtime vars
 
     let files = [("base.mds", base), ("child.mds", child)];
@@ -1359,7 +1359,7 @@ fn f6_deep_frontmatter_merge_nested_object() {
         "base_only: \"from base\"\n",
         "---\n",
         "@block content:\n",
-        "model={config.model} temp={config.temperature} base={base_only}\n",
+        "model={{config.model}} temp={{config.temperature}} base={{base_only}}\n",
         "@end\n",
     );
     let child = concat!(
@@ -1370,7 +1370,7 @@ fn f6_deep_frontmatter_merge_nested_object() {
         "---\n",
         "@extends \"./base.mds\"\n",
         "@block content:\n",
-        "model={config.model} temp={config.temperature} extra={config.extra} base={base_only}\n",
+        "model={{config.model}} temp={{config.temperature}} extra={{config.extra}} base={{base_only}}\n",
         "@end\n",
     );
     let files = [("base.mds", base), ("child.mds", child)];
@@ -1404,7 +1404,7 @@ fn f6_deep_frontmatter_merge_array_wholesale_replace() {
         "---\n",
         "@block content:\n",
         "@for tool in tools:\n",
-        "{tool}\n",
+        "{{tool}}\n",
         "@end\n",
         "@end\n",
     );
@@ -1439,7 +1439,7 @@ fn f6_base_only_key_visible_in_child() {
         "only_in_base: \"secret_from_base\"\n",
         "---\n",
         "@block content:\n",
-        "{only_in_base}\n",
+        "{{only_in_base}}\n",
         "@end\n",
     );
     let child = concat!(
@@ -1470,7 +1470,7 @@ fn f6_nested_reserved_key_config_type_survives_merge() {
         "model: base-model\n",
         "---\n",
         "@block content:\n",
-        "{config.model}\n",
+        "{{config.model}}\n",
         "@end\n",
     );
     let child = concat!(
@@ -1512,7 +1512,7 @@ fn f7_runtime_override_precedence() {
         "role: base_role\n",
         "---\n",
         "@block content:\n",
-        "{role}\n",
+        "{{role}}\n",
         "@end\n",
     );
     let child = concat!(
@@ -1572,7 +1572,7 @@ fn f8_base_default_block_use_base_fm_alias() {
     // F8: a base default block can use a function from a base frontmatter import alias.
     // Base has `imports: [{path: ./shared.mds, as: shared}]` in its FM.
     // Base default block uses {shared.greeting("World")} interpolation.
-    let shared = "@define greeting(name):\nHello {name}!\n@end\n";
+    let shared = "@define greeting(name):\nHello {{name}}!\n@end\n";
     let base = concat!(
         "---\n",
         "imports:\n",
@@ -1580,7 +1580,7 @@ fn f8_base_default_block_use_base_fm_alias() {
         "    as: shared\n",
         "---\n",
         "@block content:\n",
-        "{shared.greeting(\"World\")}\n",
+        "{{shared.greeting(\"World\")}}\n",
         "@end\n",
     );
     let child = "@extends \"./base.mds\"\n";
@@ -1600,7 +1600,7 @@ fn f8_base_default_block_use_base_fm_alias() {
 #[test]
 fn f8_child_can_use_own_fm_import_alias() {
     // F8: child's own frontmatter import alias is available in its block overrides.
-    let lib = "@define greet(x):\nHi {x}\n@end\n";
+    let lib = "@define greet(x):\nHi {{x}}\n@end\n";
     let base = "@block msg:\nDefault message\n@end\n";
     let child = concat!(
         "---\n",
@@ -1610,7 +1610,7 @@ fn f8_child_can_use_own_fm_import_alias() {
         "---\n",
         "@extends \"./base.mds\"\n",
         "@block msg:\n",
-        "{lib.greet(\"child\")}\n",
+        "{{lib.greet(\"child\")}}\n",
         "@end\n",
     );
     let files = [("lib.mds", lib), ("base.mds", base), ("child.mds", child)];
@@ -1663,7 +1663,7 @@ fn a6_determinism_double_compile_byte_identical() {
         "y: 2\n",
         "---\n",
         "@block content:\n",
-        "{x},{y}\n",
+        "{{x}},{{y}}\n",
         "@end\n",
     );
     let b = concat!(
@@ -1697,7 +1697,7 @@ fn a6_for_loop_over_deep_merged_fm_stable_order() {
         "---\n",
         "@block content:\n",
         "@for k, v in labels:\n",
-        "{k}={v};\n",
+        "{{k}}={{v}};\n",
         "@end\n",
         "@end\n",
     );
@@ -1753,7 +1753,7 @@ fn p4_fm_merge_depth_bound_resource_limit() {
 fn regression_non_extending_file_fm_unchanged() {
     // Regression: a non-extending file with frontmatter imports still works identically.
     // This confirms the standalone build_scope_from_frontmatter path is unchanged.
-    let lib = "@define greet(name):\nHello {name}!\n@end\n";
+    let lib = "@define greet(name):\nHello {{name}}!\n@end\n";
     let standalone = concat!(
         "---\n",
         "imports:\n",
@@ -1761,7 +1761,7 @@ fn regression_non_extending_file_fm_unchanged() {
         "    as: lib\n",
         "greeting: World\n",
         "---\n",
-        "{lib.greet(greeting)}\n",
+        "{{lib.greet(greeting)}}\n",
     );
     let files = [("lib.mds", lib), ("standalone.mds", standalone)];
     let result = compile_virtual(&files, "standalone.mds")
@@ -1783,7 +1783,7 @@ fn f4_extends_emits_deep_merged_frontmatter() {
         "shared_key: base_wins_without_child_override\n",
         "---\n",
         "@block content:\n",
-        "{base_key}\n",
+        "{{base_key}}\n",
         "@end\n",
     );
     let child = concat!(
@@ -1842,7 +1842,7 @@ fn f3_multilevel_deep_merge_transitive() {
         "b: \"from_a_b\"\n",
         "---\n",
         "@block content:\n",
-        "a={a} b={b} c={c}\n",
+        "a={{a}} b={{b}} c={{c}}\n",
         "@end\n",
     );
     let b = concat!(
@@ -2286,7 +2286,7 @@ fn pf004_messages_mode_extends_validates_final_body_parity() {
     let base = concat!(
         "@block content:\n",
         "@message user:\n",
-        "Hello {undefined_var}.\n",
+        "Hello {{undefined_var}}.\n",
         "@end\n",
         "@end\n",
     );
@@ -2502,9 +2502,9 @@ fn a3_resolver_error_code_table() {
 
 #[test]
 fn e12_base_default_undefined_var_span_attributes_to_base() {
-    // base = "@block content:\n{undefined_var}\n@end\n"
+    // base = "@block content:\n{{undefined_var}}\n@end\n"
     // bytes: "@block content:\n" = 16 bytes, then "{undefined_var}" starts at 16.
-    let base = "@block content:\n{undefined_var}\n@end\n";
+    let base = "@block content:\n{{undefined_var}}\n@end\n";
     let child = "@extends \"./base.mds\"\n";
     let files = [("base.mds", base), ("child.mds", child)];
 
@@ -2563,7 +2563,7 @@ fn pf004_messages_mode_span_parity_with_text_mode() {
     let base = concat!(
         "@block content:\n",
         "@message user:\n",
-        "Hello {undefined_var}.\n",
+        "Hello {{undefined_var}}.\n",
         "@end\n",
         "@end\n",
     );
@@ -2682,7 +2682,7 @@ fn utf8_boundary_span_attributes_to_base() {
 fn e12_child_override_undefined_var_attributes_to_child() {
     let base = "@block content:\nDefault.\n@end\n";
     // child extends base, "@extends \"./base.mds\"\n" = 21 bytes
-    let child = "@extends \"./base.mds\"\n@block content:\n{undefined_var}\n@end\n";
+    let child = "@extends \"./base.mds\"\n@block content:\n{{undefined_var}}\n@end\n";
     let files = [("base.mds", base), ("child.mds", child)];
 
     let err = compile_virtual(&files, "child.mds")
@@ -2716,7 +2716,7 @@ fn e12_multilevel_undefined_var_attributes_to_root_base() {
     // A: root base with two blocks, one has an undefined var (never overridden).
     let a = concat!(
         "@block safe:\nSafe content.\n@end\n",
-        "@block danger:\n{undefined_var}\n@end\n",
+        "@block danger:\n{{undefined_var}}\n@end\n",
     );
     // B: extends A, overrides `safe`, leaves `danger` to A's default.
     let b = "@extends \"./a.mds\"\n@block safe:\nB override.\n@end\n";
@@ -2755,7 +2755,7 @@ fn e12_base_toplevel_nonblock_node_attributes_to_base() {
     // Base: a top-level interpolation between blocks — {customer_name} is not defined.
     let base = concat!(
         "@block header:\nHello.\n@end\n",
-        "Hello {customer_name}!\n", // top-level interpolation in skeleton
+        "Hello {{customer_name}}!\n", // top-level interpolation in skeleton
         "@block footer:\nBye.\n@end\n",
     );
     let child = "@extends \"./base.mds\"\n";
@@ -2801,7 +2801,7 @@ fn a_skeleton_then_standalone_upgrade_preserves_attribution() {
     // The base is resolved as a skeleton (via the child compile), then resolved
     // again as a standalone. After the upgrade, compiling a second child that
     // extends the base must still attribute errors to the base (not the child).
-    let base = "@block content:\n{undefined_var}\n@end\n";
+    let base = "@block content:\n{{undefined_var}}\n@end\n";
     let child = "@extends \"./base.mds\"\n";
     let files = [("base.mds", base), ("child.mds", child)];
     let mut cache = virtual_cache(&files);
@@ -2935,7 +2935,7 @@ fn source_label_appears_in_string_source_diagnostics() {
     // An undefined variable interpolation produces MdsError::UndefinedVariable
     // with src: Some(NamedSource { name: "<source>", ... }) and a span pointing
     // to the interpolation site — exactly the span-carrying error we need.
-    let bad_source = "{undefined_var}\n";
+    let bad_source = "{{undefined_var}}\n";
     let result = crate::compile_str_with(bad_source, Some(dir.path()), None);
 
     let err = result.unwrap_err();
@@ -3086,7 +3086,7 @@ fn f7_emitted_frontmatter_ignores_runtime_set() {
         "model: gpt-4\n",
         "---\n",
         "@block content:\n",
-        "Model: {model}\n",
+        "Model: {{model}}\n",
         "@end\n",
     );
     let child = concat!(
@@ -3151,7 +3151,7 @@ fn parent_dir_drives_nested_file_import_resolution() {
     // on sub/lib.mds's canonical key) and defines greet(x) for main.mds to consume.
     std::fs::write(
         sub.join("lib.mds"),
-        "@import \"./helper.mds\"\n@define greet(x):\nHello {x}!\n@end\n",
+        "@import \"./helper.mds\"\n@define greet(x):\nHello {{x}}!\n@end\n",
     )
     .unwrap();
 
@@ -3159,7 +3159,7 @@ fn parent_dir_drives_nested_file_import_resolution() {
     let main_path = dir.path().join("main.mds");
     std::fs::write(
         &main_path,
-        "@import \"./sub/lib.mds\"\n{greet(\"World\")}\n",
+        "@import \"./sub/lib.mds\"\n{{greet(\"World\")}}\n",
     )
     .unwrap();
 

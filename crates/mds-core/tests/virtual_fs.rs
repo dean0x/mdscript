@@ -25,7 +25,7 @@ fn single_file_compile() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("should compile");
     assert!(output.contains("Hello World!"), "got: {output}");
@@ -36,11 +36,11 @@ fn two_file_import_merge() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./lib.mds\"\n{greet(\"Alice\")}\n".to_string(),
+        "@import \"./lib.mds\"\n{{greet(\"Alice\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("should compile");
     assert!(output.contains("Hello Alice!"), "got: {output}");
@@ -51,15 +51,15 @@ fn three_file_chain() {
     let mut modules = HashMap::new();
     modules.insert(
         "c.mds".to_string(),
-        "@define shout(x):\n{x}!!!\n@end\n".to_string(),
+        "@define shout(x):\n{{x}}!!!\n@end\n".to_string(),
     );
     modules.insert(
         "b.mds".to_string(),
-        "@import \"./c.mds\"\n@define greet(x):\n{shout(x)}\n@end\n".to_string(),
+        "@import \"./c.mds\"\n@define greet(x):\n{{shout(x)}}\n@end\n".to_string(),
     );
     modules.insert(
         "a.mds".to_string(),
-        "@import \"./b.mds\"\n{greet(\"World\")}\n".to_string(),
+        "@import \"./b.mds\"\n{{greet(\"World\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "a.mds").expect("should compile");
     assert!(output.contains("World!!!"), "got: {output}");
@@ -117,11 +117,11 @@ fn selective_import() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n@define farewell(x):\nBye {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n@define farewell(x):\nBye {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import { greet } from \"./lib.mds\"\n{greet(\"Bob\")}\n".to_string(),
+        "@import { greet } from \"./lib.mds\"\n{{greet(\"Bob\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("should compile");
     assert!(output.contains("Hi Bob!"), "got: {output}");
@@ -135,11 +135,11 @@ fn selective_import_excludes_non_imported() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n@define farewell(x):\nBye {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n@define farewell(x):\nBye {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import { greet } from \"./lib.mds\"\n{farewell(\"Bob\")}\n".to_string(),
+        "@import { greet } from \"./lib.mds\"\n{{farewell(\"Bob\")}}\n".to_string(),
     );
     let err =
         compile_vfs(modules, "main.mds").expect_err("calling a non-imported function should fail");
@@ -160,12 +160,12 @@ fn export_visibility_exported_function_accessible() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define internal():\nhidden\n@end\n@define greet(x):\nHi {x}!\n@end\n@export greet\n"
+        "@define internal():\nhidden\n@end\n@define greet(x):\nHi {{x}}!\n@end\n@export greet\n"
             .to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./lib.mds\"\n{greet(\"Carol\")}\n".to_string(),
+        "@import \"./lib.mds\"\n{{greet(\"Carol\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("should compile");
     assert!(output.contains("Hi Carol!"), "got: {output}");
@@ -179,13 +179,13 @@ fn export_visibility_non_exported_function_inaccessible() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define internal():\nhidden\n@end\n@define greet(x):\nHi {x}!\n@end\n@export greet\n"
+        "@define internal():\nhidden\n@end\n@define greet(x):\nHi {{x}}!\n@end\n@export greet\n"
             .to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
         // Attempt to call the non-exported function.
-        "@import \"./lib.mds\"\n{internal()}\n".to_string(),
+        "@import \"./lib.mds\"\n{{internal()}}\n".to_string(),
     );
     let err =
         compile_vfs(modules, "main.mds").expect_err("calling a non-exported function should fail");
@@ -207,11 +207,11 @@ fn namespace_import() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./lib.mds\" as lib\n{lib.greet(\"Dave\")}\n".to_string(),
+        "@import \"./lib.mds\" as lib\n{{lib.greet(\"Dave\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("should compile");
     assert!(output.contains("Hello Dave!"), "got: {output}");
@@ -222,7 +222,7 @@ fn wildcard_reexport() {
     let mut modules = HashMap::new();
     modules.insert(
         "base.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "barrel.mds".to_string(),
@@ -230,7 +230,7 @@ fn wildcard_reexport() {
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./barrel.mds\"\n{greet(\"Eve\")}\n".to_string(),
+        "@import \"./barrel.mds\"\n{{greet(\"Eve\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("should compile");
     assert!(output.contains("Hi Eve!"), "got: {output}");
@@ -261,11 +261,11 @@ fn cross_subdirectory_import() {
     let mut modules = HashMap::new();
     modules.insert(
         "shared/utils.mds".to_string(),
-        "@define format_name(x):\n[{x}]\n@end\n".to_string(),
+        "@define format_name(x):\n[{{x}}]\n@end\n".to_string(),
     );
     modules.insert(
         "pages/main.mds".to_string(),
-        "@import \"../shared/utils.mds\"\n{format_name(\"Alice\")}\n".to_string(),
+        "@import \"../shared/utils.mds\"\n{{format_name(\"Alice\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "pages/main.mds").expect("should compile");
     assert!(output.contains("[Alice]"), "got: {output}");
@@ -277,7 +277,7 @@ fn resolve_key_directly() {
     let mut modules = HashMap::new();
     modules.insert(
         "greeting.mds".to_string(),
-        "---\nwho: World\n---\nHello {who}!\n".to_string(),
+        "---\nwho: World\n---\nHello {{who}}!\n".to_string(),
     );
     let mut cache = ModuleCache::virtual_fs(modules);
     let mut warnings = vec![];
@@ -300,7 +300,7 @@ fn deps_single_file() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
     assert_eq!(result.dependencies, Vec::<String>::new());
@@ -316,11 +316,11 @@ fn deps_two_files() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./lib.mds\"\n{greet(\"Alice\")}\n".to_string(),
+        "@import \"./lib.mds\"\n{{greet(\"Alice\")}}\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
     assert_eq!(result.dependencies, vec!["lib.mds".to_string()]);
@@ -334,15 +334,15 @@ fn deps_three_file_chain() {
     let mut modules = HashMap::new();
     modules.insert(
         "c.mds".to_string(),
-        "@define shout(x):\n{x}!!!\n@end\n".to_string(),
+        "@define shout(x):\n{{x}}!!!\n@end\n".to_string(),
     );
     modules.insert(
         "b.mds".to_string(),
-        "@import \"./c.mds\"\n@define greet(x):\n{shout(x)}\n@end\n".to_string(),
+        "@import \"./c.mds\"\n@define greet(x):\n{{shout(x)}}\n@end\n".to_string(),
     );
     modules.insert(
         "a.mds".to_string(),
-        "@import \"./b.mds\"\n{greet(\"World\")}\n".to_string(),
+        "@import \"./b.mds\"\n{{greet(\"World\")}}\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "a.mds", None).expect("should compile");
     // Resolution is post-order DFS: c is inserted first (leaf), then b, then a (entry, excluded).
@@ -364,7 +364,7 @@ fn deps_diamond_no_duplicates() {
     let mut modules = HashMap::new();
     modules.insert(
         "shared.mds".to_string(),
-        "@define tag(x):\n[{x}]\n@end\n".to_string(),
+        "@define tag(x):\n[{{x}}]\n@end\n".to_string(),
     );
     // a and b each import shared; their output is just text (no calls to tag)
     modules.insert(
@@ -425,7 +425,7 @@ fn deps_str_with_deps_basic() {
     // Use a base_dir so the import resolution works; but with NativeFs that
     // would look for real files. Skip this variant here — covered in api_surface.rs.
     // Instead test the no-import case:
-    let result = mds::compile_str_with_deps("---\nname: Alice\n---\nHi {name}!\n", None, None)
+    let result = mds::compile_str_with_deps("---\nname: Alice\n---\nHi {{name}}!\n", None, None)
         .expect("should compile");
     // No imports → no deps
     assert_eq!(result.dependencies, Vec::<String>::new());
@@ -441,10 +441,10 @@ fn deps_str_with_deps_file_import() {
     let dir = tempfile::TempDir::new().unwrap();
     let lib_path = dir.path().join("lib.mds");
     let mut f = std::fs::File::create(&lib_path).unwrap();
-    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n")
+    f.write_all(b"@define greet(x):\nHello {{x}}!\n@end\n")
         .unwrap();
 
-    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let source = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n";
     let result = mds::compile_str_with_deps(source, Some(dir.path()), None)
         .expect("should compile with file import");
 
@@ -474,7 +474,7 @@ fn deps_error_returns_err() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "Hello {undefined_var}!\n".to_string(),
+        "Hello {{undefined_var}}!\n".to_string(),
     );
     let err = mds::compile_virtual_with_deps(modules, "main.mds", None)
         .expect_err("should fail with undefined variable");
@@ -488,15 +488,15 @@ fn deps_error_returns_err() {
 
 #[test]
 fn fm_import_alias_basic() {
-    // Alias import: `as lib` → `{lib.greet("Alice")}` works.
+    // Alias import: `as lib` → `{{lib.greet("Alice")}}` works.
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "---\nimports:\n  - path: ./lib.mds\n    as: lib\n---\n{lib.greet(\"Alice\")}\n"
+        "---\nimports:\n  - path: ./lib.mds\n    as: lib\n---\n{{lib.greet(\"Alice\")}}\n"
             .to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("alias import should compile");
@@ -509,11 +509,11 @@ fn fm_import_merge_basic() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "---\nimports:\n  - path: ./lib.mds\n---\n{greet(\"Bob\")}\n".to_string(),
+        "---\nimports:\n  - path: ./lib.mds\n---\n{{greet(\"Bob\")}}\n".to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("merge import should compile");
     assert!(output.contains("Hi Bob!"), "got: {output}");
@@ -525,11 +525,11 @@ fn fm_import_selective_basic() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n@define farewell(x):\nBye {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n@define farewell(x):\nBye {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "---\nimports:\n  - path: ./lib.mds\n    names: [greet]\n---\n{greet(\"Carol\")}\n"
+        "---\nimports:\n  - path: ./lib.mds\n    names: [greet]\n---\n{{greet(\"Carol\")}}\n"
             .to_string(),
     );
     let output = compile_vfs(modules, "main.mds").expect("selective import should compile");
@@ -542,11 +542,11 @@ fn fm_import_with_body_import() {
     let mut modules = HashMap::new();
     modules.insert(
         "fm_lib.mds".to_string(),
-        "@define shout(x):\n{x}!!!\n@end\n".to_string(),
+        "@define shout(x):\n{{x}}!!!\n@end\n".to_string(),
     );
     modules.insert(
         "body_lib.mds".to_string(),
-        "@define greet(x):\nHello {x}\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -557,7 +557,7 @@ fn fm_import_with_body_import() {
             "    as: fm\n",
             "---\n",
             "@import \"./body_lib.mds\"\n",
-            "{fm.shout(greet(\"Dave\"))}\n",
+            "{{fm.shout(greet(\"Dave\"))}}\n",
         )
         .to_string(),
     );
@@ -567,7 +567,7 @@ fn fm_import_with_body_import() {
 
 #[test]
 fn fm_import_not_leaked_as_var() {
-    // `{imports}` in body should error — `imports` is reserved, not a scope variable.
+    // `{{imports}}` in body should error — `imports` is reserved, not a scope variable.
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
@@ -575,7 +575,7 @@ fn fm_import_not_leaked_as_var() {
     );
     modules.insert(
         "main.mds".to_string(),
-        "---\nimports:\n  - path: ./lib.mds\n---\n{imports}\n".to_string(),
+        "---\nimports:\n  - path: ./lib.mds\n---\n{{imports}}\n".to_string(),
     );
     let err = compile_vfs(modules, "main.mds").expect_err("imports should not be a scope var");
     let msg = err.to_string();
@@ -591,7 +591,7 @@ fn fm_import_stripped_output() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -602,7 +602,7 @@ fn fm_import_stripped_output() {
             "  - path: ./lib.mds\n",
             "    as: lib\n",
             "---\n",
-            "{lib.greet(name)}\n",
+            "{{lib.greet(name)}}\n",
         )
         .to_string(),
     );
@@ -632,7 +632,7 @@ fn fm_import_for_expr() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define split_items(s, sep):\n{split(s, sep)}\n@end\n".to_string(),
+        "@define split_items(s, sep):\n{{split(s, sep)}}\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -644,7 +644,7 @@ fn fm_import_for_expr() {
             "    as: lib\n",
             "---\n",
             "@for x in split(csv, \",\"):\n",
-            "{x}\n",
+            "{{x}}\n",
             "@end\n",
         )
         .to_string(),
@@ -670,7 +670,7 @@ fn fm_import_chain() {
             "  - path: ./c.mds\n",
             "    as: c\n",
             "---\n",
-            "@define wrap():\n[{c.base()}]\n@end\n",
+            "@define wrap():\n[{{c.base()}}]\n@end\n",
         )
         .to_string(),
     );
@@ -682,7 +682,7 @@ fn fm_import_chain() {
             "  - path: ./b.mds\n",
             "    as: b\n",
             "---\n",
-            "{b.wrap()}\n",
+            "{{b.wrap()}}\n",
         )
         .to_string(),
     );
@@ -696,7 +696,7 @@ fn fm_import_deps_tracked() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -706,7 +706,7 @@ fn fm_import_deps_tracked() {
             "  - path: ./lib.mds\n",
             "    as: lib\n",
             "---\n",
-            "{lib.greet(\"World\")}\n",
+            "{{lib.greet(\"World\")}}\n",
         )
         .to_string(),
     );
@@ -736,7 +736,7 @@ fn fm_import_collision_with_body() {
             "    as: lib\n",
             "---\n",
             "@import \"./lib.mds\" as lib\n",
-            "{lib.f()}\n",
+            "{{lib.f()}}\n",
         )
         .to_string(),
     );
@@ -766,7 +766,7 @@ fn fm_import_collision_within_fm() {
             "  - path: ./lib.mds\n",
             "    as: lib\n",
             "---\n",
-            "{lib.f()}\n",
+            "{{lib.f()}}\n",
         )
         .to_string(),
     );
@@ -840,7 +840,7 @@ fn fm_import_selective_not_exported() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -926,7 +926,7 @@ fn fm_import_with_other_vars() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHi {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHi {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -937,7 +937,7 @@ fn fm_import_with_other_vars() {
             "  - path: ./lib.mds\n",
             "    as: lib\n",
             "---\n",
-            "{lib.greet(name)}\n",
+            "{{lib.greet(name)}}\n",
         )
         .to_string(),
     );
@@ -951,7 +951,7 @@ fn fm_import_same_path_diff_alias() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
@@ -962,7 +962,7 @@ fn fm_import_same_path_diff_alias() {
             "    as: a\n",
             "---\n",
             "@import \"./lib.mds\" as b\n",
-            "{a.greet(\"X\")} {b.greet(\"Y\")}\n",
+            "{{a.greet(\"X\")}} {{b.greet(\"Y\")}}\n",
         )
         .to_string(),
     );
@@ -994,7 +994,7 @@ fn fm_import_collision_merge_within_fm() {
             "  - path: ./lib_a.mds\n",
             "  - path: ./lib_b.mds\n",
             "---\n",
-            "{common()}\n",
+            "{{common()}}\n",
         )
         .to_string(),
     );
@@ -1326,7 +1326,7 @@ fn round_trip_interior_verbatim_byte_identical() {
 
 #[test]
 fn issue_149_indented_fence_inside_list_item_with_braces() {
-    // An indented code fence inside a list item containing literal `{braces}`
+    // An indented code fence inside a list item containing literal `{{braces}}`
     // must compile successfully: braces inside the fence are NOT interpolated,
     // and the fence lines are emitted verbatim.
     let src = concat!(
@@ -1482,18 +1482,13 @@ fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
 #[test]
 fn issue_153_invalid_interpolation_hint_text() {
     // Compiling a file with an invalid interpolation shape must produce an error
-    // whose hint text contains `\{` (single brace) and NOT `\{{` (double brace).
-    let src = "{123invalid}\n";
+    // whose hint text contains `\\{{` (double-brace escape hint for the new {{expr}} syntax).
+    let src = "{{123invalid}}\n";
     let err = mds::compile_str(src).expect_err("#153: invalid interpolation must fail to compile");
     let msg = format!("{err}");
     assert!(
-        msg.contains("\\{"),
-        "#153: error hint must mention \\{{ (single brace escape); got: {msg}"
-    );
-    // Guard the regression: must NOT say \{{ (double brace — old broken form).
-    assert!(
-        !msg.contains("\\{{"),
-        "#153: error hint must NOT say \\{{{{  (double brace); got: {msg}"
+        msg.contains("\\\\{{"),
+        "#153: error hint must mention \\\\{{ (double-brace escape); got: {msg}"
     );
 }
 
@@ -1614,7 +1609,7 @@ fn compile_vfs_err(
 #[test]
 fn b1_type_mismatch_in_imported_define_names_helper_file() {
     // helper.mds defines `check(x)` whose body contains `@if x == "yes":`.
-    // main.mds imports helper and calls `{check(42)}` — number vs string mismatch
+    // main.mds imports helper and calls `{{check(42)}}` — number vs string mismatch
     // in the HELPER'S body.  The error must name "helper.mds", not "main.mds".
     let helper_src =
         "@define check(x):\n@if x == \"yes\":\nok\n@else:\nfail\n@end\n@end\n".to_string();
@@ -1624,7 +1619,7 @@ fn b1_type_mismatch_in_imported_define_names_helper_file() {
     modules.insert("helper.mds".to_string(), helper_src.clone());
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./helper.mds\" as h\n{h.check(42)}\n".to_string(),
+        "@import \"./helper.mds\" as h\n{{h.check(42)}}\n".to_string(),
     );
     let err = compile_vfs_err(modules, "main.mds");
     let serialized = err.serialize();
@@ -1708,15 +1703,15 @@ fn b1_same_file_type_mismatch_span_still_works() {
 fn b1_two_level_chain_attributes_to_innermost_definer() {
     // a.mds imports b.mds which imports c.mds.  c.mds defines `inner(x)` with a
     // cross-type @if.  b.mds defines `mid(x)` that calls `inner(x)`.  a.mds calls
-    // `{lib.mid(42)}`.  The error must carry a span indexing c_src.
+    // `{{lib.mid(42)}}`.  The error must carry a span indexing c_src.
     let c_src = "@define inner(x):\n@if x == \"yes\":\nok\n@else:\nno\n@end\n@end\n".to_string();
-    let b_src = "@import \"./c.mds\" as c\n@define mid(x):\n{c.inner(x)}\n@end\n".to_string();
+    let b_src = "@import \"./c.mds\" as c\n@define mid(x):\n{{c.inner(x)}}\n@end\n".to_string();
     let mut modules = std::collections::HashMap::new();
     modules.insert("c.mds".to_string(), c_src.clone());
     modules.insert("b.mds".to_string(), b_src);
     modules.insert(
         "a.mds".to_string(),
-        "@import \"./b.mds\" as lib\n{lib.mid(42)}\n".to_string(),
+        "@import \"./b.mds\" as lib\n{{lib.mid(42)}}\n".to_string(),
     );
     let err = compile_vfs_err(modules, "a.mds");
     let serialized = err.serialize();
@@ -1819,7 +1814,7 @@ fn b2_for_missing_colon_carries_span() {
 #[test]
 fn b3_arity_mismatch_includes_signature_in_help() {
     // Define foo(x, y) and call it with only one arg.
-    let src = "@define foo(x, y):\n{x} {y}\n@end\n{foo(\"a\")}\n".to_string();
+    let src = "@define foo(x, y):\n{{x}} {{y}}\n@end\n{{foo(\"a\")}}\n".to_string();
     let mut modules = std::collections::HashMap::new();
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");
@@ -1839,7 +1834,7 @@ fn b3_arity_mismatch_includes_signature_in_help() {
 /// Calling a user-defined function with optional defaults should show defaults in signature.
 #[test]
 fn b3_arity_mismatch_signature_shows_defaults() {
-    let src = "@define greet(name, sep = \", \"):\n{name}{sep}\n@end\n{greet()}\n".to_string();
+    let src = "@define greet(name, sep = \", \"):\n{{name}}{{sep}}\n@end\n{{greet()}}\n".to_string();
     let mut modules = std::collections::HashMap::new();
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");
@@ -1860,7 +1855,7 @@ fn b3_arity_mismatch_signature_shows_defaults() {
 #[test]
 fn b3_builtin_arity_mismatch_no_signature_in_help() {
     // `upper` takes exactly 1 arg.
-    let src = "{upper(\"a\", \"b\")}\n".to_string();
+    let src = "{{upper(\"a\", \"b\")}}\n".to_string();
     let mut modules = std::collections::HashMap::new();
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");

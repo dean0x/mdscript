@@ -15,7 +15,7 @@ fn public_functions_exist() {
     let _ = mds::format_str("Hello!\n");
     let _ = mds::format_str_with("Hello!\n", None);
     let _ = mds::format_str_named("Hello!\n", None, "<test>");
-    let _ = mds::compile_str("---\nname: World\n---\nHello {name}!\n");
+    let _ = mds::compile_str("---\nname: World\n---\nHello {{name}}!\n");
     let _ = mds::compile_str_with("Hello!\n", None, None);
     let _ = mds::compile_str_collecting_warnings("Hello!\n", None, None);
     let _ = mds::compile(Path::new("nonexistent.mds"), None);
@@ -317,11 +317,11 @@ fn compile_result_to_json() {
     let modules = HashMap::from([
         (
             "dep.mds".to_string(),
-            "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+            "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
         ),
         (
             "main.mds".to_string(),
-            "@import \"./dep.mds\"\n{greet(\"World\")}\n".to_string(),
+            "@import \"./dep.mds\"\n{{greet(\"World\")}}\n".to_string(),
         ),
     ]);
     let co = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
@@ -355,7 +355,7 @@ fn compile_with_deps_exists() {
 #[test]
 fn compile_str_with_deps_exists() {
     // compile_str_with_deps compiles successfully.
-    let result = mds::compile_str_with_deps("---\nname: World\n---\nHello {name}!\n", None, None)
+    let result = mds::compile_str_with_deps("---\nname: World\n---\nHello {{name}}!\n", None, None)
         .expect("should compile");
     assert_eq!(result.dependencies, Vec::<String>::new());
     assert_eq!(
@@ -370,7 +370,7 @@ fn compile_virtual_with_deps_exists() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
     assert_eq!(result.dependencies, Vec::<String>::new());
@@ -399,7 +399,7 @@ fn compile_with_deps_output_matches_compile() {
     // Same input → same Markdown output as compile_virtual.
     let modules = HashMap::from([(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     )]);
     let baseline = mds::compile_virtual(modules.clone(), "main.mds", None)
         .expect("baseline")
@@ -447,7 +447,7 @@ fn compile_virtual_collecting_warnings_direct() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
     let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None);
     assert!(
@@ -482,7 +482,7 @@ fn check_virtual_collecting_warnings_direct() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
     let result = mds::check_virtual_collecting_warnings(modules, "main.mds", None);
     assert!(
@@ -502,7 +502,7 @@ fn check_virtual_rejects_invalid_module() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "Hello {undefined_var}!\n".to_string(),
+        "Hello {{undefined_var}}!\n".to_string(),
     );
     let result = mds::check_virtual(modules, "main.mds", None);
     assert!(
@@ -526,12 +526,12 @@ fn compile_with_deps_native_fs_integration() {
 
     let lib_path = dir.path().join("lib.mds");
     let mut f = std::fs::File::create(&lib_path).unwrap();
-    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n")
+    f.write_all(b"@define greet(x):\nHello {{x}}!\n@end\n")
         .unwrap();
 
     let entry_path = dir.path().join("main.mds");
     let mut f = std::fs::File::create(&entry_path).unwrap();
-    f.write_all(b"@import \"./lib.mds\"\n{greet(\"World\")}\n")
+    f.write_all(b"@import \"./lib.mds\"\n{{greet(\"World\")}}\n")
         .unwrap();
 
     let result = mds::compile_with_deps(&entry_path, None)
@@ -575,11 +575,11 @@ fn compile_result_warnings_emitted_for_empty_include() {
     let mut modules = std::collections::HashMap::new();
     modules.insert(
         "defs.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
     );
     modules.insert(
         "main.mds".to_string(),
-        "@import \"./defs.mds\" as defs\n@include defs\n{defs.greet(\"World\")}\n".to_string(),
+        "@import \"./defs.mds\" as defs\n@include defs\n{{defs.greet(\"World\")}}\n".to_string(),
     );
     let result = mds::compile_virtual_with_deps(modules, "main.mds", None).expect("should compile");
 
@@ -613,10 +613,10 @@ fn compile_str_with_import_resolves_relative_to_base_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let lib_path = dir.path().join("lib.mds");
     let mut f = std::fs::File::create(&lib_path).unwrap();
-    f.write_all(b"@define greet(x):\nHello {x}!\n@end\n")
+    f.write_all(b"@define greet(x):\nHello {{x}}!\n@end\n")
         .unwrap();
 
-    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let source = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n";
     let result = mds::compile_str_with(source, Some(dir.path()), None);
     assert!(
         result.is_ok(),
@@ -750,7 +750,7 @@ fn load_vars_str_empty_object() {
 fn load_vars_str_feeds_compile_virtual() {
     let vars = mds::load_vars_str(r#"{"name": "Test"}"#).unwrap();
     let mut modules = HashMap::new();
-    modules.insert("main.mds".to_string(), "Hello {name}!\n".to_string());
+    modules.insert("main.mds".to_string(), "Hello {{name}}!\n".to_string());
     let output = mds::compile_virtual(modules, "main.mds", Some(vars))
         .unwrap()
         .into_markdown()
@@ -913,13 +913,13 @@ fn compile_with_deps_messages_excludes_entry_from_dependencies() {
     // compile_with_deps on a messages template excludes the entry key from deps.
     let dir = tempfile::tempdir().unwrap();
     let helper = dir.path().join("helper.mds");
-    std::fs::write(&helper, "@define greet(name):\nHello {name}!\n@end\n").unwrap();
+    std::fs::write(&helper, "@define greet(name):\nHello {{name}}!\n@end\n").unwrap();
 
     let entry = dir.path().join("chat.mds");
     std::fs::write(
         &entry,
         "@import { greet } from \"./helper.mds\"\n\
-         @message user:\n{greet(\"World\")}\n@end\n",
+         @message user:\n{{greet(\"World\")}}\n@end\n",
     )
     .unwrap();
 
@@ -1032,6 +1032,7 @@ fn lint_types_exist() {
         span: None,
         file: Some("test.mds".to_string()),
         fix_removals: None,
+        fix_edits: None,
     };
     assert_eq!(diag.rule, "unused-variable");
     assert_eq!(diag.severity, Severity::Warn);
@@ -1103,6 +1104,7 @@ fn lint_canonical_json_schema() {
             }),
             file: Some("test.mds".to_string()),
             fix_removals: None,
+            fix_edits: None,
         }],
         truncated: false,
         is_standalone: false,
@@ -1158,6 +1160,7 @@ fn lint_canonical_json_fixable_semantics() {
             span: None,
             file: Some("a.mds".to_string()),
             fix_removals: Some(vec![FixLineSpan::single(0)]),
+            fix_edits: None,
         }],
         truncated: false,
         is_standalone: false, // even non-standalone Tier A is fixable
@@ -1176,6 +1179,7 @@ fn lint_canonical_json_fixable_semantics() {
             span: None,
             file: Some("b.mds".to_string()),
             fix_removals: Some(vec![FixLineSpan::single(0)]),
+            fix_edits: None,
         }],
         truncated: false,
         is_standalone: false,
@@ -1193,6 +1197,7 @@ fn lint_canonical_json_fixable_semantics() {
             span: None,
             file: Some("c.mds".to_string()),
             fix_removals: Some(vec![FixLineSpan::single(0)]),
+            fix_edits: None,
         }],
         truncated: false,
         is_standalone: true,
@@ -1210,6 +1215,7 @@ fn lint_canonical_json_fixable_semantics() {
             span: None,
             file: Some("d.mds".to_string()),
             fix_removals: None,
+            fix_edits: None,
         }],
         truncated: false,
         is_standalone: true, // even standalone Tier C is not fixable
@@ -1436,6 +1442,7 @@ fn fix_api_incremental_exists() {
         start: 0,
         end: 5,
         rule: "duplicate-import".to_string(),
+        replacement: String::new(),
     };
     let rejected = RejectedEdit {
         edit,

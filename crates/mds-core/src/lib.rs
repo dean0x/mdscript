@@ -1834,7 +1834,7 @@ mod tests {
     #[test]
     fn scan_imports_syntax_error() {
         // Unclosed interpolation — lexer/parser should return an error.
-        let result = scan_imports("Hello {name\n");
+        let result = scan_imports("Hello {{name\n");
         assert!(result.is_err(), "expected error for malformed source");
     }
 
@@ -1845,7 +1845,7 @@ mod tests {
             "name: Alice\n",
             "---\n",
             "@import \"./lib.mds\"\n",
-            "Hello {name}!\n",
+            "Hello {{name}}!\n",
         );
         let paths = scan_imports(source).expect("frontmatter + imports should succeed");
         assert_eq!(paths, vec!["./lib.mds".to_string()]);
