@@ -1482,13 +1482,14 @@ fn extends_base_skeleton_type_mismatch_span_not_misattributed_to_child() {
 #[test]
 fn issue_153_invalid_interpolation_hint_text() {
     // Compiling a file with an invalid interpolation shape must produce an error
-    // whose hint text contains `\\{{` (double-brace escape hint for the new {{expr}} syntax).
+    // whose hint text contains `\{{` (single backslash + double brace) — the escape the
+    // lexer actually accepts to emit a literal `{{` in the document.
     let src = "{{123invalid}}\n";
     let err = mds::compile_str(src).expect_err("#153: invalid interpolation must fail to compile");
     let msg = format!("{err}");
     assert!(
-        msg.contains("\\\\{{"),
-        "#153: error hint must mention \\\\{{ (double-brace escape); got: {msg}"
+        msg.contains("\\{{"),
+        "#153: error hint must mention `\\{{` (single-backslash double-brace escape); got: {msg}"
     );
 }
 

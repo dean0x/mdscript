@@ -403,19 +403,19 @@ fn parse_invalid_dot_path_interpolation_returns_error() {
 
 #[test]
 fn invalid_interpolation_hint_recommends_single_brace_escape() {
-    // Updated for {{x}} syntax: the hint must recommend `\{{` (backslash + double brace)
-    // to produce a literal `{{` in the document. The format string in parser_helpers.rs
-    // now renders `\\{{` as the escape sequence (two backslashes + two braces in the
-    // format string, producing two backslashes + two braces in the error message string).
+    // Updated for {{x}} syntax: the hint must recommend `\{{` (single backslash + double
+    // brace) to produce a literal `{{` in the document — matching the escape the lexer
+    // actually accepts (see lexer::scan_escape) and the lexer's own unclosed-interpolation
+    // hint. In the Rust source assertion, `"\\{{"` is the string `\{{` (one backslash).
     let src = "{{123invalid}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "test.mds", src);
     assert!(result.is_err(), "invalid interpolation should fail");
     let err_msg = format!("{}", result.unwrap_err());
-    // Must contain `\\{{` as the escape hint (backslash + double brace).
+    // Must contain `\{{` (one backslash + double brace) as the escape hint.
     assert!(
-        err_msg.contains("\\\\{{"),
-        "hint must recommend double-brace escape, got: {err_msg}"
+        err_msg.contains("\\{{"),
+        "hint must recommend single-backslash double-brace escape `\\{{`, got: {err_msg}"
     );
 }
 

@@ -1106,7 +1106,7 @@ pub(super) fn parse_interpolation_expr(
     if !is_valid_identifier(content) {
         return Err(MdsError::syntax_at(
             format!(
-                "invalid interpolation expression '{content}': use a variable name, function call like func(), or dot path like obj.field. To output a literal `{{{{` in the document, escape it as `\\\\{{{{`."
+                "invalid interpolation expression '{content}': use a variable name, function call like func(), or dot path like obj.field. To output a literal `{{{{` in the document, escape it as `\\{{{{`."
             ),
             file, source, offset, len,
         ));
