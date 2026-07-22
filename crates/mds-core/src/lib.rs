@@ -7,7 +7,7 @@
 //! **In-memory compilation** — compile from a string with no files involved:
 //!
 //! ```rust
-//! let result = mds::compile_str("---\nname: World\n---\nHello {name}!\n")?;
+//! let result = mds::compile_str("---\nname: World\n---\nHello {{name}}!\n")?;
 //! assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -322,7 +322,7 @@ pub fn compile(
 /// # Examples
 ///
 /// ```rust
-/// let result = mds::compile_str("---\ngreeting: Hi\n---\n{greeting} there!\n")?;
+/// let result = mds::compile_str("---\ngreeting: Hi\n---\n{{greeting}} there!\n")?;
 /// assert_eq!(result.into_markdown()?, "---\ngreeting: Hi\n---\nHi there!\n");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -344,7 +344,7 @@ pub fn compile_str(source: &str) -> Result<CompileResult, MdsError> {
 ///
 /// let vars = HashMap::from([("lang".to_string(), mds::Value::String("Rust".to_string()))]);
 /// let result = mds::compile_str_with(
-///     "---\nlang: unknown\n---\nI love {lang}!\n",
+///     "---\nlang: unknown\n---\nI love {{lang}}!\n",
 ///     Some(Path::new("templates/")),
 ///     Some(vars),
 /// )?;
@@ -396,10 +396,10 @@ pub fn check(
 ///
 /// ```rust
 /// // Valid template — no error
-/// mds::check_str("---\nname: Test\n---\nHello {name}!\n")?;
+/// mds::check_str("---\nname: Test\n---\nHello {{name}}!\n")?;
 ///
 /// // Invalid template — undefined variable
-/// assert!(mds::check_str("Hello {name}!\n").is_err());
+/// assert!(mds::check_str("Hello {{name}}!\n").is_err());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use = "errors should be handled"]
@@ -779,7 +779,7 @@ pub(crate) fn clean_output(s: &str) -> String {
 /// use std::collections::HashMap;
 ///
 /// let mut modules = HashMap::new();
-/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
+/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {{name}}!\n".to_string());
 ///
 /// let result = mds::compile_virtual(modules, "main.mds", None)?;
 /// assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
@@ -811,7 +811,7 @@ pub fn compile_virtual(
 /// use std::collections::HashMap;
 ///
 /// let mut modules = HashMap::new();
-/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
+/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {{name}}!\n".to_string());
 ///
 /// let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)?;
 /// assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
@@ -909,7 +909,7 @@ pub fn compile_str_with_deps(
 /// use std::collections::HashMap;
 ///
 /// let mut modules = HashMap::new();
-/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {name}!\n".to_string());
+/// modules.insert("main.mds".to_string(), "---\nname: World\n---\nHello {{name}}!\n".to_string());
 ///
 /// let result = mds::compile_virtual_with_deps(modules, "main.mds", None)?;
 /// assert_eq!(result.into_markdown()?, "---\nname: World\n---\nHello World!\n");
@@ -1418,7 +1418,7 @@ pub fn load_vars_file(path: &Path) -> Result<HashMap<String, Value>, MdsError> {
 /// let vars = mds::load_vars_str(r#"{"name": "World", "count": 42}"#)?;
 /// let result = mds::compile_virtual(
 ///     std::collections::HashMap::from([
-///         ("main.mds".to_string(), "Hello {name}!\n".to_string()),
+///         ("main.mds".to_string(), "Hello {{name}}!\n".to_string()),
 ///     ]),
 ///     "main.mds",
 ///     Some(vars),

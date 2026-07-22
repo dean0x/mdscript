@@ -34,7 +34,7 @@
 //! ```js
 //! const { compile, compileFile, check, checkFile } = require('./index');
 //!
-//! const result = compile('Hello {name}!\n', { vars: { name: 'World' } });
+//! const result = compile('Hello {{name}}!\n', { vars: { name: 'World' } });
 //! console.log(result.kind);   // "markdown"
 //! console.log(result.output); // "Hello World!\n"
 //!
