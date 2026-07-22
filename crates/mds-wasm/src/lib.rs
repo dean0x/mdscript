@@ -25,13 +25,13 @@
 //!
 //! await init();
 //!
-//! const result = compile('Hello {name}!\n', {
+//! const result = compile('Hello {{name}}!\n', {
 //!   vars: { name: 'World' },
 //!   filename: 'input.mds',
 //! });
 //! console.log(result.output); // "Hello World!\n"
 //!
-//! check('Hello {name}!\n', { vars: { name: 'World' } });
+//! check('Hello {{name}}!\n', { vars: { name: 'World' } });
 //! ```
 
 use std::collections::HashMap;
@@ -706,7 +706,7 @@ fn build_canonical_js(result: mds::CompileResult) -> Result<JsValue, JsValue> {
 /// ## Example (JavaScript)
 ///
 /// ```js
-/// const result = compile('Hello {name}!\n', { vars: { name: 'World' } });
+/// const result = compile('Hello {{name}}!\n', { vars: { name: 'World' } });
 /// console.log(result.kind);   // "markdown"
 /// console.log(result.output); // "Hello World!\n"
 /// ```
@@ -758,7 +758,7 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// ## Example (JavaScript)
 ///
 /// ```js
-/// const result = check('---\nname: World\n---\nHello {name}!\n');
+/// const result = check('---\nname: World\n---\nHello {{name}}!\n');
 /// console.log(result.warnings); // []
 /// ```
 #[wasm_bindgen]
@@ -863,8 +863,8 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 ///
 /// ```js
 /// const result = lintVirtual(
-///   { 'main.mds': '@import { greet } from "./helper.mds"\n{greet("World")}\n',
-///     'helper.mds': '@define greet(name): Hello {name}!\n@end\n' },
+///   { 'main.mds': '@import { greet } from "./helper.mds"\n{{greet("World")}}\n',
+///     'helper.mds': '@define greet(name): Hello {{name}}!\n@end\n' },
 ///   'main.mds',
 /// );
 /// console.log(result.files.length); // number of files with findings
