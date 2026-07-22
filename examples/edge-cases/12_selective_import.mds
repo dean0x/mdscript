@@ -7,8 +7,8 @@ name: World
 
 # Welcome
 
-Hello {bold(name)}!
+Hello {{bold(name)}}!
 
-{badge("Status", "Active")}
+{{badge("Status", "Active")}}
 
-{teacher("Physics")}
+{{teacher("Physics")}}

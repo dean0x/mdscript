@@ -30,21 +30,21 @@ show_inactive: false
 
 @for dept in departments:
 @if dept.active:
-## {dept.name}
+## {{dept.name}}
 
 @for team in dept.teams:
-### {team.name} (Lead: {team.lead})
+### {{team.name}} (Lead: {{team.lead}})
 
 @for member in team.members:
 @if member.senior:
-- **{member.name}** (Senior)
+- **{{member.name}}** (Senior)
 @else:
-- {member.name}
+- {{member.name}}
 @end
 @end
 
 @end
 @elseif show_inactive:
-## {dept.name} (Inactive)
+## {{dept.name}} (Inactive)
 @end
 @end

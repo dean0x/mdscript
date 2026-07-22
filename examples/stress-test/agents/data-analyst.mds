@@ -31,24 +31,24 @@ output_format: markdown
 @import "../lib/index.mds" as lib
 @import "../shared/output-formats.mds"
 
-# {lib.bold(agent_name)} Configuration
+# {{lib.bold(agent_name)}} Configuration
 
-{lib.badge("Version", version)}
-{lib.badge("Model", model)}
+{{lib.badge("Version", version)}}
+{{lib.badge("Model", model)}}
 
 ## Capabilities
 
 @for cap in capabilities:
-- {lib.code(cap)}
+- {{lib.code(cap)}}
 @end
 
 ## Tools
 
 @for tool in tools:
 @if tool.safe:
-- {lib.bold(tool.name)} ({tool.type}) — Safe
+- {{lib.bold(tool.name)}} ({{tool.type}}) — Safe
 @else:
-- {lib.bold(tool.name)} ({tool.type}) — Requires approval
+- {{lib.bold(tool.name)}} ({{tool.type}}) — Requires approval
 @end
 @end
 
@@ -56,10 +56,10 @@ output_format: markdown
 
 Allowed schemas:
 @for schema in constraints.allowed_schemas:
-- `{schema}`
+- `{{schema}}`
 @end
 
-Max rows: {constraints.max_rows} | Timeout: {constraints.timeout}s
+Max rows: {{constraints.max_rows}} | Timeout: {{constraints.timeout}}s
 
 @if debug:
 ## Debug Mode
@@ -70,9 +70,9 @@ Debug logging is enabled. All queries will be logged.
 ## Output
 
 @if output_format == "json":
-{format_output("json", debug)}
+{{format_output("json", debug)}}
 @elseif output_format == "markdown":
-{format_output("markdown", debug)}
+{{format_output("markdown", debug)}}
 @else:
-{format_output("plain", debug)}
+{{format_output("plain", debug)}}
 @end

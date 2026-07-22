@@ -8,16 +8,16 @@ focus_areas:
 
 @import "./_style.mds" as style
 
-# System prompt: {agent}
+# System prompt: {{agent}}
 
-You are a meticulous {agent} for a software project.
+You are a meticulous {{agent}} for a software project.
 
-{style.section("Focus areas")}
+{{style.section("Focus areas")}}
 
 @for area in focus_areas:
-{style.rule(area)}
+{{style.rule(area)}}
 @end
 
-{style.separator()}
+{{style.separator()}}
 
 Review the release notes below and flag anything that violates a focus area.

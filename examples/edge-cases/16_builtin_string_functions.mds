@@ -4,17 +4,17 @@ greeting: "Hello, World!"
 sentence: "the quick brown fox"
 ---
 
-UPPER: {upper(name)}
-LOWER: {lower(greeting)}
-TRIM: [{trim(name)}]
-REPLACE: {replace(greeting, "World", "MDS")}
+UPPER: {{upper(name)}}
+LOWER: {{lower(greeting)}}
+TRIM: [{{trim(name)}}]
+REPLACE: {{replace(greeting, "World", "MDS")}}
 
-STARTS_WITH true: {starts_with(greeting, "Hello")}
-STARTS_WITH false: {starts_with(greeting, "Goodbye")}
-ENDS_WITH true: {ends_with(greeting, "World!")}
-ENDS_WITH false: {ends_with(greeting, "Earth!")}
-CONTAINS true: {contains(sentence, "brown")}
-CONTAINS false: {contains(sentence, "red")}
+STARTS_WITH true: {{starts_with(greeting, "Hello")}}
+STARTS_WITH false: {{starts_with(greeting, "Goodbye")}}
+ENDS_WITH true: {{ends_with(greeting, "World!")}}
+ENDS_WITH false: {{ends_with(greeting, "Earth!")}}
+CONTAINS true: {{contains(sentence, "brown")}}
+CONTAINS false: {{contains(sentence, "red")}}
 
-SLICE with end: [{slice(greeting, 0, 5)}]
-SLICE without end: [{slice(greeting, 7)}]
+SLICE with end: [{{slice(greeting, 0, 5)}}]
+SLICE without end: [{{slice(greeting, 7)}}]

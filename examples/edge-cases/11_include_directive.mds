@@ -6,7 +6,7 @@ name: Test
 
 # Header
 
-This is the main content for {name}.
+This is the main content for {{name}}.
 
 ## Included Guardrails Module
 

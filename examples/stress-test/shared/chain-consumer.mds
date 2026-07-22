@@ -6,8 +6,8 @@ topic: Algebra
 
 # Module Chain Test
 
-{chain.bold("Testing 3-level import chain")}
+{{chain.bold("Testing 3-level import chain")}}
 
-{chain.safety_rules()}
+{{chain.safety_rules()}}
 
-{chain.teacher(topic)}
+{{chain.teacher(topic)}}

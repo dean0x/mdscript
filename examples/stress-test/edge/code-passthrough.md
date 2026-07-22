@@ -3,11 +3,10 @@ language: Python
 framework: FastAPI
 ---
 
-@import "../lib/formatting.mds" as fmt
 
-# {{fmt.bold(language)}} Code Examples
+# **Python** Code Examples
 
-Here's a {{language}} example using {{framework}}:
+Here's a Python example using FastAPI:
 
 ```python
 from fastapi import FastAPI
@@ -22,7 +21,7 @@ config = {"key": "value", "nested": {"deep": True}}
 template = f"Hello {name}!"
 ```
 
-After the code block, interpolation resumes: {{language}} with {{framework}}.
+After the code block, interpolation resumes: Python with FastAPI.
 
 ```json
 {
@@ -33,4 +32,4 @@ After the code block, interpolation resumes: {{language}} with {{framework}}.
 }
 ```
 
-Final interpolation: {{fmt.badge("Stack", language)}}
+Final interpolation: **Stack**: `Python`

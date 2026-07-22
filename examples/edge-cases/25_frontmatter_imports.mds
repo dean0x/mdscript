@@ -9,19 +9,19 @@ imports:
   - path: ../prompt-library/personas.mds
 ---
 
-# {fmt.bold(topic)}
+# {{fmt.bold(topic)}}
 
 ## Alias import (fmt.bold, fmt.badge)
 
-{fmt.badge("Feature", "Frontmatter Imports")}
-{fmt.badge("Version", "0.2.0")}
+{{fmt.badge("Feature", "Frontmatter Imports")}}
+{{fmt.badge("Version", "0.2.0")}}
 
 ## Selective import (safety_rules, tone_professional)
 
-{safety_rules()}
+{{safety_rules()}}
 
-{tone_professional()}
+{{tone_professional()}}
 
 ## Merge import (teacher from personas)
 
-{teacher("MDS Templates")}
+{{teacher("MDS Templates")}}

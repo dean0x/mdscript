@@ -19,15 +19,15 @@ tools:
 
 @for name, config in tools:
 @if config.tier == "premium":
-- **{name}** (Premium): {config.description}
+- **{{name}}** (Premium): {{config.description}}
 @else:
-- **{name}**: {config.description}
+- **{{name}}**: {{config.description}}
 @end
 @end
 
 @define tool_list(registry):
 @for tool_name, tool_config in registry:
-- {tool_name}: {tool_config.description} [{tool_config.tier}]
+- {{tool_name}}: {{tool_config.description}} [{{tool_config.tier}}]
 @end
 @end
 

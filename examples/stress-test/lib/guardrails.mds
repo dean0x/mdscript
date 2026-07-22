@@ -22,9 +22,9 @@ Respond with well-structured Markdown using headers, lists, and code blocks wher
 
 @define output_format(format_name):
 @if format_name == "json":
-{output_json()}
+{{output_json()}}
 @elseif format_name == "markdown":
-{output_markdown()}
+{{output_markdown()}}
 @else:
 Respond in plain text. No special formatting required.
 @end

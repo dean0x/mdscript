@@ -16,61 +16,61 @@ items:
 ---
 
 CHAIN: split → trim → upper (nested calls):
-{upper(trim(first(split(raw_tags, ","))))}
+{{upper(trim(first(split(raw_tags, ","))))}}
 
 CHAIN: split → sort → join:
-{join(sort(split("cherry,apple,banana", ",")), " < ")}
+{{join(sort(split("cherry,apple,banana", ",")), " < ")}}
 
 CHAIN: split → unique → sort → join (note: split preserves whitespace):
-{join(sort(unique(split(raw_tags, ","))), ", ")}
+{{join(sort(unique(split(raw_tags, ","))), ", ")}}
 
 CHAIN: split → reverse → first:
-{first(reverse(split("a,b,c,d", ",")))}
+{{first(reverse(split("a,b,c,d", ",")))}}
 
 CHAIN: split → length:
-{length(split(raw_tags, ","))}
+{{length(split(raw_tags, ","))}}
 
 CHAIN: replace → upper:
-{upper(replace("hello world", "world", "mds"))}
+{{upper(replace("hello world", "world", "mds"))}}
 
 CHAIN: trim → lower → replace:
-{replace(lower(trim("  HELLO WORLD  ")), "hello", "hi")}
+{{replace(lower(trim("  HELLO WORLD  ")), "hello", "hi")}}
 
 CHAIN: slice → upper:
-{upper(slice("hello world", 0, 5))}
+{{upper(slice("hello world", 0, 5))}}
 
 @define format_name(person):
-{trim(person.name)}
+{{trim(person.name)}}
 @end
 
 @define format_entry(person):
-- {upper(trim(person.name))}: {person.role}
+- {{upper(trim(person.name))}}: {{person.role}}
 @end
 
 CHAIN with functions:
 @for item in items:
 @if item.active:
-{format_entry(item)}
+{{format_entry(item)}}
 @end
 @end
 
 @define name_and_role(person, sep = " — "):
-{upper(trim(person.name))}{sep}{person.role}
+{{upper(trim(person.name))}}{{sep}}{{person.role}}
 @end
 
 CHAIN default arg + builtins:
 @for item in items:
 @if item.active:
-{name_and_role(item)}
-{name_and_role(item, ": ")}
+{{name_and_role(item)}}
+{{name_and_role(item, ": ")}}
 @end
 @end
 
 CHAIN: reverse string:
-{reverse("abcde")}
+{{reverse("abcde")}}
 
 CHAIN: slice → reverse:
-{reverse(slice("abcdefgh", 2, 6))}
+{{reverse(slice("abcdefgh", 2, 6))}}
 
 CHAIN: replace → split → join:
-{join(split(replace("a.b.c.d", ".", "-"), "-"), " / ")}
+{{join(split(replace("a.b.c.d", ".", "-"), "-"), " / ")}}

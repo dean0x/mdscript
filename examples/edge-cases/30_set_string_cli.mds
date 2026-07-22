@@ -22,7 +22,7 @@ mds build examples/edge-cases/30_set_string_cli.mds --set-string id=007 -o -
 mds build examples/edge-cases/30_set_string_cli.mds --set id=1 --set-string id=007 -o -
 ~~~
 
-Rendered id: {id}
+Rendered id: {{id}}
 
 @if number(id) == 7:
 - `number(id) == 7` — bridging to a number yields 7 in every mode; leading zeros are gone.

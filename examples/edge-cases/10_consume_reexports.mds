@@ -4,8 +4,8 @@ subject: Mathematics
 
 @import "./09_reexport_chain.mds" as lib
 
-{lib.safety_rules()}
+{{lib.safety_rules()}}
 
-{lib.teacher(subject)}
+{{lib.teacher(subject)}}
 
-Here is a {lib.bold("key concept")} in {lib.italic(subject)}.
+Here is a {{lib.bold("key concept")}} in {{lib.italic(subject)}}.

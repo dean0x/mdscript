@@ -2,11 +2,11 @@
 language: Python
 ---
 
-## Working with {language}
+## Working with {{language}}
 
-Here's how to use string formatting in {language}:
+Here's how to use string formatting in {{language}}:
 
-Escaped braces: \{variable\} should appear literally.
+Escaped braces: {variable} should appear literally.
 
 ```python
 name = "World"
@@ -14,7 +14,7 @@ print(f"Hello {name}!")  # This should NOT be interpolated
 result = {"key": "value"}  # This should NOT be interpolated
 ```
 
-After the code block, interpolation resumes: {language} is great!
+After the code block, interpolation resumes: {{language}} is great!
 
 Another code block with template syntax:
 
@@ -25,4 +25,4 @@ This is literal text inside a code fence.
 {this_is_also_literal}
 ```
 
-Back to normal: {language} rocks.
+Back to normal: {{language}} rocks.

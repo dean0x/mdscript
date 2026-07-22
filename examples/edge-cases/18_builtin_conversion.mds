@@ -7,19 +7,19 @@ nothing: null
 numeric_str: "123"
 ---
 
-STRING from number: [{string(num)}]
-STRING from float: [{string(pi)}]
-STRING from bool: [{string(flag)}]
-STRING from null: [{string(nothing)}]
+STRING from number: [{{string(num)}}]
+STRING from float: [{{string(pi)}}]
+STRING from bool: [{{string(flag)}}]
+STRING from null: [{{string(nothing)}}]
 
-NUMBER from string: {number(numeric_str)}
-NUMBER from bool true: {number(flag)}
-NUMBER from bool false: {number(false_val)}
-NUMBER from null: {number(nothing)}
+NUMBER from string: {{number(numeric_str)}}
+NUMBER from bool true: {{number(flag)}}
+NUMBER from bool false: {{number(false_val)}}
+NUMBER from null: {{number(nothing)}}
 
 @define show_type(val):
-converted: {string(val)}
+converted: {{string(val)}}
 @end
 
-{show_type(num)}
-{show_type(flag)}
+{{show_type(num)}}
+{{show_type(flag)}}

@@ -4,7 +4,7 @@ task: code review
 ---
 
 @message system:
-You are {agent}, ready to perform a {task}.
+You are {{agent}}, ready to perform a {{task}}.
 @end
 
 @message user:

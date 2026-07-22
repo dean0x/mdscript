@@ -31,44 +31,44 @@ sections:
 @import "../prompt-library/formatting.mds" as fmt
 @import "../prompt-library/guardrails.mds" as guard
 
-{guard.tone_professional()}
+{{guard.tone_professional()}}
 
 You are a technical blog writer. Generate a detailed blog post based on the
 following specification.
 
-{fmt.separator()}
+{{fmt.separator()}}
 
-# {title}
+# {{title}}
 
-{fmt.badge("Author", author)} | {fmt.badge("Date", date)} | {fmt.badge("Audience", audience)}
+{{fmt.badge("Author", author)}} | {{fmt.badge("Date", date)}} | {{fmt.badge("Audience", audience)}}
 
 ## Tags
 
 @for tag in tags:
-- `#{tag}`
+- `#{{tag}}`
 @end
 
-{fmt.separator()}
+{{fmt.separator()}}
 
 ## Article Structure
 
 @for section in sections:
-### {section.title}
+### {{section.title}}
 
 Cover the following key points in this section:
 
 @for point in section.key_points:
-- {point}
+- {{point}}
 @end
 
 @end
 
-{fmt.separator()}
+{{fmt.separator()}}
 
 ## Writing Guidelines
 
 - Use concrete examples and code snippets where appropriate
 - Include diagrams described in Mermaid syntax
-- Target {audience} — assume familiarity with basic concepts
+- Target {{audience}} — assume familiarity with basic concepts
 - Keep paragraphs concise — max 4 sentences each
 - End with actionable takeaways

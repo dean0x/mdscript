@@ -17,24 +17,24 @@ max_file_edits: 10
 
 @import "./shared.mds" as shared
 
-# {agent} Configuration (v{version})
+# {{agent}} Configuration (v{{version}})
 
-{shared.preamble()}
+{{shared.preamble()}}
 
 ## Capabilities
 
 @for cap in capabilities:
-- {cap}
+- {{cap}}
 @end
 
 ## Rules
 
 @for rule in rules:
-1. {rule}
+1. {{rule}}
 @end
 
 ## Limits
 
-- Maximum file edits per turn: **{max_file_edits}**
+- Maximum file edits per turn: **{{max_file_edits}}**
 
-{shared.footer()}
+{{shared.footer()}}

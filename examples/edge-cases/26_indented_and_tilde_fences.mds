@@ -2,7 +2,7 @@
 language: Rust
 ---
 
-## Code Fences in {language} — indented, tilde, and blockquoted variants
+## Code Fences in {{language}} — indented, tilde, and blockquoted variants
 
 The MDS compiler recognises indented, tilde, and blockquoted code-fence variants in addition to standard backtick fences.
 No interpolation occurs inside any of them.
@@ -22,7 +22,7 @@ fn greet(name: &str) -> String {
 }
 ~~~
 
-After the tilde fence, interpolation resumes: {language} is great!
+After the tilde fence, interpolation resumes: {{language}} is great!
 
 ### 3. Indented fence (4 spaces prefix)
 
@@ -37,7 +37,7 @@ A list item whose code block is indented:
     let msg = format!("{}", 42);
     ```
 
-- Item three continues normally — {language} is back.
+- Item three continues normally — {{language}} is back.
 
 ### 4. Blockquoted fence (`> \`\`\``)
 
@@ -47,4 +47,4 @@ A list item whose code block is indented:
 > fn main() { println!("Hello"); }
 > ```
 
-Back in normal body: the language is {language}.
+Back in normal body: the language is {{language}}.

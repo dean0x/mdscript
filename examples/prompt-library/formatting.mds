@@ -3,27 +3,27 @@ type: mds
 ---
 
 @define bold(text):
-**{text}**
+**{{text}}**
 @end
 
 @define italic(text):
-*{text}*
+*{{text}}*
 @end
 
 @define h1(text):
-# {text}
+# {{text}}
 @end
 
 @define h2(text):
-## {text}
+## {{text}}
 @end
 
 @define h3(text):
-### {text}
+### {{text}}
 @end
 
 @define badge(label, value):
-**{label}**: `{value}`
+**{{label}}**: `{{value}}`
 @end
 
 @define separator():
@@ -31,7 +31,7 @@ type: mds
 @end
 
 @define blockquote(text):
-> {text}
+> {{text}}
 @end
 
 @export bold

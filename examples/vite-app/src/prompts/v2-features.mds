@@ -13,12 +13,12 @@ verbose: false
 @import "./rules.mds" as rules
 
 @define agent_header(name, title = "AI Assistant"):
-# {upper(trim(name))} — {title}
+# {{upper(trim(name))}} — {{title}}
 @end
 
 @define capability_list(caps, style = "bullet"):
 @for cap in caps:
-- {upper(first(split(cap, " ")))} — {cap}
+- {{upper(first(split(cap, " ")))}} — {{cap}}
 @end
 @end
 
@@ -34,30 +34,30 @@ Status: RESTRICTED
 @end
 @end
 
-{agent_header(agent_name)}
+{{agent_header(agent_name)}}
 
-{status_badge(active, admin)}
+{{status_badge(active, admin)}}
 
-## Capabilities ({length(unique(capabilities))} unique)
+## Capabilities ({{length(unique(capabilities))}} unique)
 
-{capability_list(capabilities)}
+{{capability_list(capabilities)}}
 
 ## Standards
 
-{rules.coding_standards()}
+{{rules.coding_standards()}}
 
 @if admin && active:
 ## Admin Tools
 
-Full diagnostic access enabled for {trim(agent_name)}.
-First capability: {first(sort(unique(capabilities)))}
+Full diagnostic access enabled for {{trim(agent_name)}}.
+First capability: {{first(sort(unique(capabilities)))}}
 @end
 
 @if verbose || admin:
 ## Debug Info
 
-Agent: {upper(trim(agent_name))}
-Capabilities (sorted): {join(sort(unique(capabilities)), ", ")}
-Reverse: {reverse(trim(agent_name))}
-Name length: {length(trim(agent_name))}
+Agent: {{upper(trim(agent_name))}}
+Capabilities (sorted): {{join(sort(unique(capabilities)), ", ")}}
+Reverse: {{reverse(trim(agent_name))}}
+Name length: {{length(trim(agent_name))}}
 @end

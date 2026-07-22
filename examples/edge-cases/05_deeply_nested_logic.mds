@@ -26,24 +26,24 @@ show_paused: false
 # Project Report
 
 @for user in users:
-## {user.name} ({user.role})
+## {{user.name}} ({{user.role}})
 
 @for project in user.projects:
 @if project.active:
-### {project.name} — Active
+### {{project.name}} — Active
 
 Tasks:
 @for task in project.tasks:
-- [ ] {task}
+- [ ] {{task}}
 @end
 
 @else:
 @if show_paused:
-### {project.name} — Paused
+### {{project.name}} — Paused
 
 Tasks:
 @for task in project.tasks:
-- [x] {task} (on hold)
+- [x] {{task}} (on hold)
 @end
 
 @end

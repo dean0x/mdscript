@@ -22,16 +22,16 @@ strict_output: true
 @import "../lib/index.mds" as lib
 @import "../shared/output-formats.mds"
 
-# {lib.bold(orchestrator_name)}
+# {{lib.bold(orchestrator_name)}}
 
-{lib.badge("Max Concurrent", max_concurrent)}
-{lib.badge("Fallback", fallback_strategy)}
+{{lib.badge("Max Concurrent", max_concurrent)}}
+{{lib.badge("Fallback", fallback_strategy)}}
 
 ## Active Sub-Agents
 
 @for agent in sub_agents:
 @if agent.active:
-- {lib.bold(agent.name)} — Role: {lib.code(agent.role)}
+- {{lib.bold(agent.name)}} — Role: {{lib.code(agent.role)}}
 @end
 @end
 
@@ -39,7 +39,7 @@ strict_output: true
 
 @for agent in sub_agents:
 @if !agent.active:
-- ~~{agent.name}~~ — Role: {lib.code(agent.role)} (disabled)
+- ~~{{agent.name}}~~ — Role: {{lib.code(agent.role)}} (disabled)
 @end
 @end
 
@@ -48,7 +48,7 @@ strict_output: true
 @if max_concurrent == 1:
 Running in sequential mode — one agent at a time.
 @else:
-Running up to {max_concurrent} agents concurrently.
+Running up to {{max_concurrent}} agents concurrently.
 @end
 
 @if fallback_strategy == "queue":
@@ -56,7 +56,7 @@ When at capacity, additional tasks are queued.
 @elseif fallback_strategy == "reject":
 When at capacity, additional tasks are rejected.
 @else:
-Fallback strategy: {fallback_strategy}
+Fallback strategy: {{fallback_strategy}}
 @end
 
-{format_output("json", strict_output)}
+{{format_output("json", strict_output)}}

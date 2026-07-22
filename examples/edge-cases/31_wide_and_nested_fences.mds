@@ -18,7 +18,7 @@ print("{lang} is NOT interpolated in here")
 ````
 
 The inner three-backtick line above does not close the four-backtick fence;
-only a run of four-or-more backticks does. Back in the body, {lang} interpolates.
+only a run of four-or-more backticks does. Back in the body, {{lang}} interpolates.
 
 ### Mismatched markers never cross-close
 
@@ -30,4 +30,4 @@ A tilde run never closes a backtick fence, so the tildes below stay literal:
 ~~~
 ```
 
-After the backtick fence: {lang}.
+After the backtick fence: {{lang}}.

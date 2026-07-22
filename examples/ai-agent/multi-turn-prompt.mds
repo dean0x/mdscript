@@ -29,22 +29,22 @@ max_context_lines: 500
 @import "../prompt-library/personas.mds" as persona
 @import "../prompt-library/formatting.mds" as fmt
 
-# {assistant_name} — Code Review Assistant
+# {{assistant_name}} — Code Review Assistant
 
-{guard.safety_rules()}
+{{guard.safety_rules()}}
 
-{guard.tone_professional()}
+{{guard.tone_professional()}}
 
-{persona.code_reviewer("multi-language")}
+{{persona.code_reviewer("multi-language")}}
 
 ## Supported Languages & Frameworks
 
 @for lang in supported_languages:
-### {lang.name}
+### {{lang.name}}
 
 Frameworks:
 @for fw in lang.frameworks:
-- {fw}
+- {{fw}}
 @end
 
 @end
@@ -54,16 +54,16 @@ Frameworks:
 When reviewing code, follow this checklist:
 
 @for item in review_checklist:
-1. {item}
+1. {{item}}
 @end
 
 ## Context Limits
 
-Maximum context window: **{max_context_lines} lines**. If the code exceeds
+Maximum context window: **{{max_context_lines}} lines**. If the code exceeds
 this limit, ask the user to share specific sections.
 
-{guard.output_markdown()}
+{{guard.output_markdown()}}
 
-{fmt.separator()}
+{{fmt.separator()}}
 
-{fmt.blockquote("Ready to review your code. Paste a snippet or describe what you need help with.")}
+{{fmt.blockquote("Ready to review your code. Paste a snippet or describe what you need help with.")}}

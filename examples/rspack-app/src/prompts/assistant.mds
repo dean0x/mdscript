@@ -8,14 +8,14 @@ tasks:
 verbose: true
 ---
 
-# {name}
+# {{name}}
 
-You are **{name}**, an expert in JavaScript build tooling.
+You are **{{name}}**, an expert in JavaScript build tooling.
 
 ## Core Tasks
 
 @for task in tasks:
-- {task}
+- {{task}}
 @end
 
 @if verbose:

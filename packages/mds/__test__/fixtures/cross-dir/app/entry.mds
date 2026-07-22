@@ -4,4 +4,4 @@ user: World
 
 @import "../lib/helpers.mds" as helpers
 
-{helpers.greet(user)}
+{{helpers.greet(user)}}
