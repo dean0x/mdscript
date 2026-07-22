@@ -250,11 +250,11 @@ fn evaluate_nodes(
                             map.cursor, abs_out,
                             "cursor invariant violated at EscapedBrace offset={offset}"
                         );
-                        // Source span: '\{' is 2 source bytes (backslash + brace).
-                        map.push_segment(abs_out, *offset as u32, 2);
+                        // Source span: `\{{` is 3 source bytes (backslash + two braces).
+                        map.push_segment(abs_out, *offset as u32, 3);
                     }
                 }
-                output.push('{');
+                output.push_str("{{");
                 if let Some(ref mut map) = ctx.map {
                     map.cursor = saved_cursor + output.len() as u32;
                 }
@@ -475,10 +475,10 @@ fn render_expr(expr: &Expr, scope: &mut Scope, ctx: &mut EvalContext) -> Result<
             // Build a descriptive error depending on the expression type
             let hint = match expr {
                 Expr::Var(name) => format!(
-                    "cannot interpolate object '{name}' directly, access a specific field with dot notation (e.g. {{{name}.field}})"
+                    "cannot interpolate object '{name}' directly, access a specific field with dot notation (e.g. {{{{{name}.field}}}})"
                 ),
                 Expr::MemberAccess { object, fields } => format!(
-                    "cannot interpolate object directly, access a specific field with dot notation (e.g. {{{object}.{field}}})",
+                    "cannot interpolate object directly, access a specific field with dot notation (e.g. {{{{{object}.{field}}}}})",
                     field = fields.last().map_or("field", |f| f.as_str())
                 ),
                 _ => "cannot interpolate an object value directly".to_string(),
@@ -1600,13 +1600,13 @@ mod tests {
         let nodes = vec![
             text("Use "),
             Node::EscapedBrace { offset: 4 },
-            text("name} for interpolation"),
+            text("name}} for interpolation"),
         ];
         let mut scope = Scope::new();
         let mut warnings = vec![];
         assert_eq!(
             evaluate(&nodes, &mut scope, &mut warnings, "", "").unwrap(),
-            "Use {name} for interpolation"
+            "Use {{name}} for interpolation"
         );
     }
 
@@ -1886,7 +1886,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_used_when_not_provided() {
         let result = crate::compile_str_md(
-            "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet()}\n",
+            "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n{{greet()}}\n",
         )
         .unwrap();
         assert_eq!(result, "Hello World!\n");
@@ -1895,7 +1895,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_overridden_when_provided() {
         let result = crate::compile_str_md(
-            "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet(\"Alice\")}\n",
+            "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n{{greet(\"Alice\")}}\n",
         )
         .unwrap();
         assert_eq!(result, "Hello Alice!\n");
@@ -1904,7 +1904,7 @@ mod tests {
     #[test]
     fn evaluate_all_defaults_provided() {
         let result =
-            crate::compile_str_md("@define add(a = 1, b = 2):\n{a} {b}\n@end\n{add(10, 20)}\n")
+            crate::compile_str_md("@define add(a = 1, b = 2):\n{{a}} {{b}}\n@end\n{{add(10, 20)}}\n")
                 .unwrap();
         assert_eq!(result, "10 20\n");
     }
@@ -1912,7 +1912,7 @@ mod tests {
     #[test]
     fn evaluate_mixed_required_and_default() {
         let result = crate::compile_str_md(
-            "@define greet(name, greeting = \"Hello\"):\n{greeting} {name}!\n@end\n{greet(\"Bob\")}\n",
+            "@define greet(name, greeting = \"Hello\"):\n{{greeting}} {{name}}!\n@end\n{{greet(\"Bob\")}}\n",
         )
         .unwrap();
         assert_eq!(result, "Hello Bob!\n");
@@ -1921,7 +1921,7 @@ mod tests {
     #[test]
     fn evaluate_default_param_number() {
         // literal_expr_to_value: Expr::NumberLiteral → Value::Number
-        let result = crate::compile_str_md("@define show(x = 42):\n{x}\n@end\n{show()}\n").unwrap();
+        let result = crate::compile_str_md("@define show(x = 42):\n{{x}}\n@end\n{{show()}}\n").unwrap();
         assert!(
             result.contains("42"),
             "Number default should produce its numeric value, got: {result}"
@@ -1932,7 +1932,7 @@ mod tests {
     fn evaluate_default_param_boolean_true() {
         // literal_expr_to_value: Expr::BooleanLiteral(true) → Value::Boolean(true)
         let result = crate::compile_str_md(
-            "@define show(flag = true):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{show()}\n",
+            "@define show(flag = true):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{{show()}}\n",
         )
         .unwrap();
         assert!(
@@ -1945,7 +1945,7 @@ mod tests {
     fn evaluate_default_param_boolean_false() {
         // literal_expr_to_value: Expr::BooleanLiteral(false) → Value::Boolean(false)
         let result = crate::compile_str_md(
-            "@define show(flag = false):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{show()}\n",
+            "@define show(flag = false):\n@if flag:\nyes\n@else:\nno\n@end\n@end\n{{show()}}\n",
         )
         .unwrap();
         assert!(
@@ -1958,7 +1958,7 @@ mod tests {
     fn evaluate_default_param_null() {
         // literal_expr_to_value: Expr::NullLiteral → Value::Null (falsy)
         let result = crate::compile_str_md(
-            "@define show(x = null):\n@if x:\nset\n@else:\nnull_branch\n@end\n@end\n{show()}\n",
+            "@define show(x = null):\n@if x:\nset\n@else:\nnull_branch\n@end\n@end\n{{show()}}\n",
         )
         .unwrap();
         assert!(
@@ -1969,7 +1969,7 @@ mod tests {
 
     #[test]
     fn evaluate_arity_error_on_too_few_required_args() {
-        let result = crate::compile_str_md("@define greet(name):\n{name}\n@end\n{greet()}\n");
+        let result = crate::compile_str_md("@define greet(name):\n{{name}}\n@end\n{{greet()}}\n");
         assert!(result.is_err(), "too few required args should fail");
     }
 
@@ -1985,7 +1985,7 @@ mod tests {
         // Body has a leading blank line and a trailing blank line around the content.
         // After edge-trim the blank lines are removed; only the content (and its
         // trailing newline from the template output) survives.
-        let src = "@define body():\n\nHello.\n\n@end\n{body()}\n";
+        let src = "@define body():\n\nHello.\n\n@end\n{{body()}}\n";
         let result = crate::compile_str_md(src).unwrap();
         assert_eq!(
             result, "Hello.\n",
@@ -1997,7 +1997,7 @@ mod tests {
     fn define_edge_trim_preserves_interior_blank_run() {
         // Body has leading blank lines, an interior blank run, and trailing blank lines.
         // Edge-trim removes the outer blank lines; the interior blank run is preserved.
-        let src = "@define body():\n\nLine one.\n\nLine two.\n\n@end\n{body()}\n";
+        let src = "@define body():\n\nLine one.\n\nLine two.\n\n@end\n{{body()}}\n";
         let result = crate::compile_str_md(src).unwrap();
         assert_eq!(
             result, "Line one.\n\nLine two.\n",
@@ -2009,7 +2009,7 @@ mod tests {
     fn define_edge_trim_leading_indentation_stripped() {
         // A leading newline before indented content: edge-trim removes the leading
         // whitespace (newline) while preserving the body content.
-        let src = "@define body():\n\nContent here.\n@end\n{body()}\n";
+        let src = "@define body():\n\nContent here.\n@end\n{{body()}}\n";
         let result = crate::compile_str_md(src).unwrap();
         assert_eq!(
             result, "Content here.\n",
@@ -2021,7 +2021,7 @@ mod tests {
 
     #[test]
     fn builtin_upper_in_interpolation() {
-        let result = crate::compile_str_md("---\nword: hello\n---\n{upper(word)}\n").unwrap();
+        let result = crate::compile_str_md("---\nword: hello\n---\n{{upper(word)}}\n").unwrap();
         assert!(
             result.contains("HELLO"),
             "upper() should uppercase, got: {result}"
@@ -2030,7 +2030,7 @@ mod tests {
 
     #[test]
     fn builtin_lower_in_interpolation() {
-        let result = crate::compile_str_md("---\nword: HELLO\n---\n{lower(word)}\n").unwrap();
+        let result = crate::compile_str_md("---\nword: HELLO\n---\n{{lower(word)}}\n").unwrap();
         assert!(
             result.contains("hello"),
             "lower() should lowercase, got: {result}"
@@ -2039,7 +2039,7 @@ mod tests {
 
     #[test]
     fn builtin_length_string_in_interpolation() {
-        let result = crate::compile_str_md("---\nword: hello\n---\n{length(word)}\n").unwrap();
+        let result = crate::compile_str_md("---\nword: hello\n---\n{{length(word)}}\n").unwrap();
         assert!(
             result.contains('5'),
             "length of 'hello' should be 5, got: {result}"
@@ -2049,7 +2049,7 @@ mod tests {
     #[test]
     fn builtin_shadowed_by_user_function() {
         // A user-defined function named 'upper' should shadow the built-in.
-        let src = "@define upper(x):\ncustom\n@end\n{upper(\"anything\")}\n";
+        let src = "@define upper(x):\ncustom\n@end\n{{upper(\"anything\")}}\n";
         let result = crate::compile_str_md(src).unwrap();
         assert_eq!(
             result.trim(),
@@ -2061,7 +2061,7 @@ mod tests {
     #[test]
     fn builtin_compose_join_split() {
         let result =
-            crate::compile_str_md("---\ncsv: a,b,c\n---\n{join(split(csv, \",\"), \" | \")}\n")
+            crate::compile_str_md("---\ncsv: a,b,c\n---\n{{join(split(csv, \",\"), \" | \")}}\n")
                 .unwrap();
         assert!(
             result.contains("a | b | c"),
@@ -2071,7 +2071,7 @@ mod tests {
 
     #[test]
     fn builtin_string_with_number_literal_arg() {
-        let result = crate::compile_str_md("{string(42)}\n").unwrap();
+        let result = crate::compile_str_md("{{string(42)}}\n").unwrap();
         assert_eq!(result.trim(), "42");
     }
 
@@ -2115,7 +2115,7 @@ mod tests {
     #[test]
     fn block_with_interpolation_renders_inline() {
         // A @block body that contains interpolation resolves variables from scope.
-        let src = "---\nname: Alice\n---\n@block greeting:\nHello {name}!\n@end\n";
+        let src = "---\nname: Alice\n---\n@block greeting:\nHello {{name}}!\n@end\n";
         let result = crate::compile_str_md(src).unwrap();
         assert!(
             result.contains("Hello Alice!"),
@@ -2244,7 +2244,7 @@ mod tests {
     #[test]
     fn for_array_loop_messages_mode() {
         // Each @message is emitted once per iteration.
-        let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n@message user:\n{item}\n@end\n@end\n";
+        let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n@message user:\n{{item}}\n@end\n@end\n";
         let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
         assert_eq!(
             messages.len(),
@@ -2261,7 +2261,7 @@ mod tests {
         // Object keys must appear in alphabetical order regardless of insertion order.
         // Use a run-time vars injection so keys don't appear in the source/frontmatter
         // and we only find them in the loop body output.
-        let src = "@for k, v in obj:\n{k}\n@end\n";
+        let src = "@for k, v in obj:\n{{k}}\n@end\n";
         use std::collections::HashMap;
         let obj = crate::value::Value::Object(HashMap::from([
             ("zebra".to_string(), crate::value::Value::Number(1.0)),
@@ -2284,7 +2284,7 @@ mod tests {
     #[test]
     fn for_key_value_alpha_sort_messages_mode() {
         // Same alpha-sort requirement applies in messages mode.
-        let src = "---\nobj:\n  zebra: 1\n  apple: 2\n  mango: 3\n---\n@for k, v in obj:\n@message user:\n{k}\n@end\n@end\n";
+        let src = "---\nobj:\n  zebra: 1\n  apple: 2\n  mango: 3\n---\n@for k, v in obj:\n@message user:\n{{k}}\n@end\n@end\n";
         let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
         assert_eq!(messages.len(), 3, "messages mode: expected 3 messages");
         let keys: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
@@ -2399,7 +2399,7 @@ mod tests {
     fn for_loop_var_shadows_outer_var_text_mode() {
         // A loop variable with the same name as an outer variable shadows it
         // for the duration of the loop body, then the outer value is restored.
-        let src = "---\nitem: outer\nitems:\n  - inner\n---\nbefore:{item}\n@for item in items:\nduring:{item}\n@end\nafter:{item}\n";
+        let src = "---\nitem: outer\nitems:\n  - inner\n---\nbefore:{{item}}\n@for item in items:\nduring:{{item}}\n@end\nafter:{{item}}\n";
         let result = crate::compile_str_md(src).unwrap();
         assert!(
             result.contains("before:outer"),
@@ -2418,7 +2418,7 @@ mod tests {
     #[test]
     fn for_loop_var_shadows_outer_var_messages_mode() {
         // Same shadowing behaviour in messages mode.
-        let src = "---\nitem: outer\nitems:\n  - inner\n---\n@message system:\nbefore:{item}\n@end\n@for item in items:\n@message user:\nduring:{item}\n@end\n@end\n@message system:\nafter:{item}\n@end\n";
+        let src = "---\nitem: outer\nitems:\n  - inner\n---\n@message system:\nbefore:{{item}}\n@end\n@for item in items:\n@message user:\nduring:{{item}}\n@end\n@end\n@message system:\nafter:{{item}}\n@end\n";
         let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
         assert_eq!(messages.len(), 3, "expected 3 messages");
         assert_eq!(
