@@ -396,6 +396,75 @@ mod tests {
     }
 
     #[test]
+    fn detects_message_dynamic_role_directive() {
+        // `@message {role}:` (single-brace dynamic role) → flagged with atomic fix.
+        let diags = check_src("@message {role}:\nhi\n@end\n");
+        assert_eq!(
+            diags.len(),
+            1,
+            "single-brace @message role should be flagged"
+        );
+        assert_eq!(diags[0].rule, RULE);
+        let edits = diags[0].fix_edits.as_ref().unwrap();
+        assert_eq!(edits.len(), 1, "single atomic edit for @message role");
+        // `{role}` starts at byte 9 in "@message {role}:" and spans 6 bytes.
+        assert_eq!(edits[0].start, 9, "fix starts at `{{` of the role");
+        assert_eq!(edits[0].end, 15, "fix ends exclusive after `}}`");
+        assert_eq!(
+            edits[0].new_text, "{{role}}",
+            "role migrated to double brace"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_double_brace_message_role() {
+        // `@message {{role}}:` is already new syntax — must not be flagged.
+        let diags = check_src("@message {{role}}:\nhi\n@end\n");
+        assert!(
+            diags.is_empty(),
+            "double-brace @message role must not be flagged"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_bareword_message_role() {
+        // `@message system:` bare-word role — no braces, nothing to migrate.
+        let diags = check_src("@message system:\nhi\n@end\n");
+        assert!(
+            diags.is_empty(),
+            "bare-word @message role must not be flagged"
+        );
+    }
+
+    #[test]
+    fn multibyte_prefix_offsets_are_byte_accurate() {
+        // Non-ASCII prefix (`é` is 2 UTF-8 bytes) must not skew the byte offsets of
+        // the fix edit — risk area: multi-byte offset correctness.
+        // "café {name}!": c0 a1 f2 é3-4 space5 {6 n7 a8 m9 e10 }11 !12
+        let src = "café {name}!";
+        let diags = check_src(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "one legacy interpolation after a multibyte prefix"
+        );
+        let edits = diags[0].fix_edits.as_ref().unwrap();
+        assert_eq!(
+            edits[0].start, 6,
+            "`{{` sits at byte 6 after `café ` (é is 2 bytes)"
+        );
+        assert_eq!(edits[0].end, 12, "exclusive end after `}}` at byte 12");
+        assert_eq!(edits[0].new_text, "{{name}}");
+        // The edit range must land on char boundaries in the original source.
+        assert!(src.is_char_boundary(edits[0].start));
+        assert!(src.is_char_boundary(edits[0].end));
+        // Applying the edit yields the correctly-migrated string.
+        let mut applied = src.to_string();
+        applied.replace_range(edits[0].start..edits[0].end, &edits[0].new_text);
+        assert_eq!(applied, "café {{name}}!");
+    }
+
+    #[test]
     fn fix_edits_single_atomic_replacement() {
         // Regression: must emit ONE atomic TextEdit, not split open/close.
         // Split edits allow per-edit fallback to accept only the close-brace half,
