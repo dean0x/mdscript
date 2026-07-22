@@ -40,7 +40,7 @@ pub(crate) fn check(
     for token in tokens {
         match token {
             Token::Text(text, base_offset) => {
-                check_text(text, *base_offset, source, filename, severity, builder);
+                check_text(text, *base_offset, filename, severity, builder);
             }
             Token::Directive(line, offset) => {
                 check_directive(line, *offset, source, filename, severity, builder);
@@ -54,7 +54,6 @@ pub(crate) fn check(
 fn check_text(
     text: &str,
     base: usize,
-    _source: &str,
     filename: &str,
     severity: Severity,
     builder: &mut LintResultBuilder,
@@ -290,7 +289,7 @@ fn is_legacy_expr(s: &str) -> bool {
         return true;
     }
     // Dot path: a.b.c
-    if s.split('.').all(is_valid_identifier) && s.contains('.') {
+    if s.contains('.') && s.split('.').all(is_valid_identifier) {
         return true;
     }
     // Function call: name(...)
