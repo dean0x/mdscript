@@ -3,10 +3,10 @@ name: "Rene"
 emoji: "Hello"
 ---
 
-Greetings {name}! {emoji}
+Greetings {{name}}! {{emoji}}
 
 ```python
 x = {not_interpolated}
 ```
 
-Farewell {name}!
+Farewell {{name}}!

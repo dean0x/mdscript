@@ -1,5 +1,5 @@
 ---
 name: World
 ---
-Hello {name}!
+Hello {{name}}!
 This is line two.

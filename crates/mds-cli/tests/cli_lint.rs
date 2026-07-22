@@ -303,7 +303,7 @@ fn fix_check_exits_1_when_fixes_pending_and_never_writes() {
 
 #[test]
 fn stdin_mode_report_only_sends_diagnostics_to_stderr() {
-    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
     let out = lint_stdin(source, &[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -326,7 +326,7 @@ fn stdin_mode_report_only_sends_diagnostics_to_stderr() {
 
 #[test]
 fn stdin_fix_mode_writes_fixed_source_to_stdout() {
-    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
     let out = lint_stdin(source, &["--fix"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -433,7 +433,7 @@ fn directory_mode_lints_all_files_including_partials() {
 
 #[test]
 fn fix_json_stdin_is_usage_error_exit_2() {
-    let out = lint_stdin("Hello {name}!", &["--fix", "--format", "json"]);
+    let out = lint_stdin("Hello {{name}}!", &["--fix", "--format", "json"]);
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -973,7 +973,7 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
     // (residual after fix): reuse lint_error.mds (duplicate-export) content plus the
     // unused frontmatter key from lint_warn_only.mds.
     let mixed = "---\ngreeting: Hello\nunused_key: not referenced\n---\n\n\
-                  @define greet(name):\n  Hello {name}!\n@end\n\n\
+                  @define greet(name):\n  Hello {{name}}!\n@end\n\n\
                   @export greet\n@export greet\n";
     let target = subdir.join("mixed.mds");
     fs::write(&target, mixed).unwrap();
@@ -1264,7 +1264,7 @@ fn partially_fixed_end_to_end_count_in_summary() {
 
 #[test]
 fn stdin_lint_diagnostic_includes_code_frame() {
-    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
     let out = lint_stdin(source, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
@@ -1406,7 +1406,7 @@ fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
 #[test]
 fn stdin_fix_check_exits_1_and_writes_nothing_to_stdout() {
     // A fixable source — duplicate-export, Tier A.
-    let source = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
     let out = lint_stdin(source, &["--fix", "--check"]);
 
     // Must exit 1: fix is pending, --check signals "would change".
@@ -1606,7 +1606,7 @@ fn lint_fix_preserves_mode_0644() {
     // and no residual warning, so --fix exits 0 (clean after fix).
     fs::write(
         &target,
-        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+        "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n",
     )
     .unwrap();
     // Set 0644 explicitly before invoking --fix.
@@ -1645,7 +1645,7 @@ fn lint_write_failure_includes_filename_in_stderr() {
     // A single Tier A auto-fixable issue so lint will attempt to write the file.
     fs::write(
         &target,
-        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+        "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n",
     )
     .unwrap();
 
@@ -1692,7 +1692,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_single_file() {
     // Tier A auto-fixable content.
     fs::write(
         &target,
-        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+        "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n",
     )
     .unwrap();
 
@@ -1736,7 +1736,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     let target = inner.join("no_fixed_label_dir.mds");
     fs::write(
         &target,
-        "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n",
+        "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n",
     )
     .unwrap();
 
@@ -1884,7 +1884,7 @@ fn lint_dir_nested_malformed_config_per_file_error() {
     // Clean file in root — no mds.json present, defaults apply.
     fs::write(
         root.join("clean.mds"),
-        "---\ngreeting: hi\n---\n{greeting} world!\n",
+        "---\ngreeting: hi\n---\n{{greeting}} world!\n",
     )
     .unwrap();
 
@@ -1894,7 +1894,7 @@ fn lint_dir_nested_malformed_config_per_file_error() {
     fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
     fs::write(
         bad.join("bad.mds"),
-        "---\ngreeting: hi\n---\n{greeting} world!\n",
+        "---\ngreeting: hi\n---\n{{greeting}} world!\n",
     )
     .unwrap();
 

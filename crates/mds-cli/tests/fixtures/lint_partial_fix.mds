@@ -5,7 +5,7 @@
 @export empty_fn
 
 @define greet(name):
-  Hello {name}!
+  Hello {{name}}!
 @end
 
 @export greet

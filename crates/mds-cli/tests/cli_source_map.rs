@@ -617,7 +617,7 @@ fn sm14_stdin_source_map_inline_produces_carrier() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let result = child.wait_with_output().unwrap();
@@ -1031,7 +1031,7 @@ fn sm14b_stdin_source_map_sidecar_relabels_source_to_stdin() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let result = child.wait_with_output().unwrap();

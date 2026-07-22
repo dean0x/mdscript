@@ -2,4 +2,4 @@
 unused_key: default
 ---
 
-Hello {required_var}!
+Hello {{required_var}}!

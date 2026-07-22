@@ -3,4 +3,4 @@ type: mds
 name: World
 ---
 
-Hello {name}!
+Hello {{name}}!

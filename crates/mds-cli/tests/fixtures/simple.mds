@@ -3,4 +3,4 @@ name: Alice
 count: 3
 ---
 
-Hello {name}! You have {count} items.
+Hello {{name}}! You have {{count}} items.

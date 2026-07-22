@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 #[test]
 fn frontmatter_preserved_in_str_output() {
-    let result = mds::compile_str("---\nname: World\n---\nHello {name}!\n")
+    let result = mds::compile_str("---\nname: World\n---\nHello {{name}}!\n")
         .unwrap()
         .into_markdown()
         .unwrap();
@@ -13,7 +13,7 @@ fn frontmatter_preserved_in_str_output() {
 
 #[test]
 fn frontmatter_type_mds_stripped() {
-    let source = "---\ntype: mds\nname: Alice\n---\nHello {name}!\n";
+    let source = "---\ntype: mds\nname: Alice\n---\nHello {{name}}!\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("---\nname: Alice\n---\n"),
@@ -53,7 +53,7 @@ fn frontmatter_empty_no_fences() {
 #[test]
 fn frontmatter_runtime_override_doesnt_alter_output() {
     // The frontmatter in the output reflects original values; the body uses overridden values.
-    let source = "---\nname: Alice\n---\nHello {name}!\n";
+    let source = "---\nname: Alice\n---\nHello {{name}}!\n";
     let mut vars = HashMap::new();
     vars.insert("name".to_string(), mds::Value::String("Bob".to_string()));
     let result = mds::compile_str_with(source, None, Some(vars))
@@ -83,7 +83,7 @@ fn frontmatter_only_no_body() {
 
 #[test]
 fn frontmatter_with_objects_preserved() {
-    let source = "---\nconfig:\n  theme: dark\n  debug: true\n---\n{config.theme}\n";
+    let source = "---\nconfig:\n  theme: dark\n  debug: true\n---\n{{config.theme}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("config:"),
@@ -105,12 +105,12 @@ fn frontmatter_imported_module_not_emitted() {
     let main_path = dir.path().join("main.mds");
     std::fs::write(
         &lib_path,
-        "---\nlibkey: libval\n---\n@define greet(n):\nHi {n}!\n@end\n",
+        "---\nlibkey: libval\n---\n@define greet(n):\nHi {{n}}!\n@end\n",
     )
     .unwrap();
     std::fs::write(
         &main_path,
-        "---\nmainkey: mainval\n---\n@import \"./lib.mds\"\n{greet(\"World\")}\n",
+        "---\nmainkey: mainval\n---\n@import \"./lib.mds\"\n{{greet(\"World\")}}\n",
     )
     .unwrap();
     let result = mds::compile(&main_path, None)
@@ -132,7 +132,7 @@ fn strip_type_mds_only_strips_top_level_key() {
     // Regression: strip_type_mds used line.trim() before matching, which caused
     // indented 'type: mds' lines inside nested YAML objects to be incorrectly removed.
     // Only the top-level (no leading whitespace) 'type: mds' directive should be stripped.
-    let source = "---\ntype: mds\nconfig:\n  type: mds\n  theme: dark\n---\n{config.theme}\n";
+    let source = "---\ntype: mds\nconfig:\n  type: mds\n  theme: dark\n---\n{{config.theme}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     // The top-level `type: mds` must not appear as an unindented frontmatter key.
     // Check that no line in the output equals "type: mds" (i.e. no leading whitespace).
@@ -208,7 +208,7 @@ fn type_key_available_in_mds_files() {
 #[test]
 fn yaml_map_type_works() {
     // YAML map values are now supported as objects with dot-notation access.
-    let source = "---\nconfig:\n  key: value\n---\n{config.key}\n";
+    let source = "---\nconfig:\n  key: value\n---\n{{config.key}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("value\n"), "got: {result}");
 }

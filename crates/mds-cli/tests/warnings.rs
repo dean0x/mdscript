@@ -17,7 +17,7 @@ fn check_collecting_warnings_returns_warnings_for_empty_include() {
 #[test]
 fn check_str_collecting_warnings_no_warnings_for_clean_source() {
     // A well-formed source with no warnings should return an empty warnings vec.
-    let source = "---\nname: Test\n---\nHello {name}!\n";
+    let source = "---\nname: Test\n---\nHello {{name}}!\n";
     let ((), warnings) = mds::check_str_collecting_warnings(source, None, None)
         .expect("check_str_collecting_warnings should succeed on clean source");
     assert!(
@@ -30,7 +30,7 @@ fn check_str_collecting_warnings_no_warnings_for_clean_source() {
 fn check_str_collecting_warnings_errors_on_invalid_source() {
     // check_str_collecting_warnings should return Err for sources with compile errors,
     // independently of CLI argument parsing.
-    let source = "{undefined_variable}";
+    let source = "{{undefined_variable}}";
     let result = mds::check_str_collecting_warnings(source, None, None);
     assert!(
         result.is_err(),

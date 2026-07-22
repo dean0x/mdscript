@@ -1,12 +1,12 @@
 @define bullet_list(items):
 @for item in items:
-- {item}
+- {{item}}
 @end
 @end
 
 @define numbered_list(items):
 @for item in items:
-1. {item}
+1. {{item}}
 @end
 @end
 

@@ -34,7 +34,7 @@ fn create_messages_mds(dir: &Path, name: &str) {
 
 /// A syntactically invalid .mds file (undefined variable causes a compile error).
 fn create_bad_mds(dir: &Path, name: &str) {
-    fs::write(dir.join(name), "{undefined_var_xyz}\n").unwrap();
+    fs::write(dir.join(name), "{{undefined_var_xyz}}\n").unwrap();
 }
 
 fn build_dir(dir: &Path, extra_args: &[&str]) -> std::process::Output {

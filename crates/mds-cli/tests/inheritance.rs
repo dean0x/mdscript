@@ -186,7 +186,7 @@ fn f6_deep_merge_base_only_key_visible_in_child() {
 
     std::fs::write(
         &base_path,
-        "---\nbase_key: base_value\n---\n@block body:\n{base_key}\n@end\n",
+        "---\nbase_key: base_value\n---\n@block body:\n{{base_key}}\n@end\n",
     )
     .unwrap();
     // Child inherits base_key but doesn't override it.
@@ -215,7 +215,7 @@ fn f8_block_body_with_control_flow_and_interp() {
 
     std::fs::write(
         &base_path,
-        "---\nmode: default\n---\n@block body:\n@if mode == \"verbose\":\nVERBOSE: {mode}\n@else:\nSTD: {mode}\n@end\n@end\n",
+        "---\nmode: default\n---\n@block body:\n@if mode == \"verbose\":\nVERBOSE: {{mode}}\n@else:\nSTD: {{mode}}\n@end\n@end\n",
     )
     .unwrap();
     std::fs::write(
@@ -506,7 +506,7 @@ fn e12_base_default_undefined_var_render_points_at_base() {
 
     std::fs::write(
         &base_path,
-        "@block greeting:\nHello {customer_name}, welcome.\n@end\n",
+        "@block greeting:\nHello {{customer_name}}, welcome.\n@end\n",
     )
     .unwrap();
     std::fs::write(&child_path, "@extends \"./base.mds\"\n").unwrap();
@@ -545,7 +545,7 @@ fn e12_check_and_build_diagnostics_match() {
     let base_path = dir.path().join("base.mds");
     let child_path = dir.path().join("child.mds");
 
-    std::fs::write(&base_path, "@block content:\n{missing_var}\n@end\n").unwrap();
+    std::fs::write(&base_path, "@block content:\n{{missing_var}}\n@end\n").unwrap();
     std::fs::write(&child_path, "@extends \"./base.mds\"\n").unwrap();
 
     let (_, build_stderr, build_ok) = build_file(child_path.to_str().unwrap());

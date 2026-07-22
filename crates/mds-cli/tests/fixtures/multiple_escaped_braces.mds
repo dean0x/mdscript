@@ -3,4 +3,4 @@ a: hello
 b: world
 ---
 
-\{a\} and \{b\}
+{a} and {b}

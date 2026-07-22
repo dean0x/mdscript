@@ -119,7 +119,7 @@ fn unicode_content() {
 
 #[test]
 fn compile_str_simple() {
-    let source = "---\nname: World\n---\nHello {name}!\n";
+    let source = "---\nname: World\n---\nHello {{name}}!\n";
     let result = mds::compile_str_with(source, None, None)
         .unwrap()
         .into_markdown()
@@ -219,11 +219,11 @@ fn multiple_escaped_braces() {
         .unwrap()
         .into_markdown()
         .unwrap();
-    // \{a\} → literal '{a}' and \{b\} → literal '{b}'
-    // Per spec: both \{ and \} are escape sequences, producing literal { and }
+    // In the new syntax, {a} and {b} are literal text (single braces = literal).
+    // The fixture uses `{a} and {b}` which outputs them verbatim.
     assert!(
         result.contains("{a") && result.contains("{b"),
-        "escaped braces should produce literal '{{', got: {result}"
+        "single-brace text should appear literally in output, got: {result}"
     );
 }
 
@@ -314,7 +314,7 @@ fn crlf_line_endings() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("crlf.mds");
     // Write the file with \r\n line endings (Windows style).
-    std::fs::write(&path, b"---\r\nname: Alice\r\n---\r\nHello {name}!\r\n").unwrap();
+    std::fs::write(&path, b"---\r\nname: Alice\r\n---\r\nHello {{name}}!\r\n").unwrap();
 
     let result = mds::compile(&path, None).unwrap().into_markdown().unwrap();
     assert!(
@@ -361,7 +361,7 @@ fn single_quote_string_literal_in_function_args() {
 #[test]
 fn zero_parameter_function() {
     // @define separator(): produces a fixed separator string with no params
-    let source = "@define separator():\n---\n@end\n{separator()}\n";
+    let source = "@define separator():\n---\n@end\n{{separator()}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("---"),
@@ -372,7 +372,7 @@ fn zero_parameter_function() {
 #[test]
 fn empty_function_body() {
     // @define empty(): @end — calling it should succeed and produce empty string
-    let source = "@define empty():\n@end\nBefore{empty()}After\n";
+    let source = "@define empty():\n@end\nBefore{{empty()}}After\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("BeforeAfter"),
@@ -404,9 +404,9 @@ fn function_returning_inner_call() {
         inner-result\n\
         @end\n\
         @define outer():\n\
-        {inner()}\n\
+        {{inner()}}\n\
         @end\n\
-        {outer()}\n";
+        {{outer()}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("inner-result"),
@@ -416,7 +416,7 @@ fn function_returning_inner_call() {
 
 #[test]
 fn loop_single_element_array() {
-    let source = "---\nitems: [only]\n---\n@for item in items:\n- {item}\n@end\n";
+    let source = "---\nitems: [only]\n---\n@for item in items:\n- {{item}}\n@end\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("- only"),
@@ -426,19 +426,21 @@ fn loop_single_element_array() {
 
 #[test]
 fn escaped_brace_inside_function_body() {
-    // \{ in MDS source renders as a literal {, so \{literal} produces {literal}
-    let source = "@define show():\n\\{literal}\n@end\n{show()}\n";
+    // In the new syntax, single braces are literal text — no backslash escape needed.
+    // {literal} inside a @define body outputs as the literal string "{literal}".
+    let source = "@define show():\n{literal}\n@end\n{{show()}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("{literal}"),
-        "escaped brace inside function body should render as literal brace, got: {result}"
+        "single-brace text inside function body should render as literal, got: {result}"
     );
 }
 
 #[test]
 fn variable_interpolation_in_function_argument() {
-    // {greet(name)} where name is a frontmatter variable
-    let source = "---\nname: Alice\n---\n@define greet(who):\nHello {who}!\n@end\n{greet(name)}\n";
+    // {{greet(name)}} calls greet with the frontmatter variable `name`
+    let source =
+        "---\nname: Alice\n---\n@define greet(who):\nHello {{who}}!\n@end\n{{greet(name)}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("Hello Alice!"),
@@ -448,90 +450,91 @@ fn variable_interpolation_in_function_argument() {
 
 #[test]
 fn escaped_braces_in_function_body() {
-    // Per spec: both \{ and \} are escape sequences producing literal braces.
-    // So \{curly braces\} → "{curly braces}" in output.
+    // In the new syntax, single braces are literal text — {curly braces} appears verbatim
+    // while {{x}} interpolates the parameter. So the fixture produces:
+    // "Use {curly braces} for interpolation: Alice"
     let result = mds::compile(fixture("escaped_brace_in_fn.mds"), None)
         .unwrap()
         .into_markdown()
         .unwrap();
     assert!(
         result.contains("{curly braces"),
-        "escaped brace in function body should produce literal brace, got: {result}"
+        "single-brace text in function body should appear literally, got: {result}"
     );
     assert!(
         result.contains("Alice"),
-        "interpolation inside function body should still work, got: {result}"
+        "double-brace interpolation inside function body should resolve the param, got: {result}"
     );
 }
 
 #[test]
 fn escaped_braces_in_blocks() {
-    // Per spec: both \{ and \} are escape sequences producing literal braces.
-    // So \{variable\} => "{variable}" and \{item\} => "{item}".
+    // In the new syntax, {variable} and {item} on the left side are literal text.
+    // {{item}} on the right interpolates the loop variable.
+    // @if body: "Syntax: {variable}"
+    // @for body: "{item} = a" and "{item} = b"
     let result = mds::compile(fixture("escaped_brace_in_blocks.mds"), None)
         .unwrap()
         .into_markdown()
         .unwrap();
     assert!(
         result.contains("{variable"),
-        "escaped brace in @if body should produce literal brace, got: {result}"
+        "single-brace text in @if body should appear literally, got: {result}"
     );
     assert!(
         result.contains("{item") && result.contains("= a"),
-        "escaped brace in @for body should produce literal brace for 'a', got: {result}"
+        "single-brace literal {{item}} in @for body with interpolated value 'a', got: {result}"
     );
     assert!(
         result.contains("{item") && result.contains("= b"),
-        "escaped brace in @for body should produce literal brace for 'b', got: {result}"
+        "single-brace literal {{item}} in @for body with interpolated value 'b', got: {result}"
     );
 }
 
 #[test]
-fn escaped_close_brace_produces_literal_brace() {
-    // `\}` should produce a literal `}` in output, symmetric with `\{` → `{`.
-    let result = mds::compile_str("Use \\} to close.")
+fn single_close_brace_is_literal() {
+    // In the new syntax, a lone `}` is already literal — no escape needed.
+    let result = mds::compile_str("Use } to close.")
         .unwrap()
         .into_markdown()
         .unwrap();
     assert!(
         result.contains('}'),
-        "\\}} should produce a literal `}}`, got: {result}"
-    );
-    assert!(
-        !result.contains("\\}"),
-        "backslash should be stripped before `}}`, got: {result}"
+        "lone `}}` should appear literally in output, got: {result}"
     );
 }
 
 #[test]
-fn escaped_open_and_close_brace_together() {
-    // `\{not interpolated\}` should produce `{not interpolated}` in output.
-    let result = mds::compile_str("\\{not interpolated\\}")
+fn double_brace_escape_produces_literal_double_brace() {
+    // `\{{` is the escape for a literal `{{` in output.
+    // `}}` (closing double-brace) is already literal text — no escape needed.
+    let result = mds::compile_str("\\{{not interpolated}}")
         .unwrap()
         .into_markdown()
         .unwrap();
     assert!(
-        result.contains("{not interpolated}"),
-        "expected `{{not interpolated}}` in output, got: {result}"
+        result.contains("{{not interpolated}}"),
+        "\\{{...}} should produce literal `{{{{...}}}}` in output, got: {result}"
     );
 }
 
 #[test]
-fn escaped_close_brace_in_function_body() {
-    // `\}` inside a @define body should also produce a literal `}`.
-    let source = "@define show():\nresult\\}\n@end\n{show()}\n";
+fn single_brace_in_function_body_is_literal() {
+    // In the new syntax, `}` inside a @define body is already literal — no backslash needed.
+    // Call uses double-brace interpolation `{{show()}}`.
+    let source = "@define show():\nresult}\n@end\n{{show()}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("result}"),
-        "escaped `}}` inside function body should render as literal `}}`, got: {result}"
+        "bare `}}` inside function body should render as literal `}}`, got: {result}"
     );
 }
 
 #[test]
 fn loop_var_not_visible_after_loop() {
     // The loop variable is scoped to the @for...@end block.
-    // After the loop, attempting to use it should fail.
-    let source = "---\nitems: [a, b]\n---\n@for item in items:\n- {item}\n@end\n{item}\n";
+    // After the loop, attempting to use it with {{item}} should fail.
+    let source = "---\nitems: [a, b]\n---\n@for item in items:\n- {{item}}\n@end\n{{item}}\n";
     let result = mds::compile_str(source);
     assert!(
         result.is_err(),
@@ -547,8 +550,8 @@ fn loop_var_not_visible_after_loop() {
 #[test]
 fn function_param_not_visible_outside_function() {
     // Function parameters are scoped to the function body.
-    // After the call, the param name is not in scope.
-    let source = "@define greet(name):\nHello {name}!\n@end\n{greet(\"Alice\")}\n{name}\n";
+    // After the call, {{name}} should fail — no frontmatter `name` in scope.
+    let source = "@define greet(name):\nHello {{name}}!\n@end\n{{greet(\"Alice\")}}\n{{name}}\n";
     let result = mds::compile_str(source);
     assert!(
         result.is_err(),
@@ -575,7 +578,7 @@ fn compile_str_empty_frontmatter() {
 #[test]
 fn compile_str_truly_no_frontmatter() {
     // Source with no --- fences at all is valid per spec (frontmatter is optional).
-    let source = "@define greet(name):\nHi {name}!\n@end\n{greet(\"World\")}\n";
+    let source = "@define greet(name):\nHi {{name}}!\n@end\n{{greet(\"World\")}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("Hi World!"),
@@ -1195,7 +1198,7 @@ fn elseif_short_circuit_only_matched_branch_evaluates() {
 #[test]
 fn builtin_upper_golden_path() {
     // mds build code path: {upper(word)} produces uppercase output
-    let source = "---\nword: hello\n---\n{upper(word)}\n";
+    let source = "---\nword: hello\n---\n{{upper(word)}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("HELLO"),
@@ -1205,7 +1208,7 @@ fn builtin_upper_golden_path() {
 
 #[test]
 fn builtin_lower_golden_path() {
-    let source = "---\nword: WORLD\n---\n{lower(word)}\n";
+    let source = "---\nword: WORLD\n---\n{{lower(word)}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("world"),
@@ -1216,7 +1219,7 @@ fn builtin_lower_golden_path() {
 #[test]
 fn builtin_trim_golden_path() {
     // Use compile_str_with to avoid frontmatter passthrough containing the raw value
-    let source = "@define show(w):\n{trim(w)}\n@end\n{show(\"  hi  \")}\n";
+    let source = "@define show(w):\n{{trim(w)}}\n@end\n{{show(\"  hi  \")}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("hi"),
@@ -1230,7 +1233,7 @@ fn builtin_trim_golden_path() {
 
 #[test]
 fn builtin_length_string_golden_path() {
-    let source = "---\nword: hello\n---\n{length(word)}\n";
+    let source = "---\nword: hello\n---\n{{length(word)}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains('5'),
@@ -1241,7 +1244,7 @@ fn builtin_length_string_golden_path() {
 #[test]
 fn builtin_join_split_golden_path() {
     // Compose split + join: split("a,b,c", ",") then join with " | "
-    let source = "---\ncsv: a,b,c\n---\n{join(split(csv, \",\"), \" | \")}\n";
+    let source = "---\ncsv: a,b,c\n---\n{{join(split(csv, \",\"), \" | \")}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("a | b | c"),
@@ -1254,7 +1257,7 @@ fn builtin_arity_mismatch_error_via_check() {
     // mds check code path: calling upper() with zero args must fail with arity error
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad_arity.mds");
-    std::fs::write(&path, "{upper()}\n").unwrap();
+    std::fs::write(&path, "{{upper()}}\n").unwrap();
     let result = mds::check(&path, None);
     assert!(
         result.is_err(),
@@ -1272,7 +1275,7 @@ fn builtin_too_many_args_error_via_check() {
     // mds check code path: calling trim() with two args must fail with arity error
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad_arity2.mds");
-    std::fs::write(&path, "---\na: hello\nb: world\n---\n{trim(a, b)}\n").unwrap();
+    std::fs::write(&path, "---\na: hello\nb: world\n---\n{{trim(a, b)}}\n").unwrap();
     let result = mds::check(&path, None);
     assert!(
         result.is_err(),
@@ -1290,7 +1293,7 @@ fn builtin_too_many_args_error_via_check() {
 #[test]
 fn default_arg_string_used_when_omitted() {
     // mds build code path: calling greet() without arg uses string default "World"
-    let source = "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet()}\n";
+    let source = "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n{{greet()}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("Hello World!"),
@@ -1300,7 +1303,7 @@ fn default_arg_string_used_when_omitted() {
 
 #[test]
 fn default_arg_overridden_when_provided() {
-    let source = "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet(\"Alice\")}\n";
+    let source = "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n{{greet(\"Alice\")}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("Hello Alice!"),
@@ -1310,7 +1313,7 @@ fn default_arg_overridden_when_provided() {
 
 #[test]
 fn default_arg_number_used_when_omitted() {
-    let source = "@define show(x = 42):\nvalue={x}\n@end\n{show()}\n";
+    let source = "@define show(x = 42):\nvalue={{x}}\n@end\n{{show()}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("value=42"),
@@ -1325,7 +1328,7 @@ fn default_arg_check_valid_call() {
     let path = dir.path().join("default_ok.mds");
     std::fs::write(
         &path,
-        "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet()}\n{greet(\"Alice\")}\n",
+        "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n{{greet()}}\n{{greet(\"Alice\")}}\n",
     )
     .unwrap();
     let result = mds::check(&path, None);
@@ -1343,7 +1346,7 @@ fn default_arg_arity_error_too_many_args_via_check() {
     let path = dir.path().join("too_many.mds");
     std::fs::write(
         &path,
-        "@define greet(name = \"World\"):\nHello {name}!\n@end\n{greet(\"Alice\", \"extra\")}\n",
+        "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n{{greet(\"Alice\", \"extra\")}}\n",
     )
     .unwrap();
     let result = mds::check(&path, None);

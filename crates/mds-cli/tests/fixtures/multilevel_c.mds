@@ -1,5 +1,5 @@
 @define deepfn(name):
-Deep: {name}
+Deep: {{name}}
 @end
 
 @export deepfn

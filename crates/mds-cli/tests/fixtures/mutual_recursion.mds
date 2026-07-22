@@ -2,11 +2,11 @@
 name: test
 ---
 @define foo(x):
-{bar(x)}
+{{bar(x)}}
 @end
 
 @define bar(x):
-{foo(x)}
+{{foo(x)}}
 @end
 
-{foo(name)}
+{{foo(name)}}

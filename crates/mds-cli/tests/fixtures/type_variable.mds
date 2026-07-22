@@ -1,4 +1,4 @@
 ---
 type: assistant
 ---
-My type is {type}.
+My type is {{type}}.

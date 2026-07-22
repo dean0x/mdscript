@@ -1,5 +1,5 @@
 @define recurse(x):
-{recurse(x)}
+{{recurse(x)}}
 @end
 
-{recurse("test")}
+{{recurse("test")}}

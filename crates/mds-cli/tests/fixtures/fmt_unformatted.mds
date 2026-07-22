@@ -2,7 +2,7 @@
 name: World
 ---
 @if name:   
-Hello {name}!
+Hello {{name}}!
 
 
 

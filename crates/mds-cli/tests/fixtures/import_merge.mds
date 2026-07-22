@@ -1,4 +1,4 @@
 @import "./utils.mds"
 
-{greet("Bob")}
-{farewell("Bob")}
+{{greet("Bob")}}
+{{farewell("Bob")}}

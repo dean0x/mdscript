@@ -1,2 +1,2 @@
 @import "./lint_nonexistent_file_xyz.mds" as lib
-Hello {lib.greeting}!
+Hello {{lib.greeting}}!

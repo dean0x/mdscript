@@ -3,8 +3,8 @@ name: Bob
 ---
 
 @define greet(person):
-Hello {person}!
+Hello {{person}}!
 @end
 
-{greet("Alice")}
-{greet(name)}
+{{greet("Alice")}}
+{{greet(name)}}
