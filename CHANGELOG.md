@@ -13,7 +13,7 @@ Interpolation now uses **double braces**: `{{variable}}`, `{{obj.field}}`,
 `{{func("arg")}}`, `{{alias.func()}}`. Single `{` and `}` are always **literal
 text** — no escaping needed for lone braces.
 
-#### Interpolation syntax changed (#TBD)
+#### Interpolation syntax changed (#236)
 
 Templates using the old `{var}` form will no longer interpolate — they will emit
 the literal text `{var}` instead. This affects every template that uses variable
