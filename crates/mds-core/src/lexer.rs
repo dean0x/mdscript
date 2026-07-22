@@ -283,10 +283,7 @@ impl<'a> Lexer<'a> {
             }
 
             // Outside a string: check for closing `}}`
-            if c == '}'
-                && self.pos + 1 < self.chars.len()
-                && self.chars[self.pos + 1] == '}'
-            {
+            if c == '}' && self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '}' {
                 self.pos += 2; // skip `}}`
                 found_close = true;
                 break;
@@ -761,7 +758,9 @@ mod tests {
     fn lone_brace_is_plain_text() {
         let tokens = tokenize("JSON: {\"key\": 1}", "test.mds").unwrap();
         // No interpolation should be produced
-        assert!(!tokens.iter().any(|t| matches!(t, Token::Interpolation(_, _))));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
         // Should have text tokens containing the braces
         let text: String = tokens
             .iter()
@@ -776,7 +775,9 @@ mod tests {
     #[test]
     fn lone_open_brace_at_eof_is_text() {
         let tokens = tokenize("end{", "test.mds").unwrap();
-        assert!(!tokens.iter().any(|t| matches!(t, Token::Interpolation(_, _))));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
     }
 
     #[test]
@@ -792,7 +793,9 @@ mod tests {
         // Should NOT produce EscapedBrace (that's only for \{{)
         assert!(!tokens.iter().any(|t| matches!(t, Token::EscapedBrace(_))));
         // Should NOT produce an interpolation
-        assert!(!tokens.iter().any(|t| matches!(t, Token::Interpolation(_, _))));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
     }
 
     #[test]
@@ -842,13 +845,17 @@ mod tests {
         // \{ (not followed by {) — just two plain chars
         let tokens = tokenize("a\\{b", "test.mds").unwrap();
         assert!(!tokens.iter().any(|t| matches!(t, Token::EscapedBrace(_))));
-        assert!(!tokens.iter().any(|t| matches!(t, Token::Interpolation(_, _))));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
     }
 
     #[test]
     fn crlf_inside_interpolation_preserved() {
         // Multi-line interpolation (would be unusual but must not crash)
         let tokens = tokenize("{{name}}\r\n", "test.mds").unwrap();
-        assert!(tokens.iter().any(|t| matches!(t, Token::Interpolation(s, _) if s == "name")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(s, _) if s == "name")));
     }
 }

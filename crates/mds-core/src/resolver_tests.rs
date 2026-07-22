@@ -2821,7 +2821,7 @@ fn a_skeleton_then_standalone_upgrade_preserves_attribution() {
 
     // Second: compile base standalone (A1 upgrade path).
     // (The base compiles fine standalone since {undefined_var} would be provided.)
-    let base_with_var = "@block content:\n{x}\n@end\n";
+    let base_with_var = "@block content:\n{{x}}\n@end\n";
     let base_def = "@block content:\nHello.\n@end\n";
     let files2 = [("base.mds", base_def), ("child.mds", child)];
     let mut cache2 = virtual_cache(&files2);

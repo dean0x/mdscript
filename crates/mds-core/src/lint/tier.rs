@@ -46,6 +46,19 @@ pub fn rule_tier(rule: &str) -> FixTier {
     }
 }
 
+/// Return `true` when applying a fix for this rule is guaranteed to produce
+/// byte-identical compiled output to the original.
+///
+/// All current Tier A / Tier B rules are output-neutral EXCEPT
+/// `legacy-interpolation`, whose fix intentionally changes compiled output:
+/// it migrates `{x}` (plain text in the current engine) to `{{x}}`
+/// (interpolation), so the emitted text changes from a literal brace-wrapped
+/// expression to the interpolated value.  The reverify gate's output-equality
+/// check must be skipped for this rule.
+pub fn is_output_neutral(rule: &str) -> bool {
+    rule != "legacy-interpolation"
+}
+
 /// Return `true` when this diagnostic is auto-fixable (Tier A or B standalone).
 ///
 /// The `is_standalone` flag controls whether Tier B diagnostics are fixable.
@@ -125,6 +138,36 @@ mod tests {
         assert_eq!(rule_tier("unused-variable"), FixTier::C, "unused-variable");
         assert_eq!(rule_tier("redundant-else"), FixTier::C, "redundant-else");
         assert_eq!(rule_tier("shadow-variable"), FixTier::C, "shadow-variable");
+    }
+
+    /// is_output_neutral: legacy-interpolation is NOT output-neutral; all other
+    /// rules are.
+    ///
+    /// This property gates the reverify output-equality check in `plan_and_apply_fixes`
+    /// — the check is skipped when the fix batch contains any non-output-neutral rule.
+    #[test]
+    fn output_neutral_classification() {
+        // The sole output-changing rule:
+        assert!(
+            !is_output_neutral("legacy-interpolation"),
+            "legacy-interpolation must NOT be output-neutral"
+        );
+        // All other known rules are output-neutral:
+        for rule in &[
+            "duplicate-import",
+            "duplicate-export",
+            "unreachable-branch",
+            "empty-block",
+            "unused-import",
+            "unused-function",
+            "unused-variable",
+            "redundant-else",
+            "shadow-variable",
+        ] {
+            assert!(is_output_neutral(rule), "{rule} should be output-neutral");
+        }
+        // Unknown rules default to output-neutral (safe fallback).
+        assert!(is_output_neutral("unknown-rule"));
     }
 
     /// first_occurrence: first call inserts and returns true.

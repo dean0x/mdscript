@@ -33,7 +33,9 @@ pub(crate) mod rules;
 pub(crate) mod tier;
 
 pub use config::LintConfig;
-pub use diagnostic::{sanitize_control_chars, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit};
+pub use diagnostic::{
+    sanitize_control_chars, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit,
+};
 
 use crate::error::MdsError;
 use crate::{lexer, parser};
@@ -84,7 +86,15 @@ pub(crate) fn lint_source(
 
     // Rule dispatch — non-generic plain-fn dispatch (AC-PERF-02, no monomorphization).
     let mut builder = LintResultBuilder::new();
-    run_rules(&module, &ctx, &tokens, source, filename, config, &mut builder);
+    run_rules(
+        &module,
+        &ctx,
+        &tokens,
+        source,
+        filename,
+        config,
+        &mut builder,
+    );
 
     Ok(builder.build(is_standalone))
 }

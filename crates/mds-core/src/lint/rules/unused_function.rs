@@ -132,7 +132,7 @@ mod tests {
     fn unexported_uncalled_fires_when_module_has_exports() {
         // has_explicit_exports=true (there's an @export for `greet`), but `format_name` is unused.
         let src =
-            "@define greet():\nhello\n@end\n@define format_name(x):\n{x}!\n@end\n@export greet\n";
+            "@define greet():\nhello\n@end\n@define format_name(x):\n{{x}}!\n@end\n@export greet\n";
         let diags = lint_src(src);
         assert!(
             diags
@@ -248,7 +248,7 @@ mod tests {
         // `format_name` is defined but never exported or called (has_explicit_exports = true
         // because `greet` is exported); the rule must fire for `format_name`.
         let src =
-            "@define greet():\nhello\n@end\n@define format_name(x):\n{x}!\n@end\n@export greet\n";
+            "@define greet():\nhello\n@end\n@define format_name(x):\n{{x}}!\n@end\n@export greet\n";
         let diags = lint_src(src);
         let d = diags
             .iter()

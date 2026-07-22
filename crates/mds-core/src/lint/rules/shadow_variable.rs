@@ -128,7 +128,7 @@ mod tests {
     /// L-U-SV1 (default-off): Shadow rule is silent with default config.
     #[test]
     fn default_off_produces_no_diagnostics() {
-        let src = "---\nname: World\n---\n@for name in items:\n{name}\n@end\n";
+        let src = "---\nname: World\n---\n@for name in items:\n{{name}}\n@end\n";
         let diags = lint_with_config(src, &LintConfig::default());
         assert!(
             !diags.iter().any(|d| d.rule == RULE),
@@ -140,7 +140,7 @@ mod tests {
     /// When explicitly enabled, @for var over FM key fires.
     #[test]
     fn enabled_for_var_over_fm_key_fires() {
-        let src = "---\nname: World\n---\n@for name in items:\n{name}\n@end\n";
+        let src = "---\nname: World\n---\n@for name in items:\n{{name}}\n@end\n";
         let diags = lint_with_config(src, &enabled_config());
         assert!(
             diags
@@ -180,7 +180,7 @@ mod tests {
     /// Rule=info enables it; rule=off silences even if it was enabled before.
     #[test]
     fn rule_off_suppresses() {
-        let src = "---\nname: World\n---\n@for name in items:\n{name}\n@end\n";
+        let src = "---\nname: World\n---\n@for name in items:\n{{name}}\n@end\n";
         let config = LintConfig {
             rules: [(RULE.to_string(), Severity::Off)].into_iter().collect(),
         };

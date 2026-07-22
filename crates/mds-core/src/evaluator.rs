@@ -1903,9 +1903,10 @@ mod tests {
 
     #[test]
     fn evaluate_all_defaults_provided() {
-        let result =
-            crate::compile_str_md("@define add(a = 1, b = 2):\n{{a}} {{b}}\n@end\n{{add(10, 20)}}\n")
-                .unwrap();
+        let result = crate::compile_str_md(
+            "@define add(a = 1, b = 2):\n{{a}} {{b}}\n@end\n{{add(10, 20)}}\n",
+        )
+        .unwrap();
         assert_eq!(result, "10 20\n");
     }
 
@@ -1921,7 +1922,8 @@ mod tests {
     #[test]
     fn evaluate_default_param_number() {
         // literal_expr_to_value: Expr::NumberLiteral → Value::Number
-        let result = crate::compile_str_md("@define show(x = 42):\n{{x}}\n@end\n{{show()}}\n").unwrap();
+        let result =
+            crate::compile_str_md("@define show(x = 42):\n{{x}}\n@end\n{{show()}}\n").unwrap();
         assert!(
             result.contains("42"),
             "Number default should produce its numeric value, got: {result}"
@@ -2235,7 +2237,7 @@ mod tests {
 
     #[test]
     fn for_array_loop_text_mode() {
-        let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n{item}\n@end\n";
+        let src = "---\nitems:\n  - alpha\n  - beta\n---\n@for item in items:\n{{item}}\n@end\n";
         let result = crate::compile_str_md(src).unwrap();
         assert!(result.contains("alpha"), "text: alpha missing");
         assert!(result.contains("beta"), "text: beta missing");
@@ -2386,7 +2388,8 @@ mod tests {
     #[test]
     fn for_empty_iterable_messages_mode() {
         // An empty array in messages mode produces zero messages, no error.
-        let src = "---\nitems: []\n---\n@for item in items:\n@message user:\n{item}\n@end\n@end\n";
+        let src =
+            "---\nitems: []\n---\n@for item in items:\n@message user:\n{{item}}\n@end\n@end\n";
         let messages = crate::compile_str(src).unwrap().into_messages().unwrap();
         assert_eq!(
             messages.len(),
@@ -2475,7 +2478,7 @@ mod tests {
         // Iterating an object with array syntax (@for x in obj:) must error in both modes.
         // The validator fires first with a static-analysis hint; the evaluator would fire
         // at runtime. Either way, the error message tells users to use key-value syntax.
-        let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n{x}\n@end\n";
+        let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n{{x}}\n@end\n";
         let err = crate::compile_str_md(src).expect_err("object in array syntax should error");
         let msg = format!("{err}");
         assert!(
@@ -2486,7 +2489,7 @@ mod tests {
 
     #[test]
     fn for_object_in_array_mode_errors_messages() {
-        let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n@message user:\n{x}\n@end\n@end\n";
+        let src = "---\nobj:\n  a: 1\n---\n@for x in obj:\n@message user:\n{{x}}\n@end\n@end\n";
         let err = crate::compile_str_md(src).expect_err("object in array syntax should error");
         let msg = format!("{err}");
         assert!(

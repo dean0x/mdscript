@@ -93,7 +93,7 @@ use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResult, Severity}
 // Tier classification lives in the leaf `tier` module to break the would-be
 // circular dependency (fix.rs → diagnostic.rs → fix.rs). Re-export here so
 // the public API surface at `mds::fix::FixTier` etc. is unchanged.
-pub use super::tier::{is_fixable, rule_tier, FixTier};
+pub use super::tier::{is_fixable, is_output_neutral, rule_tier, FixTier};
 
 // ── Fix plan ─────────────────────────────────────────────────────────────────
 

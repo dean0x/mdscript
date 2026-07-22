@@ -878,7 +878,7 @@ pub fn compile_with_deps(
 ///
 /// ```rust
 /// let result = mds::compile_str_with_deps(
-///     "---\ngreeting: Hi\n---\n{greeting} there!\n",
+///     "---\ngreeting: Hi\n---\n{{greeting}} there!\n",
 ///     None,
 ///     None,
 /// )?;

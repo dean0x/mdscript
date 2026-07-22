@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn collects_var_uses_from_for_iterable() {
-        let src = "@define greet(items):\n@for item in items:\n{item}\n@end\n@end\n";
+        let src = "@define greet(items):\n@for item in items:\n{{item}}\n@end\n@end\n";
         let ctx = facts(src);
         // `items` is referenced as @for iterable
         assert!(
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn detects_for_var_shadowing_fm_key() {
-        let src = "---\nname: World\n---\n@for name in items:\n{name}\n@end\n";
+        let src = "---\nname: World\n---\n@for name in items:\n{{name}}\n@end\n";
         let ctx = facts(src);
         let shadow = ctx.shadow_pairs.iter().find(|p| {
             p.name == "name"
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn detects_define_param_shadowing_fm_key() {
-        let src = "---\nuser: Alice\n---\n@define greet(user):\nhello {user}\n@end\n";
+        let src = "---\nuser: Alice\n---\n@define greet(user):\nhello {{user}}\n@end\n";
         let ctx = facts(src);
         let shadow = ctx.shadow_pairs.iter().find(|p| {
             p.name == "user"

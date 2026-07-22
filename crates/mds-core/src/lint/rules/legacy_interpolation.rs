@@ -140,18 +140,11 @@ fn check_text(
                         }),
                         file: Some(filename.to_string()),
                         fix_removals: None,
-                        fix_edits: Some(vec![
-                            TextEdit {
-                                start: src_open,
-                                end: src_open + 1, // replace `{` with `{{`
-                                new_text: "{{".to_string(),
-                            },
-                            TextEdit {
-                                start: src_close,
-                                end: src_close + 1, // replace `}` with `}}`
-                                new_text: "}}".to_string(),
-                            },
-                        ]),
+                        fix_edits: Some(vec![TextEdit {
+                            start: src_open,
+                            end: src_close + 1, // replace entire `{expr}` span atomically
+                            new_text: format!("{{{{{}}}}}", inner), // `{expr}` → `{{expr}}`
+                        }]),
                     };
                     if !builder.push(diag) {
                         return;
@@ -217,18 +210,11 @@ fn check_directive(
                         }),
                         file: Some(filename.to_string()),
                         fix_removals: None,
-                        fix_edits: Some(vec![
-                            TextEdit {
-                                start: src_open,
-                                end: src_open + 1,
-                                new_text: "{{".to_string(),
-                            },
-                            TextEdit {
-                                start: src_close,
-                                end: src_close + 1,
-                                new_text: "}}".to_string(),
-                            },
-                        ]),
+                        fix_edits: Some(vec![TextEdit {
+                            start: src_open,
+                            end: src_close + 1, // replace entire `{expr}` span atomically
+                            new_text: format!("{{{{{}}}}}", inner), // `{expr}` → `{{expr}}`
+                        }]),
                     };
                     builder.push(diag);
                 }
@@ -349,7 +335,13 @@ mod tests {
     fn check_src(src: &str) -> Vec<LintDiagnostic> {
         let tokens = tokenize(src, "test.mds").unwrap();
         let mut builder = LintResultBuilder::new();
-        check(&tokens, src, "test.mds", &LintConfig::default(), &mut builder);
+        check(
+            &tokens,
+            src,
+            "test.mds",
+            &LintConfig::default(),
+            &mut builder,
+        );
         builder.build(true).diagnostics
     }
 
@@ -371,16 +363,16 @@ mod tests {
     fn does_not_flag_json_like_braces() {
         // `{"key": 1}` — not a valid legacy expr (contains quotes/spaces/colon)
         let diags = check_src(r#"JSON: {"key": 1}"#);
-        assert!(diags.is_empty(), "JSON-like brace content must not be flagged");
+        assert!(
+            diags.is_empty(),
+            "JSON-like brace content must not be flagged"
+        );
     }
 
     #[test]
     fn detects_old_backslash_escape() {
         let diags = check_src(r"Text \{name}");
-        assert!(
-            !diags.is_empty(),
-            "legacy \\{{ escape should be flagged"
-        );
+        assert!(!diags.is_empty(), "legacy \\{{ escape should be flagged");
         assert!(diags[0].fix_edits.is_some());
     }
 
@@ -405,11 +397,20 @@ mod tests {
     }
 
     #[test]
-    fn fix_edits_replace_open_and_close() {
-        let diags = check_src("Hello {name}!");
+    fn fix_edits_single_atomic_replacement() {
+        // Regression: must emit ONE atomic TextEdit, not split open/close.
+        // Split edits allow per-edit fallback to accept only the close-brace half,
+        // producing `{expr}}` garbage that compounds on repeated `lint --fix` runs.
+        let src = "Hello {name}!";
+        let diags = check_src(src);
         let edits = diags[0].fix_edits.as_ref().unwrap();
-        assert_eq!(edits.len(), 2, "two edits: open and close brace");
-        assert_eq!(edits[0].new_text, "{{");
-        assert_eq!(edits[1].new_text, "}}");
+        assert_eq!(edits.len(), 1, "single atomic edit — no split open/close");
+        // `{name}` starts at byte 6, ends exclusive at byte 12
+        assert_eq!(edits[0].start, 6, "start at opening `{{`");
+        assert_eq!(edits[0].end, 12, "end exclusive after closing `}}`");
+        assert_eq!(
+            edits[0].new_text, "{{name}}",
+            "full span replaced atomically"
+        );
     }
 }

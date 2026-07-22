@@ -1834,7 +1834,8 @@ fn b3_arity_mismatch_includes_signature_in_help() {
 /// Calling a user-defined function with optional defaults should show defaults in signature.
 #[test]
 fn b3_arity_mismatch_signature_shows_defaults() {
-    let src = "@define greet(name, sep = \", \"):\n{{name}}{{sep}}\n@end\n{{greet()}}\n".to_string();
+    let src =
+        "@define greet(name, sep = \", \"):\n{{name}}{{sep}}\n@end\n{{greet()}}\n".to_string();
     let mut modules = std::collections::HashMap::new();
     modules.insert("main.mds".to_string(), src);
     let err = compile_vfs_err(modules, "main.mds");
