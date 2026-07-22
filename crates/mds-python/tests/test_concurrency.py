@@ -28,7 +28,7 @@ import pytest
 import mdscript as m
 
 # A moderately expensive, deterministic compile (a few ms each).
-LOOP_SRC = "@for i in items:\nItem {i}: lorem ipsum dolor sit amet consectetur adipiscing\n@end\n"
+LOOP_SRC = "@for i in items:\nItem {{i}}: lorem ipsum dolor sit amet consectetur adipiscing\n@end\n"
 ITEMS = list(range(2000))
 
 
@@ -94,7 +94,7 @@ def test_perf1_long_compile_does_not_block_main_thread() -> None:
     main_iterations = 0
     deadline = time.perf_counter() + 5.0
     while not done.is_set() and time.perf_counter() < deadline:
-        m.compile("Hi {n}!\n", vars={"n": "x"})
+        m.compile("Hi {{n}}!\n", vars={"n": "x"})
         main_iterations += 1
     t.join(timeout=5.0)
     assert not t.is_alive(), "background compiles did not finish in time"

@@ -24,7 +24,7 @@ from mdscript import (
 
 
 def render_markdown() -> str:
-    result: CompileResult = mdscript.compile("Hello {name}!", vars={"name": "Alice"})
+    result: CompileResult = mdscript.compile("Hello {{name}}!", vars={"name": "Alice"})
     if result.output is not None:  # narrow str | None -> str
         return result.output
     return ""
@@ -60,7 +60,7 @@ def imports(source: str) -> list[str]:
 
 def describe_error() -> str:
     try:
-        mdscript.compile("{undef}")
+        mdscript.compile("{{undef}}")
     except MdsError as err:
         code: str = err.code
         span: Span | None = err.span

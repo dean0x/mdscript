@@ -53,7 +53,7 @@ After code block: {{project_name}} still works.
 
 ## Escaped Braces
 
-Literal braces: {not_interpolated} but this is: {{version}}
+Escape \{{ produces a literal double-brace. Interpolated: {{version}}
 
 ## Included Modules
 

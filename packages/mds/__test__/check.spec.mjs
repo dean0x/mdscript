@@ -11,7 +11,7 @@ describe('check', () => {
   before(() => init());
 
   test('U-K1: check valid source returns empty warnings', () => {
-    const result = check('---\nname: World\n---\nHello {name}!\n');
+    const result = check('---\nname: World\n---\nHello {{name}}!\n');
     assert.deepEqual(result.warnings, []);
   });
 
@@ -22,7 +22,7 @@ describe('check', () => {
 
   test('U-K3: check syntax error throws MdsError', () => {
     assert.throws(
-      () => check('Hello {name\n'),
+      () => check('Hello {{name\n'),
       (err) => {
         assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
         return true;
@@ -31,7 +31,7 @@ describe('check', () => {
   });
 
   test('U-K4: check with runtime vars succeeds', () => {
-    const result = check('Hello {name}!\n', { vars: { name: 'Test' } });
+    const result = check('Hello {{name}}!\n', { vars: { name: 'Test' } });
     assert.ok(Array.isArray(result.warnings));
   });
 

@@ -58,7 +58,7 @@ describe('error shape', () => {
 
   test('U-E6: check syntax error has code property', () => {
     try {
-      check('Hello {name\n');
+      check('Hello {{name\n');
       assert.fail('expected error to be thrown');
     } catch (err) {
       assert.ok(isMdsError(err), 'should be MdsError');
@@ -68,8 +68,8 @@ describe('error shape', () => {
 
   test('U-E7: undefined variable error has syntax-related code', () => {
     try {
-      // Using an undefined variable in strict mode should error.
-      compile('{undefinedVar}\n');
+      // Using an undefined variable should error.
+      compile('{{undefinedVar}}\n');
       assert.fail('expected error');
     } catch (err) {
       assert.ok(isMdsError(err), 'should be MdsError');
@@ -79,7 +79,7 @@ describe('error shape', () => {
 
   test('U-E8: error message is a non-empty string', () => {
     try {
-      compile('Hello {name\n');
+      compile('Hello {{name\n');
       assert.fail('expected error');
     } catch (err) {
       assert.ok(err instanceof Error);

@@ -28,7 +28,7 @@ GOLDENS: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
     ),
     (
         "interp",
-        "Hello {name}!\n",
+        "Hello {{name}}!\n",
         {"name": "World"},
         {"kind": "markdown", "output": "Hello World!\n", "warnings": [], "dependencies": []},
     ),
@@ -40,7 +40,7 @@ GOLDENS: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
     ),
     (
         "frontmatter",
-        "---\nname: Alice\ncount: 3\n---\n\nHello {name}! You have {count} items.\n",
+        "---\nname: Alice\ncount: 3\n---\n\nHello {{name}}! You have {{count}} items.\n",
         {},
         {
             "kind": "markdown",
@@ -51,7 +51,7 @@ GOLDENS: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
     ),
     (
         "messages",
-        "@message system:\nYou are helpful.\n@end\n@message user:\nHi {who}!\n@end\n",
+        "@message system:\nYou are helpful.\n@end\n@message user:\nHi {{who}}!\n@end\n",
         {"who": "World"},
         {
             "kind": "messages",
@@ -86,15 +86,15 @@ def test_par2_live_cli_markdown_byte_parity(
 ) -> None:
     cases = [
         ("Just some prose text.\n", []),
-        ("Hello {name}!\n", ["--set", "name=World"]),
-        ("---\ntitle: Doc\n---\n# {title}\n", []),
+        ("Hello {{name}}!\n", ["--set", "name=World"]),
+        ("---\ntitle: Doc\n---\n# {{title}}\n", []),
         # Blank line after frontmatter fence exercises #150/#151 interior-verbatim
         # whitespace preservation.
-        ("---\ntitle: Doc\n---\n\n# {title}\n", []),
+        ("---\ntitle: Doc\n---\n\n# {{title}}\n", []),
     ]
     for src, sets in cases:
         cli_out = cli_build(mds_cli, src, tmp_path, *sets)
-        vars = {"name": "World"} if "{name}" in src else None
+        vars = {"name": "World"} if "{{name}}" in src else None
         py = m.compile(src, vars=vars).to_dict()
         assert py["kind"] == "markdown"
         assert py["output"] == cli_out, f"payload mismatch for {src!r}"
@@ -103,7 +103,7 @@ def test_par2_live_cli_markdown_byte_parity(
 def test_par2_live_cli_messages_byte_parity(
     mds_cli: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    src = "@message system:\nBe brief.\n@end\n@message user:\nHi {who}!\n@end\n"
+    src = "@message system:\nBe brief.\n@end\n@message user:\nHi {{who}}!\n@end\n"
     cli_out = cli_build(mds_cli, src, tmp_path, "--set", "who=Sam")
     py = m.compile(src, vars={"who": "Sam"}).to_dict()
     assert py["messages"] == json.loads(cli_out)
@@ -115,7 +115,7 @@ def test_par2_live_cli_messages_byte_parity(
 # code through the Python binding (messages/spans come from the shared core).
 
 NAPI_ERROR_PARITY = [
-    ("mds::undefined_var", lambda: m.compile("Hello {undefined_var}!\n")),
+    ("mds::undefined_var", lambda: m.compile("Hello {{undefined_var}}!\n")),
     ("mds::syntax", lambda: m.compile("@import\n")),
     ("mds::file_not_found", lambda: m.compile_file("/no/such/file.mds")),
     ("mds::mixed_content", lambda: m.compile("Some prose text.\n\n@message user:\nA message.\n@end\n")),
@@ -161,7 +161,7 @@ LINT_GOLDENS: list[tuple[str, str, dict[str, str], str]] = [
         "---\nunused_key: value\n---\nHello!\n",
         {},
         (
-            '{"files":[{"diagnostics":[{"fixable":false,"help":"Remove the frontmatter'
+            '{"files":[{"diagnostics":[{"fix_edits":null,"fixable":false,"help":"Remove the frontmatter'
             ' key or reference it in the template body.","message":"Variable'
             " 'unused_key' is defined in frontmatter but never referenced in the"
             ' body.","rule":"unused-variable","severity":"warn","span":{"length":10,'
@@ -220,6 +220,7 @@ def test_par6_file_report_to_dict_parity_null_help_span() -> None:
                         "help": None,
                         "fixable": False,
                         "span": None,
+                        "fix_edits": None,
                     }
                 ],
             }
@@ -246,6 +247,8 @@ def test_par6_file_report_to_dict_parity_null_help_span() -> None:
     assert diag_dict["help"] is None, "help must be None (not absent) when not set"
     assert "span" in diag_dict, "to_dict() must always include 'span' key"
     assert diag_dict["span"] is None, "span must be None (not absent) when not set"
+    assert "fix_edits" in diag_dict, "to_dict() must always include 'fix_edits' key"
+    assert diag_dict["fix_edits"] is None, "fix_edits must be None (not absent) when not set"
 
 
 def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> None:

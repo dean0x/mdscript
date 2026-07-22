@@ -14,17 +14,17 @@ import mdscript as m
 def test_e1_mdserror_is_exception_and_catchable() -> None:
     assert issubclass(m.MdsError, Exception)
     with pytest.raises(m.MdsError):
-        m.compile("Hello {undef}!\n")
+        m.compile("Hello {{undef}}!\n")
     # also catchable as a plain Exception
     try:
-        m.compile("Hello {undef}!\n")
+        m.compile("Hello {{undef}}!\n")
     except Exception as e:  # noqa: BLE001
         assert isinstance(e, m.MdsError)
 
 
 def test_e2_structured_fields_and_str_equals_message() -> None:
     try:
-        m.compile("Hello {undef}!\n")
+        m.compile("Hello {{undef}}!\n")
     except m.MdsError as e:
         assert isinstance(e.code, str) and e.code == "mds::undefined_var"
         assert isinstance(e.message, str) and e.message
@@ -49,10 +49,10 @@ def test_e2_help_is_none_when_absent() -> None:
 
 CORE_CASES = [
     ("mds::syntax", "@import\n"),
-    ("mds::undefined_var", "Hello {undef}!\n"),
-    ("mds::undefined_fn", "{nofn()}\n"),
-    ("mds::arity", "@define f(x):\n{x}\n@end\n{f()}\n"),
-    ("mds::type_error", "---\nn: 5\n---\n@for x in n:\n{x}\n@end\n"),
+    ("mds::undefined_var", "Hello {{undef}}!\n"),
+    ("mds::undefined_fn", "{{nofn()}}\n"),
+    ("mds::arity", "@define f(x):\n{{x}}\n@end\n{{f()}}\n"),
+    ("mds::type_error", "---\nn: 5\n---\n@for x in n:\n{{x}}\n@end\n"),
     ("mds::mixed_content", "Prose.\n\n@message user:\nHi\n@end\n"),
 ]
 
@@ -113,7 +113,7 @@ def test_e4_resource_limit_code() -> None:
 
 def test_e4_error_messages_do_not_leak_rust_source_paths() -> None:
     # Boundary/compile errors must not contain internal Rust source file paths.
-    for src in ("Hello {undef}!\n", "@import\n"):
+    for src in ("Hello {{undef}}!\n", "@import\n"):
         try:
             m.compile(src)
         except m.MdsError as e:
@@ -135,13 +135,13 @@ def test_v2_non_mapping_vars(bad: object) -> None:
 
 
 def test_e5_span_offset_and_line_column_single_line() -> None:
-    src = "X" * 100 + "{undef}!\n"
+    src = "X" * 100 + "{{undef}}!\n"
     try:
         m.compile(src)
     except m.MdsError as e:
         assert e.span is not None
         # span points at the interpolation, deep in the source (byte offset tracked)
-        assert e.span.offset == src.index("{undef") == 100
+        assert e.span.offset == src.index("{{undef") == 100
         assert e.span.length > 0
         assert e.span.line == 1
         # 1-indexed character column (ASCII → char offset == byte offset)
@@ -152,7 +152,7 @@ def test_e5_span_offset_and_line_column_single_line() -> None:
 
 
 def test_e5_span_line_increments_on_multiline() -> None:
-    src = "line one\nline two {undef}\n"
+    src = "line one\nline two {{undef}}\n"
     try:
         m.compile(src)
     except m.MdsError as e:

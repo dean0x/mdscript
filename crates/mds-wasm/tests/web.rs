@@ -61,7 +61,7 @@ fn compile_undefined_options() {
 
 #[wasm_bindgen_test]
 fn compile_with_frontmatter_vars() {
-    let source = "---\nname: World\n---\nHello {name}!\n";
+    let source = "---\nname: World\n---\nHello {{name}}!\n";
     let result = mds_wasm::compile(source, JsValue::NULL).unwrap();
     let output = get_str(&result, "output");
     assert!(output.contains("Hello World!"), "got: {output}");
@@ -69,7 +69,7 @@ fn compile_with_frontmatter_vars() {
 
 #[wasm_bindgen_test]
 fn compile_with_runtime_vars() {
-    let source = "Hello {name}!\n";
+    let source = "Hello {{name}}!\n";
     let opts = vars_opts(&serde_json::json!({ "name": "Rust" }));
     let result = mds_wasm::compile(source, opts).unwrap();
     let output = get_str(&result, "output");
@@ -80,9 +80,9 @@ fn compile_with_runtime_vars() {
 fn compile_with_modules_import() {
     // VirtualFs normalizes "./lib.mds" from "input.mds" to "lib.mds",
     // so the module key must be "lib.mds".
-    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let source = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n";
     let opts = modules_opts(&serde_json::json!({
-        "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
+        "lib.mds": "@define greet(x):\nHello {{x}}!\n@end\n"
     }));
     let result = mds_wasm::compile(source, opts).unwrap();
     let output = get_str(&result, "output");
@@ -111,9 +111,9 @@ fn compile_has_dependencies_field() {
 
 #[wasm_bindgen_test]
 fn compile_dependencies_contains_imported_module() {
-    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let source = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n";
     let opts = modules_opts(&serde_json::json!({
-        "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
+        "lib.mds": "@define greet(x):\nHello {{x}}!\n@end\n"
     }));
     let result = mds_wasm::compile(source, opts).unwrap();
     let deps_val = get_prop(&result, "dependencies");
@@ -138,7 +138,7 @@ fn compile_custom_filename() {
 
 #[wasm_bindgen_test]
 fn compile_runtime_vars_override_frontmatter() {
-    let source = "---\nname: Old\n---\nHello {name}!\n";
+    let source = "---\nname: Old\n---\nHello {{name}}!\n";
     let opts = vars_opts(&serde_json::json!({ "name": "New" }));
     let result = mds_wasm::compile(source, opts).unwrap();
     let output = get_str(&result, "output");
@@ -149,11 +149,11 @@ fn compile_runtime_vars_override_frontmatter() {
 
 /// Source string shared by all error-path tests.
 ///
-/// The variable reference `{undefined_var}` starts at byte offset 6 (after
-/// `"Hello "`). The compiler reports a span of offset=6, length=13, covering
-/// the opening brace and identifier name (`{undefined_var` without the closing
-/// `}`). Tests that assert exact span values rely on these positions.
-const UNDEFINED_VAR_SOURCE: &str = "Hello {undefined_var}!\n";
+/// The interpolation `{{undefined_var}}` starts at byte offset 6 (after
+/// `"Hello "`). The compiler reports a span with offset=6 (first `{`) and
+/// length=13 (the trimmed inner identifier `undefined_var`).
+/// Tests that assert exact span values rely on these positions.
+const UNDEFINED_VAR_SOURCE: &str = "Hello {{undefined_var}}!\n";
 
 /// Compile `UNDEFINED_VAR_SOURCE` and return the resulting JS error.
 fn compile_undefined_var_err() -> JsValue {
@@ -212,7 +212,7 @@ fn compile_error_has_span_with_offset_and_length() {
     // Assert exact byte positions so regressions in span calculation are caught.
     assert_eq!(
         offset, 6,
-        "span.offset must be 6 (start of '{{undefined_var}}' in source)"
+        "span.offset must be 6 (start of '{{{{undefined_var}}}}' in source)"
     );
     assert_eq!(
         length, 13,
@@ -285,7 +285,7 @@ fn check_valid_template() {
 
 #[wasm_bindgen_test]
 fn check_with_frontmatter_vars() {
-    let source = "---\nname: World\n---\nHello {name}!\n";
+    let source = "---\nname: World\n---\nHello {{name}}!\n";
     let result = mds_wasm::check(source, JsValue::NULL).unwrap();
     let warnings_arr = js_sys::Array::from(&get_prop(&result, "warnings"));
     assert_eq!(warnings_arr.length(), 0, "should have no warnings");
@@ -312,9 +312,9 @@ fn check_error_has_code_property() {
 fn check_with_modules_import() {
     // check() exercises check_virtual_collecting_warnings, a different code path
     // from compile_virtual_with_deps; module resolution must work through it too.
-    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let source = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n";
     let opts = modules_opts(&serde_json::json!({
-        "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
+        "lib.mds": "@define greet(x):\nHello {{x}}!\n@end\n"
     }));
     let result = mds_wasm::check(source, opts).unwrap();
     let warnings = get_prop(&result, "warnings");
@@ -327,7 +327,7 @@ fn check_with_modules_import() {
 #[wasm_bindgen_test]
 fn check_with_runtime_vars() {
     // Verify the vars option flows through the check() path correctly.
-    let source = "Hello {name}!\n";
+    let source = "Hello {{name}}!\n";
     let opts = vars_opts(&serde_json::json!({ "name": "Rust" }));
     let result = mds_wasm::check(source, opts).unwrap();
     let warnings_arr = js_sys::Array::from(&get_prop(&result, "warnings"));
@@ -406,7 +406,7 @@ fn compile_unknown_option_key_returns_error() {
     // A typo like `varss` must be caught rather than silently ignored.
     let opts_val = serde_json::json!({ "varss": { "name": "World" } });
     let opts = to_js_object(&opts_val);
-    let err = mds_wasm::compile("Hello {name}!\n", opts).unwrap_err();
+    let err = mds_wasm::compile("Hello {{name}}!\n", opts).unwrap_err();
     let code = get_str(&err, "code");
     assert_eq!(code, "mds::invalid_options", "got: {code}");
     let message = get_str(&err, "message");
@@ -475,7 +475,7 @@ fn check_still_accepts_filename_option() {
 fn check_still_accepts_vars_option() {
     // check() must continue to accept the vars option.
     let opts = vars_opts(&serde_json::json!({ "name": "World" }));
-    let result = mds_wasm::check("Hello {name}!\n", opts).unwrap();
+    let result = mds_wasm::check("Hello {{name}}!\n", opts).unwrap();
     let warnings = get_prop(&result, "warnings");
     assert!(
         js_sys::Array::is_array(&warnings),
@@ -486,9 +486,9 @@ fn check_still_accepts_vars_option() {
 #[wasm_bindgen_test]
 fn check_still_accepts_modules_option() {
     // check() must continue to accept the modules option.
-    let source = "@import \"./lib.mds\"\n{greet(\"World\")}\n";
+    let source = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n";
     let opts = modules_opts(&serde_json::json!({
-        "lib.mds": "@define greet(x):\nHello {x}!\n@end\n"
+        "lib.mds": "@define greet(x):\nHello {{x}}!\n@end\n"
     }));
     let result = mds_wasm::check(source, opts).unwrap();
     let warnings = get_prop(&result, "warnings");
@@ -530,8 +530,8 @@ fn scan_imports_returns_empty_array_for_importless_source() {
 
 #[wasm_bindgen_test]
 fn scan_imports_returns_error_for_malformed_source() {
-    // Unclosed interpolation — should produce an error.
-    let err = mds_wasm::scan_imports("Hello {name\n").unwrap_err();
+    // Unclosed double-brace interpolation — should produce a syntax error.
+    let err = mds_wasm::scan_imports("Hello {{name\n").unwrap_err();
     let code = get_str(&err, "code");
     assert!(
         !code.is_empty(),
@@ -591,7 +591,7 @@ fn compile_extends_text_mode_skeleton_and_override() {
     // Output must contain the overridden blocks and the base skeleton text.
     let base_src = concat!(
         "---\nrole: general\n---\n",
-        "You are a {role} assistant.\n",
+        "You are a {{role}} assistant.\n",
         "@block instructions:\nAnalyze data carefully.\n@end\n",
         "@block tools:\n@end\n",
         "@block output_format:\nRespond in plain text.\n@end\n",
@@ -679,7 +679,7 @@ fn compile_extends_messages_mode() {
     // the canonical { kind: "messages", messages, warnings, dependencies } shape.
     let base_src = concat!(
         "---\nrole: assistant\n---\n",
-        "@block system_msg:\n@message system:\nYou are a {role}.\n@end\n@end\n",
+        "@block system_msg:\n@message system:\nYou are a {{role}}.\n@end\n@end\n",
         "@block user_msg:\n@message user:\nHello!\n@end\n@end\n",
     );
     let child_src = concat!(
@@ -752,7 +752,7 @@ fn compile_extends_undefined_var_in_base_default_carries_real_span() {
     // are numbers, not undefined) when the child does not override that block.
     // Regression: before the source-attribution fix (7d4310f), line/column were
     // absent (miette reported OutOfBounds for the cross-source offset).
-    let base_src = "@block greeting:\nHello {customer_name}, welcome.\n@end\n";
+    let base_src = "@block greeting:\nHello {{customer_name}}, welcome.\n@end\n";
     let child_src = "@extends \"./base.mds\"\n";
     let opts = inheritance_modules_opts(child_src, base_src);
 

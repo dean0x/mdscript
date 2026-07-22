@@ -9,9 +9,9 @@ import pytest
 import mdscript as m
 
 RESULTS = [
-    m.compile("Hello {n}!\n", vars={"n": "A"}),
+    m.compile("Hello {{n}}!\n", vars={"n": "A"}),
     m.compile("@message user:\nHi\n@end\n"),
-    m.check("Hello {n}!\n", vars={"n": "A"}),
+    m.check("Hello {{n}}!\n", vars={"n": "A"}),
     m.Span(3, 5, 1, 4),
     m.Span(0, 1),  # line/column None
     m.Message("user", "hello"),
@@ -30,7 +30,7 @@ def test_pk1_result_pickle_round_trip(obj: object, proto: int) -> None:
 
 
 def test_pk1_compile_result_fields_survive() -> None:
-    r = m.compile("@message user:\nHi {x}\n@end\n", vars={"x": "there"})
+    r = m.compile("@message user:\nHi {{x}}\n@end\n", vars={"x": "there"})
     back = pickle.loads(pickle.dumps(r))
     assert back.kind == r.kind == "messages"
     assert back.to_dict() == r.to_dict()
@@ -53,7 +53,7 @@ def test_pk1_compile_result_rejects_corrupt_state() -> None:
 
 def test_pk2_mdserror_round_trip_with_span() -> None:
     try:
-        m.compile("Hello {undef}!\n")
+        m.compile("Hello {{undef}}!\n")
     except m.MdsError as e:
         back = pickle.loads(pickle.dumps(e))
         assert isinstance(back, m.MdsError)
@@ -97,8 +97,8 @@ def test_pk3_multiprocessing_round_trip() -> None:
 
     ctx = mp.get_context("spawn")  # portable across macOS/Windows/Linux
     with ctx.Pool(processes=1) as pool:
-        result = pool.apply(_mp_worker, ("Hello {name}!\n",))
+        result = pool.apply(_mp_worker, ("Hello {{name}}!\n",))
     # The result was pickled from the child back to the parent.
     assert isinstance(result, m.CompileResult)
     assert result.output == "Hello MP!\n"
-    assert result == m.compile("Hello {name}!\n", vars={"name": "MP"})
+    assert result == m.compile("Hello {{name}}!\n", vars={"name": "MP"})

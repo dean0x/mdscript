@@ -64,7 +64,7 @@ describe('lint', () => {
 
   test('U-L6: lint invalid source throws MdsError', () => {
     assert.throws(
-      () => lint('Hello {undefined_var}!\n'),
+      () => lint('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
         assert.ok(err.code.startsWith('mds::'), `expected mds:: code, got: ${err.code}`);

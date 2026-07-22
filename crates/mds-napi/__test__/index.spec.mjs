@@ -213,20 +213,20 @@ describe('check', () => {
   });
 
   test('F-K4: check with frontmatter vars is valid', () => {
-    const source = '---\nname: Test\n---\nHello {name}!\n';
+    const source = '---\nname: Test\n---\nHello {{name}}!\n';
     const result = check(source);
     assert.deepEqual(result.warnings, []);
   });
 
   test('F-K5: check with runtime vars', () => {
-    const source = 'Hello {name}!\n';
+    const source = 'Hello {{name}}!\n';
     const result = check(source, { vars: { name: 'Test' } });
     assert.deepEqual(result.warnings, []);
   });
 
   test('F-K6: check undefined variable throws', () => {
     assert.throws(
-      () => check('Hello {undefined_var}!\n'),
+      () => check('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.ok(err instanceof Error);
         assert.equal(err.code, 'mds::undefined_var', `got: ${err.code}`);
@@ -236,7 +236,7 @@ describe('check', () => {
   });
 
   test('F-K7: check with basePath', () => {
-    const source = `@import { greet } from "./import_provider.mds"\n\n{greet("Test")}\n`;
+    const source = `@import { greet } from "./import_provider.mds"\n\n{{greet("Test")}}\n`;
     const result = check(source, { basePath: FIXTURES });
     assert.ok(Array.isArray(result.warnings));
   });
@@ -275,7 +275,7 @@ describe('check', () => {
 describe('error shape', () => {
   test('E-1: error is instanceof Error', () => {
     assert.throws(
-      () => compile('Hello {undefined_var}!\n'),
+      () => compile('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.ok(err instanceof Error, 'should be instanceof Error');
         return true;
@@ -285,7 +285,7 @@ describe('error shape', () => {
 
   test('E-2: error has code property', () => {
     assert.throws(
-      () => compile('Hello {undefined_var}!\n'),
+      () => compile('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.ok('code' in err, 'should have code property');
         assert.ok(typeof err.code === 'string', `code should be string, got ${typeof err.code}`);
@@ -296,7 +296,7 @@ describe('error shape', () => {
 
   test('E-3: error has message property', () => {
     assert.throws(
-      () => compile('Hello {undefined_var}!\n'),
+      () => compile('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.ok(typeof err.message === 'string', 'should have message');
         assert.ok(err.message.length > 0, 'message should not be empty');
@@ -307,7 +307,7 @@ describe('error shape', () => {
 
   test('E-4: undefined var error has correct code', () => {
     assert.throws(
-      () => compile('Hello {undefined_var}!\n'),
+      () => compile('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.equal(err.code, 'mds::undefined_var', `got: ${err.code}`);
         return true;
@@ -317,7 +317,7 @@ describe('error shape', () => {
 
   test('E-5: undefined var error has help property', () => {
     assert.throws(
-      () => compile('Hello {undefined_var}!\n'),
+      () => compile('Hello {{undefined_var}}!\n'),
       (err) => {
         // undefined_var always carries a help message from the diagnostic annotation.
         assert.ok('help' in err, 'undefined_var errors should include a help property');
@@ -350,7 +350,7 @@ describe('error shape', () => {
 
   test('E-8: span is object when present', () => {
     assert.throws(
-      () => compile('Hello {undefined_var}!\n'),
+      () => compile('Hello {{undefined_var}}!\n'),
       (err) => {
         // undefined_var errors produced via compile() go through the validator which
         // always attaches a source span (offset + length of the variable name).
@@ -603,7 +603,7 @@ describe('template inheritance', () => {
   // INH-1: compileFile round-trip — skeleton + override, base in dependencies
   test('INH-1: compileFile inherits base skeleton and applies child overrides', () => {
     const baseContent =
-      '---\nrole: general\n---\nYou are a {role} assistant.\n@block body:\nDefault body.\n@end\n';
+      '---\nrole: general\n---\nYou are a {{role}} assistant.\n@block body:\nDefault body.\n@end\n';
     const childContent =
       '---\nrole: specialist\n---\n@extends "./base.mds"\n@block body:\nOverridden body.\n@end\n';
 
@@ -654,7 +654,7 @@ describe('template inheritance', () => {
   // INH-3: C4 regression — undefined var in base default block carries a real span
   // (line/column) rather than undefined when the child does not override the block.
   test('INH-3: undefined var in inherited base default block has code mds::undefined_var and a real span', () => {
-    const baseContent = '@block greeting:\nHello {customer_name}, welcome.\n@end\n';
+    const baseContent = '@block greeting:\nHello {{customer_name}}, welcome.\n@end\n';
     const childContent = '@extends "./base.mds"\n';
 
     withInheritanceFixtures(baseContent, childContent, (childPath) => {
@@ -903,7 +903,7 @@ describe('lint', () => {
   // L-N-8: parse error throws (check gate enforced)
   test('L-N-8: lint on invalid source throws with mds:: error code', () => {
     assert.throws(
-      () => lint('Hello {undefined_var}!\n'),
+      () => lint('Hello {{undefined_var}}!\n'),
       (err) => {
         assert.ok(err instanceof Error);
         assert.ok(err.code.startsWith('mds::'), `expected mds:: code, got: ${err.code}`);

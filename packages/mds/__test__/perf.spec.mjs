@@ -50,7 +50,7 @@ describe('performance', () => {
   test('U-PF2: compile with vars 100 times completes quickly', () => {
     const start = Date.now();
     for (let i = 0; i < 100; i++) {
-      compile('Hello {name}!\n', { vars: { name: `World${i}` } });
+      compile('Hello {{name}}!\n', { vars: { name: `World${i}` } });
     }
     const elapsed = Date.now() - start;
     assert.ok(elapsed < 2000, `100 compile-with-vars took ${elapsed}ms`);

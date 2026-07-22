@@ -9,7 +9,7 @@ Single braces are literal text (no interpolation): {not_a_var}
 
 Double braces interpolate a variable: {{real_var}}
 
-Escaped double-brace renders as literal {{ in output: \{{ not interpolated }}
+Escape sequence \{{ prevents interpolation: rendered as \{{ in the output.
 
 Mixed line: {literal_text} then {{real_var}} then {another_literal}
 
@@ -17,4 +17,4 @@ Function calls use double braces: {{fmt.bold(real_var)}}
 
 Single-brace function syntax is literal text: {fmt.bold("nope")}
 
-Template syntax guide: use \{{ for a literal {{ and {{label}} for injected values.
+Template syntax guide: use \{{ for a literal \{{ and {{label}} for injected values.

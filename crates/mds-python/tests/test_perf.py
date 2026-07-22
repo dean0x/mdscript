@@ -18,7 +18,7 @@ import mdscript as m
 
 pytestmark = pytest.mark.perf
 
-REPRESENTATIVE = "---\nname: Alice\n---\n@for i in items:\n- {name}: item {i}\n@end\n"
+REPRESENTATIVE = "---\nname: Alice\n---\n@for i in items:\n- {{name}}: item {{i}}\n@end\n"
 ITEMS = list(range(50))
 
 
@@ -47,7 +47,7 @@ def test_perf2_large_input_throughput() -> None:
 
 def test_perf3_no_memory_growth_over_iterations() -> None:
     # 10k compiles must not leak Python objects unboundedly.
-    src = "Hello {name}!\n"
+    src = "Hello {{name}}!\n"
     for _ in range(500):  # warm up allocators/caches
         m.compile(src, vars={"name": "x"})
     gc.collect()
@@ -67,11 +67,11 @@ def test_perf3_refcount_stability() -> None:
     # Repeated compiles must not perturb the refcount of a stable shared object.
     sentinel = "stable-vars-value"
     vars = {"name": sentinel}
-    m.compile("Hello {name}!\n", vars=vars)  # warm up
+    m.compile("Hello {{name}}!\n", vars=vars)  # warm up
     gc.collect()
     before = sys.getrefcount(sentinel)
     for _ in range(5000):
-        m.compile("Hello {name}!\n", vars=vars)
+        m.compile("Hello {{name}}!\n", vars=vars)
     gc.collect()
     after = sys.getrefcount(sentinel)
     # The binding must not retain references to caller-provided values.
