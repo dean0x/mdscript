@@ -511,7 +511,7 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
     // edits are applied first. Use splice (replace_range) so that both pure
     // deletions (replacement="") and text replacements are handled uniformly.
     // Safety: source is valid UTF-8; edits must operate on char boundaries.
-    // Invalid UTF-8 after edit is a logic error — use lossy conversion in that case.
+    // replace_range on char-boundary offsets with valid-UTF-8 replacement preserves UTF-8.
     let mut result = source.to_string();
     for edit in plan.edits.iter().rev() {
         let start = edit.start;

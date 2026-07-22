@@ -3,6 +3,7 @@ audience: developers
 retries: 3
 ---
 @import "./_shared.mds" as shared
+@import "./_shared.mds" as extra
 
 # Lint demo
 
