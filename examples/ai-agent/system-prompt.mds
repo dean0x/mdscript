@@ -52,6 +52,11 @@ You are **{{agent_name}}**, an AI data analysis assistant powered by {{model}}.
 
 {{tools.usage_guidelines()}}
 
+## Model Configuration
+
+- Max tokens: **{{max_tokens}}**
+- Temperature: **{{temperature}}**
+
 ## Constraints
 
 - Maximum result rows: **{{constraints.max_rows}}**

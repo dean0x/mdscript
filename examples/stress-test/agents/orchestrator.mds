@@ -15,7 +15,6 @@ sub_agents:
     role: writer
     active: true
 fallback_strategy: queue
-debug: false
 strict_output: true
 ---
 

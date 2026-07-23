@@ -12,7 +12,7 @@ tone: professional
 
 # {{agent_name}}
 
-You are **{{agent_name}}**, a {{role}} who specializes in:
+You are **{{agent_name}}**, a {{tone}} {{role}} who specializes in:
 
 @for spec in specialties:
 - {{spec}}
