@@ -3,4 +3,4 @@ name: Alice
 ---
 @import "./greetings.mds" as g
 
-{greet(name)}
+{{greet(name)}}

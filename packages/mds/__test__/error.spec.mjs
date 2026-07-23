@@ -11,7 +11,7 @@ describe('error shape', () => {
 
   test('U-E1: compile syntax error is an Error instance', () => {
     try {
-      compile('Hello {name\n');
+      compile('Hello {{name\n');
       assert.fail('expected error to be thrown');
     } catch (err) {
       assert.ok(err instanceof Error, `expected Error instance, got: ${typeof err}`);
@@ -20,7 +20,7 @@ describe('error shape', () => {
 
   test('U-E2: compile syntax error has code property', () => {
     try {
-      compile('Hello {name\n');
+      compile('Hello {{name\n');
       assert.fail('expected error to be thrown');
     } catch (err) {
       assert.ok(typeof (err).code === 'string', `expected code string, got: ${(err).code}`);
@@ -29,7 +29,7 @@ describe('error shape', () => {
 
   test('U-E3: isMdsError returns true for MDS errors', () => {
     try {
-      compile('Hello {name\n');
+      compile('Hello {{name\n');
       assert.fail('expected error to be thrown');
     } catch (err) {
       assert.ok(isMdsError(err), 'isMdsError should return true');
@@ -58,7 +58,7 @@ describe('error shape', () => {
 
   test('U-E6: check syntax error has code property', () => {
     try {
-      check('Hello {name\n');
+      check('Hello {{name\n');
       assert.fail('expected error to be thrown');
     } catch (err) {
       assert.ok(isMdsError(err), 'should be MdsError');
@@ -68,8 +68,8 @@ describe('error shape', () => {
 
   test('U-E7: undefined variable error has syntax-related code', () => {
     try {
-      // Using an undefined variable in strict mode should error.
-      compile('{undefinedVar}\n');
+      // Using an undefined variable should error.
+      compile('{{undefinedVar}}\n');
       assert.fail('expected error');
     } catch (err) {
       assert.ok(isMdsError(err), 'should be MdsError');
@@ -79,7 +79,7 @@ describe('error shape', () => {
 
   test('U-E8: error message is a non-empty string', () => {
     try {
-      compile('Hello {name\n');
+      compile('Hello {{name\n');
       assert.fail('expected error');
     } catch (err) {
       assert.ok(err instanceof Error);

@@ -3,14 +3,14 @@ use std::collections::HashMap;
 #[test]
 fn dot_notation_object_access_works() {
     // {obj.key} now works as object field access (not an error).
-    let source = "---\ndata:\n  name: Alice\n---\n{data.name}\n";
+    let source = "---\ndata:\n  name: Alice\n---\n{{data.name}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("Alice\n"), "got: {result}");
 }
 
 #[test]
 fn object_single_level_access() {
-    let source = "---\nconfig:\n  key: val\n---\n{config.key}\n";
+    let source = "---\nconfig:\n  key: val\n---\n{{config.key}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert_eq!(
         result, "---\nconfig:\n  key: val\n---\nval\n",
@@ -20,7 +20,7 @@ fn object_single_level_access() {
 
 #[test]
 fn object_multi_level_access() {
-    let source = "---\na:\n  b:\n    c: deep\n---\n{a.b.c}\n";
+    let source = "---\na:\n  b:\n    c: deep\n---\n{{a.b.c}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert_eq!(
         result, "---\na:\n  b:\n    c: deep\n---\ndeep\n",
@@ -30,7 +30,7 @@ fn object_multi_level_access() {
 
 #[test]
 fn object_direct_interpolation_error() {
-    let source = "---\nobj:\n  key: val\n---\n{obj}\n";
+    let source = "---\nobj:\n  key: val\n---\n{{obj}}\n";
     let result = mds::compile_str(source);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -39,7 +39,7 @@ fn object_direct_interpolation_error() {
 
 #[test]
 fn object_field_not_found() {
-    let source = "---\nobj:\n  key: val\n---\n{obj.missing}\n";
+    let source = "---\nobj:\n  key: val\n---\n{{obj.missing}}\n";
     let result = mds::compile_str(source);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -51,7 +51,7 @@ fn object_field_not_found() {
 
 #[test]
 fn object_access_on_non_object() {
-    let source = "---\nname: Alice\n---\n{name.key}\n";
+    let source = "---\nname: Alice\n---\n{{name.key}}\n";
     let result = mds::compile_str(source);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -78,7 +78,7 @@ fn if_dot_path_falsy() {
 
 #[test]
 fn for_dot_path_iterable() {
-    let source = "---\nconfig:\n  items:\n    - a\n    - b\n---\n@for item in config.items:\n- {item}\n@end\n";
+    let source = "---\nconfig:\n  items:\n    - a\n    - b\n---\n@for item in config.items:\n- {{item}}\n@end\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("- a") && result.contains("- b"),
@@ -89,7 +89,7 @@ fn for_dot_path_iterable() {
 #[test]
 fn for_key_value_object() {
     let source =
-        "---\nobj:\n  alpha: 1\n  beta: 2\n---\n@for key, value in obj:\n{key}={value}\n@end\n";
+        "---\nobj:\n  alpha: 1\n  beta: 2\n---\n@for key, value in obj:\n{{key}}={{value}}\n@end\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("alpha=1") && result.contains("beta=2"),
@@ -106,7 +106,7 @@ fn for_key_value_object() {
 
 #[test]
 fn for_single_var_object_error() {
-    let source = "---\nobj:\n  key: val\n---\n@for item in obj:\n{item}\n@end\n";
+    let source = "---\nobj:\n  key: val\n---\n@for item in obj:\n{{item}}\n@end\n";
     let result = mds::compile_str(source);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -118,7 +118,7 @@ fn for_single_var_object_error() {
 
 #[test]
 fn for_key_value_non_object_error() {
-    let source = "---\nitems:\n  - a\n  - b\n---\n@for k, v in items:\n{k}\n@end\n";
+    let source = "---\nitems:\n  - a\n  - b\n---\n@for k, v in items:\n{{k}}\n@end\n";
     let result = mds::compile_str(source);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -130,14 +130,14 @@ fn for_key_value_non_object_error() {
 
 #[test]
 fn func_arg_dot_path() {
-    let source = "---\nconfig:\n  name: Alice\n---\n@define greet(who):\nHello {who}!\n@end\n{greet(config.name)}\n";
+    let source = "---\nconfig:\n  name: Alice\n---\n@define greet(who):\nHello {{who}}!\n@end\n{{greet(config.name)}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(result.contains("Hello Alice!"), "got: {result}");
 }
 
 #[test]
 fn objects_inside_arrays() {
-    let source = "---\nitems:\n  - name: Alice\n  - name: Bob\n---\n@for item in items:\n{item.name}\n@end\n";
+    let source = "---\nitems:\n  - name: Alice\n  - name: Bob\n---\n@for item in items:\n{{item.name}}\n@end\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert!(
         result.contains("Alice") && result.contains("Bob"),
@@ -162,8 +162,8 @@ fn empty_object_is_falsy() {
 
 #[test]
 fn namespace_and_object_coexist() {
-    // Verify that {obj.key} (MemberAccess) works alongside the existing codebase features.
-    let source = "---\nobj:\n  key: val\n---\n{obj.key}\n";
+    // Verify that {{obj.key}} (MemberAccess) works alongside the existing codebase features.
+    let source = "---\nobj:\n  key: val\n---\n{{obj.key}}\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     assert_eq!(result, "---\nobj:\n  key: val\n---\nval\n", "got: {result}");
 }
@@ -182,7 +182,7 @@ fn vars_file_with_nested_objects() {
 fn runtime_vars_object_dot_access() {
     // Runtime-supplied objects (via compile_str_with) should be accessible via dot-path.
     // This covers the runtime_vars path, distinct from frontmatter-defined objects.
-    let source = "{config.host}:{config.port}\n";
+    let source = "{{config.host}}:{{config.port}}\n";
     let mut inner = HashMap::new();
     inner.insert(
         "host".to_string(),
@@ -203,7 +203,7 @@ fn runtime_vars_object_dot_access() {
 fn for_key_value_dot_path_object() {
     // Key-value iteration and dot-path object access should work in combination:
     // @for key, value in config.settings should iterate the nested object.
-    let source = "---\nconfig:\n  settings:\n    theme: dark\n    lang: en\n---\n@for k, v in config.settings:\n{k}={v}\n@end\n";
+    let source = "---\nconfig:\n  settings:\n    theme: dark\n    lang: en\n---\n@for k, v in config.settings:\n{{k}}={{v}}\n@end\n";
     let result = mds::compile_str(source).unwrap().into_markdown().unwrap();
     // Entries appear in sorted key order (lang before theme alphabetically).
     // Frontmatter is preserved in output.
@@ -220,7 +220,7 @@ fn dot_path_depth_limit_interpolation() {
     // Build a path with 33 segments: a.b.c.d...
     let segments: Vec<String> = (0..33).map(|i| format!("f{i}")).collect();
     let path = segments.join(".");
-    let source = format!("{{{path}}}\n");
+    let source = format!("{{{{{path}}}}}\n");
     let result = mds::compile_str(&source);
     assert!(result.is_err(), "expected error for >32 segments, got Ok");
     let err = format!("{}", result.unwrap_err());
@@ -253,7 +253,7 @@ fn dot_path_depth_limit_for_iterable() {
     // @for iterable with >32 dot segments must be rejected at parse time.
     let segments: Vec<String> = (0..33).map(|i| format!("f{i}")).collect();
     let path = segments.join(".");
-    let source = format!("@for item in {path}:\n{{item}}\n@end\n");
+    let source = format!("@for item in {path}:\n{{{{item}}}}\n@end\n");
     let result = mds::compile_str(&source);
     assert!(
         result.is_err(),
@@ -275,7 +275,7 @@ fn dot_path_depth_limit_exactly_at_boundary_is_allowed() {
     // itself may fail as undefined, which is acceptable.
     let segments: Vec<String> = (0..32).map(|i| format!("f{i}")).collect();
     let path = segments.join(".");
-    let source = format!("{{{path}}}\n");
+    let source = format!("{{{{{path}}}}}\n");
     let result = mds::compile_str(&source);
     // Should not be a depth-limit error (may be an undefined-variable error).
     if let Err(ref err) = result {
@@ -291,8 +291,8 @@ fn dot_path_depth_limit_exactly_at_boundary_is_allowed() {
 fn error_reports_full_traversed_path_on_missing_field() {
     // When a field is missing after a successful partial traversal, the error
     // should name the *traversed* path (not just the root variable).
-    // For {a.b.missing}, the error should mention "a.b" (the path traversed so far).
-    let source = "---\na:\n  b:\n    c: deep\n---\n{a.b.missing}\n";
+    // For {{a.b.missing}}, the error should mention "a.b" (the path traversed so far).
+    let source = "---\na:\n  b:\n    c: deep\n---\n{{a.b.missing}}\n";
     let result = mds::compile_str(source);
     assert!(result.is_err(), "expected error for missing field");
     let err = format!("{}", result.unwrap_err());

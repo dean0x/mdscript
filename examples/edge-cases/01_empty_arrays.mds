@@ -6,7 +6,7 @@ name: test
 Before loop.
 
 @for item in items:
-- {item}
+- {{item}}
 @end
 
-After loop. Name is {name}.
+After loop. Name is {{name}}.

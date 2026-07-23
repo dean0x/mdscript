@@ -33,13 +33,13 @@ describe('native backend', () => {
   });
 
   test('U-N2: compile with frontmatter vars', () => {
-    const source = '---\nname: Test\n---\nHello {name}!\n';
+    const source = '---\nname: Test\n---\nHello {{name}}!\n';
     const result = nativeBackend.compile(source);
     assert.ok(result.output.includes('Hello Test!'), `got: ${result.output}`);
   });
 
   test('U-N3: compile with runtime vars', () => {
-    const result = nativeBackend.compile('Hello {name}!\n', { vars: { name: 'World' } });
+    const result = nativeBackend.compile('Hello {{name}}!\n', { vars: { name: 'World' } });
     assert.equal(result.output, 'Hello World!\n');
   });
 
@@ -49,7 +49,7 @@ describe('native backend', () => {
   });
 
   test('U-N5: compile syntax error throws', () => {
-    assert.throws(() => nativeBackend.compile('Hello {name\n'));
+    assert.throws(() => nativeBackend.compile('Hello {{name\n'));
   });
 
   test('U-N6: compileFile resolves with kind:markdown shape', async () => {

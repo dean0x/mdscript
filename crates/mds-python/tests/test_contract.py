@@ -8,7 +8,7 @@ import pytest
 
 import mdscript as m
 
-MD = m.compile("Hello {name}!\n", vars={"name": "Alice"})
+MD = m.compile("Hello {{name}}!\n", vars={"name": "Alice"})
 MSG = m.compile("@message user:\nHi\n@end\n")
 LR = m.lint("---\nunused_key: value\n---\nHello!\n")
 

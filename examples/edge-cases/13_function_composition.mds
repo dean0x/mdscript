@@ -17,11 +17,11 @@ LOW
 @end
 
 @define task_line(task):
-- **{task.name}**: {format_priority(task.is_high)}
+- **{{task.name}}**: {{format_priority(task.is_high)}}
 @end
 
 # Task List
 
 @for item in items:
-{task_line(item)}
+{{task_line(item)}}
 @end

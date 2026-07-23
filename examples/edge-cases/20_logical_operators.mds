@@ -3,7 +3,6 @@ admin: true
 active: true
 guest: false
 blocked: false
-score: 85
 name: "Alice"
 empty: ""
 ---

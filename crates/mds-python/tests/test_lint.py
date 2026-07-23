@@ -66,7 +66,7 @@ def test_l6_lint_rules_non_mapping_raises() -> None:
 def test_l7_lint_invalid_source_raises() -> None:
     """The check gate fires before lint — an unresolvable variable raises MdsError."""
     with pytest.raises(m.MdsError) as ei:
-        m.lint("Hello {undefined_var}!\n")
+        m.lint("Hello {{undefined_var}}!\n")
     assert ei.value.code.startswith("mds::")
 
 

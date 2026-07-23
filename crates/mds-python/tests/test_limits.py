@@ -104,7 +104,7 @@ def test_l3_deep_value_nesting_is_mdserror() -> None:
     for _ in range(70):
         nested = {"a": nested}
     with pytest.raises(m.MdsError) as ei:
-        m.compile("{v}\n", vars={"v": nested})
+        m.compile("{{v}}\n", vars={"v": nested})
     assert ei.value.code in ("mds::invalid_options", "mds::json")
 
 
@@ -112,14 +112,14 @@ def test_l3_deep_value_nesting_is_mdserror() -> None:
 
 
 def test_v3_plain_numbers() -> None:
-    assert m.compile("{v}\n", vars={"v": 42}).output == "42\n"
-    assert m.compile("{v}\n", vars={"v": 1.5}).output == "1.5\n"
+    assert m.compile("{{v}}\n", vars={"v": 42}).output == "42\n"
+    assert m.compile("{{v}}\n", vars={"v": 1.5}).output == "1.5\n"
 
 
 def test_v3_float_1e20_parity_with_napi() -> None:
     # JS numbers are f64; napi renders `1e20` as an integer string. A Python float
     # goes through the same f64 path, so parity holds exactly.
-    assert m.compile("{v}\n", vars={"v": 1e20}).output == "100000000000000000000\n"
+    assert m.compile("{{v}}\n", vars={"v": 1e20}).output == "100000000000000000000\n"
 
 
 def test_v3_huge_int_rejected() -> None:
@@ -129,19 +129,19 @@ def test_v3_huge_int_rejected() -> None:
     # float, e.g. `1e20`, for parity.)
     for huge in (10**20, 10**40):
         with pytest.raises(m.MdsError) as ei:
-            m.compile("{v}\n", vars={"v": huge})
+            m.compile("{{v}}\n", vars={"v": huge})
         assert ei.value.code == "mds::invalid_options"
 
 
 def test_v3_nan_inf_become_null() -> None:
     # NaN/Inf are not representable in JSON; they map to null → empty render.
-    assert m.compile("{v}\n", vars={"v": math.nan}).output == ""
-    assert m.compile("{v}\n", vars={"v": math.inf}).output == ""
+    assert m.compile("{{v}}\n", vars={"v": math.nan}).output == ""
+    assert m.compile("{{v}}\n", vars={"v": math.inf}).output == ""
 
 
 def test_v3_none_is_valid_null() -> None:
     # A Python None is a valid null value (renders empty), not an error.
-    assert m.compile("{v}\n", vars={"v": None}).output == ""
+    assert m.compile("{{v}}\n", vars={"v": None}).output == ""
 
 
 @pytest.mark.parametrize("bad", [b"bytes", object(), 1 + 2j])
@@ -149,20 +149,20 @@ def test_v3_unconvertible_scalar_values(bad: object) -> None:
     # bytes / arbitrary objects / complex can't convert to JSON values →
     # invalid_options. (Sets and tuples DO convert — see below.)
     with pytest.raises(m.MdsError) as ei:
-        m.compile("{v}\n", vars={"v": bad})
+        m.compile("{{v}}\n", vars={"v": bad})
     assert ei.value.code == "mds::invalid_options"
 
 
 def test_v3_set_and_tuple_become_arrays() -> None:
-    assert m.compile("{v}\n", vars={"v": (1, 2, 3)}).output == "1, 2, 3\n"
+    assert m.compile("{{v}}\n", vars={"v": (1, 2, 3)}).output == "1, 2, 3\n"
     # set ordering is not guaranteed; assert the elements render, comma-joined
-    out = m.compile("{v}\n", vars={"v": {1, 2, 3}}).output
+    out = m.compile("{{v}}\n", vars={"v": {1, 2, 3}}).output
     assert sorted(out.strip().split(", ")) == ["1", "2", "3"]
 
 
 def test_v3_non_string_keys_rejected() -> None:
     with pytest.raises(m.MdsError) as ei:
-        m.compile("{v}\n", vars={"v": {1: "x"}})
+        m.compile("{{v}}\n", vars={"v": {1: "x"}})
     assert ei.value.code == "mds::invalid_options"
 
 
@@ -170,7 +170,7 @@ def test_v3_nested_json_values_accepted() -> None:
     # A nested object var is accepted; access a scalar field (objects cannot be
     # interpolated directly).
     r = m.compile(
-        "{cfg.flag} {cfg.items}\n",
+        "{{cfg.flag}} {{cfg.items}}\n",
         vars={"cfg": {"flag": True, "items": [1, 2], "n": None}},
     )
     assert r.output == "true 1, 2\n"

@@ -152,7 +152,7 @@ fn structural_fallback_formats_file_with_undefined_var() {
     // time — refusing to format them would make `mds fmt` useless on templates.
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("template.mds");
-    let src = "Hello {undefined_runtime_var}!\n\n\n\nBye.\n";
+    let src = "Hello {{undefined_runtime_var}}!\n\n\n\nBye.\n";
     fs::write(&target, src).unwrap();
 
     let output = fmt_path(&target, &[]);
@@ -167,7 +167,7 @@ fn structural_fallback_formats_file_with_undefined_var() {
     // Interior-verbatim (#150/#151): blank-line runs pass through verbatim
     // even via the structural fallback; only trailing edge is normalised (R2).
     assert_eq!(
-        after, "Hello {undefined_runtime_var}!\n\n\n\nBye.\n",
+        after, "Hello {{undefined_runtime_var}}!\n\n\n\nBye.\n",
         "interior blank-line runs must be preserved verbatim (interior-verbatim contract)"
     );
 }

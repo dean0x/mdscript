@@ -2,7 +2,7 @@
 title: Interior Blank Lines
 ---
 
-## {title} — whitespace is verbatim as of v0.4.0
+## {{title}} — whitespace is verbatim as of v0.4.0
 
 Interior blank-line runs are preserved byte-for-byte everywhere. Only the
 trailing edge of the whole output normalizes to exactly one final newline.
@@ -18,13 +18,13 @@ AFTER-RUN — exactly three blank lines above, none collapsed.
 ### Inside a @define body
 
 @define spaced(first, second):
-{first}
+{{first}}
 
 
-{second} — exactly two blank lines above, carried from the macro body.
+{{second}} — exactly two blank lines above, carried from the macro body.
 @end
 
-{spaced("alpha", "omega")}
+{{spaced("alpha", "omega")}}
 
 ### Inside a @block body
 

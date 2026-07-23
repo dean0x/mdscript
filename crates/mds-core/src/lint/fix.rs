@@ -93,25 +93,28 @@ use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResult, Severity}
 // Tier classification lives in the leaf `tier` module to break the would-be
 // circular dependency (fix.rs → diagnostic.rs → fix.rs). Re-export here so
 // the public API surface at `mds::fix::FixTier` etc. is unchanged.
-pub use super::tier::{is_fixable, rule_tier, FixTier};
+pub use super::tier::{is_fixable, is_output_neutral, rule_tier, FixTier};
 
 // ── Fix plan ─────────────────────────────────────────────────────────────────
 
 /// A single byte-range edit on the source string.
 ///
-/// The edit removes the bytes in `[start, end)` from the source. The
-/// `end` is exclusive; the removed range must not exceed the source length.
+/// The edit replaces the bytes in `[start, end)` with `replacement`. When
+/// `replacement` is empty, this is equivalent to a pure deletion. The
+/// `end` is exclusive; the range must not exceed the source length.
 ///
 /// **CRLF note**: `end` must be chosen to include the complete line terminator
-/// (call [`extend_to_line_end`] to adjust if needed).
+/// (call [`extend_to_line_end`] to adjust if needed) for line-removal edits.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ByteEdit {
-    /// Inclusive start byte offset of the removal.
+    /// Inclusive start byte offset of the range to replace.
     pub start: usize,
-    /// Exclusive end byte offset of the removal.
+    /// Exclusive end byte offset of the range to replace.
     pub end: usize,
     /// Rule that generated this edit (for audit/logging).
     pub rule: String,
+    /// Replacement text. Empty string means pure deletion (line removal).
+    pub replacement: String,
 }
 
 /// A fix edit that was rejected by the per-edit reverify gate in [`apply_fixes_incremental`].
@@ -284,21 +287,46 @@ fn fix_line_span_to_edit(span: &FixLineSpan, source: &str, rule: &str) -> Option
         start,
         end,
         rule: rule.to_string(),
+        replacement: String::new(), // line-removal: empty replacement
     })
 }
 
-/// Convert a diagnostic's `fix_removals` into zero or more `ByteEdit`s.
+/// Convert a diagnostic's `fix_removals` and `fix_edits` into zero or more `ByteEdit`s.
 ///
-/// Returns an empty `Vec` when `diag.fix_removals` is `None` (no-fix case)
-/// or when every span resolves to an invalid range (fail-closed per ADR-001).
+/// Returns an empty `Vec` when both `fix_removals` and `fix_edits` are `None`
+/// (no-fix case), or when every span resolves to an invalid range (fail-closed per ADR-001).
 fn diag_to_edits(diag: &LintDiagnostic, source: &str) -> Vec<ByteEdit> {
-    let Some(removals) = &diag.fix_removals else {
-        return vec![];
-    };
-    removals
-        .iter()
-        .filter_map(|span| fix_line_span_to_edit(span, source, &diag.rule))
-        .collect()
+    let mut edits = Vec::new();
+
+    // fix_removals path (line removals)
+    if let Some(removals) = &diag.fix_removals {
+        edits.extend(
+            removals
+                .iter()
+                .filter_map(|span| fix_line_span_to_edit(span, source, &diag.rule)),
+        );
+    }
+
+    // fix_edits path (replacement edits)
+    if let Some(text_edits) = &diag.fix_edits {
+        for edit in text_edits {
+            // Validate bounds: fail-closed per ADR-001 (silently skip invalid ranges)
+            if edit.start <= edit.end
+                && edit.end <= source.len()
+                && source.is_char_boundary(edit.start)
+                && source.is_char_boundary(edit.end)
+            {
+                edits.push(ByteEdit {
+                    start: edit.start,
+                    end: edit.end,
+                    rule: diag.rule.clone(),
+                    replacement: edit.new_text.clone(),
+                });
+            }
+        }
+    }
+
+    edits
 }
 
 /// Extend a byte position to include the complete line terminator at or after `pos`.
@@ -463,8 +491,6 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
         return source.to_string();
     }
 
-    let mut result = source.as_bytes().to_vec();
-
     // `plan.edits` must be sorted ascending by start offset (guaranteed by
     // plan_fixes_with_options which calls `edits.sort()` before returning).
     // Iterate right-to-left with `.rev()` — no clone or re-sort needed.
@@ -480,6 +506,13 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
         plan.edits.windows(2).all(|w| w[0].start <= w[1].start),
         "apply_plan_unchecked: edits must be sorted ascending by start offset (avoids PF-005)"
     );
+
+    // Apply right-to-left: earlier byte offsets remain valid as higher-offset
+    // edits are applied first. Use splice (replace_range) so that both pure
+    // deletions (replacement="") and text replacements are handled uniformly.
+    // Safety: source is valid UTF-8; edits must operate on char boundaries.
+    // replace_range on char-boundary offsets with valid-UTF-8 replacement preserves UTF-8.
+    let mut result = source.to_string();
     for edit in plan.edits.iter().rev() {
         let start = edit.start;
         let end = edit.end;
@@ -491,14 +524,18 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
             );
             continue;
         }
-        result.drain(start..end);
+        debug_assert!(
+            result.is_char_boundary(start),
+            "fix edit start={start} is not a char boundary"
+        );
+        debug_assert!(
+            result.is_char_boundary(end),
+            "fix edit end={end} is not a char boundary"
+        );
+        result.replace_range(start..end, &edit.replacement);
     }
 
-    // Safety: source is valid UTF-8; edits remove whole character sequences
-    // (line-by-line removal at newline boundaries). Invalid UTF-8 after edit
-    // is a logic error — use lossy conversion in that case.
-    String::from_utf8(result)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.into_bytes().as_slice()).into_owned())
+    result
 }
 
 /// Apply a `FixPlan` with a reverify callback.
@@ -871,6 +908,7 @@ mod tests {
             file: Some("test.mds".to_string()),
             // fix_removals drives the planner; FixLineSpan::single(offset) covers one line.
             fix_removals: Some(vec![FixLineSpan::single(offset)]),
+            fix_edits: None,
         }
     }
 
@@ -1098,6 +1136,7 @@ mod tests {
             }),
             file: None,
             fix_removals: Some(vec![FixLineSpan::single(0)]),
+            fix_edits: None,
         };
         let diag_b = LintDiagnostic {
             rule: "duplicate-export".to_string(),
@@ -1112,6 +1151,7 @@ mod tests {
             }),
             file: None,
             fix_removals: Some(vec![FixLineSpan::single(0)]),
+            fix_edits: None,
         };
         let result = LintResult {
             diagnostics: vec![diag_a, diag_b],
@@ -1161,6 +1201,7 @@ mod tests {
                 to: 21,   // @end offset
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         let narrow_edit = LintDiagnostic {
             rule: "empty-block".to_string(),
@@ -1176,6 +1217,7 @@ mod tests {
                 to: 21,
                 to_inclusive: false,
             }]),
+            fix_edits: None,
         };
         let result = LintResult {
             diagnostics: vec![wide_edit, narrow_edit],
@@ -1247,6 +1289,7 @@ mod tests {
                 to: 6,   // offset inside line1; extend_to_line_end(6) = 12
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         // Edit B covers bytes [6, 18): spans line1 (start) through line2 (end inclusive).
         // B.start=6 < A.end=12, B.end=18 > A.end=12 → genuine partial overlap.
@@ -1262,6 +1305,7 @@ mod tests {
                 to: 12,  // offset inside line2; extend_to_line_end(12) = 18
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         let result = LintResult {
             diagnostics: vec![diag_a, diag_b],
@@ -1371,6 +1415,7 @@ mod tests {
             }),
             file: Some("test.mds".to_string()),
             fix_removals: None, // Tier B unused-import: no edit emitted
+            fix_edits: None,
         };
         let result = make_result(vec![diag]);
         // plan_fixes_with_options(include_tier_b=true) still produces no edit because
@@ -1421,6 +1466,7 @@ mod tests {
                     to_inclusive: true,
                 },
             ]),
+            fix_edits: None,
         };
         let result = make_result(vec![diag]);
         let plan = plan_fixes(&result, source);
@@ -1765,6 +1811,7 @@ mod tests {
                 start: 5,
                 end: 12,
                 rule: "duplicate-import".to_string(),
+                replacement: String::new(),
             }],
             overlap_rejected: false,
             truncated: false,
@@ -2074,11 +2121,13 @@ mod tests {
                     start: 6,
                     end: 12,
                     rule: "duplicate-import".to_string(),
+                    replacement: String::new(),
                 },
                 ByteEdit {
                     start: 0,
                     end: 6,
                     rule: "duplicate-import".to_string(),
+                    replacement: String::new(),
                 },
             ],
             overlap_rejected: false,
@@ -2103,11 +2152,13 @@ mod tests {
                     start: 6,
                     end: 12,
                     rule: "duplicate-import".to_string(),
+                    replacement: String::new(),
                 },
                 ByteEdit {
                     start: 0,
                     end: 6,
                     rule: "duplicate-import".to_string(),
+                    replacement: String::new(),
                 },
             ],
             overlap_rejected: false,

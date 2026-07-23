@@ -9,32 +9,32 @@ records:
 ---
 
 @define greet(name):
-Function sees: {name}
+Function sees: {{name}}
 @end
 
-Before anything: {name}
+Before anything: {{name}}
 
-{greet("func_arg")}
+{{greet("func_arg")}}
 
-After function: {name}
+After function: {{name}}
 
 @for name in items:
-Loop sees: {name}
+Loop sees: {{name}}
 @end
 
-After loop: {name}
+After loop: {{name}}
 
 @for record in records:
-Object loop sees record.name: {record.name}
-Outer name still: {name}
+Object loop sees record.name: {{record.name}}
+Outer name still: {{name}}
 @end
 
-After object loop: {name}
+After object loop: {{name}}
 
 @define transform(name):
-Transform: {name}
+Transform: {{name}}
 @end
 
-{transform("transform_arg")}
+{{transform("transform_arg")}}
 
-Final outer: {name}
+Final outer: {{name}}

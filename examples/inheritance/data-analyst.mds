@@ -4,7 +4,7 @@ audience: data scientists
 ---
 @extends "./base-agent.mds"
 @block persona:
-You are a meticulous {role} who shows your reasoning step by step.
+You are a meticulous {{role}} who shows your reasoning step by step.
 @end
 @block capabilities:
 You can profile datasets, run statistical tests, and explain the trade-offs

@@ -115,7 +115,7 @@ fn watch_rejects_dir_with_output_flag() {
 fn watch_initial_compile_writes_output() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let child = ChildGuard(
@@ -138,7 +138,7 @@ fn watch_initial_compile_writes_output() {
 fn watch_edit_entry_updates_output() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: Alice\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let child = ChildGuard(
@@ -157,7 +157,7 @@ fn watch_edit_entry_updates_output() {
     );
 
     // Edit the source.
-    std::fs::write(&src, "---\nname: Bob\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Bob\n---\nHello {{name}}!\n").unwrap();
 
     // Wait for rebuild.
     assert!(
@@ -178,7 +178,7 @@ fn watch_edit_imported_dep_updates_entry() {
     let helper = dir.path().join("helper.mds");
     std::fs::write(
         &helper,
-        "@define greet(name):\nHello {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nHello {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
 
@@ -186,7 +186,7 @@ fn watch_edit_imported_dep_updates_entry() {
     let entry = dir.path().join("entry.mds");
     std::fs::write(
         &entry,
-        "@import \"./helper.mds\" as h\n\n{h.greet(\"World\")}\n",
+        "@import \"./helper.mds\" as h\n\n{{h.greet(\"World\")}}\n",
     )
     .unwrap();
     let out = dir.path().join("entry.md");
@@ -208,7 +208,7 @@ fn watch_edit_imported_dep_updates_entry() {
     // Edit the helper to change the greeting.
     std::fs::write(
         &helper,
-        "@define greet(name):\nHi there {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nHi there {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
 
@@ -226,7 +226,7 @@ fn watch_edit_imported_dep_updates_entry() {
 fn watch_compile_error_keeps_watcher_alive() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: Alice\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let mut child = ChildGuard(
@@ -245,7 +245,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     );
 
     // Introduce a compile error.
-    std::fs::write(&src, "Hello {undefined_var_xyz}!\n").unwrap();
+    std::fs::write(&src, "Hello {{undefined_var_xyz}}!\n").unwrap();
     // Give the watcher time to attempt rebuild.
     std::thread::sleep(Duration::from_millis(500));
 
@@ -258,7 +258,7 @@ fn watch_compile_error_keeps_watcher_alive() {
     );
 
     // Fix the error — watcher should recover.
-    std::fs::write(&src, "---\nname: Charlie\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Charlie\n---\nHello {{name}}!\n").unwrap();
     assert!(
         wait_for_file_contains(&out, "Hello Charlie!", TIMEOUT),
         "fixing the error should trigger a successful rebuild"
@@ -274,12 +274,12 @@ fn watch_dir_mode_compiles_all_on_startup() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.mds"),
-        "---\nname: A\n---\nFile A: {name}\n",
+        "---\nname: A\n---\nFile A: {{name}}\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("b.mds"),
-        "---\nname: B\n---\nFile B: {name}\n",
+        "---\nname: B\n---\nFile B: {{name}}\n",
     )
     .unwrap();
     let out_dir = dir.path().join("out");
@@ -314,7 +314,7 @@ fn watch_dir_mode_compiles_all_on_startup() {
     // Edit a.mds → only a.md should update.
     std::fs::write(
         dir.path().join("a.mds"),
-        "---\nname: A-edited\n---\nFile A: {name}\n",
+        "---\nname: A-edited\n---\nFile A: {{name}}\n",
     )
     .unwrap();
     assert!(
@@ -366,7 +366,7 @@ fn watch_dir_mode_picks_up_new_files() {
     // Create a new file AFTER the watcher is running.
     std::fs::write(
         dir.path().join("c.mds"),
-        "---\nname: C\n---\nNew file {name}\n",
+        "---\nname: C\n---\nNew file {{name}}\n",
     )
     .unwrap();
 
@@ -439,7 +439,7 @@ fn watch_vars_file_change_triggers_recompile() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
     // Provide a frontmatter default so the template compiles even without vars.
-    std::fs::write(&src, "---\nname: Default\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Default\n---\nHello {{name}}!\n").unwrap();
     let vars = dir.path().join("vars.json");
     std::fs::write(&vars, r#"{"name": "Alice"}"#).unwrap();
     let out = dir.path().join("hello.md");
@@ -483,7 +483,7 @@ fn watch_vars_file_change_triggers_recompile() {
 fn watch_clear_non_tty_no_ansi_escape() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     // Spawn with piped stderr — not a TTY. `clear_terminal` only emits the ANSI
@@ -516,7 +516,7 @@ fn watch_clear_non_tty_no_ansi_escape() {
 
     // Edit the source to trigger a rebuild — this is the path that calls
     // clear_terminal(). On a non-TTY pipe it must be a no-op.
-    std::fs::write(&src, "---\nname: There\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: There\n---\nHello {{name}}!\n").unwrap();
     assert!(
         wait_for_file_contains(&out, "Hello There!", TIMEOUT),
         "rebuild should occur after editing source"
@@ -559,7 +559,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 fn watch_output_flag_writes_to_specified_file() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("custom_output.md");
 
     let child = ChildGuard(
@@ -597,7 +597,7 @@ fn watch_output_flag_writes_to_specified_file() {
 fn watch_set_vars_applied_on_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("tpl.mds");
-    std::fs::write(&src, "Hello {name}!\n").unwrap();
+    std::fs::write(&src, "Hello {{name}}!\n").unwrap();
     let out = dir.path().join("tpl.md");
 
     let child = ChildGuard(
@@ -623,7 +623,7 @@ fn watch_set_vars_applied_on_rebuild() {
     );
 
     // Edit to trigger rebuild — --set should still apply.
-    std::fs::write(&src, "Greetings {name}!\n").unwrap();
+    std::fs::write(&src, "Greetings {{name}}!\n").unwrap();
     assert!(
         wait_for_file_contains(&out, "Greetings Alice!", TIMEOUT),
         "--set name=Alice should persist across rebuilds"
@@ -684,7 +684,7 @@ fn watch_messages_template_produces_json_intrinsically() {
 fn watch_stdout_contains_content_when_o_stdout() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     // -o - forces stdout output.
     let mut child = ChildGuard(
@@ -737,7 +737,7 @@ fn watch_stdout_contains_content_when_o_stdout() {
 fn watch_ctrl_c_exits_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let child = mds_bin()
@@ -786,7 +786,7 @@ fn watch_ctrl_c_exits_cleanly() {
 fn watch_debounce_final_value_wins_after_rapid_edits() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: v0\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: v0\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     // Use a 200ms debounce for stability.
@@ -807,7 +807,7 @@ fn watch_debounce_final_value_wins_after_rapid_edits() {
 
     // Write 10 rapid edits within the debounce window.
     for i in 1..=10 {
-        std::fs::write(&src, format!("---\nname: v{i}\n---\nHello {{name}}!\n")).unwrap();
+        std::fs::write(&src, format!("---\nname: v{i}\n---\nHello {{{{name}}}}!\n")).unwrap();
         // Tiny sleep to ensure filesystem registers the write, but
         // well within the 200ms debounce window.
         std::thread::sleep(Duration::from_millis(5));
@@ -866,7 +866,7 @@ fn watch_import_removal_stops_tracking_dep() {
     let helper = dir.path().join("helper.mds");
     std::fs::write(
         &helper,
-        "@define greet(name):\nHello {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nHello {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
 
@@ -874,7 +874,7 @@ fn watch_import_removal_stops_tracking_dep() {
     let entry = dir.path().join("entry.mds");
     std::fs::write(
         &entry,
-        "@import \"./helper.mds\" as h\n\n{h.greet(\"World\")}\n",
+        "@import \"./helper.mds\" as h\n\n{{h.greet(\"World\")}}\n",
     )
     .unwrap();
     let out = dir.path().join("entry.md");
@@ -898,7 +898,7 @@ fn watch_import_removal_stops_tracking_dep() {
     // Edit helper — entry output should update because helper is tracked.
     std::fs::write(
         &helper,
-        "@define greet(name):\nHi {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nHi {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
     assert!(
@@ -921,7 +921,7 @@ fn watch_import_removal_stops_tracking_dep() {
     // was removed from the watch set after the resync in step 2.
     std::fs::write(
         &helper,
-        "@define greet(name):\nBye {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nBye {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
 
@@ -949,12 +949,12 @@ fn watch_dir_mode_vars_change_recompiles_all() {
     // Two templates that each interpolate the `greeting` var.
     std::fs::write(
         src_dir.path().join("a.mds"),
-        "---\ngreeting: Default\n---\n{greeting} from A\n",
+        "---\ngreeting: Default\n---\n{{greeting}} from A\n",
     )
     .unwrap();
     std::fs::write(
         src_dir.path().join("b.mds"),
-        "---\ngreeting: Default\n---\n{greeting} from B\n",
+        "---\ngreeting: Default\n---\n{{greeting}} from B\n",
     )
     .unwrap();
 
@@ -1013,7 +1013,7 @@ fn watch_dir_mode_vars_change_recompiles_all() {
 fn watch_quiet_keeps_errors_visible() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let mut child = ChildGuard(
@@ -1053,7 +1053,7 @@ fn watch_quiet_keeps_errors_visible() {
     );
 
     // Introduce a compile error (reference an undefined variable with no frontmatter default).
-    std::fs::write(&src, "Hello {__undefined_xyz__}!\n").unwrap();
+    std::fs::write(&src, "Hello {{__undefined_xyz__}}!\n").unwrap();
 
     // Give the watcher time to attempt rebuild and emit error.
     std::thread::sleep(Duration::from_millis(500));
@@ -1074,7 +1074,7 @@ fn watch_quiet_keeps_errors_visible() {
     );
 
     // Fix the error — watcher should recover.
-    std::fs::write(&src, "---\nname: Fixed\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Fixed\n---\nHello {{name}}!\n").unwrap();
     assert!(
         wait_for_file_contains(&out, "Hello Fixed!", TIMEOUT),
         "after fixing the compile error, watcher should rebuild successfully"
@@ -1091,7 +1091,7 @@ fn watch_quiet_keeps_errors_visible() {
 fn watch_ctrl_c_prints_stopped_watching() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let child = mds_bin()
@@ -1175,7 +1175,7 @@ fn watch_ctrl_c_prints_stopped_watching() {
 fn watch_debounce_single_rebuild_from_burst() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("burst.mds");
-    std::fs::write(&src, "---\nname: v0\n---\nBurst {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: v0\n---\nBurst {{name}}!\n").unwrap();
     let out = dir.path().join("burst.md");
 
     // Use a 250ms debounce — large enough to reliably swallow the ~10 × 5ms burst.
@@ -1217,7 +1217,7 @@ fn watch_debounce_single_rebuild_from_burst() {
 
     // Write 10 rapid edits within the 250ms debounce window.
     for i in 1..=10u32 {
-        std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{name}}!\n")).unwrap();
+        std::fs::write(&src, format!("---\nname: v{i}\n---\nBurst {{{{name}}}}!\n")).unwrap();
         std::thread::sleep(Duration::from_millis(5));
     }
 
@@ -1266,7 +1266,7 @@ fn watch_no_arg_auto_detects_single_mds_file() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("only.mds"),
-        "---\nname: AutoDetect\n---\nAuto {name}!\n",
+        "---\nname: AutoDetect\n---\nAuto {{name}}!\n",
     )
     .unwrap();
     let out = dir.path().join("only.md");
@@ -1328,7 +1328,7 @@ fn watch_no_arg_fails_with_multiple_mds_files() {
 fn watch_startup_no_spurious_recompile() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("nochange.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("nochange.md");
 
     let mut child = ChildGuard(
@@ -1497,12 +1497,12 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.mds"),
-        "---\nname: A\n---\nFile A: {name}\n",
+        "---\nname: A\n---\nFile A: {{name}}\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("b.mds"),
-        "---\nname: B\n---\nFile B: {name}\n",
+        "---\nname: B\n---\nFile B: {{name}}\n",
     )
     .unwrap();
     let out_dir = dir.path().join("out");
@@ -1601,7 +1601,7 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
 fn watch_single_status_line_per_rebuild() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("status.mds");
-    std::fs::write(&src, "---\nname: v0\n---\nStatus {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: v0\n---\nStatus {{name}}!\n").unwrap();
     let out = dir.path().join("status.md");
 
     let mut child = ChildGuard(
@@ -1647,7 +1647,7 @@ fn watch_single_status_line_per_rebuild() {
     );
 
     // Make ONE real content-changing edit.
-    std::fs::write(&src, "---\nname: v1\n---\nStatus {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: v1\n---\nStatus {{name}}!\n").unwrap();
 
     // Wait for the rebuild to appear in the output.
     assert!(
@@ -1692,7 +1692,7 @@ fn watch_dir_mode_mirrors_subtree_to_out_dir() {
     let dir = tempfile::tempdir().unwrap();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
-    std::fs::write(sub.join("deep.mds"), "---\nname: D\n---\nDeep {name}\n").unwrap();
+    std::fs::write(sub.join("deep.mds"), "---\nname: D\n---\nDeep {{name}}\n").unwrap();
     let out_dir = dir.path().join("out");
 
     let child = ChildGuard(
@@ -1795,15 +1795,15 @@ fn watch_dir_mode_shared_partial_rebuilds_importers() {
     let partial = dir.path().join("_shared.mds");
     std::fs::write(
         &partial,
-        "@define greet(name):\nHello {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nHello {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
 
     // Two importers.
     let a = dir.path().join("a.mds");
     let b = dir.path().join("b.mds");
-    std::fs::write(&a, "@import \"./_shared.mds\" as s\n{s.greet(\"A\")}\n").unwrap();
-    std::fs::write(&b, "@import \"./_shared.mds\" as s\n{s.greet(\"B\")}\n").unwrap();
+    std::fs::write(&a, "@import \"./_shared.mds\" as s\n{{s.greet(\"A\")}}\n").unwrap();
+    std::fs::write(&b, "@import \"./_shared.mds\" as s\n{{s.greet(\"B\")}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
 
@@ -1843,7 +1843,7 @@ fn watch_dir_mode_shared_partial_rebuilds_importers() {
     // Edit the partial — both importers must rebuild.
     std::fs::write(
         &partial,
-        "@define greet(name):\nHi {name}!\n@end\n\n@export greet\n",
+        "@define greet(name):\nHi {{name}}!\n@end\n\n@export greet\n",
     )
     .unwrap();
 
@@ -1875,11 +1875,11 @@ fn watch_dir_mode_chain_rebuild() {
     let b = dir.path().join("_b.mds");
     std::fs::write(
         &b,
-        "@import \"./_c.mds\" as c\n@define val():\n{c.val()}\n@end\n\n@export val\n",
+        "@import \"./_c.mds\" as c\n@define val():\n{{c.val()}}\n@end\n\n@export val\n",
     )
     .unwrap();
     let a = dir.path().join("a.mds");
-    std::fs::write(&a, "@import \"./_b.mds\" as b\n{b.val()}\n").unwrap();
+    std::fs::write(&a, "@import \"./_b.mds\" as b\n{{b.val()}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
 
@@ -1924,7 +1924,7 @@ fn watch_dir_mode_chain_rebuild() {
 fn watch_poll_interval_zero_works() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
     let child = ChildGuard(
@@ -1950,7 +1950,7 @@ fn watch_poll_interval_zero_works() {
     );
 
     // Verify a real edit also works.
-    std::fs::write(&src, "---\nname: Poll\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Poll\n---\nHello {{name}}!\n").unwrap();
     assert!(
         wait_for_file_contains(&out, "Hello Poll!", TIMEOUT),
         "--poll-interval 0: edit should still trigger rebuild via native event"
@@ -2027,7 +2027,7 @@ fn watch_poll_interval_tiny_clamped() {
 fn watch_file_mode_idle_no_recompile_across_ticks() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("idle.mds");
-    std::fs::write(&src, "---\nname: World\n---\nIdle {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nIdle {{name}}!\n").unwrap();
     let out = dir.path().join("idle.md");
 
     let mut child = ChildGuard(
@@ -2115,7 +2115,7 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.mds"),
-        "---\nname: A\n---\nFile A: {name}\n",
+        "---\nname: A\n---\nFile A: {{name}}\n",
     )
     .unwrap();
     let out_dir = dir.path().join("out");
@@ -2213,7 +2213,7 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
     let src_dir = base.path().join("src");
     std::fs::create_dir(&src_dir).unwrap();
     let src = src_dir.join("entry.mds");
-    std::fs::write(&src, "---\nname: Before\n---\nEntry {name}\n").unwrap();
+    std::fs::write(&src, "---\nname: Before\n---\nEntry {{name}}\n").unwrap();
     let out = src_dir.join("entry.md");
 
     let child = ChildGuard(
@@ -2247,7 +2247,7 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
 
     // Recreate the parent dir and the source file with new content.
     std::fs::create_dir(&src_dir).unwrap();
-    std::fs::write(&src, "---\nname: After\n---\nEntry {name}\n").unwrap();
+    std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
 
     // Watcher should recover within ~1 tick (100ms poll-interval) and recompile.
     assert!(
@@ -2302,7 +2302,11 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
 
     // Recreate the root with a brand-new file (init-gap case).
     std::fs::create_dir(&root).unwrap();
-    std::fs::write(root.join("new.mds"), "---\nname: N\n---\nNew file {name}\n").unwrap();
+    std::fs::write(
+        root.join("new.mds"),
+        "---\nname: N\n---\nNew file {{name}}\n",
+    )
+    .unwrap();
 
     // The watcher should recover and compile the new file.
     assert!(
@@ -2321,7 +2325,7 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
 fn watch_file_mode_entry_deleted_settles_then_recovers() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("entry.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("entry.md");
 
     let mut child = ChildGuard(
@@ -2394,7 +2398,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     );
 
     // Recreate the file with different content.
-    std::fs::write(&src, "---\nname: Recovered\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Recovered\n---\nHello {{name}}!\n").unwrap();
 
     // Wait for recompile after recovery.
     assert!(
@@ -2436,7 +2440,7 @@ fn watch_vars_dir_delete_recreate_rearms() {
     std::fs::create_dir_all(&vars_dir).unwrap();
 
     let src = src_dir.join("tpl.mds");
-    std::fs::write(&src, "---\ngreeting: Default\n---\n{greeting}\n").unwrap();
+    std::fs::write(&src, "---\ngreeting: Default\n---\n{{greeting}}\n").unwrap();
     let vars_file = vars_dir.join("vars.json");
     std::fs::write(&vars_file, r#"{"greeting": "Hello"}"#).unwrap();
     let out = src_dir.join("tpl.md");
@@ -2535,7 +2539,7 @@ fn watch_dir_mode_cross_root_partial_edit_rebuilds_importer() {
     let importer = root.join("importer.mds");
     std::fs::write(
         &importer,
-        "@import \"../shared/_x.mds\" as x\n{x.greet()}\n",
+        "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n",
     )
     .unwrap();
 
@@ -2615,7 +2619,7 @@ fn watch_dir_mode_delete_partial_surfaces_broken_import() {
     .unwrap();
 
     let importer = dir.path().join("main.mds");
-    std::fs::write(&importer, "@import \"./_p.mds\" as p\n{p.val()}\n").unwrap();
+    std::fs::write(&importer, "@import \"./_p.mds\" as p\n{{p.val()}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
 
@@ -2708,7 +2712,7 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
 
     // Importer references a partial that does NOT exist yet.
     let importer = dir.path().join("main.mds");
-    std::fs::write(&importer, "@import \"./_missing.mds\" as m\n{m.val()}\n").unwrap();
+    std::fs::write(&importer, "@import \"./_missing.mds\" as m\n{{m.val()}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
 
@@ -2766,7 +2770,7 @@ fn watch_dir_mode_dual_role_node_edit_and_delete() {
     .unwrap();
 
     let consumer = dir.path().join("consumer.mds");
-    std::fs::write(&consumer, "@import \"./dual.mds\" as d\n{d.greet()}\n").unwrap();
+    std::fs::write(&consumer, "@import \"./dual.mds\" as d\n{{d.greet()}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
 
@@ -2849,11 +2853,11 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("a.mds"),
-        "---\nname: A\n---\nFile A: {name}\n",
+        "---\nname: A\n---\nFile A: {{name}}\n",
     )
     .unwrap();
     // Syntax error file: references undefined variable with no frontmatter.
-    std::fs::write(dir.path().join("bad.mds"), "Hello {__undefined_xyz__}!\n").unwrap();
+    std::fs::write(dir.path().join("bad.mds"), "Hello {{__undefined_xyz__}}!\n").unwrap();
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
@@ -3060,17 +3064,17 @@ fn watch_dir_mode_partial_edit_rebuilds_exactly_n_importers() {
     // Three importers.
     std::fs::write(
         dir.path().join("a.mds"),
-        "@import \"./_shared.mds\" as s\n{s.val()} from A\n",
+        "@import \"./_shared.mds\" as s\n{{s.val()}} from A\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("b.mds"),
-        "@import \"./_shared.mds\" as s\n{s.val()} from B\n",
+        "@import \"./_shared.mds\" as s\n{{s.val()}} from B\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("c.mds"),
-        "@import \"./_shared.mds\" as s\n{s.val()} from C\n",
+        "@import \"./_shared.mds\" as s\n{{s.val()}} from C\n",
     )
     .unwrap();
 
@@ -3163,7 +3167,7 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
     std::fs::write(&partial, "@define val():\nSoak V0\n@end\n\n@export val\n").unwrap();
 
     let importer = dir.path().join("consumer.mds");
-    std::fs::write(&importer, "@import \"./_soak.mds\" as s\n{s.val()}\n").unwrap();
+    std::fs::write(&importer, "@import \"./_soak.mds\" as s\n{{s.val()}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
     let mut child = ChildGuard(
@@ -3536,7 +3540,7 @@ fn watch_rejects_symlinked_vars_file() {
 
     // Real entry and vars files.
     let entry = dir.path().join("entry.mds");
-    std::fs::write(&entry, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&entry, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     let real_vars = dir.path().join("real_vars.json");
     std::fs::write(&real_vars, r#"{"name": "World"}"#).unwrap();
@@ -3585,7 +3589,7 @@ fn watch_rejects_symlinked_dir_target() {
     std::fs::create_dir(&real_src).unwrap();
     std::fs::write(
         real_src.join("a.mds"),
-        "---\nname: A\n---\nFile A: {name}\n",
+        "---\nname: A\n---\nFile A: {{name}}\n",
     )
     .unwrap();
 
@@ -3638,14 +3642,14 @@ fn watch_dir_skips_symlinked_source_file() {
     std::fs::create_dir(&src).unwrap();
 
     // A real .mds file inside the watched dir — SHOULD compile.
-    std::fs::write(src.join("a.mds"), "---\nname: A\n---\nFile A: {name}\n").unwrap();
+    std::fs::write(src.join("a.mds"), "---\nname: A\n---\nFile A: {{name}}\n").unwrap();
 
     // An external .mds file to be pointed at by the symlink.
     let external_dir = dir.path().join("external");
     std::fs::create_dir(&external_dir).unwrap();
     std::fs::write(
         external_dir.join("external.mds"),
-        "---\nname: Ext\n---\nExternal: {name}\n",
+        "---\nname: Ext\n---\nExternal: {{name}}\n",
     )
     .unwrap();
 

@@ -2,8 +2,6 @@
 
 Vite plugin for importing `.mds` templates as ES modules with HMR support.
 
-> **Note:** This package is pre-release and not yet published to npm.
-
 ## Installation
 
 ```sh

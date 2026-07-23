@@ -5,7 +5,7 @@ tools: [search, code, browse]
 
 @import "./index.mds" as prompts
 
-{prompts.hello(user)}
+{{prompts.hello(user)}}
 
 You have access to:
-{prompts.bullet_list(tools)}
+{{prompts.bullet_list(tools)}}

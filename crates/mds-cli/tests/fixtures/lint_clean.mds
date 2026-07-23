@@ -2,4 +2,4 @@
 greeting: Hello
 ---
 
-{greeting}, world!
+{{greeting}}, world!

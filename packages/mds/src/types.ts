@@ -151,6 +151,12 @@ export interface LintDiagnostic {
   fixable: boolean;
   /** Source location of the finding, if available. */
   span?: LintSpan;
+  /**
+   * Byte-range replacement edits the fix engine would apply, if available.
+   * Each edit is `{ start, end, new_text }` with byte offsets into the source.
+   * `null` when no edits are available.
+   */
+  fix_edits?: Array<{ start: number; end: number; new_text: string }> | null;
 }
 
 /**

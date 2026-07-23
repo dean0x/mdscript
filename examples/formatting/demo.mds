@@ -4,19 +4,19 @@ audience: end users
 tone: concise
 ---
 
-# {role}
+# {{role}}
 
-You write changelog entries for {audience} in a {tone} voice.
+You write changelog entries for {{audience}} in a {{tone}} voice.
 
 @define entry(kind, summary):
-- **{kind}:** {summary}
+- **{{kind}}:** {{summary}}
 @end
 
 ## Rules
 
-{entry("Added", "New capabilities, described from the reader's point of view.")}
-{entry("Fixed", "User-visible bugs, with the symptom named first.")}
-{entry("Changed", "Behavior differences someone upgrading would notice.")}
+{{entry("Added", "New capabilities, described from the reader's point of view.")}}
+{{entry("Fixed", "User-visible bugs, with the symptom named first.")}}
+{{entry("Changed", "Behavior differences someone upgrading would notice.")}}
 
 ## Voice sample
 

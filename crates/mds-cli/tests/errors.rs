@@ -44,7 +44,7 @@ fn not_mds_file_error() {
 
 #[test]
 fn undefined_function_error() {
-    let source = "{nonexistent(\"arg\")}\n";
+    let source = "{{nonexistent(\"arg\")}}\n";
     let result = mds::compile_str_with(source, None, None);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -56,7 +56,7 @@ fn undefined_function_error() {
 
 #[test]
 fn undefined_namespace_in_qualified_call() {
-    let source = "{missing_ns.greet(\"Alice\")}\n";
+    let source = "{{missing_ns.greet(\"Alice\")}}\n";
     let result = mds::compile_str_with(source, None, None);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -68,7 +68,7 @@ fn undefined_namespace_in_qualified_call() {
 
 #[test]
 fn undefined_function_error_message_says_function() {
-    let source = "{nonexistent_fn(\"arg\")}\n";
+    let source = "{{nonexistent_fn(\"arg\")}}\n";
     let result = mds::compile_str_with(source, None, None);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
@@ -113,7 +113,7 @@ fn for_iterate_non_array_error() {
 #[test]
 fn invalid_identifier_in_for_var() {
     // @for x-y in items: — loop variable 'x-y' is not a valid identifier
-    let source = "---\nitems: [a, b]\n---\n@for x-y in items:\n- {item}\n@end\n";
+    let source = "---\nitems: [a, b]\n---\n@for x-y in items:\n- {{item}}\n@end\n";
     let result = mds::compile_str_with(source, None, None);
     assert!(
         result.is_err(),
@@ -142,7 +142,7 @@ fn invalid_identifier_in_define_name() {
 #[test]
 fn duplicate_define_params_errors() {
     // @define test(a, a): — duplicate parameter 'a' must be a compile error
-    let source = "@define test(a, a):\n{a}\n@end\n";
+    let source = "@define test(a, a):\n{{a}}\n@end\n";
     let result = mds::compile_str_with(source, None, None);
     assert!(result.is_err(), "duplicate parameter name must be rejected");
     let err = format!("{}", result.unwrap_err());
@@ -172,7 +172,7 @@ fn duplicate_define_errors() {
 fn error_output_shows_line_numbers() {
     // Compile a file with a known error and verify the miette output
     // includes source context with line numbers
-    let source = "---\nname: Alice\n---\nHello {username}!\n";
+    let source = "---\nname: Alice\n---\nHello {{username}}!\n";
     let result = mds::compile_str_with(source, None, None);
     assert!(result.is_err(), "should fail with undefined variable");
 
@@ -197,7 +197,7 @@ fn error_format_includes_file_line_col() {
     // Use the CLI to get the full diagnostic rendering.
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("err_test.mds");
-    std::fs::write(&input, "---\nname: Alice\n---\nHello {undefined_var}!\n").unwrap();
+    std::fs::write(&input, "---\nname: Alice\n---\nHello {{undefined_var}}!\n").unwrap();
 
     let output = mds_bin()
         .args(["build", input.to_str().unwrap()])
@@ -236,7 +236,7 @@ fn circular_import_error_has_help_text() {
 #[test]
 fn type_error_for_non_array_in_for_loop() {
     // Build a source that tries @for over a non-array variable
-    let source = "---\ncount: 42\n---\n@for item in count:\n- {item}\n@end\n";
+    let source = "---\ncount: 42\n---\n@for item in count:\n- {{item}}\n@end\n";
     let result = mds::compile_str(source);
     assert!(result.is_err(), "type error should be returned");
     let err = result.unwrap_err();

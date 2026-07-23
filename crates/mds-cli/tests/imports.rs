@@ -209,7 +209,7 @@ fn include_respects_export_visibility_for_prompt() {
 
     std::fs::write(
         &provider,
-        "@define greet(name):\nHello {name}!\n@end\n\n@export greet\n\nThis body should be hidden.\n",
+        "@define greet(name):\nHello {{name}}!\n@end\n\n@export greet\n\nThis body should be hidden.\n",
     )
     .unwrap();
     std::fs::write(&consumer, "@import \"./provider.mds\" as p\n\n@include p\n").unwrap();
@@ -314,12 +314,12 @@ fn explicit_export_hides_non_exported() {
 
     std::fs::write(
         &provider,
-        "@define public_fn(name):\nPublic: {name}\n@end\n\n@define private_fn(name):\nPrivate: {name}\n@end\n\n@export public_fn\n",
+        "@define public_fn(name):\nPublic: {{name}}\n@end\n\n@define private_fn(name):\nPrivate: {{name}}\n@end\n\n@export public_fn\n",
     )
     .unwrap();
     std::fs::write(
         &consumer,
-        "@import { private_fn } from \"./provider.mds\"\n\n{private_fn(\"Alice\")}\n",
+        "@import { private_fn } from \"./provider.mds\"\n\n{{private_fn(\"Alice\")}}\n",
     )
     .unwrap();
 
@@ -342,11 +342,11 @@ fn default_public_when_no_exports() {
     let provider = dir.path().join("provider.mds");
     let consumer = dir.path().join("consumer.mds");
 
-    std::fs::write(&provider, "@define hello(name):\nHello {name}!\n@end\n").unwrap();
+    std::fs::write(&provider, "@define hello(name):\nHello {{name}}!\n@end\n").unwrap();
     // No @export directive — hello should still be importable.
     std::fs::write(
         &consumer,
-        "@import { hello } from \"./provider.mds\"\n\n{hello(\"World\")}\n",
+        "@import { hello } from \"./provider.mds\"\n\n{{hello(\"World\")}}\n",
     )
     .unwrap();
 
@@ -381,7 +381,7 @@ fn import_nonexistent_file_error() {
 
     std::fs::write(
         &consumer,
-        "@import { greet } from \"./does_not_exist.mds\"\n{greet(\"Alice\")}\n",
+        "@import { greet } from \"./does_not_exist.mds\"\n{{greet(\"Alice\")}}\n",
     )
     .unwrap();
 
@@ -406,14 +406,14 @@ fn selective_import_of_non_exported_name() {
 
     std::fs::write(
         &provider,
-        "@define exported(name):\nExported: {name}\n@end\n\
-         @define hidden(name):\nHidden: {name}\n@end\n\
+        "@define exported(name):\nExported: {{name}}\n@end\n\
+         @define hidden(name):\nHidden: {{name}}\n@end\n\
          @export exported\n",
     )
     .unwrap();
     std::fs::write(
         &consumer,
-        "@import { hidden } from \"./provider.mds\"\n{hidden(\"Alice\")}\n",
+        "@import { hidden } from \"./provider.mds\"\n{{hidden(\"Alice\")}}\n",
     )
     .unwrap();
 

@@ -21,7 +21,7 @@ function assert(condition, msg) {
 
 // ─── Test: compile simple string ─────────────────────────────────
 test('compile simple string', () => {
-  const result = mds.compile('---\nname: World\n---\nHello {name}!\n');
+  const result = mds.compile('---\nname: World\n---\nHello {{name}}!\n');
   assert(result.kind === 'markdown', `expected kind==='markdown', got ${result.kind}`);
   assert(result.output.includes('Hello World!'), 'should interpolate variable');
   assert(result.warnings.length === 0, 'should have no warnings');
@@ -30,7 +30,7 @@ test('compile simple string', () => {
 
 // ─── Test: compile with runtime vars ─────────────────────────────
 test('compile with vars override', () => {
-  const result = mds.compile('---\nenv: dev\n---\nEnv: {env}\n', {
+  const result = mds.compile('---\nenv: dev\n---\nEnv: {{env}}\n', {
     vars: { env: 'production' },
   });
   assert(result.output.includes('Env: production'), 'vars should override frontmatter');
@@ -68,7 +68,7 @@ test('check valid file', async () => {
 // ─── Test: error handling with isMdsError ────────────────────────
 test('error handling', () => {
   try {
-    mds.compile('Hello {undefined_var}!');
+    mds.compile('Hello {{undefined_var}}!');
     assert(false, 'should have thrown');
   } catch (err) {
     assert(mds.isMdsError(err), 'should be MDS error');
@@ -87,7 +87,7 @@ users:
 ---
 @for user in users:
 @if user.active:
-- {user.name} (active)
+- {{user.name}} (active)
 @end
 @end
 `;
@@ -102,10 +102,10 @@ test('function definition and call', () => {
   const source = `---
 ---
 @define greet(name, role):
-Hello {name}, you are a {role}!
+Hello {{name}}, you are a {{role}}!
 @end
 
-{greet("Alice", "developer")}
+{{greet("Alice", "developer")}}
 `;
   const result = mds.compile(source);
   assert(result.output.includes('Hello Alice, you are a developer!'), 'should expand function');
@@ -113,7 +113,7 @@ Hello {name}, you are a {role}!
 
 // ─── Test: code block passthrough ────────────────────────────────
 test('code block passthrough', () => {
-  const source = '---\nlang: Python\n---\n\n```python\nx = {\"key\": \"value\"}\n```\n\nLanguage: {lang}\n';
+  const source = '---\nlang: Python\n---\n\n```python\nx = {\"key\": \"value\"}\n```\n\nLanguage: {{lang}}\n';
   const result = mds.compile(source);
   assert(result.output.includes('{"key": "value"}'), 'braces in code block should be literal');
   assert(result.output.includes('Language: Python'), 'var outside code block should interpolate');
@@ -121,15 +121,16 @@ test('code block passthrough', () => {
 
 // ─── Test: escaped braces ────────────────────────────────────────
 test('escaped braces', () => {
-  const source = '---\nname: test\n---\nLiteral: \\{name\\} Interpolated: {name}\n';
+  // In the new engine: {x} is literal text; {{x}} interpolates; \{{ is a literal {{
+  const source = '---\nname: test\n---\nLiteral: {name} Interpolated: {{name}}\n';
   const result = mds.compile(source);
-  assert(result.output.includes('Literal: {name}'), 'escaped braces should be literal');
-  assert(result.output.includes('Interpolated: test'), 'non-escaped should interpolate');
+  assert(result.output.includes('Literal: {name}'), 'single braces are literal text');
+  assert(result.output.includes('Interpolated: test'), 'double braces interpolate the variable');
 });
 
 // ─── Test: empty array loop ──────────────────────────────────────
 test('empty array loop', () => {
-  const source = '---\nitems: []\n---\nBefore\n@for item in items:\n{item}\n@end\nAfter\n';
+  const source = '---\nitems: []\n---\nBefore\n@for item in items:\n{{item}}\n@end\nAfter\n';
   const result = mds.compile(source);
   assert(result.output.includes('Before'), 'should have content before loop');
   assert(result.output.includes('After'), 'should have content after loop');
@@ -142,14 +143,14 @@ test('built-in string functions', () => {
 name: "  hello world  "
 greeting: "Hello, World!"
 ---
-UPPER: {upper(name)}
-LOWER: {lower(greeting)}
-TRIM: [{trim(name)}]
-REPLACE: {replace(greeting, "World", "MDS")}
-STARTS: {starts_with(greeting, "Hello")}
-ENDS: {ends_with(greeting, "World!")}
-CONTAINS: {contains(greeting, "World")}
-SLICE: [{slice(greeting, 0, 5)}]
+UPPER: {{upper(name)}}
+LOWER: {{lower(greeting)}}
+TRIM: [{{trim(name)}}]
+REPLACE: {{replace(greeting, "World", "MDS")}}
+STARTS: {{starts_with(greeting, "Hello")}}
+ENDS: {{ends_with(greeting, "World!")}}
+CONTAINS: {{contains(greeting, "World")}}
+SLICE: [{{slice(greeting, 0, 5)}}]
 `);
   assert(result.output.includes('UPPER:   HELLO WORLD'), 'upper should work');
   assert(result.output.includes('LOWER: hello, world!'), 'lower should work');
@@ -171,14 +172,14 @@ fruits:
   - apple
 csv: "red,green,blue"
 ---
-SPLIT: {split(csv, ",")}
-JOIN: {join(fruits, " | ")}
-LENGTH: {length(fruits)}
-FIRST: {first(fruits)}
-LAST: {last(fruits)}
-SORT: {sort(fruits)}
-UNIQUE: {unique(fruits)}
-REVERSE: {reverse(fruits)}
+SPLIT: {{split(csv, ",")}}
+JOIN: {{join(fruits, " | ")}}
+LENGTH: {{length(fruits)}}
+FIRST: {{first(fruits)}}
+LAST: {{last(fruits)}}
+SORT: {{sort(fruits)}}
+UNIQUE: {{unique(fruits)}}
+REVERSE: {{reverse(fruits)}}
 `);
   assert(result.output.includes('SPLIT: red, green, blue'), 'split should work');
   assert(result.output.includes('JOIN: banana | apple | cherry | apple'), 'join should work');
@@ -198,12 +199,12 @@ flag: true
 nothing: null
 numeric_str: "123"
 ---
-S_NUM: [{string(num)}]
-S_BOOL: [{string(flag)}]
-S_NULL: [{string(nothing)}]
-N_STR: {number(numeric_str)}
-N_BOOL: {number(flag)}
-N_NULL: {number(nothing)}
+S_NUM: [{{string(num)}}]
+S_BOOL: [{{string(flag)}}]
+S_NULL: [{{string(nothing)}}]
+N_STR: {{number(numeric_str)}}
+N_BOOL: {{number(flag)}}
+N_NULL: {{number(nothing)}}
 `);
   assert(result.output.includes('S_NUM: [42]'), 'string(num) should work');
   assert(result.output.includes('S_BOOL: [true]'), 'string(bool) should work');
@@ -218,18 +219,18 @@ test('default function arguments', () => {
   const result = mds.compile(`---
 ---
 @define greet(name, greeting = "Hello"):
-{greeting}, {name}!
+{{greeting}}, {{name}}!
 @end
 
 @define badge(label, color = "blue", size = 3):
-[{color}:{label}:{size}]
+[{{color}}:{{label}}:{{size}}]
 @end
 
-DEFAULTS: {greet("Alice")}
-OVERRIDE: {greet("Bob", "Hey")}
-BADGE_DEF: {badge("v2")}
-BADGE_PART: {badge("v2", "green")}
-BADGE_FULL: {badge("v2", "red", 5)}
+DEFAULTS: {{greet("Alice")}}
+OVERRIDE: {{greet("Bob", "Hey")}}
+BADGE_DEF: {{badge("v2")}}
+BADGE_PART: {{badge("v2", "green")}}
+BADGE_FULL: {{badge("v2", "red", 5)}}
 `);
   assert(result.output.includes('DEFAULTS: Hello, Alice!'), 'default arg should apply');
   assert(result.output.includes('OVERRIDE: Hey, Bob!'), 'explicit arg should override');
@@ -243,11 +244,11 @@ test('default arg types', () => {
   const result = mds.compile(`---
 ---
 @define show_num(val = 42):
-num:{val}
+num:{{val}}
 @end
 
 @define show_bool(val = true):
-bool:{val}
+bool:{{val}}
 @end
 
 @define show_null(val = null):
@@ -258,10 +259,10 @@ null_val
 @end
 @end
 
-{show_num()}
-{show_bool()}
-{show_null()}
-{show_null("override")}
+{{show_num()}}
+{{show_bool()}}
+{{show_null()}}
+{{show_null("override")}}
 `);
   assert(result.output.includes('num:42'), 'default number arg should work');
   assert(result.output.includes('bool:true'), 'default bool arg should work');
@@ -333,12 +334,12 @@ PREC_PASS2
 test('chaining builtins', () => {
   const result = mds.compile(`---
 ---
-CHAIN1: {upper(trim("  hello  "))}
-CHAIN2: {join(sort(split("cherry,apple,banana", ",")), " < ")}
-CHAIN3: {upper(replace("hello world", "world", "mds"))}
-CHAIN4: {reverse(slice("abcdefgh", 2, 6))}
-CHAIN5: {length(split("a,b,c,d,e", ","))}
-CHAIN6: {first(reverse(split("a,b,c", ",")))}
+CHAIN1: {{upper(trim("  hello  "))}}
+CHAIN2: {{join(sort(split("cherry,apple,banana", ",")), " < ")}}
+CHAIN3: {{upper(replace("hello world", "world", "mds"))}}
+CHAIN4: {{reverse(slice("abcdefgh", 2, 6))}}
+CHAIN5: {{length(split("a,b,c,d,e", ","))}}
+CHAIN6: {{first(reverse(split("a,b,c", ",")))}}
 `);
   assert(result.output.includes('CHAIN1: HELLO'), 'upper(trim()) should chain');
   assert(result.output.includes('CHAIN2: apple < banana < cherry'), 'sort(split()) should chain');
@@ -357,12 +358,12 @@ name: "Alice"
 ---
 @define user_line(user_name, role = "member"):
 @if admin && active:
-{upper(user_name)}: {role}
+{{upper(user_name)}}: {{role}}
 @end
 @end
 
-{user_line(name)}
-{user_line("Bob", "admin")}
+{{user_line(name)}}
+{{user_line("Bob", "admin")}}
 `);
   assert(result.output.includes('ALICE: member'), 'default arg + logical + builtin should work');
   assert(result.output.includes('BOB: admin'), 'explicit arg should override default');
@@ -463,7 +464,7 @@ test('expression @for: function call iterable', () => {
 csv: "x,y,z"
 ---
 @for item in split(csv, ","):
-- {item}
+- {{item}}
 @end
 `);
   assert(result.output.includes('- x'), '@for split iterable should produce x');
@@ -479,7 +480,7 @@ tags:
   - b
 ---
 @for t in sort(unique(tags)):
-- {t}
+- {{t}}
 @end
 `);
   const lines = result.output.split('\n').filter(l => l.startsWith('- '));
@@ -542,8 +543,8 @@ test('compileFile: frontmatter imports (alias, selective, merge)', async () => {
 });
 
 test('frontmatter imports: inline alias', () => {
-  const lib = `@define greet(x):\nHello {x}!\n@end\n@export greet\n`;
-  const main = `---\ntype: mds\nimports:\n  - path: ./lib.mds\n    as: lib\n---\n{lib.greet("World")}\n`;
+  const lib = `@define greet(x):\nHello {{x}}!\n@end\n@export greet\n`;
+  const main = `---\ntype: mds\nimports:\n  - path: ./lib.mds\n    as: lib\n---\n{{lib.greet("World")}}\n`;
   try {
     const result = mds.compile(main);
     assert(false, 'inline frontmatter imports need file-based resolution');
@@ -554,7 +555,7 @@ test('frontmatter imports: inline alias', () => {
 
 test('frontmatter imports: compile() rejects scalar imports key', () => {
   try {
-    mds.compile(`---\nimports: some_value\nname: test\n---\nHello {name}\n`);
+    mds.compile(`---\nimports: some_value\nname: test\n---\nHello {{name}}\n`);
     assert(false, 'should throw — compile() treats source as MDS, so imports is reserved');
   } catch (err) {
     assert(mds.isMdsError(err), 'should be MDS error');
@@ -565,7 +566,7 @@ test('frontmatter imports: compile() rejects scalar imports key', () => {
 // ─── Tests: intrinsic output kind (discriminated union) ──────────
 
 test('kind: markdown template returns kind==="markdown"', () => {
-  const result = mds.compile('---\nname: World\n---\nHello {name}!\n');
+  const result = mds.compile('---\nname: World\n---\nHello {{name}}!\n');
   assert(result.kind === 'markdown', `expected kind==='markdown', got ${result.kind}`);
   assert(typeof result.output === 'string', 'markdown result must have string output');
   assert(!('messages' in result), 'markdown result must not have messages field');
@@ -630,7 +631,7 @@ test('kind: messages template with zero messages emits empty array', () => {
 // ─── Tests: lint API (v0.4.0) ────────────────────────────────────
 
 test('lint: canonical shape + unused-variable finding', () => {
-  const result = mds.lint('---\nused: yes\nnever_used: 1\n---\n# Doc\n\nValue: {used}\n');
+  const result = mds.lint('---\nused: yes\nnever_used: 1\n---\n# Doc\n\nValue: {{used}}\n');
   assert(result.version === 1, `lint result version must be 1, got ${result.version}`);
   assert(Array.isArray(result.files), 'lint result must have files array');
   assert(result.truncated === false, 'lint result truncated must be false');
@@ -675,7 +676,7 @@ test('lintFile: canonical shape on a real template', async () => {
 // ─── Tests: source maps (v0.4.0) ─────────────────────────────────
 
 test('compile with sourceMap: version 3 + mappings', () => {
-  const source = '---\nname: Mapper\n---\n# Hello {name}\n\nLine two.\n';
+  const source = '---\nname: Mapper\n---\n# Hello {{name}}\n\nLine two.\n';
   const result = mds.compile(source, { sourceMap: true });
   assert(result.kind === 'markdown', 'sourceMap test template is markdown-kind');
   assert(result.sourceMap, 'result.sourceMap must be present when sourceMap: true');
@@ -687,7 +688,7 @@ test('compile with sourceMap: version 3 + mappings', () => {
 });
 
 test('compile with sourceMap + sourcesContent embeds the source', () => {
-  const source = '---\nname: Mapper\n---\n# Hello {name}\n';
+  const source = '---\nname: Mapper\n---\n# Hello {{name}}\n';
   const result = mds.compile(source, { sourceMap: true, sourcesContent: true });
   assert(Array.isArray(result.sourceMap.sourcesContent), 'sourcesContent must be present when requested');
   assert(result.sourceMap.sourcesContent[0] === source, 'sourcesContent[0] must be the exact original source');

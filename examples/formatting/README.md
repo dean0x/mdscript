@@ -5,6 +5,11 @@ makes small, mechanical fixes to directive lines and the file's trailing edge �
 and nothing else. Every rewrite is re-compiled and refused if it would change
 the compiled output, so formatting a file can never alter what it produces.
 
+> **Upgrading a legacy project?** Run `mds lint --fix` first to auto-migrate
+> `{x}` → `{{x}}` interpolation syntax (the `legacy-interpolation` rule), then
+> run `mds fmt` to normalize formatting. `mds fmt` itself performs no legacy
+> detection — the migration step is always `mds lint --fix` first.
+
 [`demo.mds`](demo.mds) is a complete, already-formatted template. It is checked
 in **fmt-clean**, so `mds fmt --check examples/formatting/` exits `0`.
 
@@ -62,10 +67,10 @@ lines at the end, `mds fmt --diff` shows exactly what it would fix:
 @@ -1,8 +1,5 @@
 -@define entry(kind, summary):
 +@define entry(kind, summary):
- - **{kind}:** {summary}
+ - **{{kind}}:** {{summary}}
  @end
 
- {entry("Added", "New capabilities.")}
+ {{entry("Added", "New capabilities.")}}
 -
 -
 -

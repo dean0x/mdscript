@@ -10,5 +10,5 @@ env:
 ## Environment Variables
 
 @for key, value in env:
-- `{key}` = `{value}`
+- `{{key}}` = `{{value}}`
 @end

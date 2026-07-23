@@ -45,7 +45,7 @@ fn parse_if_else() {
 
 #[test]
 fn parse_for_block() {
-    let src = "@for item in items:\n- {item}\n@end\n";
+    let src = "@for item in items:\n- {{item}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     assert!(matches!(module.body[0], Node::For(_)));
@@ -53,7 +53,7 @@ fn parse_for_block() {
 
 #[test]
 fn parse_define() {
-    let src = "@define greet(name):\nHello {name}!\n@end\n";
+    let src = "@define greet(name):\nHello {{name}}!\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     assert!(matches!(module.body[0], Node::Define(_)));
@@ -198,7 +198,7 @@ fn parse_include() {
 
 #[test]
 fn parse_function_call_interpolation() {
-    let src = "{greet(\"Alice\")}";
+    let src = "{{greet(\"Alice\")}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Interpolation(interp) = &module.body[0] {
@@ -210,7 +210,7 @@ fn parse_function_call_interpolation() {
 
 #[test]
 fn parse_qualified_call() {
-    let src = "{utils.greet(\"Alice\")}";
+    let src = "{{utils.greet(\"Alice\")}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Interpolation(interp) = &module.body[0] {
@@ -271,8 +271,8 @@ fn unescape_double_backslash() {
 
 #[test]
 fn parse_member_access_interpolation() {
-    // {config.key} should produce Expr::MemberAccess
-    let src = "{config.key}";
+    // {{config.key}} should produce Expr::MemberAccess
+    let src = "{{config.key}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Interpolation(interp) = &module.body[0] {
@@ -289,8 +289,8 @@ fn parse_member_access_interpolation() {
 
 #[test]
 fn parse_member_access_multi_segment() {
-    // {a.b.c} should produce MemberAccess with two fields
-    let src = "{a.b.c}";
+    // {{a.b.c}} should produce MemberAccess with two fields
+    let src = "{{a.b.c}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Interpolation(interp) = &module.body[0] {
@@ -307,8 +307,8 @@ fn parse_member_access_multi_segment() {
 
 #[test]
 fn parse_arg_member_access() {
-    // {greet(config.name)} should produce Expr::Call with Arg::MemberAccess
-    let src = r#"{greet(config.name)}"#;
+    // {{greet(config.name)}} should produce Expr::Call with Arg::MemberAccess
+    let src = r#"{{greet(config.name)}}"#;
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Interpolation(interp) = &module.body[0] {
@@ -332,7 +332,7 @@ fn parse_arg_member_access() {
 #[test]
 fn parse_for_key_value_destructuring() {
     // @for key, value in obj: should produce ForBlock with key_var set
-    let src = "@for key, value in obj:\n{key}: {value}\n@end\n";
+    let src = "@for key, value in obj:\n{{key}}: {{value}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
@@ -351,7 +351,7 @@ fn parse_for_key_value_destructuring() {
 #[test]
 fn parse_for_dot_path_iterable() {
     // @for item in data.list: — iterable is a dot-separated path
-    let src = "@for item in data.list:\n- {item}\n@end\n";
+    let src = "@for item in data.list:\n- {{item}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
@@ -389,8 +389,8 @@ fn parse_if_dot_path_condition() {
 
 #[test]
 fn parse_invalid_dot_path_interpolation_returns_error() {
-    // {a.123.b} — "123" is not a valid identifier; should be an error
-    let src = "{a.123.b}";
+    // {{a.123.b}} — "123" is not a valid identifier; should be an error
+    let src = "{{a.123.b}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "test.mds", src);
     assert!(result.is_err(), "invalid dot-path segment should fail");
@@ -403,23 +403,19 @@ fn parse_invalid_dot_path_interpolation_returns_error() {
 
 #[test]
 fn invalid_interpolation_hint_recommends_single_brace_escape() {
-    // Regression test for #153: the hint must say `\{` (one brace) not `\{{` (two).
-    // The format string in parser_helpers.rs was `\\{{{{` (rendered `\{{`) —
-    // fixed to `\\{{` (renders `\{`).
-    let src = "{123invalid}";
+    // Updated for {{x}} syntax: the hint must recommend `\{{` (single backslash + double
+    // brace) to produce a literal `{{` in the document — matching the escape the lexer
+    // actually accepts (see lexer::scan_escape) and the lexer's own unclosed-interpolation
+    // hint. In the Rust source assertion, `"\\{{"` is the string `\{{` (one backslash).
+    let src = "{{123invalid}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "test.mds", src);
     assert!(result.is_err(), "invalid interpolation should fail");
     let err_msg = format!("{}", result.unwrap_err());
-    // Must contain `\{` as the escape hint.
+    // Must contain `\{{` (one backslash + double brace) as the escape hint.
     assert!(
-        err_msg.contains("escape with \\{"),
-        "hint must recommend escape with \\{{ (single brace), got: {err_msg}"
-    );
-    // Must NOT say `\{{` (double brace — the old, broken form).
-    assert!(
-        !err_msg.contains("escape with \\{{"),
-        "hint must NOT say \\{{{{  (double brace), got: {err_msg}"
+        err_msg.contains("\\{{"),
+        "hint must recommend single-backslash double-brace escape `\\{{`, got: {err_msg}"
     );
 }
 
@@ -430,7 +426,7 @@ fn parse_dot_path_at_limit_accepted() {
     // MAX_DOT_SEGMENTS segments (e.g. a.b.c...32 parts) must be accepted.
     let segments: Vec<&str> = std::iter::repeat_n("x", MAX_DOT_SEGMENTS).collect();
     let path = segments.join(".");
-    let src = format!("{{{path}}}");
+    let src = format!("{{{{{path}}}}}");
     let tokens = tokenize(&src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -444,7 +440,7 @@ fn parse_interpolation_dot_path_exceeds_limit_rejected() {
     // MAX_DOT_SEGMENTS + 1 segments in an interpolation must be rejected.
     let segments: Vec<&str> = std::iter::repeat_n("x", MAX_DOT_SEGMENTS + 1).collect();
     let path = segments.join(".");
-    let src = format!("{{{path}}}");
+    let src = format!("{{{{{path}}}}}");
     let tokens = tokenize(&src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "test.mds", &src);
     assert!(
@@ -824,7 +820,7 @@ fn parse_arg_identifier_not_confused_with_number() {
 
 #[test]
 fn parse_define_required_params() {
-    let src = "@define greet(name):\nHello {name}!\n@end\n";
+    let src = "@define greet(name):\nHello {{name}}!\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -838,7 +834,7 @@ fn parse_define_required_params() {
 
 #[test]
 fn parse_define_default_string() {
-    let src = "@define greet(name = \"World\"):\nHello {name}!\n@end\n";
+    let src = "@define greet(name = \"World\"):\nHello {{name}}!\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -855,7 +851,7 @@ fn parse_define_default_string() {
 
 #[test]
 fn parse_define_default_number() {
-    let src = "@define repeat(n = 3):\n{n}\n@end\n";
+    let src = "@define repeat(n = 3):\n{{n}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -868,7 +864,7 @@ fn parse_define_default_number() {
 
 #[test]
 fn parse_define_default_negative_number() {
-    let src = "@define offset(n = -1):\n{n}\n@end\n";
+    let src = "@define offset(n = -1):\n{{n}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -880,7 +876,7 @@ fn parse_define_default_negative_number() {
 
 #[test]
 fn parse_define_default_bool() {
-    let src = "@define toggle(flag = true):\n{flag}\n@end\n";
+    let src = "@define toggle(flag = true):\n{{flag}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -895,7 +891,7 @@ fn parse_define_default_bool() {
 
 #[test]
 fn parse_define_default_null() {
-    let src = "@define maybe(x = null):\n{x}\n@end\n";
+    let src = "@define maybe(x = null):\n{{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -907,7 +903,7 @@ fn parse_define_default_null() {
 
 #[test]
 fn parse_define_default_string_with_comma() {
-    let src = "@define greet(sep = \"a, b\"):\n{sep}\n@end\n";
+    let src = "@define greet(sep = \"a, b\"):\n{{sep}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -922,7 +918,7 @@ fn parse_define_default_string_with_comma() {
 
 #[test]
 fn parse_define_required_after_optional_rejected() {
-    let src = "@define bad(a = \"x\", b):\n{a}\n@end\n";
+    let src = "@define bad(a = \"x\", b):\n{{a}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -938,7 +934,7 @@ fn parse_define_required_after_optional_rejected() {
 
 #[test]
 fn parse_define_duplicate_param_rejected() {
-    let src = "@define bad(a, a):\n{a}\n@end\n";
+    let src = "@define bad(a, a):\n{{a}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(result.is_err(), "duplicate param name must be rejected");
@@ -951,7 +947,7 @@ fn parse_define_duplicate_param_rejected() {
 
 #[test]
 fn parse_define_mixed_required_and_optional() {
-    let src = "@define greet(name, greeting = \"Hello\"):\n{greeting} {name}!\n@end\n";
+    let src = "@define greet(name, greeting = \"Hello\"):\n{{greeting}} {{name}}!\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::Define(def) = &module.body[0] {
@@ -987,7 +983,7 @@ const NON_LITERAL_DEFAULT_ERR: &str = "must be a string, number, boolean, or nul
 fn parse_define_default_function_call_rejected() {
     // `@define f(x = upper("a"))` — a function-call Expr in default position.
     // The type can now represent it, but the parser must still reject it.
-    let src = "@define f(x = upper(\"a\")):\n{x}\n@end\n";
+    let src = "@define f(x = upper(\"a\")):\n{{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -1004,7 +1000,7 @@ fn parse_define_default_function_call_rejected() {
 #[test]
 fn parse_define_default_variable_reference_rejected() {
     // `@define f(x = y)` — a bare identifier (variable reference) is not a literal.
-    let src = "@define f(x = y):\n{x}\n@end\n";
+    let src = "@define f(x = y):\n{{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -1021,7 +1017,7 @@ fn parse_define_default_variable_reference_rejected() {
 #[test]
 fn parse_define_default_member_access_rejected() {
     // `@define f(x = config.key)` — a member-access Expr is not a literal.
-    let src = "@define f(x = config.key):\n{x}\n@end\n";
+    let src = "@define f(x = config.key):\n{{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -1095,34 +1091,34 @@ fn parse_cond_value_only_admits_literals() {
 #[test]
 fn default_string_value_parity() {
     // Expr::StringLiteral → Value::String, rendered verbatim.
-    let out = crate::compile_str_md("@define f(x = \"hi\"):\n{x}\n@end\n{f()}\n").unwrap();
+    let out = crate::compile_str_md("@define f(x = \"hi\"):\n{{x}}\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out, "hi\n");
 }
 
 #[test]
 fn default_number_value_parity() {
     // Expr::NumberLiteral → Value::Number; integral floats render without a decimal.
-    let out = crate::compile_str_md("@define f(x = 42):\n{x}\n@end\n{f()}\n").unwrap();
+    let out = crate::compile_str_md("@define f(x = 42):\n{{x}}\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out, "42\n");
-    let out_neg = crate::compile_str_md("@define f(x = -1):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_neg = crate::compile_str_md("@define f(x = -1):\n{{x}}\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out_neg, "-1\n");
-    let out_frac = crate::compile_str_md("@define f(x = 3.14):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_frac = crate::compile_str_md("@define f(x = 3.14):\n{{x}}\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out_frac, "3.14\n");
 }
 
 #[test]
 fn default_boolean_value_parity() {
     // Expr::BooleanLiteral → Value::Boolean, rendered as `true`/`false`.
-    let out_true = crate::compile_str_md("@define f(x = true):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_true = crate::compile_str_md("@define f(x = true):\n{{x}}\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out_true, "true\n");
-    let out_false = crate::compile_str_md("@define f(x = false):\n{x}\n@end\n{f()}\n").unwrap();
+    let out_false = crate::compile_str_md("@define f(x = false):\n{{x}}\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out_false, "false\n");
 }
 
 #[test]
 fn default_null_value_parity() {
     // Expr::NullLiteral → Value::Null, rendered as the empty string in interpolation.
-    let out = crate::compile_str_md("@define f(x = null):\n[{x}]\n@end\n{f()}\n").unwrap();
+    let out = crate::compile_str_md("@define f(x = null):\n[{{x}}]\n@end\n{{f()}}\n").unwrap();
     assert_eq!(out, "[]\n");
 }
 
@@ -1423,7 +1419,7 @@ fn parse_if_qualified_call_truthy() {
 #[test]
 fn parse_for_call_iterable() {
     // @for x in func(args): → ForBlock with Expr::Call
-    let src = "@for x in split(csv, \",\"):\n- {x}\n@end\n";
+    let src = "@for x in split(csv, \",\"):\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
@@ -1440,7 +1436,7 @@ fn parse_for_call_iterable() {
 #[test]
 fn parse_for_nested_call_iterable() {
     // @for x in sort(unique(tags)): → nested calls
-    let src = "@for x in sort(unique(tags)):\n- {x}\n@end\n";
+    let src = "@for x in sort(unique(tags)):\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
@@ -1500,7 +1496,7 @@ fn parse_if_colon_in_string_arg() {
 #[test]
 fn parse_for_colon_as_separator() {
     // @for x in split(s, ":"): — colon as argument must not corrupt directive parsing
-    let src = "@for x in split(s, \":\"):\n- {x}\n@end\n";
+    let src = "@for x in split(s, \":\"):\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -1551,7 +1547,7 @@ fn parse_if_string_literal_truthy_rejected() {
 #[test]
 fn parse_for_literal_iterable_rejected() {
     // @for x in "literal": → parse error
-    let src = "@for x in \"items\":\n- {x}\n@end\n";
+    let src = "@for x in \"items\":\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(result.is_err(), "@for x in \"literal\": should be rejected");
@@ -1640,7 +1636,7 @@ fn parse_backward_compat_if_var_eq_string() {
 #[test]
 fn parse_backward_compat_for_var_iterable() {
     // @for x in items: → ForBlock with Expr::Var
-    let src = "@for x in items:\n- {x}\n@end\n";
+    let src = "@for x in items:\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
@@ -1731,7 +1727,7 @@ fn evaluate_if_and_with_calls() {
 #[test]
 fn evaluate_for_split_iterable() {
     let result = crate::compile_str_md(
-        "---\ncsv: \"a,b,c\"\n---\n@for x in split(csv, \",\"):\n- {x}\n@end\n",
+        "---\ncsv: \"a,b,c\"\n---\n@for x in split(csv, \",\"):\n- {{x}}\n@end\n",
     )
     .unwrap();
     assert!(
@@ -1743,7 +1739,7 @@ fn evaluate_for_split_iterable() {
 #[test]
 fn evaluate_for_sort_unique_iterable() {
     let result = crate::compile_str_md(
-        "---\ntags:\n  - b\n  - a\n  - b\n---\n@for t in sort(unique(tags)):\n- {t}\n@end\n",
+        "---\ntags:\n  - b\n  - a\n  - b\n---\n@for t in sort(unique(tags)):\n- {{t}}\n@end\n",
     )
     .unwrap();
     // Ensure deduplication — only 2 items, not 3
@@ -1767,7 +1763,7 @@ fn evaluate_for_sort_unique_iterable() {
 #[test]
 fn evaluate_for_non_array_result_is_error() {
     let result =
-        crate::compile_str_md("---\nname: Alice\n---\n@for x in upper(name):\n- {x}\n@end\n");
+        crate::compile_str_md("---\nname: Alice\n---\n@for x in upper(name):\n- {{x}}\n@end\n");
     assert!(
         result.is_err(),
         "non-array result from @for expression should error"
@@ -1890,7 +1886,7 @@ fn evaluate_if_or_with_calls() {
 #[test]
 fn parse_for_qualified_call_iterable() {
     // @for x in ns.func(args): → ForBlock with Expr::QualifiedCall
-    let src = "@for x in utils.items(config):\n- {x}\n@end\n";
+    let src = "@for x in utils.items(config):\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let module = parse_with_ctx(&tokens, "", "").unwrap();
     if let Node::For(block) = &module.body[0] {
@@ -2032,7 +2028,7 @@ fn unclosed_for_error_anchored_at_opener() {
 /// Unclosed @define block produces a syntax error anchored at the @define opener.
 #[test]
 fn unclosed_define_error_anchored_at_opener() {
-    let src = "@define greet(name):\nhello {name}\n";
+    let src = "@define greet(name):\nhello {{name}}\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let err = parse_with_ctx(&tokens, "test.mds", src)
         .unwrap_err()
@@ -2050,7 +2046,7 @@ fn unclosed_define_error_anchored_at_opener() {
 #[test]
 fn parse_for_unterminated_string_error() {
     // @for with unterminated string arg should give targeted error, not generic "must end with ':'"
-    let src = "@for x in split(s, \"alice:\n- {x}\n@end\n";
+    let src = "@for x in split(s, \"alice:\n- {{x}}\n@end\n";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(result.is_err(), "unterminated string in @for should error");
@@ -3153,8 +3149,8 @@ fn find_unquoted_equals_multibyte_in_default_value() {
 
 #[test]
 fn interpolation_expr_var_parsed_correctly() {
-    // `{name}` — simple variable reference works in interpolation
-    let src = "{name}";
+    // `{{name}}` — simple variable reference works in interpolation
+    let src = "{{name}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -3165,8 +3161,8 @@ fn interpolation_expr_var_parsed_correctly() {
 
 #[test]
 fn interpolation_expr_member_access() {
-    // `{user.name}` — member access works in interpolation
-    let src = "{user.name}";
+    // `{{user.name}}` — member access works in interpolation
+    let src = "{{user.name}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -3177,8 +3173,8 @@ fn interpolation_expr_member_access() {
 
 #[test]
 fn interpolation_expr_call() {
-    // `{upper(x)}` — function call works in interpolation
-    let src = "{upper(x)}";
+    // `{{upper(x)}}` — function call works in interpolation
+    let src = "{{upper(x)}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(result.is_ok(), "call interpolation must parse: {result:?}");
@@ -3186,8 +3182,8 @@ fn interpolation_expr_call() {
 
 #[test]
 fn interpolation_expr_qualified_call() {
-    // `{str.upper(x)}` — qualified call works in interpolation
-    let src = "{str.upper(x)}";
+    // `{{str.upper(x)}}` — qualified call works in interpolation
+    let src = "{{str.upper(x)}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -3198,8 +3194,8 @@ fn interpolation_expr_qualified_call() {
 
 #[test]
 fn interpolation_expr_literal_rejected() {
-    // `{"hello"}` — string literal is NOT valid in interpolation (no-literals rule)
-    let src = "{\"hello\"}";
+    // `{{"hello"}}` — string literal is NOT valid in interpolation (no-literals rule)
+    let src = "{{\"hello\"}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(
@@ -3246,9 +3242,9 @@ fn directive_expr_qualified_call() {
 
 #[test]
 fn interpolation_multibyte_utf8_adjacent_to_brace() {
-    // `{café}` — multibyte UTF-8 in interpolation identifier must be rejected
+    // `{{café}}` — multibyte UTF-8 in interpolation identifier must be rejected
     // (identifiers are ASCII-only)
-    let src = "{café}";
+    let src = "{{café}}";
     let tokens = tokenize(src, "test.mds").unwrap();
     let result = parse_with_ctx(&tokens, "", "");
     assert!(

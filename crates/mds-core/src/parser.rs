@@ -609,9 +609,12 @@ impl Parser<'_> {
             .ok_or_else(|| self.colon_error("@message", trimmed, offset))?;
         let role_trimmed = role_str.trim();
 
-        let role = if role_trimmed.starts_with('{') && role_trimmed.ends_with('}') {
-            // Dynamic role expression: @message {role_var}:
-            let inner = role_trimmed[1..role_trimmed.len() - 1].trim();
+        let role = if role_trimmed.starts_with("{{")
+            && role_trimmed.ends_with("}}")
+            && role_trimmed.len() >= 4
+        {
+            // Dynamic role expression: @message {{role_var}}:
+            let inner = role_trimmed[2..role_trimmed.len() - 2].trim();
             parse_expr_inner(inner) // safe: state not yet mutated
                 .map_err(|e| {
                     e.or_span(

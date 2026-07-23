@@ -1,9 +1,9 @@
 @define outer(x):
-[{x}]
+[{{x}}]
 @end
 
 @define inner(x):
-{x}!
+{{x}}!
 @end
 
-{outer(inner("arg"))}
+{{outer(inner("arg"))}}

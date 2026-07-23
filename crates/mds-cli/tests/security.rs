@@ -146,7 +146,7 @@ fn symlink_import_rejected() {
 
     // Create a real .mds file to be the symlink target
     let real_file = dir.path().join("real.mds");
-    std::fs::write(&real_file, "@define greet(name):\nHello {name}!\n@end\n").unwrap();
+    std::fs::write(&real_file, "@define greet(name):\nHello {{name}}!\n@end\n").unwrap();
 
     // Create a symlink pointing to it
     let link_file = dir.path().join("linked.mds");
@@ -156,7 +156,7 @@ fn symlink_import_rejected() {
     let consumer = dir.path().join("consumer.mds");
     std::fs::write(
         &consumer,
-        "@import { greet } from \"./linked.mds\"\n{greet(\"Alice\")}\n",
+        "@import { greet } from \"./linked.mds\"\n{{greet(\"Alice\")}}\n",
     )
     .unwrap();
 
@@ -218,7 +218,7 @@ fn resolve_source_nonexistent_base_dir_errors() {
     // (previously silently fell back to the raw path).
     let nonexistent_dir = std::path::Path::new("/nonexistent/path/that/does/not/exist");
     let result = mds::compile_str_with(
-        "---\nname: World\n---\nHello {name}!\n",
+        "---\nname: World\n---\nHello {{name}}!\n",
         Some(nonexistent_dir),
         None,
     );
@@ -372,7 +372,7 @@ fn exit_code_resource_limit() {
     source.push_str("---\n");
     source.push_str("@for x in outer:\n");
     source.push_str("@for y in inner:\n");
-    source.push_str("{x}-{y}\n");
+    source.push_str("{{x}}-{{y}}\n");
     source.push_str("@end\n");
     source.push_str("@end\n");
 

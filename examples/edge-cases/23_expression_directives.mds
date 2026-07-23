@@ -39,12 +39,12 @@ Has both rust and go
 
 ## @for with function call iterable (split)
 @for x in split(csv, ","):
-- {x}
+- {{x}}
 @end
 
 ## @for with nested call iterable (sort + unique)
 @for t in sort(unique(tags)):
-- {t}
+- {{t}}
 @end
 
 ## @elseif with expression

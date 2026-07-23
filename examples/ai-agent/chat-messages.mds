@@ -15,25 +15,25 @@ question: "Why does my generic lose its type once I wrap it in a Promise?"
 ---
 
 @message system:
-You are {assistant}, an expert {domain} pair-programmer.
+You are {{assistant}}, an expert {{domain}} pair-programmer.
 @if strict:
 Treat every lint warning as an error, and explain your reasoning before writing code.
 @end
 Available tools:
 @for tool in tools:
-- {tool}
+- {{tool}}
 @end
 @end
 
 @for shot in shots:
 @message user:
-{shot.ask}
+{{shot.ask}}
 @end
 @message assistant:
-{shot.reply}
+{{shot.reply}}
 @end
 @end
 
 @message user:
-{question}
+{{question}}
 @end

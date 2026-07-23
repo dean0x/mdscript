@@ -432,9 +432,16 @@ pub struct LintDiagnostic {
     fixable: bool,
     #[pyo3(get)]
     span: Option<Span>,
+    // `fix_edits` is not exposed via `#[pyo3(get)]` because `Vec<serde_json::Value>`
+    // does not implement `IntoPy`; a custom `#[getter]` is used instead.
+    fix_edits: Option<Vec<serde_json::Value>>,
 }
 
 /// The `(type, args)` shape returned by [`LintDiagnostic::__reduce__`].
+///
+/// `fix_edits` is round-tripped as a JSON string (`Option<String>`) because
+/// `serde_json::Value` is not directly pickle-able; the `#[new]` constructor
+/// accepts and parses this string back into `Vec<serde_json::Value>`.
 type LintDiagnosticReduce<'py> = (
     Bound<'py, PyType>,
     (
@@ -444,13 +451,15 @@ type LintDiagnosticReduce<'py> = (
         Option<String>,
         bool,
         Option<Py<Span>>,
+        Option<String>,
     ),
 );
 
 #[pymethods]
 impl LintDiagnostic {
     #[new]
-    #[pyo3(signature = (rule, severity, message, help=None, fixable=false, span=None))]
+    #[pyo3(signature = (rule, severity, message, help=None, fixable=false, span=None, fix_edits_json=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         rule: String,
@@ -462,16 +471,29 @@ impl LintDiagnostic {
         // a `#[new]` signature; accept `Py<Span>` (which implements
         // `FromPyObject`) and clone the inner value via a GIL borrow.
         span: Option<Py<Span>>,
-    ) -> Self {
+        // `fix_edits` is passed as a JSON string during unpickling so that the
+        // args tuple stays fully pickle-able; `None` means no edits available.
+        fix_edits_json: Option<String>,
+    ) -> PyResult<Self> {
         let span = span.map(|py_span| py_span.borrow(py).clone());
-        LintDiagnostic {
+        let fix_edits = fix_edits_json
+            .as_deref()
+            .map(serde_json::from_str::<Vec<serde_json::Value>>)
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "fix_edits_json is not valid JSON: {e}"
+                ))
+            })?;
+        Ok(LintDiagnostic {
             rule,
             severity,
             message,
             help,
             fixable,
             span,
-        }
+            fix_edits,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -495,13 +517,17 @@ impl LintDiagnostic {
         self.as_json().to_string()
     }
 
-    /// Reconstruct on unpickle via `LintDiagnostic(rule, severity, message, help, fixable, span)`.
+    /// Reconstruct on unpickle via `LintDiagnostic(rule, severity, message, help, fixable, span, fix_edits_json)`.
     fn __reduce__<'py>(&self, py: Python<'py>) -> PyResult<LintDiagnosticReduce<'py>> {
         let span_py = self
             .span
             .as_ref()
             .map(|s| Py::new(py, s.clone()))
             .transpose()?;
+        let fix_edits_str = self
+            .fix_edits
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
         Ok((
             py.get_type::<LintDiagnostic>(),
             (
@@ -511,21 +537,42 @@ impl LintDiagnostic {
                 self.help.clone(),
                 self.fixable,
                 span_py,
+                fix_edits_str,
             ),
         ))
+    }
+
+    /// The byte-range replacement edits the fix engine would apply, or `None`.
+    ///
+    /// Each edit is a dict with keys `start`, `end` (byte offsets into the
+    /// source), and `new_text` (replacement string). Returns `None` when no
+    /// edits are associated with this diagnostic.
+    #[getter]
+    fn fix_edits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.fix_edits {
+            Some(edits) => value_to_py(py, &serde_json::Value::Array(edits.clone())),
+            None => Ok(py.None().into_bound(py)),
+        }
     }
 }
 
 impl LintDiagnostic {
     /// Canonical JSON value for this diagnostic (keys in wire-format alphabetical order).
     ///
-    /// `help` and `span` are always emitted — as JSON `null` when `None` — to match
-    /// `to_canonical_json()` exactly and satisfy the cross-surface byte-parity invariant
-    /// (PF-007).
+    /// `help`, `span`, and `fix_edits` are always emitted — as JSON `null` when `None` —
+    /// to match `to_canonical_json()` exactly and satisfy the cross-surface byte-parity
+    /// invariant (PF-007).
     fn as_json(&self) -> serde_json::Value {
         // Keys are inserted in alphabetical order (serde_json::Map preserves insertion order)
         // to produce a stable, predictable dict layout for callers that iterate keys.
         let mut map = serde_json::Map::new();
+        // Emit fix_edits unconditionally (null when None) to match to_canonical_json exactly.
+        let fix_edits_val = self
+            .fix_edits
+            .as_ref()
+            .map(|v| serde_json::Value::Array(v.clone()))
+            .unwrap_or(serde_json::Value::Null);
+        map.insert("fix_edits".to_string(), fix_edits_val);
         map.insert("fixable".to_string(), serde_json::Value::Bool(self.fixable));
         // Emit help unconditionally (null when None) to match to_canonical_json exactly.
         map.insert(
@@ -718,6 +765,10 @@ impl LintResult {
                                         column: None,
                                     })
                                 });
+                                let fix_edits = d
+                                    .get("fix_edits")
+                                    .and_then(serde_json::Value::as_array)
+                                    .map(|arr| arr.to_vec());
                                 LintDiagnostic {
                                     rule: json_str(d, "rule"),
                                     severity: json_str(d, "severity"),
@@ -731,6 +782,7 @@ impl LintResult {
                                         .and_then(serde_json::Value::as_bool)
                                         .unwrap_or(false),
                                     span,
+                                    fix_edits,
                                 }
                             })
                             .collect()

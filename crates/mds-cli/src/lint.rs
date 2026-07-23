@@ -50,6 +50,7 @@ const KNOWN_RULES: &[&str] = &[
     "unreachable-branch",
     "duplicate-import",
     "duplicate-export",
+    "legacy-interpolation",
 ];
 
 pub(crate) struct LintArgs {
@@ -272,6 +273,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
         span: diag.span.clone(),
         file: diag.file.clone(),
         fix_removals: diag.fix_removals.clone(),
+        fix_edits: diag.fix_edits.clone(),
     };
     // Attach the source code so miette can render the span with source context
     // (source line + caret underline). The labels() implementation on LintDiagnostic
@@ -406,6 +408,15 @@ fn plan_and_apply_fixes(
     // Used to compute the "{applied} of {total}" summary for PartiallyFixed output.
     let total_edits = plan.edits.len();
 
+    // `legacy-interpolation` edits intentionally change compiled output (they migrate
+    // `{x}` plain-text to `{{x}}` interpolation).  When the plan contains any such
+    // edit, the output byte-equality gate below must be skipped — it only applies to
+    // output-neutral fixes (dup-import removal, empty-block removal, etc.).
+    let all_output_neutral = plan
+        .edits
+        .iter()
+        .all(|e| mds::fix::is_output_neutral(&e.rule));
+
     // AC-F-20 output-delta baseline: compile the original source once.
     // If it fails (e.g. missing runtime vars at eval time), skip the output-diff —
     // existing gates (recompile-success, no-new-diagnostics) still apply.
@@ -429,22 +440,25 @@ fn plan_and_apply_fixes(
         )?;
 
         // AC-F-20 output byte-equality gate: refuse if the fix changes compiled output.
-        // All shipped auto-fixes (dup-import/dup-export removal, empty-block removal,
-        // dead-branch removal) are output-neutral by design — any delta indicates a bug.
-        if let Some(ref orig_out) = original_output {
-            match mds::compile_str_collecting_warnings(
-                fixed,
-                Some(&base_dir_owned),
-                runtime_vars.clone(),
-            ) {
-                Ok(fixed_compile) if fixed_compile.output != *orig_out => {
-                    return Err(MdsError::Io {
-                        message: "lint --fix would change compiled output; \
-                                  edit reverted to preserve template semantics"
-                            .to_string(),
-                    });
+        // Skipped when the plan contains any output-changing rule (currently only
+        // `legacy-interpolation`) — those fixes intentionally alter compiled output
+        // and the gate would always reject them.
+        if all_output_neutral {
+            if let Some(ref orig_out) = original_output {
+                match mds::compile_str_collecting_warnings(
+                    fixed,
+                    Some(&base_dir_owned),
+                    runtime_vars.clone(),
+                ) {
+                    Ok(fixed_compile) if fixed_compile.output != *orig_out => {
+                        return Err(MdsError::Io {
+                            message: "lint --fix would change compiled output; \
+                                      edit reverted to preserve template semantics"
+                                .to_string(),
+                        });
+                    }
+                    _ => {} // outputs match, or fixed source didn't compile (lint_str_with caught it)
                 }
-                _ => {} // outputs match, or fixed source didn't compile (lint_str_with caught it)
             }
         }
 
@@ -523,6 +537,13 @@ fn preview_fixes(
         return PreviewOutcome::NothingToFix;
     }
 
+    // Same output-neutral check as plan_and_apply_fixes: skip the equality gate when
+    // the plan contains any output-changing rule (e.g. legacy-interpolation).
+    let all_output_neutral = plan
+        .edits
+        .iter()
+        .all(|e| mds::fix::is_output_neutral(&e.rule));
+
     let original_output =
         mds::compile_str_collecting_warnings(source, Some(base_dir), runtime_vars.clone())
             .ok()
@@ -538,20 +559,23 @@ fn preview_fixes(
             &config_clone,
         )?;
 
-        if let Some(ref orig_out) = original_output {
-            match mds::compile_str_collecting_warnings(
-                fixed,
-                Some(&base_dir_owned),
-                runtime_vars.clone(),
-            ) {
-                Ok(fixed_compile) if fixed_compile.output != *orig_out => {
-                    return Err(MdsError::Io {
-                        message: "lint --fix would change compiled output; \
-                                  edit reverted to preserve template semantics"
-                            .to_string(),
-                    });
+        // Output byte-equality gate — skipped for output-changing rules.
+        if all_output_neutral {
+            if let Some(ref orig_out) = original_output {
+                match mds::compile_str_collecting_warnings(
+                    fixed,
+                    Some(&base_dir_owned),
+                    runtime_vars.clone(),
+                ) {
+                    Ok(fixed_compile) if fixed_compile.output != *orig_out => {
+                        return Err(MdsError::Io {
+                            message: "lint --fix would change compiled output; \
+                                      edit reverted to preserve template semantics"
+                                .to_string(),
+                        });
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -1458,7 +1482,7 @@ mod tests {
     use std::path::Path;
 
     /// ISS-13: CLI-level genuine partial overlaps are structurally impossible with
-    /// the current 9 rules.  Every pair of real-rule fix spans is either disjoint
+    /// the current 10 rules.  Every pair of real-rule fix spans is either disjoint
     /// (different AST blocks) or in a containment relationship (same block, different
     /// rules) — the latter is resolved by `dedup_contained_or_identical` before the
     /// overlap detector is reached.  No MDS fixture can drive `overlap_rejected=true`
@@ -1495,6 +1519,7 @@ mod tests {
                 to: 6,   // inside line1; extend_to_line_end(6) = 12
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
         // Partially overlaps A at [6, 12).
@@ -1510,6 +1535,7 @@ mod tests {
                 to: 12,  // inside line2; extend_to_line_end(12) = 18
                 to_inclusive: true,
             }]),
+            fix_edits: None,
         };
         let result = LintResult {
             diagnostics: vec![diag_a, diag_b],

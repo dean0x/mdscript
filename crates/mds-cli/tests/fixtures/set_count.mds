@@ -2,4 +2,4 @@
 count: 0
 ---
 
-Count is {count}.
+Count is {{count}}.

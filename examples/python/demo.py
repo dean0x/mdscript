@@ -31,7 +31,7 @@ def rule(title: str) -> None:
 # ── 1. Compile a string to Markdown ─────────────────────────────────────────
 rule("compile a string")
 result = mdscript.compile(
-    "# Hi {name}\n\n@for item in items:\n- {item}\n@end\n",
+    "# Hi {{name}}\n\n@for item in items:\n- {{item}}\n@end\n",
     vars={"name": "World", "items": ["alpha", "beta"]},
 )
 print("kind:", result.kind)
@@ -41,7 +41,7 @@ print("output:\n" + result.output)
 # ── 2. Compile with a Source Map v3 ─────────────────────────────────────────
 rule("compile a string with source_map=True")
 mapped = mdscript.compile(
-    "# Hi {name}\n\n@for item in items:\n- {item}\n@end\n",
+    "# Hi {{name}}\n\n@for item in items:\n- {{item}}\n@end\n",
     vars={"name": "World", "items": ["alpha", "beta"]},
     source_map=True,
 )
@@ -81,7 +81,7 @@ except mdscript.MdsError as exc:
 # ── 3. Error handling via MdsError ──────────────────────────────────────────
 rule("error handling")
 try:
-    mdscript.compile("Hello {missing}!\n")
+    mdscript.compile("Hello {{missing}}!\n")
 except mdscript.MdsError as exc:
     print("code:", exc.code)
     print("help:", exc.help)
@@ -93,7 +93,7 @@ except mdscript.MdsError as exc:
 
 # ── 4. Lint a template ──────────────────────────────────────────────────────
 rule("lint")
-lint_result = mdscript.lint("---\nunused: 1\nused: hi\n---\n{used}\n")
+lint_result = mdscript.lint("---\nunused: 1\nused: hi\n---\n{{used}}\n")
 print("lint schema version:", lint_result.version, "truncated:", lint_result.truncated)
 # LintResult.files returns a list of LintFileReport objects (B6/F10 typed access).
 for report in lint_result.files:

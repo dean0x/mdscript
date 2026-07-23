@@ -18,7 +18,7 @@ import time
 
 import mdscript
 
-REPRESENTATIVE = "---\nname: Alice\n---\n@for i in items:\n- {name}: item {i}\n@end\n"
+REPRESENTATIVE = "---\nname: Alice\n---\n@for i in items:\n- {{name}}: item {{i}}\n@end\n"
 ITEMS = list(range(200))
 VARS = {"items": ITEMS}
 

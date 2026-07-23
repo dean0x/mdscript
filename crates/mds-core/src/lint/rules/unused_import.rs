@@ -169,6 +169,7 @@ fn make_diag(
         }),
         file: Some(filename.to_string()),
         fix_removals: None, // unused-import is report-only (partial-name removal unsafe)
+        fix_edits: None,
     }
 }
 
@@ -211,7 +212,7 @@ mod tests {
     /// Used alias import (via qualified call) does not fire.
     #[test]
     fn used_alias_via_qualified_call_does_not_fire() {
-        let src = "@import \"./lib.mds\" as lib\n{lib.greet(\"world\")}\n";
+        let src = "@import \"./lib.mds\" as lib\n{{lib.greet(\"world\")}}\n";
         let diags = lint_src(src);
         assert!(
             !diags.iter().any(|d| d.rule == RULE),
@@ -249,7 +250,7 @@ mod tests {
     /// Used selective import name does not fire.
     #[test]
     fn used_selective_import_does_not_fire() {
-        let src = "@import { greet } from \"./lib.mds\"\n{greet(\"world\")}\n";
+        let src = "@import { greet } from \"./lib.mds\"\n{{greet(\"world\")}}\n";
         let diags = lint_src(src);
         assert!(
             !diags.iter().any(|d| d.rule == RULE),

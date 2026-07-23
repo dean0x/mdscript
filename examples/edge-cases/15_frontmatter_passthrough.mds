@@ -7,11 +7,11 @@ tags:
   - frontmatter
 ---
 
-# {title}
+# {{title}}
 
-By {author}, version {version}.
+By {{author}}, version {{version}}.
 
 Tags:
 @for tag in tags:
-`{tag}`
+`{{tag}}`
 @end

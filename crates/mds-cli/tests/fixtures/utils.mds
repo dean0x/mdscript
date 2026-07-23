@@ -1,9 +1,9 @@
 @define greet(name):
-Hello {name}!
+Hello {{name}}!
 @end
 
 @define farewell(name):
-Goodbye {name}!
+Goodbye {{name}}!
 @end
 
 @export greet

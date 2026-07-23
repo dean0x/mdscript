@@ -224,7 +224,7 @@ describe('intrinsic output format — node.js surface', () => {
   });
 
   test('U-IO-14: compile @message → dynamic role from vars (migrated U-CM3)', () => {
-    const src = '@message {r}:\nContent.\n@end\n';
+    const src = '@message {{r}}:\nContent.\n@end\n';
     const result = compile(src, { vars: { r: 'assistant' } });
     assert.equal(result.kind, 'messages');
     if (result.kind === 'messages') {
@@ -250,7 +250,7 @@ describe('intrinsic output format — node.js surface', () => {
   });
 
   test('U-IO-16: compile @message → interpolation inside body (migrated U-CM6)', () => {
-    const src = '---\nname: World\n---\n@message user:\nHello {name}!\n@end\n';
+    const src = '---\nname: World\n---\n@message user:\nHello {{name}}!\n@end\n';
     const result = compile(src);
     assert.equal(result.kind, 'messages');
     if (result.kind === 'messages') {

@@ -16,7 +16,7 @@ fn check_stdin_valid() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -43,7 +43,7 @@ fn check_invalid_exits_nonzero() {
 fn check_auto_detects_single_mds_file_in_directory() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let mds_path = dir.path().join("valid.mds");
-    std::fs::write(&mds_path, "---\nname: World\n---\nHello {name}!\n").expect("write fixture");
+    std::fs::write(&mds_path, "---\nname: World\n---\nHello {{name}}!\n").expect("write fixture");
 
     let output = mds_bin()
         .current_dir(dir.path())
@@ -370,7 +370,7 @@ fn set_string_cross_flag_duplicate_key_is_error() {
     // through both flags is a hard error (#152).
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("conflict.mds");
-    std::fs::write(&src, "{x}\n").unwrap();
+    std::fs::write(&src, "{{x}}\n").unwrap();
     let output = mds_bin()
         .args([
             "build",
@@ -402,7 +402,7 @@ fn exit_code_success() {
     // Use a temp directory to avoid writing simple.md into tests/fixtures/.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("simple.mds");
-    std::fs::write(&src, "---\nname: Alice\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
     let status = mds_bin()
         .arg("build")
         .arg(&src)
@@ -436,7 +436,7 @@ fn exit_code_syntax_error() {
     // A file with an undefined variable produces a logical/syntax error → exit code 1.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bad.mds");
-    std::fs::write(&path, "{undefined_var}").unwrap();
+    std::fs::write(&path, "{{undefined_var}}").unwrap();
     let status = mds_bin()
         .args(["build"])
         .arg(&path)

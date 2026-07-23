@@ -39,7 +39,7 @@ fn build_from_stdin() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -125,7 +125,7 @@ fn build_auto_detects_single_mds_file_in_directory() {
     // The default output is <name>.md next to the source, so auto.md should be created.
     let dir = tempfile::tempdir().expect("create temp dir");
     let mds_path = dir.path().join("auto.mds");
-    std::fs::write(&mds_path, "---\nname: World\n---\nHello {name}!\n").expect("write fixture");
+    std::fs::write(&mds_path, "---\nname: World\n---\nHello {{name}}!\n").expect("write fixture");
 
     let output = mds_bin()
         .current_dir(dir.path())
@@ -202,7 +202,7 @@ fn build_auto_detect_writes_file() {
     // Auto-detect + default file output: auto.mds → auto.md.
     let dir = tempfile::tempdir().unwrap();
     let mds_path = dir.path().join("auto.mds");
-    std::fs::write(&mds_path, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&mds_path, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     let output = mds_bin()
         .current_dir(dir.path())
@@ -234,7 +234,7 @@ fn build_default_writes_file_next_to_source() {
     // With no -o or --out-dir, `mds build foo.mds` writes `foo.md` next to the source.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     let output = mds_bin()
         .arg("build")
@@ -278,7 +278,7 @@ fn build_dash_o_dash_writes_to_stdout() {
     // `-o -` forces stdout regardless of the default file-output behavior.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     let output = mds_bin()
         .args(["build", src.to_str().unwrap(), "-o", "-"])
@@ -320,7 +320,7 @@ fn build_stdin_defaults_to_stdout() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -351,7 +351,7 @@ fn build_stdin_with_output_writes_file() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -392,7 +392,7 @@ fn build_stdin_with_out_dir_writes_to_directory() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"---\nname: World\n---\nHello {name}!\n")
+        .write_all(b"---\nname: World\n---\nHello {{name}}!\n")
         .unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -424,7 +424,7 @@ fn build_out_dir_writes_to_directory() {
     // `--out-dir dist` writes `dist/foo.md`.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("foo.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     let dist = dir.path().join("dist");
     // dist does not exist yet — should be created.
@@ -519,7 +519,7 @@ fn build_mds_json_output_dir() {
     // mds.json with `build.output_dir` controls where the output goes.
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("hello.mds");
-    std::fs::write(&src, "---\nname: World\n---\nHello {name}!\n").unwrap();
+    std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     std::fs::write(
         dir.path().join("mds.json"),
         r#"{"build": {"output_dir": "out"}}"#,

@@ -2,8 +2,6 @@
 
 Rollup plugin for importing `.mds` templates as ES modules.
 
-> **Note:** This package is pre-release and not yet published to npm.
-
 ## Installation
 
 ```sh

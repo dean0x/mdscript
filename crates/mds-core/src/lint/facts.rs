@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn collects_var_uses_from_interpolation() {
-        let src = "{name}\n";
+        let src = "{{name}}\n";
         let ctx = facts(src);
         assert!(
             ctx.used_vars.contains("name"),
@@ -802,14 +802,14 @@ mod tests {
 
     #[test]
     fn collects_call_from_interpolation() {
-        let src = "{greet(\"world\")}\n";
+        let src = "{{greet(\"world\")}}\n";
         let ctx = facts(src);
         assert!(ctx.used_calls.contains("greet"), "should collect Call ref");
     }
 
     #[test]
     fn collects_namespace_from_qualified_call() {
-        let src = "@import \"./lib.mds\" as lib\n{lib.greet(\"world\")}\n";
+        let src = "@import \"./lib.mds\" as lib\n{{lib.greet(\"world\")}}\n";
         let ctx = facts(src);
         assert!(
             ctx.used_namespaces.contains("lib"),
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn collects_var_uses_from_for_iterable() {
-        let src = "@define greet(items):\n@for item in items:\n{item}\n@end\n@end\n";
+        let src = "@define greet(items):\n@for item in items:\n{{item}}\n@end\n@end\n";
         let ctx = facts(src);
         // `items` is referenced as @for iterable
         assert!(
@@ -852,7 +852,7 @@ mod tests {
 
     #[test]
     fn detects_for_var_shadowing_fm_key() {
-        let src = "---\nname: World\n---\n@for name in items:\n{name}\n@end\n";
+        let src = "---\nname: World\n---\n@for name in items:\n{{name}}\n@end\n";
         let ctx = facts(src);
         let shadow = ctx.shadow_pairs.iter().find(|p| {
             p.name == "name"
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn detects_define_param_shadowing_fm_key() {
-        let src = "---\nuser: Alice\n---\n@define greet(user):\nhello {user}\n@end\n";
+        let src = "---\nuser: Alice\n---\n@define greet(user):\nhello {{user}}\n@end\n";
         let ctx = facts(src);
         let shadow = ctx.shadow_pairs.iter().find(|p| {
             p.name == "user"

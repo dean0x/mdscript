@@ -111,7 +111,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
 
   test('T-HMR-a (AC-F1): edit entry .mds → fresh bundle with new marker', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A',
     });
     const outDir = join(dir, 'out');
     const { watching, getBundle } = await startRspackWatcher(buildConfig(paths['entry.mds'], outDir));
@@ -119,7 +119,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
     try {
       assert.ok(getBundle().includes('MARKER_A'), 'initial build contains MARKER_A');
 
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       await waitFor(() => getBundle().includes('MARKER_B'),
         { timeoutMs: 10_000, label: 'MARKER_B in bundle' });
 
@@ -134,8 +134,8 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
   test('T-HMR-b (AC-F2): edit transitive @import dep → fresh bundle', async () => {
     // ADR-014: dep files BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
-      'dep.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-      'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+      'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+      'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
     });
     const outDir = join(dir, 'out');
     const { watching, getBundle } = await startRspackWatcher(buildConfig(paths['entry.mds'], outDir));
@@ -144,7 +144,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
       await waitFor(() => getBundle().includes('MARKER_A'),
         { timeoutMs: 10_000, label: 'initial MARKER_A' });
 
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! MARKER_B\n@end\n\n@export greet');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! MARKER_B\n@end\n\n@export greet');
       await waitFor(() => getBundle().includes('MARKER_B'),
         { timeoutMs: 10_000, label: 'MARKER_B after dep edit' });
 
@@ -157,7 +157,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
 
   test('T-HMR-c (AC-F3): inject compile error → rspack surfaces error, watcher stays alive', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A',
     });
     const outDir = join(dir, 'out');
     const compiler = rspack(buildConfig(paths['entry.mds'], outDir));
@@ -173,7 +173,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
       assert.ok(readBundleFile(outDir).includes('MARKER_A'), 'initial MARKER_A');
 
       // Inject a compile error
-      editFile(paths['entry.mds'], '{undefined_var_xyz_bad_syntax!!!}');
+      editFile(paths['entry.mds'], '{{undefined_var_xyz_bad_syntax!!!}}');
       await waitFor(() => latestStats !== null && latestStats.hasErrors(),
         { timeoutMs: 10_000, label: 'rspack error state' });
 
@@ -184,7 +184,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
 
       // isAlive(): watcher keeps firing after error
       const statsBefore = latestStats;
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_FIXED');
       await waitFor(() => latestStats !== statsBefore && !latestStats.hasErrors(),
         { timeoutMs: 10_000, label: 'recovery build after error' });
 
@@ -198,7 +198,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
 
   test('T-HMR-d (AC-F4): fix compile error → fresh bundle, hasErrors() false', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '{undefined_var_xyz_bad_syntax!!!}',
+      'entry.mds': '{{undefined_var_xyz_bad_syntax!!!}}',
     });
     const outDir = join(dir, 'out');
     const compiler = rspack(buildConfig(paths['entry.mds'], outDir));
@@ -216,7 +216,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
       // Fix the file — wait for stats to clear first, then assert fresh content.
       // Using waitForContent (not existsSync + inline read) prevents early-pass on a
       // stale on-disk bundle that hasn't been overwritten by the recovery compile yet.
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_FIXED');
       await waitFor(
         () => latestStats !== null && !latestStats.hasErrors(),
         { timeoutMs: 10_000, label: 'hasErrors()===false after fix' },
@@ -238,8 +238,8 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
   test('T-HMR-e (AC-F5): add a second @import dep, edit it → recompile', async () => {
     // ADR-014: dep files BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
-      'dep1.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-      'entry.mds': '@import { greet } from "./dep1.mds"\n\n{greet("World")}',
+      'dep1.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+      'entry.mds': '@import { greet } from "./dep1.mds"\n\n{{greet("World")}}',
     });
     const outDir = join(dir, 'out');
     const { watching, getBundle } = await startRspackWatcher(buildConfig(paths['entry.mds'], outDir));
@@ -249,15 +249,15 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
         { timeoutMs: 10_000, label: 'initial MARKER_A' });
 
       const dep2Path = join(dir, 'dep2.mds');
-      editFile(dep2Path, '@define farewell(who):\nBye {who}! MARKER_B\n@end\n\n@export farewell');
+      editFile(dep2Path, '@define farewell(who):\nBye {{who}}! MARKER_B\n@end\n\n@export farewell');
       editFile(paths['entry.mds'],
-        '@import { greet } from "./dep1.mds"\n@import { farewell } from "./dep2.mds"\n\n{greet("World")} {farewell("World")}');
+        '@import { greet } from "./dep1.mds"\n@import { farewell } from "./dep2.mds"\n\n{{greet("World")}} {{farewell("World")}}');
 
       await waitFor(() => getBundle().includes('MARKER_B'),
         { timeoutMs: 10_000, label: 'MARKER_B after dep2 import' });
       assert.ok(getBundle().includes('MARKER_B'), 'dep2 content in bundle');
 
-      editFile(dep2Path, '@define farewell(who):\nBye {who}! MARKER_C\n@end\n\n@export farewell');
+      editFile(dep2Path, '@define farewell(who):\nBye {{who}}! MARKER_C\n@end\n\n@export farewell');
       await waitFor(() => getBundle().includes('MARKER_C'),
         { timeoutMs: 10_000, label: 'MARKER_C after dep2 edit' });
       assert.ok(getBundle().includes('MARKER_C'), 'dep2 edit triggers recompile');
@@ -269,7 +269,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
 
   test('T-P1 (AC-P1): edit → fresh bundle within 10s performance budget', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A',
     });
     const outDir = join(dir, 'out');
     const { watching, getBundle } = await startRspackWatcher(buildConfig(paths['entry.mds'], outDir));
@@ -277,7 +277,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
     try {
       assert.ok(getBundle().includes('MARKER_A'), 'initial build ok');
 
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       // Liveness is enforced by the waitFor timeout (10s). The wall-clock assertion
       // was redundant (waitFor throws first on slow runners) and flaky under CI load.
       await waitFor(() => getBundle().includes('MARKER_B'), { timeoutMs: 10_000 });
@@ -291,7 +291,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
   test('T-P2 (AC-P2): 20-iteration bounded edit loop — no degradation, watcher alive', async () => {
     const N = 20;
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! ITERATION_0',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! ITERATION_0',
     });
     const outDir = join(dir, 'out');
     const { watching, getBundle } = await startRspackWatcher(buildConfig(paths['entry.mds'], outDir));
@@ -299,7 +299,7 @@ describe('rspack-loader HMR e2e — Suite 1 (real watcher)', { skip: !HMR_ENABLE
     try {
       for (let i = 1; i <= N; i++) {
         const marker = `ITERATION_${i}`;
-        editFile(paths['entry.mds'], `---\nname: World\n---\n\nHello {name}! ${marker}`);
+        editFile(paths['entry.mds'], `---\nname: World\n---\n\nHello {{name}}! ${marker}`);
         await waitFor(() => getBundle().includes(marker), { timeoutMs: 10_000, label: marker });
       }
       assert.ok(getBundle().includes(`ITERATION_${N}`), `Final iteration ${N} is fresh`);
@@ -319,8 +319,8 @@ describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &&
   test('T-E-del (AC-E1): delete @imported dep → rspack errors; recreate → recovers', async () => {
     // ADR-014: dep BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
-      'dep.mds': '@define greet(who):\nHi {who}! DEP_MARKER\n@end\n\n@export greet',
-      'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+      'dep.mds': '@define greet(who):\nHi {{who}}! DEP_MARKER\n@end\n\n@export greet',
+      'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
     });
     const outDir = join(dir, 'out');
     const compiler = rspack(buildConfig(paths['entry.mds'], outDir));
@@ -336,14 +336,14 @@ describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &&
       assert.ok(readBundleFile(outDir).includes('DEP_MARKER'), 'initial DEP_MARKER');
 
       unlinkSync(paths['dep.mds']);
-      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{greet("World")} AFTER_DEL');
+      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{{greet("World")}} AFTER_DEL');
 
       await waitFor(() => latestStats !== null && latestStats.hasErrors(),
         { timeoutMs: 10_000, label: 'error after dep deletion' });
       assert.ok(latestStats.hasErrors(), 'rspack errors after dep deleted');
 
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! DEP_RECREATED\n@end\n\n@export greet');
-      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{greet("World")}');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! DEP_RECREATED\n@end\n\n@export greet');
+      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{{greet("World")}}');
 
       await waitFor(
         () => latestStats !== null && !latestStats.hasErrors() && readBundleFile(outDir).includes('DEP_RECREATED'),
@@ -358,7 +358,7 @@ describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &&
 
   test('T-E-create (AC-E1): entry @imports not-yet-created dep → error; create dep → recovers', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '@import { greet } from "./missing.mds"\n\n{greet("World")}',
+      'entry.mds': '@import { greet } from "./missing.mds"\n\n{{greet("World")}}',
     });
     const outDir = join(dir, 'out');
     const compiler = rspack(buildConfig(paths['entry.mds'], outDir));
@@ -373,8 +373,8 @@ describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &&
         { timeoutMs: 30_000, label: 'initial error (missing dep)' });
       assert.ok(latestStats.hasErrors(), 'rspack errors for missing dep');
 
-      editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {who}! CREATED_MARKER\n@end\n\n@export greet');
-      editFile(paths['entry.mds'], '@import { greet } from "./missing.mds"\n\n{greet("World")}');
+      editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {{who}}! CREATED_MARKER\n@end\n\n@export greet');
+      editFile(paths['entry.mds'], '@import { greet } from "./missing.mds"\n\n{{greet("World")}}');
 
       // Wait for stats to clear, then verify fresh content via waitForContent to avoid
       // early-pass on a stale on-disk bundle (avoids the existsSync + inline read pattern).
@@ -409,7 +409,7 @@ describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &&
         { timeoutMs: 10_000, label: 'MD_PLAIN_MARKER compiled' });
       assert.ok(getBundle().includes('MD_PLAIN_MARKER'), '.mds file compiled without frontmatter');
 
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MD_FLIP_MARKER');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MD_FLIP_MARKER');
       await waitFor(() => getBundle().includes('MD_FLIP_MARKER'),
         { timeoutMs: 10_000, label: 'MD_FLIP_MARKER after frontmatter added' });
       assert.ok(getBundle().includes('MD_FLIP_MARKER'), 'bundle updated after frontmatter added');
@@ -421,7 +421,7 @@ describe('rspack-loader HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED &&
 
   test('T-E-cycle: circular @import → rspack errors, no infinite rebuild loop', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '@import { thing } from "./entry.mds"\n\n{thing}',
+      'entry.mds': '@import { thing } from "./entry.mds"\n\n{{thing}}',
     });
     const outDir = join(dir, 'out');
     const compiler = rspack(buildConfig(paths['entry.mds'], outDir));

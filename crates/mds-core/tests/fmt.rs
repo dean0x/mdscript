@@ -19,18 +19,24 @@ use mds::{format_str, format_str_named, format_str_with, MdsError};
 // tests below (they need a real tempdir).
 const CORPUS: &[&str] = &[
     "Hello world!\n",
-    "---\nname: World\n---\nHello {name}!\n",
+    "---\nname: World\n---\nHello {{name}}!\n",
     "---\npremium: true\n---\n@if premium:\nThanks!\n@end\n",
-    "---\nitems: [a, b, c]\n---\n@for item in items:\n- {item}\n@end\n",
+    "---\nitems: [a, b, c]\n---\n@for item in items:\n- {{item}}\n@end\n",
     "```python\ndef f():\n    pass\n```\n",
-    "@define greet(x):\nHello {x}!\n@end\n{greet(\"World\")}\n",
+    "@define greet(x):\nHello {{x}}!\n@end\n{{greet(\"World\")}}\n",
     "@message user:\nHi!\n@end\n",
+    // Old \{ syntax is now plain literal text in MDS v2 — single-brace is no
+    // longer an interpolation trigger. Exercises body-content pass-through.
     "Line with \\{escaped\\} braces.\n",
+    // \{{ escape: prevents double-brace interpolation, renders as {{ literally.
+    "Escaped: \\{{not_interpolated}} and more \\{{text}}.\n",
+    // Literal single braces are plain text in MDS v2 (no interpolation).
+    "Single {literal} brace is plain text.\n",
     "",
     "   \n",
     "No trailing newline",
     "---\nname: x\n---\n",
-    "---\npremium: true\n---\nBefore\n\n\n\nAfter\n@if premium:\ninline text {premium}\n@end\n",
+    "---\npremium: true\n---\nBefore\n\n\n\nAfter\n@if premium:\ninline text {{premium}}\n@end\n",
 ];
 
 fn compiled_markdown(src: &str) -> Option<String> {
@@ -260,7 +266,7 @@ fn r4_trailing_tabs_on_directive_and_blank_lines_stripped_body_tabs_preserved() 
 
 #[test]
 fn r7_frontmatter_content_byte_identical_mod_cr() {
-    let src = "---\nname: World\nimports:\n  - path: ./lib.mds\ntype: mds\n---\nHello {name}!\n";
+    let src = "---\nname: World\nimports:\n  - path: ./lib.mds\ntype: mds\n---\nHello {{name}}!\n";
     let out = format_str(src).expect("should format");
     assert!(
         out.starts_with("---\nname: World\nimports:\n  - path: ./lib.mds\ntype: mds\n---\n"),
@@ -285,7 +291,7 @@ fn syntax_error_unclosed_code_fence_is_err() {
 
 #[test]
 fn syntax_error_unclosed_interpolation_is_err() {
-    let err = format_str("Hello {name\n").unwrap_err();
+    let err = format_str("Hello {{name\n").unwrap_err();
     assert!(matches!(err, MdsError::Syntax { .. }));
 }
 
@@ -313,8 +319,8 @@ fn syntax_error_unclosed_directive_blocks_surface_syntax_not_formatter_invariant
     for src in [
         "@message user:\nHi\n",
         "@if x:\nHi\n",
-        "@for a in items:\n- {a}\n",
-        "@define greet(x):\nHello {x}\n",
+        "@for a in items:\n- {{a}}\n",
+        "@define greet(x):\nHello {{x}}\n",
         "@block b:\nStuff\n",
     ] {
         match format_str(src) {
@@ -371,14 +377,14 @@ fn gate_fallback_structural_equivalent_no_false_positive_on_trailing_blank_line(
 #[test]
 fn gate_fallback_no_false_positive_multiple_trailing_blank_lines() {
     // Variant: multiple trailing blank lines — all are insignificant and should be stripped.
-    let src = "@for item in undefined_list:\n- {item}\n@end\n\n\n";
+    let src = "@for item in undefined_list:\n- {{item}}\n@end\n\n\n";
     assert!(
         mds::compile_str(src).is_err(),
         "sanity: source must not compile standalone"
     );
     let out =
         format_str(src).expect("multiple trailing blank lines must not produce FormatterInvariant");
-    assert_eq!(out, "@for item in undefined_list:\n- {item}\n@end\n");
+    assert_eq!(out, "@for item in undefined_list:\n- {{item}}\n@end\n");
     let out2 = format_str(&out).expect("second pass must succeed");
     assert_eq!(out, out2, "idempotent");
 }
@@ -404,27 +410,27 @@ fn gate_fallback_no_false_positive_crlf_trailing_blank_line() {
 fn gate_fallback_undefined_var_source_still_formats() {
     // `mds::compile_str` fails (undefined variable), so format_str_with must
     // fall back to the structural check rather than hard-failing.
-    let src = "Hello {undefined_var}!\n\n\n\nBye.\n";
+    let src = "Hello {{undefined_var}}!\n\n\n\nBye.\n";
     assert!(
         mds::compile_str(src).is_err(),
         "sanity: source must not compile standalone"
     );
     let out = format_str(src).expect("format_str must still succeed via structural fallback");
-    assert_eq!(out, "Hello {undefined_var}!\n\n\n\nBye.\n");
+    assert_eq!(out, "Hello {{undefined_var}}!\n\n\n\nBye.\n");
 }
 
 #[test]
 fn gate_full_check_runs_when_base_dir_resolves_imports() {
     let dir = tempfile::tempdir().unwrap();
     let lib_path = dir.path().join("lib.mds");
-    std::fs::write(&lib_path, "@define greet(x):\nHello {x}!\n@end\n").unwrap();
+    std::fs::write(&lib_path, "@define greet(x):\nHello {{x}}!\n@end\n").unwrap();
 
-    let src = "@import \"./lib.mds\"\n{greet(\"World\")}\n\n\n\nBye.\n";
+    let src = "@import \"./lib.mds\"\n{{greet(\"World\")}}\n\n\n\nBye.\n";
     let out =
         format_str_with(src, Some(dir.path())).expect("format_str_with should resolve imports");
     assert_eq!(
         out,
-        "@import \"./lib.mds\"\n{greet(\"World\")}\n\n\n\nBye.\n"
+        "@import \"./lib.mds\"\n{{greet(\"World\")}}\n\n\n\nBye.\n"
     );
 
     // Compile-equivalence via the REAL gate: compile both with the same base_dir.
@@ -473,7 +479,7 @@ fn ec_file_ending_mid_directive_at_eof_no_trailing_newline() {
 #[test]
 fn ec_unclosed_fence_interp_frontmatter_all_error() {
     assert!(format_str("```\nunclosed").is_err());
-    assert!(format_str("{unclosed").is_err());
+    assert!(format_str("{{unclosed").is_err());
     assert!(format_str("---\nunclosed").is_err());
 }
 
@@ -532,10 +538,10 @@ fn ec_blank_lines_inside_define_message_block_bodies_preserved() {
     // safety gate is the load-bearing check in every case below.
 
     // @define body: blank-line runs pass through verbatim.
-    let define_src = "@define greet(x):\nHello\n\n\n\n{x}!\n@end\n{greet(\"World\")}\n";
+    let define_src = "@define greet(x):\nHello\n\n\n\n{{x}}!\n@end\n{{greet(\"World\")}}\n";
     let define_out = format_str(define_src).expect("should format");
     assert!(
-        define_out.contains("Hello\n\n\n\n{x}!"),
+        define_out.contains("Hello\n\n\n\n{{x}}!"),
         "blank-line run inside @define body must be preserved, got: {define_out:?}"
     );
     let define_before = mds::compile_str(define_src).unwrap();
@@ -651,7 +657,7 @@ fn perf_formats_large_file_without_panic_or_catastrophic_slowdown() {
     // Uses an undefined variable so compile_str fails; format_str must still succeed.
     let mut fallback_src = String::new();
     let fallback_chunk =
-        "Hello {undefined_runtime_var}!\n@if undefined_runtime_var:\nYes.\n@end\n\n\n\n";
+        "Hello {{undefined_runtime_var}}!\n@if undefined_runtime_var:\nYes.\n@end\n\n\n\n";
     while fallback_src.len() < 300_000 {
         fallback_src.push_str(fallback_chunk);
     }
@@ -694,7 +700,7 @@ fn t3_deep_nesting_for_inside_if_inside_message_compile_equivalence_and_idempote
         @message user:\n\
         @if premium:\n\
         @for item in items:\n\
-        - {item}\n\
+        - {{item}}\n\
         @end\n\
         \n\n\n\
         @end\n\
@@ -811,7 +817,7 @@ fn format_str_named_happy_path_matches_format_str_with() {
 fn format_str_named_lexer_syntax_error_src_shows_file_name() {
     // Unclosed interpolation -> lexer-level Syntax error.
     // format_str_named must thread file_name into tokenize so the NamedSource carries it.
-    let err = format_str_named("Hello {name\n", None, "my_template.mds").unwrap_err();
+    let err = format_str_named("Hello {{name\n", None, "my_template.mds").unwrap_err();
     assert!(
         matches!(err, MdsError::Syntax { .. }),
         "unclosed interpolation must be a Syntax error, got: {err:?}"

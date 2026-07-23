@@ -6,17 +6,17 @@ items:
 ---
 
 @define greet(name):
-Hello {name} from function!
+Hello {{name}} from function!
 @end
 
-Outer name: {name}
+Outer name: {{name}}
 
-{greet("inner")}
+{{greet("inner")}}
 
-After function, outer name: {name}
+After function, outer name: {{name}}
 
 @for name in items:
-Loop name: {name}
+Loop name: {{name}}
 @end
 
-After loop, outer name: {name}
+After loop, outer name: {{name}}

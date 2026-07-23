@@ -5,10 +5,16 @@ label: Status
 
 @import "../lib/formatting.mds" as fmt
 
-Escaped: \{not_a_var\} but real: {real_var}
+Single braces are literal text (no interpolation): {not_a_var}
 
-Mixed line: \{literal\} then {real_var} then \{another_literal\}
+Double braces interpolate a variable: {{real_var}}
 
-{fmt.bold(real_var)} vs \{fmt.bold("nope")\}
+Escape sequence \{{ prevents interpolation: rendered as \{{ in the output.
 
-Template syntax guide: use \{var_name\} for literal braces and {label} for values.
+Mixed line: {literal_text} then {{real_var}} then {another_literal}
+
+Function calls use double braces: {{fmt.bold(real_var)}}
+
+Single-brace function syntax is literal text: {fmt.bold("nope")}
+
+Template syntax guide: use \{{ for a literal \{{ and {{label}} for injected values.

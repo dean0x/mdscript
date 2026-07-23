@@ -118,7 +118,7 @@ async function run() {
     const result = await compileFile(r('edge/escaped-braces.mds'));
     assertContains(result.output, '{not_a_var}', 'escaped-braces literal braces');
     assertContains(result.output, 'INTERPOLATED', 'escaped-braces real var');
-    assertContains(result.output, '{literal} then INTERPOLATED', 'escaped-braces mixed line');
+    assertContains(result.output, '{literal_text} then INTERPOLATED', 'escaped-braces mixed line');
   }
   {
     const result = await compileFile(r('edge/deep-nesting.mds'));
@@ -160,7 +160,7 @@ async function run() {
     assertContains(result.output, '`DataInsight Pro`', 'main enabled_agents loop');
     assertContains(result.output, '**DataInsight Pro** Configuration', 'main @include analyst');
     assertContains(result.output, '**AgentOrch**', 'main @include orchestrator');
-    assertContains(result.output, '{not_interpolated}', 'main escaped braces');
+    assertContains(result.output, 'Escape {{ produces a literal double-brace.', 'main escaped braces');
     assertContains(result.output, '@if condition:', 'main code block passthrough');
     assertContains(result.output, 'Running in production mode', 'main debug=false conditional');
     assert(result.dependencies.length >= 7, `main has ${result.dependencies.length} transitive deps (expected 7+)`);
@@ -187,7 +187,7 @@ async function run() {
   // ── Group 7: compile() inline templates ──
   console.log('\n── Inline compile() ──');
   {
-    const result = compile('Hello {name}!', { vars: { name: 'World' } });
+    const result = compile('Hello {{name}}!', { vars: { name: 'World' } });
     assert(result.output.trim() === 'Hello World!', 'inline simple interpolation');
   }
   {
@@ -198,7 +198,7 @@ async function run() {
       '  - beta',
       '---',
       '@for item in items:',
-      '- {item}',
+      '- {{item}}',
       '@end',
     ].join('\n');
     const result = compile(src);
@@ -222,17 +222,18 @@ async function run() {
   {
     const src = [
       '@define greet(name):',
-      'Hello {name}!',
+      'Hello {{name}}!',
       '@end',
-      '{greet("World")}',
+      '{{greet("World")}}',
     ].join('\n');
     const result = compile(src);
     assertContains(result.output, 'Hello World!', 'inline function call');
   }
   {
-    const src = 'Escaped: \\{literal\\} and plain text.';
+    // Single braces are literal text in the new syntax; \{{ escape renders as {{
+    const src = 'Single {brace} is literal; escape \\{{ gives double-brace.';
     const result = compile(src);
-    assertContains(result.output, '{literal}', 'inline escaped braces');
+    assertContains(result.output, '{brace}', 'inline escaped braces');
   }
 
   // ── Group 8: check() and checkFile() ──
@@ -242,12 +243,12 @@ async function run() {
     assert(Array.isArray(checkResult.warnings), 'checkFile shadowing returns warnings array');
   }
   {
-    const result = check('Hello {name}!', { vars: { name: 'Test' } });
+    const result = check('Hello {{name}}!', { vars: { name: 'Test' } });
     assert(Array.isArray(result.warnings), 'check inline returns warnings array');
   }
   {
     try {
-      check('{undefined_thing}');
+      check('{{undefined_thing}}');
       assert(false, 'check rejects undefined var');
     } catch (err) {
       assert(isMdsError(err), 'check undefined throws MdsError');

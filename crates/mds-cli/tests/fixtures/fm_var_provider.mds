@@ -3,7 +3,7 @@ greeting: Hello from module A
 ---
 
 @define greet_with_fm():
-{greeting}
+{{greeting}}
 @end
 
 @export greet_with_fm

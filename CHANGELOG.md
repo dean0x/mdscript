@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### **BREAKING** — Interpolation syntax: `{x}` → `{{x}}`
+
+Interpolation now uses **double braces**: `{{variable}}`, `{{obj.field}}`,
+`{{func("arg")}}`, `{{alias.func()}}`. Single `{` and `}` are always **literal
+text** — no escaping needed for lone braces.
+
+#### Interpolation syntax changed (#236)
+
+Templates using the old `{var}` form will no longer interpolate — they will emit
+the literal text `{var}` instead. This affects every template that uses variable
+substitution, function calls, or dynamic message roles.
+
+**Migration:** run `mds lint --fix` to auto-migrate (the `legacy-interpolation`
+lint rule, Tier A, rewrites every `{x}` → `{{x}}` in one pass), then run
+`mds fmt` to normalize formatting.
+
+```
+# One-command migration for a project:
+mds lint --fix && mds fmt
+```
+
+#### Escape syntax changed
+
+- Old: `\{` → literal `{`, `\}` → literal `}` — **deleted**; these escapes are
+  no longer recognized (single braces are ordinary text and need no escaping).
+- New: `\{{` → literal `{{` in output. Use this only when you need `{{` as
+  literal text in the output (e.g. inside a Jinja/Python f-string example).
+
+#### `@message {{role}}:` dynamic roles
+
+Dynamic message roles now use double braces: `@message {{role}}:` instead of
+`@message {role}:`. Bare-word roles (`@message system:`) are unchanged.
+
+#### New `fix_edits` field on `LintDiagnostic`
+
+`LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;
+an array of `{start, end, new_text}` byte-span edit objects when fixable). This
+field is present across all binding surfaces: CLI JSON output, napi
+(`LintDiagnostic.fix_edits?: …`), WASM, and Python
+(`LintDiagnostic.fix_edits: list[dict] | None`). Code that constructs
+`LintDiagnostic` objects directly must add `fix_edits: null` or the typed field.
+
 ### Security
 
 - **Source Map v3 `sources[]` no longer leaks absolute filesystem paths** across

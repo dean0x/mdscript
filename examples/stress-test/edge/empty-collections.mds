@@ -9,13 +9,13 @@ label: test
 Before empty array loop.
 
 @for item in empty_arr:
-FAIL: should not render {item}
+FAIL: should not render {{item}}
 @end
 
 After empty array loop.
 
 @for key, val in empty_obj:
-FAIL: should not render {key} {val}
+FAIL: should not render {{key}} {{val}}
 @end
 
 After empty object loop.
@@ -28,10 +28,10 @@ FAIL: empty array truthy
 FAIL: empty object truthy
 @end
 
-Non-empty works: {label}
+Non-empty works: {{label}}
 
 @for item in filled_arr:
-- {item}
+- {{item}}
 @end
 
 Done.

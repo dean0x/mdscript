@@ -61,7 +61,7 @@ describe('bundler-utils integration', () => {
     const tmpDir = join(tmpdir(), `mds-integration-${process.pid}`);
     mkdirSync(tmpDir, { recursive: true });
     const tmpMd = join(tmpDir, 'test.md');
-    writeFileSync(tmpMd, '---\ntype: mds\nname: World\n---\nHello {name}!\n');
+    writeFileSync(tmpMd, '---\ntype: mds\nname: World\n---\nHello {{name}}!\n');
 
     try {
       const transformer = createMdsTransformer(mds);

@@ -84,6 +84,7 @@ pub(crate) fn check(
                 }),
                 file: Some(filename.to_string()),
                 fix_removals: None,
+                fix_edits: None,
             })
         {
             return;
@@ -149,7 +150,7 @@ mod tests {
     /// L-U-UV2: Used FM key does not fire.
     #[test]
     fn used_fm_key_does_not_fire() {
-        let src = "---\nname: World\n---\nHello {name}!\n";
+        let src = "---\nname: World\n---\nHello {{name}}!\n";
         let diags = lint_src(src);
         assert!(
             !diags.iter().any(|d| d.rule == RULE),

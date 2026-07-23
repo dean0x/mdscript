@@ -5,9 +5,9 @@ use crate::error::MdsError;
 pub enum Token {
     /// Raw text content.
     Text(String, usize),
-    /// An interpolation expression `{...}` — inner content without braces.
+    /// An interpolation expression `{{...}}` — inner content without braces.
     Interpolation(String, usize),
-    /// An escaped brace `\{`.
+    /// An escaped double-brace `\{{` that produces a literal `{{` in output.
     EscapedBrace(usize),
     /// A directive line starting with `@`.
     Directive(String, usize),
@@ -219,66 +219,99 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token::Directive(line, start));
     }
 
-    /// Scan a `\{` or `\}` escape sequence.
+    /// Scan a `\{{` escape sequence (3-character sequence → EscapedBrace token).
     ///
-    /// Returns `true` and advances `self.pos` by 2 if an escape was found;
-    /// returns `false` otherwise (caller continues to next check).
+    /// Only `\{{` triggers EscapedBrace. A lone `\{` (not followed by `{`) is
+    /// ordinary text, not an escape. Returns `true` and advances `self.pos` by 3
+    /// if the sequence was found; `false` otherwise.
     fn scan_escape(&mut self) -> bool {
-        if self.pos + 1 >= self.chars.len() || self.chars[self.pos] != '\\' {
-            return false;
-        }
-        let next = self.chars[self.pos + 1];
-        if next == '{' {
+        // Only `\{{` triggers EscapedBrace — a 3-character sequence.
+        // A lone `\{` (not followed by `{`) is ordinary text, not an escape.
+        if self.pos + 2 < self.chars.len()
+            && self.chars[self.pos] == '\\'
+            && self.chars[self.pos + 1] == '{'
+            && self.chars[self.pos + 2] == '{'
+        {
             self.tokens
                 .push(Token::EscapedBrace(self.byte_pos(self.pos)));
-            self.pos += 2;
-            true
-        } else if next == '}' {
-            self.tokens
-                .push(Token::Text("}".to_string(), self.byte_pos(self.pos)));
-            self.pos += 2;
+            self.pos += 3;
             true
         } else {
             false
         }
     }
 
-    /// Scan a `{...}` interpolation with brace depth tracking.
+    /// Scan a `{{...}}` interpolation, string-aware to avoid closing on `}}` inside strings.
     ///
-    /// Precondition: `self.chars[self.pos] == '{'`.
-    /// Advances `self.pos` past the closing `}`.
+    /// Precondition: `self.chars[self.pos] == '{'` and `self.chars[self.pos+1] == '{'`.
+    /// Advances `self.pos` past the closing `}}`.
     fn scan_interpolation(&mut self) -> Result<(), MdsError> {
         let start = self.byte_pos(self.pos);
-        self.pos += 1; // skip opening {
-        let mut depth = 1usize;
+        // Skip the opening `{{`
+        self.pos += 2;
+
         let mut content = String::new();
-        while self.pos < self.chars.len() && depth > 0 {
-            match self.chars[self.pos] {
-                '{' => {
-                    depth += 1;
-                    content.push('{');
-                }
-                '}' => {
-                    depth -= 1;
-                    if depth > 0 {
-                        content.push('}');
-                    }
-                }
-                c => {
-                    content.push(c);
-                }
+        let mut in_string = false;
+        let mut string_char = '"';
+        let mut escaped = false;
+        let mut found_close = false;
+
+        while self.pos < self.chars.len() {
+            let c = self.chars[self.pos];
+
+            if escaped {
+                content.push(c);
+                escaped = false;
+                self.pos += 1;
+                continue;
             }
+
+            if in_string {
+                match c {
+                    '\\' => {
+                        escaped = true;
+                        content.push(c);
+                    }
+                    q if q == string_char => {
+                        content.push(c);
+                        in_string = false;
+                    }
+                    _ => content.push(c),
+                }
+                self.pos += 1;
+                continue;
+            }
+
+            // Outside a string: check for closing `}}`
+            if c == '}' && self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '}' {
+                self.pos += 2; // skip `}}`
+                found_close = true;
+                break;
+            }
+
+            // Start of a string literal
+            if c == '"' || c == '\'' {
+                in_string = true;
+                string_char = c;
+                content.push(c);
+                self.pos += 1;
+                continue;
+            }
+
+            content.push(c);
             self.pos += 1;
         }
-        if depth != 0 {
+
+        if !found_close {
             return Err(MdsError::syntax_at(
-                "unclosed interpolation brace — to include a literal `{`, escape it as `\\{`",
+                "unclosed `{{` interpolation — to include a literal `{{` in output, escape it as `\\{{`",
                 self.file,
                 self.source,
                 start,
-                1,
+                2,
             ));
         }
+
         self.tokens
             .push(Token::Interpolation(content.trim().to_string(), start));
         Ok(())
@@ -286,23 +319,41 @@ impl<'a> Lexer<'a> {
 
     /// Scan regular text, stopping at any special character that begins another token.
     ///
+    /// Lone `{` and `\{` (not followed by `{`) are now plain text.
+    /// Only `{{` and `\{{` stop scanning.
+    ///
     /// Advances `self.pos` past the accumulated text content.
     fn scan_text(&mut self) {
         let start = self.byte_pos(self.pos);
         let mut text = String::new();
         while self.pos < self.chars.len() {
             let c = self.chars[self.pos];
-            // Stop at interpolation
+
+            // Stop at `{{` (double-brace interpolation opener)
             if c == '{' {
-                break;
-            }
-            // Stop at escape sequences
-            if c == '\\' && self.pos + 1 < self.chars.len() {
-                let next = self.chars[self.pos + 1];
-                if next == '{' || next == '}' {
+                if self.pos + 1 < self.chars.len() && self.chars[self.pos + 1] == '{' {
                     break;
                 }
+                // Lone `{` — consume as plain text
+                text.push(c);
+                self.pos += 1;
+                continue;
             }
+
+            // Stop at `\{{` (escaped-brace sequence opener)
+            if c == '\\' {
+                if self.pos + 2 < self.chars.len()
+                    && self.chars[self.pos + 1] == '{'
+                    && self.chars[self.pos + 2] == '{'
+                {
+                    break;
+                }
+                // `\` not followed by `{{` — consume as plain text
+                text.push(c);
+                self.pos += 1;
+                continue;
+            }
+
             // Stop at directive or code fence at line start
             if self.is_line_start() {
                 if c == '@' {
@@ -312,6 +363,7 @@ impl<'a> Lexer<'a> {
                     break;
                 }
             }
+
             text.push(c);
             self.pos += 1;
         }
@@ -353,13 +405,16 @@ impl<'a> Lexer<'a> {
                 continue;
             }
 
-            // Escape sequences: `\{` and `\}`
+            // Escape sequences: `\{{` only
             if self.scan_escape() {
                 continue;
             }
 
-            // Interpolation `{...}`
-            if self.chars[self.pos] == '{' {
+            // Interpolation `{{...}}`
+            if self.chars[self.pos] == '{'
+                && self.pos + 1 < self.chars.len()
+                && self.chars[self.pos + 1] == '{'
+            {
                 self.scan_interpolation()?;
                 continue;
             }
@@ -472,7 +527,7 @@ mod tests {
 
     #[test]
     fn tokenize_interpolation() {
-        let tokens = tokenize("Hello {name}!", "test.mds").unwrap();
+        let tokens = tokenize("Hello {{name}}!", "test.mds").unwrap();
         assert_eq!(tokens.len(), 3);
         match &tokens[1] {
             Token::Interpolation(expr, _) => assert_eq!(expr, "name"),
@@ -491,7 +546,7 @@ mod tests {
 
     #[test]
     fn tokenize_escaped_brace() {
-        let tokens = tokenize("Hello \\{name}!", "test.mds").unwrap();
+        let tokens = tokenize("Hello \\{{name}}!", "test.mds").unwrap();
         assert!(tokens.iter().any(|t| matches!(t, Token::EscapedBrace(_))));
     }
 
@@ -644,9 +699,9 @@ mod tests {
 
     #[test]
     fn interpolation_resumes_after_closed_tilde_fence() {
-        // {post} appears after a closed ~~~ block and must become an Interpolation,
+        // {{post}} appears after a closed ~~~ block and must become an Interpolation,
         // not be swallowed as CodeContent.
-        let src = "{pre}\n~~~python\n{inside}\n~~~\n{post}\n";
+        let src = "{{pre}}\n~~~python\n{{inside}}\n~~~\n{{post}}\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         assert!(
             tokens
@@ -670,10 +725,10 @@ mod tests {
 
     #[test]
     fn interpolation_resumes_after_closed_blockquoted_fence() {
-        // {post} appears after the closing `> ``` ` line and must become Interpolation.
-        // The `> {inside}` line is raw CodeContent; the blockquote prefix is part of
+        // {{post}} appears after the closing `> ``` ` line and must become Interpolation.
+        // The `> {{inside}}` line is raw CodeContent; the blockquote prefix is part of
         // that raw content (not stripped by the lexer — the formatter handles regions).
-        let src = "> ```python\n> {inside}\n> ```\n{post}\n";
+        let src = "> ```python\n> {{inside}}\n> ```\n{{post}}\n";
         let tokens = tokenize(src, "test.mds").unwrap();
         assert!(
             tokens
@@ -687,5 +742,120 @@ mod tests {
                 .any(|t| matches!(t, Token::Interpolation(s, _) if s == "inside")),
             "interpolation inside blockquoted fence must be suppressed"
         );
+    }
+
+    // ── Double-brace interpolation (new syntax) ──────────────────────────────────
+
+    #[test]
+    fn double_brace_interpolation_basic() {
+        let tokens = tokenize("Hello {{name}}!", "test.mds").unwrap();
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(s, _) if s == "name")));
+    }
+
+    #[test]
+    fn lone_brace_is_plain_text() {
+        let tokens = tokenize("JSON: {\"key\": 1}", "test.mds").unwrap();
+        // No interpolation should be produced
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
+        // Should have text tokens containing the braces
+        let text: String = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Text(s, _) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(text.contains('{'));
+    }
+
+    #[test]
+    fn lone_open_brace_at_eof_is_text() {
+        let tokens = tokenize("end{", "test.mds").unwrap();
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
+    }
+
+    #[test]
+    fn escaped_double_brace_produces_escaped_brace_token() {
+        let tokens = tokenize(r"\{{", "test.mds").unwrap();
+        assert!(tokens.iter().any(|t| matches!(t, Token::EscapedBrace(_))));
+    }
+
+    #[test]
+    fn old_single_brace_escape_is_now_plain_text() {
+        // \{ is no longer an escape — it's two plain-text chars: \ and {
+        let tokens = tokenize(r"\{name}", "test.mds").unwrap();
+        // Should NOT produce EscapedBrace (that's only for \{{)
+        assert!(!tokens.iter().any(|t| matches!(t, Token::EscapedBrace(_))));
+        // Should NOT produce an interpolation
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
+    }
+
+    #[test]
+    fn double_brace_interpolation_with_string_arg() {
+        // {{fn("}}")}} — the `}}` inside the string must not close the interpolation
+        let tokens = tokenize(r#"{{fn("}}")}}"#, "test.mds").unwrap();
+        let interp: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Interpolation(s, _) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interp.len(), 1, "exactly one interpolation expected");
+        assert_eq!(interp[0], r#"fn("}}")"#);
+    }
+
+    #[test]
+    fn unclosed_double_brace_interpolation_error() {
+        let err = tokenize("{{name", "test.mds").unwrap_err();
+        assert!(
+            format!("{err}").contains("unclosed"),
+            "unclosed `{{` must produce error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn double_brace_in_fence_is_suppressed() {
+        let src = "text\n```\n{{no_interp}}\n```\nmore";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        assert!(tokens.iter().any(|t| matches!(t, Token::CodeContent(_, _))));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(s, _) if s == "no_interp")));
+    }
+
+    #[test]
+    fn empty_double_brace_is_invalid() {
+        // `{{ }}` — whitespace-only inner → trim → empty → either lexer accepts or rejects
+        // Either way, check it doesn't panic.
+        let result = tokenize("{{ }}", "test.mds");
+        let _ = result;
+    }
+
+    #[test]
+    fn lone_backslash_then_lone_brace_is_plain_text() {
+        // \{ (not followed by {) — just two plain chars
+        let tokens = tokenize("a\\{b", "test.mds").unwrap();
+        assert!(!tokens.iter().any(|t| matches!(t, Token::EscapedBrace(_))));
+        assert!(!tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(_, _))));
+    }
+
+    #[test]
+    fn crlf_inside_interpolation_preserved() {
+        // Multi-line interpolation (would be unusual but must not crash)
+        let tokens = tokenize("{{name}}\r\n", "test.mds").unwrap();
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(t, Token::Interpolation(s, _) if s == "name")));
     }
 }

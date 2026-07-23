@@ -14,16 +14,16 @@ numbers:
 csv: "red,green,blue"
 ---
 
-SPLIT: {split(csv, ",")}
-JOIN: {join(fruits, " | ")}
-LENGTH string: {length(csv)}
-LENGTH array: {length(fruits)}
-FIRST: {first(fruits)}
-LAST: {last(fruits)}
-REVERSE: {reverse(fruits)}
-SORT strings: {sort(fruits)}
-SORT numbers: {sort(numbers)}
-UNIQUE: {unique(fruits)}
-CONTAINS array true: {contains(fruits, "cherry")}
-CONTAINS array false: {contains(fruits, "grape")}
-SLICE array: {slice(fruits, 1, 3)}
+SPLIT: {{split(csv, ",")}}
+JOIN: {{join(fruits, " | ")}}
+LENGTH string: {{length(csv)}}
+LENGTH array: {{length(fruits)}}
+FIRST: {{first(fruits)}}
+LAST: {{last(fruits)}}
+REVERSE: {{reverse(fruits)}}
+SORT strings: {{sort(fruits)}}
+SORT numbers: {{sort(numbers)}}
+UNIQUE: {{unique(fruits)}}
+CONTAINS array true: {{contains(fruits, "cherry")}}
+CONTAINS array false: {{contains(fruits, "grape")}}
+SLICE array: {{slice(fruits, 1, 3)}}

@@ -19,13 +19,13 @@ describe('compile', () => {
   });
 
   test('U-C2: compile with frontmatter variables', () => {
-    const source = '---\nname: Alice\n---\nHello {name}!\n';
+    const source = '---\nname: Alice\n---\nHello {{name}}!\n';
     const result = compile(source);
     assert.ok(result.output.includes('Hello Alice!'), `expected "Hello Alice!" in: ${result.output}`);
   });
 
   test('U-C3: compile with runtime vars', () => {
-    const source = 'Hello {name}!\n';
+    const source = 'Hello {{name}}!\n';
     const result = compile(source, { vars: { name: 'World' } });
     assert.equal(result.output, 'Hello World!\n');
   });
@@ -41,7 +41,7 @@ describe('compile', () => {
 
   test('U-C5: compile syntax error throws MdsError with code', () => {
     assert.throws(
-      () => compile('Hello {name\n'),
+      () => compile('Hello {{name\n'),
       (err) => {
         assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
         assert.ok(typeof err.code === 'string', 'code should be string');

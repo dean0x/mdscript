@@ -8,8 +8,6 @@ JavaScript/TypeScript bindings for the [MDS](../../README.md) compiler.
 npm install @mdscript/mds
 ```
 
-> **Note:** This package is pre-release and not yet published to npm.
-
 ## Node.js usage (zero-config)
 
 Node.js auto-selects the native addon and falls back to WASM if unavailable.
@@ -19,13 +17,13 @@ No initialization required.
 import { compile, check, compileFile, checkFile, getBackend, isMdsError } from '@mdscript/mds';
 
 // Compile MDS source to Markdown
-const result = compile('Hello {name}', { vars: { name: 'world' } });
+const result = compile('Hello {{name}}', { vars: { name: 'world' } });
 console.log(result.output);       // "Hello world"
 console.log(result.warnings);     // string[]
 console.log(result.dependencies); // string[] of imported file paths
 
 // Validate without rendering
-const checked = check('Hello {name}', { vars: { name: 'world' } });
+const checked = check('Hello {{name}}', { vars: { name: 'world' } });
 
 // File-based operations (resolves @import directives)
 const fileResult = await compileFile('./my-template.mds');
@@ -47,7 +45,7 @@ await init();
 // or with a custom WASM URL:
 await init({ wasmUrl: '/assets/mds_bg.wasm' });
 
-const result = compile('# {title}', { vars: { title: 'Hello' } });
+const result = compile('# {{title}}', { vars: { title: 'Hello' } });
 ```
 
 > `compileFile` and `checkFile` are not available in browser environments.

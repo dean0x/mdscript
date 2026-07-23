@@ -7,7 +7,7 @@ byte-identical across all bindings.
 Example
 -------
 >>> import mdscript
->>> r = mdscript.compile("Hello {name}!", vars={"name": "Alice"})
+>>> r = mdscript.compile("Hello {{name}}!", vars={"name": "Alice"})
 >>> r.kind, r.output
 ('markdown', 'Hello Alice!')
 

@@ -51,6 +51,22 @@ impl fmt::Display for Severity {
     }
 }
 
+// ── TextEdit ──────────────────────────────────────────────────────────────────
+
+/// A replacement edit at a byte range in the source.
+///
+/// Used by the fix planner for in-place replacement edits (e.g. `{x}` → `{{x}}`).
+/// An empty `new_text` is equivalent to a pure deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextEdit {
+    /// Inclusive start byte offset of the range to replace.
+    pub start: usize,
+    /// Exclusive end byte offset of the range to replace.
+    pub end: usize,
+    /// Replacement text (empty string for pure deletion).
+    pub new_text: String,
+}
+
 // ── FixLineSpan ───────────────────────────────────────────────────────────────
 
 /// A line-range descriptor for a single lint auto-fix removal.
@@ -134,6 +150,12 @@ pub struct LintDiagnostic {
     /// span-based heuristic. The `fixable` field in the JSON wire format is
     /// `fix_removals.is_some() && tier::is_fixable(rule, is_standalone)`.
     pub fix_removals: Option<Vec<FixLineSpan>>,
+    /// In-place replacement edits for this diagnostic (alternative to `fix_removals`).
+    ///
+    /// Used for rules that need to replace text rather than remove whole lines
+    /// (e.g. `legacy-interpolation` replaces `{x}` with `{{x}}`). `None` for
+    /// rules that use `fix_removals` or have no fix.
+    pub fix_edits: Option<Vec<TextEdit>>,
 }
 
 impl fmt::Debug for LintDiagnostic {
@@ -146,6 +168,7 @@ impl fmt::Debug for LintDiagnostic {
             .field("span", &self.span)
             .field("file", &self.file)
             .field("fix_removals", &self.fix_removals.as_ref().map(|v| v.len()))
+            .field("fix_edits", &self.fix_edits.as_ref().map(|v| v.len()))
             .finish()
     }
 }
@@ -275,13 +298,27 @@ impl LintResult {
                 obj
             });
 
+            let fix_edits_json = diag.fix_edits.as_ref().map(|edits| {
+                edits
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "start": e.start,
+                            "end": e.end,
+                            "new_text": e.new_text,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+
             let d = serde_json::json!({
                 "rule": diag.rule,
                 "severity": diag.severity.to_string(),
                 "message": diag.message,
                 "help": diag.help,
-                "fixable": diag.fix_removals.is_some() && super::tier::is_fixable(&diag.rule, self.is_standalone),
+                "fixable": (diag.fix_removals.is_some() || diag.fix_edits.is_some()) && super::tier::is_fixable(&diag.rule, self.is_standalone),
                 "span": span_json,
+                "fix_edits": fix_edits_json,
             });
 
             by_file.entry(key).or_default().push(d);
@@ -446,6 +483,7 @@ mod tests {
                 span: None,
                 file: Some("f.mds".to_string()),
                 fix_removals: None,
+                fix_edits: None,
             }],
             truncated: false,
             is_standalone: false,
@@ -480,6 +518,7 @@ mod tests {
                 span: None,
                 file: None,
                 fix_removals: None,
+                fix_edits: None,
             });
             assert!(accepted, "diagnostic {i} should be accepted");
         }
@@ -492,6 +531,7 @@ mod tests {
             span: None,
             file: None,
             fix_removals: None,
+            fix_edits: None,
         });
         assert!(!rejected, "push beyond cap should return false");
 
@@ -517,6 +557,7 @@ mod tests {
                 span: None,
                 file: Some("f.mds".to_string()),
                 fix_removals: None,
+                fix_edits: None,
             });
         }
         let result = builder.build(false);
@@ -551,6 +592,7 @@ mod tests {
             span: None,
             file: None,
             fix_removals: None,
+            fix_edits: None,
         };
         let code = diag.code().unwrap().to_string();
         assert_eq!(code, "mds::lint::unused-variable");
@@ -568,6 +610,7 @@ mod tests {
             span: None,
             file: None,
             fix_removals: None,
+            fix_edits: None,
         };
         assert_eq!(warn.severity(), Some(miette::Severity::Warning));
 
@@ -579,6 +622,7 @@ mod tests {
             span: None,
             file: None,
             fix_removals: None,
+            fix_edits: None,
         };
         assert_eq!(info.severity(), Some(miette::Severity::Advice));
 
@@ -590,6 +634,7 @@ mod tests {
             span: None,
             file: None,
             fix_removals: None,
+            fix_edits: None,
         };
         assert_eq!(err.severity(), Some(miette::Severity::Error));
     }

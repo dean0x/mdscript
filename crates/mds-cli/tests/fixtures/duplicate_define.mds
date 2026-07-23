@@ -1,9 +1,9 @@
 @define greet(name):
-Hello {name}!
+Hello {{name}}!
 @end
 
 @define greet(name):
-Goodbye {name}!
+Goodbye {{name}}!
 @end
 
-{greet("Alice")}
+{{greet("Alice")}}

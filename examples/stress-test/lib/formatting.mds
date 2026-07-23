@@ -3,32 +3,32 @@ type: mds
 ---
 
 @define bold(text):
-**{text}**
+**{{text}}**
 @end
 
 @define italic(text):
-*{text}*
+*{{text}}*
 @end
 
 @define code(text):
-`{text}`
+`{{text}}`
 @end
 
 @define badge(label, value):
-**{label}**: `{value}`
+**{{label}}**: `{{value}}`
 @end
 
 @define h2(text):
-## {text}
+## {{text}}
 @end
 
 @define h3(text):
-### {text}
+### {{text}}
 @end
 
 @define table_row(cells):
 @for cell in cells:
-| {cell}
+| {{cell}}
 @end
 |
 @end

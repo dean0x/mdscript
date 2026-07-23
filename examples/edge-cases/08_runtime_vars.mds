@@ -5,7 +5,7 @@ is_development: true
 debug: false
 ---
 
-# {app_name}
+# {{app_name}}
 
 @if debug:
 ## Debug Mode Enabled

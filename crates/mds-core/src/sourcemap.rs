@@ -1769,13 +1769,14 @@ mod tests {
 
     #[test]
     fn finalize_simple_no_frontmatter_no_cr() {
-        // Source template: "Hello {name}!\n"
+        // Source template: "Hello {{name}}!\n"
         // After evaluation with name="World": raw = "Hello World!\n"
         // clean_output: same (no trailing whitespace change)
-        // Segments: Text("Hello ") at src_off=0, len=6; Interpolation at src_off=6, len=6
-        let mut b = MapBuilder::new("t.mds".to_string(), "Hello {name}!\n".to_string());
+        // Segments: Text("Hello ") at src_off=0, len=6; Interpolation at src_off=6, inner-len=4
+        // Source: "Hello {{name}}!\n" — `{{` starts at byte 6, inner `name` is 4 bytes
+        let mut b = MapBuilder::new("t.mds".to_string(), "Hello {{name}}!\n".to_string());
         b.push_segment(0, 0, 6); // "Hello " maps to src byte 0
-        b.push_segment(6, 6, 6); // "{name}" maps to src byte 6
+        b.push_segment(6, 6, 4); // {{name}}: offset=6, inner-len=4 (name is 4 chars)
 
         let body_raw = "Hello World!\n";
         let final_body = "Hello World!\n"; // no frontmatter

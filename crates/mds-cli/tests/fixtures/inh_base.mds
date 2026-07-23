@@ -1,7 +1,7 @@
 ---
 role: general
 ---
-You are a {role} assistant.
+You are a {{role}} assistant.
 
 @block instructions:
 Analyze data carefully.

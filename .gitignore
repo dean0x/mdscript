@@ -27,5 +27,8 @@ __pycache__/
 .venv/
 crates/mds-python/dist/
 
+# Local Cargo config (e.g. sccache workarounds, nextest job overrides) — never commit
+.cargo/
+
 # devflow local state — local-only, not shared via git (reverses ADR-019; see ADR-023)
 .devflow/

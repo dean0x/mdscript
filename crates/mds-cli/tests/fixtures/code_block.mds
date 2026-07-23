@@ -2,11 +2,11 @@
 name: Alice
 ---
 
-Hello {name}!
+Hello {{name}}!
 
 ```python
 x = {not_a_var}
 print(f"hello {world}")
 ```
 
-Goodbye {name}!
+Goodbye {{name}}!

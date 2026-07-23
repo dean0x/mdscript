@@ -10,14 +10,14 @@ tone: professional
 
 @import "./rules.mds" as rules
 
-# {agent_name}
+# {{agent_name}}
 
-You are **{agent_name}**, a {role} who specializes in:
+You are **{{agent_name}}**, a {{tone}} {{role}} who specializes in:
 
 @for spec in specialties:
-- {spec}
+- {{spec}}
 @end
 
-{rules.coding_standards()}
+{{rules.coding_standards()}}
 
-{rules.response_format()}
+{{rules.response_format()}}

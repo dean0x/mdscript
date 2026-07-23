@@ -134,7 +134,7 @@ describe('browser entry — post-init', () => {
 
   test('U-BR9: compile throws MdsError on syntax error after init()', () => {
     assert.throws(
-      () => compile('Hello {unclosed\n'),
+      () => compile('Hello {{unclosed\n'),
       (err) => {
         assert.ok(isMdsError(err), `expected MdsError, got: ${String(err)}`);
         assert.ok(typeof err.code === 'string', 'MdsError must have a string code');

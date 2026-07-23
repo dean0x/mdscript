@@ -1,5 +1,5 @@
 @define greet(name):
-Hello from A, {name}!
+Hello from A, {{name}}!
 @end
 
 @export greet

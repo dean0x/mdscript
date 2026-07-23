@@ -94,7 +94,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
 
   test('T-HMR-a (AC-F1): edit entry .mds → fresh bundle with new marker', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A',
     });
     const { watcher, getCode } = await startWatcher(paths['entry.mds']);
 
@@ -104,7 +104,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
       assert.ok(codeA.includes('MARKER_A'), 'initial build contains MARKER_A');
 
       // Edit entry → MARKER_B
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       await waitForMarker(getCode, 'MARKER_B');
 
       const codeB = await getCode();
@@ -119,8 +119,8 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
   test('T-HMR-b (AC-F2): edit transitive @import dep → fresh bundle', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
       // ADR-014: dep BEFORE entry
-      'dep.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-      'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+      'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+      'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
     });
     const { watcher, getCode } = await startWatcher(paths['entry.mds']);
 
@@ -128,7 +128,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
       await waitForMarker(getCode, 'MARKER_A', 10_000);
 
       // Edit the dep file
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! MARKER_B\n@end\n\n@export greet');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! MARKER_B\n@end\n\n@export greet');
       await waitForMarker(getCode, 'MARKER_B');
 
       const code = await getCode();
@@ -141,7 +141,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
 
   test('T-HMR-c (AC-F3): inject compile error → Rollup surfaces ERROR event, watcher stays alive', async (t) => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A',
     });
 
     const watcher = watch({
@@ -173,7 +173,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
       assert.ok(lastGoodCode.includes('MARKER_A'), 'initial build ok');
 
       // Inject a compile error
-      editFile(paths['entry.mds'], '{undefined_var_xyz_bad_syntax!!!}');
+      editFile(paths['entry.mds'], '{{undefined_var_xyz_bad_syntax!!!}}');
       await waitFor(() => errors.length >= 1, { timeoutMs: 10_000, label: 'ERROR event received' });
 
       assert.ok(errors[0] instanceof Error, 'error is an Error instance');
@@ -183,7 +183,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
 
       // isAlive(): watcher emits further events after error
       const bundleCountBeforeRecovery = bundleCount;
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_FIXED');
       await waitFor(
         () => bundleCount > bundleCountBeforeRecovery,
         { timeoutMs: 10_000, label: 'recovery build after error' },
@@ -204,7 +204,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
 
   test('T-HMR-d (AC-F4): fix compile error → fresh bundle, error cleared', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '{undefined_var_xyz_bad_syntax!!!}',
+      'entry.mds': '{{undefined_var_xyz_bad_syntax!!!}}',
     });
 
     const watcher = watch({
@@ -233,7 +233,7 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
       await waitFor(() => errors.length >= 1, { timeoutMs: 15_000, label: 'initial ERROR' });
 
       // Fix the file
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_FIXED');
       await waitFor(() => lastGoodCode !== null && lastGoodCode.includes('MARKER_FIXED'),
         { timeoutMs: 10_000, label: 'MARKER_FIXED in bundle' });
 
@@ -247,8 +247,8 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
   test('T-HMR-e (AC-F5): add a second @import dep, edit it → recompile', async () => {
     // ADR-014: dep files BEFORE entry
     const { dir, paths, cleanup } = createTempMdsProject({
-      'dep1.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-      'entry.mds': '@import { greet } from "./dep1.mds"\n\n{greet("World")}',
+      'dep1.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+      'entry.mds': '@import { greet } from "./dep1.mds"\n\n{{greet("World")}}',
     });
 
     const watcher = watch({
@@ -274,16 +274,16 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
       // Add a second dep and update entry to import it
       // (dep2 must exist before we reference it in entry)
       const dep2Path = join(dir, 'dep2.mds');
-      editFile(dep2Path, '@define farewell(who):\nBye {who}! MARKER_B\n@end\n\n@export farewell');
+      editFile(dep2Path, '@define farewell(who):\nBye {{who}}! MARKER_B\n@end\n\n@export farewell');
       editFile(paths['entry.mds'],
-        '@import { greet } from "./dep1.mds"\n@import { farewell } from "./dep2.mds"\n\n{greet("World")} {farewell("World")}');
+        '@import { greet } from "./dep1.mds"\n@import { farewell } from "./dep2.mds"\n\n{{greet("World")}} {{farewell("World")}}');
 
       await waitFor(() => lastCode != null && lastCode.includes('MARKER_B'),
         { timeoutMs: 10_000, label: 'MARKER_B after dep2 import' });
       assert.ok(lastCode.includes('MARKER_B'), 'second dep content in bundle');
 
       // Now edit dep2 → MARKER_C
-      editFile(dep2Path, '@define farewell(who):\nBye {who}! MARKER_C\n@end\n\n@export farewell');
+      editFile(dep2Path, '@define farewell(who):\nBye {{who}}! MARKER_C\n@end\n\n@export farewell');
       await waitFor(() => lastCode != null && lastCode.includes('MARKER_C'),
         { timeoutMs: 10_000, label: 'MARKER_C after dep2 edit' });
       assert.ok(lastCode.includes('MARKER_C'), 'dep2 edit triggers recompile');
@@ -295,13 +295,13 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
 
   test('T-P1 (AC-P1): edit → fresh bundle within 10s performance budget', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A',
     });
     const { watcher, getCode } = await startWatcher(paths['entry.mds']);
 
     try {
       const startMs = Date.now();
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       await waitForMarker(getCode, 'MARKER_B', 10_000);
       const elapsedMs = Date.now() - startMs;
 
@@ -318,14 +318,14 @@ describe('rollup-plugin watch e2e — Suite 1 (real watcher)', { skip: !HMR_ENAB
   test('T-P2 (AC-P2): 20-iteration bounded edit loop — no degradation, watcher alive', async () => {
     const N = 20;
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '---\nname: World\n---\n\nHello {name}! ITERATION_0',
+      'entry.mds': '---\nname: World\n---\n\nHello {{name}}! ITERATION_0',
     });
     const { watcher, getCode } = await startWatcher(paths['entry.mds']);
 
     try {
       for (let i = 1; i <= N; i++) {
         const marker = `ITERATION_${i}`;
-        editFile(paths['entry.mds'], `---\nname: World\n---\n\nHello {name}! ${marker}`);
+        editFile(paths['entry.mds'], `---\nname: World\n---\n\nHello {{name}}! ${marker}`);
         await waitForMarker(getCode, marker, 10_000);
       }
 
@@ -346,8 +346,8 @@ describe('rollup-plugin watch e2e — Suite 3 edge cases', { skip: !HMR_ENABLED 
 
   test('T-E-del (AC-E1): delete @imported dep → error surfaced; recreate → recovers', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'dep.mds': '@define greet(who):\nHi {who}! DEP_MARKER\n@end\n\n@export greet',
-      'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+      'dep.mds': '@define greet(who):\nHi {{who}}! DEP_MARKER\n@end\n\n@export greet',
+      'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
     });
 
     const watcher = watch({
@@ -381,15 +381,15 @@ describe('rollup-plugin watch e2e — Suite 3 edge cases', { skip: !HMR_ENABLED 
 
       // Touch the entry to force a rebuild attempt (some watchers may not notice
       // the dep deletion without a re-run of the entry)
-      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{greet("World")} AFTER_DEL');
+      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{{greet("World")}} AFTER_DEL');
 
       // Rollup will emit ERROR when the dep is missing
       await waitFor(() => errors.length >= 1, { timeoutMs: 10_000, label: 'ERROR after dep deletion' });
       assert.ok(errors[0] instanceof Error, 'error surfaced after dep deletion');
 
       // Recreate the dep
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! DEP_RECREATED\n@end\n\n@export greet');
-      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{greet("World")}');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! DEP_RECREATED\n@end\n\n@export greet');
+      editFile(paths['entry.mds'], '@import { greet } from "./dep.mds"\n\n{{greet("World")}}');
 
       await waitFor(() => lastGoodCode !== null && lastGoodCode.includes('DEP_RECREATED'),
         { timeoutMs: 10_000, label: 'DEP_RECREATED after dep restore' });
@@ -402,7 +402,7 @@ describe('rollup-plugin watch e2e — Suite 3 edge cases', { skip: !HMR_ENABLED 
 
   test('T-E-create (AC-E1): entry @imports not-yet-created dep → error; create dep → recovers', async () => {
     const { dir, paths, cleanup } = createTempMdsProject({
-      'entry.mds': '@import { greet } from "./missing.mds"\n\n{greet("World")}',
+      'entry.mds': '@import { greet } from "./missing.mds"\n\n{{greet("World")}}',
     });
 
     const watcher = watch({
@@ -432,8 +432,8 @@ describe('rollup-plugin watch e2e — Suite 3 edge cases', { skip: !HMR_ENABLED 
       assert.ok(errors[0] instanceof Error, 'error when dep is missing');
 
       // Create the missing dep and re-touch entry
-      editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {who}! CREATED_MARKER\n@end\n\n@export greet');
-      editFile(paths['entry.mds'], '@import { greet } from "./missing.mds"\n\n{greet("World")}');
+      editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {{who}}! CREATED_MARKER\n@end\n\n@export greet');
+      editFile(paths['entry.mds'], '@import { greet } from "./missing.mds"\n\n{{greet("World")}}');
 
       await waitFor(() => lastGoodCode !== null && lastGoodCode.includes('CREATED_MARKER'),
         { timeoutMs: 10_000, label: 'CREATED_MARKER after dep creation' });
@@ -480,7 +480,7 @@ describe('rollup-plugin watch e2e — Suite 3 edge cases', { skip: !HMR_ENABLED 
       await waitFor(() => events.length >= 1, { timeoutMs: 15_000, label: 'initial build for .md file' });
 
       // Add type:mds frontmatter
-      editFile(paths['entry.md'], '---\ntype: mds\nname: World\n---\n\nHello {name}! MD_FLIP_MARKER');
+      editFile(paths['entry.md'], '---\ntype: mds\nname: World\n---\n\nHello {{name}}! MD_FLIP_MARKER');
 
       await waitFor(
         () => events.some(e => e.type === 'bundle' && e.code?.includes('MD_FLIP_MARKER')),
@@ -499,7 +499,7 @@ describe('rollup-plugin watch e2e — Suite 3 edge cases', { skip: !HMR_ENABLED 
     // The watcher must stay alive and not enter an infinite rebuild loop.
     const { dir, paths, cleanup } = createTempMdsProject({
       // Entry tries to import from itself (simplest cycle)
-      'entry.mds': '@import { thing } from "./entry.mds"\n\n{thing}',
+      'entry.mds': '@import { thing } from "./entry.mds"\n\n{{thing}}',
     });
 
     const watcher = watch({

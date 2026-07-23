@@ -9,10 +9,10 @@ imports:
   - path: ../lib/personas.mds
 ---
 
-# {fmt.bold(topic)}
+# {{fmt.bold(topic)}}
 
-{fmt.badge("Feature", "frontmatter-imports")}
+{{fmt.badge("Feature", "frontmatter-imports")}}
 
-{safety_rules()}
+{{safety_rules()}}
 
-{teacher("MDS")}
+{{teacher("MDS")}}

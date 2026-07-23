@@ -1,9 +1,9 @@
 @define wrap(text):
-[{text}]
+[{{text}}]
 @end
 
 @define greet(name):
-{wrap(name)}
+{{wrap(name)}}
 @end
 
-{greet("Alice")}
+{{greet("Alice")}}

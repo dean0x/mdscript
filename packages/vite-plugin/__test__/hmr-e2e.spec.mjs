@@ -136,7 +136,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
 
   test('T-HMR-a (AC-F1): edit entry .mds → fresh transformRequest with new marker', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A' },
+      { 'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A' },
     );
     const server = await createViteServer(dir);
 
@@ -146,7 +146,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       assert.ok(codeA?.code?.includes('MARKER_A'), 'initial transform contains MARKER_A');
 
       // Edit → fresh
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       const codeB = await transformFresh(server, '/entry.mds');
       assert.ok(codeB.includes('MARKER_B'), 'fresh transform contains MARKER_B');
       assert.ok(!codeB.includes('MARKER_A'), 'MARKER_A gone after edit');
@@ -159,7 +159,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
   test('T-HMR-a (reload): watcher change event → server.ws.send full-reload', async () => {
     // Tests the HMR signal path: watcher detects change → handleHotUpdate → ws.send
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A' },
+      { 'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A' },
     );
     const server = await createViteServer(dir);
     const { reloads, restore } = spyOnWsSend(server);
@@ -169,7 +169,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       await server.transformRequest('/entry.mds');
 
       // Edit the file and emit a watcher change event
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       server.watcher.emit('change', paths['entry.mds']);
 
       await waitFor(() => reloads.some(r => r.type === 'full-reload'),
@@ -190,8 +190,8 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
     const { dir, paths, cleanup } = createTempMdsProject(
       {
         // ADR-014: dep BEFORE entry
-        'dep.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-        'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+        'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+        'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
       },
     );
     const server = await createViteServer(dir);
@@ -200,7 +200,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       const codeA = await server.transformRequest('/entry.mds');
       assert.ok(codeA?.code?.includes('MARKER_A'), 'initial MARKER_A in entry transform');
 
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! MARKER_B\n@end\n\n@export greet');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! MARKER_B\n@end\n\n@export greet');
       const codeB = await transformFresh(server, '/entry.mds');
       assert.ok(codeB.includes('MARKER_B'), 'dep edit propagates to entry transform');
     } finally {
@@ -212,8 +212,8 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
   test('T-HMR-b (dep reload): dep change → full-reload signal via handleHotUpdate', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
       {
-        'dep.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-        'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+        'dep.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+        'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
       },
     );
     const server = await createViteServer(dir);
@@ -224,7 +224,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       await server.transformRequest('/entry.mds');
 
       // Emit change for the dep file
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! MARKER_B\n@end\n\n@export greet');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! MARKER_B\n@end\n\n@export greet');
       server.watcher.emit('change', paths['dep.mds']);
 
       await waitFor(() => reloads.some(r => r.type === 'full-reload'),
@@ -239,7 +239,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
 
   test('T-HMR-c (AC-F3): inject compile error → Vite throws, server stays alive', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A' },
+      { 'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A' },
     );
     const server = await createViteServer(dir);
 
@@ -249,7 +249,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       assert.ok(codeA?.code?.includes('MARKER_A'), 'initial MARKER_A');
 
       // Inject compile error
-      editFile(paths['entry.mds'], '{undefined_var_xyz_bad_syntax!!!}');
+      editFile(paths['entry.mds'], '{{undefined_var_xyz_bad_syntax!!!}}');
       let transformError = null;
       try {
         await transformFresh(server, '/entry.mds');
@@ -259,7 +259,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       assert.ok(transformError instanceof Error, 'compile error surfaced as thrown Error');
 
       // isAlive(): server can still transform other/fixed files
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_FIXED');
       const codeFixed = await transformFresh(server, '/entry.mds');
       assert.ok(codeFixed.includes('MARKER_FIXED'), 'server alive after error: fixed file transforms');
     } finally {
@@ -270,7 +270,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
 
   test('T-HMR-d (AC-F4): fix compile error → fresh transform, no error', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '{undefined_var_xyz_bad_syntax!!!}' },
+      { 'entry.mds': '{{undefined_var_xyz_bad_syntax!!!}}' },
     );
     const server = await createViteServer(dir);
 
@@ -285,7 +285,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       assert.ok(initialError instanceof Error, 'initial transform throws for bad syntax');
 
       // Fix the file
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_FIXED');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_FIXED');
       const codeFixed = await transformFresh(server, '/entry.mds');
       assert.ok(codeFixed.includes('MARKER_FIXED'), 'fixed file transforms successfully');
     } finally {
@@ -297,8 +297,8 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
   test('T-HMR-e (AC-F5): add a second @import dep, edit it → recompile', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
       {
-        'dep1.mds': '@define greet(who):\nHi {who}! MARKER_A\n@end\n\n@export greet',
-        'entry.mds': '@import { greet } from "./dep1.mds"\n\n{greet("World")}',
+        'dep1.mds': '@define greet(who):\nHi {{who}}! MARKER_A\n@end\n\n@export greet',
+        'entry.mds': '@import { greet } from "./dep1.mds"\n\n{{greet("World")}}',
       },
     );
     const server = await createViteServer(dir);
@@ -309,15 +309,15 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
 
       // Add dep2
       const dep2Path = join(dir, 'dep2.mds');
-      editFile(dep2Path, '@define farewell(who):\nBye {who}! MARKER_B\n@end\n\n@export farewell');
+      editFile(dep2Path, '@define farewell(who):\nBye {{who}}! MARKER_B\n@end\n\n@export farewell');
       editFile(paths['entry.mds'],
-        '@import { greet } from "./dep1.mds"\n@import { farewell } from "./dep2.mds"\n\n{greet("World")} {farewell("World")}');
+        '@import { greet } from "./dep1.mds"\n@import { farewell } from "./dep2.mds"\n\n{{greet("World")}} {{farewell("World")}}');
 
       const codeB = await transformFresh(server, '/entry.mds');
       assert.ok(codeB.includes('MARKER_B'), 'dep2 content in fresh transform');
 
       // Edit dep2
-      editFile(dep2Path, '@define farewell(who):\nBye {who}! MARKER_C\n@end\n\n@export farewell');
+      editFile(dep2Path, '@define farewell(who):\nBye {{who}}! MARKER_C\n@end\n\n@export farewell');
       const codeC = await transformFresh(server, '/entry.mds');
       assert.ok(codeC.includes('MARKER_C'), 'dep2 edit propagates to entry transform');
     } finally {
@@ -328,7 +328,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
 
   test('T-P1 (AC-P1): edit → fresh transform within 10s performance budget', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '---\nname: World\n---\n\nHello {name}! MARKER_A' },
+      { 'entry.mds': '---\nname: World\n---\n\nHello {{name}}! MARKER_A' },
     );
     const server = await createViteServer(dir);
 
@@ -336,7 +336,7 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
       await server.transformRequest('/entry.mds');
 
       const startMs = Date.now();
-      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {name}! MARKER_B');
+      editFile(paths['entry.mds'], '---\nname: World\n---\n\nHello {{name}}! MARKER_B');
       const codeB = await transformFresh(server, '/entry.mds');
       const elapsedMs = Date.now() - startMs;
 
@@ -354,14 +354,14 @@ describe('vite-plugin HMR e2e — Suite 1 (real server)', { skip: !HMR_ENABLED &
   test('T-P2 (AC-P2): 20-iteration bounded edit loop — no degradation, server alive', async () => {
     const N = 20;
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '---\nname: World\n---\n\nHello {name}! ITERATION_0' },
+      { 'entry.mds': '---\nname: World\n---\n\nHello {{name}}! ITERATION_0' },
     );
     const server = await createViteServer(dir);
 
     try {
       for (let i = 1; i <= N; i++) {
         const marker = `ITERATION_${i}`;
-        editFile(paths['entry.mds'], `---\nname: World\n---\n\nHello {name}! ${marker}`);
+        editFile(paths['entry.mds'], `---\nname: World\n---\n\nHello {{name}}! ${marker}`);
         const code = await transformFresh(server, '/entry.mds');
         assert.ok(code.includes(marker), `Iteration ${i}: fresh transform has ${marker}`);
       }
@@ -381,8 +381,8 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
   test('T-E-del (AC-E1): delete @imported dep → transform errors; recreate → recovers', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
       {
-        'dep.mds': '@define greet(who):\nHi {who}! DEP_MARKER\n@end\n\n@export greet',
-        'entry.mds': '@import { greet } from "./dep.mds"\n\n{greet("World")}',
+        'dep.mds': '@define greet(who):\nHi {{who}}! DEP_MARKER\n@end\n\n@export greet',
+        'entry.mds': '@import { greet } from "./dep.mds"\n\n{{greet("World")}}',
       },
     );
     const server = await createViteServer(dir);
@@ -402,7 +402,7 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
       assert.ok(deleteError instanceof Error, 'transform errors after dep deleted');
 
       // Recreate dep and re-transform
-      editFile(paths['dep.mds'], '@define greet(who):\nHi {who}! DEP_RECREATED\n@end\n\n@export greet');
+      editFile(paths['dep.mds'], '@define greet(who):\nHi {{who}}! DEP_RECREATED\n@end\n\n@export greet');
       const codeFixed = await transformFresh(server, '/entry.mds');
       assert.ok(codeFixed.includes('DEP_RECREATED'), 'recovered after dep recreated');
     } finally {
@@ -413,7 +413,7 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
 
   test('T-E-create (AC-E1): entry @imports not-yet-created dep → error; create dep → recovers', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '@import { greet } from "./missing.mds"\n\n{greet("World")}' },
+      { 'entry.mds': '@import { greet } from "./missing.mds"\n\n{{greet("World")}}' },
     );
     const server = await createViteServer(dir);
 
@@ -427,7 +427,7 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
       assert.ok(initialError instanceof Error, 'transform errors when dep is missing');
 
       // Create the missing dep and re-transform
-      editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {who}! CREATED_MARKER\n@end\n\n@export greet');
+      editFile(join(dir, 'missing.mds'), '@define greet(who):\nHi {{who}}! CREATED_MARKER\n@end\n\n@export greet');
       const codeFixed = await transformFresh(server, '/entry.mds');
       assert.ok(codeFixed.includes('CREATED_MARKER'), 'recovered after dep created');
     } finally {
@@ -455,7 +455,7 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
       await server.transformRequest('/doc.md');
 
       // Add type:mds frontmatter
-      editFile(paths['doc.md'], '---\ntype: mds\nname: World\n---\n\nHello {name}! MD_FLIP_MARKER');
+      editFile(paths['doc.md'], '---\ntype: mds\nname: World\n---\n\nHello {{name}}! MD_FLIP_MARKER');
       const codeB = await transformFresh(server, '/doc.md');
       assert.ok(
         codeB.includes('MD_FLIP_MARKER'),
@@ -469,7 +469,7 @@ describe('vite-plugin HMR e2e — Suite 3 edge cases', { skip: !HMR_ENABLED && '
 
   test('T-E-cycle: circular @import → transform errors, server stays alive', async () => {
     const { dir, paths, cleanup } = createTempMdsProject(
-      { 'entry.mds': '@import { thing } from "./entry.mds"\n\n{thing}' },
+      { 'entry.mds': '@import { thing } from "./entry.mds"\n\n{{thing}}' },
     );
     const server = await createViteServer(dir);
 

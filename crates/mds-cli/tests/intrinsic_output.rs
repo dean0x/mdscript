@@ -504,7 +504,7 @@ fn symlinked_vars_file_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
 
     let entry = dir.path().join("chat.mds");
-    std::fs::write(&entry, "@message user:\n{greeting}\n@end\n").unwrap();
+    std::fs::write(&entry, "@message user:\n{{greeting}}\n@end\n").unwrap();
 
     let real_vars = dir.path().join("real_vars.json");
     std::fs::write(&real_vars, r#"{"greeting": "Hello!"}"#).unwrap();
@@ -575,7 +575,7 @@ fn dynamic_role_special_chars_round_trip() {
     std::fs::write(&vars_file, r#"{"role": "ad\"min\nuser"}"#).unwrap();
 
     let entry = dir.path().join("chat.mds");
-    std::fs::write(&entry, "@message {role}:\nRequest received.\n@end\n").unwrap();
+    std::fs::write(&entry, "@message {{role}}:\nRequest received.\n@end\n").unwrap();
 
     let output = mds_bin()
         .args([

@@ -6,10 +6,10 @@ roles:
 deprecated_flag: false
 audit: true
 ---
-Primary role: {role}
+Primary role: {{role}}
 
 @for role in roles:
-- {role}
+- {{role}}
 @end
 
 @if audit:

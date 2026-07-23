@@ -1,9 +1,9 @@
 @define section(title):
-## {title}
+## {{title}}
 @end
 
 @define rule(text):
-- {text}
+- {{text}}
 @end
 
 @define separator():

@@ -3,7 +3,7 @@ type: mds
 ---
 
 @define greet(name):
-Hello {name}!
+Hello {{name}}!
 @end
 
 @export greet

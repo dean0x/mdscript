@@ -3,7 +3,7 @@ role: assistant
 ---
 @block system_msg:
 @message system:
-You are a {role}.
+You are a {{role}}.
 @end
 @end
 

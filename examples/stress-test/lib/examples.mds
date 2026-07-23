@@ -3,11 +3,11 @@ type: mds
 ---
 
 @define few_shot(task, examples):
-## Few-Shot Examples for: {task}
+## Few-Shot Examples for: {{task}}
 
 @for ex in examples:
-**Input**: {ex.input}
-**Output**: {ex.output}
+**Input**: {{ex.input}}
+**Output**: {{ex.output}}
 
 @end
 Now apply the same pattern to the user's request.

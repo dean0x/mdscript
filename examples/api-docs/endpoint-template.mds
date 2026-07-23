@@ -59,22 +59,22 @@ rate_limit:
 @import "../prompt-library/formatting.mds" as fmt
 @import "./response-schemas.mds" as schemas
 
-# {api_name}
+# {{api_name}}
 
-Base URL: `{base_url}`
+Base URL: `{{base_url}}`
 
-Authentication: **{auth_type}**
+Authentication: **{{auth_type}}**
 
-Rate Limit: {rate_limit.requests_per_minute} req/min (burst: {rate_limit.burst})
+Rate Limit: {{rate_limit.requests_per_minute}} req/min (burst: {{rate_limit.burst}})
 
-{fmt.separator()}
+{{fmt.separator()}}
 
 ## Endpoints
 
 @for endpoint in endpoints:
-### {endpoint.method} `{endpoint.path}`
+### {{endpoint.method}} `{{endpoint.path}}`
 
-{endpoint.description}
+{{endpoint.description}}
 
 @if endpoint.params:
 #### Parameters
@@ -82,17 +82,17 @@ Rate Limit: {rate_limit.requests_per_minute} req/min (burst: {rate_limit.burst})
 | Name | Type | Required | Default |
 |------|------|----------|---------|
 @for param in endpoint.params:
-| `{param.name}` | {param.type} | {param.required} | {param.default} |
+| `{{param.name}}` | {{param.type}} | {{param.required}} | {{param.default}} |
 @end
 @end
 
-**Response**: `{endpoint.response_code}`
+**Response**: `{{endpoint.response_code}}`
 
-{fmt.separator()}
+{{fmt.separator()}}
 
 @end
 
-{schemas.error_format()}
+{{schemas.error_format()}}
 
 ## Authentication
 

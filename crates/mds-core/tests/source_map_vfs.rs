@@ -78,7 +78,7 @@ fn source_map_basic_single_file() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
 
     let result = vfs_with_map(modules, "main.mds");
@@ -115,7 +115,7 @@ fn source_map_absent_when_disabled() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
 
     let result = vfs_no_map(modules, "main.mds");
@@ -144,7 +144,7 @@ fn source_map_disabled_zero_cost_observable() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
 
     let result = vfs_no_map(modules.clone(), "main.mds");
@@ -235,7 +235,7 @@ fn to_canonical_json_includes_source_map_key_when_present() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "---\nname: World\n---\nHello {name}!\n".to_string(),
+        "---\nname: World\n---\nHello {{name}}!\n".to_string(),
     );
 
     // With source map
@@ -326,7 +326,7 @@ fn source_map_function_call_suppression() {
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
-        "@define greet(x):\nHello {x}!\n@end\n\n{greet(\"World\")}\n".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n\n{{greet(\"World\")}}\n".to_string(),
     );
 
     let result = vfs_with_map(modules, "main.mds");
@@ -342,7 +342,7 @@ fn source_map_function_call_suppression() {
 /// sourcesContent is populated with template source text.
 #[test]
 fn source_map_sources_content_populated() {
-    let source_text = "---\nname: World\n---\nHello {name}!\n";
+    let source_text = "---\nname: World\n---\nHello {{name}}!\n";
     let mut modules = HashMap::new();
     modules.insert("main.mds".to_string(), source_text.to_string());
 
@@ -689,11 +689,11 @@ fn source_map_s8_cross_file_function_attribution() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(who):\nHello {who}!\n@end\n".to_string(),
+        "@define greet(who):\nHello {{who}}!\n@end\n".to_string(),
     );
     modules.insert(
         "entry.mds".to_string(),
-        "@import \"./lib.mds\" as lib\n{lib.greet(\"World\")}\n".to_string(),
+        "@import \"./lib.mds\" as lib\n{{lib.greet(\"World\")}}\n".to_string(),
     );
 
     let result = vfs_with_map(modules.clone(), "entry.mds");
@@ -763,22 +763,22 @@ fn source_map_s8_nested_trim_composition() {
     // h produces content with extra surrounding whitespace.
     modules.insert(
         "h.mds".to_string(),
-        "@define h(x):\n   inner {x}   \n@end\n".to_string(),
+        "@define h(x):\n   inner {{x}}   \n@end\n".to_string(),
     );
     // g calls h, adding its own wrapper whitespace.
     modules.insert(
         "g.mds".to_string(),
-        "@import \"./h.mds\" as hm\n@define g(x):\n  {hm.h(x)}  \n@end\n".to_string(),
+        "@import \"./h.mds\" as hm\n@define g(x):\n  {{hm.h(x)}}  \n@end\n".to_string(),
     );
     // f calls g.
     modules.insert(
         "f.mds".to_string(),
-        "@import \"./g.mds\" as gm\n@define f(x):\n{gm.g(x)}\n@end\n".to_string(),
+        "@import \"./g.mds\" as gm\n@define f(x):\n{{gm.g(x)}}\n@end\n".to_string(),
     );
     // entry calls f.
     modules.insert(
         "entry.mds".to_string(),
-        "@import \"./f.mds\" as fm\nResult: {fm.f(\"test\")}\n".to_string(),
+        "@import \"./f.mds\" as fm\nResult: {{fm.f(\"test\")}}\n".to_string(),
     );
 
     let result = vfs_with_map(modules, "entry.mds");
@@ -934,7 +934,7 @@ fn source_map_segment_cap_degrades_to_none() {
     // 100 000 iters × 11 = 1 100 000 > MAX_SOURCEMAP_SEGMENTS (1 000 000).
     modules.insert(
         "big.mds".to_string(),
-        "@for item in items:\nA{item}B{item}C{item}D{item}E{item}F\n@end\n".to_string(),
+        "@for item in items:\nA{{item}}B{{item}}C{{item}}D{{item}}E{{item}}F\n@end\n".to_string(),
     );
 
     let result = mds::compile_virtual_with_deps_opts(
@@ -986,7 +986,7 @@ fn source_map_multibyte_line_vlq_alphabet() {
     // multi-byte codepoints (AC-PERF-04).
     let long_cjk_line = "你好世界".repeat(100); // 400 CJK chars = 1200 bytes
                                                 // Embed as a frontmatter value so the template renders a long CJK string.
-    let source_with_fm = format!("---\nval: \"{long_cjk_line}\"\n---\n{{val}}\n");
+    let source_with_fm = format!("---\nval: \"{long_cjk_line}\"\n---\n{{{{val}}}}\n");
     modules.insert("cjk.mds".to_string(), source_with_fm);
 
     let result = vfs_with_map(modules, "cjk.mds");
@@ -1018,11 +1018,11 @@ fn source_map_s8_output_unchanged() {
     let mut modules = HashMap::new();
     modules.insert(
         "lib.mds".to_string(),
-        "@define greet(who):\nHello {who}!\n@end\n".to_string(),
+        "@define greet(who):\nHello {{who}}!\n@end\n".to_string(),
     );
     modules.insert(
         "entry.mds".to_string(),
-        "@import \"./lib.mds\" as lib\n{lib.greet(\"World\")}\n".to_string(),
+        "@import \"./lib.mds\" as lib\n{{lib.greet(\"World\")}}\n".to_string(),
     );
 
     let with_map = vfs_with_map(modules.clone(), "entry.mds")
@@ -1124,10 +1124,10 @@ fn for_max_total_iterations_across_extends_regions_source_map() {
         "child.mds".to_string(),
         "---\nextends: base.mds\n---\n\
          @block loop1:\n\
-         @for o in outer:\n@for i in inner:\n{o}{i}\n@end\n@end\n\
+         @for o in outer:\n@for i in inner:\n{{o}}{{i}}\n@end\n@end\n\
          @end\n\
          @block loop2:\n\
-         @for o in outer:\n@for i in inner:\n{o}{i}\n@end\n@end\n\
+         @for o in outer:\n@for i in inner:\n{{o}}{{i}}\n@end\n@end\n\
          @end\n"
             .to_string(),
     );
@@ -1203,7 +1203,7 @@ fn d1_s8_locally_defined_function_no_source_sentinel() {
     // After the fix both MapBuilder::new and source_index canonicalize it to
     // "input.mds", so sources must be exactly ["input.mds"] — no duplicates.
     let result = mds::compile_str_with_deps_opts(
-        "@define greet():\nHello!\n@end\n{greet()}\n",
+        "@define greet():\nHello!\n@end\n{{greet()}}\n",
         None,
         None,
         CompileOptions {

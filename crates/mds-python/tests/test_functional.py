@@ -29,14 +29,14 @@ def test_f2_messages_result_shape() -> None:
 
 
 def test_f3_runtime_vars_override_frontmatter() -> None:
-    src = "---\nname: Alice\n---\nHello {name}!\n"
+    src = "---\nname: Alice\n---\nHello {{name}}!\n"
     assert "Alice" in m.compile(src).output  # type: ignore[operator]
     r = m.compile(src, vars={"name": "Override"})
     assert "Hello Override!" in (r.output or "")
 
 
 def test_f4_base_path_import(fixtures: pathlib.Path) -> None:
-    src = '@import { greet } from "./import_provider.mds"\n\n{greet("Test")}\n'
+    src = '@import { greet } from "./import_provider.mds"\n\n{{greet("Test")}}\n'
     r = m.compile(src, base_path=fixtures)
     assert r.kind == "markdown"
     assert "Hello Test!" in (r.output or "")
@@ -109,7 +109,7 @@ def test_f5_compile_file_bare_name_from_cwd(
 
 
 def test_f6_check_source() -> None:
-    assert m.check("Hello {n}!\n", vars={"n": "x"}).warnings == []
+    assert m.check("Hello {{n}}!\n", vars={"n": "x"}).warnings == []
 
 
 def test_f6_check_empty_base_path_is_invalid_options() -> None:
@@ -128,8 +128,8 @@ def test_f7_check_file(fixtures: pathlib.Path) -> None:
 # ── compile_virtual / check_virtual (F8, F9) ────────────────────────────────────
 
 VIRTUAL = {
-    "main.mds": '@import { g } from "./lib.mds"\n{g("V")}\n',
-    "lib.mds": "@define g(x):\nHi {x}!\n@end\n@export g\n",
+    "main.mds": '@import { g } from "./lib.mds"\n{{g("V")}}\n',
+    "lib.mds": "@define g(x):\nHi {{x}}!\n@end\n@export g\n",
 }
 
 
@@ -150,14 +150,14 @@ def test_f9_check_virtual_returns_warnings() -> None:
     # the warning via `.warnings` (not raise, not swallow it).
     mods = {
         "main.mds": '@import "./lib.mds" as provider\n@include provider\n',
-        "lib.mds": "@define g(x):\nHi {x}!\n@end\n@export g\n",
+        "lib.mds": "@define g(x):\nHi {{x}}!\n@end\n@export g\n",
     }
     r = m.check_virtual(mods, "main.mds")
     assert any("empty output" in w for w in r.warnings), r.warnings
 
 
 def test_f8_compile_virtual_messages() -> None:
-    mods = {"m.mds": "@message user:\nHi {who}\n@end\n"}
+    mods = {"m.mds": "@message user:\nHi {{who}}\n@end\n"}
     r = m.compile_virtual(mods, "m.mds", vars={"who": "there"})
     assert r.kind == "messages"
     assert (r.messages or [])[0].content.strip() == "Hi there"
@@ -200,7 +200,7 @@ def test_f11_warnings_surfaced_not_printed(
     # this is cross-platform (no OS path resolution involved).
     mods = {
         "main.mds": '@import "./lib.mds" as provider\n@include provider\n',
-        "lib.mds": "@define g(x):\nHi {x}!\n@end\n@export g\n",
+        "lib.mds": "@define g(x):\nHi {{x}}!\n@end\n@export g\n",
     }
     r = m.compile_virtual(mods, "main.mds")
     captured = capfd.readouterr()

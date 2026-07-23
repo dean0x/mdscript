@@ -8,14 +8,14 @@ premium: true
 
 @define list(items):
 @for item in items:
-- {item}
+- {{item}}
 @end
 @end
 
-Hello {name}!
+Hello {{name}}!
 
 Your items:
-{list(items)}
+{{list(items)}}
 
 @if premium:
 Thanks for being premium!

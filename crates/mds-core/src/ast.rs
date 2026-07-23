@@ -68,9 +68,9 @@ pub struct Frontmatter {
 pub enum Node {
     /// Raw text content (may contain interpolation markers).
     Text(TextNode),
-    /// Variable or function call interpolation: `{name}` or `{greet("x")}`.
+    /// Variable or function call interpolation: `{{name}}` or `{{greet("x")}}`.
     Interpolation(Interpolation),
-    /// An escaped brace: `\{` → literal `{`.
+    /// An escaped double-brace: `\{{` → literal `{{` in output.
     ///
     /// The `offset` field captures the byte position of the `\` in the source,
     /// so that later phases can emit a source-map point mapping for this node.
