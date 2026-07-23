@@ -107,41 +107,35 @@ gh workflow run release.yml -f version=X.Y.Z   # DOES NOT WORK YET — see #127
 
 Intended to do everything in one command, but its `prepare` job pushes the release
 commit directly to protected `main`, which branch protection rejects for the Actions
-bot (`GH006`). It leaves an orphaned tag and publishes nothing. Re-enable it by giving
-a release PAT/GitHub App branch-protection bypass, or by having `prepare` open a PR
-instead of pushing to `main` (#127). Until then, use tag-push above.
+bot (`GH006`). It leaves an orphaned tag and publishes nothing. Use tag-push until
+#127 is fixed.
 
-### What happens after tagging
+See @RELEASING.md for the full runbook.
 
-The `release.yml` workflow runs, in order:
-   1. **version-gate** — synchronized-version check (fails fast).
-   2. **build-napi** — cross-compiles the addon for all 7 targets.
-   3. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
-      LICENSE into each platform dir, runs the **A3 name-gate**.
-   4. **publish-crates** — `cargo publish` `mds-core`, wait for the index, then
-      `mds-cli`.
-   5. **publish-npm** — regenerate `index.d.ts`, re-run the A3 gate, then publish
-      (with provenance): the **platform packages** (`napi prepublish`), the
-      **host** `@mdscript/mds-napi`, **`@mdscript/mds-wasm`**, the **universal**
-      `@mdscript/mds`, and the **bundler** packages.
-   6. **github-release** — `gh release create` with generated notes.
+## Gotchas
 
-## Post-release
-
-- Verify each package on its registry (crates.io, npmjs.com) and that npm shows
-  the **provenance** attestation.
-- Smoke test a clean install on a fresh machine/container:
-  `npm i @mdscript/mds` then `node -e "import('@mdscript/mds').then(m=>m.init())"`.
-- Open a fresh `## [Unreleased]` section in `CHANGELOG.md`.
+- Workspace panic strategy must stay `unwind` — catch_unwind at the JS/Python FFI boundary requires it
+- `mds-wasm/Cargo.toml` has explicit (non-inherited) license/repo fields because older wasm-pack parsers fail on workspace inheritance
+- aarch64 Linux cross-builds use system gcc (gnu) and zig (musl) instead of napi `--use-napi-cross` because the macOS-generated lockfile doesn't resolve `@napi-rs/tar` linux binaries
+- `cargo publish -p mds-cli --dry-run` fails locally because mds-cli has a path+version dep on mds-core — this is expected; CI publishes mds-core first
+- `scripts/verify-napi-names.mjs` (A3 gate) is critical — if the hand-written `crates/mds-napi/index.js` loader drifts from generated platform packages, the universal package silently fails to load native binaries at runtime
+- `NPM_CONFIG_ACCESS=public` is required for first-time publishes of scoped `@mdscript/*` packages with provenance
+- `debug-panics` Cargo feature must never ship enabled (all three binding crates) — it attaches raw panic payloads (may contain filesystem paths) to errors
+- Local WASM builds require Binaryen v129+ for wasm-opt — `brew install binaryen` (macOS) or `apt install binaryen` (Linux)
+- `crates/mds-python` (PyO3): test with **pytest, not `cargo test`** — 0 Rust tests by design (`[lib] test = false`). `abi3-py311` is always-on and `extension-module` is the default feature, so `cargo build/clippy/test --workspace` compile the cdylib without linking libpython; pyo3's abi3 forward-compat tolerates an older `python3` on PATH (repo default is 3.9)
+- `crates/mds-python/build.rs` emits a cdylib-scoped `-undefined dynamic_lookup` so bare `cargo build` links the extension on macOS (Linux allows undefined cdylib symbols; maturin passes the flag itself when it builds the wheel)
+- Local Python dev: `maturin develop` needs an active **virtualenv** + `python3` on PATH; CI has no venv so it uses `pip install ./crates/mds-python` (the maturin PEP 517 backend). Wheels are `cp311-abi3` (one per platform)
+- `crates/mds-python` is free-threading ready (frozen result classes, `#[pymodule(gil_used = false)]`, GIL released around each compile); the `cp314t` free-threaded wheel is a separate ABI and is deferred with the wheel matrix + PyPI publishing (follow-up to #132)
 
 ## Notes
 
-- The 7 native targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-  `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
-  `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`,
-  `x86_64-pc-windows-msvc`. Linux musl/arm builds use napi's `--use-napi-cross`.
-- `wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...]` is enabled in `crates/mds-wasm/Cargo.toml`; CI installs
-  wasm-pack and Binaryen v129 via the composite action at `.github/actions/setup-wasm/` (version pins live there). Local builds need Binaryen separately
-  (`brew install binaryen` / `apt install binaryen`).
-- Platform packages are generated **in CI only** — they cannot be validated with a
-  local `npm pack`; use the dry-run workflow above instead.
+- `cargo publish -p mds-cli --dry-run` fails locally because mds-cli has a path+version dep on mds-core — this is expected; CI publishes mds-core first
+- `scripts/verify-napi-names.mjs` (A3 gate) is critical — if the hand-written `crates/mds-napi/index.js` loader drifts from generated platform packages, the universal package silently fails to load native binaries at runtime
+- `NPM_CONFIG_ACCESS=public` is required for first-time publishes of scoped `@mdscript/*` packages with provenance
+- `debug-panics` Cargo feature must never ship enabled (all three binding crates) — it attaches raw panic payloads (may contain filesystem paths) to errors
+- Local WASM builds require Binaryen v129+ for wasm-opt — `brew install binaryen` (macOS) or `apt install binaryen` (Linux)
+- `crates/mds-python` (PyO3): test with **pytest, not `cargo test`** — 0 Rust tests by design (`[lib] test = false`). `abi3-py311` is always-on and `extension-module` is the default feature, so `cargo build/clippy/test --workspace` compile the cdylib without linking libpython; pyo3's abi3 forward-compat tolerates an older `python3` on PATH (repo default is 3.9)
+- `crates/mds-python/build.rs` emits a cdylib-scoped `-undefined dynamic_lookup` so bare `cargo build` links the extension on macOS (Linux allows undefined cdylib symbols; maturin passes the flag itself when it builds the wheel)
+- Local Python dev: `maturin develop` needs an active **virtualenv** + `python3` on PATH; CI has no venv so it uses `pip install ./crates/mds-python` (the maturin PEP 517 backend). Wheels are `cp311-abi3` (one per platform)
+- `crates/mds-python` is free-threading ready (frozen result classes, `#[pymodule(gil_used = false)]`, GIL released around each compile); the `cp314t` free-threaded wheel is a separate ABI and is deferred with the wheel matrix + PyPI publishing (follow-up to #132)
+- Due to its temp-file-then-rename implementation, `atomic_write_file` does not preserve hard links, ACLs, extended attributes (xattrs), or owner/group metadata of the original file.
