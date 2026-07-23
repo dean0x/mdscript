@@ -443,7 +443,13 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
     #[cfg(unix)]
     let original_mode: Option<u32> = {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path).map(|m| m.permissions().mode()).ok()
+        match std::fs::metadata(path) {
+            Ok(m) => Some(m.permissions().mode()),
+            Err(e) => {
+                eprint_error(miette::miette!("cannot get metadata for {}: {e}", path.display()));
+                None
+            }
+        }
     };
 
     // Temp file in same directory so rename is always intra-filesystem.
