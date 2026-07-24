@@ -1195,8 +1195,8 @@ describe('source maps (F-SM)', () => {
 // Two vectors:
 //  (a) error path: `@include fo<ESC>o` — parser rejects invalid alias, message
 //      embeds the raw alias. After fix: err.message has no raw C0/DEL/C1 bytes.
-//  (b) lint path: frontmatter with a double-quoted YAML key containing U+001B —
-//      unused-variable fires; diagnostic message has no raw ESC byte.
+//  (b) lint path: lintVirtual with module name containing U+001B, imported twice —
+//      duplicate-import fires; diagnostic message has no raw ESC byte.
 
 describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
   // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 bytes in a string.
