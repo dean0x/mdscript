@@ -184,6 +184,18 @@ def test_e5_span_none_when_core_reports_none() -> None:
 # other tests (PF-008: pytest -k matches substrings of the full node id).
 
 
+def _assert_no_control_chars(s: str, label: str) -> None:
+    """Assert no raw C0 (excl. \\t \\n), DEL, or C1 bytes appear in `s`."""
+    for i, ch in enumerate(s):
+        code = ord(ch)
+        is_c0 = code < 0x20 and code not in (0x09, 0x0A)
+        is_del = code == 0x7F
+        is_c1 = 0x80 <= code <= 0x9F
+        assert not (is_c0 or is_del or is_c1), (
+            f"raw control char U+{code:04X} at index {i} must not appear in {label}; got: {s!r}"
+        )
+
+
 def test_e11_control_chars_in_message_are_escaped() -> None:
     """T-14 / E11 [AC-F3, AC-C2]: error-path sanitization for Python surface.
 
@@ -199,16 +211,7 @@ def test_e11_control_chars_in_message_are_escaped() -> None:
         m.compile(source)
     except m.MdsError as e:
         msg = e.message
-        # No raw C0 (excl. \\t \\n), DEL, or C1 bytes.
-        for i, ch in enumerate(msg):
-            code = ord(ch)
-            is_c0 = code < 0x20 and code not in (0x09, 0x0A)
-            is_del = code == 0x7F
-            is_c1 = 0x80 <= code <= 0x9F
-            assert not (is_c0 or is_del or is_c1), (
-                f"raw control char U+{code:04X} at index {i} must not appear in "
-                f"e.message; got: {msg!r}"
-            )
+        _assert_no_control_chars(msg, "e.message")
         # Sanitized literal must be present.
         assert "\\u001B" in msg, (
             f"sanitized \\u001B literal must appear in e.message; got: {msg!r}"
@@ -219,18 +222,6 @@ def test_e11_control_chars_in_message_are_escaped() -> None:
         )
     else:
         pytest.fail("expected m.MdsError to be raised")
-
-
-def _assert_no_control_chars(s: str, label: str) -> None:
-    """Assert no raw C0 (excl. \\t \\n), DEL, or C1 bytes appear in `s`."""
-    for i, ch in enumerate(s):
-        code = ord(ch)
-        is_c0 = code < 0x20 and code not in (0x09, 0x0A)
-        is_del = code == 0x7F
-        is_c1 = 0x80 <= code <= 0x9F
-        assert not (is_c0 or is_del or is_c1), (
-            f"raw control char U+{code:04X} at index {i} must not appear in {label}; got: {s!r}"
-        )
 
 
 def test_e12_lint_virtual_esc_in_import_path_message_sanitized() -> None:

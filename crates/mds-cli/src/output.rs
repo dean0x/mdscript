@@ -485,6 +485,17 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 
 // ── Sanitized stderr render ───────────────────────────────────────────────────
 
+/// Render a miette Report to a sanitized `String` — the pure transformation
+/// extracted from [`eprint_error`] so it can be tested without touching stderr.
+///
+/// Formats the report with `{:?}` (miette's human-readable renderer) and applies
+/// `mds::sanitize_control_chars` over the full rendered text, including any
+/// embedded source frames (issue #176 / CWE-150). The render+sanitize pass is
+/// idempotent: calling it a second time on already-sanitized output is a no-op.
+pub(crate) fn render_error_sanitized(report: &miette::Report) -> String {
+    mds::sanitize_control_chars(&format!("{report:?}"))
+}
+
 /// Render a miette Report to stderr with control-character sanitization applied.
 ///
 /// Per-file error handlers in directory-mode loops (e.g. `lint_one_file_human`,
@@ -498,17 +509,6 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 /// while preserving `\n`, `\t`, and printable Unicode — miette box-drawing and
 /// carets therefore survive intact; only raw ESC bytes and other non-printing
 /// controls are escaped to `\uXXXX` literals.
-/// Render a miette Report to a sanitized `String` — the pure transformation
-/// extracted from [`eprint_error`] so it can be tested without touching stderr.
-///
-/// Formats the report with `{:?}` (miette's human-readable renderer) and applies
-/// `mds::sanitize_control_chars` over the full rendered text, including any
-/// embedded source frames (issue #176 / CWE-150). The render+sanitize pass is
-/// idempotent: calling it a second time on already-sanitized output is a no-op.
-pub(crate) fn render_error_sanitized(report: &miette::Report) -> String {
-    mds::sanitize_control_chars(&format!("{report:?}"))
-}
-
 pub(crate) fn eprint_error(report: miette::Report) {
     eprintln!("{}", render_error_sanitized(&report));
 }
@@ -817,7 +817,6 @@ mod tests {
         // A source line containing a raw ESC byte mid-word, plus a normal word so
         // we can assert the frame is not vacuously empty.
         let hostile_source = "Hello \x1B[31mworld\x1B[0m".to_string();
-        let source_len = hostile_source.len();
         // Place a span that covers "Hello" (offset 0, length 5) so miette renders
         // the source line with a caret.
         let span = miette::SourceSpan::new(0.into(), 5);
@@ -846,6 +845,5 @@ mod tests {
             rendered.contains("Hello"),
             "source context word 'Hello' must still be visible; got: {rendered:?}"
         );
-        let _ = source_len; // suppress unused warning (used for documentation only)
     }
 }
