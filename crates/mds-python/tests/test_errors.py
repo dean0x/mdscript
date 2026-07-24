@@ -233,33 +233,65 @@ def _assert_no_control_chars(s: str, label: str) -> None:
         )
 
 
-def test_e12_lint_hostile_source_no_raw_control_bytes() -> None:
-    """T-14 / E12 [AC-F4]: lint-path sanitization — Python surface.
+def test_e12_lint_virtual_esc_in_import_path_message_sanitized() -> None:
+    """T-14 / E12 [AC-F4]: Python typed LintDiagnostic.message and as_json() sanitization.
 
-    A frontmatter with a YAML double-quoted key containing a raw ESC byte (U+001B)
-    triggers a YAML parse error from serde_yaml_ng (control characters are not
-    allowed in YAML double-quoted strings). Whether m.lint() raises MdsError (YAML
-    error path) or returns a LintResult (if the parser becomes more permissive),
-    the output must contain no raw C0/DEL/C1 control bytes.
+    Uses the lint_virtual API with a module whose NAME contains a raw ESC byte (U+001B)
+    to trigger a duplicate-import rule whose message embeds the raw path — a reachable
+    end-to-end vector that exercises the Python typed surface without touching YAML parsing.
 
-    Note: the targeted scenario (unused-variable diagnostic message carrying U+001B)
-    cannot be reached via CLI source because YAML rejects the key. The corresponding
-    programmatic-API coverage lives in T-4 (to_canonical_json unit test in Rust).
+    Verifies:
+    (a) LintDiagnostic.message contains no raw C0/DEL/C1 bytes (typed attribute clean)
+    (b) LintDiagnostic.message contains the sanitized \\u001B literal (explicit evidence)
+    (c) LintDiagnostic.to_dict()["message"] is identical to .message (parity guard, PF-007)
     """
     esc = "\x1b"
-    source = f'---\n"a{esc}b": 1\n---\nhi\n'
-    try:
-        result = m.lint(source)
-        # YAML parsing succeeded — verify diagnostic messages are clean.
-        for file_report in result.files:
-            for diag in file_report.diagnostics:
-                msg = diag.message
-                assert isinstance(msg, str), "message must be a string"
-                _assert_no_control_chars(msg, "LintDiagnostic.message")
-    except m.MdsError as e:
-        # Expected: serde_yaml_ng rejects the raw ESC byte in the YAML key.
-        # Verify the error message is sanitized (no raw ESC echoed back).
-        _assert_no_control_chars(e.message, "MdsError.message (YAML error)")
+    # Module whose name contains a raw ESC byte — import path embeds it in the message.
+    module_name = f"fo{esc}o.mds"
+    modules = {
+        module_name: "hi\n",
+        # Import the same module twice to trigger duplicate-import; message will embed module_name.
+        "main.mds": f'@import "./{module_name}"\n@import "./{module_name}"\n',
+    }
+    result = m.lint_virtual(modules, "main.mds")
+
+    files = result.files
+    assert files, "expected at least one LintFileReport from lint_virtual"
+    all_diags = [d for fr in files for d in fr.diagnostics]
+    assert all_diags, (
+        "expected at least one LintDiagnostic (duplicate-import should fire for "
+        "the twice-imported module)"
+    )
+
+    for diag in all_diags:
+        msg = diag.message
+        assert isinstance(msg, str) and msg, "message must be a non-empty string"
+
+        # (a) No raw C0/DEL/C1 bytes in typed .message attribute.
+        _assert_no_control_chars(msg, "LintDiagnostic.message")
+
+        # (b) At least one diagnostic must carry the sanitized \\u001B literal —
+        #     confirming the ESC byte in the module name was sanitized, not dropped.
+        # (Only the duplicate-import diagnostic embeds the path; check all.)
+
+    esc_in_messages = [d for d in all_diags if "\\u001B" in d.message or "\\u001b" in d.message]
+    assert esc_in_messages, (
+        "expected at least one diagnostic whose message carries the sanitized "
+        "\\u001B literal (module path); got: "
+        + str([d.message for d in all_diags])
+    )
+
+    # (c) Parity guard: to_dict()["message"] must equal .message (PF-007).
+    # as_json() / to_dict() must not re-introduce raw control bytes from pyclass fields.
+    for diag in all_diags:
+        d_dict = diag.to_dict()
+        assert isinstance(d_dict, dict), "to_dict() must return a dict"
+        dict_msg = d_dict.get("message", "")
+        assert isinstance(dict_msg, str), "to_dict()[message] must be a string"
+        assert dict_msg == diag.message, (
+            f"to_dict()[message] must equal .message; "
+            f"typed={diag.message!r}, dict={dict_msg!r}"
+        )
 
 
 # ── D2: type_mismatch_at — span present on @if cross-type comparison ─────────────

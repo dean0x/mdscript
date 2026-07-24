@@ -1824,7 +1824,7 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
     for (i, byte) in stdout_str.bytes().enumerate() {
         let is_c0 = byte < 0x20 && byte != b'\t' && byte != b'\n';
         let is_del = byte == 0x7F;
-        let is_c1 = byte >= 0x80 && byte <= 0x9F;
+        let is_c1 = (0x80..=0x9F).contains(&byte);
         assert!(
             !is_c0 && !is_del && !is_c1,
             "raw control byte 0x{byte:02X} at position {i} must not appear \
@@ -1842,7 +1842,7 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
                         assert!(
                             !msg.bytes().any(|b| b < 0x20 && b != b'\t' && b != b'\n'
                                 || b == 0x7F
-                                || (b >= 0x80 && b <= 0x9F)),
+                                || (0x80..=0x9F).contains(&b)),
                             "raw control byte in diagnostic message; got: {msg:?}"
                         );
                     }

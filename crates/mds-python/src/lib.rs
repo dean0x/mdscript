@@ -772,11 +772,16 @@ impl LintResult {
                                 LintDiagnostic {
                                     rule: json_str(d, "rule"),
                                     severity: json_str(d, "severity"),
-                                    message: json_str(d, "message"),
+                                    // Change #2 [AC-F4]: sanitize control chars at the pyclass
+                                    // population site as belt-and-suspenders defense-in-depth.
+                                    // The upstream to_canonical_json() also sanitizes, but this
+                                    // ensures as_json()/to_dict() parity for any future code path
+                                    // that bypasses the JSON round-trip (PF-004/PF-007).
+                                    message: mds::sanitize_control_chars(&json_str(d, "message")),
                                     help: d
                                         .get("help")
                                         .and_then(serde_json::Value::as_str)
-                                        .map(str::to_owned),
+                                        .map(mds::sanitize_control_chars),
                                     fixable: d
                                         .get("fixable")
                                         .and_then(serde_json::Value::as_bool)
