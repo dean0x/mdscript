@@ -820,41 +820,80 @@ fn wasm_control_chars_in_error_message_are_escaped() {
 }
 
 #[wasm_bindgen_test]
-fn wasm_lint_hostile_source_no_raw_control_bytes() {
-    // T-15 / F6 [AC-F4]: lint-path sanitization — WASM surface.
-    // serde_yaml_ng rejects raw ESC bytes in YAML double-quoted keys, so lint()
-    // returns Err (mds::yaml) rather than a result with an unused-variable diagnostic.
-    // Whether lint() succeeds or fails, the output must contain no raw C0/DEL/C1 bytes.
+fn wasm_lint_virtual_esc_in_module_name_sanitizes_duplicate_import_message() {
+    // T-15 / F6 [AC-F4]: lint-path sanitization via lintVirtual — WASM surface.
+    // Use a module whose NAME contains a raw ESC byte (U+001B), imported twice so
+    // duplicate-import fires and embeds the raw path in its message.
+    // After sanitization: message must contain no raw control bytes and must carry
+    // the sanitized  literal (positive evidence). Mirrors Python E12 pattern.
+    // Verifies:
+    //   (1) No raw C0/DEL/C1 bytes in any diagnostic message.
+    //   (2) Sanitized  literal IS present (positive evidence, non-vacuous).
+    //   (3) Result shape: version 1, duplicate-import rule present.
     let esc = '\u{001B}';
-    let source = format!("---\n\"a{esc}b\": 1\n---\nhi\n");
-    match mds_wasm::lint(&source, JsValue::NULL) {
-        Ok(result) => {
-            // Unexpected: YAML parsed the hostile key. Verify any diagnostic messages are clean.
-            let files = get_prop(&result, "files");
-            let files_arr = js_sys::Array::from(&files);
-            for i in 0..files_arr.length() {
-                let file_entry = files_arr.get(i);
-                let diags = get_prop(&file_entry, "diagnostics");
-                let diags_arr = js_sys::Array::from(&diags);
-                for j in 0..diags_arr.length() {
-                    let diag = diags_arr.get(j);
-                    let msg = get_str(&diag, "message");
-                    assert_no_control_chars(
-                        &msg,
-                        &format!("files[{i}].diagnostics[{j}].message (T-15/F6)"),
-                    );
-                }
-            }
-        }
-        Err(err) => {
-            // Expected: serde_yaml_ng rejects the raw ESC byte (mds::yaml).
-            // Verify the error message itself contains no raw control bytes.
-            let msg = get_str(&err, "message");
-            assert!(
-                !msg.is_empty(),
-                "T-15/F6: error message must not be empty for a YAML parse error"
+    let module_name = format!("fo{esc}o.mds");
+    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
+
+    // Build the modules JS object with js_sys::Reflect so the key preserves the raw
+    // ESC byte as a JS string character (U+001B in UTF-16).
+    let modules_obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str(&module_name),
+        &JsValue::from_str("hi\n"),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str("main.mds"),
+        &JsValue::from_str(&main_src),
+    )
+    .unwrap();
+
+    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
+        .expect("T-15/F6: lintVirtual must succeed with ESC in module name");
+
+    // (3) Result shape: version 1.
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("T-15/F6: result.version must be a number") as u32;
+    assert_eq!(version, 1, "T-15/F6: result.version must be 1");
+
+    let files = get_prop(&result, "files");
+    let files_arr = js_sys::Array::from(&files);
+    assert!(
+        files_arr.length() > 0,
+        "T-15/F6: expected at least one file entry with diagnostics"
+    );
+
+    let mut all_messages: Vec<String> = Vec::new();
+    for i in 0..files_arr.length() {
+        let file_entry = files_arr.get(i);
+        let diags = get_prop(&file_entry, "diagnostics");
+        let diags_arr = js_sys::Array::from(&diags);
+        for j in 0..diags_arr.length() {
+            let diag = diags_arr.get(j);
+            let msg = get_str(&diag, "message");
+            // (1) No raw control bytes in any diagnostic message.
+            assert_no_control_chars(
+                &msg,
+                &format!("T-15/F6: files[{i}].diagnostics[{j}].message"),
             );
-            assert_no_control_chars(&msg, "err.message (YAML error, T-15/F6)");
+            all_messages.push(msg);
         }
     }
+
+    assert!(
+        !all_messages.is_empty(),
+        "T-15/F6: expected at least one diagnostic (duplicate-import should fire)"
+    );
+
+    // (2) At least one message contains the sanitized  literal (positive evidence).
+    let has_sanitized = all_messages
+        .iter()
+        .any(|m| m.contains("\\u001B") || m.contains("\\u001b"));
+    assert!(
+        has_sanitized,
+        "T-15/F6: expected sanitized \\u001B in at least one message; got: {all_messages:?}"
+    );
 }

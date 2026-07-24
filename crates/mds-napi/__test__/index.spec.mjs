@@ -1231,32 +1231,58 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   });
 
-  test('T-13b: lint path — hostile source with ESC byte produces no raw control bytes', () => {
-    // serde_yaml_ng rejects raw ESC bytes in YAML double-quoted keys, so lint()
-    // throws mds::yaml rather than returning a result with an unused-variable diagnostic.
-    // Whether it throws or returns, the output must contain no raw C0/DEL/C1 bytes.
+  test('T-13b: lint path — lintVirtual with ESC in module name sanitizes duplicate-import message', () => {
+    // Use lintVirtual with a module whose NAME contains a raw ESC byte (U+001B),
+    // imported twice so duplicate-import fires and embeds the raw path in its message.
+    // Mirrors Python E12 (test_e12_lint_virtual_esc_in_import_path_message_sanitized).
+    // Verifies:
+    //   (1) No raw C0/DEL/C1 bytes in any diagnostic message.
+    //   (2) Sanitized  literal IS present (positive evidence, non-vacuous).
+    //   (3) Result shape: version 1, duplicate-import rule present.
     const esc = String.fromCharCode(0x1b);
-    const source = `---\n"a${esc}b": 1\n---\nhi\n`;
-    try {
-      const result = lint(source);
-      // Unexpected: YAML parsed the hostile key. Verify any diagnostics are clean.
-      assert.equal(result.version, 1, 'version must be 1');
-      if (Array.isArray(result.files)) {
-        for (const fileEntry of result.files) {
-          if (Array.isArray(fileEntry.diagnostics)) {
-            for (const diag of fileEntry.diagnostics) {
-              if (typeof diag.message === 'string') {
-                assertNoControlBytes(diag.message, 'diagnostic.message');
-              }
-            }
-          }
-        }
+    const moduleName = `fo${esc}o.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    const result = lintVirtual(modules, 'main.mds');
+
+    // (3) Result shape: version 1.
+    assert.equal(result.version, 1, 'T-13b: version must be 1');
+    assert.ok(Array.isArray(result.files), 'T-13b: files must be an array');
+
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.length > 0,
+      'T-13b: expected at least one diagnostic (duplicate-import should fire); got: ' +
+        JSON.stringify(allDiags),
+    );
+
+    // (1) No raw control bytes in any diagnostic message.
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlBytes(diag.message, `T-13b: diag[${diag.rule}].message`);
       }
-    } catch (err) {
-      // Expected: serde_yaml_ng rejects the raw ESC byte (mds::yaml error).
-      // Verify the error message itself contains no raw control bytes.
-      const msg = typeof err?.message === 'string' ? err.message : String(err);
-      assertNoControlBytes(msg, 'err.message (YAML parse error)');
     }
+
+    // (2) At least one message carries the sanitized  literal (positive evidence).
+    const hasSanitizedEsc = allDiags.some(
+      (d) =>
+        typeof d.message === 'string' &&
+        (d.message.includes('\\u001B') || d.message.includes('\\u001b')),
+    );
+    assert.ok(
+      hasSanitizedEsc,
+      'T-13b: expected \\u001B in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+
+    // (3) Expected rule: duplicate-import must be among the diagnostics.
+    const hasDupImport = allDiags.some((d) => d.rule === 'duplicate-import');
+    assert.ok(
+      hasDupImport,
+      'T-13b: expected duplicate-import diagnostic; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
   });
 });
