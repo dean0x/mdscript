@@ -263,8 +263,9 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
     if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
         return;
     }
-    // Sanitize at the render boundary (AC-F-16): message and help only; raw bytes
-    // are preserved in the stored diagnostic and in JSON output via to_canonical_json().
+    // Belt-and-suspenders: field-level sanitize on message/help (defense-in-depth).
+    // The whole-report render below also sanitizes, making this a double-pass that is
+    // idempotent and guards against any future path that might bypass the outer pass.
     let sanitized = mds::LintDiagnostic {
         rule: diag.rule.clone(),
         severity: diag.severity,
@@ -275,16 +276,17 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
         fix_removals: diag.fix_removals.clone(),
         fix_edits: diag.fix_edits.clone(),
     };
-    // Attach the source code so miette can render the span with source context
-    // (source line + caret underline). The labels() implementation on LintDiagnostic
-    // returns the span; with_source_code() provides the text miette reads to render it.
-    if let Some((filename, src)) = named_source {
-        let report = miette::Report::from(sanitized)
-            .with_source_code(miette::NamedSource::new(filename, src.to_string()));
-        eprintln!("{report:?}");
+    // Render the whole report and sanitize the full output, including any embedded
+    // source frame (filename and source line text). Span accuracy is preserved because
+    // miette computes carets against the raw source before `render_error_sanitized`
+    // applies its pass over the already-rendered string (issue #176 / CWE-150).
+    let report = if let Some((filename, src)) = named_source {
+        miette::Report::from(sanitized)
+            .with_source_code(miette::NamedSource::new(filename, src.to_string()))
     } else {
-        eprintln!("{:?}", miette::Report::from(sanitized));
-    }
+        miette::Report::from(sanitized)
+    };
+    crate::output::eprint_error(report);
 }
 
 /// Render all diagnostics in a `LintResult` to stderr.

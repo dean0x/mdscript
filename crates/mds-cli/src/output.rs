@@ -498,8 +498,19 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 /// while preserving `\n`, `\t`, and printable Unicode — miette box-drawing and
 /// carets therefore survive intact; only raw ESC bytes and other non-printing
 /// controls are escaped to `\uXXXX` literals.
+/// Render a miette Report to a sanitized `String` — the pure transformation
+/// extracted from [`eprint_error`] so it can be tested without touching stderr.
+///
+/// Formats the report with `{:?}` (miette's human-readable renderer) and applies
+/// `mds::sanitize_control_chars` over the full rendered text, including any
+/// embedded source frames (issue #176 / CWE-150). The render+sanitize pass is
+/// idempotent: calling it a second time on already-sanitized output is a no-op.
+pub(crate) fn render_error_sanitized(report: &miette::Report) -> String {
+    mds::sanitize_control_chars(&format!("{report:?}"))
+}
+
 pub(crate) fn eprint_error(report: miette::Report) {
-    eprintln!("{}", mds::sanitize_control_chars(&format!("{report:?}")));
+    eprintln!("{}", render_error_sanitized(&report));
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -786,5 +797,55 @@ mod tests {
         let base = OutputBase::NextToSource;
         let result = output_base_no_ext(&source, &root, &base);
         assert_eq!(result, PathBuf::from("/root/src/chat"));
+    }
+
+    // ── T-10: render_error_sanitized (issue #176 / ESC-INJECTION) ────────────
+
+    /// T-10 [AC-F2 proxy]: `render_error_sanitized` strips raw ESC (U+001B) and
+    /// other C0/DEL/C1 control bytes from the rendered miette frame, including bytes
+    /// that arrive via the embedded source context (NamedSource).
+    ///
+    /// The test constructs a miette Report with a source frame containing raw ESC
+    /// (simulating a hostile .mds file that would leak through `eprintln!("{report:?}")`
+    /// before the fix). After `render_error_sanitized` the output must contain no raw
+    /// 0x1B bytes and must contain the sanitized `` literal. The word "Hello"
+    /// from the source context must still be visible (verifies the frame is not empty).
+    #[test]
+    fn render_error_sanitized_strips_control_chars_from_source_frame() {
+        use miette::NamedSource;
+
+        // A source line containing a raw ESC byte mid-word, plus a normal word so
+        // we can assert the frame is not vacuously empty.
+        let hostile_source = "Hello \x1B[31mworld\x1B[0m".to_string();
+        let source_len = hostile_source.len();
+        // Place a span that covers "Hello" (offset 0, length 5) so miette renders
+        // the source line with a caret.
+        let span = miette::SourceSpan::new(0.into(), 5);
+        let report = miette::miette!(
+            labels = vec![miette::LabeledSpan::new_with_span(None, span)],
+            "lint finding on hostile source"
+        )
+        .with_source_code(NamedSource::new("f.mds", hostile_source));
+
+        let rendered = render_error_sanitized(&report);
+
+        // No raw ESC byte (0x1B) may appear in the rendered output.
+        assert!(
+            !rendered.as_bytes().contains(&0x1Bu8),
+            "raw ESC byte (0x1B) must not appear in render_error_sanitized output; \
+             got (first 512 bytes hex): {:02x?}",
+            &rendered.as_bytes()[..rendered.len().min(512)]
+        );
+        // The sanitized 6-char literal \\u001B must appear instead.
+        assert!(
+            rendered.contains("\\u001B"),
+            "sanitized \\u001B literal must appear in output; got: {rendered:?}"
+        );
+        // "Hello" from the source context must still be visible (frame is not empty).
+        assert!(
+            rendered.contains("Hello"),
+            "source context word 'Hello' must still be visible; got: {rendered:?}"
+        );
+        let _ = source_len; // suppress unused warning (used for documentation only)
     }
 }

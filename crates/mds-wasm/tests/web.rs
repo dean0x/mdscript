@@ -776,3 +776,85 @@ fn compile_extends_undefined_var_in_base_default_carries_real_span() {
         .as_f64()
         .expect("WASM C4: span.column must be a number, not undefined");
 }
+
+// ── T-15: ESC-injection hardening — WASM surface (issue #176 / CWE-150) ──────
+//
+// Two sub-tests:
+//  F5: error path — @include alias with U+001B mid-token; err.message must
+//      carry the sanitized \uXXXX literal and contain no raw control bytes.
+//  F6: lint path — frontmatter key with U+001B; first diagnostic message clean.
+
+/// Assert that a string contains no raw C0 (excl. \t \n), DEL, or C1 bytes.
+fn assert_no_control_chars(s: &str, label: &str) {
+    for (i, ch) in s.char_indices() {
+        let code = ch as u32;
+        let is_c0 = code < 0x20 && code != 0x09 && code != 0x0A;
+        let is_del = code == 0x7F;
+        let is_c1 = (0x80..=0x9F).contains(&code);
+        assert!(
+            !is_c0 && !is_del && !is_c1,
+            "raw control char U+{code:04X} at byte {i} must not appear in {label}; got: {s:?}"
+        );
+    }
+}
+
+#[wasm_bindgen_test]
+fn wasm_control_chars_in_error_message_are_escaped() {
+    // T-15 / F5 [AC-F3]: error-path sanitization for WASM surface.
+    // @include with a raw ESC byte (U+001B) mid-alias is rejected by the parser.
+    // After Change #1, serialize() sanitizes so err.message contains no raw
+    // control bytes and the sanitized  literal is visible.
+    let esc = '\u{001B}';
+    let source = format!("@include fo{esc}o\n");
+    let err = mds_wasm::compile(&source, JsValue::NULL).unwrap_err();
+    let msg = get_str(&err, "message");
+    assert!(
+        !msg.is_empty(),
+        "T-15/F5: err.message must not be empty for an ESC-in-alias error"
+    );
+    assert_no_control_chars(&msg, "err.message (T-15/F5)");
+    assert!(
+        msg.contains("\\u001B"),
+        "T-15/F5: sanitized \\u001B literal must appear in err.message; got: {msg:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_hostile_source_no_raw_control_bytes() {
+    // T-15 / F6 [AC-F4]: lint-path sanitization — WASM surface.
+    // serde_yaml_ng rejects raw ESC bytes in YAML double-quoted keys, so lint()
+    // returns Err (mds::yaml) rather than a result with an unused-variable diagnostic.
+    // Whether lint() succeeds or fails, the output must contain no raw C0/DEL/C1 bytes.
+    let esc = '\u{001B}';
+    let source = format!("---\n\"a{esc}b\": 1\n---\nhi\n");
+    match mds_wasm::lint(&source, JsValue::NULL) {
+        Ok(result) => {
+            // Unexpected: YAML parsed the hostile key. Verify any diagnostic messages are clean.
+            let files = get_prop(&result, "files");
+            let files_arr = js_sys::Array::from(&files);
+            for i in 0..files_arr.length() {
+                let file_entry = files_arr.get(i);
+                let diags = get_prop(&file_entry, "diagnostics");
+                let diags_arr = js_sys::Array::from(&diags);
+                for j in 0..diags_arr.length() {
+                    let diag = diags_arr.get(j);
+                    let msg = get_str(&diag, "message");
+                    assert_no_control_chars(
+                        &msg,
+                        &format!("files[{i}].diagnostics[{j}].message (T-15/F6)"),
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            // Expected: serde_yaml_ng rejects the raw ESC byte (mds::yaml).
+            // Verify the error message itself contains no raw control bytes.
+            let msg = get_str(&err, "message");
+            assert!(
+                !msg.is_empty(),
+                "T-15/F6: error message must not be empty for a YAML parse error"
+            );
+            assert_no_control_chars(&msg, "err.message (YAML error, T-15/F6)");
+        }
+    }
+}

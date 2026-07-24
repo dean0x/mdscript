@@ -39,8 +39,9 @@ use crate::build::{
     resolve_output_path_for_kind, write_output, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
-    canonicalize_out_dir, collect_mds_files, is_partial, is_within_default_excluded_dir,
-    output_base_no_ext, output_path_for, probe_and_remove_stale, resolve_output_base, OutputBase,
+    canonicalize_out_dir, collect_mds_files, eprint_error, is_partial,
+    is_within_default_excluded_dir, output_base_no_ext, output_path_for, probe_and_remove_stale,
+    resolve_output_base, OutputBase,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -786,7 +787,7 @@ fn rebuild_file(
     }) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             state.last_mtimes = snapshot_state(&state.foi);
             return;
         }
@@ -865,7 +866,7 @@ fn rebuild_file(
                         }
                     }
                     Err(e) => {
-                        eprintln!("{e:?}");
+                        eprint_error(e);
                         // Error-settle: update snapshot so we don't re-fire.
                         state.last_mtimes = snapshot_state(&state.foi);
                     }
@@ -873,7 +874,7 @@ fn rebuild_file(
             }
         }
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             // Error-settle: snapshot current state so the tick gate
             // won't re-fire on the same unchanged files (AC-R7/W6).
             state.last_mtimes = snapshot_state(&state.foi);
@@ -933,7 +934,7 @@ fn run_watch_file(
         Ok(result) => result,
         Err(e) => {
             // Initial compile error: print and continue watching (entry dir still watched).
-            eprintln!("{e:?}");
+            eprint_error(e);
             // Fall back: resolve output path with Markdown kind as a placeholder so we
             // know where to watch. This path may not match a later successful compile if
             // the template has @message blocks, but it will correct on first successful rebuild.
@@ -1276,7 +1277,7 @@ fn compile_one_source(
                         );
                     }
                     Err(e) => {
-                        eprintln!("{e:?}");
+                        eprint_error(e);
                         // Error-settle: update mtime so the gate won't re-fire.
                         state.record_error(src);
                     }
@@ -1288,7 +1289,7 @@ fn compile_one_source(
             }
         }
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             state.record_error(src);
         }
     }
@@ -1456,7 +1457,7 @@ fn liveness_probe_dir(
             }) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("{e:?}");
+                    eprint_error(e);
                     state.last_mtimes = snapshot_state(&state.known_set());
                     return;
                 }
@@ -1584,7 +1585,7 @@ fn handle_fs_event_dir(
     }) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             state.last_mtimes = snapshot_state(&state.known_set());
             return DirEventOutcome::Done;
         }
@@ -1699,14 +1700,14 @@ fn dir_watch_startup(
                     let out = output_path_for(&key, &root, &output_base, ext);
                     if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
                     {
-                        eprintln!("{e:?}");
+                        eprint_error(e);
                     } else {
                         state.last_written.insert(out, compiled.content);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("{e:?}");
+                eprint_error(e);
                 state.forward_deps.insert(key.clone(), vec![]);
                 state.errored.insert(key.clone());
                 state.known_files.insert(key);
@@ -2095,7 +2096,7 @@ fn process_dir_batch_incremental(
                     state.errored.remove(src);
                 }
                 Err(e) => {
-                    eprintln!("{e:?}");
+                    eprint_error(e);
                     state.errored.insert(src.clone());
                     settle_mtime(src, &mut state.last_mtimes);
                 }

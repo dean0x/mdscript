@@ -1189,3 +1189,74 @@ describe('source maps (F-SM)', () => {
     );
   });
 });
+
+// ── T-13: ESC-injection hardening — napi direct (issue #176 / CWE-150) ───────
+//
+// Two vectors:
+//  (a) error path: `@include fo<ESC>o` — parser rejects invalid alias, message
+//      embeds the raw alias. After fix: err.message has no raw C0/DEL/C1 bytes.
+//  (b) lint path: frontmatter with a double-quoted YAML key containing U+001B —
+//      unused-variable fires; diagnostic message has no raw ESC byte.
+
+describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
+  // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 bytes in a string.
+  function assertNoControlBytes(s, label) {
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      const isC0 = code < 0x20 && code !== 0x09 && code !== 0x0a;
+      const isDel = code === 0x7f;
+      const isC1 = code >= 0x80 && code <= 0x9f;
+      assert.ok(
+        !isC0 && !isDel && !isC1,
+        `${label}: raw control char U+${code.toString(16).toUpperCase().padStart(4,'0')} ` +
+        `at index ${i} must not appear; got: ${JSON.stringify(s)}`
+      );
+    }
+  }
+
+  test('T-13a: error path — compile error message sanitized for ESC-in-alias', () => {
+    const esc = String.fromCharCode(0x1b);
+    const source = `@include fo${esc}o\n`;
+    try {
+      compile(source);
+      assert.fail('expected compile to throw');
+    } catch (err) {
+      const msg = err.message;
+      assert.ok(typeof msg === 'string' && msg.length > 0, 'message must be non-empty');
+      assertNoControlBytes(msg, 'err.message');
+      assert.ok(
+        msg.includes('\\u001B'),
+        `sanitized \\u001B must appear in err.message; got: ${JSON.stringify(msg)}`
+      );
+    }
+  });
+
+  test('T-13b: lint path — hostile source with ESC byte produces no raw control bytes', () => {
+    // serde_yaml_ng rejects raw ESC bytes in YAML double-quoted keys, so lint()
+    // throws mds::yaml rather than returning a result with an unused-variable diagnostic.
+    // Whether it throws or returns, the output must contain no raw C0/DEL/C1 bytes.
+    const esc = String.fromCharCode(0x1b);
+    const source = `---\n"a${esc}b": 1\n---\nhi\n`;
+    try {
+      const result = lint(source);
+      // Unexpected: YAML parsed the hostile key. Verify any diagnostics are clean.
+      assert.equal(result.version, 1, 'version must be 1');
+      if (Array.isArray(result.files)) {
+        for (const fileEntry of result.files) {
+          if (Array.isArray(fileEntry.diagnostics)) {
+            for (const diag of fileEntry.diagnostics) {
+              if (typeof diag.message === 'string') {
+                assertNoControlBytes(diag.message, 'diagnostic.message');
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Expected: serde_yaml_ng rejects the raw ESC byte (mds::yaml error).
+      // Verify the error message itself contains no raw control bytes.
+      const msg = typeof err?.message === 'string' ? err.message : String(err);
+      assertNoControlBytes(msg, 'err.message (YAML parse error)');
+    }
+  });
+});

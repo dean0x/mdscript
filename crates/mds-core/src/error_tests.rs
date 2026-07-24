@@ -232,6 +232,91 @@ fn serialized_error_to_json_null_span() {
     assert!(v["span"].is_null(), "span should be null in JSON when None");
 }
 
+// ── T-1..T-3: serialize() sanitizes control chars (issue #176 / ESC-INJECTION) ──
+
+/// T-1 [AC-F3]: serialize() sanitizes raw ESC (U+001B) in the message field.
+/// The message string must not contain the raw ESC byte; the sanitized 6-char
+/// literal `` must appear instead.
+#[test]
+fn serialize_sanitizes_esc_in_message() {
+    // Build a Syntax error whose message embeds a raw ESC byte mid-string.
+    let e = MdsError::syntax("bad\x1Btoken");
+    let s = e.serialize();
+    assert!(
+        !s.message.contains('\x1B'),
+        "raw ESC byte must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in message; got: {:?}",
+        s.message
+    );
+}
+
+/// T-2 [AC-F3]: serialize() sanitizes raw ESC in both message and help fields.
+/// UndefinedVariable embeds `name` in both the message ("undefined variable 'name'")
+/// and the help ("define 'name' in frontmatter or imports").
+#[test]
+fn serialize_sanitizes_esc_in_help() {
+    // The name `a\x1Bb` embeds an ESC byte — miette uses it in both fields.
+    let e = MdsError::undefined_var("a\x1Bb");
+    let s = e.serialize();
+    // Message must be sanitized.
+    assert!(
+        !s.message.contains('\x1B'),
+        "raw ESC byte must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in message; got: {:?}",
+        s.message
+    );
+    // Help must also be sanitized.
+    let help = s.help.expect("UndefinedVariable should carry help text");
+    assert!(
+        !help.contains('\x1B'),
+        "raw ESC byte must not appear in serialized help; got: {:?}",
+        help
+    );
+    assert!(
+        help.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in help; got: {:?}",
+        help
+    );
+}
+
+/// T-3 [AC-F3]: serialize() sanitizes DEL (U+007F) and C1 NEL (U+0085) in addition
+/// to ESC, producing the corresponding `\uXXXX` literals.
+#[test]
+fn serialize_sanitizes_del_and_c1() {
+    let e = MdsError::syntax("del\u{007F}and\u{0085}nel");
+    let s = e.serialize();
+    // Raw DEL byte must be sanitized.
+    assert!(
+        !s.message.contains('\u{007F}'),
+        "raw DEL must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u007F"),
+        "sanitized \\u007F must appear in message; got: {:?}",
+        s.message
+    );
+    // Raw C1 NEL (U+0085) must be sanitized.
+    assert!(
+        !s.message.contains('\u{0085}'),
+        "raw C1 NEL must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u0085"),
+        "sanitized \\u0085 must appear in message; got: {:?}",
+        s.message
+    );
+}
+
 // ── Display output ────────────────────────────────────────────────────────
 
 #[test]

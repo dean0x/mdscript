@@ -4,11 +4,17 @@
 //! be rendered by miette at the CLI human-render boundary. The `severity()` override
 //! maps our `Severity` enum to miette's rendering tiers (Error/Warning/Advice).
 //!
-//! **Sanitization discipline**: `sanitize_control_chars` is a render-boundary helper.
-//! It is NOT called in `LintDiagnostic` constructors — the raw message is preserved
-//! intact for `LintResult::to_canonical_json()` (typed serialization is safe; C0/C1
-//! bytes in JSON string values are legal and the consumer can handle them). Apply
-//! `sanitize_control_chars` only at the CLI human-render step (mds-cli/src/lint.rs).
+//! **Sanitization discipline**: `sanitize_control_chars` is applied at ALL
+//! serialization and render boundaries:
+//! - CLI human render (`render_diag_human` in mds-cli/src/lint.rs)
+//! - `MdsError::serialize()` (error.rs) — covers all three bindings' error path
+//! - `LintResult::to_canonical_json()` (this module) — covers all surfaces' lint path
+//! - Python typed `LintDiagnostic` pyclass (mds-python/src/lib.rs)
+//!
+//! `message` and `help` in serialized/rendered output carry sanitized `\uXXXX` literals
+//! for C0/DEL/C1 control characters. Raw byte values are preserved only in the stored
+//! `LintDiagnostic` struct so that span offsets and fix-edits remain byte-accurate.
+//! `sanitize_control_chars` is NOT called in `LintDiagnostic` constructors.
 
 use std::fmt;
 
@@ -311,11 +317,15 @@ impl LintResult {
                     .collect::<Vec<_>>()
             });
 
+            // Sanitize at the serialization boundary (issue #176 / CWE-150):
+            // message and help carry sanitized \uXXXX literals for C0/DEL/C1 bytes.
+            // Spans and fix_edits reference raw byte offsets into the source — left
+            // untouched so fix pipelines and span highlighting stay accurate.
             let d = serde_json::json!({
                 "rule": diag.rule,
                 "severity": diag.severity.to_string(),
-                "message": diag.message,
-                "help": diag.help,
+                "message": sanitize_control_chars(&diag.message),
+                "help": diag.help.as_deref().map(sanitize_control_chars),
                 "fixable": (diag.fix_removals.is_some() || diag.fix_edits.is_some()) && super::tier::is_fixable(&diag.rule, self.is_standalone),
                 "span": span_json,
                 "fix_edits": fix_edits_json,
@@ -392,16 +402,17 @@ impl LintResultBuilder {
 /// (U+0080–U+009F) control characters from a string, except `\n` (U+000A)
 /// and `\t` (U+0009).
 ///
-/// Applied ONLY at the CLI human-render boundary — NOT in `LintDiagnostic`
-/// constructors. The raw message is preserved in `to_canonical_json()` output
-/// because typed JSON serialization escapes control characters safely, and mutating
-/// the constructor would corrupt the LSP-stable wire format.
+/// Applied at all serialization and render boundaries (CLI human render, JSON
+/// serialization, and the Python typed conversion). NOT called in `LintDiagnostic`
+/// constructors so that span offsets and fix-edit byte ranges remain accurate against
+/// the raw source. Raw bytes in the stored struct; sanitized literals in all output.
 ///
 /// Replacement strategy: replace each control character with its Unicode escape
 /// `\uXXXX` to make the rendered text visually safe on terminals without silently
 /// dropping information that a developer might need to diagnose rule logic.
 /// DEL (U+007F) is included because some terminals interpret it as a backspace,
-/// which can corrupt human-readable output.
+/// which can corrupt human-readable output. The function is idempotent — calling it
+/// twice on already-sanitized text is a no-op.
 pub fn sanitize_control_chars(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -501,6 +512,73 @@ mod tests {
         assert!(
             raw_msg.contains('\x00') || raw_msg.contains("\\u0000"),
             "JSON should preserve or properly escape NUL byte, got: {raw_msg:?}"
+        );
+    }
+
+    /// T-4 [AC-F4, AC-C3]: `to_canonical_json()` sanitizes control chars in diagnostic
+    /// message and help. Simulates a `unused-variable` diagnostic whose message embeds
+    /// a raw ESC byte (e.g. from a hostile frontmatter key like `"ab"`).
+    ///
+    /// After the fix: the JSON message/help must carry the sanitized `\uXXXX` literal;
+    /// the raw ESC byte must not be present in the JSON string value.
+    /// Span offsets (raw byte positions) must remain unchanged.
+    #[test]
+    fn to_canonical_json_sanitizes_diagnostic_message() {
+        // Simulate an unused-variable diagnostic whose variable name contains U+001B.
+        let hostile_name = "a\x1Bb";
+        let result = LintResult {
+            diagnostics: vec![LintDiagnostic {
+                rule: "unused-variable".to_string(),
+                severity: Severity::Warn,
+                message: format!(
+                    "Variable '{}' is defined in frontmatter but never referenced in the body.",
+                    hostile_name
+                ),
+                help: Some(
+                    "Remove the frontmatter key or reference it in the template body.".to_string(),
+                ),
+                span: Some(crate::error::SerializedSpan {
+                    offset: 4,
+                    length: 3,
+                    line: None,
+                    column: None,
+                }),
+                file: Some("test.mds".to_string()),
+                fix_removals: None,
+                fix_edits: None,
+            }],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        let json = result.to_canonical_json();
+        let diag = &json["files"][0]["diagnostics"][0];
+
+        // Wire format shape must be intact.
+        assert_eq!(json["version"], 1, "version field must be 1");
+        assert_eq!(json["truncated"], false, "truncated must be false");
+        assert_eq!(json["files"][0]["file"], "test.mds");
+
+        let msg = diag["message"].as_str().unwrap();
+        // Raw ESC byte must not appear in the serialized message.
+        assert!(
+            !msg.contains('\x1B'),
+            "raw ESC byte must not appear in to_canonical_json message; got: {msg:?}"
+        );
+        // Sanitized 6-char literal \\u001B must appear.
+        assert!(
+            msg.contains("\\u001B"),
+            "sanitized literal \\u001B must appear in to_canonical_json message; got: {msg:?}"
+        );
+
+        // Span offset must be byte-accurate (not corrupted by sanitization).
+        assert_eq!(
+            diag["span"]["offset"], 4,
+            "span offset must be unchanged after message sanitization"
+        );
+        assert_eq!(
+            diag["span"]["length"], 3,
+            "span length must be unchanged after message sanitization"
         );
     }
 

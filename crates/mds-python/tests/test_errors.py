@@ -173,6 +173,95 @@ def test_e5_span_none_when_core_reports_none() -> None:
         pytest.fail("expected MdsError")
 
 
+# ── T-14: ESC-injection hardening — Python surface (issue #176 / CWE-150) ──────
+#
+# Two sub-tests:
+#  E11: error path — @include alias with U+001B in mid-token; err.message must
+#       carry the sanitized \\u001B literal; str(e) == e.message (AC-C2) must hold.
+#  E12: lint path — frontmatter key with U+001B; LintDiagnostic.message clean.
+#
+# Naming: test_e11_* / test_e12_* — chosen so -k substrings cannot collide with
+# other tests (PF-008: pytest -k matches substrings of the full node id).
+
+
+def test_e11_control_chars_in_message_are_escaped() -> None:
+    """T-14 / E11 [AC-F3, AC-C2]: error-path sanitization for Python surface.
+
+    @include with a raw ESC byte (U+001B) mid-alias is rejected by the parser
+    with MdsError::Syntax("invalid include alias: 'fo<ESC>o'"). After Change #1,
+    serialize() sanitizes the message so e.message contains no raw control bytes
+    and the sanitized \\u001B literal is visible. AC-C2 (str(e) == e.message) must
+    still hold because both use the same sanitized string.
+    """
+    esc = "\x1b"
+    source = f"@include fo{esc}o\n"
+    try:
+        m.compile(source)
+    except m.MdsError as e:
+        msg = e.message
+        # No raw C0 (excl. \\t \\n), DEL, or C1 bytes.
+        for i, ch in enumerate(msg):
+            code = ord(ch)
+            is_c0 = code < 0x20 and code not in (0x09, 0x0A)
+            is_del = code == 0x7F
+            is_c1 = 0x80 <= code <= 0x9F
+            assert not (is_c0 or is_del or is_c1), (
+                f"raw control char U+{code:04X} at index {i} must not appear in "
+                f"e.message; got: {msg!r}"
+            )
+        # Sanitized literal must be present.
+        assert "\\u001B" in msg, (
+            f"sanitized \\u001B literal must appear in e.message; got: {msg!r}"
+        )
+        # AC-C2: str(e) == e.message.
+        assert str(e) == e.message, (
+            f"AC-C2 violated: str(e)={str(e)!r} != e.message={e.message!r}"
+        )
+    else:
+        pytest.fail("expected m.MdsError to be raised")
+
+
+def _assert_no_control_chars(s: str, label: str) -> None:
+    """Assert no raw C0 (excl. \\t \\n), DEL, or C1 bytes appear in `s`."""
+    for i, ch in enumerate(s):
+        code = ord(ch)
+        is_c0 = code < 0x20 and code not in (0x09, 0x0A)
+        is_del = code == 0x7F
+        is_c1 = 0x80 <= code <= 0x9F
+        assert not (is_c0 or is_del or is_c1), (
+            f"raw control char U+{code:04X} at index {i} must not appear in {label}; got: {s!r}"
+        )
+
+
+def test_e12_lint_hostile_source_no_raw_control_bytes() -> None:
+    """T-14 / E12 [AC-F4]: lint-path sanitization — Python surface.
+
+    A frontmatter with a YAML double-quoted key containing a raw ESC byte (U+001B)
+    triggers a YAML parse error from serde_yaml_ng (control characters are not
+    allowed in YAML double-quoted strings). Whether m.lint() raises MdsError (YAML
+    error path) or returns a LintResult (if the parser becomes more permissive),
+    the output must contain no raw C0/DEL/C1 control bytes.
+
+    Note: the targeted scenario (unused-variable diagnostic message carrying U+001B)
+    cannot be reached via CLI source because YAML rejects the key. The corresponding
+    programmatic-API coverage lives in T-4 (to_canonical_json unit test in Rust).
+    """
+    esc = "\x1b"
+    source = f'---\n"a{esc}b": 1\n---\nhi\n'
+    try:
+        result = m.lint(source)
+        # YAML parsing succeeded — verify diagnostic messages are clean.
+        for file_report in result.files:
+            for diag in file_report.diagnostics:
+                msg = diag.message
+                assert isinstance(msg, str), "message must be a string"
+                _assert_no_control_chars(msg, "LintDiagnostic.message")
+    except m.MdsError as e:
+        # Expected: serde_yaml_ng rejects the raw ESC byte in the YAML key.
+        # Verify the error message is sanitized (no raw ESC echoed back).
+        _assert_no_control_chars(e.message, "MdsError.message (YAML error)")
+
+
 # ── D2: type_mismatch_at — span present on @if cross-type comparison ─────────────
 
 

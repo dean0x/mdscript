@@ -1,6 +1,6 @@
 /**
  * Error shape tests for @mdscript/mds universal package.
- * Tests: U-E1 through U-E9
+ * Tests: U-E1 through U-E10
  */
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
@@ -85,6 +85,45 @@ describe('error shape', () => {
       assert.ok(err instanceof Error);
       assert.ok(typeof err.message === 'string');
       assert.ok(err.message.length > 0, 'error message should not be empty');
+    }
+  });
+
+  // T-12 / U-E10 [AC-F3, AC-F4]: ESC-injection hardening (issue #176 / CWE-150).
+  // `@include fo<ESC>o` — alias contains a raw ESC byte (U+001B) mid-token so
+  // trim() cannot strip it.  The parser rejects the alias as an invalid identifier
+  // and produces a MdsError::Syntax whose message interpolates the raw alias.
+  // After the fix, err.message must carry the sanitized 6-char  literal and
+  // must contain no raw C0/DEL/C1 bytes.
+  test('U-E10: control chars in error message are escaped to \\uXXXX literals', () => {
+    // Build source string with raw ESC (0x1B) mid-alias at runtime to avoid any
+    // editor/tool stripping the control byte.
+    const esc = String.fromCharCode(0x1b);
+    const source = `@include fo${esc}o\n`;
+    try {
+      compile(source);
+      assert.fail('expected error to be thrown');
+    } catch (err) {
+      assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
+      const msg = err.message;
+      assert.ok(typeof msg === 'string' && msg.length > 0,
+        'message must be a non-empty string');
+      // No raw C0 (excl. \t \n), DEL, or C1 bytes — check via charCode range.
+      for (let i = 0; i < msg.length; i++) {
+        const code = msg.charCodeAt(i);
+        const isC0 = code < 0x20 && code !== 0x09 && code !== 0x0a;
+        const isDel = code === 0x7f;
+        const isC1 = code >= 0x80 && code <= 0x9f;
+        assert.ok(
+          !isC0 && !isDel && !isC1,
+          `raw control char (U+${code.toString(16).toUpperCase().padStart(4,'0')}) ` +
+          `at index ${i} must not appear in err.message; got: ${JSON.stringify(msg)}`
+        );
+      }
+      // Sanitized literal  must be present.
+      assert.ok(
+        msg.includes('\\u001B'),
+        `sanitized \\u001B literal must appear in err.message; got: ${JSON.stringify(msg)}`
+      );
     }
   });
 });
