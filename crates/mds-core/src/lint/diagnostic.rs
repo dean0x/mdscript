@@ -481,40 +481,6 @@ mod tests {
         assert!(output.contains("\\u0085"));
     }
 
-    /// L-U-H2 regression: raw message is NOT sanitized in to_canonical_json —
-    /// JSON serialization handles control characters safely via `serde_json`.
-    #[test]
-    fn canonical_json_raw_message_preserved() {
-        let result = LintResult {
-            diagnostics: vec![LintDiagnostic {
-                rule: "test-rule".to_string(),
-                severity: Severity::Warn,
-                message: "msg\x1Bwith\x00controls".to_string(),
-                help: None,
-                span: None,
-                file: Some("f.mds".to_string()),
-                fix_removals: None,
-                fix_edits: None,
-            }],
-            truncated: false,
-            is_standalone: false,
-        };
-        let json = result.to_canonical_json();
-        let raw_msg = json["files"][0]["diagnostics"][0]["message"]
-            .as_str()
-            .unwrap();
-        // The raw bytes should appear in JSON (serde_json escapes them as \u00xx).
-        // Crucially, we must NOT have applied sanitize_control_chars in the constructor.
-        assert!(
-            raw_msg.contains('\x1B') || raw_msg.contains("\\u001B"),
-            "JSON should preserve or properly escape ESC byte, got: {raw_msg:?}"
-        );
-        assert!(
-            raw_msg.contains('\x00') || raw_msg.contains("\\u0000"),
-            "JSON should preserve or properly escape NUL byte, got: {raw_msg:?}"
-        );
-    }
-
     /// T-4 [AC-F4, AC-C3]: `to_canonical_json()` sanitizes control chars in diagnostic
     /// message and help. Simulates a `unused-variable` diagnostic whose message embeds
     /// a raw ESC byte (e.g. from a hostile frontmatter key like `"ab"`).
