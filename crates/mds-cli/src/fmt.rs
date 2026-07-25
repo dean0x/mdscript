@@ -58,7 +58,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 
     let (input, auto_detected) = resolve_input(input, "fmt")?;
     if auto_detected && !quiet {
-        eprintln!("Formatting {}", input.display());
+        eprintln!("Formatting {}", crate::output::safe_path(&input));
     }
 
     let flags = FmtFlags { check, diff, quiet };
@@ -163,7 +163,7 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let result = format_source_named(&source, base_dir, &file_name)?;
 
     if diff && result.changed {
-        let label = path.display().to_string();
+        let label = crate::output::safe_path(path);
         print_diff(&render_diff(&source, &result.formatted, &label))?;
     }
 
@@ -175,10 +175,10 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // commit c5aa086 — both write paths now share the same helper).
             atomic_write_file(path, &result.formatted)?;
             if !quiet {
-                eprintln!("Formatted: {}", path.display());
+                eprintln!("Formatted: {}", crate::output::safe_path(path));
             }
         } else if !quiet {
-            eprintln!("Unchanged: {}", path.display());
+            eprintln!("Unchanged: {}", crate::output::safe_path(path));
         }
         return Ok(());
     }
@@ -186,12 +186,12 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     if check {
         if result.changed {
             if !quiet {
-                eprintln!("Would reformat: {}", path.display());
+                eprintln!("Would reformat: {}", crate::output::safe_path(path));
             }
             std::process::exit(1);
         }
         if !quiet {
-            eprintln!("Unchanged: {}", path.display());
+            eprintln!("Unchanged: {}", crate::output::safe_path(path));
         }
     }
     Ok(())
@@ -269,7 +269,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         match atomic_write_file(file, &result.formatted) {
             Ok(()) => {
                 if !quiet {
-                    eprintln!("Formatted: {}", file.display());
+                    eprintln!("Formatted: {}", crate::output::safe_path(file));
                 }
                 FileOutcome::Formatted
             }
@@ -315,7 +315,7 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
             std::process::exit(1);
         }
         if !flags.quiet {
-            eprintln!("No .mds files found in {}", dir.display());
+            eprintln!("No .mds files found in {}", crate::output::safe_path(dir));
         }
         return Ok(());
     }

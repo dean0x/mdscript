@@ -8,8 +8,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mds::{
-    effective_parent, sanitize_control_chars, CompiledOutput, MdsError, MAX_FILE_SIZE,
-    MAX_TRAVERSAL_DEPTH, STRING_SOURCE_MAP_LABEL,
+    effective_parent, CompiledOutput, MdsError, MAX_FILE_SIZE, MAX_TRAVERSAL_DEPTH,
+    STRING_SOURCE_MAP_LABEL,
 };
 use miette::Result;
 use serde::Deserialize;
@@ -561,7 +561,7 @@ pub(crate) fn write_output(
             std::fs::write(&path, compiled)
                 .map_err(|e| miette::miette!("cannot write {}: {e}", path.display()))?;
             if !quiet && announce {
-                eprintln!("Compiled to {}", path.display());
+                eprintln!("Compiled to {}", crate::output::safe_path(&path));
             }
         }
         None => {
@@ -1003,7 +1003,7 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
         if !quiet {
             eprintln!(
                 "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                map_path.display()
+                crate::output::safe_path(map_path)
             );
         }
         return;
@@ -1012,7 +1012,7 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
         if !quiet {
             eprintln!(
                 "warning: leaving {} in place — not a tool-generated SMv3 map (version/file mismatch)",
-                map_path.display()
+                crate::output::safe_path(map_path)
             );
         }
         return;
@@ -1021,11 +1021,11 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
         if !quiet {
             eprintln!(
                 "warning: could not remove stale map {}: {e}",
-                map_path.display()
+                crate::output::safe_path(map_path)
             );
         }
     } else if !quiet {
-        eprintln!("Removed stale map {}", map_path.display());
+        eprintln!("Removed stale map {}", crate::output::safe_path(map_path));
     }
 }
 
@@ -1053,7 +1053,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     // When auto-detected, print a "Building {path}" banner so users know which file was selected.
     let (input, auto_detected) = resolve_input(input, "build")?;
     if auto_detected && !quiet {
-        eprintln!("Building {}", input.display());
+        eprintln!("Building {}", crate::output::safe_path(&input));
     }
 
     // Directory mode: compile every non-partial .mds file in the tree.
@@ -1197,7 +1197,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                                 miette::miette!("cannot write {}: {e}", map_path.display())
                             })?;
                             if !quiet {
-                                eprintln!("Source map written to {}", map_path.display());
+                                eprintln!(
+                                    "Source map written to {}",
+                                    crate::output::safe_path(&map_path)
+                                );
                             }
                         }
                         return Ok(());
@@ -1326,7 +1329,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             miette::miette!("cannot write {}: {e}", map_path.display())
                         })?;
                         if !quiet {
-                            eprintln!("Source map written to {}", map_path.display());
+                            eprintln!(
+                                "Source map written to {}",
+                                crate::output::safe_path(&map_path)
+                            );
                         }
                     }
                 }
@@ -1418,7 +1424,7 @@ fn run_build_directory(
             std::process::exit(1);
         }
         if !quiet {
-            eprintln!("No .mds files found in {}", dir.display());
+            eprintln!("No .mds files found in {}", crate::output::safe_path(dir));
         }
         return Ok(());
     }
@@ -1467,7 +1473,7 @@ fn run_build_directory(
                         if let Err(e) = std::fs::create_dir_all(parent) {
                             eprintln!(
                                 "error: cannot create output directory {}: {e}",
-                                parent.display()
+                                crate::output::safe_path(parent)
                             );
                             fail_count += 1;
                             continue;
@@ -1494,7 +1500,7 @@ fn run_build_directory(
                 match std::fs::write(&out_path, &final_content) {
                     Ok(()) => {
                         if !quiet {
-                            eprintln!("Compiled to {}", out_path.display());
+                            eprintln!("Compiled to {}", crate::output::safe_path(&out_path));
                         }
                         written_this_run.insert(out_path.clone());
 
@@ -1504,12 +1510,18 @@ fn run_build_directory(
                                 let map_path = map_path_for(&out_path);
                                 let map_json = sm.to_json();
                                 if let Err(e) = std::fs::write(&map_path, &map_json) {
-                                    eprintln!("error: cannot write {}: {e}", map_path.display());
+                                    eprintln!(
+                                        "error: cannot write {}: {e}",
+                                        crate::output::safe_path(&map_path)
+                                    );
                                     fail_count += 1;
                                     continue;
                                 }
                                 if !quiet {
-                                    eprintln!("Source map written to {}", map_path.display());
+                                    eprintln!(
+                                        "Source map written to {}",
+                                        crate::output::safe_path(&map_path)
+                                    );
                                 }
                             }
                         }
@@ -1537,15 +1549,18 @@ fn run_build_directory(
                         ok_count += 1;
                     }
                     Err(e) => {
-                        eprintln!("error: cannot write {}: {e}", out_path.display());
+                        eprintln!(
+                            "error: cannot write {}: {e}",
+                            crate::output::safe_path(&out_path)
+                        );
                         fail_count += 1;
                     }
                 }
             }
             Err(e) => {
-                // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
-                // source fragments that may contain raw ESC bytes (avoids terminal escape injection).
-                eprintln!("{}", sanitize_control_chars(&format!("{e:?}")));
+                // Route through the single render choke point (avoids PF-004 /
+                // architecture-6: hand-rolled sanitize_control_chars bypass).
+                crate::output::eprint_error(e);
                 fail_count += 1;
             }
         }

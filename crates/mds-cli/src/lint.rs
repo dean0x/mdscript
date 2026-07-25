@@ -37,7 +37,10 @@ use crate::build::{
     build_runtime_vars, ensure_existing_mds_file, load_config, read_stdin, resolve_input,
     RuntimeVarArgs,
 };
-use crate::output::{atomic_write_file, collect_mds_files_detailed, neutralize_source_for_render};
+use crate::output::{
+    atomic_write_file, collect_mds_files_detailed, eprint_error, neutralize_source_for_render,
+    safe_path,
+};
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
 const KNOWN_RULES: &[&str] = &[
@@ -92,7 +95,9 @@ pub(crate) fn run_lint(args: LintArgs) -> Result<()> {
     match do_lint(args) {
         Ok(()) => Ok(()),
         Err(e) => {
-            eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
+            // Route through the single render choke point (avoids PF-004 /
+            // architecture-6: hand-rolled sanitize_control_chars bypass).
+            eprint_error(e);
             std::process::exit(2);
         }
     }
@@ -253,8 +258,9 @@ fn write_stdout(s: &str) -> Result<()> {
 
 // ── Human diagnostic rendering ────────────────────────────────────────────────
 
-/// Render one lint diagnostic to stderr, sanitizing all user-controlled inputs at the
-/// boundary before miette renders them (PF-014).
+/// Render one lint diagnostic to stderr. All user-controlled text — message, help,
+/// filename, and source — is sanitized at the input boundary so miette renders from
+/// safe inputs; the frame itself is not post-processed (PF-014).
 ///
 /// `--quiet` suppresses Warn and Info; Error always renders.
 /// `named_source`: `(filename, source_text)` pair for span context rendering. Human
@@ -265,6 +271,7 @@ fn write_stdout(s: &str) -> Result<()> {
 /// - filename: `sanitize_control_chars` → \\uXXXX escapes.
 /// - source: `neutralize_source_for_render` → byte-length-preserving substitution so
 ///   miette's span byte-offset slices remain valid after neutralization.
+///
 /// The rendered miette frame is NOT post-processed, so miette's own SGR colour codes
 /// are never corrupted.
 fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Option<(&str, &str)>) {
@@ -292,10 +299,11 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
     let (filename, src) = named_source.expect("Human format always provides named_source");
     let clean_filename = mds::sanitize_control_chars(filename);
     let clean_src = neutralize_source_for_render(src);
-    let report = miette::Report::from(sanitized).with_source_code(
-        miette::NamedSource::new(clean_filename.as_ref(), clean_src.into_owned()),
-    );
-    crate::output::eprint_error(report);
+    let report = miette::Report::from(sanitized).with_source_code(miette::NamedSource::new(
+        clean_filename.as_ref(),
+        clean_src.into_owned(),
+    ));
+    eprint_error(report);
 }
 
 /// Render all diagnostics in a `LintResult` to stderr.
@@ -798,7 +806,7 @@ fn run_lint_file(
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source)?;
                 if !quiet {
-                    eprintln!("Fixed: {}", path.display());
+                    eprintln!("Fixed: {}", safe_path(path));
                 }
                 exit_by_severity(&residual);
             }
@@ -811,7 +819,7 @@ fn run_lint_file(
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
-                        path.display()
+                        safe_path(path)
                     );
                 }
                 emit_result(format, &residual, quiet, named_source);
@@ -826,7 +834,7 @@ fn run_lint_file(
             FixFileOutcome::NothingToFix { original } => {
                 emit_result(format, &original, quiet, named_source);
                 if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
-                    eprintln!("Clean: {filename}");
+                    eprintln!("Clean: {}", mds::sanitize_control_chars(filename));
                 }
                 exit_by_severity(&original);
             }
@@ -834,7 +842,7 @@ fn run_lint_file(
         return Ok(());
     }
 
-    // ── Preview path: --fix --check and/or --fix --diff ───────────────────────
+    // ── Preview path: --fix --check and/or --fix --diff ─────────────────
     // Route preview through the same gated pipeline as the write path.
     // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
     // a diff or check result could misrepresent what --fix would actually do.
@@ -843,13 +851,13 @@ fn run_lint_file(
         match preview {
             PreviewOutcome::WouldFix(ref fixed) => {
                 if diff {
-                    let label = path.display().to_string();
+                    let label = safe_path(path);
                     let diff_str = render_diff_lint(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
                 if check {
                     if !quiet {
-                        eprintln!("Would fix: {}", path.display());
+                        eprintln!("Would fix: {}", safe_path(path));
                     }
                     std::process::exit(1);
                 }
@@ -872,7 +880,7 @@ fn run_lint_file(
     // ── Report-only mode (no --fix) ───────────────────────────────────────────
     emit_result(format, &result, quiet, named_source);
     if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
-        eprintln!("Clean: {filename}");
+        eprintln!("Clean: {}", mds::sanitize_control_chars(filename));
     }
     exit_by_severity(&result);
     Ok(())
@@ -980,7 +988,7 @@ fn run_lint_directory(
             std::process::exit(2);
         }
         if !quiet {
-            eprintln!("No .mds files found in {}", dir.display());
+            eprintln!("No .mds files found in {}", safe_path(dir));
         }
         return Ok(());
     }
@@ -1111,7 +1119,7 @@ fn lint_one_file_accumulating(
             eprintln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
-                file.display(),
+                safe_path(file),
                 mds::MAX_DIAGNOSTICS
             );
         }
@@ -1142,7 +1150,7 @@ fn lint_one_file_accumulating(
                 set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", file.display());
+                    eprintln!("error writing {}: {e}", safe_path(file));
                     return FileTally::Error;
                 }
                 tally_from_result(&residual)
@@ -1157,19 +1165,19 @@ fn lint_one_file_accumulating(
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
-                        file.display()
+                        safe_path(file)
                     );
                 }
                 set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", file.display());
+                    eprintln!("error writing {}: {e}", safe_path(file));
                     return FileTally::Error;
                 }
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("{}: fix rejected: {reason}", file.display());
+                eprintln!("{}: fix rejected: {reason}", safe_path(file));
                 accumulate_result_json(&original, json_files);
                 tally_from_result(&original)
             }
@@ -1200,13 +1208,13 @@ fn lint_one_file_accumulating(
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
                 if diff {
-                    let label = file.display().to_string();
+                    let label = safe_path(file);
                     let diff_str = render_diff_lint(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
             }
             PreviewOutcome::Rejected(ref reason) => {
-                eprintln!("{}: fix rejected: {reason}", file.display());
+                eprintln!("{}: fix rejected: {reason}", safe_path(file));
             }
             PreviewOutcome::NothingToFix => {}
         }
@@ -1243,7 +1251,7 @@ fn lint_one_file_human(
     let source = match read_source_file(file) {
         Ok(s) => s,
         Err(e) => {
-            crate::output::eprint_error(miette::Report::from(e));
+            eprint_error(miette::Report::from(e));
             return FileTally::Error;
         }
     };
@@ -1257,7 +1265,7 @@ fn lint_one_file_human(
     let config = match ctx.config_for(base_dir) {
         Ok(c) => c,
         Err(e) => {
-            crate::output::eprint_error(miette::Report::from(e));
+            eprint_error(miette::Report::from(e));
             return FileTally::Error;
         }
     };
@@ -1268,7 +1276,7 @@ fn lint_one_file_human(
     let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(ref e) => {
-            crate::output::eprint_error(miette::Report::from(e.clone()));
+            eprint_error(miette::Report::from(e.clone()));
             return if matches!(e, MdsError::ResourceLimit { .. }) {
                 FileTally::ResourceLimit
             } else {
@@ -1285,7 +1293,7 @@ fn lint_one_file_human(
             eprintln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
-                file.display(),
+                safe_path(file),
                 mds::MAX_DIAGNOSTICS
             );
         }
@@ -1302,11 +1310,11 @@ fn lint_one_file_human(
                 set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", file.display());
+                    eprintln!("error writing {}: {e}", safe_path(file));
                     return FileTally::Error;
                 }
                 if !quiet {
-                    eprintln!("Fixed: {}", file.display());
+                    eprintln!("Fixed: {}", safe_path(file));
                 }
                 tally_from_result(&residual)
             }
@@ -1320,19 +1328,19 @@ fn lint_one_file_human(
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
-                        file.display()
+                        safe_path(file)
                     );
                 }
                 set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", file.display());
+                    eprintln!("error writing {}: {e}", safe_path(file));
                     return FileTally::Error;
                 }
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("{}: fix rejected: {reason}", file.display());
+                eprintln!("{}: fix rejected: {reason}", safe_path(file));
                 render_result_human(&original, quiet, named_source);
                 tally_from_result(&original)
             }
@@ -1353,17 +1361,17 @@ fn lint_one_file_human(
             PreviewOutcome::WouldFix(ref fixed) => {
                 *any_would_fix = true;
                 if diff {
-                    let label = file.display().to_string();
+                    let label = safe_path(file);
                     let diff_str = render_diff_lint(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
                 if check && !quiet {
-                    eprintln!("Would fix: {}", file.display());
+                    eprintln!("Would fix: {}", safe_path(file));
                 }
             }
             PreviewOutcome::Rejected(ref reason) => {
                 if !quiet {
-                    eprintln!("{}: fix rejected: {reason}", file.display());
+                    eprintln!("{}: fix rejected: {reason}", safe_path(file));
                 }
             }
             PreviewOutcome::NothingToFix => {}
@@ -1411,10 +1419,9 @@ fn emit_analysis_failure_json_or_stderr(e: &MdsError, format: LintFormat) {
             serde_json::to_string(&envelope).expect("canonical lint JSON is always serializable")
         ));
     } else {
-        // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
-        // source fragments that may contain raw ESC bytes (avoids terminal escape injection).
-        let rendered = format!("{:?}", miette::Report::from(e.clone()));
-        eprintln!("{}", mds::sanitize_control_chars(&rendered));
+        // Route through the single render choke point (avoids PF-004 /
+        // architecture-6: hand-rolled sanitize_control_chars bypass).
+        eprint_error(miette::Report::from(e.clone()));
     }
 }
 

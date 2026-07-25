@@ -492,29 +492,56 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 /// (avoids PF-004 / PF-014 parallel-path drift).
 pub(crate) use mds::neutralize_source_for_render;
 
-/// Render a miette Report to a `String` — the pure transformation extracted from
+/// Render a miette `Report` to a `String` — the pure transformation extracted from
 /// [`eprint_error`] so it can be tested without touching stderr.
 ///
-/// Under the input-sanitizing design (avoids PF-014), this function does NOT apply
+/// Under the input-sanitizing design (PF-014), this function does NOT apply
 /// `sanitize_control_chars` to the rendered frame — that would escape miette's own
 /// ANSI SGR colour codes on any colour-capable TTY.  Hostile control characters must
-/// be removed from the Report's *inputs* (message, help, and source text) before this
-/// function is called.  [`render_diag_human`](crate::lint) is the canonical call site
-/// that performs that input-level sanitization.
-pub(crate) fn render_error_sanitized(report: &miette::Report) -> String {
+/// be neutralized from the Report's *inputs* (message, help, and source text) before
+/// this function is called.
+///
+/// Note: idempotency is a property of [`mds::sanitize_control_chars`] (calling it
+/// twice on already-sanitized input is a no-op), not of this function (each call
+/// re-renders the `Report` from scratch).
+fn render_error_sanitized(report: &miette::Report) -> String {
     format!("{report:?}")
 }
 
-/// Render a miette Report to stderr.
+/// Render a miette `Report` to stderr — the single choke-point for all CLI error
+/// output.
 ///
-/// Per-file error handlers MUST build their miette Reports with pre-sanitized inputs
-/// (message, help, and source text) before calling this helper (avoids PF-004: a check
-/// enforced on the primary path silently absent on a sibling path).  miette's own ANSI
-/// SGR styling flows through to the terminal untouched — carets and box-drawing survive
-/// intact because source text is neutralized with byte-length-preserving substitution
-/// before being handed to miette, keeping every span byte-offset valid.
+/// All per-file error handlers in `main`, `build`, `lint`, and `watch` route error
+/// rendering through this helper, so there is exactly one site to audit for escape-
+/// injection safety (architecture-6 / avoids PF-004: a check enforced on the primary
+/// path silently absent on a sibling path).
+///
+/// Callers must pre-sanitize the Report's inputs before calling this function:
+/// - **message / help**: via [`mds::sanitize_control_chars`]
+/// - **source text**: via [`mds::neutralize_source_for_render`] (byte-length-preserving
+///   so span byte-offsets remain valid after substitution)
+/// - **filename**: via [`mds::sanitize_control_chars`]
+///
+/// miette's own ANSI SGR styling is passed through untouched — carets and box-drawing
+/// survive intact.
+///
+/// Note: status-line path display (`Clean:`, `Fixed:`, etc.) is handled by the
+/// separate [`safe_path`] helper, not by this function.
 pub(crate) fn eprint_error(report: miette::Report) {
     eprintln!("{}", render_error_sanitized(&report));
+}
+
+/// Sanitize a filesystem path for terminal display (CWE-150 guard).
+///
+/// Converts the path to a display string and applies [`mds::sanitize_control_chars`]
+/// so hostile filenames containing control sequences (e.g. `ESC[2J`) cannot inject
+/// ANSI terminal commands into status lines.
+///
+/// All status-line path interpolations (`Clean:`, `Fixed:`, `Compiled to:`, etc.) in
+/// `lint`, `fmt`, and `build` must route through this helper (avoids PF-004 /
+/// security-5: unsanitized filename vector in status output).
+pub(crate) fn safe_path(p: &std::path::Path) -> String {
+    mds::sanitize_control_chars(&p.display().to_string()).into_owned()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -803,6 +830,33 @@ mod tests {
         assert_eq!(result, PathBuf::from("/root/src/chat"));
     }
 
+    // ── safe_path: CWE-150 status-line guard (security-5/6) ──────────────────────
+
+    /// T-11a [security-5 / PF-013]: safe_path escapes a raw ESC byte in a filename
+    /// to the 6-char \\uXXXX literal so it cannot inject ANSI into a status line.
+    #[test]
+    fn safe_path_sanitizes_esc_byte() {
+        let raw = format!("dir/fo{}o.mds", '\x1b');
+        let p = std::path::Path::new(&raw);
+        let result = safe_path(p);
+        assert!(
+            !result.contains('\x1b'),
+            "raw ESC must be absent from safe_path output"
+        );
+        assert!(
+            result.contains("\\u001B"),
+            "ESC must be escaped to \\u001B; got: {result:?}"
+        );
+    }
+
+    /// T-11b [security-5 / PF-013]: safe_path passes a clean path through unchanged
+    /// (no unnecessary allocation or mutation).
+    #[test]
+    fn safe_path_passes_clean_path_unchanged() {
+        let p = std::path::Path::new("dir/normal.mds");
+        assert_eq!(safe_path(p), "dir/normal.mds");
+    }
+
     // ── T-10a/b/c: neutralize_source_for_render + colour path (── PF-014) ────────
 
     /// T-10a [PF-014 / AC-F2]: neutralize_source_for_render removes C0 controls
@@ -863,7 +917,7 @@ mod tests {
     }
 
     /// T-10c [testing-2 / PF-014]: miette's own SGR colour codes survive
-    /// (render_error_sanitized no longer strips them) while a hostile
+    /// (render_error_sanitized never post-processes the frame) while a hostile
     /// OSC sequence embedded in the source is neutralised at the input stage.
     #[test]
     fn colour_path_miette_sgr_survives_hostile_osc_is_removed() {
@@ -876,7 +930,10 @@ mod tests {
         let raw = format!("good{}text", hostile_char);
         let clean = neutralize_source_for_render(&raw);
         assert_eq!(clean.len(), raw.len(), "byte length preserved");
-        assert!(!clean.contains(hostile_char), "C1 OSC neutralised in source");
+        assert!(
+            !clean.contains(hostile_char),
+            "C1 OSC neutralised in source"
+        );
 
         #[derive(Debug, thiserror::Error, miette::Diagnostic)]
         #[error("colour test")]
