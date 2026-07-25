@@ -1,0 +1,196 @@
+# Resolution Summary
+
+**Branch**: fix/esc-injection-176 -> main
+**Date**: 2026-07-25
+**Review**: .devflow/docs/reviews/fix-esc-injection-176/2026-07-25_1625
+**Command**: /resolve
+
+## Decisions Citations
+
+- applies PF-014 — resolve-B2a (regression-1 cluster: sanitize inputs, never the rendered frame), resolve-B2b, resolve-B1b
+- avoids PF-013 — resolve-B1a (testing-3, testing-7), resolve-B4 (python-2), resolve-B5 (consistency-1), resolve-B7 (testing-1, testing-9, testing-12), resolve-B3 (display_sanitized tests)
+- avoids PF-004 — resolve-B2a (formatter.rs parallel NamedSource path), resolve-B4 (python-5 typed path), resolve-B2b (5 hand-rolled sites unified)
+- applies PF-007 — resolve-B4 (typed/wire parity), resolve-B5 (native-vs-WASM differential)
+- avoids PF-008 — resolve-B7 (testing-12 fail-closed gates)
+
+## Statistics
+| Metric | Value |
+|--------|-------|
+| Total Issues | 110 |
+| Fixed | 94 |
+| False Positive | 0 |
+| By Design | 0 |
+| Deferred | 11 |
+| Blocked | 0 |
+| Escalated | 5 |
+
+_(Note: `Deferred` = `## Fix Separately` count + `## Deferred to Tech Debt` count combined — the two sections are distinct by scope, but the Statistics row aggregates both for the convergence parser.)_
+
+## Verification
+| Command | Result |
+|---------|--------|
+| cargo fmt --all -- --check | PASS |
+| cargo clippy --workspace --all-targets -- -D warnings | PASS |
+| cargo nextest run --workspace (1925 tests) | PASS |
+| cargo test --doc --workspace (36 doc tests) | PASS |
+| maturin develop + pytest crates/mds-python/tests (223 tests) | PASS |
+| npm test -w @mdscript/mds-napi (98 tests) | PASS |
+| npm test -w @mdscript/mds (263 tests) | PASS |
+
+Regression tests added: 27
+
+Final gate: PASS
+
+## Fixed Issues
+| Issue | File:Line | Commit |
+|-------|-----------|--------|
+| performance-1: sanitize_control_chars always allocates (String::with_capacity(s.len())) and copies char-by-char even when the | crates/mds-core/src/lint/diagnostic.rs:416 | ed24492 |
+| rust-7: sanitize_control_chars returns String unconditionally where Cow<'_, str> is the idiomatic signature—a &str ->  | crates/mds-core/src/lint/diagnostic.rs:418 | ed24492 |
+| reliability-3: String::with_capacity(s.len()) is guaranteed insufficient for inputs containing control characters: every esca | crates/mds-core/src/lint/diagnostic.rs:417 | ed24492 |
+| performance-7: fmt::write(&mut out, format_args!("\\u{:04X}", ch as u32)) invokes the full width/zero-pad formatting machiner | crates/mds-core/src/lint/diagnostic.rs:424 | ed24492 |
+| security-3: to_canonical_json() sanitizes message and help but emits the per-file group key verbatim: "file": file | crates/mds-core/src/lint/diagnostic.rs:341 | ed24492 |
+| reliability-5: file is the one user-controlled text channel left unsanitized on every JSON and typed surface | crates/mds-core/src/lint/diagnostic.rs:292 | ed24492 |
+| compliance-2: The PR claim 'every serialization boundary' overstates coverage: in to_canonical_json(), message and help are  | crates/mds-core/src/lint/diagnostic.rs:344 | ed24492 |
+| security-8: Compile warnings are printed and serialized unsanitized at main.rs:278, :287, :340, build.rs:694, :1148, and C | crates/mds-cli/src/main.rs:278 | ed24492 |
+| architecture-8: Unsanitized warning emission via emit_warnings (lib.rs:507-511), CompileResult::to_canonical_json warnings (li | crates/mds-core/src/lib.rs:507 | ed24492 |
+| rust-8: let _ = fmt::write(&mut out, format_args!("\\u{:04X}", ch as u32)) discards a Result and uses fmt::write + for | crates/mds-core/src/lint/diagnostic.rs:426 | ed24492 |
+| complexity-8: let _ = fmt::write(&mut out, format_args!(...)) is an unusual form that reads as though something subtle is ha | crates/mds-core/src/lint/diagnostic.rs:424 | ed24492 |
+| rust-9: Public sanitize_control_chars lacks #[must_use] and a doctest, breaking mds-core's own API convention | crates/mds-core/src/lint/diagnostic.rs:418 | ed24492 |
+| testing-3: The diff adds help sanitization at two new boundaries: diagnostic.rs:328 and mds-python/src/lib.rs:784 | crates/mds-core/src/lint/diagnostic.rs:328 | ed24492 |
+| testing-7: Idempotency is claimed in three places (diagnostic.rs:414, output.rs:494, and the KB) and asserted nowhere | crates/mds-core/src/lint/diagnostic.rs:414 | ed24492 |
+| regression-1: Whole-frame sanitization escapes miette's own ANSI colour codes, so interactive mds lint and mds watch output  | crates/mds-cli/src/lint.rs:289 | 5d35da0 |
+| security-1: Whole-frame sanitization mangles miette's own ANSI styling: interactive mds lint / mds watch output is now lit | crates/mds-cli/src/lint.rs:289 | 5d35da0 |
+| security-2: Caret/underline is misaligned whenever the source line contains a control char | crates/mds-cli/src/output.rs:495 | 5d35da0 |
+| reliability-1: Post-render sanitization desynchronizes miette's caret/underline from the source line it points at | crates/mds-cli/src/output.rs:496 | 5d35da0 |
+| reliability-2: render_result_human iterates result.diagnostics (capped at MAX_DIAGNOSTICS=1000) | crates/mds-cli/src/lint.rs:283 | 5d35da0 |
+| architecture-3: The field-level pre-sanitize in render_diag_human builds a full LintDiagnostic clone to sanitize message and h | crates/mds-cli/src/lint.rs:266 | 5d35da0 |
+| complexity-4: The comment at lint.rs:266-268 claims the double-pass 'guards against any future path that might bypass the ou | crates/mds-cli/src/lint.rs:266 | 5d35da0 |
+| documentation-8: The comment at lint.rs:266-268 justifies the field-level sanitize as guarding 'against any future path that mi | crates/mds-cli/src/lint.rs:266 | 5d35da0 |
+| rust-2: The comment at lint.rs:265-267 claims the inner field-level pass 'guards against any future path that might by | crates/mds-cli/src/lint.rs:265 | 5d35da0 |
+| reliability-4: The field-level pass builds a complete LintDiagnostic clone including span.clone(), file.clone(), fix_removals | crates/mds-cli/src/lint.rs:266 | 5d35da0 |
+| performance-3: The redundant field-level sanitize pass in render_diag_human is fully subsumed by the whole-report pass in epr | crates/mds-cli/src/lint.rs:272 | 5d35da0 |
+| rust-1: render_diag_human builds a render-only sanitized local with a full-field struct literal that includes fix_remo | crates/mds-cli/src/lint.rs:269 | 5d35da0 |
+| performance-6: The sanitized LintDiagnostic clone at lint.rs:276-277 clones fix_removals and fix_edits (Vec<TextEdit>, each w | crates/mds-cli/src/lint.rs:276 | 5d35da0 |
+| testing-4: The named_source = None branch of render_diag_human is unreachable | crates/mds-cli/src/lint.rs:288 | 5d35da0 |
+| documentation-6: output.rs:509-511 claims 'miette box-drawing and carets therefore survive intact' and lint.rs:284-287 claims ' | crates/mds-cli/src/output.rs:509 | 5d35da0 |
+| testing-2: All five new e2e vectors force NO_COLOR=1 deliberately, so the suite has zero coverage of the default interact | crates/mds-cli/src/lint.rs:283 | 5d35da0 |
+| regression-3: All five new ESC tests force NO_COLOR=1 deliberately, making the suite pin only the non-default configuration | crates/mds-cli/tests/cli_lint.rs:343 | 5d35da0 |
+| testing-10: T-10 depends on ambient colour configuration: format!("{report:?}") uses miette's global handler | crates/mds-cli/src/output.rs:812 | 5d35da0 |
+| reliability-8: T-10's assertion set (no 0x1B, contains \u001B, contains Hello) cannot distinguish a correct frame from a care | crates/mds-cli/src/output.rs:812 | 5d35da0 |
+| testing-5: Two defence-in-depth layers added in this diff cannot be distinguished from their own absence by any test: (1) | crates/mds-cli/src/lint.rs:271 | 5d35da0 |
+| rust-5: After this PR the crate ships two text accessors with opposite safety properties: e.serialize().message is san | crates/mds-core/src/error.rs:826 | 5d35da0 |
+| architecture-2: MdsError derives Display via thiserror and is publicly re-exported; a downstream Rust consumer writing the nat | crates/mds-core/src/error.rs:826 | 5d35da0 |
+| consistency-7: error.rs uses crate::lint::sanitize_control_chars(...) inline twice at lines 826 and 828; the symbol is re-exp | crates/mds-core/src/error.rs:826 | 5d35da0 |
+| rust-12: error.rs uses crate::lint::sanitize_control_chars(...) inline at lines 826 and 828 while crate::sanitize_contr | crates/mds-core/src/error.rs:826 | 5d35da0 |
+| compliance-3: err.detail bypasses the new MdsError::serialize() choke-point: it is set by the catch_unwind wrappers outside  | crates/mds-napi/src/lib.rs:310 | 5d35da0 |
+| python-1: Change #2 breaks typed-vs-wire parity: message/help are sanitized when populating the typed pyclass at lines 7 | crates/mds-python/src/lib.rs:780 | dfb21a5 |
+| architecture-4: The Python belt-and-suspenders guard re-sanitizes json_str(d, "message") where d is already a serde_json::Valu | crates/mds-python/src/lib.rs:776 | dfb21a5 |
+| python-4: The code comment at lib.rs:775-779 claims the wrap 'ensures as_json()/to_dict() parity for any future code pat | crates/mds-python/src/lib.rs:775 | dfb21a5 |
+| performance-4: message: mds::sanitize_control_chars(&json_str(d, "message")) causes two wasted allocations per diagnostic fie | crates/mds-python/src/lib.rs:780 | dfb21a5 |
+| rust-4: message: mds::sanitize_control_chars(&json_str(d, "message")) double-allocates: json_str already returns an ow | crates/mds-python/src/lib.rs:779 | dfb21a5 |
+| python-5: LintFileReport.file carries raw C0/DEL/C1 bytes—json_str(file_val, "file") is populated unsanitized in the sam | crates/mds-python/src/lib.rs:752 | dfb21a5 |
+| python-2: E12 cannot fail if the pyclass sanitize wrap at lib.rs:780/784 is deleted—it validates core B4, not the Python | crates/mds-python/tests/test_errors.py:232 | dfb21a5 |
+| python-6: The (b) comment block inside E12's first loop sits inside for diag in all_diags: but the (b) assertion actuall | crates/mds-python/tests/test_errors.py:274 | dfb21a5 |
+| python-7: Only ESC (U+001B) is exercised on the Python surface | crates/mds-python/tests/test_errors.py:200 | dfb21a5 |
+| python-3: E12 docstring states the vector uses 'a module whose NAME contains a raw ESC byte', but the resulting file key | crates/mds-python/tests/test_errors.py:272 | dfb21a5 |
+| consistency-1: Three lint-path binding tests accept either escape casing via || alternatives: napi T-13b, Python E12, and WAS | crates/mds-napi/__test__/index.spec.mjs:1272 | 555095f |
+| consistency-2: The vector-label scheme has three conflicting accountings and T-11 does not exist | crates/mds-napi/__test__/index.spec.mjs:1193 | 555095f |
+| testing-11: Binding surfaces test ESC only (U+001B); DEL/C1 stop at core + CLI | crates/mds-napi/__test__/index.spec.mjs:1200 | 555095f |
+| testing-6: Six per-surface goldens exist but zero differential assertions | crates/mds-napi/__test__/index.spec.mjs:1275 | 555095f |
+| consistency-5: The control-char assertion predicate is spelled four ways with naming inconsistency: napi uses assertNoControl | crates/mds-napi/__test__/index.spec.mjs:1203 | 555095f |
+| complexity-3: The control-byte assertion predicate (C0-excl-\t\n / DEL / C1) appears six times across the PR | crates/mds-wasm/tests/web.rs:790 | 555095f |
+| consistency-6: The feature-KB anchor note states E11/E12 live in test_errors.py/test_lint.py, but crates/mds-python/tests/tes | .devflow/features/mds-lint/KNOWLEDGE.md | 555095f |
+| architecture-6: Five sibling sites (lint.rs:95, lint.rs:1408, main.rs:232, main.rs:348, build.rs:1548) still hand-roll eprintl | crates/mds-cli/src/lint.rs:95 | 9b1e3c3 |
+| security-7: mds build / mds check already mangle miette colours via pre-existing sanitize_control_chars(&format!("{e:?}")) | crates/mds-cli/src/main.rs:232 | 9b1e3c3 |
+| security-5: mds lint status lines print attacker-controlled filenames raw at lint.rs:792, :820, :843, :866, :1163, :1300,  | crates/mds-cli/src/lint.rs:792 | 9b1e3c3 |
+| architecture-10: ESC-bearing filenames are a distinct unaddressed vector: eprintln!("error writing {}: {e}", file.display()) at | crates/mds-cli/src/lint.rs:1136 | 9b1e3c3 |
+| security-6: Same raw-filename pattern across fmt.rs (lines 61, 178, 181, 189, 194, 272, 318) and build.rs (lines 564, 1028 | crates/mds-cli/src/fmt.rs:61 | 9b1e3c3 |
+| regression-4: mds check, mds build, and mds fmt already mangle colour via pre-existing eprint_error and inline-sanitize site | crates/mds-cli/src/fmt.rs:232 | 9b1e3c3 |
+| documentation-12: eprint_error's doc states handlers 'MUST use this helper' and that centralizing the render 'means the sanitize | crates/mds-cli/src/output.rs:501 | 9b1e3c3 |
+| consistency-4: eprint_error call style forks within this PR: watch.rs:42 adds eprint_error to its use crate::output::{...} bl | crates/mds-cli/src/watch.rs:42 | 9b1e3c3 |
+| rust-3: render_error_sanitized is pub(crate) but its only non-test caller is eprint_error at output.rs:513—same module | crates/mds-cli/src/output.rs:495 | 9b1e3c3 |
+| reliability-7: render_error_sanitized doc claims 'The render+sanitize pass is idempotent: calling it a second time on already | crates/mds-cli/src/output.rs:492 | 9b1e3c3 |
+| documentation-14: render_diag_human's summary line still reads 'applying sanitize_control_chars at the boundary', written for th | crates/mds-cli/src/lint.rs:256 | 9b1e3c3 |
+| documentation-4: 'ALL serialization and render boundaries' is factually false on two counts: (1) CompileResult::to_canonical_js | crates/mds-core/src/lint/diagnostic.rs:7 | 9ef6576 |
+| architecture-1: The rewritten module doc asserts sanitization is applied at 'ALL serialization and render boundaries' and enum | crates/mds-core/src/lint/diagnostic.rs:7 | 9ef6576 |
+| consistency-3: Two boundary lists in the same file (module header lines 7-14 and sanitize_control_chars fn doc lines 405-407, | crates/mds-core/src/lint/diagnostic.rs:7 | 9ef6576 |
+| documentation-7: The module header (lines 7-17) and the sanitize_control_chars fn doc (lines 405-408), both rewritten in this P | crates/mds-core/src/lint/diagnostic.rs:405 | 9ef6576 |
+| documentation-3: Line 135 reads '**Sanitization**: apply sanitize_control_chars at the CLI render boundary **only**.' This is f | crates/mds-core/src/lint/diagnostic.rs:135 | 9ef6576 |
+| rust-6: LintDiagnostic struct doc at line 135 reads '**Sanitization**: apply sanitize_control_chars at the CLI render  | crates/mds-core/src/lint/diagnostic.rs:135 | 9ef6576 |
+| architecture-7: Line 135 still reads '**Sanitization**: apply sanitize_control_chars at the CLI render boundary only.' The mod | crates/mds-core/src/lint/diagnostic.rs:135 | 9ef6576 |
+| documentation-2: The LintDiagnostic doc comment reads: 'Implements std::error::Error + miette::Diagnostic so it can be rendered | crates/mds-core/src/lint/diagnostic.rs:123 | 9ef6576 |
+| complexity-5: LintDiagnostic struct doc at line 123 still reads 'so it can be rendered by miette at the CLI boundary: eprint | crates/mds-core/src/lint/diagnostic.rs:123 | 9ef6576 |
+| documentation-16: The field doc at line 143 reads 'Raw — do not sanitize in the constructor' which is accurate and should stay,  | crates/mds-core/src/lint/diagnostic.rs:143 | 9ef6576 |
+| documentation-11: sanitize_control_chars is now a load-bearing public API of the crates.io-published mds-core, re-exported at th | crates/mds-core/src/lint/diagnostic.rs:401 | 9ef6576 |
+| testing-1: T-9 is fully vacuous for three independent reasons: (1) the ESC never reaches any output field—serde_yaml_ng r | crates/mds-cli/tests/cli_lint.rs:1795 | a2a9cb0 |
+| documentation-15: T-9's redesign rationale (that serde_yaml_ng rejects raw ESC in YAML frontmatter keys so T-9 became a wire-lev | crates/mds-cli/tests/cli_lint.rs:1784 | a2a9cb0 |
+| testing-12: T-9's Gate 3 fails open: if let Some(files) = json["files"].as_array() silently skips the whole check when the | crates/mds-cli/tests/cli_lint.rs:1841 | a2a9cb0 |
+| complexity-1: T-9's Gate 2 iterates stdout_str.bytes() and tests (0x80..=0x9F).contains(&byte) for C1 | crates/mds-cli/tests/cli_lint.rs:1827 | a2a9cb0 |
+| complexity-2: Four new tests (lines 1614, 1663, 1700, 1757) hand-roll command construction that lint_path and lint_stdin hel | crates/mds-cli/tests/cli_lint.rs:1614 | a2a9cb0 |
+| complexity-9: let stderr = out.stderr.clone() clones the buffer needlessly in four new tests (lines 1622, 1671, 1717, 1767) | crates/mds-cli/tests/cli_lint.rs:1622 | a2a9cb0 |
+| testing-9: Pre-existing ESC test lint_esc_byte_in_syntax_error_is_sanitized_on_stderr (unchanged by this PR) calls lint_p | crates/mds-cli/tests/cli_lint.rs:1563 | a2a9cb0 |
+| testing-8: A3 (11 watch.rs call sites) ships with no test coverage: crates/mds-cli/tests/cli_watch.rs is untouched and no | crates/mds-cli/src/watch.rs:790 | a2a9cb0 |
+| documentation-1: CHANGELOG.md is untouched on this branch: grep for 'sanitiz', 'control char', 'CWE-150', '#176', and 'injectio | CHANGELOG.md | ae0fd23 |
+| compliance-1: git diff main...HEAD touches 15 files and zero of them is CHANGELOG.md | CHANGELOG.md | ae0fd23 |
+| regression-2: The PR body states a Behavioral change noting err.message, err.help, and lint diagnostic messages now carry \u | CHANGELOG.md | ae0fd23 |
+| documentation-5: spec.md §7.5 is the normative wire-format documentation for mds lint --format json | spec.md:971 | ae0fd23 |
+| architecture-5: to_canonical_json() now mutates the value domain of message/help while the envelope version stays 1 | crates/mds-core/src/lint/diagnostic.rs:327 | ae0fd23 |
+| documentation-9: The PR body states '@mdscript/bundler-utils (normalizeError) .. | (none) | ae0fd23 |
+| regression-5: The PR body names the bundler entry point normalizeError; the actual export is formatMdsError (packages/bundle | (none) | ae0fd23 |
+| documentation-10: The PR body claims '15 test vectors added across all surfaces' and maps T-11..T-15 to four binding surfaces (f | (none) | ae0fd23 |
+
+## False Positives
+| Issue | File:Line | Reasoning |
+|-------|-----------|-----------|
+
+(none — every spot-checked reviewer claim held)
+
+## By Design
+| Issue | File:Line | Rationale (ADR/doc) |
+|-------|-----------|---------------------|
+
+(none)
+
+## Fix Separately
+| Issue | File:Line | Reason | Tracked |
+|-------|-----------|--------|---------|
+| performance-2: render_diag_human clones the entire source file for every single diagnostic via src.to_str | crates/mds-cli/src/lint.rs:285 | src.to_string() per diagnostic identical to main; Arc<str> refactor is its own ticket | #255 |
+| performance-5: accumulate_result_json deep-clones every diagnostic Value via json_files.extend(arr.iter() | crates/mds-cli/src/lint.rs:1416 | accumulate_result_json deep clone, pre-existing; sibling to #173 | #173 (comment) |
+| complexity-6: run_watch_file is ~311 lines, fully pre-existing | crates/mds-cli/src/watch.rs:886 | run_watch_file ~311 lines, fully pre-existing; PR changed one line | #256 |
+| complexity-7: eprint_error + error-settle pattern is repeated in two identical pairs: watch.rs:869/:877  | crates/mds-cli/src/watch.rs:869 | watch.rs duplicate pairs; restructuring cost exceeds benefit in this PR | #257 |
+| reliability-6: eprintln! panics with 'failed printing to stderr' if the write fails (e.g | crates/mds-cli/src/output.rs:513 | eprintln! EPIPE panic — every site was already eprintln! on main | #258 |
+| rust-10: Public LintDiagnostic is not #[non_exhaustive] while its sibling public Message is | crates/mds-core/src/lint/diagnostic.rs | #[non_exhaustive] on LintDiagnostic — PRE-TAG deadline: free at zero users, breaking after v0.4.0 | #259 |
+| rust-11: format!("{report:?}") materializes the entire rendered frame, then sanitize_control_chars  | crates/mds-cli/src/output.rs:495 | double materialization; likely moot after PF-014 redesign — re-check then close or fix | #260 |
+| architecture-9: render_error_sanitized name describes the transformation but not that it is the boundary;  | crates/mds-cli/src/output.rs:495 | rename render_error_sanitized — revisit now that PF-014 reshaped it | #261 |
+| architecture-11: sanitize_control_chars lives in the lint module but is now a core cross-cutting concern: e | crates/mds-core/src/lint/diagnostic.rs:416 | move sanitizer to mds-core/src/sanitize.rs; orthogonal to closing #176 | #262 |
+| documentation-13: spec.md documents the lint JSON wire format (§7.5) but has no comparable normative section | spec.md | normative spec section for serialized error shape; pre-existing gap | #263 |
+| python-8: E11 uses try/except/else + pytest.fail rather than pytest.raises, which is less idiomatic | crates/mds-python/tests/test_errors.py:246 | pytest.raises idiom conditioned on file-wide style migration | #264 |
+
+## Deferred to Tech Debt
+| Issue | File:Line | Risk Factor |
+|-------|-----------|-------------|
+
+(none — all deferrals are scoped FIX_SEPARATE tickets)
+
+## Escalations
+| Issue | File:Line | Security Concern | Decision (2026-07-25) |
+|-------|-----------|-----------------|----------------------|
+| security-4: The sanitizer character class is C0 (minus \n/\t), DEL, and C1 | crates/mds-core/src/lint/diagnostic.rs:416 | Sanitizer omits bidi/Trojan Source U+202E (CVE-2021-42574) + U+2028/29 — widening the escape class is a wire-format decision | **WIDEN** (implemented 2026-07-26): extend escape class to bidi/Trojan-Source characters (U+200E/200F, U+202A–202E, U+2066–2069) and JS-hazard separators/BOM (U+2028/2029, U+FEFF), escaped as the existing uppercase `\uXXXX` literal form. Rationale: CVE-2021-42574 class; these pass through C0/DEL/C1 filtering untouched. |
+| security-9: \n pass-through permits diagnostic-line forging in unwrapped consumers: a YAML key 'a\nerr | crates/mds-core/src/lint/diagnostic.rs:419 | The \n carve-out enables CWE-117 log-record forging in unwrapped consumers — keep or close is an owner decision | **ESCAPE `\n` ON WIRE ONLY** (implemented 2026-07-26): wire/API/JSON surfaces escape newline as `\n` literal to close CWE-117 log-record forging; the CLI human render keeps real newlines so multi-line diagnostics still render. One shared escape map behind a mode flag — deliberately NOT two tables. |
+| security-10: Sanitization is not injective: source text containing the 6 literal chars \u001B is indist | crates/mds-core/src/lint/diagnostic.rs:416 | Sanitizer is non-injective (no backslash escaping); fixing churns the wire format on all 5 surfaces pre-tag | **ACCEPT + DOCUMENT** (joint decision with reliability-9, implemented 2026-07-26): escaping stays one-way, lossy and non-injective. A literal 6-character `\u001B` string in template source and a real ESC byte are indistinguishable after sanitization. The contract now explicitly forbids consumers un-escaping `\uXXXX` back to bytes; round-tripping is a permanent non-goal. No backslash escaping — it would churn the wire format across five surfaces for no security gain. Documented normatively in `spec.md` §7.5 and in `sanitize_control_chars` rustdoc. |
+| reliability-9: sanitize_control_chars is not injective: sanitize_control_chars("\\u001B") and sanitize_co | crates/mds-core/src/lint/diagnostic.rs:416 | Duplicate of security-10 — decide once | **ACCEPT + DOCUMENT** (same decision as security-10 — decided as one, implemented 2026-07-26). See security-10 row for full rationale. |
+| security-11: --diff / --check output echoes raw source lines to the terminal at lint.rs:1431 and fmt.rs | crates/mds-cli/src/lint.rs:1431 | --diff/--check echo raw source bytes to stdout by design; explicit accept-or-fix decision requested | **TTY-GATED NEUTRALIZE** (implemented 2026-07-26): `--fix --diff` preview output neutralizes control bytes when stdout is a terminal, and stays byte-faithful when piped so diffs remain usable by `patch`/tooling. NO_COLOR does not affect it — this is safety, not styling. Note precisely: neutralization applies to the `--diff` preview text; `--check` alone emits only `Would fix:`/`Would reformat:` status lines, which are unconditionally sanitized via `safe_path` and are not TTY-gated. |
+
+> **Decisions recorded 2026-07-25; implementation landed 2026-07-26.** Originally escalated as escape-map / wire-contract decisions (bidi coverage, \n carve-out, non-injectivity, --diff raw echo). All five decided as a batch in the last free wire-format window: zero users, pre-v0.4.0-tag, so wire-format churn costs nothing now and would be breaking later.
+
+**Implementing commits (branch `fix/esc-injection-176`):** `d5c7975` (core: widened class + wire mode), `3c383ad` (cross-surface tests), `7f26e3f` (spec §7.5 + CHANGELOG), `5fa54f4` (TTY-gated preview), `4f591c7` (diff-renderer consolidation), `ad2a673` (WASM parity test), `61120e7` (strip raw control bytes from comments), `ba5dde0` (P0: SanitizedReport at the stderr choke-point), `f2e2874` (boundary-table closure), `cb6d860` (eprint_warning).
+
+**Mid-flight expansion (2026-07-26, owner-approved):** After the five escalation decisions were implemented, a Scrutinizer pass demonstrated a raw-ESC-to-stderr path in `MdsError` message text on the CLI human error path (found by the Scrutinizer), plus the CLI-authored `miette!()` error family and warning prints. Fixing these was approved mid-flight as an addition to the original five escalations — not one of the five — and committed to the same branch.
+
+**Alignment-review finding (in progress):** A subsequent alignment review found the boundary-closure claim still incomplete: a bare `eprintln!` for unknown `mds.json` rule names at `crates/mds-cli/src/lint.rs:197`, and raw `MdsError` Display interpolated into `fix rejected:` reasons, remain unaddressed. Follow-up work is in progress. These are not marked closed — the alignment review correctly caught that the boundary-table closure claim was premature.
+
+## Blocked
+| Issue | File:Line | Blocker |
+|-------|-----------|---------|
+
+(none)
