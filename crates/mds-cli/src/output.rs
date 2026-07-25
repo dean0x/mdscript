@@ -6,7 +6,8 @@
 //!   path resolution used by watch and build-directory.
 //! - [`collect_mds_files`] / [`is_partial`]: directory traversal helpers.
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
-//! - [`eprint_error`]: sanitized stderr render for directory-mode error loops (PF-004).
+//! - [`eprint_error`]: the single CLI stderr choke-point — escapes every report's
+//!   message, help, and label text before miette renders it (CWE-150 / PF-014).
 //! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`.
 //! - [`preview_text_for`]: `--diff`/`--check` preview output — neutralized on TTY,
 //!   byte-faithful when piped, so redirected diffs stay applicable by `patch`/tooling.
@@ -495,35 +496,183 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 /// (avoids PF-004 / PF-014 parallel-path drift).
 pub(crate) use mds::neutralize_source_for_render;
 
-/// Render a miette `Report` to a `String` — the pure transformation extracted from
-/// [`eprint_error`] so it can be tested without touching stderr.
+/// A terminal-safe view of a [`miette::Report`], built **before** rendering.
 ///
-/// Under the input-sanitizing design (PF-014), this function does NOT apply
-/// `sanitize_control_chars` to the rendered frame — that would escape miette's own
-/// ANSI SGR colour codes on any colour-capable TTY.  Hostile control characters must
-/// be neutralized from the Report's *inputs* (message, help, and source text) before
-/// this function is called.
+/// Overrides exactly the report's three prose surfaces — the `Display` message, the
+/// `help` text, and each [`miette::LabeledSpan`]'s label — with
+/// [`mds::sanitize_control_chars`]-escaped copies (HUMAN mode, so `\n` and `\t` survive
+/// and multi-line frames stay readable).  Everything the frame's geometry depends on —
+/// `code`, `severity`, `url`, `source_code`, and each label's byte span — is delegated
+/// to the inner report untouched, so the byte-length-preserving neutralization already
+/// applied to source excerpts (`MdsError::at`, `render_diag_human`) keeps every span
+/// offset and caret column exact.
+///
+/// # Why this is the PF-014-correct boundary
+///
+/// The rendered frame is never post-processed.  Running a sanitizer over an
+/// already-rendered miette frame would escape miette's *own* ANSI SGR colour codes
+/// into literal `\u001b[33m` noise on any colour-capable TTY — on completely benign
+/// input — and desynchronise caret alignment.  CI cannot catch that regression
+/// because the CLI tests pin `NO_COLOR=1` and pipe stderr.  Sanitizing the renderer's
+/// *inputs* has neither failure mode.
+///
+/// # Why it wraps the whole `Report` rather than just `MdsError`
+///
+/// The CLI produces two error families: `MdsError` (compiler diagnostics) and
+/// CLI-authored `miette::miette!()` reports, which do **not** downcast to `MdsError`
+/// (see `build::exit_code`).  Both interpolate untrusted text — a template's include
+/// alias in the first case, an `mds.json` value or a hostile filename in the second.
+/// Wrapping at the `Report` level covers both, and keeps covering any error type added
+/// later, so the guarantee holds by construction rather than by remembering to extend
+/// a downcast ladder (avoids PF-004).
+struct SanitizedReport {
+    inner: miette::Report,
+    message: String,
+    help: Option<String>,
+}
+
+impl SanitizedReport {
+    fn new(inner: miette::Report) -> Self {
+        let message = mds::sanitize_control_chars(&inner.to_string()).into_owned();
+        let help = inner
+            .help()
+            .map(|h| mds::sanitize_control_chars(&h.to_string()).into_owned());
+
+        // No CLI error carries a cause chain, a related diagnostic, or a diagnostic
+        // source today: `MdsError` declares no `#[source]`/`#[related]` field, and
+        // `miette::miette!()` builds a bare `MietteDiagnostic`.  This wrapper therefore
+        // reports all three as absent (see the `Diagnostic` impl below) rather than
+        // forwarding text it has not sanitized.  If a future error path introduces one,
+        // this fires in debug/test builds so the wrapper is extended to sanitize it
+        // instead of silently dropping — or silently leaking — the text.
+        debug_assert!(
+            std::error::Error::source(&*inner).is_none()
+                && inner.related().is_none()
+                && inner.diagnostic_source().is_none(),
+            "SanitizedReport: report carries a cause chain, related diagnostics, or a \
+             diagnostic source, none of which this wrapper sanitizes. Extend the \
+             Diagnostic impl to sanitize them before rendering."
+        );
+
+        Self {
+            inner,
+            message,
+            help,
+        }
+    }
+}
+
+impl std::fmt::Display for SanitizedReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Hand-written so the wrapper never surfaces the inner report's own `Debug`, which
+/// under miette's `fancy` feature is the full graphical render of the *unsanitized*
+/// error.
+impl std::fmt::Debug for SanitizedReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SanitizedReport")
+            .field("message", &self.message)
+            .field("help", &self.help)
+            .finish_non_exhaustive()
+    }
+}
+
+// `source()` deliberately keeps the default `None` — see the debug_assert in
+// `SanitizedReport::new`.
+impl std::error::Error for SanitizedReport {}
+
+impl miette::Diagnostic for SanitizedReport {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.inner.code()
+    }
+
+    fn severity(&self) -> Option<miette::Severity> {
+        self.inner.severity()
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.help
+            .as_deref()
+            .map(|h| -> Box<dyn std::fmt::Display + 'a> { Box::new(h) })
+    }
+
+    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.inner.url()
+    }
+
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.inner.source_code()
+    }
+
+    /// Byte spans are forwarded verbatim (they index the neutralized, byte-length-
+    /// preserved source); only the label *text* is escaped.  `LintDiagnostic` uses its
+    /// own message as the label text, so this is a real untrusted-text surface.
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        let labels = self.inner.labels()?;
+        Some(Box::new(labels.map(|label| {
+            let text = label
+                .label()
+                .map(|t| mds::sanitize_control_chars(t).into_owned());
+            let span = *label.inner();
+            if label.primary() {
+                miette::LabeledSpan::new_primary_with_span(text, span)
+            } else {
+                miette::LabeledSpan::new_with_span(text, span)
+            }
+        })))
+    }
+}
+
+/// Wrap `report` so every prose surface it renders is control-character-escaped.
+///
+/// This is the construction-boundary half of the PF-014 design: callers hand it a
+/// `Report` built from raw values, and it produces one whose message, help, and label
+/// text are safe to hand to miette.  See [`SanitizedReport`] for the full rationale.
+fn sanitize_report(report: miette::Report) -> miette::Report {
+    miette::Report::new(SanitizedReport::new(report))
+}
+
+/// Sanitize `report`'s inputs and render it to a `String` — the pure transformation
+/// extracted from [`eprint_error`] so it can be tested without touching stderr.
+///
+/// The rendered frame itself is never post-processed (PF-014); all escaping happens
+/// in [`sanitize_report`], before miette sees the values.
 ///
 /// Note: idempotency is a property of [`mds::sanitize_control_chars`] (calling it
 /// twice on already-sanitized input is a no-op), not of this function (each call
-/// re-renders the `Report` from scratch).
-fn render_error_sanitized(report: &miette::Report) -> String {
+/// re-renders the `Report` from scratch).  That idempotency is what lets
+/// `render_diag_human` keep sanitizing its own inputs — it must, because it also
+/// neutralizes the source excerpt and filename, which this boundary cannot do.
+fn render_error_sanitized(report: miette::Report) -> String {
+    let report = sanitize_report(report);
     format!("{report:?}")
 }
 
 /// Render a miette `Report` to stderr — the single choke-point for all CLI error
 /// output.
 ///
-/// All per-file error handlers in `main`, `build`, `lint`, and `watch` route error
-/// rendering through this helper, so there is exactly one site to audit for escape-
-/// injection safety (architecture-6 / avoids PF-004: a check enforced on the primary
-/// path silently absent on a sibling path).
+/// All per-file error handlers in `main`, `build`, `fmt`, `lint`, and `watch` route
+/// error rendering through this helper, so there is exactly one site to audit for
+/// escape-injection safety (architecture-6 / avoids PF-004: a check enforced on the
+/// primary path silently absent on a sibling path).
 ///
-/// Callers must pre-sanitize the Report's inputs before calling this function:
-/// - **message / help**: via [`mds::sanitize_control_chars`]
-/// - **source text**: via [`mds::neutralize_source_for_render`] (byte-length-preserving
-///   so span byte-offsets remain valid after substitution)
-/// - **filename**: via [`mds::sanitize_control_chars`]
+/// **This function escapes the report's message, help, and label text itself**, via
+/// [`sanitize_report`], for every report it is given — `MdsError` and CLI-authored
+/// `miette::miette!()` alike.  Callers do not need to pre-sanitize prose.
+///
+/// What callers still owe, because this boundary cannot supply it:
+/// - **source text**: [`mds::neutralize_source_for_render`], which is byte-length-
+///   preserving so span byte-offsets stay valid.  Applying
+///   [`mds::sanitize_control_chars`] to source text instead would expand 1–2-byte
+///   controls to 6 bytes and desynchronise every following span.
+/// - **filename**: [`mds::sanitize_control_chars`] before it is put in a
+///   [`miette::NamedSource`].
+///
+/// Both are already done by `MdsError::at()` (compiler path) and `render_diag_human`
+/// (lint path).
 ///
 /// miette's own ANSI SGR styling is passed through untouched — carets and box-drawing
 /// survive intact.
@@ -531,7 +680,7 @@ fn render_error_sanitized(report: &miette::Report) -> String {
 /// Note: status-line path display (`Clean:`, `Fixed:`, etc.) is handled by the
 /// separate [`safe_path`] helper, not by this function.
 pub(crate) fn eprint_error(report: miette::Report) {
-    eprintln!("{}", render_error_sanitized(&report));
+    eprintln!("{}", render_error_sanitized(report));
 }
 
 /// Neutralize hostile control bytes in source text for `--diff`/`--check` preview output.
@@ -1144,6 +1293,209 @@ mod tests {
         assert!(
             !coloured.contains(hostile_char),
             "hostile C1 absent from rendered output"
+        );
+    }
+
+    // ── sanitize_report: the CLI human message/help boundary (CWE-150 / #176) ────
+    //
+    // These are in-process unit tests so they can pin the COLOUR path, which the
+    // subprocess e2e tests in `tests/security.rs` are structurally blind to (they set
+    // `NO_COLOR=1` and pipe stderr).  Per the H4 test-determinism decision, colour is
+    // selected explicitly via `GraphicalTheme` rather than inherited from the
+    // environment.
+
+    /// Render `report` through a colour-neutral handler — the deterministic in-process
+    /// equivalent of what `render_error_sanitized` emits under `NO_COLOR=1`.
+    fn render_nocolor(report: &miette::Report) -> String {
+        use miette::{GraphicalReportHandler, GraphicalTheme};
+        let mut buf = String::new();
+        GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor())
+            .render_report(&mut buf, report.as_ref())
+            .expect("render must not panic");
+        buf
+    }
+
+    /// T-ESC-1 [security-11 / PF-013 / #176]: an `MdsError` whose message *and* help
+    /// both interpolate attacker-controlled text is escaped on both surfaces before
+    /// miette renders it.
+    ///
+    /// `UndefinedVariable` is the vector because `name` lands in the `#[error(...)]`
+    /// message and in the `#[diagnostic(help(...))]` text, so one input exercises both.
+    #[test]
+    fn sanitize_report_escapes_message_and_help() {
+        let hostile_name = format!("bad{}[31mNAME", '\u{1b}');
+        let report = sanitize_report(miette::Report::new(mds::MdsError::UndefinedVariable {
+            name: hostile_name,
+            span: None,
+            src: None,
+        }));
+        let rendered = render_nocolor(&report);
+
+        // Non-vacuity: the diagnostic actually rendered, with its help line.
+        assert!(
+            rendered.contains("undefined variable"),
+            "non-vacuity: expected the undefined-variable message; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("help:"),
+            "non-vacuity: expected a help line; got: {rendered:?}"
+        );
+        // Negative.
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "raw ESC must not survive into the rendered frame; got: {rendered:?}"
+        );
+        // Positive: escaped on BOTH surfaces, so the count is at least two.
+        assert!(
+            rendered.matches("\\u001B").count() >= 2,
+            "ESC must be escaped in the message AND the help text; got: {rendered:?}"
+        );
+    }
+
+    /// T-ESC-2 [security-11 / PF-004 / #176]: a CLI-authored `miette::miette!()` report
+    /// — which does NOT downcast to `MdsError` — is escaped by the same boundary.
+    #[test]
+    fn sanitize_report_escapes_cli_authored_miette_message() {
+        let hostile = format!("cannot write fo{}[2Jo.mds", '\u{1b}');
+        let report = sanitize_report(miette::miette!("{hostile}"));
+        let rendered = render_nocolor(&report);
+
+        assert!(
+            rendered.contains("cannot write"),
+            "non-vacuity: expected the miette!() message; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "raw ESC must not survive a miette!() report; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u001B"),
+            "ESC must be escaped to the \\u001B literal; got: {rendered:?}"
+        );
+    }
+
+    /// T-ESC-3 [security-11 / #176]: the widened hazard class (bidi controls, Trojan
+    /// Source CVE-2021-42574) is escaped on this boundary too, not just C0/DEL/C1.
+    #[test]
+    fn sanitize_report_escapes_bidi_override_in_message() {
+        let hostile = format!("alias{}reversed", '\u{202e}');
+        let report = sanitize_report(miette::miette!("{hostile}"));
+        let rendered = render_nocolor(&report);
+
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "raw U+202E must not survive; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u202E"),
+            "U+202E must be escaped to the \\u202E literal; got: {rendered:?}"
+        );
+    }
+
+    /// T-ESC-4 [PF-014 / #176]: HUMAN mode — a real newline in the message survives, so
+    /// multi-line diagnostic frames stay readable.  This is the one deliberate
+    /// difference from the WIRE boundary (`MdsError::serialize`), which escapes `\n`.
+    #[test]
+    fn sanitize_report_preserves_newline_in_message() {
+        let report = sanitize_report(miette::miette!("line one\nline two"));
+        let rendered = render_nocolor(&report);
+
+        assert!(
+            rendered.contains("line one"),
+            "non-vacuity: message must render; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\\u000A"),
+            "HUMAN mode must NOT escape newlines; got: {rendered:?}"
+        );
+    }
+
+    /// T-ESC-5 [security-11 / #176]: label TEXT is escaped while the label's byte SPAN
+    /// is forwarded verbatim, so the caret still lands on the right columns.
+    ///
+    /// `LintDiagnostic::labels()` uses its own message as the label text, so this is a
+    /// real untrusted-text surface and not a hypothetical one.
+    #[test]
+    fn sanitize_report_escapes_label_text_but_keeps_span() {
+        let hostile_label = format!("here{}[31m", '\u{1b}');
+        let diag = miette::MietteDiagnostic::new("outer message")
+            .with_label(miette::LabeledSpan::at(2..5, hostile_label));
+        let report =
+            sanitize_report(miette::Report::new(diag).with_source_code("abcdefgh".to_string()));
+        let rendered = render_nocolor(&report);
+
+        assert!(
+            rendered.contains("here"),
+            "non-vacuity: the label must render; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "raw ESC must not survive in label text; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\u001B"),
+            "label ESC must be escaped; got: {rendered:?}"
+        );
+        // Span geometry preserved: the source line and its caret still render.
+        assert!(
+            rendered.contains("abcdefgh"),
+            "the labelled source excerpt must still render; got: {rendered:?}"
+        );
+    }
+
+    /// T-ESC-6 [PF-014 / #176]: the regression this boundary exists to avoid.
+    ///
+    /// Rendering the sanitized report with a COLOUR theme must leave miette's own ANSI
+    /// SGR codes intact (real ESC bytes present) while the hostile input is escaped to
+    /// a literal.  An implementation that sanitized the rendered frame instead would
+    /// strip miette's SGR into literal `\u001b[...` noise — this test fails loudly in
+    /// that case, and the subprocess e2e tests cannot (they pin `NO_COLOR=1`).
+    #[test]
+    fn sanitize_report_colour_path_keeps_miette_sgr_and_escapes_hostile_input() {
+        use miette::{GraphicalReportHandler, GraphicalTheme};
+
+        let hostile = format!("hostile{}[31mtext", '\u{1b}');
+        let report = sanitize_report(miette::miette!("{hostile}"));
+
+        let mut coloured = String::new();
+        GraphicalReportHandler::new_themed(GraphicalTheme::unicode())
+            .render_report(&mut coloured, report.as_ref())
+            .expect("render must not panic");
+
+        // miette's own SGR codes survive — the frame was never post-processed.
+        assert!(
+            coloured.contains('\u{1b}'),
+            "miette's own SGR codes must survive on the colour path; got: {coloured:?}"
+        );
+        // The hostile input is still escaped.
+        assert!(
+            coloured.contains("\\u001B"),
+            "hostile ESC must be escaped even on the colour path; got: {coloured:?}"
+        );
+        // And miette's SGR was NOT itself escaped: the only escaped literal is the one
+        // hostile byte, not the ~10 SGR sequences the frame contains.
+        assert_eq!(
+            coloured.matches("\\u001B").count(),
+            1,
+            "exactly one escaped literal (the hostile byte) — more means miette's own \
+             SGR codes were escaped, which is the PF-014 regression; got: {coloured:?}"
+        );
+    }
+
+    /// T-ESC-7 [#176]: clean input renders byte-identically with and without the
+    /// sanitizing wrapper, so the boundary is inert on the overwhelmingly common path.
+    #[test]
+    fn sanitize_report_is_inert_on_clean_input() {
+        let raw = miette::Report::new(mds::MdsError::UndefinedVariable {
+            name: "user_name".to_string(),
+            span: None,
+            src: None,
+        });
+        let before = render_nocolor(&raw);
+        let after = render_nocolor(&sanitize_report(raw));
+        assert_eq!(
+            before, after,
+            "sanitizing must not alter the render of a clean diagnostic"
         );
     }
 

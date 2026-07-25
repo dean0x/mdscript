@@ -1,5 +1,5 @@
 mod common;
-use common::{fixture, mds_bin};
+use common::{assert_no_control_chars, fixture, mds_bin};
 use std::collections::HashMap;
 
 #[test]
@@ -418,5 +418,125 @@ fn load_vars_file_rejects_symlinked_path() {
     assert!(
         err.contains("symlink") || err.contains("not allowed"),
         "error must mention symlink restriction; got: {err}"
+    );
+}
+
+// ── CWE-150: control bytes in the error MESSAGE on the CLI human path (#176) ──
+//
+// The pre-existing ESC e2e tests in `cli_build.rs` / `cli_fmt.rs` / `cli_lint.rs`
+// all use the `@define \x1bfoo:` vector, whose message is the *fixed* string
+// "syntax error: @define must have parameter list: @define name(params):" — the
+// hostile byte only ever reaches the rendered **source excerpt**, which
+// `MdsError::at()` already neutralized. Those tests therefore never exercised the
+// message text at all (PF-013: a hostile-input test that cannot fail for the
+// reason it claims). The two tests below use vectors that put attacker-controlled
+// bytes into the message itself, on both of the CLI's error families:
+//
+//   1. `MdsError` — `parser.rs` formats the raw alias into
+//      `invalid include alias: '{alias}'`.
+//   2. CLI-authored `miette::miette!()` — `output.rs` formats the raw `mds.json`
+//      value into `mds.json output_dir '{}' must not contain '..' components`.
+//
+// Both render through `eprint_error`, the single CLI stderr choke-point.
+
+/// T-ESC-MSG-1 [security-11 / CWE-150 / PF-013 / #176]: an `MdsError` whose message
+/// interpolates attacker-controlled template text must reach stderr escaped.
+///
+/// Non-vacuity guard: the command must actually fail *and* stderr must contain the
+/// expected error text, so the escape assertions cannot pass by the build silently
+/// succeeding or failing for an unrelated reason.
+#[test]
+fn build_mds_error_message_escapes_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("inc.mds");
+    // ESC (U+001B) and RIGHT-TO-LEFT OVERRIDE (U+202E) inside the include alias.
+    // `is_valid_identifier` rejects it, and the raw alias is formatted into the message.
+    std::fs::write(&src, "@include \u{1b}[31mBAD\u{202e}alias\n").unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // ── Non-vacuity ──────────────────────────────────────────────────────────
+    assert!(
+        !out.status.success(),
+        "build of an invalid include alias must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid include alias"),
+        "non-vacuity: the alias error must be the one rendered; got: {stderr}"
+    );
+
+    // ── Negative: no raw hostile bytes survive ───────────────────────────────
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not reach stderr in the error message; got: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "mds build MdsError message");
+
+    // ── Positive: the escaped literals are present ───────────────────────────
+    assert!(
+        stderr.contains("\\u001B"),
+        "ESC must be rendered as the \\u001B literal in the message; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("\\u202E"),
+        "U+202E must be rendered as the \\u202E literal in the message; got: {stderr}"
+    );
+}
+
+/// T-ESC-MSG-2 [security-11 / CWE-150 / PF-004 / #176]: a CLI-authored
+/// `miette::miette!()` error that interpolates attacker-controlled config text must
+/// reach stderr escaped too.
+///
+/// This is the PF-004 sibling path: `miette!()` reports do **not** downcast to
+/// `MdsError` (see `exit_code`'s rustdoc), so a fix that only handled `MdsError`
+/// would leave this vector open while claiming the boundary was closed.
+#[test]
+fn build_cli_authored_error_message_escapes_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+    // JSON `\u001b` decodes to a raw ESC byte in the parsed config value. The `..`
+    // component trips the traversal guard in `resolve_output_base`, which formats the
+    // raw value into its message.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"build": {"output_dir": "../\u001b[31mBAD"}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // ── Non-vacuity ──────────────────────────────────────────────────────────
+    assert!(
+        !out.status.success(),
+        "build with output_dir containing '..' must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("output_dir"),
+        "non-vacuity: the output_dir traversal error must be the one rendered; got: {stderr}"
+    );
+
+    // ── Negative + positive ──────────────────────────────────────────────────
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not reach stderr from a miette!() message; got: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "mds build miette!() message");
+    assert!(
+        stderr.contains("\\u001B"),
+        "ESC must be rendered as the \\u001B literal; got: {stderr}"
     );
 }
