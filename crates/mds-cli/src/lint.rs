@@ -263,8 +263,7 @@ fn write_stdout(s: &str) -> Result<()> {
 /// safe inputs; the frame itself is not post-processed (PF-014).
 ///
 /// `--quiet` suppresses Warn and Info; Error always renders.
-/// `named_source`: `(filename, source_text)` pair for span context rendering. Human
-/// format always provides this; it is never None on the Human path (PF-004).
+/// `named_source`: `(filename, source_text)` pair for span context rendering.
 ///
 /// Sanitization strategy (PF-014):
 /// - message/help: `sanitize_control_chars` → \\uXXXX escapes (safe for prose).
@@ -274,7 +273,7 @@ fn write_stdout(s: &str) -> Result<()> {
 ///
 /// The rendered miette frame is NOT post-processed, so miette's own SGR colour codes
 /// are never corrupted.
-fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Option<(&str, &str)>) {
+fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: (&str, &str)) {
     if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
         return;
     }
@@ -294,9 +293,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
         fix_removals: None,
         fix_edits: None,
     };
-    // Human format always supplies a named source (PF-004); panic on None is the
-    // correct response to a programming error, not a user error.
-    let (filename, src) = named_source.expect("Human format always provides named_source");
+    let (filename, src) = named_source;
     let clean_filename = mds::sanitize_control_chars(filename);
     let clean_src = neutralize_source_for_render(src);
     let report = miette::Report::from(sanitized).with_source_code(miette::NamedSource::new(
@@ -309,7 +306,7 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
 /// Render all diagnostics in a `LintResult` to stderr.
 ///
 /// `named_source` is forwarded to `render_diag_human` for span context rendering.
-fn render_result_human(result: &mds::LintResult, quiet: bool, named_source: Option<(&str, &str)>) {
+fn render_result_human(result: &mds::LintResult, quiet: bool, named_source: (&str, &str)) {
     for diag in &result.diagnostics {
         render_diag_human(diag, quiet, named_source);
     }
@@ -717,7 +714,7 @@ fn run_lint_stdin(
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
         // Stdin diagnostics: pass source text for span context rendering.
-        let named_source = Some((mds::STRING_SOURCE_MAP_LABEL, output_src.as_str()));
+        let named_source = (mds::STRING_SOURCE_MAP_LABEL, output_src.as_str());
         render_result_human(&diag_result, quiet, named_source);
         let _ = write_stdout(&output_src);
         exit_by_severity(&diag_result);
@@ -1271,7 +1268,7 @@ fn lint_one_file_human(
     };
 
     // Named source for span rendering: relative display path + source text.
-    let named_source = Some((display_path.as_str(), source.as_str()));
+    let named_source = (display_path.as_str(), source.as_str());
 
     let mut result = match mds::lint(file, ctx.runtime_vars.clone(), &config) {
         Ok(r) => r,
@@ -1402,7 +1399,11 @@ fn emit_result(
             serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
         ));
     } else {
-        render_result_human(result, quiet, named_source);
+        render_result_human(
+            result,
+            quiet,
+            named_source.expect("Human format requires named_source"),
+        );
     }
 }
 
