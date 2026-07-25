@@ -78,6 +78,54 @@ field is present across all binding surfaces: CLI JSON output, napi
   identifiers are deliberate exclusions — they carry position data, not
   terminal-bound text. (#176)
 
+- **Widened escape class: bidi / separator / BOM characters (#176).** The
+  escaped set now covers characters outside C0 / DEL / C1 that are still
+  display-hazardous, on every surface:
+  - **U+200E, U+200F, U+202A–U+202E, U+2066–U+2069** — the Unicode bidi
+    controls behind Trojan Source (CVE-2021-42574). A single U+202E in a
+    filename or diagnostic message reverses how the rest of the line renders
+    in any bidi-aware terminal, IDE, or code-review UI.
+  - **U+2028, U+2029** — LINE / PARAGRAPH SEPARATOR, which terminate a
+    JavaScript string literal.
+  - **U+FEFF** — BOM / ZWNBSP, invisible in every renderer.
+
+  Each becomes its uppercase six-character `\uXXXX` literal, exactly like the
+  existing C0 / DEL / C1 escapes. Source excerpts inside a rendered diagnostic
+  frame are neutralized to U+FFFD instead (3 bytes → 3 bytes), preserving the
+  byte-length invariant that keeps span offsets and caret columns exact. (#176)
+
+- **BREAKING (wire format): machine-readable boundaries now escape `\n` (#176).**
+  `MdsError::serialize()`, `LintResult::to_canonical_json()` (message, help, and
+  the `"file"` group key), `CompileResult::to_canonical_json()` warnings, and the
+  Python typed lint surface now emit `\n` as the six-character `\u000A` literal.
+  A raw newline inside a diagnostic string is a line-forging vector: any consumer
+  that prints or line-splits the value can be made to render an attacker-authored
+  line as a genuine second finding. `\t` is unaffected.
+
+  **Human-render output is unchanged** — the CLI renderer,
+  `MdsError::display_sanitized()`, and stderr warnings still preserve raw
+  newlines so multi-line diagnostic frames stay readable.
+
+  **Migration:** consumers that split a `message` / `help` / warning string on
+  `\n` will now see a single line containing the literal `\u000A` where a real
+  newline used to be. Split on that literal instead, or render the value verbatim.
+
+- **Escaping is one-way — consumers must not un-escape (#176).** The
+  transformation is lossy and non-injective by design: a template that literally
+  contains the six characters `\u001B` and one containing an actual ESC byte are
+  indistinguishable after serialization. **Do not** convert `\uXXXX` sequences
+  back into bytes — that reconstitutes the injection the escape prevents. Round-tripping is
+  an explicit non-goal; no backslash-escaping will be added to make the mapping
+  reversible. Consumers needing original bytes must read them from the source via
+  the raw `span` / `fix_edits` byte offsets, which stay unsanitized for this
+  purpose. Documented normatively in spec §7.5.
+
+- **`mds lint --fix --diff` / `--check` preview output is TTY-gated (#176).**
+  Preview diff text is neutralized when stdout is a terminal (where control bytes
+  would execute) and emitted **byte-faithful when piped or redirected**, so a
+  redirected diff remains applicable. Preview output is not part of the
+  `"version": 1` JSON wire format.
+
 ### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
 
 These changes alter observable runtime behavior and compiled output. Templates relying

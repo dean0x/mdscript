@@ -999,16 +999,66 @@ Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` whe
 Under `"version": 1`, the following guarantees are normative. The prior behavior of
 passing raw control bytes through to JSON is superseded.
 
+The **escaped class** is:
+
+| Codepoints | Why |
+|------------|-----|
+| C0 (U+0000–U+001F) except `\t` (U+0009) | Terminal escape-sequence injection (CWE-150) |
+| `\n` (U+000A) | Line forging in any consumer that prints or line-splits the value |
+| DEL (U+007F) | Interpreted as a destructive backspace by some terminals |
+| C1 (U+0080–U+009F) | Terminal control, incl. NEL (U+0085) |
+| U+200E, U+200F, U+202A–U+202E, U+2066–U+2069 | Unicode bidi controls — visually reorder the line (Trojan Source, CVE-2021-42574) |
+| U+2028, U+2029 | Terminate a JavaScript string literal |
+| U+FEFF | Invisible BOM / ZWNBSP — hides or splits content |
+
+Each is replaced with its six-character `\uXXXX` literal (uppercase hex) before
+serialization. `\t` is the only character in the class that is preserved.
+
 | Field | Invariant |
 |-------|-----------|
-| `message`, `help` | C0 bytes except `\n` (U+000A) and `\t` (U+0009), DEL (U+007F), and C1 bytes (U+0080–U+009F) are replaced with their six-character `\uXXXX` literal before serialization. |
-| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control bytes into the JSON output. |
+| `message`, `help` | Every codepoint in the escaped class above is replaced with its six-character `\uXXXX` literal before serialization. |
+| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into the JSON output. |
 | `rule` | Fixed ASCII identifier; never contains control bytes by construction. Not sanitized. |
 | `span`, `fix_edits` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
 
 This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
+All five surfaces emit byte-identical values.
+
+**Human-render output escapes the same class minus `\n`.** Terminal output (the CLI
+human renderer, `MdsError::display_sanitized()`, stderr warnings) preserves raw
+newlines so multi-line diagnostic frames stay readable. `\n` is escaped only on the
+machine-readable boundaries listed above, where a raw newline is itself an injection
+vector. Source excerpts embedded in a rendered diagnostic frame are neutralized
+byte-length-preservingly instead of escaped (C0/DEL → `?`, C1 → U+00A0, bidi and
+separators → U+FFFD), so span offsets and caret columns stay exact.
+
+##### Escaping is one-way
+
+The transformation is **lossy and non-injective, by design**. A template that
+literally contains the six characters `\`, `u`, `0`, `0`, `1`, `B` and a template
+containing an actual ESC byte both serialize to the identical six-character
+string `\u001B`;
+after serialization they are indistinguishable.
+
+Consumers **MUST NOT** un-escape `\uXXXX` sequences back into bytes. Doing so
+reconstitutes exactly the injection this invariant prevents — an attacker who
+controls a diagnostic message controls what a naive un-escaper writes to your
+terminal. The escape exists for display, not for transport.
+
+Round-tripping is an explicit **non-goal**: no backslash-escaping (`\` → `\\`)
+will be added to make the mapping reversible, in this or any later wire version. A
+consumer that needs the original bytes must read them from the source file using the
+raw `span` / `fix_edits` byte offsets, which are deliberately left unsanitized for
+precisely this purpose.
+
+##### `--fix --diff` / `--fix --check` preview output
+
+Preview output is diff text, not a diagnostic field, and is governed separately: it
+is neutralized when stdout is a TTY (where control bytes would execute), and emitted
+**byte-faithful when stdout is piped or redirected** (where the diff must remain
+applicable). It is not part of the `"version": 1` JSON wire format.
 
 ### 7.6 `mds init`
 
