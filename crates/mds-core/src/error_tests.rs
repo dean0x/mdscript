@@ -317,6 +317,50 @@ fn serialize_sanitizes_del_and_c1() {
     );
 }
 
+// ── display_sanitized() ───────────────────────────────────────────────────
+
+/// T-DS: `display_sanitized()` escapes raw ESC (U+001B) bytes in the terminal-
+/// safe output while `to_string()` / `Display` leaves them raw.
+///
+/// This test is the regression anchor for rust-5/architecture-2 (PF-004 on
+/// the published API, CWE-150 / issue #176).  It FAILS if `display_sanitized()`
+/// is removed or reverted to a bare `self.to_string()` call (avoids PF-013).
+#[test]
+fn display_sanitized_escapes_esc_byte() {
+    let e = MdsError::syntax("bad\x1Btoken");
+    let displayed = e.display_sanitized();
+    assert!(
+        !displayed.contains('\x1B'),
+        "raw ESC byte must not appear in display_sanitized(); got: {:?}",
+        displayed
+    );
+    // Positive assertion — FAILS if display_sanitized() reverts to to_string().
+    assert!(
+        displayed.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in display_sanitized(); got: {:?}",
+        displayed
+    );
+}
+
+/// `display_sanitized()` and `to_string()` differ on ESC-bearing input, proving
+/// that `display_sanitized()` is not a trivial alias for the raw Display impl.
+#[test]
+fn display_sanitized_differs_from_to_string_on_esc() {
+    let e = MdsError::syntax("msg\x1Bend");
+    // Raw Display keeps the ESC byte.
+    assert!(
+        e.to_string().contains('\x1B'),
+        "to_string() must keep raw ESC (display contract); got: {:?}",
+        e.to_string()
+    );
+    // Sanitized form must not.
+    assert!(
+        !e.display_sanitized().contains('\x1B'),
+        "display_sanitized() must not keep raw ESC; got: {:?}",
+        e.display_sanitized()
+    );
+}
+
 // ── Display output ────────────────────────────────────────────────────────
 
 #[test]

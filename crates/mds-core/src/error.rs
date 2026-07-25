@@ -3,6 +3,8 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
+use crate::lint::{neutralize_source_for_render, sanitize_control_chars};
+
 // ── Serializable error types ──────────────────────────────────────────────────
 
 /// A serializable representation of a source span.
@@ -119,13 +121,39 @@ fn at(
         return (Some(SourceSpan::new(offset.into(), len)), None);
     }
 
+    // Neutralize source with byte-length-preserving substitution so miette's span
+    // byte-offsets remain valid after sanitization (PF-014).  Sanitize the filename
+    // with \uXXXX escapes — it is prose, not span-indexed.
+    let clean_source = neutralize_source_for_render(source);
+    let clean_file = sanitize_control_chars(file);
     (
         Some(SourceSpan::new(offset.into(), len)),
-        Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
+        Some(Arc::new(miette::NamedSource::new(
+            clean_file.as_ref(),
+            clean_source.into_owned(),
+        ))),
     )
 }
 
 /// All errors produced by the MDS compiler.
+///
+/// ## Display contract — sanitization split (CWE-150 / issue #176)
+///
+/// `MdsError` implements `std::fmt::Display` via `thiserror`.  The `Display`
+/// output is the **raw, unsanitized** message string: it may contain C0/DEL/C1
+/// control bytes from untrusted `.mds` source input.
+///
+/// | Method / path | Sanitized | Intended context |
+/// |---|---|---|
+/// | `e.to_string()` / `format!("{e}")` | **No** | Machine-readable pipelines, structured loggers |
+/// | [`MdsError::display_sanitized()`] | **Yes** | Terminal output, user-facing render |
+/// | [`MdsError::serialize()`]`.message` | **Yes** | JSON API / binding surfaces |
+///
+/// **Do not write `eprintln!("{e}")` or `e.to_string()` when the output goes
+/// to a TTY or is embedded in a user-visible string without further escaping.**
+/// Use [`MdsError::display_sanitized()`] instead to avoid terminal injection
+/// (CWE-150).  All three published binding surfaces (napi, WASM, Python)
+/// already use `serialize()` and are unaffected.
 #[must_use]
 #[non_exhaustive]
 #[derive(Error, Debug, Diagnostic, Clone)]
@@ -823,9 +851,9 @@ impl MdsError {
         let code = Diagnostic::code(self)
             .map(|c| c.to_string())
             .unwrap_or_default();
-        let message = crate::lint::sanitize_control_chars(&self.to_string()).into_owned();
-        let help = Diagnostic::help(self)
-            .map(|h| crate::lint::sanitize_control_chars(&h.to_string()).into_owned());
+        let message = sanitize_control_chars(&self.to_string()).into_owned();
+        let help =
+            Diagnostic::help(self).map(|h| sanitize_control_chars(&h.to_string()).into_owned());
 
         // Extract (span, src) from each span-bearing variant; no-span variants
         // use the wildcard arm and produce span: None.
@@ -880,6 +908,23 @@ impl MdsError {
             help,
             span: serialized_span,
         }
+    }
+
+    /// Return a terminal-safe, sanitized version of this error's `Display` text.
+    ///
+    /// All C0 control characters (except `\t` and `\n`), DEL (U+007F), and C1
+    /// control characters (U+0080–U+009F) are replaced by their six-character
+    /// `\uXXXX` escape literals — identical to the escaping applied by
+    /// [`MdsError::serialize`].  `\t` and `\n` are preserved so that multi-line
+    /// miette renders remain readable.
+    ///
+    /// Use this method — not `e.to_string()` / `eprintln!("{e}")` — whenever the
+    /// string will be written to a TTY or embedded in a user-visible context
+    /// without further escaping.  See the [type-level doc][MdsError] for the full
+    /// Display-contract table.
+    #[must_use]
+    pub fn display_sanitized(&self) -> String {
+        sanitize_control_chars(&self.to_string()).into_owned()
     }
 }
 

@@ -485,30 +485,34 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 
 // ── Sanitized stderr render ───────────────────────────────────────────────────
 
-/// Render a miette Report to a sanitized `String` — the pure transformation
-/// extracted from [`eprint_error`] so it can be tested without touching stderr.
+/// Re-export: byte-length-preserving source neutralization before miette rendering.
 ///
-/// Formats the report with `{:?}` (miette's human-readable renderer) and applies
-/// `mds::sanitize_control_chars` over the full rendered text, including any
-/// embedded source frames (issue #176 / CWE-150). The render+sanitize pass is
-/// idempotent: calling it a second time on already-sanitized output is a no-op.
+/// Lives in `mds-core` so both `MdsError::at()` (compiler error path) and
+/// `render_diag_human` (lint diagnostic path) use a single canonical implementation
+/// (avoids PF-004 / PF-014 parallel-path drift).
+pub(crate) use mds::neutralize_source_for_render;
+
+/// Render a miette Report to a `String` — the pure transformation extracted from
+/// [`eprint_error`] so it can be tested without touching stderr.
+///
+/// Under the input-sanitizing design (avoids PF-014), this function does NOT apply
+/// `sanitize_control_chars` to the rendered frame — that would escape miette's own
+/// ANSI SGR colour codes on any colour-capable TTY.  Hostile control characters must
+/// be removed from the Report's *inputs* (message, help, and source text) before this
+/// function is called.  [`render_diag_human`](crate::lint) is the canonical call site
+/// that performs that input-level sanitization.
 pub(crate) fn render_error_sanitized(report: &miette::Report) -> String {
-    mds::sanitize_control_chars(&format!("{report:?}")).into_owned()
+    format!("{report:?}")
 }
 
-/// Render a miette Report to stderr with control-character sanitization applied.
+/// Render a miette Report to stderr.
 ///
-/// Per-file error handlers in directory-mode loops (e.g. `lint_one_file_human`,
-/// `format_one_file`) MUST use this helper instead of bare
-/// `eprintln!("{:?}", miette::Report::from(e))`.  Centralising the render here
-/// means the sanitizer cannot be forgotten on any future parallel path
-/// (avoids PF-004: a check enforced on the primary path silently absent on a
-/// sibling path).
-///
-/// The `mds::sanitize_control_chars` function strips C0, C1, and DEL codepoints
-/// while preserving `\n`, `\t`, and printable Unicode — miette box-drawing and
-/// carets therefore survive intact; only raw ESC bytes and other non-printing
-/// controls are escaped to `\uXXXX` literals.
+/// Per-file error handlers MUST build their miette Reports with pre-sanitized inputs
+/// (message, help, and source text) before calling this helper (avoids PF-004: a check
+/// enforced on the primary path silently absent on a sibling path).  miette's own ANSI
+/// SGR styling flows through to the terminal untouched — carets and box-drawing survive
+/// intact because source text is neutralized with byte-length-preserving substitution
+/// before being handed to miette, keeping every span byte-offset valid.
 pub(crate) fn eprint_error(report: miette::Report) {
     eprintln!("{}", render_error_sanitized(&report));
 }
@@ -799,51 +803,111 @@ mod tests {
         assert_eq!(result, PathBuf::from("/root/src/chat"));
     }
 
-    // ── T-10: render_error_sanitized (issue #176 / ESC-INJECTION) ────────────
+    // ── T-10a/b/c: neutralize_source_for_render + colour path (── PF-014) ────────
 
-    /// T-10 [AC-F2 proxy]: `render_error_sanitized` strips raw ESC (U+001B) and
-    /// other C0/DEL/C1 control bytes from the rendered miette frame, including bytes
-    /// that arrive via the embedded source context (NamedSource).
-    ///
-    /// The test constructs a miette Report with a source frame containing raw ESC
-    /// (simulating a hostile .mds file that would leak through `eprintln!("{report:?}")`
-    /// before the fix). After `render_error_sanitized` the output must contain no raw
-    /// 0x1B bytes and must contain the sanitized `` literal. The word "Hello"
-    /// from the source context must still be visible (verifies the frame is not empty).
+    /// T-10a [PF-014 / AC-F2]: neutralize_source_for_render removes C0 controls
+    /// (except \n/\t), DEL, and 2-byte C1 controls while preserving total byte length
+    /// so that miette span offsets remain valid after substitution.
     #[test]
-    fn render_error_sanitized_strips_control_chars_from_source_frame() {
-        use miette::NamedSource;
+    fn neutralize_source_removes_c0_del_c1_preserving_byte_length() {
+        // ASCII NUL (C0), DEL (0x7F), and U+0085 NEL (C1, 2-byte UTF-8) are hostile.
+        // \n and \t are allowed through unchanged.
+        let raw = "a\x00b\x7fc\u{0085}d\ne\tf";
+        let out = neutralize_source_for_render(raw);
+        // Byte length must be identical (span safety invariant).
+        assert_eq!(out.len(), raw.len(), "byte length preserved");
+        // Hostile bytes are replaced; safe bytes survive.
+        assert!(!out.contains('\x00'), "NUL removed");
+        assert!(!out.contains('\x7f'), "DEL removed");
+        assert!(!out.contains('\u{0085}'), "C1 NEL removed");
+        assert!(out.contains('\n'), "LF preserved");
+        assert!(out.contains('\t'), "TAB preserved");
+    }
 
-        // A source line containing a raw ESC byte mid-word, plus a normal word so
-        // we can assert the frame is not vacuously empty.
-        let hostile_source = "Hello \x1B[31mworld\x1B[0m".to_string();
-        // Place a span that covers "Hello" (offset 0, length 5) so miette renders
-        // the source line with a caret.
-        let span = miette::SourceSpan::new(0.into(), 5);
-        let report = miette::miette!(
-            labels = vec![miette::LabeledSpan::new_with_span(None, span)],
-            "lint finding on hostile source"
-        )
-        .with_source_code(NamedSource::new("f.mds", hostile_source));
+    /// T-10b [reliability-8 / PF-014]: When the span starts AFTER a control character
+    /// the substituted byte at that position must still form a valid char boundary so
+    /// miette can slice the excerpt without panicking.
+    #[test]
+    fn neutralize_source_caret_alignment_with_span_after_control_char() {
+        use miette::{GraphicalReportHandler, GraphicalTheme, NamedSource, SourceSpan};
 
-        let rendered = render_error_sanitized(&report);
+        // "a<ESC>bc" where span covers 'b' (byte offset 2..3, AFTER the ESC byte).
+        // If neutralization breaks the byte-length invariant, miette panics here.
+        let raw = "a\x1bbc";
+        let clean = neutralize_source_for_render(raw);
+        assert_eq!(clean.len(), raw.len(), "byte length invariant");
 
-        // No raw ESC byte (0x1B) may appear in the rendered output.
+        // Build a minimal miette report whose source excerpt exercises the span.
+        #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+        #[error("test")]
+        struct SpanErr {
+            #[source_code]
+            src: NamedSource<String>,
+            #[label("here")]
+            span: SourceSpan,
+        }
+
+        let report = miette::Report::new(SpanErr {
+            src: NamedSource::new("test.mds", clean.into_owned()),
+            span: (2, 1).into(), // byte 2..3 = 'b'
+        });
+
+        let mut buf = String::new();
+        GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor())
+            .render_report(&mut buf, report.as_ref())
+            .expect("render must not panic after neutralization");
+        // The caret must point at 'b', not produce garbage.
+        assert!(buf.contains('b'), "caret points at b");
+        // No raw ESC byte survives into the rendered output.
+        assert!(!buf.contains('\x1b'), "no raw ESC in rendered output");
+    }
+
+    /// T-10c [testing-2 / PF-014]: miette's own SGR colour codes survive
+    /// (render_error_sanitized no longer strips them) while a hostile
+    /// OSC sequence embedded in the source is neutralised at the input stage.
+    #[test]
+    fn colour_path_miette_sgr_survives_hostile_osc_is_removed() {
+        use miette::{GraphicalReportHandler, GraphicalTheme, NamedSource, SourceSpan};
+
+        // A 2-byte C1 U+009D = OSC opener (hostile). After neutralize it becomes
+        // U+00A0 NBSP, same byte length; no OSC survives into the render.
+        // U+009D in UTF-8 is 0xC2 0x9D (2 bytes). We use the char directly.
+        let hostile_char = '\u{009D}'; // C1 OSC opener
+        let raw = format!("good{}text", hostile_char);
+        let clean = neutralize_source_for_render(&raw);
+        assert_eq!(clean.len(), raw.len(), "byte length preserved");
+        assert!(!clean.contains(hostile_char), "C1 OSC neutralised in source");
+
+        #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+        #[error("colour test")]
+        struct ColourErr {
+            #[source_code]
+            src: NamedSource<String>,
+            #[label("here")]
+            span: SourceSpan,
+        }
+
+        let src_len = clean.len();
+        let report = miette::Report::new(ColourErr {
+            src: NamedSource::new("colour.mds", clean.into_owned()),
+            span: (0, src_len).into(),
+        });
+
+        // Colour-enabled renderer — miette will emit real SGR codes.
+        let mut coloured = String::new();
+        GraphicalReportHandler::new_themed(GraphicalTheme::unicode())
+            .render_report(&mut coloured, report.as_ref())
+            .expect("render must not panic");
+
+        // miette's own ANSI codes must survive in the coloured output.
         assert!(
-            !rendered.as_bytes().contains(&0x1Bu8),
-            "raw ESC byte (0x1B) must not appear in render_error_sanitized output; \
-             got (first 512 bytes hex): {:02x?}",
-            &rendered.as_bytes()[..rendered.len().min(512)]
+            coloured.contains('\x1b'),
+            "miette SGR codes present in coloured output"
         );
-        // The sanitized 6-char literal \\u001B must appear instead.
+        // But the hostile C1 byte is gone from the rendered string.
         assert!(
-            rendered.contains("\\u001B"),
-            "sanitized \\u001B literal must appear in output; got: {rendered:?}"
-        );
-        // "Hello" from the source context must still be visible (frame is not empty).
-        assert!(
-            rendered.contains("Hello"),
-            "source context word 'Hello' must still be visible; got: {rendered:?}"
+            !coloured.contains(hostile_char),
+            "hostile C1 absent from rendered output"
         );
     }
 }

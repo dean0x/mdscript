@@ -78,6 +78,7 @@ use std::sync::Arc;
 
 use crate::error::MdsError;
 use crate::lexer::{self, Token};
+use crate::lint::{neutralize_source_for_render, sanitize_control_chars};
 
 /// Format MDS source code, returning the rewritten source string.
 ///
@@ -470,9 +471,11 @@ fn assert_equivalent(
         Err(MdsError::Syntax { message, span, .. }) => Err(MdsError::Syntax {
             message,
             span,
+            // Neutralize source (byte-length-preserving) so miette span offsets remain
+            // valid after substitution; sanitize filename for display (PF-014).
             src: Some(Arc::new(miette::NamedSource::new(
-                file_name,
-                source.to_string(),
+                sanitize_control_chars(file_name).as_ref(),
+                neutralize_source_for_render(source).into_owned(),
             ))),
         }),
         // Any other compile failure (undefined var/fn, unresolved import, …)

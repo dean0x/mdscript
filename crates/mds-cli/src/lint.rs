@@ -37,7 +37,7 @@ use crate::build::{
     build_runtime_vars, ensure_existing_mds_file, load_config, read_stdin, resolve_input,
     RuntimeVarArgs,
 };
-use crate::output::{atomic_write_file, collect_mds_files_detailed};
+use crate::output::{atomic_write_file, collect_mds_files_detailed, neutralize_source_for_render};
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
 const KNOWN_RULES: &[&str] = &[
@@ -253,19 +253,27 @@ fn write_stdout(s: &str) -> Result<()> {
 
 // ── Human diagnostic rendering ────────────────────────────────────────────────
 
-/// Render one lint diagnostic to stderr, applying `sanitize_control_chars` at the boundary.
+/// Render one lint diagnostic to stderr, sanitizing all user-controlled inputs at the
+/// boundary before miette renders them (PF-014).
 ///
 /// `--quiet` suppresses Warn and Info; Error always renders.
-/// `named_source`: optional `(filename, source_text)` pair attached to the miette Report so
-/// the renderer can show the offending source line + caret (span highlighting). When absent,
-/// diagnostics are still rendered but without source context.
+/// `named_source`: `(filename, source_text)` pair for span context rendering. Human
+/// format always provides this; it is never None on the Human path (PF-004).
+///
+/// Sanitization strategy (PF-014):
+/// - message/help: `sanitize_control_chars` → \\uXXXX escapes (safe for prose).
+/// - filename: `sanitize_control_chars` → \\uXXXX escapes.
+/// - source: `neutralize_source_for_render` → byte-length-preserving substitution so
+///   miette's span byte-offset slices remain valid after neutralization.
+/// The rendered miette frame is NOT post-processed, so miette's own SGR colour codes
+/// are never corrupted.
 fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Option<(&str, &str)>) {
     if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
         return;
     }
-    // Belt-and-suspenders: field-level sanitize on message/help (defense-in-depth).
-    // The whole-report render below also sanitizes, making this a double-pass that is
-    // idempotent and guards against any future path that might bypass the outer pass.
+    // Sanitize message and help at the input boundary.
+    // fix_removals/fix_edits are not read by miette's Diagnostic impl — set to None
+    // to avoid unnecessary allocations (architecture-3 / rust-1).
     let sanitized = mds::LintDiagnostic {
         rule: diag.rule.clone(),
         severity: diag.severity,
@@ -276,19 +284,17 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
             .map(|h| mds::sanitize_control_chars(h).into_owned()),
         span: diag.span.clone(),
         file: diag.file.clone(),
-        fix_removals: diag.fix_removals.clone(),
-        fix_edits: diag.fix_edits.clone(),
+        fix_removals: None,
+        fix_edits: None,
     };
-    // Render the whole report and sanitize the full output, including any embedded
-    // source frame (filename and source line text). Span accuracy is preserved because
-    // miette computes carets against the raw source before `render_error_sanitized`
-    // applies its pass over the already-rendered string (issue #176 / CWE-150).
-    let report = if let Some((filename, src)) = named_source {
-        miette::Report::from(sanitized)
-            .with_source_code(miette::NamedSource::new(filename, src.to_string()))
-    } else {
-        miette::Report::from(sanitized)
-    };
+    // Human format always supplies a named source (PF-004); panic on None is the
+    // correct response to a programming error, not a user error.
+    let (filename, src) = named_source.expect("Human format always provides named_source");
+    let clean_filename = mds::sanitize_control_chars(filename);
+    let clean_src = neutralize_source_for_render(src);
+    let report = miette::Report::from(sanitized).with_source_code(
+        miette::NamedSource::new(clean_filename.as_ref(), clean_src.into_owned()),
+    );
     crate::output::eprint_error(report);
 }
 

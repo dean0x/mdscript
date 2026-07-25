@@ -1595,8 +1595,14 @@ fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
 //
 // C1 note (T-8): raw 0x80–0x9F bytes are invalid UTF-8 so they are rejected by the
 // MDS lexer before any lint rule runs.  The C1 representative used here is U+0085
-// (NEL, UTF-8 0xC2 0x85), which is valid UTF-8 and must be escaped by
-// `sanitize_control_chars`.
+// (NEL, UTF-8 0xC2 0x85), which is valid UTF-8 and is neutralized by
+// `neutralize_source_for_render` before miette renders the source frame.
+//
+// Neutralization model (PF-014): control bytes in source are substituted at the INPUT
+// boundary before miette renders, not post-processed over the rendered frame.
+// - C0/DEL (1-byte) → '?' (1 byte, byte-length-preserving)
+// - C1 (2-byte UTF-8 0x80–0x9F) → U+00A0 NBSP (2 bytes, byte-length-preserving)
+// `sanitize_control_chars` (\\uXXXX expansion) is used only for message and help text.
 //
 // All tests use `NO_COLOR=1` so ANSI colour codes in miette output don't interfere
 // with the raw-byte search.
@@ -1633,12 +1639,8 @@ fn lint_single_file_esc_in_diagnostic_frame_is_sanitized() {
         "raw ESC byte (0x1B) must not appear on stderr; got (hex first 512): {:02x?}",
         &stderr[..stderr.len().min(512)]
     );
-    // Sanitized literal \\u001B must be visible in the rendered frame.
-    assert!(
-        stderr_str.contains("\\u001B"),
-        "sanitized \\u001B literal must appear on stderr; got: {stderr_str:?}"
-    );
-    // "Hello" must still be visible (guard against vacuously empty output).
+    // Under input-neutralization (PF-014): ESC → '?' in the source frame.
+    // "Hello" must be visible, confirming source context is non-vacuous.
     assert!(
         stderr_str.contains("Hello"),
         "source context word 'Hello' must be visible in output; got: {stderr_str:?}"
@@ -1677,10 +1679,7 @@ fn lint_directory_esc_in_diagnostic_frame_is_sanitized() {
         "directory mode: raw ESC byte must not appear on stderr; hex: {:02x?}",
         &stderr[..stderr.len().min(512)]
     );
-    assert!(
-        stderr_str.contains("\\u001B"),
-        "directory mode: sanitized \\u001B literal must appear; got: {stderr_str:?}"
-    );
+    // Under input-neutralization (PF-014): ESC → '?' in the source frame.
     assert!(
         stderr_str.contains("Hello"),
         "directory mode: 'Hello' must be visible in output; got: {stderr_str:?}"
@@ -1726,10 +1725,7 @@ fn lint_stdin_esc_in_diagnostic_frame_is_sanitized() {
         "stdin mode: raw ESC byte must not appear on stderr; hex: {:02x?}",
         &stderr[..stderr.len().min(512)]
     );
-    assert!(
-        stderr_str.contains("\\u001B"),
-        "stdin mode: sanitized \\u001B literal must appear; got: {stderr_str:?}"
-    );
+    // Under input-neutralization (PF-014): ESC → '?' in the source frame.
     assert!(
         stderr_str.contains("Hello"),
         "stdin mode: 'Hello' must be visible in output; got: {stderr_str:?}"
@@ -1761,23 +1757,24 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
         Some(1),
         "del/c1 test: expected exit 1; stderr: {stderr_str}"
     );
-    // DEL must be sanitized.
+    // DEL must be neutralized: 0x7F → '?' (1-byte → 1-byte, PF-014).
     assert!(
         !stderr_str.contains('\u{007F}'),
         "raw DEL must not appear on stderr; got: {stderr_str:?}"
     );
-    assert!(
-        stderr_str.contains("\\u007F"),
-        "sanitized \\u007F must appear on stderr; got: {stderr_str:?}"
-    );
-    // C1 NEL must be sanitized.
+    // C1 NEL must be neutralized: U+0085 → U+00A0 NBSP (2-byte → 2-byte, PF-014).
     assert!(
         !stderr_str.contains('\u{0085}'),
         "raw C1 NEL must not appear on stderr; got: {stderr_str:?}"
     );
     assert!(
-        stderr_str.contains("\\u0085"),
-        "sanitized \\u0085 must appear on stderr; got: {stderr_str:?}"
+        stderr_str.contains('\u{00A0}'),
+        "neutralized C1 NEL must appear as NBSP (U+00A0) in source frame; got: {stderr_str:?}"
+    );
+    // Source context guard: "Hello" confirms output is non-vacuous.
+    assert!(
+        stderr_str.contains("Hello"),
+        "source context word 'Hello' must be visible; got: {stderr_str:?}"
     );
 }
 

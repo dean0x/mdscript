@@ -494,6 +494,46 @@ fn is_control_char(ch: char) -> bool {
         || ('\u{0080}'..='\u{009F}').contains(&ch)
 }
 
+/// Replace control characters in source text with byte-length-preserving substitutes so
+/// that miette's span byte-offsets and caret columns remain accurate (avoids PF-014).
+///
+/// This function is the input-sanitization companion to [`sanitize_control_chars`].
+/// It MUST be applied to any source string passed to [`miette::NamedSource`] before
+/// the Report is rendered.  Applying [`sanitize_control_chars`] instead would expand
+/// each control char to 6 bytes (`\uXXXX`), desynchronising every span byte-offset
+/// that follows the substitution point and producing misaligned carets.
+///
+/// Substitution rules (byte-length-preserving):
+/// - C0 bytes (U+0000–U+001F) except `\n`/`\t`: 1-byte → `?` (U+003F, 1 byte)
+/// - DEL (U+007F): 1-byte → `?`
+/// - C1 range (U+0080–U+009F, 2-byte UTF-8): 2-byte → U+00A0 NBSP (2 bytes)
+///
+/// Returns [`Cow::Borrowed`] when no substitution is needed (fast path).
+pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
+    let needs_neutralize = s.chars().any(is_control_char);
+    if !needs_neutralize {
+        return Cow::Borrowed(s);
+    }
+    // Allocate once; capacity is exact because every substitution preserves byte length.
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let u = c as u32;
+        if (u < 0x20 && c != '\n' && c != '\t') || u == 0x7F {
+            out.push('?'); // 1-byte C0/DEL → '?' (1 byte) — byte-length-preserving
+        } else if (0x80..=0x9F).contains(&u) {
+            out.push('\u{00A0}'); // 2-byte C1 → U+00A0 NBSP (2 bytes) — byte-length-preserving
+        } else {
+            out.push(c);
+        }
+    }
+    debug_assert_eq!(
+        out.len(),
+        s.len(),
+        "neutralize_source_for_render must preserve byte length"
+    );
+    Cow::Owned(out)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
