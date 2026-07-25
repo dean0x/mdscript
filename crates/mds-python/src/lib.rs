@@ -777,11 +777,12 @@ impl LintResult {
                                     // The upstream to_canonical_json() also sanitizes, but this
                                     // ensures as_json()/to_dict() parity for any future code path
                                     // that bypasses the JSON round-trip (PF-004/PF-007).
-                                    message: mds::sanitize_control_chars(&json_str(d, "message")),
+                                    message: mds::sanitize_control_chars(&json_str(d, "message"))
+                                        .into_owned(),
                                     help: d
                                         .get("help")
                                         .and_then(serde_json::Value::as_str)
-                                        .map(mds::sanitize_control_chars),
+                                        .map(|s| mds::sanitize_control_chars(s).into_owned()),
                                     fixable: d
                                         .get("fixable")
                                         .and_then(serde_json::Value::as_bool)

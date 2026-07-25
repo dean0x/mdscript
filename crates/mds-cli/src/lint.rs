@@ -269,8 +269,11 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: Opti
     let sanitized = mds::LintDiagnostic {
         rule: diag.rule.clone(),
         severity: diag.severity,
-        message: mds::sanitize_control_chars(&diag.message),
-        help: diag.help.as_deref().map(mds::sanitize_control_chars),
+        message: mds::sanitize_control_chars(&diag.message).into_owned(),
+        help: diag
+            .help
+            .as_deref()
+            .map(|h| mds::sanitize_control_chars(h).into_owned()),
         span: diag.span.clone(),
         file: diag.file.clone(),
         fix_removals: diag.fix_removals.clone(),

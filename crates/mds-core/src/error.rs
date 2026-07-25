@@ -823,9 +823,9 @@ impl MdsError {
         let code = Diagnostic::code(self)
             .map(|c| c.to_string())
             .unwrap_or_default();
-        let message = crate::lint::sanitize_control_chars(&self.to_string());
-        let help =
-            Diagnostic::help(self).map(|h| crate::lint::sanitize_control_chars(&h.to_string()));
+        let message = crate::lint::sanitize_control_chars(&self.to_string()).into_owned();
+        let help = Diagnostic::help(self)
+            .map(|h| crate::lint::sanitize_control_chars(&h.to_string()).into_owned());
 
         // Extract (span, src) from each span-bearing variant; no-span variants
         // use the wildcard arm and produce span: None.

@@ -180,10 +180,14 @@ impl CompileResult {
     /// key; a messages result has no `output` key. Explicit field-by-field construction
     /// via `serde_json::json!()` prevents serde derive from injecting unwanted keys.
     pub fn to_canonical_json(self) -> serde_json::Value {
+        // Sanitize warnings at the serialization boundary (issue #176 / CWE-150):
+        // warning strings may embed an ESC-bearing filename.
         let warnings: serde_json::Value = self
             .warnings
             .into_iter()
-            .map(serde_json::Value::String)
+            .map(|w| {
+                serde_json::Value::String(crate::lint::sanitize_control_chars(&w).into_owned())
+            })
             .collect::<Vec<_>>()
             .into();
         let dependencies: serde_json::Value = self
@@ -504,9 +508,12 @@ fn path_to_str(path: &Path) -> Result<&str, MdsError> {
 }
 
 /// Print warnings to stderr. Each warning is printed on its own line.
+///
+/// Sanitizes each warning before printing (issue #176 / CWE-150): warning strings
+/// may embed a hostile filename, so C0/DEL/C1 bytes are escaped to `\uXXXX` literals.
 fn emit_warnings(warnings: &[String]) {
     for w in warnings {
-        eprintln!("{w}");
+        eprintln!("{}", crate::lint::sanitize_control_chars(w));
     }
 }
 

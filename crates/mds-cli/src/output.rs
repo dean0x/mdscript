@@ -493,7 +493,7 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
 /// embedded source frames (issue #176 / CWE-150). The render+sanitize pass is
 /// idempotent: calling it a second time on already-sanitized output is a no-op.
 pub(crate) fn render_error_sanitized(report: &miette::Report) -> String {
-    mds::sanitize_control_chars(&format!("{report:?}"))
+    mds::sanitize_control_chars(&format!("{report:?}")).into_owned()
 }
 
 /// Render a miette Report to stderr with control-character sanitization applied.

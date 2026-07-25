@@ -16,7 +16,9 @@
 //! `LintDiagnostic` struct so that span offsets and fix-edits remain byte-accurate.
 //! `sanitize_control_chars` is NOT called in `LintDiagnostic` constructors.
 
+use std::borrow::Cow;
 use std::fmt;
+use std::fmt::Write as _;
 
 use crate::error::SerializedSpan;
 use crate::limits::MAX_DIAGNOSTICS;
@@ -281,6 +283,7 @@ impl LintResult {
     ///
     /// **NEVER** build this JSON via `format!()` — use `serde_json::json!()` so
     /// control characters in message/help are serialized safely.
+    #[must_use]
     pub fn to_canonical_json(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
 
@@ -334,11 +337,14 @@ impl LintResult {
             by_file.entry(key).or_default().push(d);
         }
 
+        // Sanitize the file key at the serialization boundary (issue #176 / CWE-150):
+        // POSIX filenames may legally contain C0/DEL/C1 bytes.  All surfaces that
+        // call to_canonical_json() inherit this fix without further changes.
         let files: Vec<serde_json::Value> = by_file
             .into_iter()
             .map(|(file, diagnostics)| {
                 serde_json::json!({
-                    "file": file,
+                    "file": sanitize_control_chars(&file),
                     "diagnostics": diagnostics,
                 })
             })
@@ -402,31 +408,90 @@ impl LintResultBuilder {
 /// (U+0080–U+009F) control characters from a string, except `\n` (U+000A)
 /// and `\t` (U+0009).
 ///
+/// Returns a borrowed view of the input when no escaping is needed (zero
+/// allocation for the overwhelmingly-common clean case). Allocates only when
+/// a control character is actually present, reserving exact capacity.
+///
 /// Applied at all serialization and render boundaries (CLI human render, JSON
 /// serialization, and the Python typed conversion). NOT called in `LintDiagnostic`
 /// constructors so that span offsets and fix-edit byte ranges remain accurate against
 /// the raw source. Raw bytes in the stored struct; sanitized literals in all output.
 ///
 /// Replacement strategy: replace each control character with its Unicode escape
-/// `\uXXXX` to make the rendered text visually safe on terminals without silently
-/// dropping information that a developer might need to diagnose rule logic.
-/// DEL (U+007F) is included because some terminals interpret it as a backspace,
-/// which can corrupt human-readable output. The function is idempotent — calling it
-/// twice on already-sanitized text is a no-op.
-pub fn sanitize_control_chars(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        let is_c0 = ch < '\u{0020}' && ch != '\n' && ch != '\t';
-        let is_del = ch == '\u{007F}';
-        let is_c1 = ('\u{0080}'..='\u{009F}').contains(&ch);
-        if is_c0 || is_del || is_c1 {
-            // Replace with Unicode escape so the byte is visible but harmless.
-            let _ = fmt::write(&mut out, format_args!("\\u{:04X}", ch as u32));
-        } else {
-            out.push(ch);
+/// `\uXXXX` (uppercase hex, 4 digits, literal backslash) to make the rendered
+/// text visually safe on terminals without silently dropping information that a
+/// developer might need to diagnose rule logic. DEL (U+007F) is included because
+/// some terminals interpret it as a backspace, which can corrupt human-readable
+/// output. The function is idempotent — calling it twice on already-sanitized
+/// text is a no-op.
+///
+/// # Examples
+///
+/// ```
+/// use mds::sanitize_control_chars;
+///
+/// // ESC (U+001B) is escaped to the 6-char uppercase literal.
+/// assert_eq!(&*sanitize_control_chars("\x1B[33m"), "\\u001B[33m");
+///
+/// // \n and \t are preserved.
+/// assert_eq!(&*sanitize_control_chars("hello\nworld"), "hello\nworld");
+///
+/// // DEL (U+007F) is escaped.
+/// assert_eq!(&*sanitize_control_chars("a\x7Fb"), "a\\u007Fb");
+///
+/// // C1 control NEL (U+0085) is escaped.
+/// assert_eq!(&*sanitize_control_chars("a\u{0085}b"), "a\\u0085b");
+///
+/// // Clean input is borrowed — zero allocation.
+/// let s = "normal text";
+/// let cow = sanitize_control_chars(s);
+/// assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+///
+/// // Idempotent: a second call on already-sanitized output is a no-op.
+/// let once = sanitize_control_chars("a\x1Bb");
+/// let twice = sanitize_control_chars(&once);
+/// assert_eq!(once, twice);
+/// ```
+#[must_use]
+pub fn sanitize_control_chars(s: &str) -> Cow<'_, str> {
+    // Byte-level fast path: scan for any byte that signals a control character.
+    // - C0 (U+0000–U+001F) and DEL (U+007F) are single bytes: b < 0x20 or b == 0x7F.
+    // - C1 (U+0080–U+009F) in UTF-8 is encoded as 0xC2 0x80–0xC2 0x9F; scanning
+    //   for 0xC2 has occasional false positives (e.g. U+00A0 NBSP also starts with
+    //   0xC2) but those are handled correctly by the char loop below.
+    // \n (0x0A) and \t (0x09) are in C0 but kept; the false-positive for b < 0x20
+    // just triggers the slow path which keeps them unchanged — still correct.
+    let needs_work = s.bytes().any(|b| b < 0x20 || b == 0x7F || b == 0xC2);
+    if !needs_work {
+        return Cow::Borrowed(s);
+    }
+
+    // Count the escapes so we can reserve exactly: each escaped char takes 6 output
+    // bytes (\uXXXX) instead of 1–4 input bytes, a net growth of at most 5 bytes.
+    let n_escaped = s.chars().filter(|&ch| is_control_char(ch)).count();
+    let mut out = String::with_capacity(s.len() + 5 * n_escaped);
+
+    // Bulk-copy clean runs; replace each control char with its \uXXXX literal.
+    let mut bulk_start = 0;
+    for (i, ch) in s.char_indices() {
+        if is_control_char(ch) {
+            out.push_str(&s[bulk_start..i]);
+            // \uXXXX: literal backslash + u + 4 uppercase hex digits.
+            write!(out, "\\u{:04X}", ch as u32).expect("writing to a String is infallible");
+            bulk_start = i + ch.len_utf8();
         }
     }
-    out
+    // Flush the final clean segment.
+    out.push_str(&s[bulk_start..]);
+    Cow::Owned(out)
+}
+
+/// Returns `true` for codepoints that `sanitize_control_chars` escapes.
+#[inline]
+fn is_control_char(ch: char) -> bool {
+    (ch < '\u{0020}' && ch != '\n' && ch != '\t')
+        || ch == '\u{007F}'
+        || ('\u{0080}'..='\u{009F}').contains(&ch)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -485,9 +550,8 @@ mod tests {
     /// message and help. Simulates a `unused-variable` diagnostic whose message embeds
     /// a raw ESC byte (e.g. from a hostile frontmatter key like `"ab"`).
     ///
-    /// After the fix: the JSON message/help must carry the sanitized `\uXXXX` literal;
-    /// the raw ESC byte must not be present in the JSON string value.
-    /// Span offsets (raw byte positions) must remain unchanged.
+    /// After the fix: the JSON message AND help carry the sanitized `\uXXXX` literal
+    /// (uppercase, exactly 4 digits).  Span offsets (raw byte positions) are unchanged.
     #[test]
     fn to_canonical_json_sanitizes_diagnostic_message() {
         // Simulate an unused-variable diagnostic whose variable name contains U+001B.
@@ -500,9 +564,12 @@ mod tests {
                     "Variable '{}' is defined in frontmatter but never referenced in the body.",
                     hostile_name
                 ),
-                help: Some(
-                    "Remove the frontmatter key or reference it in the template body.".to_string(),
-                ),
+                // Help also embeds the hostile name: removing the `map(sanitize_control_chars)`
+                // call for help would leave the raw ESC byte in the output and fail below.
+                help: Some(format!(
+                    "Remove the key '{}' from frontmatter or reference it in the template body.",
+                    hostile_name
+                )),
                 span: Some(crate::error::SerializedSpan {
                     offset: 4,
                     length: 3,
@@ -531,10 +598,21 @@ mod tests {
             !msg.contains('\x1B'),
             "raw ESC byte must not appear in to_canonical_json message; got: {msg:?}"
         );
-        // Sanitized 6-char literal \\u001B must appear.
+        // Sanitized 6-char uppercase literal must appear (no lowercase alternative).
         assert!(
             msg.contains("\\u001B"),
             "sanitized literal \\u001B must appear in to_canonical_json message; got: {msg:?}"
+        );
+
+        let help = diag["help"].as_str().unwrap();
+        // Help field must also be sanitized — pins the help-sanitize call (avoids PF-013).
+        assert!(
+            !help.contains('\x1B'),
+            "raw ESC byte must not appear in to_canonical_json help; got: {help:?}"
+        );
+        assert!(
+            help.contains("\\u001B"),
+            "sanitized literal \\u001B must appear in to_canonical_json help; got: {help:?}"
         );
 
         // Span offset must be byte-accurate (not corrupted by sanitization).
@@ -546,6 +624,30 @@ mod tests {
             diag["span"]["length"], 3,
             "span length must be unchanged after message sanitization"
         );
+    }
+
+    /// [testing-7]: `sanitize_control_chars` is idempotent — a second call on
+    /// already-sanitized output is always a no-op.  This property is relied on by the
+    /// double-pass in `render_diag_human` (field-level + whole-frame).
+    #[test]
+    fn sanitize_is_idempotent() {
+        let cases: &[&str] = &[
+            "\x1B",
+            "a\x1Bb",
+            "a\u{007F}b",
+            "a\u{0085}b",
+            "\x00\x01\x02\x1F",
+            "hello world",
+            "",
+        ];
+        for &input in cases {
+            let once = sanitize_control_chars(input);
+            let twice = sanitize_control_chars(&once);
+            assert_eq!(
+                once, twice,
+                "sanitize_control_chars is not idempotent for input {input:?}"
+            );
+        }
     }
 
     // ── LintResultBuilder truncation ──────────────────────────────────────────
