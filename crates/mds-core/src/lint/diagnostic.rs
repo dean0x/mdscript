@@ -5,19 +5,33 @@
 //! maps our `Severity` enum to miette's rendering tiers (Error/Warning/Advice).
 //!
 //! **Sanitization discipline**: `message` and `help` are sanitized at every output
-//! boundary (C0/DEL/C1 → `\uXXXX` uppercase 6-char literals; `\n`/`\t` preserved).
-//! The complete closed boundary set:
+//! boundary. The escaped class is C0 except `\n`/`\t`, DEL (U+007F), C1
+//! (U+0080–U+009F), the Unicode bidi controls (U+200E/U+200F, U+202A–U+202E,
+//! U+2066–U+2069 — Trojan Source, CVE-2021-42574), the JS line/paragraph separators
+//! U+2028/U+2029, and U+FEFF; each becomes an uppercase 6-char `\uXXXX` literal.
 //!
-//! - **CLI human render** (`render_diag_human`, mds-cli/src/lint.rs): `message`/`help`
-//!   via `sanitize_control_chars`; source excerpts via `neutralize_source_for_render`
-//!   (byte-length-preserving substitution; avoids PF-014 caret desync)
-//! - **`MdsError::serialize()`** (error.rs) — covers all three bindings' error path
-//! - **`LintResult::to_canonical_json()`** (this module) — `message`, `help`, and
-//!   the `files[].file` key
-//! - **`CompileResult::to_canonical_json()`** (lib.rs) — warning strings; *distinct
-//!   method from `LintResult::to_canonical_json` above, not a duplicate*
-//! - **`emit_warnings()`** (lib.rs) — sanitizes before printing to stderr
-//! - **Python typed `LintDiagnostic` pyclass** (mds-python/src/lib.rs)
+//! Two escape modes share one implementation, differing only on `\n`:
+//!
+//! - **HUMAN** ([`sanitize_control_chars`]) — `\n` preserved. For terminal / miette
+//!   render output, where multi-line frames must stay readable.
+//! - **WIRE** ([`sanitize_control_chars_wire`]) — `\n` escaped too, so a hostile
+//!   message cannot forge an extra line in a line-oriented consumer of the value
+//!   (log forging, YAML key injection).
+//!
+//! `\t` is preserved in both modes. The complete closed boundary set:
+//!
+//! | Boundary | Mode | Fields |
+//! |----------|------|--------|
+//! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help`/filename via `sanitize_control_chars`; source excerpts via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
+//! | `MdsError::at()` (error.rs) | HUMAN | filename; source via `neutralize_source_for_render` |
+//! | `MdsError::display_sanitized()` (error.rs) | HUMAN | whole `Display` string |
+//! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr |
+//! | `safe_path()` (mds-cli/src/output.rs) | HUMAN | CLI status-line path display |
+//! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
+//! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key |
+//! | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings; *distinct method from `LintResult::to_canonical_json`, not a duplicate* |
+//! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
+//! | `--diff` / `--check` preview output (mds-cli/src/output.rs) | HUMAN, TTY-gated | neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable |
 //!
 //! **Deliberate exclusions** (documented, not gaps):
 //! - `LintDiagnostic::fmt` (raw `Display`) — unsanitized by design; use
@@ -29,8 +43,17 @@
 //! (raw byte accuracy required for fix pipelines and span highlighting).
 //!
 //! Raw byte values are preserved in the stored `LintDiagnostic` struct so that span
-//! offsets and fix-edits remain byte-accurate. `sanitize_control_chars` is NOT called
-//! in `LintDiagnostic` constructors.
+//! offsets and fix-edits remain byte-accurate. Neither sanitizer is called in
+//! `LintDiagnostic` constructors.
+//!
+//! **Escaping is one-way.** The transformation is lossy and non-injective: a template
+//! that literally contains the six characters `\`,`u`,`0`,`0`,`1`,`B` and one that
+//! contains an actual ESC byte are indistinguishable in the output. Consumers MUST NOT
+//! un-escape `\uXXXX` sequences back into bytes — that reconstitutes exactly the
+//! injection this guard prevents. Round-tripping is an explicit non-goal; no
+//! backslash-escaping will be added to make the mapping reversible. A consumer that
+//! needs original bytes must read them from the source via the raw `span` /
+//! `fix_edits` byte offsets.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -339,15 +362,17 @@ impl LintResult {
                     .collect::<Vec<_>>()
             });
 
-            // Sanitize at the serialization boundary (issue #176 / CWE-150):
-            // message and help carry sanitized \uXXXX literals for C0/DEL/C1 bytes.
+            // Sanitize at the serialization boundary (issue #176 / CWE-150) in WIRE
+            // mode: message and help carry sanitized \uXXXX literals for control,
+            // bidi, separator and BOM characters — and for `\n`, so a hostile message
+            // cannot forge an extra line in a line-oriented consumer of this JSON.
             // Spans and fix_edits reference raw byte offsets into the source — left
             // untouched so fix pipelines and span highlighting stay accurate.
             let d = serde_json::json!({
                 "rule": diag.rule,
                 "severity": diag.severity.to_string(),
-                "message": sanitize_control_chars(&diag.message),
-                "help": diag.help.as_deref().map(sanitize_control_chars),
+                "message": sanitize_control_chars_wire(&diag.message),
+                "help": diag.help.as_deref().map(sanitize_control_chars_wire),
                 "fixable": (diag.fix_removals.is_some() || diag.fix_edits.is_some()) && super::tier::is_fixable(&diag.rule, self.is_standalone),
                 "span": span_json,
                 "fix_edits": fix_edits_json,
@@ -356,14 +381,15 @@ impl LintResult {
             by_file.entry(key).or_default().push(d);
         }
 
-        // Sanitize the file key at the serialization boundary (issue #176 / CWE-150):
-        // POSIX filenames may legally contain C0/DEL/C1 bytes.  All surfaces that
-        // call to_canonical_json() inherit this fix without further changes.
+        // Sanitize the file key at the serialization boundary (issue #176 / CWE-150),
+        // WIRE mode: POSIX filenames may legally contain C0/DEL/C1 bytes, bidi
+        // controls, and even newlines.  All surfaces that call to_canonical_json()
+        // inherit this fix without further changes.
         let files: Vec<serde_json::Value> = by_file
             .into_iter()
             .map(|(file, diagnostics)| {
                 serde_json::json!({
-                    "file": sanitize_control_chars(&file),
+                    "file": sanitize_control_chars_wire(&file),
                     "diagnostics": diagnostics,
                 })
             })
@@ -423,26 +449,60 @@ impl LintResultBuilder {
 
 // ── sanitize_control_chars ────────────────────────────────────────────────────
 
-/// Strip or escape C0 (U+0000–U+001F incl. ESC), DEL (U+007F), and C1
-/// (U+0080–U+009F) control characters from a string, except `\n` (U+000A)
-/// and `\t` (U+0009).
+/// Which escape class a sanitizer call applies.
+///
+/// Both variants escape the same hostile character class (see [`is_control_char`]);
+/// they differ only in how they treat `\n` (U+000A). `\t` (U+0009) is preserved by
+/// both — a tab cannot forge a line and cannot reposition a cursor destructively.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EscapeMode {
+    /// Terminal / miette render output. `\n` is preserved so multi-line diagnostic
+    /// frames stay readable.
+    Human,
+    /// Machine-readable output (JSON wire, binding error objects). `\n` is escaped
+    /// as well, so a hostile message cannot forge an extra line in a line-oriented
+    /// consumer of the string value (log forging, YAML key injection).
+    Wire,
+}
+
+/// Escape hostile characters, preserving `\n` (HUMAN mode).
+///
+/// The escaped class is C0 (U+0000–U+001F incl. ESC) except `\n`/`\t`, DEL (U+007F),
+/// C1 (U+0080–U+009F), the Unicode bidi controls (U+200E/U+200F, U+202A–U+202E,
+/// U+2066–U+2069), the line/paragraph separators U+2028/U+2029, and U+FEFF.
+///
+/// Use this at **render** boundaries (anything bound for a terminal or a miette
+/// frame). Use [`sanitize_control_chars_wire`] at **wire** boundaries (JSON, binding
+/// error objects), where an embedded newline is itself an injection vector.
 ///
 /// Returns a borrowed view of the input when no escaping is needed (zero
 /// allocation for the overwhelmingly-common clean case). Allocates only when
-/// a control character is actually present, reserving exact capacity.
+/// a hostile character is actually present, reserving exact capacity.
 ///
 /// Applied at every output boundary — see the module-level "Sanitization discipline"
 /// note for the authoritative list. NOT called in `LintDiagnostic` constructors so that
 /// span offsets and fix-edit byte ranges remain accurate against the raw source. Raw
 /// bytes in the stored struct; sanitized literals in all output.
 ///
-/// Replacement strategy: replace each control character with its Unicode escape
+/// Replacement strategy: replace each hostile character with its Unicode escape
 /// `\uXXXX` (uppercase hex, 4 digits, literal backslash) to make the rendered
 /// text visually safe on terminals without silently dropping information that a
 /// developer might need to diagnose rule logic. DEL (U+007F) is included because
 /// some terminals interpret it as a backspace, which can corrupt human-readable
-/// output. The function is idempotent — calling it twice on already-sanitized
-/// text is a no-op.
+/// output. The bidi controls are included because they can visually reorder a
+/// diagnostic line (Trojan Source, CVE-2021-42574). The function is idempotent —
+/// calling it twice on already-sanitized text is a no-op.
+///
+/// # Escaping is one-way
+///
+/// This transformation is **lossy and non-injective**: a template that literally
+/// contains the seven characters `\`,`u`,`0`,`0`,`1`,`B` and an actual ESC byte both
+/// serialize to the same `` output. Consumers **MUST NOT** un-escape `\uXXXX`
+/// sequences back into bytes — doing so re-creates exactly the injection this guard
+/// exists to prevent. The escape is for display only; when a consumer needs the
+/// original bytes it must read the source through `span`/`fix_edits` byte offsets,
+/// which are deliberately left raw. No backslash-escaping (`\` → `\\`) will be added
+/// to make the mapping reversible; round-tripping is an explicit non-goal.
 ///
 /// # Examples
 ///
@@ -452,7 +512,7 @@ impl LintResultBuilder {
 /// // ESC (U+001B) is escaped to the 6-char uppercase literal.
 /// assert_eq!(&*sanitize_control_chars("\x1B[33m"), "\\u001B[33m");
 ///
-/// // \n and \t are preserved.
+/// // \n and \t are preserved in HUMAN mode.
 /// assert_eq!(&*sanitize_control_chars("hello\nworld"), "hello\nworld");
 ///
 /// // DEL (U+007F) is escaped.
@@ -460,6 +520,13 @@ impl LintResultBuilder {
 ///
 /// // C1 control NEL (U+0085) is escaped.
 /// assert_eq!(&*sanitize_control_chars("a\u{0085}b"), "a\\u0085b");
+///
+/// // Bidi override (U+202E RLO — Trojan Source) is escaped.
+/// assert_eq!(&*sanitize_control_chars("a\u{202E}b"), "a\\u202Eb");
+///
+/// // JS line separator (U+2028) and BOM (U+FEFF) are escaped.
+/// assert_eq!(&*sanitize_control_chars("a\u{2028}b"), "a\\u2028b");
+/// assert_eq!(&*sanitize_control_chars("a\u{FEFF}b"), "a\\uFEFFb");
 ///
 /// // Clean input is borrowed — zero allocation.
 /// let s = "normal text";
@@ -473,29 +540,82 @@ impl LintResultBuilder {
 /// ```
 #[must_use]
 pub fn sanitize_control_chars(s: &str) -> Cow<'_, str> {
-    // Byte-level fast path: scan for any byte that signals a control character.
+    sanitize_with(s, EscapeMode::Human)
+}
+
+/// Escape hostile characters **including `\n`** (WIRE mode).
+///
+/// Identical to [`sanitize_control_chars`] except that `\n` (U+000A) is also escaped
+/// to its 6-character literal. `\t` is still preserved.
+///
+/// Use this at machine-readable boundaries — `MdsError::serialize()`,
+/// `LintResult::to_canonical_json()`, `CompileResult::to_canonical_json()` warnings,
+/// and the Python typed-surface construction path. A raw newline inside a JSON string
+/// value is legal JSON, but once a consumer prints or line-splits that value a hostile
+/// message can forge an entire extra diagnostic line (log forging / YAML key
+/// injection). Escaping it makes the value single-line by construction.
+///
+/// The one-way-escaping contract in [`sanitize_control_chars`] applies verbatim here.
+///
+/// # Examples
+///
+/// ```
+/// use mds::{sanitize_control_chars, sanitize_control_chars_wire};
+///
+/// // WIRE escapes the newline; HUMAN keeps it.
+/// assert_eq!(&*sanitize_control_chars_wire("a\nb"), "a\\u000Ab");
+/// assert_eq!(&*sanitize_control_chars("a\nb"), "a\nb");
+///
+/// // \t is preserved in both modes.
+/// assert_eq!(&*sanitize_control_chars_wire("a\tb"), "a\tb");
+///
+/// // Everything else escapes identically in both modes.
+/// assert_eq!(&*sanitize_control_chars_wire("a\u{202E}b"), "a\\u202Eb");
+///
+/// // Clean input is borrowed — zero allocation.
+/// assert!(matches!(
+///     sanitize_control_chars_wire("normal text"),
+///     std::borrow::Cow::Borrowed(_)
+/// ));
+/// ```
+#[must_use]
+pub fn sanitize_control_chars_wire(s: &str) -> Cow<'_, str> {
+    sanitize_with(s, EscapeMode::Wire)
+}
+
+/// Single escape implementation shared by both public entry points.
+///
+/// Kept as one function on purpose: a second, forked escape map would be a PF-004
+/// parallel path — the two would drift and one boundary would silently stop
+/// enforcing what the other does.
+fn sanitize_with(s: &str, mode: EscapeMode) -> Cow<'_, str> {
+    // Byte-level fast path: scan for any byte that can start an escaped character.
     // - C0 (U+0000–U+001F) and DEL (U+007F) are single bytes: b < 0x20 or b == 0x7F.
-    // - C1 (U+0080–U+009F) in UTF-8 is encoded as 0xC2 0x80–0xC2 0x9F; scanning
-    //   for 0xC2 has occasional false positives (e.g. U+00A0 NBSP also starts with
-    //   0xC2) but those are handled correctly by the char loop below.
-    // \n (0x0A) and \t (0x09) are in C0 but kept; the false-positive for b < 0x20
-    // just triggers the slow path which keeps them unchanged — still correct.
-    let needs_work = s.bytes().any(|b| b < 0x20 || b == 0x7F || b == 0xC2);
+    // - C1 (U+0080–U+009F) in UTF-8 is encoded as 0xC2 0x80–0xC2 0x9F.
+    // - U+200E/U+200F, U+2028/U+2029, U+202A–U+202E and U+2066–U+2069 all start
+    //   with 0xE2; U+FEFF starts with 0xEF.
+    // The scan is a deliberate over-approximation (0xC2/0xE2/0xEF also lead many
+    // benign codepoints); false positives only cost a trip through the char loop
+    // below, which leaves non-hostile characters unchanged.
+    let needs_work = s
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7F || b == 0xC2 || b == 0xE2 || b == 0xEF);
     if !needs_work {
         return Cow::Borrowed(s);
     }
 
     // Count the escapes so we can reserve exactly: each escaped char takes 6 output
-    // bytes (\uXXXX) instead of 1–4 input bytes, a net growth of at most 5 bytes.
-    let n_escaped = s.chars().filter(|&ch| is_control_char(ch)).count();
+    // bytes (\uXXXX) instead of 1–3 input bytes, a net growth of at most 5 bytes.
+    let n_escaped = s.chars().filter(|&ch| escapes_in(ch, mode)).count();
     let mut out = String::with_capacity(s.len() + 5 * n_escaped);
 
-    // Bulk-copy clean runs; replace each control char with its \uXXXX literal.
+    // Bulk-copy clean runs; replace each hostile char with its \uXXXX literal.
     let mut bulk_start = 0;
     for (i, ch) in s.char_indices() {
-        if is_control_char(ch) {
+        if escapes_in(ch, mode) {
             out.push_str(&s[bulk_start..i]);
-            // \uXXXX: literal backslash + u + 4 uppercase hex digits.
+            // \uXXXX: literal backslash + u + 4 uppercase hex digits. Every escaped
+            // codepoint is in the BMP, so 4 digits is always exact.
             write!(out, "\\u{:04X}", ch as u32).expect("writing to a String is infallible");
             bulk_start = i + ch.len_utf8();
         }
@@ -505,12 +625,47 @@ pub fn sanitize_control_chars(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Returns `true` for codepoints that `sanitize_control_chars` escapes.
+/// Returns `true` when `ch` must be escaped under `mode`.
+#[inline]
+fn escapes_in(ch: char, mode: EscapeMode) -> bool {
+    is_control_char(ch) || (mode == EscapeMode::Wire && ch == '\n')
+}
+
+/// Returns `true` for codepoints escaped in **both** modes.
+///
+/// Also the predicate driving [`neutralize_source_for_render`], so the render path
+/// and the escape path can never diverge on which characters are hostile (PF-004).
 #[inline]
 fn is_control_char(ch: char) -> bool {
     (ch < '\u{0020}' && ch != '\n' && ch != '\t')
         || ch == '\u{007F}'
         || ('\u{0080}'..='\u{009F}').contains(&ch)
+        || is_format_hazard_char(ch)
+}
+
+/// Returns `true` for the non-C0/C1 codepoints that are still display-hazardous.
+///
+/// - **U+200E/U+200F, U+202A–U+202E, U+2066–U+2069** — the Unicode bidirectional
+///   controls (marks, embeddings, overrides, isolates). They reorder how the rest of
+///   a line renders, which is the Trojan Source attack (CVE-2021-42574): a diagnostic
+///   or filename can be made to display as something entirely different from its bytes.
+/// - **U+2028/U+2029** — LINE SEPARATOR / PARAGRAPH SEPARATOR. Both terminate a
+///   JavaScript string literal, so an unescaped one can break out of generated JS.
+/// - **U+FEFF** — BOM / ZERO WIDTH NO-BREAK SPACE. Invisible in every renderer, so it
+///   can hide or split content the reader believes is contiguous.
+///
+/// Every codepoint here is in U+0800–U+FFFF, i.e. exactly 3 bytes in UTF-8 — which is
+/// what lets [`neutralize_source_for_render`] substitute U+FFFD (also 3 bytes) without
+/// breaking its byte-length invariant.
+#[inline]
+fn is_format_hazard_char(ch: char) -> bool {
+    matches!(ch,
+        '\u{200E}' | '\u{200F}'
+        | '\u{2028}' | '\u{2029}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{FEFF}'
+    )
 }
 
 /// Replace control characters in source text with byte-length-preserving substitutes so
@@ -522,10 +677,15 @@ fn is_control_char(ch: char) -> bool {
 /// each control char to 6 bytes (`\uXXXX`), desynchronising every span byte-offset
 /// that follows the substitution point and producing misaligned carets.
 ///
+/// It neutralizes exactly the character class [`sanitize_control_chars`] escapes —
+/// the two are kept symmetric on purpose so the render path can never lag the wire
+/// path on a newly-recognised hostile character (PF-004).
+///
 /// Substitution rules (byte-length-preserving):
 /// - C0 bytes (U+0000–U+001F) except `\n`/`\t`: 1-byte → `?` (U+003F, 1 byte)
 /// - DEL (U+007F): 1-byte → `?`
 /// - C1 range (U+0080–U+009F, 2-byte UTF-8): 2-byte → U+00A0 NBSP (2 bytes)
+/// - Bidi controls, U+2028/U+2029, U+FEFF (3-byte UTF-8): → U+FFFD (3 bytes)
 ///
 /// Returns [`Cow::Borrowed`] when no substitution is needed (fast path).
 pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
@@ -541,6 +701,9 @@ pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
             out.push('?'); // 1-byte C0/DEL → '?' (1 byte) — byte-length-preserving
         } else if (0x80..=0x9F).contains(&u) {
             out.push('\u{00A0}'); // 2-byte C1 → U+00A0 NBSP (2 bytes) — byte-length-preserving
+        } else if is_format_hazard_char(c) {
+            // 3-byte bidi/separator/BOM → U+FFFD (3 bytes) — byte-length-preserving.
+            out.push('\u{FFFD}');
         } else {
             out.push(c);
         }
@@ -706,6 +869,307 @@ mod tests {
                 once, twice,
                 "sanitize_control_chars is not idempotent for input {input:?}"
             );
+        }
+    }
+
+    // ── T-16: widened escape class — bidi / separator / BOM (issue #176) ─────
+    //
+    // These codepoints are outside C0/DEL/C1 but are still display-hazardous:
+    //  - U+200E/U+200F and U+202A–U+202E and U+2066–U+2069 are the Unicode bidi
+    //    controls behind Trojan Source (CVE-2021-42574): they can visually reorder
+    //    a diagnostic so a benign-looking line renders as something else entirely.
+    //  - U+2028/U+2029 terminate a JavaScript string literal, so an unescaped one
+    //    inside a diagnostic message can break out of generated JS.
+    //  - U+FEFF (BOM / ZWNBSP) is invisible and can hide content in any consumer.
+
+    /// T-16a: every bidi override / isolate / mark codepoint is escaped to its
+    /// uppercase 6-char `\uXXXX` literal, and the raw codepoint is gone.
+    #[test]
+    fn sanitize_escapes_bidi_control_chars() {
+        let cases: &[(char, &str)] = &[
+            ('\u{200E}', "\\u200E"), // LEFT-TO-RIGHT MARK
+            ('\u{200F}', "\\u200F"), // RIGHT-TO-LEFT MARK
+            ('\u{202A}', "\\u202A"), // LEFT-TO-RIGHT EMBEDDING
+            ('\u{202B}', "\\u202B"), // RIGHT-TO-LEFT EMBEDDING
+            ('\u{202C}', "\\u202C"), // POP DIRECTIONAL FORMATTING
+            ('\u{202D}', "\\u202D"), // LEFT-TO-RIGHT OVERRIDE
+            ('\u{202E}', "\\u202E"), // RIGHT-TO-LEFT OVERRIDE (Trojan Source)
+            ('\u{2066}', "\\u2066"), // LEFT-TO-RIGHT ISOLATE
+            ('\u{2067}', "\\u2067"), // RIGHT-TO-LEFT ISOLATE
+            ('\u{2068}', "\\u2068"), // FIRST STRONG ISOLATE
+            ('\u{2069}', "\\u2069"), // POP DIRECTIONAL ISOLATE
+        ];
+        for &(ch, expected) in cases {
+            let input = format!("a{ch}b");
+            let out = sanitize_control_chars(&input);
+            assert!(
+                !out.contains(ch),
+                "raw U+{:04X} must not survive sanitization; got: {out:?}",
+                ch as u32
+            );
+            assert_eq!(
+                &*out,
+                format!("a{expected}b"),
+                "U+{:04X} must escape to {expected}",
+                ch as u32
+            );
+        }
+    }
+
+    /// T-16b: U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are escaped.
+    /// Both terminate a JS string literal, so they must never reach a consumer raw.
+    #[test]
+    fn sanitize_escapes_line_and_paragraph_separators() {
+        assert_eq!(&*sanitize_control_chars("a\u{2028}b"), "a\\u2028b");
+        assert_eq!(&*sanitize_control_chars("a\u{2029}b"), "a\\u2029b");
+    }
+
+    /// T-16c: U+FEFF (BOM / ZWNBSP) is escaped — it is invisible in every renderer.
+    #[test]
+    fn sanitize_escapes_bom() {
+        assert_eq!(&*sanitize_control_chars("a\u{FEFF}b"), "a\\uFEFFb");
+    }
+
+    /// T-16d: `neutralize_source_for_render` must handle the widened class
+    /// symmetrically (PF-004: no wire/render parallel-path gap) while keeping the
+    /// byte-length invariant the T-10a anchor pins. Every new codepoint is 3-byte
+    /// UTF-8, and U+FFFD is also 3 bytes.
+    #[test]
+    fn neutralize_source_replaces_bidi_and_separators_byte_for_byte() {
+        let raw = "let x\u{202E} = 1;\u{2028}next\u{FEFF}line\u{2066}end";
+        let out = neutralize_source_for_render(raw);
+        assert_eq!(
+            out.len(),
+            raw.len(),
+            "neutralize_source_for_render must preserve byte length; raw={raw:?} out={out:?}"
+        );
+        for ch in ['\u{202E}', '\u{2028}', '\u{FEFF}', '\u{2066}'] {
+            assert!(
+                !out.contains(ch),
+                "raw U+{:04X} must not survive neutralization; got: {out:?}",
+                ch as u32
+            );
+        }
+        assert_eq!(
+            out.matches('\u{FFFD}').count(),
+            4,
+            "each neutralized format char must become U+FFFD; got: {out:?}"
+        );
+        // Non-vacuity: surrounding source text is untouched.
+        assert!(out.contains("let x"), "clean source must survive: {out:?}");
+        assert!(out.contains("next"), "clean source must survive: {out:?}");
+    }
+
+    /// T-16e [PF-013]: the RLO reversal vector reaches the wire through
+    /// `to_canonical_json` and comes out escaped.
+    ///
+    /// Vector: a `duplicate-import` style message embedding an import path that
+    /// carries U+202E. Without the guard the raw RLO reaches the JSON string value
+    /// and any terminal/IDE renderer reverses the rest of the line.
+    ///
+    /// Non-vacuity guards: the diagnostic list is non-empty, the expected rule is
+    /// present, and the POSITIVE assertion requires the escaped form to be there.
+    #[test]
+    fn to_canonical_json_escapes_bidi_override() {
+        let hostile_path = "./fo\u{202E}gnp.mds";
+        let result = LintResult {
+            diagnostics: vec![LintDiagnostic {
+                rule: "duplicate-import".to_string(),
+                severity: Severity::Error,
+                message: format!("Module '{hostile_path}' is imported more than once."),
+                help: Some(format!("Remove the duplicate '{hostile_path}' import.")),
+                span: Some(crate::error::SerializedSpan {
+                    offset: 9,
+                    length: 16,
+                    line: None,
+                    column: None,
+                }),
+                file: Some("ma\u{202E}in.mds".to_string()),
+                fix_removals: None,
+                fix_edits: None,
+            }],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        let json = result.to_canonical_json();
+        let files = json["files"].as_array().expect("files array");
+        assert_eq!(files.len(), 1, "non-vacuity: exactly one file group");
+        let diags = files[0]["diagnostics"].as_array().expect("diagnostics");
+        assert_eq!(diags.len(), 1, "non-vacuity: exactly one diagnostic");
+        assert_eq!(
+            diags[0]["rule"], "duplicate-import",
+            "non-vacuity: expected rule must be present"
+        );
+
+        for field in ["message", "help"] {
+            let s = diags[0][field].as_str().unwrap();
+            assert!(
+                !s.contains('\u{202E}'),
+                "raw U+202E must not appear in {field}; got: {s:?}"
+            );
+            assert!(
+                s.contains("\\u202E"),
+                "escaped \\u202E must appear in {field}; got: {s:?}"
+            );
+        }
+
+        // The file group key travels the same boundary.
+        let file_key = files[0]["file"].as_str().unwrap();
+        assert!(
+            !file_key.contains('\u{202E}'),
+            "raw U+202E must not appear in the file key; got: {file_key:?}"
+        );
+        assert!(
+            file_key.contains("\\u202E"),
+            "escaped \\u202E must appear in the file key; got: {file_key:?}"
+        );
+
+        // Span offsets stay byte-accurate against the raw source.
+        assert_eq!(diags[0]["span"]["offset"], 9);
+        assert_eq!(diags[0]["span"]["length"], 16);
+    }
+
+    /// T-16f: U+2028 in a diagnostic message is escaped on the wire — a raw one
+    /// would terminate a JS string literal in any consumer that inlines the value.
+    #[test]
+    fn to_canonical_json_escapes_line_separator() {
+        let result = LintResult {
+            diagnostics: vec![LintDiagnostic {
+                rule: "unused-variable".to_string(),
+                severity: Severity::Warn,
+                message: "Variable 'a\u{2028}b' is never referenced.".to_string(),
+                help: None,
+                span: None,
+                file: Some("t.mds".to_string()),
+                fix_removals: None,
+                fix_edits: None,
+            }],
+            truncated: false,
+            is_standalone: false,
+        };
+        let json = result.to_canonical_json();
+        let msg = json["files"][0]["diagnostics"][0]["message"]
+            .as_str()
+            .expect("non-vacuity: message must be a string");
+        assert!(
+            !msg.contains('\u{2028}'),
+            "raw U+2028 must not appear on the wire; got: {msg:?}"
+        );
+        assert!(
+            msg.contains("\\u2028"),
+            "escaped \\u2028 must appear on the wire; got: {msg:?}"
+        );
+    }
+
+    /// T-16g: wire-mode newline escaping — log/YAML-key forging guard.
+    ///
+    /// A diagnostic message carrying an embedded newline can forge an extra
+    /// "diagnostic" line in any line-oriented consumer of the JSON string value.
+    /// On the WIRE the newline (U+000A) must become its 6-char escape literal; the
+    /// HUMAN render path must keep it raw so multi-line miette frames stay readable.
+    #[test]
+    fn to_canonical_json_escapes_newline_but_human_mode_preserves_it() {
+        let forged = "a\nerror[mds::forged]: FAKE\nb";
+        let result = LintResult {
+            diagnostics: vec![LintDiagnostic {
+                rule: "unused-variable".to_string(),
+                severity: Severity::Warn,
+                message: forged.to_string(),
+                help: Some(forged.to_string()),
+                span: None,
+                file: Some("t.mds".to_string()),
+                fix_removals: None,
+                fix_edits: None,
+            }],
+            truncated: false,
+            is_standalone: false,
+        };
+        let json = result.to_canonical_json();
+        let diag = &json["files"][0]["diagnostics"][0];
+
+        for field in ["message", "help"] {
+            let s = diag[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("non-vacuity: {field} must be a string"));
+            assert!(
+                !s.contains('\n'),
+                "raw newline must not survive into the wire {field}; got: {s:?}"
+            );
+            assert!(
+                s.contains("\\u000A"),
+                "escaped \\u000A must appear in the wire {field}; got: {s:?}"
+            );
+            // Non-vacuity: the surrounding text is preserved, only the newline changed.
+            assert!(
+                s.contains("error[mds::forged]"),
+                "message body must be preserved verbatim; got: {s:?}"
+            );
+        }
+
+        // Human mode keeps the newline — this is the render-path contract.
+        let human = sanitize_control_chars(forged);
+        assert!(
+            human.contains('\n'),
+            "human mode must preserve raw newlines; got: {human:?}"
+        );
+        assert!(
+            !human.contains("\\u000A"),
+            "human mode must not escape newlines; got: {human:?}"
+        );
+        // \t is preserved in BOTH modes.
+        assert!(
+            sanitize_control_chars("a\tb").contains('\t'),
+            "human mode must preserve tabs"
+        );
+    }
+
+    /// T-16h: the two modes differ on `\n` and on nothing else.
+    ///
+    /// Guards against the two ways the split could rot: WIRE forgetting a character
+    /// HUMAN escapes (or vice versa), and WIRE escaping `\t` as collateral damage.
+    #[test]
+    fn wire_and_human_modes_differ_only_on_newline() {
+        // \n: the one intentional divergence.
+        assert_eq!(&*sanitize_control_chars_wire("a\nb"), "a\\u000Ab");
+        assert_eq!(&*sanitize_control_chars("a\nb"), "a\nb");
+        // \t: preserved by both.
+        assert_eq!(&*sanitize_control_chars_wire("a\tb"), "a\tb");
+        assert_eq!(&*sanitize_control_chars("a\tb"), "a\tb");
+        // Everything else: identical output from both modes.
+        for probe in [
+            "a\x00b",
+            "a\x1Bb",
+            "a\u{007F}b",
+            "a\u{0085}b",
+            "a\u{200E}b",
+            "a\u{202E}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{2069}b",
+            "a\u{FEFF}b",
+            "plain text",
+        ] {
+            assert_eq!(
+                sanitize_control_chars(probe),
+                sanitize_control_chars_wire(probe),
+                "modes must agree on {probe:?}"
+            );
+        }
+    }
+
+    /// T-16i: WIRE mode keeps the [`sanitize_control_chars`] properties — borrowed
+    /// on clean input (zero allocation) and idempotent.
+    #[test]
+    fn wire_mode_is_borrowed_when_clean_and_idempotent() {
+        assert!(matches!(
+            sanitize_control_chars_wire("normal text"),
+            Cow::Borrowed(_)
+        ));
+        for input in ["\x1B", "a\nb", "a\u{202E}b", "a\u{FEFF}b", "clean", ""] {
+            let once = sanitize_control_chars_wire(input);
+            let twice = sanitize_control_chars_wire(&once);
+            assert_eq!(once, twice, "wire mode not idempotent for {input:?}");
         }
     }
 

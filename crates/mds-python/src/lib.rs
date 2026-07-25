@@ -856,10 +856,15 @@ impl LintResult {
 
 // ── Lint value sanitization ─────────────────────────────────────────────────────
 
-/// Sanitize a string field in a JSON object in-place via [`mds::sanitize_control_chars`].
+/// Sanitize a string field in a JSON object in-place via
+/// [`mds::sanitize_control_chars_wire`].
+///
+/// WIRE mode: this backing store feeds `as_json()` / `to_dict()` as well as the typed
+/// getters, and must stay byte-identical to `LintResult::to_canonical_json()` on the
+/// other four surfaces (PF-007) — including the `\n` escape.
 ///
 /// Uses `Cow` so clean strings (the common case) cause no allocation — only strings
-/// that actually contain control characters are replaced. No-op when the field is
+/// that actually contain hostile characters are replaced. No-op when the field is
 /// absent or not a string.
 fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
     // Clone the field value to release the immutable borrow of `obj` before the
@@ -868,7 +873,7 @@ fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>,
         Some(serde_json::Value::String(s)) => s.clone(),
         _ => return,
     };
-    if let std::borrow::Cow::Owned(sanitized) = mds::sanitize_control_chars(&s_owned) {
+    if let std::borrow::Cow::Owned(sanitized) = mds::sanitize_control_chars_wire(&s_owned) {
         obj.insert(key.to_string(), serde_json::Value::String(sanitized));
     }
 }

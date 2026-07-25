@@ -3,7 +3,9 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::lint::{neutralize_source_for_render, sanitize_control_chars};
+use crate::lint::{
+    neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire,
+};
 
 // ── Serializable error types ──────────────────────────────────────────────────
 
@@ -851,9 +853,13 @@ impl MdsError {
         let code = Diagnostic::code(self)
             .map(|c| c.to_string())
             .unwrap_or_default();
-        let message = sanitize_control_chars(&self.to_string()).into_owned();
-        let help =
-            Diagnostic::help(self).map(|h| sanitize_control_chars(&h.to_string()).into_owned());
+        // WIRE mode: this value is consumed as JSON / as a binding error object, so
+        // `\n` is escaped too — an embedded newline would let a hostile message forge
+        // an extra line in any line-oriented consumer.  The HUMAN counterpart is
+        // `display_sanitized()`, which keeps newlines raw for terminal rendering.
+        let message = sanitize_control_chars_wire(&self.to_string()).into_owned();
+        let help = Diagnostic::help(self)
+            .map(|h| sanitize_control_chars_wire(&h.to_string()).into_owned());
 
         // Extract (span, src) from each span-bearing variant; no-span variants
         // use the wildcard arm and produce span: None.
@@ -912,11 +918,16 @@ impl MdsError {
 
     /// Return a terminal-safe, sanitized version of this error's `Display` text.
     ///
-    /// All C0 control characters (except `\t` and `\n`), DEL (U+007F), and C1
-    /// control characters (U+0080–U+009F) are replaced by their six-character
-    /// `\uXXXX` escape literals — identical to the escaping applied by
-    /// [`MdsError::serialize`].  `\t` and `\n` are preserved so that multi-line
-    /// miette renders remain readable.
+    /// All C0 control characters (except `\t` and `\n`), DEL (U+007F), C1 control
+    /// characters (U+0080–U+009F), the Unicode bidi controls (U+200E/U+200F,
+    /// U+202A–U+202E, U+2066–U+2069), U+2028/U+2029, and U+FEFF are replaced by their
+    /// six-character `\uXXXX` escape literals.  `\t` and `\n` are preserved so that
+    /// multi-line miette renders remain readable — this is the one deliberate
+    /// difference from [`MdsError::serialize`], which is a machine-readable (wire)
+    /// boundary and escapes `\n` as well.
+    ///
+    /// The escaping is one-way: see [`mds::sanitize_control_chars`][crate::sanitize_control_chars]
+    /// — consumers must not un-escape `\uXXXX` sequences back into bytes.
     ///
     /// Use this method — not `e.to_string()` / `eprintln!("{e}")` — whenever the
     /// string will be written to a TTY or embedded in a user-visible context

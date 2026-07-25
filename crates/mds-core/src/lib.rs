@@ -61,8 +61,8 @@ pub(crate) mod value;
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
-    fix, neutralize_source_for_render, sanitize_control_chars, FixLineSpan, LintConfig,
-    LintDiagnostic, LintResult, Severity,
+    fix, neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire,
+    FixLineSpan, LintConfig, LintDiagnostic, LintResult, Severity,
 };
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
@@ -182,12 +182,14 @@ impl CompileResult {
     /// via `serde_json::json!()` prevents serde derive from injecting unwanted keys.
     pub fn to_canonical_json(self) -> serde_json::Value {
         // Sanitize warnings at the serialization boundary (issue #176 / CWE-150):
-        // warning strings may embed an ESC-bearing filename.
+        // warning strings may embed a hostile filename.  WIRE mode — this value is
+        // consumed as JSON by the bindings, so an embedded newline could forge an
+        // extra warning line downstream.
         let warnings: serde_json::Value = self
             .warnings
             .into_iter()
             .map(|w| {
-                serde_json::Value::String(crate::lint::sanitize_control_chars(&w).into_owned())
+                serde_json::Value::String(crate::lint::sanitize_control_chars_wire(&w).into_owned())
             })
             .collect::<Vec<_>>()
             .into();
@@ -511,7 +513,9 @@ fn path_to_str(path: &Path) -> Result<&str, MdsError> {
 /// Print warnings to stderr. Each warning is printed on its own line.
 ///
 /// Sanitizes each warning before printing (issue #176 / CWE-150): warning strings
-/// may embed a hostile filename, so C0/DEL/C1 bytes are escaped to `\uXXXX` literals.
+/// may embed a hostile filename, so control/bidi/separator characters are escaped to
+/// `\uXXXX` literals. HUMAN mode — this is terminal output, so `\n` stays raw
+/// (the wire counterpart is `CompileResult::to_canonical_json`, which escapes it).
 fn emit_warnings(warnings: &[String]) {
     for w in warnings {
         eprintln!("{}", crate::lint::sanitize_control_chars(w));
