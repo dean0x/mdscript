@@ -889,11 +889,95 @@ fn wasm_lint_virtual_esc_in_module_name_sanitizes_duplicate_import_message() {
     );
 
     // (2) At least one message contains the sanitized  literal (positive evidence).
-    let has_sanitized = all_messages
-        .iter()
-        .any(|m| m.contains("\\u001B") || m.contains("\\u001b"));
+    let has_sanitized = all_messages.iter().any(|m| m.contains("\\u001B"));
     assert!(
         has_sanitized,
         "T-15/F6: expected sanitized \\u001B in at least one message; got: {all_messages:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_del_in_error_message_is_escaped() {
+    // T-15/F5-DEL: DEL (U+007F) in @include alias — same error-path pattern as F5
+    // with a different control character. serde_json does not escape DEL by default,
+    // making this a load-bearing second vector. Verifies DEL is sanitized to .
+    let del = '\u{007F}';
+    let source = format!("@include fo{del}o\n");
+    let err = mds_wasm::compile(&source, JsValue::NULL).unwrap_err();
+    let msg = get_str(&err, "message");
+    assert!(
+        !msg.is_empty(),
+        "T-15/F5-DEL: err.message must not be empty for a DEL-in-alias error"
+    );
+    assert_no_control_chars(&msg, "err.message (T-15/F5-DEL)");
+    assert!(
+        msg.contains("\\u007F"),
+        "T-15/F5-DEL: sanitized \\u007F literal must appear in err.message; got: {msg:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_nel_in_module_name_sanitizes_message() {
+    // T-15/F6-C1: U+0085 (NEL/C1) in lintVirtual module name — same lint-path pattern
+    // as F6 with a C1 control character. NEL passes serde_yaml_ng (unlike ESC/DEL),
+    // making it a reachable C1 vector. Verifies the sanitized  literal appears.
+    let nel = '\u{0085}';
+    let module_name = format!("fo{nel}o.mds");
+    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
+
+    let modules_obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str(&module_name),
+        &JsValue::from_str("hi\n"),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str("main.mds"),
+        &JsValue::from_str(&main_src),
+    )
+    .unwrap();
+
+    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
+        .expect("T-15/F6-C1: lintVirtual must succeed with NEL in module name");
+
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("T-15/F6-C1: result.version must be a number") as u32;
+    assert_eq!(version, 1, "T-15/F6-C1: result.version must be 1");
+
+    let files = get_prop(&result, "files");
+    let files_arr = js_sys::Array::from(&files);
+    assert!(
+        files_arr.length() > 0,
+        "T-15/F6-C1: expected at least one file entry with diagnostics"
+    );
+
+    let mut all_messages: Vec<String> = Vec::new();
+    for i in 0..files_arr.length() {
+        let file_entry = files_arr.get(i);
+        let diags = get_prop(&file_entry, "diagnostics");
+        let diags_arr = js_sys::Array::from(&diags);
+        for j in 0..diags_arr.length() {
+            let diag = diags_arr.get(j);
+            let msg = get_str(&diag, "message");
+            assert_no_control_chars(
+                &msg,
+                &format!("T-15/F6-C1: files[{i}].diagnostics[{j}].message"),
+            );
+            all_messages.push(msg);
+        }
+    }
+
+    assert!(
+        !all_messages.is_empty(),
+        "T-15/F6-C1: expected at least one diagnostic"
+    );
+
+    let has_sanitized_nel = all_messages.iter().any(|m| m.contains("\\u0085"));
+    assert!(
+        has_sanitized_nel,
+        "T-15/F6-C1: expected sanitized \\u0085 in at least one message; got: {all_messages:?}"
     );
 }

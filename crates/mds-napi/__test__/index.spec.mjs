@@ -1190,17 +1190,21 @@ describe('source maps (F-SM)', () => {
   });
 });
 
-// ── T-13: ESC-injection hardening — napi direct (issue #176 / CWE-150) ───────
+// ── T-12/T-13 (E-10/E-11): ESC-injection hardening — napi direct (issue #176 / CWE-150) ────────
 //
-// Two vectors:
-//  (a) error path: `@include fo<ESC>o` — parser rejects invalid alias, message
-//      embeds the raw alias. After fix: err.message has no raw C0/DEL/C1 bytes.
-//  (b) lint path: lintVirtual with module name containing U+001B, imported twice —
-//      duplicate-import fires; diagnostic message has no raw ESC byte.
+// Four vectors (E-10..E-13):
+//  (E-10) error path: `@include fo<ESC>o` — parser rejects invalid alias, message
+//      embeds the raw alias. After fix: err.message has no raw C0/DEL/C1 chars.
+//  (E-11) lint path: lintVirtual with module name containing U+001B, imported twice —
+//      duplicate-import fires; diagnostic message has no raw ESC char.
+//  (E-12) error path with DEL (U+007F) — same as E-10 with a different control char.
+//  (E-13) lint path with U+0085 (NEL/C1) — passes serde_yaml_ng, provides C1 coverage.
 
 describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
-  // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 bytes in a string.
-  function assertNoControlBytes(s, label) {
+  // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 chars in a string.
+  // Uses charCodeAt (UTF-16 code units); all C0/DEL/C1 codepoints are in BMP so
+  // charCodeAt correctly identifies them without surrogate pair handling.
+  function assertNoControlChars(s, label) {
     for (let i = 0; i < s.length; i++) {
       const code = s.charCodeAt(i);
       const isC0 = code < 0x20 && code !== 0x09 && code !== 0x0a;
@@ -1214,7 +1218,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   }
 
-  test('T-13a: error path — compile error message sanitized for ESC-in-alias', () => {
+  test('T-12 / E-10: error path — compile error message sanitized for ESC-in-alias', () => {
     const esc = String.fromCharCode(0x1b);
     const source = `@include fo${esc}o\n`;
     try {
@@ -1223,7 +1227,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     } catch (err) {
       const msg = err.message;
       assert.ok(typeof msg === 'string' && msg.length > 0, 'message must be non-empty');
-      assertNoControlBytes(msg, 'err.message');
+      assertNoControlChars(msg, 'err.message');
       assert.ok(
         msg.includes('\\u001B'),
         `sanitized \\u001B must appear in err.message; got: ${JSON.stringify(msg)}`
@@ -1231,7 +1235,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     }
   });
 
-  test('T-13b: lint path — lintVirtual with ESC in module name sanitizes duplicate-import message', () => {
+  test('T-13 / E-11: lint path — lintVirtual with ESC in module name sanitizes duplicate-import message', () => {
     // Use lintVirtual with a module whose NAME contains a raw ESC byte (U+001B),
     // imported twice so duplicate-import fires and embeds the raw path in its message.
     // Mirrors Python E12 (test_e12_lint_virtual_esc_in_import_path_message_sanitized).
@@ -1248,20 +1252,20 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     const result = lintVirtual(modules, 'main.mds');
 
     // (3) Result shape: version 1.
-    assert.equal(result.version, 1, 'T-13b: version must be 1');
-    assert.ok(Array.isArray(result.files), 'T-13b: files must be an array');
+    assert.equal(result.version, 1, 'T-13/E-11: version must be 1');
+    assert.ok(Array.isArray(result.files), 'T-13/E-11: files must be an array');
 
     const allDiags = result.files.flatMap((f) => f.diagnostics);
     assert.ok(
       allDiags.length > 0,
-      'T-13b: expected at least one diagnostic (duplicate-import should fire); got: ' +
+      'T-13/E-11: expected at least one diagnostic (duplicate-import should fire); got: ' +
         JSON.stringify(allDiags),
     );
 
     // (1) No raw control bytes in any diagnostic message.
     for (const diag of allDiags) {
       if (typeof diag.message === 'string') {
-        assertNoControlBytes(diag.message, `T-13b: diag[${diag.rule}].message`);
+        assertNoControlChars(diag.message, `T-13/E-11: diag[${diag.rule}].message`);
       }
     }
 
@@ -1269,11 +1273,11 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     const hasSanitizedEsc = allDiags.some(
       (d) =>
         typeof d.message === 'string' &&
-        (d.message.includes('\\u001B') || d.message.includes('\\u001b')),
+        d.message.includes('\\u001B'),
     );
     assert.ok(
       hasSanitizedEsc,
-      'T-13b: expected \\u001B in at least one diagnostic message; got: ' +
+      'T-13/E-11: expected \\u001B in at least one diagnostic message; got: ' +
         JSON.stringify(allDiags.map((d) => d.message)),
     );
 
@@ -1281,8 +1285,60 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     const hasDupImport = allDiags.some((d) => d.rule === 'duplicate-import');
     assert.ok(
       hasDupImport,
-      'T-13b: expected duplicate-import diagnostic; got rules: ' +
+      'T-13/E-11: expected duplicate-import diagnostic; got rules: ' +
         JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+  });
+
+  test('E-12: error path — compile error message sanitized for DEL (U+007F) in alias', () => {
+    // DEL (U+007F) in @include alias; parser rejects the invalid alias and embeds
+    // the raw bytes in the error message. After fix, serialize() sanitizes DEL to .
+    const del = String.fromCharCode(0x7f);
+    const source = `@include fo${del}o\n`;
+    try {
+      compile(source);
+      assert.fail('expected compile to throw');
+    } catch (err) {
+      const msg = err.message;
+      assert.ok(typeof msg === 'string' && msg.length > 0, 'E-12: message must be non-empty');
+      assertNoControlChars(msg, 'E-12: err.message');
+      assert.ok(
+        msg.includes('\\u007F'),
+        `E-12: sanitized \\u007F must appear in err.message; got: ${JSON.stringify(msg)}`
+      );
+    }
+  });
+
+  test('E-13: lint path — lintVirtual with U+0085 (NEL/C1) in module name sanitizes message', () => {
+    // U+0085 (NEL) is a C1 control char that passes serde_yaml_ng YAML parsing
+    // (unlike ESC/DEL), making it a reachable C1 ESC-injection vector for lintVirtual.
+    // The duplicate-import rule fires and embeds the raw module name in its message;
+    // after sanitization the message must carry  and no raw C1 chars.
+    const nel = String.fromCharCode(0x85);
+    const moduleName = `fo${nel}o.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1, 'E-13: version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.length > 0,
+      'E-13: expected at least one diagnostic; got: ' + JSON.stringify(allDiags),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `E-13: diag[${diag.rule}].message`);
+      }
+    }
+    const hasSanitizedNel = allDiags.some(
+      (d) => typeof d.message === 'string' && d.message.includes('\\u0085'),
+    );
+    assert.ok(
+      hasSanitizedNel,
+      'E-13: expected \\u0085 in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
     );
   });
 });
