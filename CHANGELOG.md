@@ -78,6 +78,19 @@ field is present across all binding surfaces: CLI JSON output, napi
   identifiers are deliberate exclusions — they carry position data, not
   terminal-bound text. (#176)
 
+- **CLI error *message* text is now escaped too (#176).** The hardening above
+  covered rendered source excerpts, filenames, and every wire boundary, but a
+  diagnostic's own message and help text still reached stderr raw. Both CLI error
+  families interpolate untrusted input into their messages — compiler errors carry
+  template text (`invalid include alias: '<alias>'`) and CLI errors carry `mds.json`
+  values and filesystem paths (`mds.json output_dir '<value>' must not contain '..'`)
+  — so a hostile `.mds` file or config value could still emit raw ANSI escape
+  sequences to a terminal. `mds build`, `check`, `fmt`, `lint`, and `watch` now escape
+  each report's message, help, and caret-label text at the single `eprint_error`
+  choke-point, *before* the diagnostic renderer runs. The rendered frame is still never
+  post-processed, so terminal colour and caret alignment are unaffected, and output for
+  well-formed input is byte-for-byte unchanged. (#176)
+
 - **Widened escape class: bidi / separator / BOM characters (#176).** The
   escaped set now covers characters outside C0 / DEL / C1 that are still
   display-hazardous, on every surface:

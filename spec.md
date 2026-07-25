@@ -1034,6 +1034,12 @@ vector. Source excerpts embedded in a rendered diagnostic frame are neutralized
 byte-length-preservingly instead of escaped (C0/DEL → `?`, C1 → U+00A0, bidi and
 separators → U+FFFD), so span offsets and caret columns stay exact.
 
+On the CLI this is enforced at a single choke-point: every diagnostic printed to
+stderr — compiler errors and CLI-authored errors alike — has its message, help, and
+caret-label text escaped **before** the diagnostic renderer runs. The rendered frame is
+never post-processed, so the renderer's own terminal styling is left intact and caret
+columns stay aligned.
+
 ##### Escaping is one-way
 
 The transformation is **lossy and non-injective, by design**. A template that

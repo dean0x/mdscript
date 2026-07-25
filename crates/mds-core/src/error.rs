@@ -156,6 +156,11 @@ fn at(
 /// Use [`MdsError::display_sanitized()`] instead to avoid terminal injection
 /// (CWE-150).  All three published binding surfaces (napi, WASM, Python)
 /// already use `serialize()` and are unaffected.
+///
+/// This contract governs **direct** rendering by a consumer of this crate.  The `mds`
+/// CLI never renders an `MdsError` directly: it hands the `miette::Report` to
+/// `eprint_error`, which escapes the message, help, and label text of every report it
+/// prints.  See the boundary table in `mds-core/src/lint/diagnostic.rs` for the full set.
 #[must_use]
 #[non_exhaustive]
 #[derive(Error, Debug, Diagnostic, Clone)]
@@ -933,6 +938,16 @@ impl MdsError {
     /// string will be written to a TTY or embedded in a user-visible context
     /// without further escaping.  See the [type-level doc][MdsError] for the full
     /// Display-contract table.
+    ///
+    /// # Audience
+    ///
+    /// This is an affordance for **downstream Rust consumers** of the published crate
+    /// who render an `MdsError` themselves.  It is deliberately not on the `mds` CLI's
+    /// render path: the CLI hands `miette::Report`s to `eprint_error`, which sanitizes
+    /// the message, help, and label text of *every* report — including CLI-authored
+    /// `miette::miette!()` errors that are not `MdsError`s at all, and so could never
+    /// be covered by this method.  Routing the CLI through here instead would leave
+    /// that second family unescaped (PF-004).
     #[must_use]
     pub fn display_sanitized(&self) -> String {
         sanitize_control_chars(&self.to_string()).into_owned()

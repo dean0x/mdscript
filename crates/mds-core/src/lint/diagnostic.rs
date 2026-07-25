@@ -18,15 +18,14 @@
 //!   message cannot forge an extra line in a line-oriented consumer of the value
 //!   (log forging, YAML key injection).
 //!
-//! `\t` is preserved in both modes. The boundary set below is closed for the
-//! **lint diagnostic** and **wire/JSON** paths; see "Known gap" after the table for
-//! the one terminal path that is not yet covered.
+//! `\t` is preserved in both modes. The boundary set below is closed: every terminal
+//! and wire path that carries untrusted text is covered.
 //!
 //! | Boundary | Mode | Fields |
 //! |----------|------|--------|
+//! | `eprint_error` (mds-cli/src/output.rs) | HUMAN | `message`, `help`, and `LabeledSpan` text of **every** report rendered to stderr — see "CLI terminal path" below |
 //! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help`/filename via `sanitize_control_chars`; source excerpts via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
 //! | `MdsError::at()` (error.rs) | HUMAN | filename; source via `neutralize_source_for_render` |
-//! | `MdsError::display_sanitized()` (error.rs) | HUMAN | whole `Display` string — helper only; **not currently on any CLI path** (see "Known gap") |
 //! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr |
 //! | `safe_path()` (mds-cli/src/output.rs) | HUMAN | CLI status-line path display |
 //! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
@@ -35,23 +34,32 @@
 //! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
 //! | `--diff` / `--check` preview output (mds-cli/src/output.rs) | HUMAN, TTY-gated | neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable |
 //!
-//! **Known gap — `MdsError` message text on the CLI terminal path.** The table above
-//! covers lint diagnostics and every wire boundary, but a *compile/build* error still
-//! reaches the terminal with its message unsanitized. `mds build` / `mds check` render
-//! errors via `eprint_error` → `format!("{report:?}")`, which is miette's own renderer;
-//! post-processing that rendered frame is forbidden by PF-014, and the only helper that
-//! would close the gap — [`MdsError::display_sanitized`] — has no production caller.
-//! `MdsError::at()` does neutralize the *source excerpt*, so the caret frame is safe,
-//! but an error message that interpolates attacker-controlled text (e.g.
-//! `parser.rs`'s `invalid include alias: '{alias}'`) still emits raw control bytes to
-//! stderr. Closing it requires sanitizing at `MdsError` construction rather than at
-//! render time; that is a design decision with broad golden-test blast radius and is
-//! deliberately NOT addressed in issue #176. Do not "fix" it by wrapping the rendered
-//! frame — that is exactly PF-014.
+//! **CLI terminal path.** `mds build` / `check` / `fmt` / `lint` / `watch` all render
+//! errors through the single `eprint_error` choke-point, which wraps the `miette::Report`
+//! in a sanitizing view *before* miette renders it. This covers both CLI error families:
+//! `MdsError` (whose messages interpolate template text, e.g. `parser.rs`'s
+//! `invalid include alias: '{alias}'`) and CLI-authored `miette::miette!()` reports
+//! (which interpolate `mds.json` values and filesystem paths, and do **not** downcast to
+//! `MdsError`). Because it wraps at the `Report` level, an error type added later inherits
+//! the guarantee without touching the boundary — the PF-004 failure mode of a check that
+//! holds on one path and silently lapses on a sibling path cannot recur here.
+//!
+//! Sanitizing the renderer's *inputs* is mandatory; sanitizing its *output* is forbidden.
+//! Running an escaper over an already-rendered miette frame escapes miette's own ANSI SGR
+//! codes into literal noise on any colour-capable TTY and desynchronises caret alignment,
+//! on entirely benign input — and CI cannot catch it, because the CLI tests pin
+//! `NO_COLOR=1` and pipe stderr. That is PF-014, and an earlier round of #176 shipped and
+//! reverted exactly that defect. The colour path is pinned instead by in-process unit
+//! tests that select a theme explicitly (`output.rs`, `sanitize_report_*`).
 //!
 //! **Deliberate exclusions** (documented, not gaps):
-//! - `LintDiagnostic::fmt` (raw `Display`) — unsanitized by design; use
-//!   [`MdsError::display_sanitized`] for terminal output
+//! - `LintDiagnostic::fmt` and `MdsError`'s derived `Display` (raw) — unsanitized by
+//!   design so machine-readable pipelines see exact bytes. In-tree terminal output never
+//!   uses them directly; it goes through `eprint_error`. Downstream Rust consumers of the
+//!   published crate that print an `MdsError` themselves should use
+//!   [`MdsError::display_sanitized`], which applies this module's HUMAN mode to the
+//!   `Display` string. That helper is a **consumer-facing API, not a CLI boundary** — the
+//!   CLI's own guarantee comes from `eprint_error`.
 //! - napi `err.detail` — populated only under the `debug-panics` Cargo feature,
 //!   which CLAUDE.md forbids shipping
 //!
