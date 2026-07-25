@@ -24,7 +24,7 @@
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
 
 mod common;
-use common::{fixture, mds_bin};
+use common::{assert_no_control_chars, fixture, mds_bin};
 
 use std::fs;
 use std::path::Path;
@@ -1617,28 +1617,17 @@ fn lint_single_file_esc_in_diagnostic_frame_is_sanitized() {
     // the raw ESC byte on the same line reaches the source frame.
     fs::write(&file, b"Hello \x1b{name} world\n").unwrap();
 
-    let mut cmd = mds_bin();
-    cmd.env("NO_COLOR", "1").arg("lint").arg(&file);
-    let out = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
+    let out = lint_path(&file, &[]);
 
-    let stderr = out.stderr.clone();
-    let stderr_str = String::from_utf8_lossy(&stderr);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
     // Exit 1 — legacy-interpolation is Warn severity.
     assert_eq!(
         out.status.code(),
         Some(1),
         "legacy-interpolation is warn-only; expected exit 1; stderr: {stderr_str}"
     );
-    // No raw ESC byte may appear on stderr.
-    assert!(
-        !stderr.contains(&0x1Bu8),
-        "raw ESC byte (0x1B) must not appear on stderr; got (hex first 512): {:02x?}",
-        &stderr[..stderr.len().min(512)]
-    );
+    // No raw control bytes on stderr (char-based check — catches ESC, DEL, and C1).
+    assert_no_control_chars(&stderr_str, "T-5 stderr");
     // Under input-neutralization (PF-014): ESC → '?' in the source frame.
     // "Hello" must be visible, confirming source context is non-vacuous.
     assert!(
@@ -1659,26 +1648,16 @@ fn lint_directory_esc_in_diagnostic_frame_is_sanitized() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("esc_lint.mds"), b"Hello \x1b{name} world\n").unwrap();
 
-    let mut cmd = mds_bin();
-    cmd.env("NO_COLOR", "1").arg("lint").arg(dir.path());
-    let out = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
+    let out = lint_path(dir.path(), &[]);
 
-    let stderr = out.stderr.clone();
-    let stderr_str = String::from_utf8_lossy(&stderr);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(1),
         "directory mode: expected exit 1; stderr: {stderr_str}"
     );
-    assert!(
-        !stderr.contains(&0x1Bu8),
-        "directory mode: raw ESC byte must not appear on stderr; hex: {:02x?}",
-        &stderr[..stderr.len().min(512)]
-    );
+    // No raw control bytes on stderr (char-based check).
+    assert_no_control_chars(&stderr_str, "T-6 stderr");
     // Under input-neutralization (PF-014): ESC → '?' in the source frame.
     assert!(
         stderr_str.contains("Hello"),
@@ -1696,35 +1675,16 @@ fn lint_directory_esc_in_diagnostic_frame_is_sanitized() {
 #[test]
 fn lint_stdin_esc_in_diagnostic_frame_is_sanitized() {
     let input = "Hello \x1b{name} world\n";
-    let out = {
-        let mut cmd = mds_bin();
-        cmd.env("NO_COLOR", "1");
-        // Use the BrokenPipe-safe helper.
-        use std::io::Write as _;
-        let mut child = cmd
-            .arg("lint")
-            .arg("-")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
-        child.wait_with_output().unwrap()
-    };
+    let out = lint_stdin(input, &[]);
 
-    let stderr = out.stderr.clone();
-    let stderr_str = String::from_utf8_lossy(&stderr);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(1),
         "stdin mode: expected exit 1; stderr: {stderr_str}"
     );
-    assert!(
-        !stderr.contains(&0x1Bu8),
-        "stdin mode: raw ESC byte must not appear on stderr; hex: {:02x?}",
-        &stderr[..stderr.len().min(512)]
-    );
+    // No raw control bytes on stderr (char-based check).
+    assert_no_control_chars(&stderr_str, "T-7 stderr");
     // Under input-neutralization (PF-014): ESC → '?' in the source frame.
     assert!(
         stderr_str.contains("Hello"),
@@ -1742,16 +1702,9 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
     let content = "Hello\u{007F}and\u{0085}{name}world\n";
     fs::write(dir.path().join("del_c1_lint.mds"), content.as_bytes()).unwrap();
 
-    let mut cmd = mds_bin();
-    cmd.env("NO_COLOR", "1").arg("lint").arg(dir.path());
-    let out = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
+    let out = lint_path(dir.path(), &[]);
 
-    let stderr = out.stderr.clone();
-    let stderr_str = String::from_utf8_lossy(&stderr);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -1778,75 +1731,128 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
     );
 }
 
-/// T-9 [AC-C3]: `mds lint --format json` on a source with a raw ESC byte (U+001B)
-/// must emit valid JSON that contains no raw C0/DEL/C1 control bytes anywhere in
-/// the output — whether the linter produces a diagnostic or a YAML parse error.
+/// T-9 [AC-C3]: `mds lint --format json` on a source whose `duplicate-import`
+/// diagnostic message embeds a raw C1 control character (U+0085 NEL) must emit
+/// valid JSON with no raw control bytes anywhere — in particular the embedded
+/// path must be escaped to the 6-char literal ``.
 ///
-/// Implementation note: `serde_yaml_ng` rejects raw ESC bytes in YAML keys, so a
-/// frontmatter with `"a\x1Bb": 1` causes `mds::yaml` error output rather than an
-/// `unused-variable` diagnostic.  The regression guard here is that **the entire
-/// JSON output wire** contains no raw control bytes — ensuring that any error or
-/// diagnostic message that embeds the error context is sanitized before serialization.
-/// ESC-in-diagnostic-message sanitization is unit-tested by T-4 (`to_canonical_json`).
+/// ## Why this vector?
+///
+/// The original T-9 used a YAML frontmatter key containing a raw ESC byte
+/// (`"a\x1Bb": 1`).  `serde_yaml_ng` rejects raw ESC/DEL bytes inside
+/// double-quoted YAML keys, so the test never reached the lint code path at all
+/// — the YAML parser rejected the input before any sanitizer ran, making every
+/// assertion vacuous (PF-013 shape).
+///
+/// U+0085 (NEL, C1 NEL) is a C1 control character whose UTF-8 encoding
+/// (0xC2 0x85) **passes** `serde_yaml_ng` YAML parsing.  We exploit a
+/// different route: the `duplicate-import` rule fires when the same module is
+/// imported twice and embeds the raw import path in its message.  A module
+/// whose file *name* contains U+0085 therefore injects that byte into the
+/// diagnostic message.  When `to_canonical_json` serializes the result, it
+/// must sanitize U+0085 → `` (6-char ASCII literal); if that
+/// sanitization is removed the raw 0xC2 0x85 bytes appear in the JSON wire.
+///
+/// ## Failure mode (regression guard)
+///
+/// Removing the `sanitize_control_chars` call in `to_canonical_json` causes:
+///   - Gate 1 still passes (the JSON is syntactically valid)
+///   - Gate 2 FAILS: `assert_no_control_chars` finds U+0085 (a C1 char) in
+///     the JSON wire output
+///   - Gate 3 FAILS: the per-message check finds U+0085 in the diagnostic message
+///   - The positive assertion FAILS: `` is not present when raw bytes leak
 #[test]
 fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    // Source with a raw ESC byte (U+001B) in the YAML frontmatter key.
-    // serde_yaml_ng rejects this with mds::yaml; the JSON output should be
-    // a well-formed error object with no raw control bytes anywhere.
-    let content = b"---\n\"a\x1bb\": 1\n---\nhi\n";
-    let file = dir.path().join("hostile_fm.mds");
-    fs::write(&file, content).unwrap();
 
-    let out = mds_bin()
-        .env("NO_COLOR", "1")
-        .args(["lint", "--format", "json"])
-        .arg(&file)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
+    // Helper module whose file name contains U+0085 (NEL, C1).  This character
+    // survives serde_yaml_ng YAML parsing (unlike ESC/DEL which are rejected).
+    let nel_name = "fo\u{0085}o.mds";
+    let nel_module = dir.path().join(nel_name);
+    fs::write(&nel_module, "hi\n").unwrap();
+
+    // main.mds imports the NEL-named module twice → duplicate-import fires.
+    // The diagnostic message embeds the raw import path (including U+0085).
+    let import_line = format!("@import \"./{nel_name}\"\n");
+    let main_content = format!("{import_line}{import_line}");
+    let main_file = dir.path().join("main.mds");
+    fs::write(&main_file, main_content.as_bytes()).unwrap();
+
+    let out = lint_path(&main_file, &["--format", "json"]);
 
     let stdout_str = String::from_utf8_lossy(&out.stdout);
 
-    // Gate 1: output must be valid JSON regardless of whether the linter
-    // succeeded or produced an error.
-    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|_| {
-        panic!("lint --format json output must be valid JSON; got: {stdout_str:?}")
+    // Gate 1 (fail-closed): stdout must be valid JSON with version 1.
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
+        panic!(
+            "T-9: lint --format json must emit valid JSON; parse error: {e}; \
+             stdout: {stdout_str:?}"
+        )
     });
-    assert_eq!(json["version"], 1, "JSON version must be 1");
+    assert_eq!(json["version"], 1, "T-9: JSON version must be 1");
 
-    // Gate 2: the entire JSON output wire must contain no raw C0 (excl. \t \n),
-    // DEL, or C1 bytes — the ESC byte from the source must not propagate.
-    for (i, byte) in stdout_str.bytes().enumerate() {
-        let is_c0 = byte < 0x20 && byte != b'\t' && byte != b'\n';
-        let is_del = byte == 0x7F;
-        let is_c1 = (0x80..=0x9F).contains(&byte);
-        assert!(
-            !is_c0 && !is_del && !is_c1,
-            "raw control byte 0x{byte:02X} at position {i} must not appear \
-             in JSON output; got: {stdout_str:?}"
-        );
+    // Gate 2 (fail-closed, char-based): the entire JSON wire must contain no raw
+    // C0 (excl. \t \n), DEL, or C1 control codepoints.
+    // Uses `assert_no_control_chars` which iterates over Unicode codepoints, not
+    // raw bytes, to avoid false-positives on continuation bytes of non-C1 chars.
+    assert_no_control_chars(&stdout_str, "T-9 JSON wire output");
+
+    // Gate 3 (fail-closed): assert diagnostics ARE present and the rule fired.
+    let files = json["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("T-9: JSON must have 'files' array; got: {json}"));
+    assert!(
+        !files.is_empty(),
+        "T-9: files array must be non-empty (duplicate-import should fire); got: {json}"
+    );
+    let all_diags: Vec<&serde_json::Value> = files
+        .iter()
+        .flat_map(|f| {
+            f["diagnostics"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "T-9: every file entry must have a 'diagnostics' array; \
+                                           got: {f}"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        !all_diags.is_empty(),
+        "T-9: must have at least one diagnostic; got: {files:?}"
+    );
+    let has_dup_import = all_diags.iter().any(|d| d["rule"] == "duplicate-import");
+    assert!(
+        has_dup_import,
+        "T-9: duplicate-import must be among the diagnostics; got rules: {:?}",
+        all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
+    );
+    // Per-message sanitization check (char-based).
+    for diag in &all_diags {
+        let msg = diag["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("T-9: diagnostic must have a string 'message'; got: {diag}"));
+        assert_no_control_chars(msg, "T-9 diagnostic message");
     }
 
-    // Gate 3: if there are diagnostics, each message must be a string with no
-    // raw control bytes (belt-and-suspenders over Gate 2).
-    if let Some(files) = json["files"].as_array() {
-        for file_entry in files {
-            if let Some(diags) = file_entry["diagnostics"].as_array() {
-                for diag in diags {
-                    if let Some(msg) = diag["message"].as_str() {
-                        assert!(
-                            !msg.bytes().any(|b| b < 0x20 && b != b'\t' && b != b'\n'
-                                || b == 0x7F
-                                || (0x80..=0x9F).contains(&b)),
-                            "raw control byte in diagnostic message; got: {msg:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // Positive assertion (non-vacuous, PF-013): the sanitized literal ``
+    // must appear in at least one message.  If sanitization is removed the raw
+    // U+0085 character leaks and this assertion fails because the 6-char literal
+    // is absent while the raw codepoint (caught by Gate 2/3) is present.
+    //
+    // After JSON deserialisation by serde_json the string value is ``
+    // (6 chars: backslash, u, 0, 0, 8, 5).
+    let has_sanitized_nel = all_diags.iter().any(|d| {
+        d["message"]
+            .as_str()
+            .map(|m| m.contains("\\u0085"))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_sanitized_nel,
+        "T-9: sanitized \\u0085 literal must appear in at least one diagnostic message; \
+         got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
 }
 
 // ── atomic_write_file: mode preservation and error-message coverage ──────────

@@ -3696,3 +3696,74 @@ fn watch_dir_skips_symlinked_source_file() {
 
     drop(child);
 }
+
+// ── ESC-injection: watch initial-compile-error stderr sanitization ────────────
+
+/// T-Watch-ESC [AC-F-W1]: the `eprint_error` call at the non-loop
+/// initial-compile-error path in `run_watch_file` (watch.rs line ~937) must
+/// sanitize any raw control bytes before writing to stderr.
+///
+/// Vector: a `.mds` file containing a raw ESC byte (U+001B) in an unclosed
+/// `@define` — guaranteed syntax error — so the initial compile fails and
+/// `eprint_error` is called before the watch loop begins.
+///
+/// Determinism: the initial compile is a synchronous call that completes before
+/// the watch loop starts.  We wait a fixed bounded interval (500 ms, >> any
+/// realistic compile time) then kill the process.  No file-system events are
+/// polled, so this test is immune to FSEvents/inotify timing flakiness.
+///
+/// Assertions:
+///   1. stderr is non-empty (the error IS present — non-vacuous).
+///   2. No raw ESC byte (0x1B) appears anywhere in stderr.
+#[test]
+fn watch_esc_in_initial_compile_error_is_sanitized() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("esc_watch.mds");
+    // Unclosed @define with a raw ESC byte (0x1B) on the directive line so that
+    // miette renders it inside the source context frame.
+    std::fs::write(&src, b"@define \x1bfoo:\nhello\n").unwrap();
+
+    let mut child = ChildGuard(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    // Move the stderr handle to a reader thread so the pipe never fills and
+    // so read_to_end completes once the process is killed.
+    let stderr_handle = child.0.stderr.take().expect("piped stderr");
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut h = stderr_handle;
+        let _ = std::io::Read::read_to_end(&mut h, &mut buf);
+        buf
+    });
+
+    // Give the synchronous initial compile time to run and write its error.
+    // 500 ms >> typical compile time; no polling of file-system events.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Kill the watch process (ChildGuard.drop → kill + wait) to close the pipe.
+    drop(child);
+
+    let stderr_bytes = reader.join().expect("stderr reader thread panicked");
+
+    // Assertion 1: error IS present (the initial-compile-error path ran).
+    assert!(
+        !stderr_bytes.is_empty(),
+        "watch initial-compile-error must emit something to stderr (non-vacuous)"
+    );
+
+    // Assertion 2: no raw ESC byte (0x1B) anywhere in stderr.
+    // eprint_error sanitizes via render_error_sanitized before writing;
+    // if sanitization is removed the raw 0x1B byte leaks here.
+    assert!(
+        !stderr_bytes.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must be sanitized in watch initial-compile-error stderr; \
+         got (hex first 512): {:02x?}",
+        &stderr_bytes[..stderr_bytes.len().min(512)]
+    );
+}
