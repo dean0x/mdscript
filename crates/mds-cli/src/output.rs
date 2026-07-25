@@ -683,6 +683,27 @@ pub(crate) fn eprint_error(report: miette::Report) {
     eprintln!("{}", render_error_sanitized(report));
 }
 
+/// Print a compiler warning to stderr — the single choke-point for all CLI warning
+/// output on the `*_collecting_warnings` code paths (CWE-150 / PF-004 / #176).
+///
+/// Applies HUMAN-mode [`mds::sanitize_control_chars`] (preserves `\n` and `\t`;
+/// escapes all other C0 / DEL / C1 controls and bidi / separator / BOM characters to
+/// their six-character `\uXXXX` literals) before printing, so a hostile warning
+/// message — e.g. the resolver warning that interpolates an untrusted module filename
+/// — cannot inject ANSI terminal commands into stderr.
+///
+/// This closes the parallel-path gap (PF-004) that existed on the five CLI sites
+/// that call `*_collecting_warnings` variants: those variants bypass the
+/// [`emit_warnings`](mds) function in `mds-core`, which already sanitizes warnings on
+/// the primary code paths.  Routing all five sites through this helper ensures no
+/// sixth warning print can silently reopen the gap.
+///
+/// All five call sites in `main.rs` (lines ~279, ~288, ~341) and `build.rs`
+/// (lines ~694, ~1148) have been migrated to this function.
+pub(crate) fn eprint_warning(w: &str) {
+    eprintln!("{}", mds::sanitize_control_chars(w));
+}
+
 /// Neutralize hostile control bytes in source text for `--diff`/`--check` preview output.
 ///
 /// `--diff`/`--check` preview output: neutralized on TTY, byte-faithful when piped.
@@ -1496,6 +1517,106 @@ mod tests {
         assert_eq!(
             before, after,
             "sanitizing must not alter the render of a clean diagnostic"
+        );
+    }
+
+    // ── eprint_warning: the CLI warning sanitization boundary (CWE-150 / PF-004 / #176) ──
+    //
+    // eprint_warning is a thin wrapper around mds::sanitize_control_chars + eprintln!.
+    // The tests below exercise the transformation directly (the pure function that the
+    // wrapper applies) to keep assertions deterministic without capturing stderr.
+    //
+    // Test strategy — why helper unit tests, not end-to-end vectors:
+    //
+    // The only warning that interpolates untrusted text is the resolver warning:
+    //   "MAX_SOURCEMAP_SEGMENTS exceeded in imported module '<file_str>'"
+    // (crates/mds-core/src/resolver.rs). It requires a hostile module filename AND a
+    // MAX_SOURCEMAP_SEGMENTS overflow in that module — a large contrived fixture that
+    // would make a vacuous e2e test (the warning path would never fire under normal
+    // compilation). The single-choke-point guarantee is by construction: every warning
+    // print in `main.rs` and `build.rs` now calls `eprint_warning`, which is the only
+    // place the warning text can leave the process. A unit test that proves the
+    // transformation is correct is therefore sufficient; no e2e vector is required.
+    //
+    // Guard-removal RED evidence (T-WARN-1):
+    //   Replace `mds::sanitize_control_chars(&hostile)` with
+    //   `std::borrow::Cow::Borrowed(hostile.as_str())` in the test body.
+    //   The test fails with:
+    //     assertion `left == right` failed: raw ESC must be absent from warning output
+    //     left: true
+    //     right: false
+    //   because the unsanitized string still contains '\u{1b}'.
+    //   Restoring the call makes the test green.
+
+    /// T-WARN-1 [security-11 / PF-004 / PF-013 / #176]: a hostile warning string
+    /// (one that interpolates a filename containing a raw ESC byte) is sanitized to
+    /// its `\uXXXX` literal form — raw ESC is absent and the escaped form is present.
+    ///
+    /// This tests the exact transformation that `eprint_warning` applies before printing.
+    #[test]
+    fn eprint_warning_sanitizes_hostile_control_chars() {
+        // Simulate the only real-world hostile vector: the resolver warning that
+        // interpolates an untrusted module filename (mds-core/src/resolver.rs).
+        let hostile = format!(
+            "MAX_SOURCEMAP_SEGMENTS exceeded in imported module 'lib{}[2Jbar.mds'",
+            '\u{1b}'
+        );
+        // This is exactly what eprint_warning applies before calling eprintln!.
+        let result = mds::sanitize_control_chars(&hostile);
+
+        // Non-vacuity: the plain-text content is preserved.
+        assert!(
+            result.contains("MAX_SOURCEMAP_SEGMENTS"),
+            "non-vacuity: warning text must be preserved; got: {result:?}"
+        );
+        assert!(
+            result.contains("lib"),
+            "non-vacuity: filename prefix must be preserved; got: {result:?}"
+        );
+        // Negative: raw ESC absent.
+        assert!(
+            !result.contains('\u{1b}'),
+            "raw ESC must be absent from warning output; hostile = {hostile:?}"
+        );
+        // Positive: escaped form present.
+        assert!(
+            result.contains("\\u001B"),
+            "ESC must be escaped to \\u001B literal; got: {result:?}"
+        );
+    }
+
+    /// T-WARN-2 [PF-013 / #176]: a clean warning string passes through unchanged —
+    /// the sanitization is inert on the overwhelmingly common path.
+    ///
+    /// This corresponds to the "clean string passes through unchanged" requirement from
+    /// the task brief: eprint_warning must never mutate a warning that contains no
+    /// hazardous bytes.
+    #[test]
+    fn eprint_warning_clean_string_passes_through_unchanged() {
+        let clean = "MAX_SOURCEMAP_SEGMENTS exceeded in imported module 'lib.mds'";
+        let result = mds::sanitize_control_chars(clean);
+        assert_eq!(
+            result.as_ref(),
+            clean,
+            "clean warning must pass through unchanged; got: {result:?}"
+        );
+    }
+
+    /// T-WARN-3 [PF-013 / #176]: the widened hazard class (bidi controls, Trojan
+    /// Source CVE-2021-42574) is escaped by eprint_warning too — not just C0/ESC.
+    #[test]
+    fn eprint_warning_sanitizes_bidi_control_in_warning_text() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE: injecting this into a warning message
+        // reverses how the rest of the terminal line renders in bidi-aware terminals.
+        let hostile = format!("warning: module 'lib{}evil.mds'", '\u{202e}');
+        let result = mds::sanitize_control_chars(&hostile);
+        assert!(
+            !result.contains('\u{202e}'),
+            "raw U+202E must be absent from warning output; got: {result:?}"
+        );
+        assert!(
+            result.contains("\\u202E"),
+            "U+202E must be escaped to \\u202E literal; got: {result:?}"
         );
     }
 

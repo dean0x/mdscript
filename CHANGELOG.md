@@ -91,6 +91,17 @@ field is present across all binding surfaces: CLI JSON output, napi
   post-processed, so terminal colour and caret alignment are unaffected, and output for
   well-formed input is byte-for-byte unchanged. (#176)
 
+- **CLI warning output is now escaped too (#176).** Five sites in `mds build` and
+  `mds check` that call `*_collecting_warnings` variants printed raw warning strings
+  with a bare `eprintln!("{w}")`, bypassing the `sanitize_control_chars` call that
+  `mds-core`'s `emit_warnings` applies on the primary code paths (a PF-004
+  parallel-path gap). All five sites now route through a single `eprint_warning`
+  helper in `output.rs` that applies HUMAN-mode sanitization before printing, so no
+  raw control byte can reach human stderr on any warning path. The only warning that
+  currently interpolates untrusted text is the resolver warning that embeds a module
+  filename, which requires a hostile filename *and* a `MAX_SOURCEMAP_SEGMENTS`
+  overflow in that module to fire. (#176)
+
 - **Widened escape class: bidi / separator / BOM characters (#176).** The
   escaped set now covers characters outside C0 / DEL / C1 that are still
   display-hazardous, on every surface:

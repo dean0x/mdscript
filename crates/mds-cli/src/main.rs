@@ -276,7 +276,7 @@ fn run_check(
             .map_err(miette::Error::from)?;
         if !quiet {
             for w in &warnings {
-                eprintln!("{w}");
+                output::eprint_warning(w);
             }
             eprintln!("OK: <stdin>");
         }
@@ -285,7 +285,7 @@ fn run_check(
             mds::check_collecting_warnings(&input, runtime_vars).map_err(miette::Error::from)?;
         if !quiet {
             for w in &warnings {
-                eprintln!("{w}");
+                output::eprint_warning(w);
             }
             eprintln!("OK: {}", output::safe_path(&input));
         }
@@ -338,7 +338,7 @@ fn run_check_directory(
             Ok(((), warnings)) => {
                 if !quiet {
                     for w in &warnings {
-                        eprintln!("{w}");
+                        output::eprint_warning(w);
                     }
                 }
                 ok_count += 1;

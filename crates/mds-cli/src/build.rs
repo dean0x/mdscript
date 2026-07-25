@@ -691,7 +691,7 @@ pub(crate) fn compile_to_content(
 
     if !quiet {
         for w in &result.warnings {
-            eprintln!("{w}");
+            crate::output::eprint_warning(w);
         }
     }
 
@@ -1145,7 +1145,7 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             .map_err(miette::Error::from)?;
         if !quiet {
             for w in &result.warnings {
-                eprintln!("{w}");
+                crate::output::eprint_warning(w);
             }
         }
 
