@@ -4,17 +4,33 @@
 //! be rendered by miette at the CLI human-render boundary. The `severity()` override
 //! maps our `Severity` enum to miette's rendering tiers (Error/Warning/Advice).
 //!
-//! **Sanitization discipline**: `sanitize_control_chars` is applied at ALL
-//! serialization and render boundaries:
-//! - CLI human render (`render_diag_human` in mds-cli/src/lint.rs)
-//! - `MdsError::serialize()` (error.rs) — covers all three bindings' error path
-//! - `LintResult::to_canonical_json()` (this module) — covers all surfaces' lint path
-//! - Python typed `LintDiagnostic` pyclass (mds-python/src/lib.rs)
+//! **Sanitization discipline**: `message` and `help` are sanitized at every output
+//! boundary (C0/DEL/C1 → `\uXXXX` uppercase 6-char literals; `\n`/`\t` preserved).
+//! The complete closed boundary set:
 //!
-//! `message` and `help` in serialized/rendered output carry sanitized `\uXXXX` literals
-//! for C0/DEL/C1 control characters. Raw byte values are preserved only in the stored
-//! `LintDiagnostic` struct so that span offsets and fix-edits remain byte-accurate.
-//! `sanitize_control_chars` is NOT called in `LintDiagnostic` constructors.
+//! - **CLI human render** (`render_diag_human`, mds-cli/src/lint.rs): `message`/`help`
+//!   via `sanitize_control_chars`; source excerpts via `neutralize_source_for_render`
+//!   (byte-length-preserving substitution; avoids PF-014 caret desync)
+//! - **`MdsError::serialize()`** (error.rs) — covers all three bindings' error path
+//! - **`LintResult::to_canonical_json()`** (this module) — `message`, `help`, and
+//!   the `files[].file` key
+//! - **`CompileResult::to_canonical_json()`** (lib.rs) — warning strings; *distinct
+//!   method from `LintResult::to_canonical_json` above, not a duplicate*
+//! - **`emit_warnings()`** (lib.rs) — sanitizes before printing to stderr
+//! - **Python typed `LintDiagnostic` pyclass** (mds-python/src/lib.rs)
+//!
+//! **Deliberate exclusions** (documented, not gaps):
+//! - `LintDiagnostic::fmt` (raw `Display`) — unsanitized by design; use
+//!   [`MdsError::display_sanitized`] for terminal output
+//! - napi `err.detail` — populated only under the `debug-panics` Cargo feature,
+//!   which CLAUDE.md forbids shipping
+//!
+//! Fields NOT sanitized: `rule` (fixed identifiers), `span`/`fix_edits` byte offsets
+//! (raw byte accuracy required for fix pipelines and span highlighting).
+//!
+//! Raw byte values are preserved in the stored `LintDiagnostic` struct so that span
+//! offsets and fix-edits remain byte-accurate. `sanitize_control_chars` is NOT called
+//! in `LintDiagnostic` constructors.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -122,19 +138,21 @@ impl FixLineSpan {
 /// A single lint finding.
 ///
 /// Implements `std::error::Error + miette::Diagnostic` so it can be rendered by
-/// miette at the CLI boundary: `eprintln!("{:?}", miette::Report::from(diag))`.
-/// The `severity()` override maps `Severity::Info` → Advice, `Warn` → Warning,
+/// miette. The `severity()` override maps `Severity::Info` → Advice, `Warn` → Warning,
 /// `Error` → Error; `Off` diagnostics are never constructed (the lint engine filters
 /// them before collecting).
 ///
-/// Attach a named source for miette span rendering:
-/// ```rust,no_run
-/// // At the CLI render boundary:
-/// // let diag = diag.with_source(Arc::new(miette::NamedSource::new(filename, src)));
-/// ```
+/// **CLI render**: always use `mds_cli::output::eprint_error` to render diagnostics on
+/// a TTY — never call `eprintln!("{report:?}")` on a raw `miette::Report`. Writing the
+/// rendered frame directly bypasses input-level sanitization and can inject C0/C1
+/// control bytes from hostile source content into the terminal (CWE-150 / PF-014).
+/// Input fields (`message`, `help`, source excerpts) are sanitized before the Report
+/// is constructed; post-rendering the frame must not be re-sanitized.
 ///
 /// **JSON**: use `LintResult::to_canonical_json()` — never construct JSON manually.
-/// **Sanitization**: apply `sanitize_control_chars` at the CLI render boundary only.
+/// **Sanitization**: see the module-level "Sanitization discipline" note — `message`
+/// and `help` are sanitized at every output boundary; constructors keep raw bytes so
+/// span offsets and `fix_edits` stay byte-accurate.
 pub struct LintDiagnostic {
     /// Short rule identifier, e.g. `"unused-variable"`. Becomes the miette code
     /// `mds::lint::<rule>`.
@@ -142,7 +160,8 @@ pub struct LintDiagnostic {
     /// Effective severity of this finding (never `Off` — `Off` diagnostics are not
     /// collected).
     pub severity: Severity,
-    /// Human-readable finding description. Raw — do not sanitize in the constructor.
+    /// Human-readable finding description. Raw — do not sanitize in the constructor
+    /// (sanitized at output boundaries — see module docs).
     pub message: String,
     /// Optional fix hint shown below the message.
     pub help: Option<String>,
@@ -412,10 +431,10 @@ impl LintResultBuilder {
 /// allocation for the overwhelmingly-common clean case). Allocates only when
 /// a control character is actually present, reserving exact capacity.
 ///
-/// Applied at all serialization and render boundaries (CLI human render, JSON
-/// serialization, and the Python typed conversion). NOT called in `LintDiagnostic`
-/// constructors so that span offsets and fix-edit byte ranges remain accurate against
-/// the raw source. Raw bytes in the stored struct; sanitized literals in all output.
+/// Applied at every output boundary — see the module-level "Sanitization discipline"
+/// note for the authoritative list. NOT called in `LintDiagnostic` constructors so that
+/// span offsets and fix-edit byte ranges remain accurate against the raw source. Raw
+/// bytes in the stored struct; sanitized literals in all output.
 ///
 /// Replacement strategy: replace each control character with its Unicode escape
 /// `\uXXXX` (uppercase hex, 4 digits, literal backslash) to make the rendered
