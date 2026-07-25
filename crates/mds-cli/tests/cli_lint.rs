@@ -1855,6 +1855,175 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
     );
 }
 
+/// T-9b [AC-C3]: the Trojan Source vector (CVE-2021-42574) end-to-end through
+/// `mds lint --format json`.
+///
+/// U+202E RIGHT-TO-LEFT OVERRIDE is not a C0/DEL/C1 control character, so before
+/// the escape class was widened it passed through the wire untouched. A single RLO
+/// inside a filename makes every downstream renderer (terminal, IDE, code-review UI)
+/// display the remainder of the line in reverse — a benign-looking diagnostic can be
+/// made to read as something entirely different from its bytes.
+///
+/// Reachability: the same `duplicate-import` route T-9 uses. The rule embeds the raw
+/// import path in its message, and the path is a plain string (not YAML), so U+202E
+/// reaches the lint engine intact.
+///
+/// Non-vacuity (PF-013): asserts the `files` array is non-empty, that
+/// `duplicate-import` actually fired, AND the POSITIVE assertion that the escaped
+/// `\\u202E` literal is present — all three fail if the widened class is reverted.
+#[test]
+fn lint_json_bidi_override_in_import_path_is_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // "fo<RLO>gnp.mds" renders as "fopng.mds" in a bidi-aware terminal.
+    let rlo_name = "fo\u{202E}gnp.mds";
+    fs::write(dir.path().join(rlo_name), "hi\n").unwrap();
+
+    let import_line = format!("@import \"./{rlo_name}\"\n");
+    let main_file = dir.path().join("main.mds");
+    fs::write(&main_file, format!("{import_line}{import_line}").as_bytes()).unwrap();
+
+    let out = lint_path(&main_file, &["--format", "json"]);
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+
+    // Gate 1 (fail-closed): valid JSON, version 1.
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
+        panic!("T-9b: lint --format json must emit valid JSON; parse error: {e}; stdout: {stdout_str:?}")
+    });
+    assert_eq!(json["version"], 1, "T-9b: JSON version must be 1");
+
+    // Gate 2 (fail-closed): no raw hostile codepoint anywhere in the wire output.
+    assert_no_control_chars(&stdout_str, "T-9b JSON wire output");
+
+    // Gate 3 (non-vacuity): the rule actually fired.
+    let files = json["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("T-9b: JSON must have 'files' array; got: {json}"));
+    assert!(
+        !files.is_empty(),
+        "T-9b: files array must be non-empty (duplicate-import should fire); got: {json}"
+    );
+    let all_diags: Vec<&serde_json::Value> = files
+        .iter()
+        .flat_map(|f| {
+            f["diagnostics"]
+                .as_array()
+                .unwrap_or_else(|| panic!("T-9b: every file entry needs 'diagnostics'; got: {f}"))
+        })
+        .collect();
+    assert!(
+        all_diags.iter().any(|d| d["rule"] == "duplicate-import"),
+        "T-9b: duplicate-import must be among the diagnostics; got rules: {:?}",
+        all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
+    );
+
+    // Positive assertion (PF-013): the escaped form must be present.
+    let has_escaped_rlo = all_diags
+        .iter()
+        .any(|d| d["message"].as_str().is_some_and(|m| m.contains("\\u202E")));
+    assert!(
+        has_escaped_rlo,
+        "T-9b: escaped \\u202E literal must appear in at least one diagnostic message; \
+         got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
+}
+
+/// T-9c [AC-C3]: wire-mode newline escaping end-to-end — the log/YAML-key forging
+/// vector.
+///
+/// A raw newline inside a diagnostic message lets an attacker forge what reads as a
+/// second, independent finding in any consumer that prints or line-splits the JSON
+/// string value. On the wire that newline (U+000A) must arrive as its 6-char escape
+/// literal.
+///
+/// ## Why this vector?
+///
+/// The obvious route — a POSIX filename containing a newline, imported twice — is
+/// **not reachable**: the lexer rejects a newline inside an `@import "..."` path with
+/// `syntax error: unclosed quote in path` before any lint rule runs, which would make
+/// every assertion below vacuous (PF-013 shape).
+///
+/// A YAML **double-quoted frontmatter key** does reach it: `serde_yaml_ng` decodes the
+/// `\n` escape into a real newline, and `unused-variable` embeds the decoded key
+/// verbatim in its message. The forged payload mimics a real diagnostic header, so a
+/// naive line-oriented consumer would render it as a genuine second finding.
+#[test]
+fn lint_json_newline_in_frontmatter_key_is_escaped_on_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("forge.mds");
+
+    // The `\n` sequences below are YAML escapes inside a double-quoted key — after
+    // YAML parsing the key contains two REAL newline characters.
+    fs::write(
+        &file,
+        b"---\n\"a\\nerror[mds::forged]: FAKE\\nb\": 1\n---\nHello\n",
+    )
+    .unwrap();
+
+    let out = lint_path(&file, &["--format", "json"]);
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
+        panic!("T-9c: lint --format json must emit valid JSON; parse error: {e}; stdout: {stdout_str:?}")
+    });
+    assert_eq!(json["version"], 1, "T-9c: JSON version must be 1");
+
+    let files = json["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("T-9c: JSON must have 'files' array; got: {json}"));
+    assert!(
+        !files.is_empty(),
+        "T-9c: files array must be non-empty; got: {json}"
+    );
+    let all_diags: Vec<&serde_json::Value> = files
+        .iter()
+        .flat_map(|f| {
+            f["diagnostics"]
+                .as_array()
+                .unwrap_or_else(|| panic!("T-9c: every file entry needs 'diagnostics'; got: {f}"))
+        })
+        .collect();
+
+    // Non-vacuity: the vector really did reach the lint engine.
+    assert!(
+        all_diags.iter().any(|d| d["rule"] == "unused-variable"),
+        "T-9c: unused-variable must fire; got rules: {:?}",
+        all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
+    );
+
+    // No parsed message may contain a raw newline …
+    for diag in &all_diags {
+        let msg = diag["message"].as_str().unwrap_or_else(|| {
+            panic!("T-9c: diagnostic must have a string 'message'; got: {diag}")
+        });
+        assert!(
+            !msg.contains('\n'),
+            "T-9c: raw newline must not survive into a wire message; got: {msg:?}"
+        );
+    }
+
+    // … and the escaped form must be present (positive, non-vacuous).
+    assert!(
+        all_diags
+            .iter()
+            .any(|d| d["message"].as_str().is_some_and(|m| m.contains("\\u000A"))),
+        "T-9c: escaped \\u000A literal must appear in at least one diagnostic message; \
+         got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
+
+    // The forged payload text itself is preserved verbatim (only the newline changed),
+    // proving the guard escapes rather than strips.
+    assert!(
+        all_diags.iter().any(|d| d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("error[mds::forged]"))),
+        "T-9c: message body must be preserved verbatim; got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
+}
+
 // ── atomic_write_file: mode preservation and error-message coverage ──────────
 
 /// Regression gate: `mds lint --fix <file>` must preserve the original Unix file

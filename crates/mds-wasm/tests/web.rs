@@ -784,16 +784,26 @@ fn compile_extends_undefined_var_in_base_default_carries_real_span() {
 //      carry the sanitized \uXXXX literal and contain no raw control bytes.
 //  F6: lint path — frontmatter key with U+001B; first diagnostic message clean.
 
-/// Assert that a string contains no raw C0 (excl. \t \n), DEL, or C1 bytes.
+/// Assert that a string contains no raw C0 (excl. \t \n), DEL, C1, bidi control,
+/// line/paragraph separator, or BOM codepoint.
 fn assert_no_control_chars(s: &str, label: &str) {
     for (i, ch) in s.char_indices() {
         let code = ch as u32;
         let is_c0 = code < 0x20 && code != 0x09 && code != 0x0A;
         let is_del = code == 0x7F;
         let is_c1 = (0x80..=0x9F).contains(&code);
+        // Bidi controls (Trojan Source, CVE-2021-42574), JS line/paragraph
+        // separators, and the invisible BOM.
+        let is_format_hazard = matches!(ch,
+            '\u{200E}' | '\u{200F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+        );
         assert!(
-            !is_c0 && !is_del && !is_c1,
-            "raw control char U+{code:04X} at byte {i} must not appear in {label}; got: {s:?}"
+            !is_c0 && !is_del && !is_c1 && !is_format_hazard,
+            "raw hostile char U+{code:04X} at byte {i} must not appear in {label}; got: {s:?}"
         );
     }
 }
@@ -979,5 +989,87 @@ fn wasm_lint_virtual_nel_in_module_name_sanitizes_message() {
     assert!(
         has_sanitized_nel,
         "T-15/F6-C1: expected sanitized \\u0085 in at least one message; got: {all_messages:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_bidi_override_in_module_name_is_escaped() {
+    // T-15/F6-BIDI: U+202E RIGHT-TO-LEFT OVERRIDE in a lintVirtual module name.
+    // U+202E is outside C0/DEL/C1, so it used to reach the wire untouched and
+    // reverse the display order of the rest of the line in any bidi-aware renderer
+    // (Trojan Source, CVE-2021-42574). "fo<RLO>gnp.mds" renders as "fopng.mds".
+    // Verifies:
+    //   (1) No raw hostile codepoint in any diagnostic message or file key.
+    //   (2) The escaped \\u202E literal IS present (positive evidence, non-vacuous).
+    //   (3) Result shape: version 1, duplicate-import rule present.
+    let rlo = '\u{202E}';
+    let module_name = format!("fo{rlo}gnp.mds");
+    let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
+
+    let modules_obj = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str(&module_name),
+        &JsValue::from_str("hi\n"),
+    )
+    .unwrap();
+    js_sys::Reflect::set(
+        &modules_obj,
+        &JsValue::from_str("main.mds"),
+        &JsValue::from_str(&main_src),
+    )
+    .unwrap();
+
+    let result = mds_wasm::lint_virtual(modules_obj.into(), "main.mds", JsValue::NULL)
+        .expect("T-15/F6-BIDI: lintVirtual must succeed with RLO in module name");
+
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("T-15/F6-BIDI: result.version must be a number") as u32;
+    assert_eq!(version, 1, "T-15/F6-BIDI: result.version must be 1");
+
+    let files = get_prop(&result, "files");
+    let files_arr = js_sys::Array::from(&files);
+    assert!(
+        files_arr.length() > 0,
+        "T-15/F6-BIDI: expected at least one file entry with diagnostics"
+    );
+
+    let mut all_messages: Vec<String> = Vec::new();
+    let mut all_rules: Vec<String> = Vec::new();
+    for i in 0..files_arr.length() {
+        let file_entry = files_arr.get(i);
+        // The file group key travels the same sanitization boundary.
+        assert_no_control_chars(
+            &get_str(&file_entry, "file"),
+            &format!("T-15/F6-BIDI: files[{i}].file"),
+        );
+        let diags = get_prop(&file_entry, "diagnostics");
+        let diags_arr = js_sys::Array::from(&diags);
+        for j in 0..diags_arr.length() {
+            let diag = diags_arr.get(j);
+            let msg = get_str(&diag, "message");
+            assert_no_control_chars(
+                &msg,
+                &format!("T-15/F6-BIDI: files[{i}].diagnostics[{j}].message"),
+            );
+            all_messages.push(msg);
+            all_rules.push(get_str(&diag, "rule"));
+        }
+    }
+
+    assert!(
+        !all_messages.is_empty(),
+        "T-15/F6-BIDI: expected at least one diagnostic"
+    );
+    assert!(
+        all_rules.iter().any(|r| r == "duplicate-import"),
+        "T-15/F6-BIDI: expected duplicate-import; got rules: {all_rules:?}"
+    );
+
+    let has_escaped_rlo = all_messages.iter().any(|m| m.contains("\\u202E"));
+    assert!(
+        has_escaped_rlo,
+        "T-15/F6-BIDI: expected escaped \\u202E in at least one message; got: {all_messages:?}"
     );
 }

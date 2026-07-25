@@ -103,9 +103,18 @@ describe('error shape', () => {
       const isC0 = code < 0x20 && code !== 0x09 && code !== 0x0a;
       const isDel = code === 0x7f;
       const isC1 = code >= 0x80 && code <= 0x9f;
+      // Bidi controls (Trojan Source, CVE-2021-42574), U+2028/U+2029 (JS string
+      // literal terminators), and U+FEFF (invisible BOM). `\n` is allowed here;
+      // wire-mode newline escaping is asserted explicitly by U-E14.
+      const isFormatHazard =
+        code === 0x200e || code === 0x200f ||
+        code === 0x2028 || code === 0x2029 ||
+        (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069) ||
+        code === 0xfeff;
       assert.ok(
-        !isC0 && !isDel && !isC1,
-        `${label}: raw control char U+${code.toString(16).toUpperCase().padStart(4,'0')} ` +
+        !isC0 && !isDel && !isC1 && !isFormatHazard,
+        `${label}: raw hostile char U+${code.toString(16).toUpperCase().padStart(4,'0')} ` +
         `at index ${i} must not appear; got: ${JSON.stringify(s)}`
       );
     }
@@ -186,6 +195,75 @@ describe('error shape', () => {
     );
   });
 
+  test('U-E13: U+202E (RLO) in lintVirtual module name is escaped on the wire', () => {
+    // Trojan Source (CVE-2021-42574). U+202E is outside C0/DEL/C1, so it used to
+    // reach the wire untouched and reverse how the rest of the line displays.
+    const rlo = String.fromCharCode(0x202e);
+    const moduleName = `fo${rlo}gnp.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1, 'U-E13: version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'duplicate-import'),
+      'U-E13: expected duplicate-import; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `U-E13: diag[${diag.rule}].message`);
+      }
+    }
+    for (const f of result.files) {
+      assertNoControlChars(f.file, 'U-E13: files[].file');
+    }
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u202E')),
+      'U-E13: expected \\u202E in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
+  test('U-E14: newline in a frontmatter key is escaped to \\u000A on the wire', () => {
+    // Log-forging guard: a raw newline in a diagnostic message lets an attacker
+    // forge what reads as a second, independent finding in any line-oriented
+    // consumer of the JSON string value.
+    //
+    // Reachability: a newline inside an `@import "..."` path is rejected by the
+    // lexer (vacuous route). A YAML double-quoted frontmatter key is not — the
+    // \n escape decodes to a real newline that unused-variable embeds verbatim.
+    const source =
+      '---\n"a\\nerror[mds::forged]: FAKE\\nb": 1\n---\nHello\n';
+    const result = lintVirtual({ 'main.mds': source }, 'main.mds');
+    assert.equal(result.version, 1, 'U-E14: version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'U-E14: expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      assert.ok(
+        !diag.message.includes('\n'),
+        `U-E14: raw newline must not survive into the wire message; got: ${JSON.stringify(diag.message)}`,
+      );
+    }
+    assert.ok(
+      allDiags.some((d) => d.message.includes('\\u000A')),
+      'U-E14: expected \\u000A in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+    // Escaped, not stripped.
+    assert.ok(
+      allDiags.some((d) => d.message.includes('error[mds::forged]')),
+      'U-E14: message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
   test('U-E-DIFF: native and WASM lintVirtual produce identical results for ESC-injection input', async () => {
     // Differential assertion: the same ESC-injection input run through both the
     // native (napi) and WASM backends must produce deeply equal results.
@@ -214,15 +292,44 @@ describe('error shape', () => {
       return; // WASM backend not available — skip
     }
 
+    // One vector covering every escape class: C0 (ESC), C1 (NEL), bidi override
+    // (RLO), JS line separator, BOM — carried in the module NAME — plus the
+    // wire-mode newline, carried in a YAML double-quoted frontmatter key (a
+    // newline inside an `@import "..."` path is rejected by the lexer, so the
+    // module-name route is unreachable for that one character).
+    // PF-007: a per-surface golden cannot catch cross-surface divergence, so the
+    // widened class has to be exercised through the differential too.
     const esc = String.fromCharCode(0x1b);
-    const moduleName = `fo${esc}o.mds`;
+    const nel = String.fromCharCode(0x85);
+    const rlo = String.fromCharCode(0x202e);
+    const ls = String.fromCharCode(0x2028);
+    const bom = String.fromCharCode(0xfeff);
+    const moduleName = `fo${esc}${nel}${rlo}${ls}${bom}o.mds`;
+    const mainSource =
+      '---\n"a\\nerror[mds::forged]: FAKE\\nb": 1\n---\n' +
+      `@import "./${moduleName}"\n@import "./${moduleName}"\n`;
     const modules = {
       [moduleName]: 'hi\n',
-      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+      'main.mds': mainSource,
     };
 
     const nativeResult = native.lintVirtual(modules, 'main.mds');
     const wasmResult = wasm.lintVirtual(modules, 'main.mds');
+
+    // Non-vacuity: the differential is worthless if neither backend produced
+    // diagnostics carrying the escaped forms. duplicate-import carries the module
+    // name (ESC/NEL/RLO/LS/BOM); unused-variable carries the frontmatter key (\n).
+    const nativeMessages = nativeResult.files
+      .flatMap((f) => f.diagnostics)
+      .map((d) => d.message)
+      .filter((m) => typeof m === 'string');
+    for (const escaped of ['\\u001B', '\\u0085', '\\u202E', '\\u2028', '\\uFEFF', '\\u000A']) {
+      assert.ok(
+        nativeMessages.some((m) => m.includes(escaped)),
+        `U-E-DIFF: expected ${escaped} in some message; got: ` +
+          JSON.stringify(nativeMessages),
+      );
+    }
 
     // deepEqual of plain-object round-trip proves wire-format parity.
     assert.deepEqual(

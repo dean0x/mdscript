@@ -19,13 +19,17 @@ pub fn mds_bin() -> std::process::Command {
     cmd
 }
 
-/// Assert that `s` contains no raw C0 (excluding `\t` and `\n`), DEL, or
-/// C1 control codepoints.
+/// Assert that `s` contains no raw C0 (excluding `\t` and `\n`), DEL, C1, bidi
+/// control, line/paragraph separator, or BOM codepoint.
 ///
 /// The predicate iterates over *chars* (Unicode codepoints), not raw bytes,
 /// so it correctly identifies C1 characters encoded as two-byte UTF-8
 /// sequences (0xC2 0x80–0xC2 0x9F) without false-positives on continuation
 /// bytes inside ordinary multi-byte codepoints.
+///
+/// `\n` is permitted because this helper is used on HUMAN-mode output too, where
+/// newlines are preserved by design. Wire-mode newline escaping is asserted
+/// explicitly at the call sites that need it.
 ///
 /// # Panics
 /// Panics on the first offending codepoint with a human-readable message that
@@ -37,9 +41,18 @@ pub fn assert_no_control_chars(s: &str, label: &str) {
         let is_c0 = code < 0x20 && code != 0x09 && code != 0x0a;
         let is_del = code == 0x7f;
         let is_c1 = (0x80..=0x9f).contains(&code);
+        // Bidi controls (Trojan Source, CVE-2021-42574), JS line/paragraph
+        // separators, and the invisible BOM — all escaped by the sanitizers.
+        let is_format_hazard = matches!(ch,
+            '\u{200E}' | '\u{200F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+        );
         assert!(
-            !is_c0 && !is_del && !is_c1,
-            "{label}: raw control char U+{code:04X} at byte offset {byte_offset}; \
+            !is_c0 && !is_del && !is_c1 && !is_format_hazard,
+            "{label}: raw hostile char U+{code:04X} at byte offset {byte_offset}; \
              full string: {s:?}"
         );
     }

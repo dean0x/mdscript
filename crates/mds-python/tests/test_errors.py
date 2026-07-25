@@ -185,14 +185,25 @@ def test_e5_span_none_when_core_reports_none() -> None:
 
 
 def _assert_no_control_chars(s: str, label: str) -> None:
-    """Assert no raw C0 (excl. \\t \\n), DEL, or C1 bytes appear in `s`."""
+    """Assert no raw C0 (excl. \\t \\n), DEL, C1, bidi, separator, or BOM char in `s`.
+
+    `\\n` is permitted because this helper also runs against HUMAN-mode output;
+    wire-mode newline escaping is asserted explicitly by the E13 test.
+    """
     for i, ch in enumerate(s):
         code = ord(ch)
         is_c0 = code < 0x20 and code not in (0x09, 0x0A)
         is_del = code == 0x7F
         is_c1 = 0x80 <= code <= 0x9F
-        assert not (is_c0 or is_del or is_c1), (
-            f"raw control char U+{code:04X} at index {i} must not appear in {label}; got: {s!r}"
+        # Bidi controls (Trojan Source, CVE-2021-42574), JS line/paragraph
+        # separators, and the invisible BOM.
+        is_format_hazard = (
+            code in (0x200E, 0x200F, 0x2028, 0x2029, 0xFEFF)
+            or 0x202A <= code <= 0x202E
+            or 0x2066 <= code <= 0x2069
+        )
+        assert not (is_c0 or is_del or is_c1 or is_format_hazard), (
+            f"raw hostile char U+{code:04X} at index {i} must not appear in {label}; got: {s!r}"
         )
 
 
@@ -233,8 +244,15 @@ def test_e11_control_chars_in_message_are_escaped() -> None:
         # the reachable YAML vector per KB Gotchas. Also exercised here via lint_virtual
         # (module names are plain strings, not YAML, so all three chars reach the engine).
         ("\x85", "\\u0085"),
+        # Widened escape class (#176): none of these are C0/DEL/C1, and all of them
+        # used to travel the wire untouched. Written as escapes, never as raw
+        # characters -- a literal RLO would reverse how this source file displays.
+        ("\u202e", "\\u202E"),  # RLO - Trojan Source display reversal (CVE-2021-42574)
+        ("\u2066", "\\u2066"),  # LRI - bidi isolate
+        ("\u2028", "\\u2028"),  # LINE SEPARATOR - terminates a JS string literal
+        ("\ufeff", "\\uFEFF"),  # BOM / ZWNBSP - invisible in every renderer
     ],
-    ids=["ESC", "DEL", "NEL"],
+    ids=["ESC", "DEL", "NEL", "RLO", "LRI", "LS", "BOM"],
 )
 def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
     ctrl_char: str, expected_escape: str
@@ -302,6 +320,108 @@ def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
             f"to_dict()[message] must equal .message; "
             f"typed={diag.message!r}, dict={dict_msg!r}"
         )
+
+
+def test_e13_lint_virtual_newline_in_frontmatter_key_escaped_on_wire() -> None:
+    """T-14 / E13 [AC-F4]: WIRE-mode newline escaping on the Python surface.
+
+    A raw newline inside a diagnostic message lets an attacker forge what reads as
+    a second, independent finding in any line-oriented consumer of the value (log
+    forging, YAML key injection). On the wire it must arrive as the six-character
+    ``\\u000A`` literal -- and the Python surface must emit the same bytes as the
+    other four surfaces (PF-007).
+
+    Reachability: a newline inside an ``@import "..."`` path is rejected by the lexer
+    (that route would be vacuous, PF-013). A YAML *double-quoted* frontmatter key is
+    not -- serde_yaml_ng decodes the ``\\n`` escape into a real newline, and
+    ``unused-variable`` embeds the decoded key verbatim in its message.
+
+    Verifies:
+    (a) no typed ``.message`` carries a raw newline
+    (b) the escaped ``\\u000A`` literal IS present (positive, non-vacuous)
+    (c) the payload text survives verbatim -- escaped, not stripped
+    (d) ``to_dict()`` agrees with the typed attribute (parity guard)
+    """
+    source = '---\n"a\\nerror[mds::forged]: FAKE\\nb": 1\n---\nHello\n'
+    result = m.lint_virtual({"main.mds": source}, "main.mds")
+
+    all_diags = [d for fr in result.files for d in fr.diagnostics]
+    assert any(d.rule == "unused-variable" for d in all_diags), (
+        "expected unused-variable to fire; got rules: "
+        + str([d.rule for d in all_diags])
+    )
+
+    # (a) No raw newline survives into a wire message.
+    for diag in all_diags:
+        assert "\n" not in diag.message, (
+            f"raw newline must not survive into the wire message; got: {diag.message!r}"
+        )
+
+    # (b) Positive evidence of the escape.
+    assert any("\\u000A" in d.message for d in all_diags), (
+        "expected \\u000A in at least one diagnostic message; got: "
+        + str([d.message for d in all_diags])
+    )
+
+    # (c) Escaped, not stripped.
+    assert any("error[mds::forged]" in d.message for d in all_diags), (
+        "message body must be preserved verbatim; got: "
+        + str([d.message for d in all_diags])
+    )
+
+    # (d) Parity: to_dict() must agree with the typed attribute (PF-007).
+    for diag in all_diags:
+        assert diag.to_dict()["message"] == diag.message
+
+
+def test_par7_lint_result_constructor_wire_escapes_bidi_and_newline() -> None:
+    """PF-004 anchor: the ``LintResult(canonical)`` / unpickle path uses WIRE mode.
+
+    ``sanitize_lint_value()`` in ``LintResult::new()`` is a parallel path into the same
+    backing store the typed getters and ``to_dict()`` read from. If it drifted to
+    HUMAN mode (or missed the widened class) this constructor would become a way to
+    smuggle a bidi override or a forged newline past the live-lint boundary.
+    """
+    raw_canonical = {
+        "version": 1,
+        "truncated": False,
+        "files": [
+            {
+                "file": "fo\u202egnp.mds",
+                "diagnostics": [
+                    {
+                        "rule": "unused-variable",
+                        "severity": "warn",
+                        "message": "unused \u202ekey\nerror[mds::forged]: FAKE",
+                        "help": "remove \u2028 or use it",
+                        "fixable": False,
+                        "span": None,
+                        "fix_edits": None,
+                    }
+                ],
+            }
+        ],
+    }
+    result = m.LintResult(raw_canonical)
+    fr = result.files[0]
+    diag = fr.diagnostics[0]
+
+    _assert_no_control_chars(fr.file, "LintFileReport.file (constructor)")
+    assert "\\u202E" in fr.file, f"file must be escaped; got: {fr.file!r}"
+
+    _assert_no_control_chars(diag.message, "LintDiagnostic.message (constructor)")
+    assert "\\u202E" in diag.message, f"message must escape RLO; got: {diag.message!r}"
+    assert "\\u000A" in diag.message, (
+        f"message must escape the newline on the wire; got: {diag.message!r}"
+    )
+    assert "\n" not in diag.message, (
+        f"raw newline must not survive the constructor; got: {diag.message!r}"
+    )
+    # Escaped, not stripped.
+    assert "error[mds::forged]" in diag.message
+
+    assert diag.help is not None
+    assert "\\u2028" in diag.help, f"help must escape U+2028; got: {diag.help!r}"
 
 
 def test_par6_lint_result_constructor_sanitizes_typed_fields() -> None:

@@ -317,6 +317,65 @@ fn serialize_sanitizes_del_and_c1() {
     );
 }
 
+/// T-3b [AC-F3]: `serialize()` escapes the widened class — bidi overrides
+/// (Trojan Source, CVE-2021-42574), U+2028/U+2029, and U+FEFF — none of which
+/// are C0/DEL/C1 and all of which previously passed straight through.
+#[test]
+fn serialize_sanitizes_bidi_separators_and_bom() {
+    let e = MdsError::syntax("rlo\u{202E}iso\u{2066}ls\u{2028}ps\u{2029}bom\u{FEFF}end");
+    let s = e.serialize();
+    for (ch, escaped) in [
+        ('\u{202E}', "\\u202E"),
+        ('\u{2066}', "\\u2066"),
+        ('\u{2028}', "\\u2028"),
+        ('\u{2029}', "\\u2029"),
+        ('\u{FEFF}', "\\uFEFF"),
+    ] {
+        assert!(
+            !s.message.contains(ch),
+            "raw U+{:04X} must not appear in serialized message; got: {:?}",
+            ch as u32,
+            s.message
+        );
+        assert!(
+            s.message.contains(escaped),
+            "sanitized {escaped} must appear in message; got: {:?}",
+            s.message
+        );
+    }
+    // Non-vacuity: the surrounding prose survives.
+    assert!(
+        s.message.contains("rlo") && s.message.contains("end"),
+        "clean text must be preserved; got: {:?}",
+        s.message
+    );
+}
+
+/// T-3c [AC-F3]: `serialize()` is a WIRE boundary — an embedded newline (U+000A)
+/// becomes its 6-char escape literal so a hostile message cannot forge an extra
+/// line in a line-oriented consumer of `SerializedError.message`.
+#[test]
+fn serialize_escapes_newline_on_the_wire() {
+    let e = MdsError::syntax("a\nerror[mds::forged]: FAKE\nb");
+    let s = e.serialize();
+    assert!(
+        !s.message.contains('\n'),
+        "raw newline must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u000A"),
+        "sanitized \\u000A must appear in serialized message; got: {:?}",
+        s.message
+    );
+    // Non-vacuity: the message body itself is untouched.
+    assert!(
+        s.message.contains("error[mds::forged]"),
+        "message body must be preserved verbatim; got: {:?}",
+        s.message
+    );
+}
+
 // ── display_sanitized() ───────────────────────────────────────────────────
 
 /// T-DS: `display_sanitized()` escapes raw ESC (U+001B) bytes in the terminal-
@@ -339,6 +398,40 @@ fn display_sanitized_escapes_esc_byte() {
         displayed.contains("\\u001B"),
         "sanitized literal \\u001B must appear in display_sanitized(); got: {:?}",
         displayed
+    );
+}
+
+/// T-DS-BIDI: `display_sanitized()` also covers the widened class — a bidi
+/// override reaching a TTY reverses the visible order of the rest of the line.
+#[test]
+fn display_sanitized_escapes_bidi_override() {
+    let e = MdsError::syntax("bad\u{202E}token");
+    let displayed = e.display_sanitized();
+    assert!(
+        !displayed.contains('\u{202E}'),
+        "raw U+202E must not appear in display_sanitized(); got: {displayed:?}"
+    );
+    assert!(
+        displayed.contains("\\u202E"),
+        "sanitized literal \\u202E must appear in display_sanitized(); got: {displayed:?}"
+    );
+}
+
+/// T-DS-NL: `display_sanitized()` is the HUMAN boundary — newlines stay raw so
+/// multi-line miette frames remain readable. This is the deliberate asymmetry
+/// with `serialize()` (see T-3c); pinning it here prevents an accidental
+/// "sanitize everything the same way" regression.
+#[test]
+fn display_sanitized_preserves_newline() {
+    let e = MdsError::syntax("line one\nline two");
+    let displayed = e.display_sanitized();
+    assert!(
+        displayed.contains('\n'),
+        "display_sanitized() must preserve raw newlines; got: {displayed:?}"
+    );
+    assert!(
+        !displayed.contains("\\u000A"),
+        "display_sanitized() must not escape newlines; got: {displayed:?}"
     );
 }
 
