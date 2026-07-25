@@ -26,7 +26,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -39,7 +39,7 @@ use crate::build::{
 };
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, neutralize_source_for_render,
-    preview_text_for, safe_path,
+    render_unified_diff, safe_path,
 };
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -658,7 +658,7 @@ fn run_lint_stdin(
             match preview {
                 PreviewOutcome::WouldFix(ref fixed) => {
                     if diff {
-                        let diff_str = render_diff_lint(&source, fixed, "stdin");
+                        let diff_str = render_unified_diff(&source, fixed, "stdin");
                         let _ = write_stdout(&diff_str);
                     }
                     if check {
@@ -849,7 +849,7 @@ fn run_lint_file(
             PreviewOutcome::WouldFix(ref fixed) => {
                 if diff {
                     let label = safe_path(path);
-                    let diff_str = render_diff_lint(&source, fixed, &label);
+                    let diff_str = render_unified_diff(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
                 if check {
@@ -1206,7 +1206,7 @@ fn lint_one_file_accumulating(
                 *any_would_fix = true;
                 if diff {
                     let label = safe_path(file);
-                    let diff_str = render_diff_lint(&source, fixed, &label);
+                    let diff_str = render_unified_diff(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
             }
@@ -1359,7 +1359,7 @@ fn lint_one_file_human(
                 *any_would_fix = true;
                 if diff {
                     let label = safe_path(file);
-                    let diff_str = render_diff_lint(&source, fixed, &label);
+                    let diff_str = render_unified_diff(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
                 if check && !quiet {
@@ -1432,73 +1432,6 @@ fn accumulate_result_json(result: &mds::LintResult, json_files: &mut Vec<serde_j
     if let Some(arr) = inner["files"].as_array() {
         json_files.extend(arr.iter().cloned());
     }
-}
-
-// ── Diff rendering ────────────────────────────────────────────────────────────
-
-/// Render a unified diff between `original` and `fixed` with optional colorization.
-///
-/// When stdout is a TTY, `original` and `fixed` are neutralized via
-/// [`preview_text_for`] before the diff is computed so hostile ESC/control bytes
-/// in template source cannot inject ANSI commands into the rendered diff (CWE-150,
-/// security-11). When stdout is piped the source strings pass through unchanged so
-/// redirected diff output remains byte-faithful and applicable by `patch`/tooling.
-fn render_diff_lint(original: &str, fixed: &str, label: &str) -> String {
-    let is_tty = std::io::stdout().is_terminal();
-    let original = preview_text_for(is_tty, original);
-    let fixed = preview_text_for(is_tty, fixed);
-    let diff = similar::TextDiff::from_lines(original.as_ref(), fixed.as_ref());
-    let unified = diff
-        .unified_diff()
-        .context_radius(3)
-        .header(label, label)
-        .to_string();
-
-    if unified.is_empty() || !is_tty {
-        return unified;
-    }
-    colorize_unified_diff(&unified)
-}
-
-fn colorize_unified_diff(unified: &str) -> String {
-    const RED: &str = "\x1b[31m";
-    const GREEN: &str = "\x1b[32m";
-    const CYAN: &str = "\x1b[36m";
-    const RESET: &str = "\x1b[0m";
-
-    let mut out = String::with_capacity(unified.len() + 64);
-    let mut in_hunk = false;
-    for line in unified.split_inclusive('\n') {
-        let color = if line.starts_with("@@") {
-            in_hunk = true;
-            CYAN
-        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
-            CYAN
-        } else if in_hunk && line.starts_with('+') {
-            GREEN
-        } else if in_hunk && line.starts_with('-') {
-            RED
-        } else {
-            ""
-        };
-        if color.is_empty() {
-            out.push_str(line);
-            continue;
-        }
-        out.push_str(color);
-        match line.strip_suffix('\n') {
-            Some(stripped) => {
-                out.push_str(stripped);
-                out.push_str(RESET);
-                out.push('\n');
-            }
-            None => {
-                out.push_str(line);
-                out.push_str(RESET);
-            }
-        }
-    }
-    out
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

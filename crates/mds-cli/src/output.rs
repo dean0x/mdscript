@@ -16,7 +16,7 @@
 //! callers need both single-file and directory logic.
 
 use std::borrow::Cow;
-use std::io::Write as _;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 
 use miette::Result;
@@ -574,6 +574,82 @@ pub(crate) fn preview_text_for(writer_is_tty: bool, text: &str) -> Cow<'_, str> 
     }
 }
 
+// ── Diff rendering ───────────────────────────────────────────────────────────
+
+/// Render a unified diff between `original` and `modified` with optional colorization.
+///
+/// The single shared implementation used by both `fmt --diff` and `lint --diff`.
+///
+/// When stdout is a TTY, both strings are neutralized via [`preview_text_for`] before
+/// diffing so hostile ESC/control bytes in template source cannot inject ANSI commands
+/// into the rendered diff (CWE-150, security-11). When piped, the strings pass through
+/// unchanged so redirected diff output remains byte-faithful and applicable by
+/// `patch`/tooling.
+#[must_use]
+pub(crate) fn render_unified_diff(original: &str, modified: &str, label: &str) -> String {
+    let is_tty = std::io::stdout().is_terminal();
+    let original = preview_text_for(is_tty, original);
+    let modified = preview_text_for(is_tty, modified);
+    let diff = similar::TextDiff::from_lines(original.as_ref(), modified.as_ref());
+    let unified = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(label, label)
+        .to_string();
+
+    if unified.is_empty() || !is_tty {
+        return unified;
+    }
+    colorize_unified_diff(&unified)
+}
+
+/// Colorize a unified diff string with ANSI codes.
+///
+/// Uses a state machine keyed on the first `@@` hunk marker to correctly color
+/// removed (`-`) and added (`+`) lines inside hunks without miscoloring file-header
+/// lines (`---`/`+++`) as hunk content when a removed or added line's own content
+/// starts with `--` or `++`.
+pub(crate) fn colorize_unified_diff(unified: &str) -> String {
+    const RED: &str = "\x1b[31m";
+    const GREEN: &str = "\x1b[32m";
+    const CYAN: &str = "\x1b[36m";
+    const RESET: &str = "\x1b[0m";
+
+    let mut out = String::with_capacity(unified.len() + 64);
+    let mut in_hunk = false;
+    for line in unified.split_inclusive('\n') {
+        let color = if line.starts_with("@@") {
+            in_hunk = true;
+            CYAN
+        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
+            CYAN
+        } else if in_hunk && line.starts_with('+') {
+            GREEN
+        } else if in_hunk && line.starts_with('-') {
+            RED
+        } else {
+            ""
+        };
+        if color.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(color);
+        match line.strip_suffix('\n') {
+            Some(stripped) => {
+                out.push_str(stripped);
+                out.push_str(RESET);
+                out.push('\n');
+            }
+            None => {
+                out.push_str(line);
+                out.push_str(RESET);
+            }
+        }
+    }
+    out
+}
+
 /// Sanitize a filesystem path for terminal display (CWE-150 guard).
 ///
 /// Converts the path to a display string and applies [`mds::sanitize_control_chars`]
@@ -1069,5 +1145,49 @@ mod tests {
             !coloured.contains(hostile_char),
             "hostile C1 absent from rendered output"
         );
+    }
+
+    // ── render_unified_diff / colorize_unified_diff ───────────────────────────
+
+    #[test]
+    fn render_unified_diff_empty_for_identical_input() {
+        let rendered = render_unified_diff("same\n", "same\n", "label");
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn render_unified_diff_contains_unified_markers_for_changed_input() {
+        let rendered = render_unified_diff("a\n", "b\n", "label");
+        assert!(rendered.contains("---"));
+        assert!(rendered.contains("+++"));
+        assert!(rendered.contains("-a"));
+        assert!(rendered.contains("+b"));
+    }
+
+    #[test]
+    fn colorize_unified_diff_wraps_add_remove_lines_with_ansi_when_requested() {
+        let unified = "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n";
+        let colorized = colorize_unified_diff(unified);
+        assert!(colorized.contains("\x1b[32m+new\x1b[0m"));
+        assert!(colorized.contains("\x1b[31m-old\x1b[0m"));
+        assert!(colorized.contains("\x1b[36m--- a\x1b[0m"));
+    }
+
+    #[test]
+    fn colorize_unified_diff_correctly_colors_content_starting_with_dashes_or_pluses() {
+        // Regression: a removed line whose content starts with "-- " produces
+        // "--- ..." in the rendered unified diff. The old global prefix check
+        // matched `starts_with("---")` and mis-colored it CYAN (file header)
+        // instead of RED (removal). Same defect for "++" content → "+++ " →
+        // mis-colored CYAN instead of GREEN.
+        let unified = "--- a\n+++ b\n@@ -1,2 +1,2 @@\n--- dashes content\n+++ plus content\n";
+        let colorized = colorize_unified_diff(unified);
+        // Inside the hunk: removal of a line whose content starts with "-- "
+        assert!(colorized.contains("\x1b[31m--- dashes content\x1b[0m"));
+        // Inside the hunk: addition of a line whose content starts with "++"
+        assert!(colorized.contains("\x1b[32m+++ plus content\x1b[0m"));
+        // File headers (before @@) must still be CYAN
+        assert!(colorized.contains("\x1b[36m--- a\x1b[0m"));
+        assert!(colorized.contains("\x1b[36m+++ b\x1b[0m"));
     }
 }
