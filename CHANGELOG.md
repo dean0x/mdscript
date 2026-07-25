@@ -62,6 +62,22 @@ field is present across all binding surfaces: CLI JSON output, napi
   project root (located via `.mdsroot` / `.git` walk-up), and `..`-escaping
   references outside the project root fall back to the basename. (#3)
 
+- **Control-byte injection hardening (CWE-150 / #176):** Raw C0 / DEL / C1
+  control bytes in `.mds` source content could reach terminal stderr and
+  JS / Python / WASM API error messages, enabling terminal escape-sequence
+  injection. All serialization and diagnostic-render boundaries are now
+  hardened: `MdsError::serialize()` (inherited by all three binding layers),
+  `LintResult::to_canonical_json()` including the `"file"` group key,
+  `CompileResult::to_canonical_json()` warnings, and the CLI render path.
+  The CLI render path (PF-014 redesign) sanitizes renderer *inputs*
+  byte-length-preservingly — hostile C0/DEL/C1 bytes become `?` (C0/DEL) or
+  NBSP (C1) so miette's own SGR colour codes survive intact on TTY. A new
+  `MdsError::display_sanitized()` public API is provided for Rust consumers;
+  the raw `Display` impl is preserved with an explicit unsafety contract in
+  its rustdoc. `span` byte offsets, `fix_edits` byte ranges, and `rule`
+  identifiers are deliberate exclusions — they carry position data, not
+  terminal-bound text. (#176)
+
 ### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
 
 These changes alter observable runtime behavior and compiled output. Templates relying
@@ -155,6 +171,21 @@ directly via `ModuleCache::with_fs`.
   that initializes `CompileOptions` with a struct literal must either add
   `source_map_base: None` or use the `..Default::default()` tail.  Binding surfaces
   (napi, Python, WASM) are not affected. (#3)
+
+### **BREAKING** — Error/lint messages now carry `\uXXXX` literals for embedded control bytes (#176)
+
+Across the JS / Python / WASM API surfaces, `err.message`, `err.help`, and lint
+`LintDiagnostic.message` / `LintDiagnostic.help` now contain six-character `\uXXXX`
+Unicode escape literals (e.g. `\u001B`, `\u007F`, `\u0085`) wherever MDS source
+content caused raw C0-minus-`\n`/`\t`, DEL (U+007F), or C1 (U+0080–U+009F) control
+bytes to appear in error or diagnostic messages.
+
+**Not affected:** `span.offset`, `span.length`, and `fix_edits` byte ranges are raw
+byte offsets and are never sanitized. The `rule` field is a fixed ASCII identifier.
+The `"file"` key in lint JSON output is sanitized on the same pass as `message`/`help`.
+
+**Migration:** consumers that test for exact control byte sequences in error or
+diagnostic messages must update to check for the `\uXXXX` literal form instead.
 
 ### Added
 

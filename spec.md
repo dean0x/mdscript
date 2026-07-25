@@ -994,6 +994,22 @@ mode, which uses a single config located from the directory argument.
 
 Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is absent for diagnostics that lack a source location.
 
+#### Sanitization invariant (v1)
+
+Under `"version": 1`, the following guarantees are normative. The prior behavior of
+passing raw control bytes through to JSON is superseded.
+
+| Field | Invariant |
+|-------|-----------|
+| `message`, `help` | C0 bytes except `\n` (U+000A) and `\t` (U+0009), DEL (U+007F), and C1 bytes (U+0080–U+009F) are replaced with their six-character `\uXXXX` literal before serialization. |
+| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control bytes into the JSON output. |
+| `rule` | Fixed ASCII identifier; never contains control bytes by construction. Not sanitized. |
+| `span`, `fix_edits` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
+
+This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
+(`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
+(`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
+
 ### 7.6 `mds init`
 
 ```bash
