@@ -224,21 +224,37 @@ def test_e11_control_chars_in_message_are_escaped() -> None:
         pytest.fail("expected m.MdsError to be raised")
 
 
-def test_e12_lint_virtual_esc_in_import_path_message_sanitized() -> None:
+@pytest.mark.parametrize(
+    "ctrl_char,expected_escape",
+    [
+        ("\x1b", "\\u001B"),  # ESC (U+001B) — C0 control char
+        ("\x7f", "\\u007F"),  # DEL (U+007F) — serde_json does not auto-escape 0x7F
+        # U+0085 NEL (C1) — passes serde_yaml_ng where ESC/DEL are rejected in YAML keys;
+        # the reachable YAML vector per KB Gotchas. Also exercised here via lint_virtual
+        # (module names are plain strings, not YAML, so all three chars reach the engine).
+        ("\x85", "\\u0085"),
+    ],
+    ids=["ESC", "DEL", "NEL"],
+)
+def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
+    ctrl_char: str, expected_escape: str
+) -> None:
     """T-14 / E12 [AC-F4]: Python typed LintDiagnostic.message and as_json() sanitization.
 
-    Uses the lint_virtual API with a module whose NAME contains a raw ESC byte (U+001B)
+    Uses the lint_virtual API with a module whose NAME contains a raw control byte
     to trigger a duplicate-import rule whose message embeds the raw path — a reachable
     end-to-end vector that exercises the Python typed surface without touching YAML parsing.
 
+    Parametrized over ESC, DEL, and U+0085 NEL (PF-007 python-7).
+
     Verifies:
     (a) LintDiagnostic.message contains no raw C0/DEL/C1 bytes (typed attribute clean)
-    (b) LintDiagnostic.message contains the sanitized \\u001B literal (explicit evidence)
+    (b) LintDiagnostic.message contains the sanitized escape literal (explicit evidence)
     (c) LintDiagnostic.to_dict()["message"] is identical to .message (parity guard, PF-007)
+    (d) LintFileReport.file contains no raw control bytes (python-3 regression anchor)
     """
-    esc = "\x1b"
-    # Module whose name contains a raw ESC byte — import path embeds it in the message.
-    module_name = f"fo{esc}o.mds"
+    # Module whose name contains the raw control byte — import path embeds it in the message.
+    module_name = f"fo{ctrl_char}o.mds"
     modules = {
         module_name: "hi\n",
         # Import the same module twice to trigger duplicate-import; message will embed module_name.
@@ -248,27 +264,30 @@ def test_e12_lint_virtual_esc_in_import_path_message_sanitized() -> None:
 
     files = result.files
     assert files, "expected at least one LintFileReport from lint_virtual"
+
+    # (d) LintFileReport.file must not carry raw control bytes (python-3 / python-5 anchor).
+    for fr in files:
+        _assert_no_control_chars(fr.file, "LintFileReport.file")
+
     all_diags = [d for fr in files for d in fr.diagnostics]
     assert all_diags, (
         "expected at least one LintDiagnostic (duplicate-import should fire for "
         "the twice-imported module)"
     )
 
+    # (a) No raw C0/DEL/C1 bytes in typed .message attribute.
     for diag in all_diags:
         msg = diag.message
         assert isinstance(msg, str) and msg, "message must be a non-empty string"
-
-        # (a) No raw C0/DEL/C1 bytes in typed .message attribute.
         _assert_no_control_chars(msg, "LintDiagnostic.message")
 
-        # (b) At least one diagnostic must carry the sanitized \\u001B literal —
-        #     confirming the ESC byte in the module name was sanitized, not dropped.
-        # (Only the duplicate-import diagnostic embeds the path; check all.)
-
-    esc_in_messages = [d for d in all_diags if "\\u001B" in d.message or "\\u001b" in d.message]
-    assert esc_in_messages, (
-        "expected at least one diagnostic whose message carries the sanitized "
-        "\\u001B literal (module path); got: "
+    # (b) At least one diagnostic must carry the sanitized escape literal —
+    #     confirming the control byte in the module name was sanitized, not dropped.
+    #     (Only the duplicate-import diagnostic embeds the path; check all.)
+    found_escaped = [d for d in all_diags if expected_escape in d.message]
+    assert found_escaped, (
+        f"expected at least one diagnostic whose message carries the sanitized "
+        f"{expected_escape!r} literal (module path); got: "
         + str([d.message for d in all_diags])
     )
 
@@ -283,6 +302,73 @@ def test_e12_lint_virtual_esc_in_import_path_message_sanitized() -> None:
             f"to_dict()[message] must equal .message; "
             f"typed={diag.message!r}, dict={dict_msg!r}"
         )
+
+
+def test_par6_lint_result_constructor_sanitizes_typed_fields() -> None:
+    """python-1 / python-2 regression anchor: LintResult(canonical) sanitizes via new().
+
+    Constructs LintResult directly via its Python constructor (the pickle/unpickle entry
+    point) with raw ESC bytes in message, help, and file fields. After the fix,
+    sanitize_lint_value() runs in new() and all typed getters must return sanitized values.
+
+    This test FAILS if sanitize_lint_value() is removed from LintResult::new()
+    (avoids PF-013 — the belt-and-suspenders at the population site is vacuous without
+    this constructor-level guard).
+    """
+    esc = "\x1b"
+    raw_canonical = {
+        "version": 1,
+        "truncated": False,
+        "files": [
+            {
+                "file": f"fo{esc}o.mds",
+                "diagnostics": [
+                    {
+                        "rule": "unused-variable",
+                        "severity": "warn",
+                        "message": f"unused variable {esc}key",
+                        "help": f"remove or use the variable {esc}key",
+                        "fixable": False,
+                        "span": None,
+                        "fix_edits": None,
+                    }
+                ],
+            }
+        ],
+    }
+    result = m.LintResult(raw_canonical)
+    files = result.files
+    assert len(files) == 1, "expected one LintFileReport"
+    fr = files[0]
+
+    # LintFileReport.file must be sanitized.
+    _assert_no_control_chars(fr.file, "LintFileReport.file (from constructor)")
+    assert "\\u001B" in fr.file, f"file must contain sanitized literal; got: {fr.file!r}"
+
+    assert len(fr.diagnostics) == 1, "expected one LintDiagnostic"
+    diag = fr.diagnostics[0]
+
+    # LintDiagnostic.message must be sanitized.
+    _assert_no_control_chars(diag.message, "LintDiagnostic.message (from constructor)")
+    assert "\\u001B" in diag.message, f"message must contain sanitized literal; got: {diag.message!r}"
+
+    # LintDiagnostic.help must be sanitized.
+    assert diag.help is not None
+    _assert_no_control_chars(diag.help, "LintDiagnostic.help (from constructor)")
+    assert "\\u001B" in diag.help, f"help must contain sanitized literal; got: {diag.help!r}"
+
+    # Parity: to_dict()["message"] must equal .message (PF-007).
+    d_dict = diag.to_dict()
+    assert isinstance(d_dict, dict)
+    assert d_dict["message"] == diag.message, (
+        f"to_dict()[message] must equal .message; "
+        f"typed={diag.message!r}, dict={d_dict['message']!r}"
+    )
+
+    # LintResult.to_dict() must also expose sanitized file key.
+    result_dict = result.to_dict()
+    file_in_dict = result_dict["files"][0]["file"]
+    _assert_no_control_chars(file_in_dict, "to_dict() file key (from constructor)")
 
 
 # ── D2: type_mismatch_at — span present on @if cross-type comparison ─────────────
