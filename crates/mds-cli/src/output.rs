@@ -8,11 +8,14 @@
 //! - [`probe_and_remove_stale`]: stale-output cleanup for format-flip (AC-FUNC-23).
 //! - [`eprint_error`]: sanitized stderr render for directory-mode error loops (PF-004).
 //! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`.
+//! - [`preview_text_for`]: `--diff`/`--check` preview output — neutralized on TTY,
+//!   byte-faithful when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
 //! Single-file path helpers (`OutputKind`, `compile_to_content`, `compile_and_write`,
 //! `resolve_output_path_for_kind`) remain in `build.rs`; they are imported here when
 //! callers need both single-file and directory logic.
 
+use std::borrow::Cow;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -531,6 +534,46 @@ pub(crate) fn eprint_error(report: miette::Report) {
     eprintln!("{}", render_error_sanitized(&report));
 }
 
+/// Neutralize hostile control bytes in source text for `--diff`/`--check` preview output.
+///
+/// `--diff`/`--check` preview output: neutralized on TTY, byte-faithful when piped.
+///
+/// When `writer_is_tty` is `true`, returns [`neutralize_source_for_render`]`(text)` —
+/// a byte-length-preserving substitution that maps C0/DEL/C1 controls and the widened
+/// bidi/format hazard class (added in #176) to `?` or U+00A0/U+FFFD so hostile template
+/// source cannot inject ANSI terminal commands into the rendered diff (CWE-150).
+///
+/// When `writer_is_tty` is `false`, returns `Cow::Borrowed(text)` unchanged so
+/// redirected diff output (e.g. `mds fmt --diff > patch.diff`) stays byte-faithful
+/// and applicable by `patch`/tooling.
+///
+/// This is a pure, allocation-free helper for clean inputs; the TTY detection
+/// (`std::io::stdout().is_terminal()`) is performed at the call site so this function
+/// is testable without a real TTY (avoids PF-014: sanitize renderer inputs, not the
+/// rendered frame).
+///
+/// # Byte-length invariant
+///
+/// `neutralize_source_for_render` is byte-length-preserving — every substitution
+/// produces a replacement of the same UTF-8 byte count — so diff hunk byte offsets
+/// remain coherent after substitution on the TTY path. Never use
+/// [`mds::sanitize_control_chars`] here: it expands 1–2-byte controls to 6 bytes,
+/// desynchronising all offsets that follow.
+///
+/// # Boundary table entry (consistent with `crates/mds-core/src/lint/diagnostic.rs`)
+///
+/// | Boundary | Mode | Content |
+/// |----------|------|---------|
+/// | `--diff`/`--check` preview output | HUMAN, TTY-gated | source excerpts via `neutralize_source_for_render`; piped path returns `Cow::Borrowed` |
+#[must_use]
+pub(crate) fn preview_text_for(writer_is_tty: bool, text: &str) -> Cow<'_, str> {
+    if writer_is_tty {
+        neutralize_source_for_render(text)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
 /// Sanitize a filesystem path for terminal display (CWE-150 guard).
 ///
 /// Converts the path to a display string and applies [`mds::sanitize_control_chars`]
@@ -828,6 +871,66 @@ mod tests {
         let base = OutputBase::NextToSource;
         let result = output_base_no_ext(&source, &root, &base);
         assert_eq!(result, PathBuf::from("/root/src/chat"));
+    }
+
+    // ── preview_text_for: TTY-gated source neutralization (security-11) ──────────
+
+    /// T-12a [security-11 / PF-013]: preview_text_for(true, hostile) neutralizes ESC
+    /// and preserves byte length (so diff hunks remain coherent after substitution).
+    ///
+    /// Positive assertion required by PF-013: the neutralized form MUST be present,
+    /// not merely asserted absent in the raw form.
+    #[test]
+    fn preview_text_for_tty_neutralizes_esc_preserves_byte_length() {
+        let hostile = "hello\x1bworld"; // ESC (U+001B) is 1-byte C0
+        let result = preview_text_for(true, hostile);
+        // Byte-length invariant: neutralize_source_for_render is byte-length-preserving.
+        assert_eq!(
+            result.len(),
+            hostile.len(),
+            "byte length must be preserved on TTY path"
+        );
+        // ESC must be absent from TTY output (security gate).
+        assert!(
+            !result.contains('\x1b'),
+            "raw ESC must be absent from TTY output; got: {result:?}"
+        );
+        // PF-013 positive assertion: the substituted '?' must be present.
+        assert!(
+            result.contains('?'),
+            "ESC must be replaced with '?' on TTY path; got: {result:?}"
+        );
+    }
+
+    /// T-12b [security-11 / PF-013]: preview_text_for(false, ...) returns Cow::Borrowed
+    /// so piped diff output is byte-identical to the raw source (patch/tooling safety).
+    #[test]
+    fn preview_text_for_not_tty_returns_borrowed_passthrough() {
+        let hostile = "hello\x1bworld";
+        let result = preview_text_for(false, hostile);
+        // Must be Cow::Borrowed — no allocation, byte-identical to input.
+        assert!(
+            matches!(result, Cow::Borrowed(_)),
+            "piped path must return Cow::Borrowed (no allocation); got Owned"
+        );
+        assert_eq!(
+            result.as_ref(),
+            hostile,
+            "piped path must be byte-identical to input"
+        );
+    }
+
+    /// T-12c [security-11 / PF-013]: preview_text_for(true, clean) returns unchanged content
+    /// because neutralize_source_for_render returns Cow::Borrowed for clean inputs.
+    #[test]
+    fn preview_text_for_tty_clean_string_unchanged() {
+        let clean = "hello world\n";
+        let result = preview_text_for(true, clean);
+        assert_eq!(
+            result.as_ref(),
+            clean,
+            "clean string must be unchanged on TTY path"
+        );
     }
 
     // ── safe_path: CWE-150 status-line guard (security-5/6) ──────────────────────

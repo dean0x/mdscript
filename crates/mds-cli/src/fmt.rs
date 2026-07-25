@@ -29,8 +29,7 @@ use mds::{effective_parent, FileSystem};
 use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
-use crate::output::atomic_write_file;
-use crate::output::collect_mds_files_detailed;
+use crate::output::{atomic_write_file, collect_mds_files_detailed, preview_text_for};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -389,15 +388,24 @@ fn print_diff(rendered: &str) -> Result<()> {
 /// raw ANSI escapes ONLY when stdout is a terminal (mirrors `watch.rs`'s
 /// `clear_terminal`, which does the same TTY gate for its own raw escapes;
 /// this repo has no color crate dependency).
+///
+/// When stdout is a TTY, `original` and `formatted` are neutralized via
+/// [`preview_text_for`] before the diff is computed so hostile ESC/control bytes
+/// in template source cannot inject ANSI commands into the rendered diff (CWE-150,
+/// security-11). When stdout is piped the source strings pass through unchanged so
+/// redirected diff output remains byte-faithful and applicable by `patch`/tooling.
 fn render_diff(original: &str, formatted: &str, label: &str) -> String {
-    let diff = similar::TextDiff::from_lines(original, formatted);
+    let is_tty = std::io::stdout().is_terminal();
+    let original = preview_text_for(is_tty, original);
+    let formatted = preview_text_for(is_tty, formatted);
+    let diff = similar::TextDiff::from_lines(original.as_ref(), formatted.as_ref());
     let unified = diff
         .unified_diff()
         .context_radius(3)
         .header(label, label)
         .to_string();
 
-    if unified.is_empty() || !std::io::stdout().is_terminal() {
+    if unified.is_empty() || !is_tty {
         return unified;
     }
     colorize_unified_diff(&unified)

@@ -39,7 +39,7 @@ use crate::build::{
 };
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, neutralize_source_for_render,
-    safe_path,
+    preview_text_for, safe_path,
 };
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -1437,15 +1437,24 @@ fn accumulate_result_json(result: &mds::LintResult, json_files: &mut Vec<serde_j
 // ── Diff rendering ────────────────────────────────────────────────────────────
 
 /// Render a unified diff between `original` and `fixed` with optional colorization.
+///
+/// When stdout is a TTY, `original` and `fixed` are neutralized via
+/// [`preview_text_for`] before the diff is computed so hostile ESC/control bytes
+/// in template source cannot inject ANSI commands into the rendered diff (CWE-150,
+/// security-11). When stdout is piped the source strings pass through unchanged so
+/// redirected diff output remains byte-faithful and applicable by `patch`/tooling.
 fn render_diff_lint(original: &str, fixed: &str, label: &str) -> String {
-    let diff = similar::TextDiff::from_lines(original, fixed);
+    let is_tty = std::io::stdout().is_terminal();
+    let original = preview_text_for(is_tty, original);
+    let fixed = preview_text_for(is_tty, fixed);
+    let diff = similar::TextDiff::from_lines(original.as_ref(), fixed.as_ref());
     let unified = diff
         .unified_diff()
         .context_radius(3)
         .header(label, label)
         .to_string();
 
-    if unified.is_empty() || !std::io::stdout().is_terminal() {
+    if unified.is_empty() || !is_tty {
         return unified;
     }
     colorize_unified_diff(&unified)
