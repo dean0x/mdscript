@@ -18,13 +18,15 @@
 //!   message cannot forge an extra line in a line-oriented consumer of the value
 //!   (log forging, YAML key injection).
 //!
-//! `\t` is preserved in both modes. The complete closed boundary set:
+//! `\t` is preserved in both modes. The boundary set below is closed for the
+//! **lint diagnostic** and **wire/JSON** paths; see "Known gap" after the table for
+//! the one terminal path that is not yet covered.
 //!
 //! | Boundary | Mode | Fields |
 //! |----------|------|--------|
 //! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help`/filename via `sanitize_control_chars`; source excerpts via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
 //! | `MdsError::at()` (error.rs) | HUMAN | filename; source via `neutralize_source_for_render` |
-//! | `MdsError::display_sanitized()` (error.rs) | HUMAN | whole `Display` string |
+//! | `MdsError::display_sanitized()` (error.rs) | HUMAN | whole `Display` string — helper only; **not currently on any CLI path** (see "Known gap") |
 //! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr |
 //! | `safe_path()` (mds-cli/src/output.rs) | HUMAN | CLI status-line path display |
 //! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
@@ -32,6 +34,20 @@
 //! | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings; *distinct method from `LintResult::to_canonical_json`, not a duplicate* |
 //! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
 //! | `--diff` / `--check` preview output (mds-cli/src/output.rs) | HUMAN, TTY-gated | neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable |
+//!
+//! **Known gap — `MdsError` message text on the CLI terminal path.** The table above
+//! covers lint diagnostics and every wire boundary, but a *compile/build* error still
+//! reaches the terminal with its message unsanitized. `mds build` / `mds check` render
+//! errors via `eprint_error` → `format!("{report:?}")`, which is miette's own renderer;
+//! post-processing that rendered frame is forbidden by PF-014, and the only helper that
+//! would close the gap — [`MdsError::display_sanitized`] — has no production caller.
+//! `MdsError::at()` does neutralize the *source excerpt*, so the caret frame is safe,
+//! but an error message that interpolates attacker-controlled text (e.g.
+//! `parser.rs`'s `invalid include alias: '{alias}'`) still emits raw control bytes to
+//! stderr. Closing it requires sanitizing at `MdsError` construction rather than at
+//! render time; that is a design decision with broad golden-test blast radius and is
+//! deliberately NOT addressed in issue #176. Do not "fix" it by wrapping the rendered
+//! frame — that is exactly PF-014.
 //!
 //! **Deliberate exclusions** (documented, not gaps):
 //! - `LintDiagnostic::fmt` (raw `Display`) — unsanitized by design; use
@@ -496,8 +512,8 @@ enum EscapeMode {
 /// # Escaping is one-way
 ///
 /// This transformation is **lossy and non-injective**: a template that literally
-/// contains the seven characters `\`,`u`,`0`,`0`,`1`,`B` and an actual ESC byte both
-/// serialize to the same `` output. Consumers **MUST NOT** un-escape `\uXXXX`
+/// contains the six characters `\`,`u`,`0`,`0`,`1`,`B` and an actual ESC byte both
+/// serialize to the same `\u001B` output. Consumers **MUST NOT** un-escape `\uXXXX`
 /// sequences back into bytes — doing so re-creates exactly the injection this guard
 /// exists to prevent. The escape is for display only; when a consumer needs the
 /// original bytes it must read the source through `span`/`fix_edits` byte offsets,
@@ -770,7 +786,7 @@ mod tests {
 
     /// T-4 [AC-F4, AC-C3]: `to_canonical_json()` sanitizes control chars in diagnostic
     /// message and help. Simulates a `unused-variable` diagnostic whose message embeds
-    /// a raw ESC byte (e.g. from a hostile frontmatter key like `"ab"`).
+    /// a raw ESC byte (e.g. from a hostile frontmatter key like `"a\u001Bb"`).
     ///
     /// After the fix: the JSON message AND help carry the sanitized `\uXXXX` literal
     /// (uppercase, exactly 4 digits).  Span offsets (raw byte positions) are unchanged.

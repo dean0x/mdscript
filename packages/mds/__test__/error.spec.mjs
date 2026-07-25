@@ -92,7 +92,7 @@ describe('error shape', () => {
   // `@include fo<ESC>o` — alias contains a raw ESC byte (U+001B) mid-token so
   // trim() cannot strip it.  The parser rejects the alias as an invalid identifier
   // and produces a MdsError::Syntax whose message interpolates the raw alias.
-  // After the fix, err.message must carry the sanitized 6-char  literal and
+  // After the fix, err.message must carry the sanitized 6-char \u001B literal and
   // must contain no raw C0/DEL/C1 bytes.
   // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 chars in a string.
   // Uses charCodeAt (UTF-16 code units); all C0/DEL/C1 codepoints are in BMP so
@@ -134,7 +134,7 @@ describe('error shape', () => {
       assert.ok(typeof msg === 'string' && msg.length > 0,
         'message must be a non-empty string');
       assertNoControlChars(msg, 'U-E10: err.message');
-      // Sanitized literal  must be present.
+      // Sanitized literal \u001B must be present.
       assert.ok(
         msg.includes('\\u001B'),
         `sanitized \\u001B literal must appear in err.message; got: ${JSON.stringify(msg)}`
@@ -217,6 +217,11 @@ describe('error shape', () => {
         assertNoControlChars(diag.message, `U-E13: diag[${diag.rule}].message`);
       }
     }
+    // Cheap invariant check only — NOT coverage of the `file`-key escape. The
+    // hostile RLO is in the *imported* module's name, but this key is the *entry*
+    // filename ("main.mds"), so no hostile byte reaches it and this cannot fail via
+    // this vector (PF-013). Real `file`-key coverage: mds-core
+    // `to_canonical_json_escapes_bidi_override`.
     for (const f of result.files) {
       assertNoControlChars(f.file, 'U-E13: files[].file');
     }

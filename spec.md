@@ -1053,7 +1053,7 @@ consumer that needs the original bytes must read them from the source file using
 raw `span` / `fix_edits` byte offsets, which are deliberately left unsanitized for
 precisely this purpose.
 
-##### `--fix --diff` / `--fix --check` preview output
+##### `--diff` preview output (`mds lint --fix --diff` and `mds fmt --diff`)
 
 Preview output is diff text, not a diagnostic field, and is governed separately: it
 is neutralized when stdout is a TTY (where control bytes would execute), and emitted

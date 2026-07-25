@@ -236,7 +236,7 @@ fn serialized_error_to_json_null_span() {
 
 /// T-1 [AC-F3]: serialize() sanitizes raw ESC (U+001B) in the message field.
 /// The message string must not contain the raw ESC byte; the sanitized 6-char
-/// literal `` must appear instead.
+/// literal `\u001B` must appear instead.
 #[test]
 fn serialize_sanitizes_esc_in_message() {
     // Build a Syntax error whose message embeds a raw ESC byte mid-string.

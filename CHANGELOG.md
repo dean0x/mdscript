@@ -120,7 +120,8 @@ field is present across all binding surfaces: CLI JSON output, napi
   the raw `span` / `fix_edits` byte offsets, which stay unsanitized for this
   purpose. Documented normatively in spec §7.5.
 
-- **`mds lint --fix --diff` / `--check` preview output is TTY-gated (#176).**
+- **`--diff` preview output is TTY-gated (#176).** Applies to both
+  `mds lint --fix --diff` and `mds fmt --diff`, which share one renderer.
   Preview diff text is neutralized when stdout is a terminal (where control bytes
   would execute) and emitted **byte-faithful when piped or redirected**, so a
   redirected diff remains applicable. Preview output is not part of the

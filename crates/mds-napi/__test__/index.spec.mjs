@@ -1251,7 +1251,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     // Mirrors Python E12 (test_e12_lint_virtual_esc_in_import_path_message_sanitized).
     // Verifies:
     //   (1) No raw C0/DEL/C1 bytes in any diagnostic message.
-    //   (2) Sanitized  literal IS present (positive evidence, non-vacuous).
+    //   (2) Sanitized \u001B literal IS present (positive evidence, non-vacuous).
     //   (3) Result shape: version 1, duplicate-import rule present.
     const esc = String.fromCharCode(0x1b);
     const moduleName = `fo${esc}o.mds`;
@@ -1279,7 +1279,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
       }
     }
 
-    // (2) At least one message carries the sanitized  literal (positive evidence).
+    // (2) At least one message carries the sanitized \u001B literal (positive evidence).
     const hasSanitizedEsc = allDiags.some(
       (d) =>
         typeof d.message === 'string' &&
@@ -1302,7 +1302,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
 
   test('E-12: error path — compile error message sanitized for DEL (U+007F) in alias', () => {
     // DEL (U+007F) in @include alias; parser rejects the invalid alias and embeds
-    // the raw bytes in the error message. After fix, serialize() sanitizes DEL to .
+    // the raw bytes in the error message. After fix, serialize() sanitizes DEL to \u007F.
     const del = String.fromCharCode(0x7f);
     const source = `@include fo${del}o\n`;
     try {
@@ -1380,7 +1380,11 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
         assertNoControlChars(diag.message, `E-14: diag[${diag.rule}].message`);
       }
     }
-    // File group keys travel the same boundary.
+    // Cheap invariant check only — NOT coverage of the `file`-key escape. The
+    // hostile RLO is in the *imported* module's name, but this key is the *entry*
+    // filename ("main.mds"), so no hostile byte reaches it and this cannot fail via
+    // this vector (PF-013). Real `file`-key coverage: mds-core
+    // `to_canonical_json_escapes_bidi_override`.
     for (const f of result.files) {
       assertNoControlChars(f.file, 'E-14: files[].file');
     }

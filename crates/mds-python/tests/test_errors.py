@@ -283,7 +283,11 @@ def test_e12_lint_virtual_ctrl_in_import_path_message_sanitized(
     files = result.files
     assert files, "expected at least one LintFileReport from lint_virtual"
 
-    # (d) LintFileReport.file must not carry raw control bytes (python-3 / python-5 anchor).
+    # (d) Cheap invariant check only -- NOT coverage of the ``file``-key escape. The
+    # hostile codepoint is in the *imported* module's name, but this key is the *entry*
+    # filename, so no hostile byte reaches it and this cannot fail via this vector
+    # (PF-013). Real ``file``-key coverage: ``test_par7_...``, which constructs a
+    # LintResult with ``"file": "fo\u202egnp.mds"`` directly.
     for fr in files:
         _assert_no_control_chars(fr.file, "LintFileReport.file")
 
