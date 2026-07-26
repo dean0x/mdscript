@@ -88,7 +88,9 @@
 //! for non-truncated results.
 
 use crate::error::MdsError;
-use crate::lint::diagnostic::{FixLineSpan, LintDiagnostic, LintResult, Severity};
+use crate::lint::diagnostic::{
+    sanitize_control_chars_wire, FixLineSpan, LintDiagnostic, LintResult, Severity,
+};
 
 // Tier classification lives in the leaf `tier` module to break the would-be
 // circular dependency (fix.rs → diagnostic.rs → fix.rs). Re-export here so
@@ -122,8 +124,37 @@ pub struct ByteEdit {
 pub struct RejectedEdit {
     /// The edit that was rejected.
     pub edit: ByteEdit,
-    /// Human-readable reason for rejection.
+    /// Human-readable reason for rejection. Sanitized at construction — see
+    /// [`FixOutcome::Rejected::reason`].
     pub reason: String,
+}
+
+/// Render a reverify failure into a single-line, display-safe rejection reason.
+///
+/// The single construction site for every rejection reason that embeds an
+/// [`MdsError`]. `MdsError`'s `Display` is deliberately raw (see its "Display contract"
+/// note): variants such as `syntax error: {message}`, `file not found: {path}` and
+/// `circular import detected: {cycle}` interpolate untrusted template and filesystem
+/// text verbatim. Interpolating that directly into `reason` would push raw control
+/// bytes into a field whose consumers print it on a status line.
+///
+/// WIRE mode (not HUMAN) is correct here for the same reason it is correct for a
+/// filename: the CLI prints this value as `fix rejected: {reason}` — one unframed,
+/// unindented status line. A raw `\n` in the reason would let a hostile template forge
+/// a second line indistinguishable from genuine status output (CWE-117). Every
+/// `MdsError` `Display` variant is single-line by construction, so escaping `\n` here
+/// discards nothing legitimate.
+///
+/// Sanitizing at construction rather than at each print site is deliberate: `reason` is
+/// a public field of a public enum in a published crate, so there is no bound on the
+/// number of print sites, and a per-site check is exactly the parallel-path pattern
+/// that lapses (PF-004).
+fn reverify_failure_reason(err: &MdsError) -> String {
+    format!(
+        "could not verify fix — the edited source did not re-parse cleanly ({}); \
+         leaving the file unchanged",
+        sanitize_control_chars_wire(&err.to_string())
+    )
 }
 
 /// A plan of fix edits for a single file's source.
@@ -172,9 +203,16 @@ pub enum FixOutcome {
     },
     /// The edit batch was rejected (overlap detected or reverify failed).
     Rejected {
-        /// The original (unchanged) source.
+        /// The original (unchanged) source. Raw — this is the file's bytes, not prose.
         source: String,
         /// Human-readable reason for rejection.
+        ///
+        /// **Display-safe by construction.** Every untrusted fragment interpolated into
+        /// this string (currently only an [`MdsError`]'s raw `Display`) is escaped with
+        /// WIRE-mode [`sanitize_control_chars_wire`][crate::sanitize_control_chars_wire]
+        /// before it is stored, so the value is always single-line and free of C0/DEL/C1
+        /// control bytes and bidi controls. Callers may print it directly on a status
+        /// line without further escaping. See `reverify_failure_reason`.
         reason: String,
     },
     /// No fixable edits were found in the lint result.
@@ -610,10 +648,7 @@ where
     match reverify(&fixed_source) {
         Err(err) => FixOutcome::Rejected {
             source: source.to_string(),
-            reason: format!(
-                "could not verify fix — the edited source did not re-parse cleanly \
-                 ({err}); leaving the file unchanged"
-            ),
+            reason: reverify_failure_reason(&err),
         },
         Ok(residual) => {
             // Count untargeted diagnostics in the residual, per rule.
@@ -777,10 +812,7 @@ where
 
         let reverify_result = reverify(&test_source);
         let reject_reason: Option<String> = match &reverify_result {
-            Err(err) => Some(format!(
-                "could not verify fix — the edited source did not re-parse cleanly \
-                 ({err}); leaving the file unchanged"
-            )),
+            Err(err) => Some(reverify_failure_reason(err)),
             Ok(residual) => {
                 // Use the full targeted_rules set (identical to the baseline) so the
                 // comparison is symmetric: other targeted-rule diagnostics that are
@@ -1595,6 +1627,115 @@ mod tests {
             !embedded.is_empty(),
             "A5 reason must contain a non-empty embedded error between the stable \
              prefix and suffix; got: {reason:?}"
+        );
+    }
+
+    // ── T-REASON: rejection reasons are display-safe by construction (#176) ──────
+    //
+    // `MdsError`'s `Display` is deliberately raw (see its "Display contract" note).
+    // Interpolating it into `reason` pushed unescaped control bytes into a field the
+    // CLI prints as an unframed status line: `fix rejected: {reason}`.
+
+    /// Build the hostile `MdsError` used by the T-REASON tests.
+    ///
+    /// `MdsError::Syntax` renders as `syntax error: {message}`, so the message text —
+    /// which in production comes from template source — lands verbatim in `Display`.
+    /// The vector carries one member of each escape sub-class: a C0 byte (ESC), a
+    /// 3-byte bidi control, the 2-byte bidi control that #176 added, and a newline.
+    fn hostile_reverify_error() -> MdsError {
+        MdsError::syntax(format!(
+            "unexpected token{}[2J at{}line{}mark{}Clean: real.mds",
+            '\u{1b}', '\u{202E}', '\u{061C}', '\n'
+        ))
+    }
+
+    /// T-REASON-1 [security-11 / CWE-117 / PF-013 / #176]: the reverify failure reason
+    /// produced by `apply_fixes` escapes the embedded `MdsError` Display.
+    #[test]
+    fn apply_fixes_rejection_reason_escapes_embedded_error_display() {
+        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
+        let diag = make_diag("duplicate-import", 23, "@import".len());
+        let result = make_result(vec![diag]);
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.edits.is_empty(),
+            "non-vacuity: the plan must have edits or apply_fixes never reverifies"
+        );
+
+        let outcome = apply_fixes(
+            source,
+            plan,
+            &result,
+            |_fixed| Err(hostile_reverify_error()),
+        );
+        let reason = match outcome {
+            FixOutcome::Rejected { reason, .. } => reason,
+            other => panic!("expected Rejected, got: {other:?}"),
+        };
+
+        assert_reason_is_display_safe(&reason);
+    }
+
+    /// T-REASON-2 [PF-004 / #176]: the per-edit fallback in `apply_fixes_incremental`
+    /// builds its reason through a *second* code path. It must be covered by the same
+    /// choke-point, or the guarantee holds on one path and lapses on its sibling.
+    #[test]
+    fn incremental_rejection_reason_escapes_embedded_error_display() {
+        let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
+        let diag = make_diag("duplicate-import", 23, "@import".len());
+        let result = make_result(vec![diag]);
+        let plan = plan_fixes(&result, source);
+        assert!(
+            !plan.edits.is_empty(),
+            "non-vacuity: the plan must have edits or the fallback never runs"
+        );
+
+        let outcome =
+            apply_fixes_incremental(
+                source,
+                plan,
+                &result,
+                |_fixed| Err(hostile_reverify_error()),
+            );
+        let reason = match outcome {
+            FixOutcome::Rejected { reason, .. } => reason,
+            other => panic!("expected Rejected, got: {other:?}"),
+        };
+
+        assert_reason_is_display_safe(&reason);
+    }
+
+    /// Shared assertions for T-REASON-1/2: negative, positive, and non-vacuity.
+    fn assert_reason_is_display_safe(reason: &str) {
+        // Non-vacuity: the real error text actually reached the reason, so the escape
+        // assertions cannot pass by the error being dropped instead of sanitized.
+        assert!(
+            reason.contains("syntax error") && reason.contains("unexpected token"),
+            "non-vacuity: the embedded error text must be present; got: {reason:?}"
+        );
+        // Negative: no raw hostile codepoint survives.
+        for raw in ['\u{1b}', '\u{202E}', '\u{061C}', '\n'] {
+            assert!(
+                !reason.contains(raw),
+                "raw U+{:04X} must not appear in a rejection reason; got: {reason:?}",
+                raw as u32
+            );
+        }
+        // Positive: each is present in its escaped form. The literals are UPPERCASE
+        // while the hex in the source vector is lowercase, which proves the byte really
+        // decoded and was really escaped rather than passing through as literal text.
+        for escaped in ["\\u001B", "\\u202E", "\\u061C", "\\u000A"] {
+            assert!(
+                reason.contains(escaped),
+                "{escaped} must appear in the rejection reason; got: {reason:?}"
+            );
+        }
+        // The reason is printed as one unframed status line: it must be single-line, or
+        // a hostile template can forge output indistinguishable from genuine status.
+        assert_eq!(
+            reason.lines().count(),
+            1,
+            "a rejection reason must be single-line; got: {reason:?}"
         );
     }
 

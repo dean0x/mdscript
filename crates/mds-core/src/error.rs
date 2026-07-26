@@ -3,9 +3,7 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
-use crate::lint::{
-    neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire,
-};
+use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
 
 // ── Serializable error types ──────────────────────────────────────────────────
 
@@ -123,17 +121,12 @@ fn at(
         return (Some(SourceSpan::new(offset.into(), len)), None);
     }
 
-    // Neutralize source with byte-length-preserving substitution so miette's span
-    // byte-offsets remain valid after sanitization (PF-014).  Sanitize the filename
-    // with \uXXXX escapes — it is prose, not span-indexed.
-    let clean_source = neutralize_source_for_render(source);
-    let clean_file = sanitize_control_chars(file);
+    // `named_source_for_render` applies the per-half sanitization: byte-length-preserving
+    // neutralization for the span-indexed source (PF-014), WIRE-mode \uXXXX escaping for
+    // the single-line filename (a newline-bearing filename must not forge a line).
     (
         Some(SourceSpan::new(offset.into(), len)),
-        Some(Arc::new(miette::NamedSource::new(
-            clean_file.as_ref(),
-            clean_source.into_owned(),
-        ))),
+        Some(Arc::new(named_source_for_render(file, source))),
     )
 }
 

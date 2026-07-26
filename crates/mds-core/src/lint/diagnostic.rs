@@ -6,9 +6,10 @@
 //!
 //! **Sanitization discipline**: `message` and `help` are sanitized at every output
 //! boundary. The escaped class is C0 except `\n`/`\t`, DEL (U+007F), C1
-//! (U+0080–U+009F), the Unicode bidi controls (U+200E/U+200F, U+202A–U+202E,
-//! U+2066–U+2069 — Trojan Source, CVE-2021-42574), the JS line/paragraph separators
-//! U+2028/U+2029, and U+FEFF; each becomes an uppercase 6-char `\uXXXX` literal.
+//! (U+0080–U+009F), the complete Unicode `Bidi_Control=Yes` set — all twelve of
+//! U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069 (Trojan Source,
+//! CVE-2021-42574) — the JS line/paragraph separators U+2028/U+2029, and U+FEFF;
+//! each becomes an uppercase 6-char `\uXXXX` literal.
 //!
 //! Two escape modes share one implementation, differing only on `\n`:
 //!
@@ -18,21 +19,43 @@
 //!   message cannot forge an extra line in a line-oriented consumer of the value
 //!   (log forging, YAML key injection).
 //!
-//! `\t` is preserved in both modes. The boundary set below is closed: every terminal
-//! and wire path that carries untrusted text is covered.
+//! `\t` is preserved in both modes.
+//!
+//! **Mode is chosen per FIELD, not per surface.** *Prose* (message, help, warning text,
+//! label text) is HUMAN on terminal surfaces so multi-line frames render. A *filename*
+//! is WIRE on every surface including terminal ones: it is always displayed on a single
+//! line — a status line, or a `[file:line:col]` frame header — and POSIX permits a
+//! newline inside a filename, so HUMAN mode there lets a discovered file forge a whole
+//! status line byte-identical in form to genuine output (CWE-117).
+//!
+//! ## Boundary table
+//!
+//! This table is an audit list: every in-tree site that hands untrusted text to a
+//! terminal or a wire format appears here.
 //!
 //! | Boundary | Mode | Fields |
 //! |----------|------|--------|
-//! | `eprint_error` (mds-cli/src/output.rs) | HUMAN | `message`, `help`, and `LabeledSpan` text of **every** report rendered to stderr — see "CLI terminal path" below |
-//! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help`/filename via `sanitize_control_chars`; source excerpts via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
-//! | `MdsError::at()` (error.rs) | HUMAN | filename; source via `neutralize_source_for_render` |
-//! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr |
-//! | `safe_path()` (mds-cli/src/output.rs) | HUMAN | CLI status-line path display |
+//! | `eprint_error` (mds-cli/src/output.rs) | HUMAN | `message`, `help`, `LabeledSpan` text, and the whole auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_source`) of **every** report rendered to stderr — see "CLI terminal path" below |
+//! | `eprint_warning` (mds-cli/src/output.rs) | HUMAN | every CLI warning string printed to stderr — the `*_collecting_warnings` paths in `main.rs`/`build.rs` plus the unknown-`mds.json`-rule warning in `lint.rs` |
+//! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr on the non-collecting paths |
+//! | `named_source_for_render()` (this module) | **per field** | the single `NamedSource` builder used by `MdsError::at()` (error.rs), `check_equivalence` (formatter.rs) and `render_diag_human` (mds-cli/src/lint.rs): filename WIRE, source via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
+//! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help` (its filename and source go through `named_source_for_render`) |
+//! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
+//! | `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time: the `MdsError` `Display` embedded in a reverify-failure reason, so the value is display-safe for every consumer of the published `mds::fix` API (PF-004) |
 //! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
 //! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key |
 //! | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings; *distinct method from `LintResult::to_canonical_json`, not a duplicate* |
 //! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
-//! | `--diff` / `--check` preview output (mds-cli/src/output.rs) | HUMAN, TTY-gated | neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable |
+//! | `--diff` preview output (mds-cli/src/output.rs) | neutralized, TTY-gated | source excerpts neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable. **`--check` alone emits no preview text** — only status lines, which are unconditionally sanitized via `safe_path`. |
+//!
+//! **Scope of the table.** It covers every path that carries *untrusted text* —
+//! diagnostic prose, warnings, filenames, and rejection reasons. One category of CLI
+//! output is deliberately **not** covered and is not claimed to be: `watch.rs`'s own
+//! lifecycle status lines (`Watching {}`, `Removed {} (source deleted)`,
+//! `warning: could not remove {}: {e}`) print `Path::display()` and `io::Error` through
+//! a bare `eprintln!` rather than [`sanitize_control_chars`] or `safe_path`. Those are
+//! pre-existing and outside #176's diff; they are a real gap, tracked separately. Do not
+//! read the table as covering them.
 //!
 //! **CLI terminal path.** `mds build` / `check` / `fmt` / `lint` / `watch` all render
 //! errors through the single `eprint_error` choke-point, which wraps the `miette::Report`
@@ -54,12 +77,14 @@
 //!
 //! **Deliberate exclusions** (documented, not gaps):
 //! - `LintDiagnostic::fmt` and `MdsError`'s derived `Display` (raw) — unsanitized by
-//!   design so machine-readable pipelines see exact bytes. In-tree terminal output never
-//!   uses them directly; it goes through `eprint_error`. Downstream Rust consumers of the
-//!   published crate that print an `MdsError` themselves should use
-//!   [`MdsError::display_sanitized`], which applies this module's HUMAN mode to the
-//!   `Display` string. That helper is a **consumer-facing API, not a CLI boundary** — the
-//!   CLI's own guarantee comes from `eprint_error`.
+//!   design so machine-readable pipelines see exact bytes. No in-tree path renders
+//!   either one to a terminal *unescaped*: diagnostics go through `eprint_error`, and
+//!   the one place that embeds an `MdsError` `Display` into another user-visible string
+//!   — `fix::FixOutcome::Rejected.reason` — escapes it at construction (see the table).
+//!   Downstream Rust consumers of the published crate that print an `MdsError`
+//!   themselves should use [`MdsError::display_sanitized`], which applies this module's
+//!   HUMAN mode to the `Display` string. That helper is a **consumer-facing API, not a
+//!   CLI boundary** — the CLI's own guarantee comes from `eprint_error`.
 //! - napi `err.detail` — populated only under the `debug-panics` Cargo feature,
 //!   which CLAUDE.md forbids shipping
 //!
@@ -548,6 +573,10 @@ enum EscapeMode {
 /// // Bidi override (U+202E RLO — Trojan Source) is escaped.
 /// assert_eq!(&*sanitize_control_chars("a\u{202E}b"), "a\\u202Eb");
 ///
+/// // So is U+061C ARABIC LETTER MARK — the one Bidi_Control codepoint outside
+/// // U+200E–U+2069, and the only 2-byte member of the class.
+/// assert_eq!(&*sanitize_control_chars("a\u{061C}b"), "a\\u061Cb");
+///
 /// // JS line separator (U+2028) and BOM (U+FEFF) are escaped.
 /// assert_eq!(&*sanitize_control_chars("a\u{2028}b"), "a\\u2028b");
 /// assert_eq!(&*sanitize_control_chars("a\u{FEFF}b"), "a\\uFEFFb");
@@ -616,14 +645,15 @@ fn sanitize_with(s: &str, mode: EscapeMode) -> Cow<'_, str> {
     // Byte-level fast path: scan for any byte that can start an escaped character.
     // - C0 (U+0000–U+001F) and DEL (U+007F) are single bytes: b < 0x20 or b == 0x7F.
     // - C1 (U+0080–U+009F) in UTF-8 is encoded as 0xC2 0x80–0xC2 0x9F.
+    // - U+061C is encoded as 0xD8 0x9C.
     // - U+200E/U+200F, U+2028/U+2029, U+202A–U+202E and U+2066–U+2069 all start
     //   with 0xE2; U+FEFF starts with 0xEF.
-    // The scan is a deliberate over-approximation (0xC2/0xE2/0xEF also lead many
+    // The scan is a deliberate over-approximation (0xC2/0xD8/0xE2/0xEF also lead many
     // benign codepoints); false positives only cost a trip through the char loop
     // below, which leaves non-hostile characters unchanged.
     let needs_work = s
         .bytes()
-        .any(|b| b < 0x20 || b == 0x7F || b == 0xC2 || b == 0xE2 || b == 0xEF);
+        .any(|b| b < 0x20 || b == 0x7F || b == 0xC2 || b == 0xD8 || b == 0xE2 || b == 0xEF);
     if !needs_work {
         return Cow::Borrowed(s);
     }
@@ -669,20 +699,51 @@ fn is_control_char(ch: char) -> bool {
 
 /// Returns `true` for the non-C0/C1 codepoints that are still display-hazardous.
 ///
-/// - **U+200E/U+200F, U+202A–U+202E, U+2066–U+2069** — the Unicode bidirectional
-///   controls (marks, embeddings, overrides, isolates). They reorder how the rest of
-///   a line renders, which is the Trojan Source attack (CVE-2021-42574): a diagnostic
-///   or filename can be made to display as something entirely different from its bytes.
+/// The class is split by **UTF-8 byte width**, not by hazard category, because
+/// [`neutralize_source_for_render`] must substitute a replacement of identical byte
+/// length and therefore needs a different replacement per width. Splitting the
+/// predicate is what keeps that invariant checkable by reading the code rather than
+/// by trusting a comment: a member added to the wrong helper is a byte-width bug the
+/// `debug_assert_eq!` in `neutralize_source_for_render` catches immediately.
+///
+/// See [`is_two_byte_format_hazard`] and [`is_three_byte_format_hazard`] for the
+/// per-width membership and the rationale for each codepoint.
+#[inline]
+fn is_format_hazard_char(ch: char) -> bool {
+    is_two_byte_format_hazard(ch) || is_three_byte_format_hazard(ch)
+}
+
+/// Display-hazardous codepoints that occupy **2 bytes** in UTF-8 (U+0080–U+07FF).
+///
+/// - **U+061C** — ARABIC LETTER MARK. One of the twelve codepoints with the Unicode
+///   `Bidi_Control=Yes` property, and the only one outside the U+200E–U+2069 range.
+///   It reorders how the rest of a line renders exactly like its U+200E/U+200F
+///   siblings (Trojan Source, CVE-2021-42574), so omitting it would leave a hole in
+///   the bidi class that the other eleven members close.
+///
+/// Members here are neutralized to U+00A0 NBSP (also 2 bytes), the same replacement
+/// the C1 range uses — **not** U+FFFD, which is 3 bytes and would break the
+/// byte-length invariant.
+#[inline]
+fn is_two_byte_format_hazard(ch: char) -> bool {
+    ch == '\u{061C}'
+}
+
+/// Display-hazardous codepoints that occupy **3 bytes** in UTF-8 (U+0800–U+FFFF).
+///
+/// - **U+200E/U+200F, U+202A–U+202E, U+2066–U+2069** — the remaining eleven Unicode
+///   bidirectional controls (marks, embeddings, overrides, isolates). They reorder how
+///   the rest of a line renders, which is the Trojan Source attack (CVE-2021-42574): a
+///   diagnostic or filename can be made to display as something entirely different from
+///   its bytes.
 /// - **U+2028/U+2029** — LINE SEPARATOR / PARAGRAPH SEPARATOR. Both terminate a
 ///   JavaScript string literal, so an unescaped one can break out of generated JS.
 /// - **U+FEFF** — BOM / ZERO WIDTH NO-BREAK SPACE. Invisible in every renderer, so it
 ///   can hide or split content the reader believes is contiguous.
 ///
-/// Every codepoint here is in U+0800–U+FFFF, i.e. exactly 3 bytes in UTF-8 — which is
-/// what lets [`neutralize_source_for_render`] substitute U+FFFD (also 3 bytes) without
-/// breaking its byte-length invariant.
+/// Members here are neutralized to U+FFFD (also 3 bytes).
 #[inline]
-fn is_format_hazard_char(ch: char) -> bool {
+fn is_three_byte_format_hazard(ch: char) -> bool {
     matches!(ch,
         '\u{200E}' | '\u{200F}'
         | '\u{2028}' | '\u{2029}'
@@ -708,8 +769,8 @@ fn is_format_hazard_char(ch: char) -> bool {
 /// Substitution rules (byte-length-preserving):
 /// - C0 bytes (U+0000–U+001F) except `\n`/`\t`: 1-byte → `?` (U+003F, 1 byte)
 /// - DEL (U+007F): 1-byte → `?`
-/// - C1 range (U+0080–U+009F, 2-byte UTF-8): 2-byte → U+00A0 NBSP (2 bytes)
-/// - Bidi controls, U+2028/U+2029, U+FEFF (3-byte UTF-8): → U+FFFD (3 bytes)
+/// - C1 range (U+0080–U+009F) and U+061C (both 2-byte UTF-8): → U+00A0 NBSP (2 bytes)
+/// - Remaining bidi controls, U+2028/U+2029, U+FEFF (3-byte UTF-8): → U+FFFD (3 bytes)
 ///
 /// Returns [`Cow::Borrowed`] when no substitution is needed (fast path).
 pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
@@ -723,9 +784,10 @@ pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
         let u = c as u32;
         if (u < 0x20 && c != '\n' && c != '\t') || u == 0x7F {
             out.push('?'); // 1-byte C0/DEL → '?' (1 byte) — byte-length-preserving
-        } else if (0x80..=0x9F).contains(&u) {
-            out.push('\u{00A0}'); // 2-byte C1 → U+00A0 NBSP (2 bytes) — byte-length-preserving
-        } else if is_format_hazard_char(c) {
+        } else if (0x80..=0x9F).contains(&u) || is_two_byte_format_hazard(c) {
+            // 2-byte C1 / U+061C → U+00A0 NBSP (2 bytes) — byte-length-preserving.
+            out.push('\u{00A0}');
+        } else if is_three_byte_format_hazard(c) {
             // 3-byte bidi/separator/BOM → U+FFFD (3 bytes) — byte-length-preserving.
             out.push('\u{FFFD}');
         } else {
@@ -738,6 +800,36 @@ pub fn neutralize_source_for_render(s: &str) -> Cow<'_, str> {
         "neutralize_source_for_render must preserve byte length"
     );
     Cow::Owned(out)
+}
+
+/// Build the [`miette::NamedSource`] for a diagnostic frame, applying the sanitization
+/// each of its two halves requires.
+///
+/// The two halves need **different** treatments, and getting them the wrong way round
+/// is a real defect in both directions — which is why every in-tree site that hands a
+/// filename plus source text to miette goes through this one function instead of
+/// open-coding the pair (avoids PF-004 parallel-path drift):
+///
+/// - **`file`** — [`sanitize_control_chars_wire`] (WIRE). A filename is prose that is
+///   rendered on a single line, both in miette's `[file:line:col]` frame header and in
+///   the CLI's own status lines. POSIX permits `\n` inside a filename, so HUMAN mode —
+///   which preserves `\n` so multi-line diagnostic *messages* stay readable — would let
+///   a file named `evil.mds\nClean: real.mds` emit an attacker-authored line that is
+///   byte-identical in form to genuine status output (CWE-117 log forging). A filename
+///   is never legitimately multi-line, so escaping `\n` costs nothing.
+/// - **`source`** — [`neutralize_source_for_render`] (byte-length-preserving). The
+///   source text is span-indexed: `sanitize_control_chars*` expands a 1–2-byte control
+///   to a 6-byte `\uXXXX` literal and desynchronises every following span offset and
+///   caret column (PF-014).
+///
+/// Both halves are sanitized *before* the `Report` is built. The rendered frame is
+/// never post-processed — see the module-level "Sanitization discipline" note.
+#[must_use]
+pub fn named_source_for_render(file: &str, source: &str) -> miette::NamedSource<String> {
+    miette::NamedSource::new(
+        sanitize_control_chars_wire(file).as_ref(),
+        neutralize_source_for_render(source).into_owned(),
+    )
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -899,43 +991,107 @@ mod tests {
     // ── T-16: widened escape class — bidi / separator / BOM (issue #176) ─────
     //
     // These codepoints are outside C0/DEL/C1 but are still display-hazardous:
-    //  - U+200E/U+200F and U+202A–U+202E and U+2066–U+2069 are the Unicode bidi
-    //    controls behind Trojan Source (CVE-2021-42574): they can visually reorder
-    //    a diagnostic so a benign-looking line renders as something else entirely.
+    //  - The twelve Unicode `Bidi_Control=Yes` codepoints — U+061C, U+200E/U+200F,
+    //    U+202A–U+202E and U+2066–U+2069 — are the controls behind Trojan Source
+    //    (CVE-2021-42574): they can visually reorder a diagnostic so a benign-looking
+    //    line renders as something else entirely.
     //  - U+2028/U+2029 terminate a JavaScript string literal, so an unescaped one
     //    inside a diagnostic message can break out of generated JS.
     //  - U+FEFF (BOM / ZWNBSP) is invisible and can hide content in any consumer.
 
+    /// The complete Unicode `Bidi_Control=Yes` set (12 codepoints) with the escaped
+    /// literal each must produce. Shared by the escape and neutralize tests so the two
+    /// paths are pinned against one list and cannot diverge on a member.
+    const BIDI_CONTROLS: &[(char, &str)] = &[
+        ('\u{061C}', "\\u061C"), // ARABIC LETTER MARK (2 bytes in UTF-8)
+        ('\u{200E}', "\\u200E"), // LEFT-TO-RIGHT MARK
+        ('\u{200F}', "\\u200F"), // RIGHT-TO-LEFT MARK
+        ('\u{202A}', "\\u202A"), // LEFT-TO-RIGHT EMBEDDING
+        ('\u{202B}', "\\u202B"), // RIGHT-TO-LEFT EMBEDDING
+        ('\u{202C}', "\\u202C"), // POP DIRECTIONAL FORMATTING
+        ('\u{202D}', "\\u202D"), // LEFT-TO-RIGHT OVERRIDE
+        ('\u{202E}', "\\u202E"), // RIGHT-TO-LEFT OVERRIDE (Trojan Source)
+        ('\u{2066}', "\\u2066"), // LEFT-TO-RIGHT ISOLATE
+        ('\u{2067}', "\\u2067"), // RIGHT-TO-LEFT ISOLATE
+        ('\u{2068}', "\\u2068"), // FIRST STRONG ISOLATE
+        ('\u{2069}', "\\u2069"), // POP DIRECTIONAL ISOLATE
+    ];
+
     /// T-16a: every bidi override / isolate / mark codepoint is escaped to its
     /// uppercase 6-char `\uXXXX` literal, and the raw codepoint is gone.
+    ///
+    /// Covers the whole `Bidi_Control=Yes` property, including U+061C — the only member
+    /// outside U+200E–U+2069, and the one the class originally missed (#176).
     #[test]
     fn sanitize_escapes_bidi_control_chars() {
-        let cases: &[(char, &str)] = &[
-            ('\u{200E}', "\\u200E"), // LEFT-TO-RIGHT MARK
-            ('\u{200F}', "\\u200F"), // RIGHT-TO-LEFT MARK
-            ('\u{202A}', "\\u202A"), // LEFT-TO-RIGHT EMBEDDING
-            ('\u{202B}', "\\u202B"), // RIGHT-TO-LEFT EMBEDDING
-            ('\u{202C}', "\\u202C"), // POP DIRECTIONAL FORMATTING
-            ('\u{202D}', "\\u202D"), // LEFT-TO-RIGHT OVERRIDE
-            ('\u{202E}', "\\u202E"), // RIGHT-TO-LEFT OVERRIDE (Trojan Source)
-            ('\u{2066}', "\\u2066"), // LEFT-TO-RIGHT ISOLATE
-            ('\u{2067}', "\\u2067"), // RIGHT-TO-LEFT ISOLATE
-            ('\u{2068}', "\\u2068"), // FIRST STRONG ISOLATE
-            ('\u{2069}', "\\u2069"), // POP DIRECTIONAL ISOLATE
-        ];
-        for &(ch, expected) in cases {
-            let input = format!("a{ch}b");
-            let out = sanitize_control_chars(&input);
+        // Non-vacuity: the table really is the complete Unicode property, not a subset
+        // that happens to match whatever the implementation covers.
+        assert_eq!(
+            BIDI_CONTROLS.len(),
+            12,
+            "Unicode defines exactly 12 Bidi_Control=Yes codepoints"
+        );
+        for &(ch, expected) in BIDI_CONTROLS {
+            for out in [
+                sanitize_control_chars(&format!("a{ch}b")),
+                sanitize_control_chars_wire(&format!("a{ch}b")),
+            ] {
+                assert!(
+                    !out.contains(ch),
+                    "raw U+{:04X} must not survive sanitization; got: {out:?}",
+                    ch as u32
+                );
+                assert_eq!(
+                    &*out,
+                    format!("a{expected}b"),
+                    "U+{:04X} must escape to {expected}",
+                    ch as u32
+                );
+            }
+        }
+    }
+
+    /// T-16a-WIDTH [#176]: `neutralize_source_for_render` preserves byte length for
+    /// every bidi control — the invariant the widened class most easily breaks.
+    ///
+    /// U+061C is 2 bytes in UTF-8 while the other eleven are 3. Routing it through the
+    /// 3-byte branch (→ U+FFFD) would grow the string by one byte per occurrence,
+    /// desynchronising every following span offset. The `debug_assert_eq!` inside
+    /// `neutralize_source_for_render` fires on that; this test pins it from outside so
+    /// the guarantee is also checked as an observable output property.
+    #[test]
+    fn neutralize_preserves_byte_length_for_every_bidi_control() {
+        for &(ch, _) in BIDI_CONTROLS {
+            let raw = format!("let x{ch} = 1;");
+            let out = neutralize_source_for_render(&raw);
+            assert_eq!(
+                out.len(),
+                raw.len(),
+                "U+{:04X} ({} bytes) must be replaced by a same-width substitute; got: {out:?}",
+                ch as u32,
+                ch.len_utf8()
+            );
             assert!(
                 !out.contains(ch),
-                "raw U+{:04X} must not survive sanitization; got: {out:?}",
+                "raw U+{:04X} must not survive neutralization; got: {out:?}",
                 ch as u32
             );
-            assert_eq!(
-                &*out,
-                format!("a{expected}b"),
-                "U+{:04X} must escape to {expected}",
-                ch as u32
+            // Positive: the width-appropriate replacement, not merely "something else".
+            let expected = if ch.len_utf8() == 2 {
+                '\u{00A0}'
+            } else {
+                '\u{FFFD}'
+            };
+            assert!(
+                out.contains(expected),
+                "U+{:04X} must neutralize to U+{:04X}; got: {out:?}",
+                ch as u32,
+                expected as u32
+            );
+            // Non-vacuity: the surrounding source is untouched.
+            assert!(
+                out.contains("let x") && out.contains(" = 1;"),
+                "non-vacuity: surrounding source must survive; got: {out:?}"
             );
         }
     }
@@ -982,6 +1138,105 @@ mod tests {
         // Non-vacuity: surrounding source text is untouched.
         assert!(out.contains("let x"), "clean source must survive: {out:?}");
         assert!(out.contains("next"), "clean source must survive: {out:?}");
+    }
+
+    // ── T-NS: named_source_for_render — the shared filename/source boundary (#176) ──
+
+    /// T-NS-1 [S14 / CWE-117 / PF-013]: a newline-bearing FILENAME is escaped, so it
+    /// cannot forge an extra line in miette's `[file:line:col]` frame header.
+    ///
+    /// Vector: POSIX permits `\n` inside a filename, and the user never types the name —
+    /// `mds lint .` discovers it by directory walk. HUMAN mode (which the filename used
+    /// to get) preserves newlines by design, so the forged text survived verbatim.
+    #[test]
+    fn named_source_escapes_newline_in_filename() {
+        let hostile = "evil.mds\nClean: real.mds";
+        let ns = named_source_for_render(hostile, "body\n");
+
+        // Non-vacuity: the real part of the filename is still there.
+        assert!(
+            ns.name().contains("evil.mds"),
+            "non-vacuity: the filename must still render; got: {:?}",
+            ns.name()
+        );
+        // Negative: no raw newline survives, so no second line can be forged.
+        assert!(
+            !ns.name().contains('\n'),
+            "a filename must be single-line after sanitization; got: {:?}",
+            ns.name()
+        );
+        // Positive: escaped to the uppercase 6-char literal (WIRE mode).
+        assert!(
+            ns.name().contains("\\u000A"),
+            "the newline must be escaped to its \\u000A literal; got: {:?}",
+            ns.name()
+        );
+    }
+
+    /// T-NS-2 [#176]: the same helper escapes the widened hazard class in the filename,
+    /// including U+061C, and still escapes ESC.
+    #[test]
+    fn named_source_escapes_hazard_class_in_filename() {
+        let ns = named_source_for_render("a\u{1b}b\u{061C}c\u{202E}d.mds", "body\n");
+        for (raw, escaped) in [
+            ('\u{1b}', "\\u001B"),
+            ('\u{061C}', "\\u061C"),
+            ('\u{202E}', "\\u202E"),
+        ] {
+            assert!(
+                !ns.name().contains(raw),
+                "raw U+{:04X} must not survive in a filename; got: {:?}",
+                raw as u32,
+                ns.name()
+            );
+            assert!(
+                ns.name().contains(escaped),
+                "U+{:04X} must escape to {escaped}; got: {:?}",
+                raw as u32,
+                ns.name()
+            );
+        }
+    }
+
+    /// T-NS-3 [PF-014 / T-10a]: the SOURCE half is neutralized, never escaped — the
+    /// distinction the whole helper exists to keep straight.
+    ///
+    /// If source text went through `sanitize_control_chars*` instead, each 1-byte
+    /// control would become a 6-byte literal and every following span offset would be
+    /// wrong. This asserts byte length is preserved and that no `\uXXXX` literal (the
+    /// signature of the wrong function) appears.
+    #[test]
+    fn named_source_neutralizes_source_without_changing_byte_length() {
+        let src = "let x\u{1b} = 1;\u{061C}\n";
+        let ns = named_source_for_render("clean.mds", src);
+        let rendered = {
+            use miette::SourceCode as _;
+            let contents = ns
+                .read_span(&(0..src.len()).into(), 0, 0)
+                .expect("span must be readable");
+            String::from_utf8(contents.data().to_vec()).expect("neutralized source stays UTF-8")
+        };
+        assert_eq!(
+            rendered.len(),
+            src.len(),
+            "source neutralization must preserve byte length; got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("\\u001B"),
+            "source must be NEUTRALIZED, not escaped — a \\uXXXX literal means the \
+             wrong function was used and every following span offset is now wrong; \
+             got: {rendered:?}"
+        );
+        // Positive: the width-appropriate substitutes are present.
+        assert!(
+            rendered.contains('?') && rendered.contains('\u{00A0}'),
+            "1-byte ESC must become '?' and 2-byte U+061C must become NBSP; got: {rendered:?}"
+        );
+        // Non-vacuity: surrounding source survives.
+        assert!(
+            rendered.contains("let x"),
+            "non-vacuity: clean source must survive; got: {rendered:?}"
+        );
     }
 
     /// T-16e [PF-013]: the RLO reversal vector reaches the wire through
