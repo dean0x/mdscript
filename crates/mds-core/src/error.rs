@@ -917,8 +917,8 @@ impl MdsError {
     /// Return a terminal-safe, sanitized version of this error's `Display` text.
     ///
     /// All C0 control characters (except `\t` and `\n`), DEL (U+007F), C1 control
-    /// characters (U+0080–U+009F), the Unicode bidi controls (U+200E/U+200F,
-    /// U+202A–U+202E, U+2066–U+2069), U+2028/U+2029, and U+FEFF are replaced by their
+    /// characters (U+0080–U+009F), all twelve Unicode bidi controls (U+061C,
+    /// U+200E/U+200F, U+202A–U+202E, U+2066–U+2069), U+2028/U+2029, and U+FEFF are replaced by their
     /// six-character `\uXXXX` escape literals.  `\t` and `\n` are preserved so that
     /// multi-line miette renders remain readable — this is the one deliberate
     /// difference from [`MdsError::serialize`], which is a machine-readable (wire)

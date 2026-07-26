@@ -1017,14 +1017,14 @@ serialization. `\t` is the only character in the class that is preserved.
 | Field | Invariant |
 |-------|-----------|
 | `message`, `help` | Every codepoint in the escaped class above is replaced with its six-character `\uXXXX` literal before serialization. |
-| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into the JSON output. A filename is escaped with the **full** class including `\n` on *every* surface, human included — it is always rendered on a single line (a status line, or a `[file:line:col]` frame header), and POSIX permits a newline inside a filename. |
+| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into the JSON output. A filename occupying a `file` **field** — this JSON key, a CLI status line, or a `[file:line:col]` frame header — is escaped with the **full** class including `\n` on every surface, human included, because it is always rendered on a single line and POSIX permits a newline inside a filename. A path interpolated into a diagnostic *message body* is prose, not a `file` field, and is governed by the message row instead; see "Residual" below. |
 | `rule` | Fixed ASCII identifier; never contains control bytes by construction. Not sanitized. |
 | `span`, `fix_edits` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
 
 This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
-All five surfaces emit byte-identical values.
+All four surfaces emit byte-identical values.
 
 ##### Mode is chosen per field, not per surface
 
@@ -1053,9 +1053,10 @@ Applied, that means:
 | Value | Mode | Because |
 |-------|------|---------|
 | `message`, `help`, warning bodies, `LabeledSpan` text | HUMAN on terminal surfaces, WIRE on the JSON wire | Prose; legitimately multi-line in a rendered frame |
-| `file` / any filename or path, including CLI status lines and `[file:line:col]` frame headers | WIRE everywhere | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
-| `mds.json` rule names and config values, `--format` arguments | WIRE everywhere | Single-line identifiers read from the working tree or the command line |
-| `io::Error` / `MdsError` causes interpolated into a status or warning line | WIRE everywhere | Single-line, and they embed paths of their own |
+| A filename or path in a `file` **field**: the JSON `file` key, a CLI status line, a `[file:line:col]` frame header | WIRE on every surface | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
+| `mds.json` rule names and config values, `--format` arguments | WIRE on every surface | Single-line identifiers read from the working tree or the command line |
+| `io::Error` / `MdsError` causes interpolated into a CLI status or warning line | WIRE on every surface | Single-line, and they embed paths of their own |
+| A path, identifier or cause interpolated into a diagnostic **message body** | HUMAN on terminal surfaces, WIRE on the JSON wire | Follows the message row above — it is part of prose. This is the **residual** below: it is not covered by the WIRE rows |
 | Compiled template output (`mds build -o -`) | not escaped | It is the command's product, not a diagnostic; redirects must stay byte-faithful |
 
 Source excerpts embedded in a rendered diagnostic frame are neutralized
@@ -1068,6 +1069,35 @@ stderr — compiler errors and CLI-authored errors alike — has its message, he
 caret-label text escaped **before** the diagnostic renderer runs. The rendered frame is
 never post-processed, so the renderer's own terminal styling is left intact and caret
 columns stay aligned.
+
+##### Residual: paths and identifiers inside a message body
+
+The rule above is per field, and a value interpolated into a diagnostic **message body**
+is part of that body. It is therefore escaped in HUMAN mode on terminal surfaces, which
+preserves `\n`. Two construction sites produce such messages:
+
+- **CLI `miette::miette!()` messages**, which interpolate `mds.json` values and
+  filesystem paths.
+- **`mds-core` `MdsError` message bodies**, which interpolate paths and `io::Error`
+  causes (`cannot read {path}: {e}`, `invalid UTF-8 in {path}: {e}` in
+  `crates/mds-core/src/fs.rs`) and template identifiers (`invalid import alias:
+  '{alias}'` in `parser_helpers.rs`).
+
+Both are **known residuals, not closed boundaries**, and they are the same defect at two
+different construction sites. A hostile path or identifier containing `\n` survives into
+the rendered frame and occupies a line of its own there.
+
+The residual is a *weaker* surface than a status line, and deliberately so: everything
+inside a rendered frame is indented and `│`-prefixed by the renderer, and that prefix
+survives `strip()`, so forged frame content cannot masquerade as a bare CLI status line
+the way an unescaped filename in a `Clean: …` line could. No raw control byte reaches
+the terminal from either path — HUMAN mode still escapes the whole class except `\n`.
+
+Closing it would mean WIRE-escaping every untrusted interpolation at every `MdsError`
+and `miette!()` construction site — over a hundred in `mds-core` alone — and changing
+the public `MdsError` message text seen by all three binding layers. That is a larger,
+separately-specified change; until it is made, this section is the disclosure, not a
+gap someone forgot.
 
 ##### Escaping is one-way
 

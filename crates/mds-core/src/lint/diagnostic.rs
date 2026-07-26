@@ -5,11 +5,17 @@
 //! maps our `Severity` enum to miette's rendering tiers (Error/Warning/Advice).
 //!
 //! **Sanitization discipline**: `message` and `help` are sanitized at every output
-//! boundary. The escaped class is C0 except `\n`/`\t`, DEL (U+007F), C1
-//! (U+0080–U+009F), the complete Unicode `Bidi_Control=Yes` set — all twelve of
-//! U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069 (Trojan Source,
+//! boundary. The escaped class — stated exactly as spec §7.5 states it — is C0
+//! (U+0000–U+001F) **including `\n`**, with `\t` (U+0009) as the sole exemption; DEL
+//! (U+007F); C1 (U+0080–U+009F); the complete Unicode `Bidi_Control=Yes` set — all twelve
+//! of U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069 (Trojan Source,
 //! CVE-2021-42574) — the JS line/paragraph separators U+2028/U+2029, and U+FEFF;
 //! each becomes an uppercase 6-char `\uXXXX` literal.
+//!
+//! `\n` is *in* the class. Whether a given boundary escapes it is the HUMAN/WIRE mode
+//! choice below, not a property of the class. Describing the class as "C0 except
+//! `\n`/`\t`" folds the mode into the class definition and makes the two documents
+//! disagree about what the class contains; they must not.
 //!
 //! Two escape modes share one implementation, differing only on `\n`:
 //!
@@ -75,12 +81,29 @@
 //!
 //! Two categories remain outside the table, deliberately and without a coverage claim:
 //!
-//! - **`miette::miette!(…)` message construction in the CLI.** Those reports are
-//!   rendered through `eprint_error`, which escapes message, help and label text in
-//!   HUMAN mode before miette sees them, so no raw control byte reaches stderr — but a
-//!   `\n` in an interpolated path survives *inside the rendered frame*. Frame content is
-//!   indented and box-drawn rather than emitted as a bare status line, so it is a weaker
-//!   surface than the status lines above. It is a known residual, not a closed one.
+//! - **Untrusted values interpolated into a diagnostic MESSAGE BODY**, at either of its
+//!   two construction sites:
+//!   - `miette::miette!(…)` in the CLI, which interpolates `mds.json` values and
+//!     filesystem paths; and
+//!   - **`MdsError` message bodies in this crate**, which interpolate paths and
+//!     `io::Error` causes (`fs.rs`'s `cannot read {normalized}: {e}` and `invalid UTF-8
+//!     in {normalized}: {e}`) and template identifiers (`parser_helpers.rs`'s `invalid
+//!     import alias: '{alias}'`).
+//!
+//!   Both are rendered through `eprint_error`, which escapes message, help and label text
+//!   in HUMAN mode before miette sees them, so no raw control byte reaches stderr — but a
+//!   `\n` in an interpolated path or identifier survives *inside the rendered frame*.
+//!   Frame content is indented and `│`-prefixed by the renderer rather than emitted as a
+//!   bare status line, and that prefix survives `strip()`, so forged frame content cannot
+//!   masquerade as genuine status output the way an unescaped filename in a `Clean: …`
+//!   line could. It is a weaker surface than the status lines above — a known residual,
+//!   not a closed one, disclosed here and in spec §7.5 ("Residual: paths and identifiers
+//!   inside a message body").
+//!
+//!   Note the asymmetry this preserves: a path in a `file` **field** — a status line, a
+//!   `[file:line:col]` header, the JSON `file` key — *is* WIRE-escaped on every surface.
+//!   The residual is specifically a path or identifier that has been interpolated into
+//!   prose, where the per-field rule makes the surrounding body HUMAN.
 //! - **Compiled template output** (`mds build -o -`, `mds lint --fix -`). That is the
 //!   command's product, not a diagnostic; escaping it would corrupt every redirect.
 //!
@@ -543,9 +566,11 @@ enum EscapeMode {
 
 /// Escape hostile characters, preserving `\n` (HUMAN mode).
 ///
-/// The escaped class is C0 (U+0000–U+001F incl. ESC) except `\n`/`\t`, DEL (U+007F),
-/// C1 (U+0080–U+009F), the Unicode bidi controls (U+200E/U+200F, U+202A–U+202E,
-/// U+2066–U+2069), the line/paragraph separators U+2028/U+2029, and U+FEFF.
+/// Escapes the full class — C0 (U+0000–U+001F incl. ESC) with `\t` exempt, DEL
+/// (U+007F), C1 (U+0080–U+009F), all twelve Unicode bidi controls (U+061C,
+/// U+200E/U+200F, U+202A–U+202E, U+2066–U+2069), the line/paragraph separators
+/// U+2028/U+2029, and U+FEFF — **except `\n`, which this mode preserves**. `\n` is in
+/// the class; HUMAN mode is the choice not to escape it. See the module doc.
 ///
 /// Use this at **render** boundaries (anything bound for a terminal or a miette
 /// frame). Use [`sanitize_control_chars_wire`] at **wire** boundaries (JSON, binding

@@ -65,13 +65,19 @@ field is present across all binding surfaces: CLI JSON output, napi
 - **Control-byte injection hardening (CWE-150 / #176):** Raw C0 / DEL / C1
   control bytes in `.mds` source content could reach terminal stderr and
   JS / Python / WASM API error messages, enabling terminal escape-sequence
-  injection. All serialization and diagnostic-render boundaries are now
-  hardened: `MdsError::serialize()` (inherited by all three binding layers),
+  injection. The serialization and diagnostic-render boundaries hardened here are
+  `MdsError::serialize()` (inherited by all three binding layers),
   `LintResult::to_canonical_json()` including the `"file"` group key,
-  `CompileResult::to_canonical_json()` warnings, and the CLI render path.
-  The CLI render path (PF-014 redesign) sanitizes renderer *inputs*
-  byte-length-preservingly — hostile C0/DEL/C1 bytes become `?` (C0/DEL) or
-  NBSP (C1) so miette's own SGR colour codes survive intact on TTY. A new
+  `CompileResult::to_canonical_json()` warnings, and the CLI render path. That is
+  an audit list, **not a closed set**: the governing rule is the per-field one
+  below, and the residual it leaves is named there. Enumerating boundaries is
+  exactly the framing this changelog retires further down.
+  The CLI render path (PF-014 redesign) sanitizes the renderer's *source-excerpt*
+  input byte-length-preservingly — hostile C0/DEL/C1 bytes become `?` (C0/DEL) or
+  NBSP (C1) so span offsets and caret columns stay exact and miette's own SGR
+  colour codes survive intact on TTY. `message` and `help` are renderer inputs too,
+  but they are `\uXXXX`-escaped rather than length-preserved; only source text
+  carries the byte-length invariant. A new
   `MdsError::display_sanitized()` public API is provided for Rust consumers;
   the raw `Display` impl is preserved with an explicit unsafety contract in
   its rustdoc. `span` byte offsets, `fix_edits` byte ranges, and `rule`
@@ -115,13 +121,20 @@ field is present across all binding surfaces: CLI JSON output, napi
   **This is now a machine-checked invariant, not an enumeration.** A new
   `crates/mds-cli/tests/print_discipline.rs` fails CI if *any* print macro under
   `crates/mds-cli/src/**` interpolates a value that is not passed through one of the
-  escape helpers, and applies the same rule to `format!` invocations nested inside
-  `eprint_warning` calls (HUMAN-mode escaping alone is not sufficient — it preserves
-  `\n`, which is the line-forgery vector). Deliberate exceptions — the compiled artefact
-  written to stdout, `&'static str` labels, integer counters — live in an explicit
-  allowlist with a written justification per entry, and a companion test fails if an
-  allowlist entry ever stops matching. Three successive reviews of this change each
-  found a *different* unescaped print; the guard is what ends that. (#176)
+  escape helpers. It applies the same rule to the argument of `eprint_warning`
+  (HUMAN-mode escaping alone is not sufficient — it preserves `\n`, which is the
+  line-forgery vector), including when the message has been hoisted into a local:
+  a bare identifier is traced one hop through its `let` binding and judged the same
+  way, and an argument the trace cannot resolve is **reported**, not trusted. It also
+  scans `write!` / `writeln!` to a stdout/stderr handle. Deliberate exceptions — the
+  compiled artefact written to stdout, `&'static str` labels, integer counters, and
+  whole warning strings produced by `mds-core` — live in explicit allowlists with a
+  written justification per entry, and a companion test fails if an entry ever stops
+  matching. The guard is a **lexical** scanner: it catches accidental reintroduction,
+  and its four known limits (name-matched sanitizers, anti-rot-not-anti-reuse
+  allowlists, the one-hop single-file trace, name-based stream detection) are stated
+  in its own rustdoc rather than implied away. Four successive reviews of this change
+  each found a *different* unescaped print; the guard is what ends that. (#176)
 
 - **The escape mode is chosen per field, not per surface (#176).** Normative in spec
   §7.5: **untrusted identifiers, filenames and error causes are WIRE-escaped on every
@@ -133,7 +146,23 @@ field is present across all binding surfaces: CLI JSON output, napi
   (CWE-117). This supersedes the earlier per-surface framing and the "wire mode at
   exactly four boundaries" enumeration. A new `mds::sanitize_control_chars_wire` and
   `mds::named_source_for_render` are public in `mds-core` for consumers that need to
-  apply the same rule. (#176)
+  apply the same rule.
+
+  **Declared residual.** "Identifier / filename / cause" means the value occupies such a
+  *field* — a CLI status line, a `[file:line:col]` frame header, the JSON `file` key. A
+  path or identifier interpolated into a diagnostic **message body** is part of prose,
+  so it follows the message row and stays HUMAN on terminal surfaces. That applies at
+  both message-construction sites: the CLI's `miette::miette!()` reports **and**
+  `mds-core`'s `MdsError` message bodies (`fs.rs`'s `cannot read {path}: {e}`,
+  `parser_helpers.rs`'s `invalid import alias: '{alias}'`). A `\n` in one of those
+  survives into the rendered frame and takes a line there. It is a weaker surface than a
+  status line — frame content is indented and `│`-prefixed, and the prefix survives
+  `strip()`, so it cannot masquerade as genuine bare status output — and no raw control
+  byte reaches the terminal either way. Closing it means WIRE-escaping over a hundred
+  `MdsError` construction sites and changing the public message text seen by all three
+  binding layers; that is a separate change. Disclosed in spec §7.5 ("Residual: paths and
+  identifiers inside a message body") and in the boundary table in
+  `crates/mds-core/src/lint/diagnostic.rs`. (#176)
 
 - **Hostile filenames can no longer forge CLI status lines (CWE-117 / #176).** POSIX
   permits a newline inside a filename, and directory-mode commands discover names by
@@ -186,9 +215,13 @@ field is present across all binding surfaces: CLI JSON output, napi
   that prints or line-splits the value can be made to render an attacker-authored
   line as a genuine second finding. `\t` is unaffected.
 
-  **Human-render output is unchanged** — the CLI renderer,
-  `MdsError::display_sanitized()`, and stderr warnings still preserve raw
-  newlines so multi-line diagnostic frames stay readable.
+  **Human-render output of diagnostic PROSE is unchanged** — the CLI renderer,
+  `MdsError::display_sanitized()`, and warning *bodies* on stderr still preserve
+  raw newlines so multi-line diagnostic frames stay readable. Human output of
+  filenames, identifiers and causes **did** change, by design: under the per-field
+  rule above those are WIRE-escaped on every surface, human included, so a newline
+  in one now renders as the six-character `\u000A` literal instead of forging a
+  line. See the two entries below.
 
   **Migration:** consumers that split a `message` / `help` / warning string on
   `\n` will now see a single line containing the literal `\u000A` where a real
