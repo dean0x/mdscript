@@ -1026,14 +1026,37 @@ This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
 All five surfaces emit byte-identical values.
 
-**Human-render output escapes the same class minus `\n`, except for filenames.**
-Terminal *prose* (the CLI human renderer's message/help text,
-`MdsError::display_sanitized()`, stderr warnings) preserves raw newlines so multi-line
-diagnostic frames stay readable. `\n` is escaped on the machine-readable boundaries
-listed above — where a raw newline is itself an injection vector — and on **filename**
-fields everywhere, human surfaces included: a filename is always rendered on a single
-line, so a newline in one can forge a whole status line that is byte-identical in form
-to genuine output.
+##### Mode is chosen per field, not per surface
+
+The escape class above is fixed. The only thing that varies is whether `\n` is escaped
+with it, and that choice is **normatively a property of the field, not of the output
+surface**:
+
+> **Untrusted identifiers, filenames, and error causes are escaped in WIRE mode on
+> *every* surface, human terminal output included. Prose — a diagnostic message body or
+> help body — is escaped in HUMAN mode on terminal surfaces, so that multi-line frames
+> keep rendering.**
+
+The discriminator is whether the value is ever *legitimately* multi-line. A filename, a
+config key, a `--format` argument, an `io::Error` cause, and a fix-rejection reason are
+each displayed on exactly one line, so preserving a raw `\n` in one buys nothing and
+lets it forge a standalone line that is byte-identical in form to genuine output
+(CWE-117). A diagnostic body genuinely is multi-line, so escaping its newlines would
+break the frame.
+
+This rule supersedes any per-surface reading of the earlier "human escapes the class
+minus `\n`" formulation: `\n` is escaped on all machine-readable boundaries listed
+above, **and** on every identifier / filename / cause field, on every surface.
+
+Applied, that means:
+
+| Value | Mode | Because |
+|-------|------|---------|
+| `message`, `help`, warning bodies, `LabeledSpan` text | HUMAN on terminal surfaces, WIRE on the JSON wire | Prose; legitimately multi-line in a rendered frame |
+| `file` / any filename or path, including CLI status lines and `[file:line:col]` frame headers | WIRE everywhere | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
+| `mds.json` rule names and config values, `--format` arguments | WIRE everywhere | Single-line identifiers read from the working tree or the command line |
+| `io::Error` / `MdsError` causes interpolated into a status or warning line | WIRE everywhere | Single-line, and they embed paths of their own |
+| Compiled template output (`mds build -o -`) | not escaped | It is the command's product, not a diagnostic; redirects must stay byte-faithful |
 
 Source excerpts embedded in a rendered diagnostic frame are neutralized
 byte-length-preservingly instead of escaped, so span offsets and caret columns stay

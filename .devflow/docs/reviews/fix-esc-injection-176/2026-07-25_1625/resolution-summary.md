@@ -187,7 +187,31 @@ Final gate: PASS
 
 **Mid-flight expansion (2026-07-26, owner-approved):** After the five escalation decisions were implemented, a Scrutinizer pass demonstrated a raw-ESC-to-stderr path in `MdsError` message text on the CLI human error path (found by the Scrutinizer), plus the CLI-authored `miette!()` error family and warning prints. Fixing these was approved mid-flight as an addition to the original five escalations — not one of the five — and committed to the same branch.
 
-**Alignment-review finding (in progress):** A subsequent alignment review found the boundary-closure claim still incomplete: a bare `eprintln!` for unknown `mds.json` rule names at `crates/mds-cli/src/lint.rs:197`, and raw `MdsError` Display interpolated into `fix rejected:` reasons, remain unaddressed. Follow-up work is in progress. These are not marked closed — the alignment review correctly caught that the boundary-table closure claim was premature.
+**Alignment-review finding (round 1, closed):** A subsequent alignment review found the boundary-closure claim still incomplete: a bare `eprintln!` for unknown `mds.json` rule names at `crates/mds-cli/src/lint.rs:197`, and raw `MdsError` Display interpolated into `fix rejected:` reasons. Both were fixed (`e145e41`, `46fb326`) and the claims narrowed (`e1d1d73`, `35195d4`).
+
+---
+
+### Decision 3 RE-RATIFIED as a per-field rule (2026-07-26)
+
+A **second** alignment review falsified the narrowed warning-path claim again — a third distinct unescaped print (`output.rs`'s own walker depth-limit warning) plus the discovery that the round-1 `lint.rs` fix used HUMAN mode, so a newline in the rule name still forged standalone status lines. Two rounds of "fix the enumerated sites" had each been correct and each been superseded.
+
+The owner therefore **re-ratified Decision 3** in a stronger, per-field form, **superseding the earlier "wire mode at exactly four boundaries" enumeration**:
+
+> **Untrusted identifiers and filenames are WIRE-escaped on every surface, human output included. Prose (diagnostic message / help bodies) stays HUMAN so multi-line frames keep rendering.**
+
+Rationale: a filename or a config key is never legitimately multi-line, so preserving `\n` in one only enables status-line forgery (CWE-117); a diagnostic body legitimately *is* multi-line. This makes each remaining site decidable **by rule** rather than by re-deriving a list of boundaries. Recorded normatively in `spec.md` §7.5 and in the `crates/mds-core/src/lint/diagnostic.rs` module doc.
+
+### Systemic guard approved and landed (2026-07-26)
+
+The owner also approved a **systemic guard** as the deliverable that ends the whack-a-mole: `crates/mds-cli/tests/print_discipline.rs` fails CI if any print macro under `crates/mds-cli/src/**` interpolates a value that is not passed through one of the escape helpers, and applies the same rule to `format!` invocations nested inside `eprint_warning` calls. Exceptions live in an explicit allowlist with a written justification per entry; a companion test fails if an allowlist entry stops matching.
+
+Consequences recorded here because they change earlier decisions:
+
+- **`watch.rs` is no longer carved out.** Previously documented as a pre-existing gap outside #176's diff, its lifecycle status lines are now routed through `safe_path` / `safe_inline` / `eprint_warning`. Allowlisting them would have been a deliberate hole in the guard.
+- **`eprint_warning` alone is explicitly not sufficient**, and is no longer documented as if it were. The boundary table now records its row as *prose HUMAN, interpolated identifiers/paths WIRE*.
+- **Known residual, deliberately not claimed closed:** CLI `miette::miette!(…)` message construction. Those reports are HUMAN-escaped at `eprint_error` before miette renders them, so no raw control byte reaches stderr, but a `\n` in an interpolated path survives inside the rendered (indented, box-drawn) frame.
+
+**Round-2 implementing commits:** see the branch log for `fix/esc-injection-176` after `35195d4`.
 
 ## Blocked
 | Issue | File:Line | Blocker |

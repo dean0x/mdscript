@@ -91,18 +91,49 @@ field is present across all binding surfaces: CLI JSON output, napi
   post-processed, so terminal colour and caret alignment are unaffected, and output for
   well-formed input is byte-for-byte unchanged. (#176)
 
-- **CLI warning output is now escaped too (#176).** Six sites printed raw warning
-  strings with a bare `eprintln!`, bypassing the `sanitize_control_chars` call that
-  `mds-core`'s `emit_warnings` applies on the primary code paths (a PF-004
-  parallel-path gap): five in `mds build` / `mds check` that call
-  `*_collecting_warnings` variants, plus `mds lint`'s unknown-`mds.json`-rule warning.
-  That sixth is the more directly reachable one — a rule NAME in `mds.json` is an
-  arbitrary JSON object key, and a JSON `\uXXXX` escape decodes to a real byte, so any
-  repository could put a raw ESC on a developer's stderr just by being linted. All six
-  now route through a single `eprint_warning` helper in `output.rs` that applies
-  HUMAN-mode sanitization before printing, so no raw control byte reaches human stderr
-  on any warning path. (`watch.rs`'s lifecycle status lines — `Watching {}`,
-  `Removed {}` — remain a separate, pre-existing gap, tracked outside this change.) (#176)
+- **Every CLI print now escapes what it interpolates, and CI enforces it (#176).**
+  Warning and status prints scattered across `main.rs`, `build.rs`, `fmt.rs`, `lint.rs`,
+  `watch.rs` and `output.rs` interpolated filenames, `mds.json` rule names, `--format`
+  arguments and `io::Error` causes into `eprintln!` raw, bypassing the
+  `sanitize_control_chars` call that `mds-core`'s `emit_warnings` applies on the primary
+  code paths (a PF-004 parallel-path gap). The two most directly reachable:
+
+  - a rule NAME in `mds.json` is an arbitrary JSON object key, and a JSON `\uXXXX`
+    escape decodes to a real byte, so any repository could put a raw ESC on a
+    developer's stderr — or forge whole `Clean: …` / `0 problems found` status lines —
+    just by being linted;
+  - the shared directory walker's depth-limit warning named the directory it stopped at,
+    so one hostile directory name reached `mds build`, `check`, `fmt`, `lint` and
+    `watch` at once.
+
+  All of them now apply the per-field rule below: the warning *body* goes through
+  `eprint_warning` (HUMAN), and every value interpolated into it goes through
+  `safe_path` / `safe_inline` (WIRE). `watch.rs`'s lifecycle status lines
+  (`Watching {}`, `Removed {}`, `warning: could not remove {}: {e}`) — previously
+  carved out as a pre-existing gap — are included.
+
+  **This is now a machine-checked invariant, not an enumeration.** A new
+  `crates/mds-cli/tests/print_discipline.rs` fails CI if *any* print macro under
+  `crates/mds-cli/src/**` interpolates a value that is not passed through one of the
+  escape helpers, and applies the same rule to `format!` invocations nested inside
+  `eprint_warning` calls (HUMAN-mode escaping alone is not sufficient — it preserves
+  `\n`, which is the line-forgery vector). Deliberate exceptions — the compiled artefact
+  written to stdout, `&'static str` labels, integer counters — live in an explicit
+  allowlist with a written justification per entry, and a companion test fails if an
+  allowlist entry ever stops matching. Three successive reviews of this change each
+  found a *different* unescaped print; the guard is what ends that. (#176)
+
+- **The escape mode is chosen per field, not per surface (#176).** Normative in spec
+  §7.5: **untrusted identifiers, filenames and error causes are WIRE-escaped on every
+  surface, human terminal output included; prose — a diagnostic message or help body —
+  stays HUMAN so multi-line frames keep rendering.** The discriminator is whether the
+  value is ever legitimately multi-line: a filename, a config key, a `--format`
+  argument and an `io::Error` never are, so preserving a raw `\n` in one buys nothing
+  and lets it forge a standalone line byte-identical in form to genuine output
+  (CWE-117). This supersedes the earlier per-surface framing and the "wire mode at
+  exactly four boundaries" enumeration. A new `mds::sanitize_control_chars_wire` and
+  `mds::named_source_for_render` are public in `mds-core` for consumers that need to
+  apply the same rule. (#176)
 
 - **Hostile filenames can no longer forge CLI status lines (CWE-117 / #176).** POSIX
   permits a newline inside a filename, and directory-mode commands discover names by

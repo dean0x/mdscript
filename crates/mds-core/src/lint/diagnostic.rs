@@ -21,12 +21,24 @@
 //!
 //! `\t` is preserved in both modes.
 //!
-//! **Mode is chosen per FIELD, not per surface.** *Prose* (message, help, warning text,
-//! label text) is HUMAN on terminal surfaces so multi-line frames render. A *filename*
-//! is WIRE on every surface including terminal ones: it is always displayed on a single
-//! line — a status line, or a `[file:line:col]` frame header — and POSIX permits a
-//! newline inside a filename, so HUMAN mode there lets a discovered file forge a whole
-//! status line byte-identical in form to genuine output (CWE-117).
+//! **Mode is chosen per FIELD, not per surface** — the governing rule, re-ratified
+//! 2026-07-26 and normative in spec §7.5:
+//!
+//! > Untrusted **identifiers, filenames and error causes are WIRE** on every surface,
+//! > human terminal output included. **Prose** — a diagnostic message body or help body
+//! > — stays **HUMAN** on terminal surfaces so multi-line frames keep rendering.
+//!
+//! The discriminator is whether the value is ever legitimately multi-line. A filename, an
+//! `mds.json` rule name, a `--format` argument and an `io::Error` cause are each rendered
+//! on exactly one line — a status line, or a `[file:line:col]` frame header — so a raw
+//! `\n` in one only lets it forge a standalone line byte-identical in form to genuine
+//! output (CWE-117); POSIX permits a newline inside a filename and the user never types
+//! it. A diagnostic body genuinely is multi-line, so escaping its newlines would break
+//! the frame.
+//!
+//! This rule supersedes the earlier "wire mode at exactly these four boundaries"
+//! enumeration. Enumerations of boundaries went stale twice under review; a per-field
+//! rule makes each new site decidable without re-deriving the list.
 //!
 //! ## Boundary table
 //!
@@ -37,8 +49,10 @@
 //! | Boundary | Mode | Fields |
 //! |----------|------|--------|
 //! | `eprint_error` (mds-cli/src/output.rs) | HUMAN | `message`, `help`, `LabeledSpan` text, and the whole auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_source`) of **every** report rendered to stderr — see "CLI terminal path" below |
-//! | `eprint_warning` (mds-cli/src/output.rs) | HUMAN | every CLI warning string printed to stderr — the `*_collecting_warnings` paths in `main.rs`/`build.rs` plus the unknown-`mds.json`-rule warning in `lint.rs` |
-//! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr on the non-collecting paths |
+//! | `eprint_warning` (mds-cli/src/output.rs) | **prose HUMAN, interpolated identifiers/paths WIRE** | the warning body is escaped HUMAN by the helper; each value interpolated into it must additionally be WIRE-escaped by the caller (`safe_path` for paths, `safe_inline` for identifiers / config values / `io::Error` causes). HUMAN alone is not sufficient — it preserves `\n`, which is the CWE-117 forgery vector |
+//! | `safe_inline()` (mds-cli/src/output.rs) | WIRE | any single-line untrusted value interpolated into a status, warning or error line: `mds.json` rule names and config paths, `--format` arguments, fix-rejection reasons, `io::Error` causes |
+//! | `tests/print_discipline.rs` (mds-cli) | *enforcement, not a boundary* | fails CI if any print macro under `crates/mds-cli/src/**` interpolates a value that is not passed through one of the escape helpers, and applies the same rule to `format!`s nested inside `eprint_warning` calls. Exceptions live in an explicit allowlist with per-entry justifications |
+//! | `emit_warnings()` (lib.rs) | HUMAN | warning strings printed to stderr on the non-collecting paths. The identifiers its producers interpolate — `resolver.rs`'s imported-module filename, `evaluator.rs`'s `@include` alias — are WIRE-escaped at construction, per the per-field rule |
 //! | `named_source_for_render()` (this module) | **per field** | the single `NamedSource` builder used by `MdsError::at()` (error.rs), `check_equivalence` (formatter.rs) and `render_diag_human` (mds-cli/src/lint.rs): filename WIRE, source via `neutralize_source_for_render` (byte-length-preserving; avoids PF-014 caret desync) |
 //! | `render_diag_human` (mds-cli/src/lint.rs) | HUMAN | `message`/`help` (its filename and source go through `named_source_for_render`) |
 //! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
@@ -50,13 +64,25 @@
 //! | `--diff` preview output (mds-cli/src/output.rs) | neutralized, TTY-gated | source excerpts neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable. **`--check` alone emits no preview text** — only status lines, which are unconditionally sanitized via `safe_path`. |
 //!
 //! **Scope of the table.** It covers every path that carries *untrusted text* —
-//! diagnostic prose, warnings, filenames, and rejection reasons. One category of CLI
-//! output is deliberately **not** covered and is not claimed to be: `watch.rs`'s own
-//! lifecycle status lines (`Watching {}`, `Removed {} (source deleted)`,
-//! `warning: could not remove {}: {e}`) print `Path::display()` and `io::Error` through
-//! a bare `eprintln!` rather than [`sanitize_control_chars`] or `safe_path`. Those are
-//! pre-existing and outside #176's diff; they are a real gap, tracked separately. Do not
-//! read the table as covering them.
+//! diagnostic prose, warnings, filenames, identifiers, and rejection reasons.
+//!
+//! `watch.rs`'s lifecycle status lines (`Watching {}`, `Removed {} (source deleted)`,
+//! `warning: could not remove {}: {e}`) were previously carved out here as a
+//! pre-existing gap. **That carve-out is gone**: they now route through `safe_path` /
+//! `safe_inline` / `eprint_warning` like every other CLI print, because leaving them out
+//! would have meant an allowlist entry in `print_discipline.rs` — a deliberate hole in
+//! the guard rather than a documented one.
+//!
+//! Two categories remain outside the table, deliberately and without a coverage claim:
+//!
+//! - **`miette::miette!(…)` message construction in the CLI.** Those reports are
+//!   rendered through `eprint_error`, which escapes message, help and label text in
+//!   HUMAN mode before miette sees them, so no raw control byte reaches stderr — but a
+//!   `\n` in an interpolated path survives *inside the rendered frame*. Frame content is
+//!   indented and box-drawn rather than emitted as a bare status line, so it is a weaker
+//!   surface than the status lines above. It is a known residual, not a closed one.
+//! - **Compiled template output** (`mds build -o -`, `mds lint --fix -`). That is the
+//!   command's product, not a diagnostic; escaping it would corrupt every redirect.
 //!
 //! **CLI terminal path.** `mds build` / `check` / `fmt` / `lint` / `watch` all render
 //! errors through the single `eprint_error` choke-point, which wraps the `miette::Report`
