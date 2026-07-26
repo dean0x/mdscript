@@ -1007,7 +1007,7 @@ The **escaped class** is:
 | `\n` (U+000A) | Line forging in any consumer that prints or line-splits the value |
 | DEL (U+007F) | Interpreted as a destructive backspace by some terminals |
 | C1 (U+0080–U+009F) | Terminal control, incl. NEL (U+0085) |
-| U+200E, U+200F, U+202A–U+202E, U+2066–U+2069 | Unicode bidi controls — visually reorder the line (Trojan Source, CVE-2021-42574) |
+| U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069 | The complete Unicode `Bidi_Control=Yes` set (12 codepoints) — they visually reorder the line (Trojan Source, CVE-2021-42574). U+061C ARABIC LETTER MARK is the only member outside U+200E–U+2069. |
 | U+2028, U+2029 | Terminate a JavaScript string literal |
 | U+FEFF | Invisible BOM / ZWNBSP — hides or splits content |
 
@@ -1017,7 +1017,7 @@ serialization. `\t` is the only character in the class that is preserved.
 | Field | Invariant |
 |-------|-----------|
 | `message`, `help` | Every codepoint in the escaped class above is replaced with its six-character `\uXXXX` literal before serialization. |
-| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into the JSON output. |
+| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into the JSON output. A filename is escaped with the **full** class including `\n` on *every* surface, human included — it is always rendered on a single line (a status line, or a `[file:line:col]` frame header), and POSIX permits a newline inside a filename. |
 | `rule` | Fixed ASCII identifier; never contains control bytes by construction. Not sanitized. |
 | `span`, `fix_edits` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
 
@@ -1026,13 +1026,19 @@ This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
 All five surfaces emit byte-identical values.
 
-**Human-render output escapes the same class minus `\n`.** Terminal output (the CLI
-human renderer, `MdsError::display_sanitized()`, stderr warnings) preserves raw
-newlines so multi-line diagnostic frames stay readable. `\n` is escaped only on the
-machine-readable boundaries listed above, where a raw newline is itself an injection
-vector. Source excerpts embedded in a rendered diagnostic frame are neutralized
-byte-length-preservingly instead of escaped (C0/DEL → `?`, C1 → U+00A0, bidi and
-separators → U+FFFD), so span offsets and caret columns stay exact.
+**Human-render output escapes the same class minus `\n`, except for filenames.**
+Terminal *prose* (the CLI human renderer's message/help text,
+`MdsError::display_sanitized()`, stderr warnings) preserves raw newlines so multi-line
+diagnostic frames stay readable. `\n` is escaped on the machine-readable boundaries
+listed above — where a raw newline is itself an injection vector — and on **filename**
+fields everywhere, human surfaces included: a filename is always rendered on a single
+line, so a newline in one can forge a whole status line that is byte-identical in form
+to genuine output.
+
+Source excerpts embedded in a rendered diagnostic frame are neutralized
+byte-length-preservingly instead of escaped, so span offsets and caret columns stay
+exact. The substitute is chosen per UTF-8 width: 1-byte C0/DEL → `?`; 2-byte C1 and
+U+061C → U+00A0; 3-byte bidi controls, separators and BOM → U+FFFD.
 
 On the CLI this is enforced at a single choke-point: every diagnostic printed to
 stderr — compiler errors and CLI-authored errors alike — has its message, help, and

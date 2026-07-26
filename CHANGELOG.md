@@ -91,32 +91,61 @@ field is present across all binding surfaces: CLI JSON output, napi
   post-processed, so terminal colour and caret alignment are unaffected, and output for
   well-formed input is byte-for-byte unchanged. (#176)
 
-- **CLI warning output is now escaped too (#176).** Five sites in `mds build` and
-  `mds check` that call `*_collecting_warnings` variants printed raw warning strings
-  with a bare `eprintln!("{w}")`, bypassing the `sanitize_control_chars` call that
+- **CLI warning output is now escaped too (#176).** Six sites printed raw warning
+  strings with a bare `eprintln!`, bypassing the `sanitize_control_chars` call that
   `mds-core`'s `emit_warnings` applies on the primary code paths (a PF-004
-  parallel-path gap). All five sites now route through a single `eprint_warning`
-  helper in `output.rs` that applies HUMAN-mode sanitization before printing, so no
-  raw control byte can reach human stderr on any warning path. The only warning that
-  currently interpolates untrusted text is the resolver warning that embeds a module
-  filename, which requires a hostile filename *and* a `MAX_SOURCEMAP_SEGMENTS`
-  overflow in that module to fire. (#176)
+  parallel-path gap): five in `mds build` / `mds check` that call
+  `*_collecting_warnings` variants, plus `mds lint`'s unknown-`mds.json`-rule warning.
+  That sixth is the more directly reachable one — a rule NAME in `mds.json` is an
+  arbitrary JSON object key, and a JSON `\uXXXX` escape decodes to a real byte, so any
+  repository could put a raw ESC on a developer's stderr just by being linted. All six
+  now route through a single `eprint_warning` helper in `output.rs` that applies
+  HUMAN-mode sanitization before printing, so no raw control byte reaches human stderr
+  on any warning path. (`watch.rs`'s lifecycle status lines — `Watching {}`,
+  `Removed {}` — remain a separate, pre-existing gap, tracked outside this change.) (#176)
+
+- **Hostile filenames can no longer forge CLI status lines (CWE-117 / #176).** POSIX
+  permits a newline inside a filename, and directory-mode commands discover names by
+  walking the tree — the user never types them. Filename display used HUMAN mode, which
+  preserves newlines by design so that multi-line diagnostic *messages* keep rendering,
+  so a file named `evil.mds<LF>Clean: real.mds<LF>OK: all-fine.mds` made
+  `mds build`/`lint`/`fmt`/`check` emit attacker-authored lines byte-identical in form
+  to genuine status output — unframed, unindented, and indistinguishable. **Filename
+  fields are now escaped in WIRE mode on every surface, human included**: `safe_path`
+  and the status-line printers, and the `[file:line:col]` frame header via a new shared
+  `mds::named_source_for_render` builder that `MdsError::at()`, the formatter and the
+  lint renderer all call. Message and help text are unchanged (still HUMAN, still
+  multi-line). A filename is never legitimately multi-line, so nothing legitimate is
+  lost. (#176)
+
+- **Fix-rejection reasons are display-safe by construction (#176).**
+  `mds::fix::FixOutcome::Rejected.reason` interpolated an `MdsError`'s deliberately-raw
+  `Display` — whose variants embed template text (`syntax error: {message}`) and
+  filesystem paths (`file not found: {path}`) — and the CLI prints that value as an
+  unframed `fix rejected: {reason}` status line. The embedded error is now escaped in
+  WIRE mode at the single construction site in `fix.rs`, so the field is single-line and
+  control-byte-free for **every** consumer of the published `mds::fix` API, not just the
+  CLI's own print sites. (#176)
 
 - **Widened escape class: bidi / separator / BOM characters (#176).** The
   escaped set now covers characters outside C0 / DEL / C1 that are still
   display-hazardous, on every surface:
-  - **U+200E, U+200F, U+202A–U+202E, U+2066–U+2069** — the Unicode bidi
-    controls behind Trojan Source (CVE-2021-42574). A single U+202E in a
-    filename or diagnostic message reverses how the rest of the line renders
-    in any bidi-aware terminal, IDE, or code-review UI.
+  - **U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069** — the complete
+    Unicode `Bidi_Control=Yes` set (all twelve codepoints), behind Trojan Source
+    (CVE-2021-42574). A single U+202E in a filename or diagnostic message
+    reverses how the rest of the line renders in any bidi-aware terminal, IDE, or
+    code-review UI. U+061C ARABIC LETTER MARK is the only member outside
+    U+200E–U+2069 and is easy to miss for exactly that reason.
   - **U+2028, U+2029** — LINE / PARAGRAPH SEPARATOR, which terminate a
     JavaScript string literal.
   - **U+FEFF** — BOM / ZWNBSP, invisible in every renderer.
 
   Each becomes its uppercase six-character `\uXXXX` literal, exactly like the
   existing C0 / DEL / C1 escapes. Source excerpts inside a rendered diagnostic
-  frame are neutralized to U+FFFD instead (3 bytes → 3 bytes), preserving the
-  byte-length invariant that keeps span offsets and caret columns exact. (#176)
+  frame are neutralized to a **same-width** substitute instead, preserving the
+  byte-length invariant that keeps span offsets and caret columns exact: 1-byte
+  C0/DEL → `?`, 2-byte C1 and U+061C → U+00A0, 3-byte bidi controls, separators
+  and BOM → U+FFFD. (#176)
 
 - **BREAKING (wire format): machine-readable boundaries now escape `\n` (#176).**
   `MdsError::serialize()`, `LintResult::to_canonical_json()` (message, help, and
