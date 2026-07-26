@@ -30,8 +30,9 @@
 //!
 //! ## Boundary table
 //!
-//! This table is an audit list: every in-tree site that hands untrusted text to a
-//! terminal or a wire format appears here.
+//! This table is an audit list of the sanitizing boundaries, not a proof of closure.
+//! Read it together with "Scope of the table" below, which names the one category of
+//! CLI output that is deliberately outside it.
 //!
 //! | Boundary | Mode | Fields |
 //! |----------|------|--------|
