@@ -41,10 +41,13 @@ pub fn assert_no_control_chars(s: &str, label: &str) {
         let is_c0 = code < 0x20 && code != 0x09 && code != 0x0a;
         let is_del = code == 0x7f;
         let is_c1 = (0x80..=0x9f).contains(&code);
-        // Bidi controls (Trojan Source, CVE-2021-42574), JS line/paragraph
-        // separators, and the invisible BOM — all escaped by the sanitizers.
+        // All twelve Unicode `Bidi_Control=Yes` codepoints (Trojan Source,
+        // CVE-2021-42574) — note U+061C, the only one outside U+200E–U+2069 — plus the
+        // JS line/paragraph separators and the invisible BOM. All escaped by the
+        // sanitizers.
         let is_format_hazard = matches!(ch,
-            '\u{200E}' | '\u{200F}'
+            '\u{061C}'
+            | '\u{200E}' | '\u{200F}'
             | '\u{2028}' | '\u{2029}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2066}'..='\u{2069}'

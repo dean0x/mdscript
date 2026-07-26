@@ -38,8 +38,8 @@ use crate::build::{
     RuntimeVarArgs,
 };
 use crate::output::{
-    atomic_write_file, collect_mds_files_detailed, eprint_error, neutralize_source_for_render,
-    render_unified_diff, safe_path,
+    atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
+    render_unified_diff, safe_file_display, safe_path,
 };
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -192,9 +192,16 @@ fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
         None => Ok(mds::LintConfig::default()),
         Some((mds_config, _config_dir)) => {
             // Warn on unknown rule names — unknown NAMES are ignored for forward compat.
+            //
+            // `name` is an arbitrary attacker-supplied JSON object key: `mds.json` is
+            // read from the working tree, and JSON `\uXXXX` escapes decode to real
+            // control bytes. It must go through `eprint_warning`, never a bare
+            // `eprintln!` (CWE-150 / PF-004).
             for name in mds_config.lint.rules.keys() {
                 if !KNOWN_RULES.contains(&name.as_str()) {
-                    eprintln!("warning: unknown lint rule '{name}' in mds.json; ignoring");
+                    eprint_warning(&format!(
+                        "warning: unknown lint rule '{name}' in mds.json; ignoring"
+                    ));
                 }
             }
             Ok(mds_config.lint.into_core_config())
@@ -266,10 +273,12 @@ fn write_stdout(s: &str) -> Result<()> {
 /// `named_source`: `(filename, source_text)` pair for span context rendering.
 ///
 /// Sanitization strategy (PF-014):
-/// - message/help: `sanitize_control_chars` → \\uXXXX escapes (safe for prose).
-/// - filename: `sanitize_control_chars` → \\uXXXX escapes.
-/// - source: `neutralize_source_for_render` → byte-length-preserving substitution so
-///   miette's span byte-offset slices remain valid after neutralization.
+/// - message/help: HUMAN-mode `sanitize_control_chars` → \\uXXXX escapes. `\n` is
+///   preserved so a multi-line diagnostic frame keeps rendering.
+/// - filename + source: `mds::named_source_for_render`, the shared boundary
+///   `MdsError::at()` and the formatter also use — WIRE-mode escaping for the
+///   single-line filename, byte-length-preserving neutralization for the span-indexed
+///   source so miette's byte-offset slices stay valid.
 ///
 /// The rendered miette frame is NOT post-processed, so miette's own SGR colour codes
 /// are never corrupted.
@@ -294,12 +303,8 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: (&st
         fix_edits: None,
     };
     let (filename, src) = named_source;
-    let clean_filename = mds::sanitize_control_chars(filename);
-    let clean_src = neutralize_source_for_render(src);
-    let report = miette::Report::from(sanitized).with_source_code(miette::NamedSource::new(
-        clean_filename.as_ref(),
-        clean_src.into_owned(),
-    ));
+    let report = miette::Report::from(sanitized)
+        .with_source_code(mds::named_source_for_render(filename, src));
     eprint_error(report);
 }
 
@@ -831,7 +836,7 @@ fn run_lint_file(
             FixFileOutcome::NothingToFix { original } => {
                 emit_result(format, &original, quiet, named_source);
                 if !quiet && format == LintFormat::Human && original.diagnostics.is_empty() {
-                    eprintln!("Clean: {}", mds::sanitize_control_chars(filename));
+                    eprintln!("Clean: {}", safe_file_display(filename));
                 }
                 exit_by_severity(&original);
             }
@@ -877,7 +882,7 @@ fn run_lint_file(
     // ── Report-only mode (no --fix) ───────────────────────────────────────────
     emit_result(format, &result, quiet, named_source);
     if !quiet && format == LintFormat::Human && result.diagnostics.is_empty() {
-        eprintln!("Clean: {}", mds::sanitize_control_chars(filename));
+        eprintln!("Clean: {}", safe_file_display(filename));
     }
     exit_by_severity(&result);
     Ok(())

@@ -9,8 +9,8 @@
 //! - [`eprint_error`]: the single CLI stderr choke-point — escapes every report's
 //!   message, help, and label text before miette renders it (CWE-150 / PF-014).
 //! - [`atomic_write_file`]: temp-file-then-rename writer shared by `fmt` and `lint --fix`.
-//! - [`preview_text_for`]: `--diff`/`--check` preview output — neutralized on TTY,
-//!   byte-faithful when piped, so redirected diffs stay applicable by `patch`/tooling.
+//! - [`preview_text_for`]: `--diff` preview output — neutralized on TTY, byte-faithful
+//!   when piped, so redirected diffs stay applicable by `patch`/tooling.
 //!
 //! Single-file path helpers (`OutputKind`, `compile_to_content`, `compile_and_write`,
 //! `resolve_output_path_for_kind`) remain in `build.rs`; they are imported here when
@@ -498,13 +498,14 @@ pub(crate) use mds::neutralize_source_for_render;
 
 /// A terminal-safe view of a [`miette::Report`], built **before** rendering.
 ///
-/// Overrides exactly the report's three prose surfaces — the `Display` message, the
-/// `help` text, and each [`miette::LabeledSpan`]'s label — with
+/// Overrides every prose surface the frame can render — the `Display` message, the
+/// `help` text, each [`miette::LabeledSpan`]'s label, and the whole auxiliary
+/// diagnostic graph (`source` cause chain, `related`, `diagnostic_source`) — with
 /// [`mds::sanitize_control_chars`]-escaped copies (HUMAN mode, so `\n` and `\t` survive
 /// and multi-line frames stay readable).  Everything the frame's geometry depends on —
 /// `code`, `severity`, `url`, `source_code`, and each label's byte span — is delegated
 /// to the inner report untouched, so the byte-length-preserving neutralization already
-/// applied to source excerpts (`MdsError::at`, `render_diag_human`) keeps every span
+/// applied to source excerpts (via `mds::named_source_for_render`) keeps every span
 /// offset and caret column exact.
 ///
 /// # Why this is the PF-014-correct boundary
@@ -525,39 +526,248 @@ pub(crate) use mds::neutralize_source_for_render;
 /// Wrapping at the `Report` level covers both, and keeps covering any error type added
 /// later, so the guarantee holds by construction rather than by remembering to extend
 /// a downcast ladder (avoids PF-004).
+///
+/// # The auxiliary graph (`source` / `related` / `diagnostic_source`)
+///
+/// A `Diagnostic` can hang three further diagnostic graphs off itself, all of which
+/// miette renders: the `std::error::Error` cause chain, the `related()` siblings, and
+/// `diagnostic_source()`.  All three carry prose, so all three must be escaped.
+///
+/// They cannot be forwarded by reference the way `code`/`severity`/`url` are: those
+/// accessors return borrows of the *inner* report, so handing back a sanitized view
+/// would require the wrapper to own it and hand out a borrow of itself.  This wrapper
+/// therefore materialises the whole graph into owned [`SanitizedNode`]s at construction
+/// (bounded by [`MAX_AUX_DEPTH`]) and forwards borrows of those.
+///
+/// Enforcing this with a `debug_assert!` that the graph is empty — which is what an
+/// earlier revision did, on the grounds that no CLI error populates it today — is
+/// exactly PF-005: `debug_assert!` is compiled out of release, so the invariant would
+/// hold under test and be absent in the shipped binary.  The first error type to grow a
+/// `#[source]` field would have silently dropped its cause chain from release stderr
+/// while CI stayed green.
 struct SanitizedReport {
     inner: miette::Report,
     message: String,
     help: Option<String>,
+    source: Option<SanitizedNode>,
+    related: Vec<SanitizedNode>,
+    diagnostic_source: Option<SanitizedNode>,
+}
+
+/// Depth bound for materialising a report's cause / related / diagnostic-source graph.
+///
+/// Cause chains are finite in practice, but nothing in the `Error` trait forbids a cycle
+/// (a `source()` that returns a sibling of itself would loop forever).  Rendering is not
+/// a place to discover that, so the walk is explicitly bounded; a graph deeper than this
+/// is truncated, which drops trailing context but never hangs or overflows the stack.
+const MAX_AUX_DEPTH: usize = 16;
+
+/// An owned, control-character-escaped snapshot of one node in a report's auxiliary
+/// diagnostic graph.
+///
+/// Every prose surface (`message`, `help`, `code`, `url`, label text) is escaped with
+/// HUMAN-mode [`mds::sanitize_control_chars`] when the node is built.  Label byte spans
+/// are copied verbatim, exactly as [`SanitizedReport::labels`] does, so caret geometry
+/// against the parent's already-neutralized source stays exact.
+///
+/// `source_code()` returns `None` by design: a `&dyn miette::SourceCode` cannot be
+/// cloned out of the inner diagnostic, and miette falls back to the *parent* report's
+/// source — which [`SanitizedReport::source_code`] forwards — when a nested diagnostic
+/// supplies none.  So a nested diagnostic still renders against neutralized source.
+struct SanitizedNode {
+    message: String,
+    help: Option<String>,
+    code: Option<String>,
+    url: Option<String>,
+    severity: Option<miette::Severity>,
+    labels: Option<Vec<miette::LabeledSpan>>,
+    source: Option<Box<SanitizedNode>>,
+    related: Vec<SanitizedNode>,
+    diagnostic_source: Option<Box<SanitizedNode>>,
+}
+
+/// Escape one optional `Display` surface to an owned `String`.
+fn escape_display(d: Option<Box<dyn std::fmt::Display + '_>>) -> Option<String> {
+    d.map(|v| mds::sanitize_control_chars(&v.to_string()).into_owned())
+}
+
+/// Escape a `Diagnostic`'s label text, keeping each byte span verbatim.
+///
+/// `None` is preserved as `None` (rather than collapsed to an empty vector) so miette
+/// distinguishes "no labels" from "labels, but none of them" exactly as it did before
+/// the wrapper was introduced.
+fn escape_labels(d: &dyn miette::Diagnostic) -> Option<Vec<miette::LabeledSpan>> {
+    Some(
+        d.labels()?
+            .map(|label| {
+                let text = label
+                    .label()
+                    .map(|t| mds::sanitize_control_chars(t).into_owned());
+                let span = *label.inner();
+                if label.primary() {
+                    miette::LabeledSpan::new_primary_with_span(text, span)
+                } else {
+                    miette::LabeledSpan::new_with_span(text, span)
+                }
+            })
+            .collect(),
+    )
+}
+
+impl SanitizedNode {
+    /// Build from a `Diagnostic` node (used for `related` / `diagnostic_source`).
+    fn from_diagnostic(d: &dyn miette::Diagnostic, depth: usize) -> Self {
+        Self {
+            message: mds::sanitize_control_chars(&d.to_string()).into_owned(),
+            help: escape_display(d.help()),
+            code: escape_display(d.code()),
+            url: escape_display(d.url()),
+            severity: d.severity(),
+            labels: escape_labels(d),
+            source: Self::chain_from_error(std::error::Error::source(d), depth),
+            related: Self::related_from(d, depth),
+            diagnostic_source: Self::boxed_from_diagnostic(d.diagnostic_source(), depth),
+        }
+    }
+
+    /// Build from a plain `Error` node (used for the `source()` cause chain, whose links
+    /// expose no `Diagnostic` data — only a `Display` message and a further `source()`).
+    fn from_error(e: &(dyn std::error::Error + 'static), depth: usize) -> Self {
+        Self {
+            message: mds::sanitize_control_chars(&e.to_string()).into_owned(),
+            help: None,
+            code: None,
+            url: None,
+            severity: None,
+            labels: None,
+            source: Self::chain_from_error(e.source(), depth),
+            related: Vec::new(),
+            diagnostic_source: None,
+        }
+    }
+
+    fn chain_from_error(
+        e: Option<&(dyn std::error::Error + 'static)>,
+        depth: usize,
+    ) -> Option<Box<SanitizedNode>> {
+        if depth >= MAX_AUX_DEPTH {
+            return None;
+        }
+        e.map(|e| Box::new(Self::from_error(e, depth + 1)))
+    }
+
+    fn boxed_from_diagnostic(
+        d: Option<&dyn miette::Diagnostic>,
+        depth: usize,
+    ) -> Option<Box<SanitizedNode>> {
+        if depth >= MAX_AUX_DEPTH {
+            return None;
+        }
+        d.map(|d| Box::new(Self::from_diagnostic(d, depth + 1)))
+    }
+
+    fn related_from(d: &dyn miette::Diagnostic, depth: usize) -> Vec<SanitizedNode> {
+        if depth >= MAX_AUX_DEPTH {
+            return Vec::new();
+        }
+        d.related()
+            .map(|rs| {
+                rs.map(|r| SanitizedNode::from_diagnostic(r, depth + 1))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for SanitizedNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Hand-written for the same reason as [`SanitizedReport`]'s: the derived `Debug` of a
+/// miette type can be its full graphical render, which would bypass the escaping.
+impl std::fmt::Debug for SanitizedNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SanitizedNode")
+            .field("message", &self.message)
+            .field("help", &self.help)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::error::Error for SanitizedNode {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|n| n as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl miette::Diagnostic for SanitizedNode {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        boxed_str(self.code.as_deref())
+    }
+
+    fn severity(&self) -> Option<miette::Severity> {
+        self.severity
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        boxed_str(self.help.as_deref())
+    }
+
+    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        boxed_str(self.url.as_deref())
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        Some(Box::new(self.labels.as_ref()?.iter().cloned()))
+    }
+
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
+        related_iter(&self.related)
+    }
+
+    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
+        self.diagnostic_source
+            .as_deref()
+            .map(|n| n as &dyn miette::Diagnostic)
+    }
+}
+
+/// Box an optional `&str` as the `Display` trait object miette's accessors return.
+fn boxed_str(s: Option<&str>) -> Option<Box<dyn std::fmt::Display + '_>> {
+    s.map(|s| -> Box<dyn std::fmt::Display + '_> { Box::new(s) })
+}
+
+/// Shared `related()` body: `None` when empty, so miette omits the section entirely.
+fn related_iter(
+    nodes: &[SanitizedNode],
+) -> Option<Box<dyn Iterator<Item = &dyn miette::Diagnostic> + '_>> {
+    if nodes.is_empty() {
+        return None;
+    }
+    Some(Box::new(nodes.iter().map(|n| n as &dyn miette::Diagnostic)))
 }
 
 impl SanitizedReport {
     fn new(inner: miette::Report) -> Self {
         let message = mds::sanitize_control_chars(&inner.to_string()).into_owned();
-        let help = inner
-            .help()
-            .map(|h| mds::sanitize_control_chars(&h.to_string()).into_owned());
-
-        // No CLI error carries a cause chain, a related diagnostic, or a diagnostic
-        // source today: `MdsError` declares no `#[source]`/`#[related]` field, and
-        // `miette::miette!()` builds a bare `MietteDiagnostic`.  This wrapper therefore
-        // reports all three as absent (see the `Diagnostic` impl below) rather than
-        // forwarding text it has not sanitized.  If a future error path introduces one,
-        // this fires in debug/test builds so the wrapper is extended to sanitize it
-        // instead of silently dropping — or silently leaking — the text.
-        debug_assert!(
-            std::error::Error::source(&*inner).is_none()
-                && inner.related().is_none()
-                && inner.diagnostic_source().is_none(),
-            "SanitizedReport: report carries a cause chain, related diagnostics, or a \
-             diagnostic source, none of which this wrapper sanitizes. Extend the \
-             Diagnostic impl to sanitize them before rendering."
-        );
+        let help = escape_display(inner.help());
+        let source = SanitizedNode::chain_from_error(std::error::Error::source(&*inner), 0)
+            .map(|boxed| *boxed);
+        let related = SanitizedNode::related_from(inner.as_ref(), 0);
+        let diagnostic_source =
+            SanitizedNode::boxed_from_diagnostic(inner.diagnostic_source(), 0).map(|boxed| *boxed);
 
         Self {
             inner,
             message,
             help,
+            source,
+            related,
+            diagnostic_source,
         }
     }
 }
@@ -580,9 +790,14 @@ impl std::fmt::Debug for SanitizedReport {
     }
 }
 
-// `source()` deliberately keeps the default `None` — see the debug_assert in
-// `SanitizedReport::new`.
-impl std::error::Error for SanitizedReport {}
+/// Forwards the **sanitized** cause chain, never the inner report's own.
+impl std::error::Error for SanitizedReport {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|n| n as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl miette::Diagnostic for SanitizedReport {
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
@@ -594,9 +809,7 @@ impl miette::Diagnostic for SanitizedReport {
     }
 
     fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        self.help
-            .as_deref()
-            .map(|h| -> Box<dyn std::fmt::Display + 'a> { Box::new(h) })
+        boxed_str(self.help.as_deref())
     }
 
     fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
@@ -611,18 +824,19 @@ impl miette::Diagnostic for SanitizedReport {
     /// preserved source); only the label *text* is escaped.  `LintDiagnostic` uses its
     /// own message as the label text, so this is a real untrusted-text surface.
     fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
-        let labels = self.inner.labels()?;
-        Some(Box::new(labels.map(|label| {
-            let text = label
-                .label()
-                .map(|t| mds::sanitize_control_chars(t).into_owned());
-            let span = *label.inner();
-            if label.primary() {
-                miette::LabeledSpan::new_primary_with_span(text, span)
-            } else {
-                miette::LabeledSpan::new_with_span(text, span)
-            }
-        })))
+        Some(Box::new(escape_labels(self.inner.as_ref())?.into_iter()))
+    }
+
+    /// The **sanitized** related-diagnostic snapshots, not the inner report's.
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
+        related_iter(&self.related)
+    }
+
+    /// The **sanitized** diagnostic source, not the inner report's.
+    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
+        self.diagnostic_source
+            .as_ref()
+            .map(|n| n as &dyn miette::Diagnostic)
     }
 }
 
@@ -659,20 +873,17 @@ fn render_error_sanitized(report: miette::Report) -> String {
 /// escape-injection safety (architecture-6 / avoids PF-004: a check enforced on the
 /// primary path silently absent on a sibling path).
 ///
-/// **This function escapes the report's message, help, and label text itself**, via
-/// [`sanitize_report`], for every report it is given — `MdsError` and CLI-authored
-/// `miette::miette!()` alike.  Callers do not need to pre-sanitize prose.
+/// **This function escapes the report's message, help, label text, and auxiliary
+/// diagnostic graph itself**, via [`sanitize_report`], for every report it is given —
+/// `MdsError` and CLI-authored `miette::miette!()` alike.  Callers do not need to
+/// pre-sanitize prose.
 ///
-/// What callers still owe, because this boundary cannot supply it:
-/// - **source text**: [`mds::neutralize_source_for_render`], which is byte-length-
-///   preserving so span byte-offsets stay valid.  Applying
-///   [`mds::sanitize_control_chars`] to source text instead would expand 1–2-byte
-///   controls to 6 bytes and desynchronise every following span.
-/// - **filename**: [`mds::sanitize_control_chars`] before it is put in a
-///   [`miette::NamedSource`].
-///
-/// Both are already done by `MdsError::at()` (compiler path) and `render_diag_human`
-/// (lint path).
+/// What callers still owe, because this boundary cannot supply it: the
+/// [`miette::NamedSource`] attached to the report, whose two halves need different
+/// treatments (byte-length-preserving neutralization for the span-indexed source, WIRE
+/// escaping for the single-line filename).  Build it with
+/// [`mds::named_source_for_render`] — `MdsError::at()` (compiler path),
+/// `check_equivalence` (formatter) and `render_diag_human` (lint path) all do.
 ///
 /// miette's own ANSI SGR styling is passed through untouched — carets and box-drawing
 /// survive intact.
@@ -695,18 +906,36 @@ pub(crate) fn eprint_error(report: miette::Report) {
 /// This closes the parallel-path gap (PF-004) that existed on the five CLI sites
 /// that call `*_collecting_warnings` variants: those variants bypass the
 /// [`emit_warnings`](mds) function in `mds-core`, which already sanitizes warnings on
-/// the primary code paths.  Routing all five sites through this helper ensures no
-/// sixth warning print can silently reopen the gap.
+/// the primary code paths.
 ///
-/// All five call sites in `main.rs` (lines ~279, ~288, ~341) and `build.rs`
-/// (lines ~694, ~1148) have been migrated to this function.
+/// **Routing those five was not sufficient, and an earlier revision of this rustdoc
+/// wrongly claimed it was** ("no sixth warning print can silently reopen the gap").  A
+/// sixth already existed: `load_lint_config` in `lint.rs` printed the unknown-`mds.json`-
+/// rule warning — whose rule NAME is an arbitrary attacker-supplied JSON object key —
+/// with a bare `eprintln!`.  That is the PF-004 failure mode exactly: a guarantee stated
+/// as a property of a code path is only ever a property of the sites someone remembered
+/// to enumerate.
+///
+/// The honest statement is therefore about *coverage now*, not about foreclosure: as of
+/// #176, every warning print in `main.rs` (~279, ~288, ~341), `build.rs` (~694, ~1148)
+/// and `lint.rs` (~202) routes through this helper.  Any new warning print must too;
+/// nothing in the type system enforces it.
+///
+/// `watch.rs`'s lifecycle status lines (`Watching {}`, `Removed {}`,
+/// `warning: could not remove {}: {e}`) are a separate, pre-existing gap outside #176's
+/// diff — they are **not** covered by this helper and are not claimed to be.
 pub(crate) fn eprint_warning(w: &str) {
     eprintln!("{}", mds::sanitize_control_chars(w));
 }
 
-/// Neutralize hostile control bytes in source text for `--diff`/`--check` preview output.
+/// Neutralize hostile control bytes in source text for `--diff` preview output.
 ///
-/// `--diff`/`--check` preview output: neutralized on TTY, byte-faithful when piped.
+/// `--diff` preview output: neutralized on TTY, byte-faithful when piped.
+///
+/// **`--diff` only.** `--check` on its own emits no preview text — just `Would fix:` /
+/// `Would reformat:` status lines, which are sanitized unconditionally via
+/// [`safe_path`] and never reach this function. The only caller is
+/// [`render_unified_diff`], shared by `mds fmt --diff` and `mds lint --fix --diff`.
 ///
 /// When `writer_is_tty` is `true`, returns [`neutralize_source_for_render`]`(text)` —
 /// a byte-length-preserving substitution that maps C0/DEL/C1 controls and the widened
@@ -734,7 +963,7 @@ pub(crate) fn eprint_warning(w: &str) {
 ///
 /// | Boundary | Mode | Content |
 /// |----------|------|---------|
-/// | `--diff`/`--check` preview output | HUMAN, TTY-gated | source excerpts via `neutralize_source_for_render`; piped path returns `Cow::Borrowed` |
+/// | `--diff` preview output | neutralized, TTY-gated | source excerpts via `neutralize_source_for_render`; piped path returns `Cow::Borrowed` |
 #[must_use]
 pub(crate) fn preview_text_for(writer_is_tty: bool, text: &str) -> Cow<'_, str> {
     if writer_is_tty {
@@ -820,17 +1049,43 @@ pub(crate) fn colorize_unified_diff(unified: &str) -> String {
     out
 }
 
-/// Sanitize a filesystem path for terminal display (CWE-150 guard).
+/// Sanitize a filesystem path for terminal display (CWE-150 / CWE-117 guard).
 ///
-/// Converts the path to a display string and applies [`mds::sanitize_control_chars`]
-/// so hostile filenames containing control sequences (e.g. `ESC[2J`) cannot inject
-/// ANSI terminal commands into status lines.
+/// Converts the path to a display string and applies WIRE-mode
+/// [`mds::sanitize_control_chars_wire`] so hostile filenames cannot inject ANSI
+/// terminal commands (e.g. `ESC[2J`) *or* forge additional status lines.
+///
+/// # Why WIRE and not HUMAN
+///
+/// Status lines are single-line by construction: `Clean: {path}`, `Fixed: {path}`,
+/// `Compiled to {path}` are emitted unframed and unindented, one per file. POSIX
+/// permits a newline inside a filename, and the user never types the name — `mds lint .`
+/// discovers it by directory walk. HUMAN mode preserves newlines (so that multi-line
+/// diagnostic *messages* keep rendering), which would let a file whose name embeds
+/// `<LF>Clean: real.mds<LF>OK: all-fine.mds` emit two attacker-authored lines
+/// byte-identical in form to genuine output. A filename is never legitimately
+/// multi-line, so escaping the newline to its six-character literal costs nothing and
+/// closes the forgery.
+///
+/// This matches the treatment `files[].file` already gets on the JSON wire surface
+/// (`LintResult::to_canonical_json`) and that miette frame headers get via
+/// [`mds::named_source_for_render`] — the human status path was the inconsistent one.
 ///
 /// All status-line path interpolations (`Clean:`, `Fixed:`, `Compiled to:`, etc.) in
 /// `lint`, `fmt`, and `build` must route through this helper (avoids PF-004 /
 /// security-5: unsanitized filename vector in status output).
 pub(crate) fn safe_path(p: &std::path::Path) -> String {
-    mds::sanitize_control_chars(&p.display().to_string()).into_owned()
+    safe_file_display(&p.display().to_string())
+}
+
+/// [`safe_path`] for a filename that is already a `&str` (e.g. a `LintDiagnostic::file`
+/// basename that never became a `Path`).
+///
+/// Exists so those sites cannot drift into open-coding a different escape mode — the
+/// exact PF-004 shape that left `Clean: {filename}` on HUMAN mode while every other
+/// status line was on WIRE.
+pub(crate) fn safe_file_display(name: &str) -> String {
+    mds::sanitize_control_chars_wire(name).into_owned()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1517,6 +1772,157 @@ mod tests {
         assert_eq!(
             before, after,
             "sanitizing must not alter the render of a clean diagnostic"
+        );
+    }
+
+    // ── sanitize_report: the auxiliary diagnostic graph (PF-005 / #176) ─────────
+    //
+    // `source()` / `related()` / `diagnostic_source()` used to be reported as absent,
+    // guarded only by a `debug_assert!` that no CLI error populates them. `debug_assert!`
+    // is compiled out of release, so that invariant was real in tests and ABSENT in the
+    // shipped binary: the first error type to grow a `#[source]` field would have had
+    // its cause chain silently dropped from release stderr while CI stayed green.
+    //
+    // These tests are pure functional assertions on the `Diagnostic` impl, so they hold
+    // identically in debug and release — which is the point.
+
+    /// A two-link cause chain: an outer diagnostic whose `#[source]` carries hostile text.
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("outer failure")]
+    struct OuterWithCause {
+        #[source]
+        cause: InnerCause,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("inner cause: {0}")]
+    struct InnerCause(String);
+
+    /// A diagnostic that hangs a hostile `related` diagnostic off itself.
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("parent diagnostic")]
+    struct ParentWithRelated {
+        #[related]
+        related: Vec<RelatedChild>,
+    }
+
+    #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+    #[error("related child: {0}")]
+    #[diagnostic(help("child help: {0}"))]
+    struct RelatedChild(String);
+
+    /// The hostile fragment shared by the auxiliary-graph tests: one C0 byte, one
+    /// 3-byte bidi control, and the 2-byte bidi control #176 added.
+    fn hostile_fragment() -> String {
+        format!("bad{}[31m{}{}end", '\u{1b}', '\u{202e}', '\u{061c}')
+    }
+
+    /// Negative + positive assertions shared by T-AUX-1/2/3.
+    fn assert_aux_text_escaped(rendered: &str, surface: &str) {
+        for raw in ['\u{1b}', '\u{202e}', '\u{061c}'] {
+            assert!(
+                !rendered.contains(raw),
+                "{surface}: raw U+{:04X} must not survive into the rendered frame; \
+                 got: {rendered:?}",
+                raw as u32
+            );
+        }
+        // Uppercase literals from a lowercase-hex source vector: proof the byte really
+        // decoded and was really escaped rather than passing through as literal text.
+        for escaped in ["\\u001B", "\\u202E", "\\u061C"] {
+            assert!(
+                rendered.contains(escaped),
+                "{surface}: {escaped} must appear in the rendered frame; got: {rendered:?}"
+            );
+        }
+    }
+
+    /// T-AUX-1 [PF-005 / security-11 / PF-013 / #176]: a report carrying a `#[source]`
+    /// cause chain renders that cause, escaped — neither leaked raw nor dropped.
+    #[test]
+    fn sanitize_report_escapes_and_preserves_the_cause_chain() {
+        let report = sanitize_report(miette::Report::new(OuterWithCause {
+            cause: InnerCause(hostile_fragment()),
+        }));
+        let rendered = render_nocolor(&report);
+
+        // Non-vacuity: the cause is actually rendered. This is the assertion that fails
+        // if `source()` reverts to returning `None` — the release-build silent drop.
+        assert!(
+            rendered.contains("inner cause"),
+            "non-vacuity: the cause chain must still render; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("outer failure"),
+            "non-vacuity: the outer message must still render; got: {rendered:?}"
+        );
+        assert_aux_text_escaped(&rendered, "cause chain");
+    }
+
+    /// T-AUX-2 [PF-005 / #176]: `related()` diagnostics — message AND help — are
+    /// escaped and preserved.
+    #[test]
+    fn sanitize_report_escapes_and_preserves_related_diagnostics() {
+        let report = sanitize_report(miette::Report::new(ParentWithRelated {
+            related: vec![RelatedChild(hostile_fragment())],
+        }));
+        let rendered = render_nocolor(&report);
+
+        assert!(
+            rendered.contains("parent diagnostic"),
+            "non-vacuity: the parent message must render; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("related child"),
+            "non-vacuity: the related diagnostic must still render; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("child help"),
+            "non-vacuity: the related diagnostic's help must still render; got: {rendered:?}"
+        );
+        assert_aux_text_escaped(&rendered, "related diagnostics");
+    }
+
+    /// T-AUX-3 [PF-005 / #176]: the walk is depth-bounded, so a self-referential
+    /// `source()` cannot hang or overflow the stack during rendering.
+    ///
+    /// `Cycle::source()` returns `self`, an infinite chain. Construction must terminate.
+    #[test]
+    fn sanitize_report_bounds_a_cyclic_cause_chain() {
+        #[derive(Debug)]
+        struct Cycle;
+        impl std::fmt::Display for Cycle {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("cyclic cause")
+            }
+        }
+        impl std::error::Error for Cycle {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Cycle)
+            }
+        }
+        #[derive(Debug, thiserror::Error, miette::Diagnostic)]
+        #[error("outer")]
+        struct Outer(#[source] Cycle);
+
+        let wrapped = SanitizedReport::new(miette::Report::new(Outer(Cycle)));
+
+        // Walk the materialised chain and assert it is finite and within the bound.
+        let mut depth = 0usize;
+        let mut node = wrapped.source.as_ref();
+        while let Some(n) = node {
+            depth += 1;
+            assert!(
+                depth <= MAX_AUX_DEPTH,
+                "the cause-chain walk must be bounded by MAX_AUX_DEPTH"
+            );
+            node = n.source.as_deref();
+        }
+        // Non-vacuity: the bound was actually reached, so this is not passing because
+        // the chain was empty.
+        assert_eq!(
+            depth, MAX_AUX_DEPTH,
+            "an infinite chain must be truncated at exactly MAX_AUX_DEPTH"
         );
     }
 
