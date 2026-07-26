@@ -281,7 +281,14 @@ This is the most important section for any agent working on security or error-ou
 
 The design is **input-sanitizing, not output-sanitizing** (avoids PF-014). The single governing rule, normative in spec §7.5:
 
-> **Untrusted identifiers, filenames, and error causes are WIRE-escaped on every surface, human terminal output included. Prose — a diagnostic message body or help body — stays HUMAN on terminal surfaces so multi-line frames keep rendering.**
+> **On the diagnostic surfaces — the `"version": 1` JSON wire, CLI status and warning lines, `[file:line:col]` frame headers — untrusted identifiers, filenames, and error causes are WIRE-escaped, human terminal output included. Prose — a diagnostic message body or help body — stays HUMAN on terminal surfaces so multi-line frames keep rendering.**
+
+**The rule governs diagnostic output only.** Two categories are named carve-outs and are not escaped at all:
+
+1. **The command's product** — compiled template output (`mds build -o -`, `mds lint --fix -`). Escaping it would corrupt every redirect.
+2. **Functional path references** — source-map `file` / `sources` / `sourcesContent` (both the `mds build --source-map` sidecar and the `sourceMap` embedded in `CompileResult::to_canonical_json()`), and `CompileResult.dependencies`. These paths are emitted **verbatim**, control bytes and all: devtools, bundlers and IDEs resolve them against the filesystem, so an escaped path would not exist. Consumers MUST treat them as untrusted and escape them for their own destination — JSON string encoding is not escaping, since a decoded `"\n"` is a real newline again. The CLI does not depend on this: `Compiled to …` / `Source map written to …` print through `safe_path`. See spec §7.5 "Carve-out: functional path references".
+
+A reviewer reproduced (2026-07-26) that a file named with a real `\n` and ESC yields a sidecar whose decoded `file` / `sources` carry those bytes while the CLI status line for the same run is escaped. That is the carve-out working as designed, not a gap — but the per-field sentence used to claim otherwise, which is why it is now scoped to diagnostic surfaces.
 
 The discriminator is whether the value is ever legitimately multi-line. A filename, an `mds.json` rule name, a `--format` argument, and an `io::Error` cause are each rendered on exactly one line (a status line or a `[file:line:col]` frame header) — a raw `\n` in one forges a standalone line byte-identical to genuine output (CWE-117). A diagnostic body genuinely is multi-line, so escaping its newlines breaks the frame.
 
@@ -348,7 +355,7 @@ The auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_sou
 
 **Deliberate residual (not closed):** `MdsError` message bodies and CLI `miette!()` message construction interpolate untrusted text as prose (paths, `io::Error` causes, identifiers). `eprint_error` applies HUMAN mode before miette renders them, so no raw control byte reaches stderr — but a `\n` in an interpolated path or identifier survives *inside the rendered frame*. Frame content is `│`-prefixed and indented, so it cannot masquerade as a bare status line. Not closed because there are 110+ `MdsError::*(format!(…))` construction sites; fixing a few would leave the claim false at ~100 others. Named in spec §7.5.
 
-**Escaping is one-way** — the transformation is lossy and non-injective: a template literally containing ``  `` and one containing an actual ESC byte produce identical output. Consumers MUST NOT un-escape `\uXXXX` sequences back into bytes. Round-tripping is an explicit non-goal.
+**Escaping is one-way** — the transformation is lossy and non-injective: a template literally containing `\u001B` and one containing an actual ESC byte produce identical output. Consumers MUST NOT un-escape `\uXXXX` sequences back into bytes. Round-tripping is an explicit non-goal.
 
 ### The Print-Discipline Guard
 
@@ -359,10 +366,13 @@ Accepted helpers (SANITIZERS): `safe_path`, `safe_file_display`, `safe_inline`, 
 The guard:
 - Traces `let` bindings **one hop** in the same file — hoisting a `format!` out of the call is checked exactly as if written inline.
 - **Fails closed on untraceable arguments** (function parameters, loop variables, unrecognised expression shapes) — false positives cost one allowlist entry with written justification; false negatives cost another review round.
+- **Poisons non-`let` binder names** (`collect_non_let_binders`). `let`s are matched file-wide, so before this a `for` variable / parameter / closure param was resolved against unrelated `let`s of the same name and accepted if all of them were safe. Proven live: `for label in rules { eprint_warning(label) }` injected into the real `lint.rs` (which has three `let label = safe_path(…)`) passed the guard; it now fails with `lint.rs:1547: eprint_warning(untraced) interpolates unsanitized \`label\``.
 - Covers `eprint_warning` arguments too — the whole `format!` nested inside must have every interpolation pass through an accepted helper.
 - Allowlists are keyed by `(file, expression)` — an `every_allowlist_entry_is_live` test fails if an entry stops matching, preventing silent staleness.
 
-**Documented limits**: sanitizers are matched by the last path segment of the callee (an alias or a local function named `safe_path` would pass); binding traces are one hop within one file; allowlist exemptions are anti-rot but not anti-reuse (a new variable reusing an exempted name in the same file inherits the exemption silently). These limits close *accidental* reintroduction (which is what all four review rounds of #176 involved) — not intentional defeat.
+**Documented limits** (five, in the file's own rustdoc): sanitizers are matched by the last path segment of the callee (an alias or a local function named `safe_path` would pass); binding traces are one hop within one file; allowlist exemptions are anti-rot but not anti-reuse (a new variable reusing an exempted name in the same file inherits the exemption silently); `write!` stream detection is by name; and the poison set models only `for` / parameter / closure binders, not `if let` / `while let` / `match`-arm ones. These limits close *accidental* reintroduction (which is what all four review rounds of #176 involved) — not intentional defeat.
+
+**The one cross-crate precondition** — that `mds-core` WIRE-escapes the identifiers its warning producers interpolate, since `mds-cli` prints whole warning strings through HUMAN-mode `eprint_warning` — is pinned by `crates/mds-cli/tests/producer_discipline.rs`. `mds-core` has exactly three such producers: `resolver.rs`'s imported-module filename (testable, and tested — a module key is a filesystem path) and `evaluator.rs`'s two `@include` alias warnings (**not** testable: the parser restricts an alias to `[A-Za-z_][A-Za-z0-9_]*`, so a test would be vacuous per PF-013 — upheld by review, and stated as such).
 
 This guard exists because three consecutive review rounds of #176 each found a NEW bare `eprintln!` after the previous one was fixed. It converts an unbounded reviewer search into a bounded enforced invariant.
 
@@ -441,7 +451,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 - **Adding a bare interpolating `eprintln!`**: `crates/mds-cli/tests/print_discipline.rs` will fail CI immediately. The guard checks `crates/mds-cli/src/**` and fails on any interpolation not routed through a WIRE helper.
 
-- **Post-processing a rendered miette frame with any sanitizer** (PF-014): Sanitizing the rendered output escapes miette's own ANSI SGR colour codes into `[33m` noise on TTYs. CI uses `NO_COLOR=1` and piped stderr so this regression would stay green indefinitely. Pre-sanitize inputs before constructing the `Report`.
+- **Post-processing a rendered miette frame with any sanitizer** (PF-014): Sanitizing the rendered output escapes miette's own ANSI SGR colour codes into `\u001B[33m` noise on TTYs. CI uses `NO_COLOR=1` and piped stderr so this regression would stay green indefinitely. Pre-sanitize inputs before constructing the `Report`.
 
 - **Putting U+061C in the 3-byte neutralization branch**: U+061C is 2 bytes in UTF-8. Routing it through the 3-byte branch (`U+FFFD`) fires the byte-length `debug_assert_eq!` (13 vs 12 bytes). This was proven, not theorized, during the #176 development. U+061C belongs in `is_two_byte_format_hazard`.
 

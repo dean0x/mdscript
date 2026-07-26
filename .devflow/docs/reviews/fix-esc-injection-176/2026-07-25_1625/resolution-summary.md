@@ -231,7 +231,9 @@ literal, a whole-expression sanitizer call, or a `format!` whose interpolations 
 accepted. A bare local is traced **one hop** through its `let` binding in the same file
 and judged by the same rule. Anything unresolved is **reported, not trusted** — the
 guard fails closed. Disposition of the five bare-`w` sites: **allowlisted with written
-justification** in a new `ALLOWED_UNTRACED_HELPER_ARGS`, kept separate from the general
+justification** in a new `ALLOWED_UNTRACED_HELPER_ARGS` — **two entries** (`build.rs`/`w`
+and `main.rs`/`w`) covering all five sites, since the list is keyed by `(file,
+expression)` — kept separate from the general
 allowlist so the exemption applies *only* in the helper-argument position. The
 justification states plainly what the reviewer observed: their safety rests on mds-core
 producer discipline (`resolver.rs`, `evaluator.rs` WIRE-escape at construction), which
@@ -298,6 +300,189 @@ difference.
 
 **Round-3 implementing commits:** `0e79385` (guard hardening), `c973331` (normative
 claim + overclaims).
+
+---
+
+## Round 4 (2026-07-26) — adversarial pass #4, and the final code round
+
+A fourth adversarial pass found one **reproduced** coverage gap and a set of sentences
+that claimed more than the code delivered. Every prior round of #176 died on that same
+failure mode, so this round's rule was: **narrow the wording to what is demonstrably
+true; add no new absolute claim anywhere.**
+
+### C1 — source-map sidecar carries raw control bytes (REPRODUCED)
+
+`mds build --source-map` on a file named `ev<LF>il<ESC>[31m.mds` writes a sidecar whose
+decoded `file` / `sources` hold a real newline and a real ESC, while the CLI status lines
+of the same run are correctly escaped:
+
+```
+# both lines describe the SAME run, on a file whose name holds a real LF and a real ESC
+stderr  : Compiled to .../ev\u000Ail\u001B[31m.md      <- escaped
+sidecar : {"version":3,"file":"ev\nil\u001b[31m.md", ...}
+python  : json.load(sidecar)['file'] -> real newline: True, real ESC: True
+```
+
+That falsified the shared per-field sentence at seven sites (`spec.md` x3,
+`diagnostic.rs`, `CHANGELOG.md`, this ledger, `KNOWLEDGE.md`).
+
+**Decision — carve source maps out; do NOT escape them.** Source Map v3 `file` /
+`sources` are *functional path references*: devtools, bundlers and IDEs resolve them
+against the filesystem. WIRE-escaping one to a `\uXXXX` literal would make the map point
+at a path that does not exist — breaking source-map resolution and dependency tracking in
+order to defend against a pathological filename. It is the same product-versus-display
+distinction that already keeps the `compiled` stdout allowlist entry unescaped: escaping
+the artefact corrupts the artefact.
+
+Implemented as an explicit, **named third carve-out** stated at every site where the
+per-field rule appears — `spec.md` §7.5 (new "Carve-out: functional path references"
+subsection, plus the `file` invariant row, the governing blockquote, the supersession
+paragraph and a new row in the mode table), `crates/mds-core/src/lint/diagnostic.rs`
+("three categories remain outside the table"), `CHANGELOG.md` ("Declared carve-out"),
+`.devflow/features/mds-lint/KNOWLEDGE.md`, and this section. Scope covers source-map
+`file` / `sources` / `sourcesContent` **and** `CompileResult.dependencies`, in the sidecar
+and in the `sourceMap` embedded in `CompileResult::to_canonical_json()`. The contract is
+stated one-way and normatively: **consumers MUST treat these paths as untrusted**; JSON
+string encoding is not escaping, since a decoded `"\n"` is a real newline again. Rustdoc
+now says so on `SourceMap` and on `CompileResult::dependencies` / `to_canonical_json`,
+where a consumer will actually read it.
+
+The per-field sentence itself was **narrowed** everywhere from "on every surface" to "on
+the diagnostic surfaces — the `"version": 1` JSON wire, CLI status and warning lines,
+`[file:line:col]` frame headers". `CHANGELOG.md`'s "every wire boundary" became "the
+diagnostic wire boundaries"; "escaped … on every surface" became "on every surface that
+renders one"; "display-hazardous, on every surface" became "on every surface that
+escapes".
+
+**Input-boundary rejection — assessed, not implemented.** Rejecting control characters in
+filenames at the input boundary (the tree walk and the `@import` path parser) would be a
+strictly stronger defence than output escaping: it fails closed once, at one place,
+instead of requiring every output site to remember. It would also remove the need for the
+carve-out to be a hazard at all, since the paths reaching a source map could then not
+carry the bytes. It is **out of scope here** — it changes which inputs compile at all
+(a breaking behavioural change), needs its own AC on `/`-and-NUL-only POSIX semantics
+versus a stricter allowlist, and belongs in a separate issue. Recorded as an assessment,
+not a plan.
+
+### C2 — two FALSE statements inside the guard's own security justification
+
+`print_discipline.rs` claimed the mds-core producer precondition was "upheld by … mds-core's
+own tests." **No such test existed**; `source_map_vfs.rs:967` only asserts
+`w.contains("segment cap")`. It also named an `evaluator.rs` producer of "rejected-value
+text" that does not exist — both evaluator sites interpolate only `inc.alias`.
+
+Rather than only striking the clauses, the precondition was **made true where it can be**.
+`mds-core` has exactly three warning producers that interpolate a runtime value:
+
+| Producer | Hostile input reachable? | Status now |
+|---|---|---|
+| `resolver.rs:1069` imported-module filename | **Yes** — a module key is a filesystem path | **Tested**: new `crates/mds-cli/tests/producer_discipline.rs` |
+| `evaluator.rs:1148` `@include` alias | No — parser requires `[A-Za-z_][A-Za-z0-9_]*` | Upheld by review, stated as such |
+| `evaluator.rs:1305` `@include` alias | No — same gate | Upheld by review, stated as such |
+
+The test lives in `mds-cli`, not `mds-core`, deliberately: it asserts the precondition on
+the exact value `build.rs` / `main.rs` hand to `eprint_warning` (`for w in
+&result.warnings`), which is what the `ALLOWED_UNTRACED_HELPER_ARGS` entries depend on —
+and it keeps `mds-core` free of executable change, so the binding suites do not need to
+re-run. Vector: an entry module importing a module named `big<ESC>[31m<U+202E>.mds` whose
+evaluation exceeds `MAX_SOURCEMAP_SEGMENTS`. PF-013 evidence: positive (both the `\u001B` and `\u202E` literals present), negative (no raw ESC, no raw U+202E, no raw `\n`),
+non-vacuity (the segment-cap warning must exist, else the haystack is empty), and
+**guard-removal proven** — deleting the `sanitize_control_chars_wire(…)` wrapper at
+`resolver.rs` makes the test fail on the raw ESC.
+
+A behavioural test of the two alias sites would assert on an input the parser rejects —
+vacuous, the PF-013 failure mode — so none is written and the asymmetry is stated in the
+guard's module doc instead of papered over.
+
+### C3 — undocumented guard bypass: non-`let` binder name collision
+
+`print_discipline.rs` affirmatively claimed a loop variable or function parameter is
+"reported, not assumed safe". It was not: `let` bindings are matched **file-wide**, so a
+`for` variable, parameter or closure param was resolved against unrelated `let`s of the
+same name and accepted when all of them were safe. Reproduced on real source — `lint.rs`
+has three `let label = safe_path(…)` bindings, so
+
+```rust
+fn atk_v12(rules: &[String]) { for label in rules { eprint_warning(label); } }
+```
+
+produced **zero sites**.
+
+**Fixed, not merely documented.** A new `collect_non_let_binders` collects every `for`
+variable, function parameter and closure parameter in a file; each **poisons** its own
+name, so `classify_helper_arg` reports such an argument instead of resolving it.
+Over-collection is the safe direction and is chosen deliberately. Proven by injecting the
+exact construct above into real `crates/mds-cli/src/lint.rs`:
+
+```
+print-discipline violation: 1 interpolation(s) reach a terminal stream unescaped.
+  lint.rs:1547: eprint_warning(untraced) interpolates unsanitized `label`
+```
+
+`lint.rs` was restored with `git checkout --` immediately after. The fix introduced **zero
+false positives** on real source: `cli_print_sites_sanitize_every_interpolated_value` and
+`every_allowlist_entry_is_live` both still pass unchanged, and no allowlist entry was
+added. A new non-vacuity assertion (>= 50 non-`let` binders found) keeps the poison set
+from silently emptying, and a new self-test
+(`the_guard_refuses_to_resolve_a_non_let_binder`) covers the `for` / parameter / closure
+shapes, asserts the collector finds each shape it models, and asserts a bitwise `|` /
+`||` operand is **not** read as a closure parameter. The residual — `if let` / `while let`
+/ `match`-arm binders are not modelled — is now **limit 5** in "Accepted limits", stated
+as the narrowed remnant of the wider hole rather than as a closed one.
+
+### C4 — doc inconsistencies
+
+- `spec.md` claimed both "C0 … except `\t`" and "`\t` is the only character **in the
+  class** that is preserved". Unified on the framing the other two documents already use:
+  `\t` is the **sole exemption** from the C0 range and is never escaped, in either mode.
+- `crates/mds-core/src/error.rs`'s `display_sanitized` rustdoc still used the retired "C0
+  except `\t` and `\n`" framing that `diagnostic.rs` says docs must not use — the
+  round-3 unification missed this third site. It now states the class once and names
+  HUMAN mode as the reason `\n` survives, with the retired framing called out explicitly.
+- `crates/mds-python/src/lib.rs` and `crates/mds-python/tests/test_errors.py` said "the
+  other four surfaces", implying five. There are four in total (CLI, napi, WASM, Python),
+  so from Python's own surface it is **three**, now named.
+- `ALLOWED_UNTRACED_HELPER_ARGS` is **two entries covering five sites** (keyed by `(file,
+  expression)`), not five entries. Corrected in this ledger and in the entry's own
+  justification.
+
+### Residuals after round 4 — the complete list
+
+Four adversarial alignment passes have now run against this branch. What remains is
+enumerated rather than implied:
+
+1. **Message-body residual** — a path / identifier / cause interpolated into an `MdsError`
+   or `miette!()` message body is prose, so it stays HUMAN on terminal surfaces and a `\n`
+   in it survives inside the rendered frame. Weaker than a status line (frame content is
+   indented and `│`-prefixed, and the prefix survives `strip()`). ~110 construction sites;
+   a separate change.
+2. **Source-map / `dependencies` carve-out** — paths verbatim, by decision (C1). The
+   one-way consumer contract is the mitigation.
+3. **Guard limits 1–5** — name-matched sanitizers, anti-rot-not-anti-reuse allowlists, the
+   one-hop single-file trace, name-based stream detection, and unmodelled `if let` /
+   `while let` / `match`-arm binders. The guard's bar is *accidental* reintroduction.
+4. **Two `evaluator.rs` producers upheld by review only** — untestable today because the
+   parser closes the vector (C2).
+5. **Escaping is one-way and non-injective** — a decided, documented non-goal, not a gap.
+
+### Round-4 verification
+
+| Command | Result |
+|---------|--------|
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS (zero warnings) |
+| `cargo nextest run --workspace` | PASS — **1980** tests across 28 binaries (baseline 1978, +2 new) |
+| `cargo test --doc --workspace` | PASS — **37** doctests (unchanged) |
+| `mds-cli::security` | 22 tests (unchanged) |
+| M1 / M2 forgery re-verification | PASS — 0 forged bare lines, 0 raw control bytes |
+| Binding suites (pytest / napi / universal JS / wasm-pack) | **not run — not required**: the round's diff under `crates/{mds-core,mds-wasm,mds-napi,mds-python}` contains zero non-`///`/`//!` lines apart from one Python test *docstring*, so no executable code changed |
+
+Raw-control-byte audit of every changed file: **0** (the two ESC bytes the tool
+layer decoded into `producer_discipline.rs`, and two pre-existing ones in
+`KNOWLEDGE.md`, were replaced with the six-character literal text).
+
+**Round-4 implementing commits:** `0ce1966` (guard fail-closed + `producer_discipline.rs`),
+`731c3b3` (source-map carve-out + claim narrowing + doc unification).
 
 ## Blocked
 | Issue | File:Line | Blocker |
