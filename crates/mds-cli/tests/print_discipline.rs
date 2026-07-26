@@ -44,9 +44,19 @@
 //!   accepted. A **bare local** is traced one hop through its `let` binding in the same
 //!   file and judged by the same rule — so hoisting the message out of the call
 //!   (`let msg = format!("… {name}"); eprint_warning(&msg);`) is checked exactly as if it
-//!   had been written inline. Anything the trace cannot resolve — a loop variable, a
-//!   function parameter, an expression shape not listed above — is **reported**, not
-//!   assumed safe. The guard fails closed: a false positive costs one allowlist entry with
+//!   had been written inline. An expression shape not listed above, and a name with no
+//!   visible `let`, are **reported**, not assumed safe.
+//!
+//!   Because `let` bindings are matched by name file-wide, a name that is *also*
+//!   introduced by a non-`let` binder would otherwise be judged by whatever unrelated
+//!   `let` of that name happens to exist elsewhere in the file. [`collect_non_let_binders`]
+//!   closes that: every `for`-loop variable, function parameter and closure parameter in
+//!   the file **poisons** its name, so such an argument is reported rather than resolved.
+//!   [`the_guard_refuses_to_resolve_a_non_let_binder`] is the proof. Pattern binders the
+//!   collector does not model — `if let` / `while let` / `match`-arm bindings — are
+//!   limit 5 under "Accepted limits".
+//!
+//!   The guard fails closed: a false positive costs one allowlist entry with
 //!   a written justification, a false negative costs another review round.
 //!
 //! **Not covered, deliberately, and not claimed to be:**
@@ -63,10 +73,26 @@
 //!   and must stay byte-faithful.
 //! - `crates/mds-core/**` warning *producers*. Core does not print except through
 //!   `emit_warnings`, which escapes in HUMAN mode; the identifiers its warning producers
-//!   interpolate (`resolver.rs`'s module filename, `evaluator.rs`'s `@include` alias) are
-//!   WIRE-escaped at construction instead. That is producer discipline, upheld by review
-//!   and by `mds-core`'s own tests — this guard cannot see across the crate boundary, and
-//!   [`ALLOWED_UNTRACED_HELPER_ARGS`] is where that dependency is written down.
+//!   interpolate are WIRE-escaped at construction instead. This guard is lexical and
+//!   cannot follow a value across a crate boundary, so that is a **precondition it
+//!   depends on and does not check**; [`ALLOWED_UNTRACED_HELPER_ARGS`] is where the
+//!   dependency is written down.
+//!
+//!   `mds-core` has exactly three warning producers that interpolate a runtime value.
+//!   Their status differs and is worth stating exactly, because "upheld by tests" was
+//!   claimed here once when it was not true:
+//!   - `resolver.rs`'s imported-module filename (the source-map segment-cap warning) —
+//!     the only one whose input can actually carry a hostile character, since a module
+//!     key is a filesystem path. **Pinned by a test**:
+//!     `crates/mds-cli/tests/producer_discipline.rs`, which compiles a module named with
+//!     a real ESC byte and asserts the warning that reaches this crate is WIRE-escaped.
+//!   - `evaluator.rs`'s two `@include` alias warnings — **upheld by review only, and not
+//!     testable today.** The parser admits an `@include` alias only if it matches
+//!     `[A-Za-z_][A-Za-z0-9_]*` (`parser.rs`'s `is_valid_identifier` check), so no
+//!     hostile character can reach either site; the WIRE call there is defence in depth
+//!     against a future parser relaxation. A behavioural test of it would assert on an
+//!     input the parser rejects, i.e. it would be vacuous — the PF-013 failure mode — so
+//!     none is written.
 //!
 //! # Accepted limits
 //!
@@ -89,6 +115,15 @@
 //! 4. **Stream detection for `write!` is by name.** `let out = std::io::stderr()` is
 //!    followed, but a handle whose name and initialiser both avoid the words `stdout` and
 //!    `stderr` (passed in as a parameter, say) is not recognised as a terminal.
+//! 5. **Only three non-`let` binder shapes poison a name.** [`collect_non_let_binders`]
+//!    models `for` variables, function parameters and closure parameters — the shapes a
+//!    hostile value plausibly arrives in. It does **not** model `if let` / `while let` /
+//!    `match`-arm bindings, so a name introduced by one of those and passed bare to
+//!    `eprint_warning` is still resolved against the file's `let`s. This is the narrowed
+//!    remnant of a wider hole: before limit 5 existed, *every* non-`let` binder was
+//!    resolved that way, and `for label in rules { eprint_warning(label) }` in `lint.rs`
+//!    passed the guard because the file's three unrelated `let label = safe_path(…)`
+//!    bindings were all safe.
 //!
 //! Every one of these requires writing code that looks wrong on purpose. The bar this
 //! guard is built to meet is **accidental** reintroduction — the four times #176 was
@@ -110,14 +145,15 @@
 //! - **Positive:** [`the_guard_flags_a_bare_interpolating_print`] proves the scanner
 //!   reports the exact expression from a synthetic violation;
 //!   [`the_guard_follows_a_hoisted_format_binding`] proves the same for a message hoisted
-//!   into a local, and [`the_guard_reports_an_untraceable_helper_argument`] for one it
-//!   cannot resolve at all.
+//!   into a local, [`the_guard_reports_an_untraceable_helper_argument`] for one it
+//!   cannot resolve at all, and [`the_guard_refuses_to_resolve_a_non_let_binder`] for one
+//!   whose name is shadowed by a `for` / parameter / closure binder.
 //! - **Negative:** [`cli_print_sites_sanitize_every_interpolated_value`] proves the real
 //!   sources are clean.
 //! - **Non-vacuity:** the same test asserts the scanner actually found the crate's
-//!   modules, its print sites, its interpolations, its `let` bindings, and its calls into
-//!   the sanitizing print helpers, so it cannot pass because the parser silently returned
-//!   nothing.
+//!   modules, its print sites, its interpolations, its `let` bindings, the non-`let`
+//!   binders that poison a name, and its calls into the sanitizing print helpers, so it
+//!   cannot pass because the parser silently returned nothing.
 //! - **Allowlist rot:** [`every_allowlist_entry_is_live`] fails if an entry in either
 //!   allowlist stops matching anything, so exemptions cannot outlive the code that
 //!   needed them.
@@ -308,12 +344,15 @@ const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
         "`for w in &result.warnings` — `w` is a whole warning string produced by \
          `mds-core`, not a value this crate interpolates. HUMAN mode is the correct mode \
          for it: it is prose, legitimately multi-line. What makes it safe is that \
-         `mds-core`'s warning producers WIRE-escape every identifier they interpolate at \
-         construction (`resolver.rs`'s module filename, `evaluator.rs`'s `@include` alias \
-         and rejected-value text) — see the boundary table in \
-         `crates/mds-core/src/lint/diagnostic.rs`. That is PRODUCER DISCIPLINE, upheld by \
-         mds-core's own tests and by review; this guard is lexical and cannot follow a \
-         value across a crate boundary to confirm it.",
+         `mds-core`'s three untrusted-value warning producers WIRE-escape at construction: \
+         `resolver.rs`'s imported-module filename, and `evaluator.rs`'s two `@include` \
+         alias warnings — see the boundary table in \
+         `crates/mds-core/src/lint/diagnostic.rs`. That is PRODUCER DISCIPLINE, which this \
+         lexical guard cannot follow across a crate boundary to confirm. It is upheld by \
+         review, plus one test on the only producer whose input can carry a hostile \
+         character: `producer_discipline.rs` in this crate. The two alias sites are upheld \
+         by review alone — the parser restricts an alias to `[A-Za-z_][A-Za-z0-9_]*`, so \
+         testing them would be vacuous (PF-013). See this file's module doc.",
     ),
     (
         "main.rs",
@@ -321,8 +360,9 @@ const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
         "`for w in &warnings` on the `mds check` file, stdin and directory paths — same \
          value and same reasoning as the `build.rs` entry above: a whole `mds-core` \
          warning string, prose, HUMAN by design, safe because mds-core WIRE-escapes the \
-         identifiers it interpolates at construction rather than because anything in this \
-         crate checks it.",
+         identifiers it interpolates at construction rather than because this lexical \
+         guard checks it. Two entries — this one and `build.rs`'s — cover all five live \
+         bare-`w` sites, because the list is keyed by (file, expression).",
     ),
 ];
 
@@ -345,6 +385,7 @@ fn cli_print_sites_sanitize_every_interpolated_value() {
     let mut total_sites = 0usize;
     let mut total_exprs = 0usize;
     let mut total_bindings = 0usize;
+    let mut total_non_let = 0usize;
     let mut total_helper_calls = 0usize;
 
     for file in &files {
@@ -352,6 +393,7 @@ fn cli_print_sites_sanitize_every_interpolated_value() {
         let src = std::fs::read_to_string(file).expect("mds-cli source must be readable");
         let masked = mask_comments(&src);
         total_bindings += collect_let_bindings(&masked).len();
+        total_non_let += collect_non_let_binders(&masked).len();
         total_helper_calls += find_invocations(&masked, SANITIZING_PRINT_HELPERS).len();
         for site in collect_sites(&src) {
             total_sites += 1;
@@ -386,6 +428,12 @@ fn cli_print_sites_sanitize_every_interpolated_value() {
         total_bindings >= 100,
         "non-vacuity: the binding trace is only as good as the bindings it finds; \
          expected at least 100 `let` bindings across mds-cli/src, found {total_bindings}"
+    );
+    assert!(
+        total_non_let >= 50,
+        "non-vacuity: the poison set is only as good as the binders it finds; expected at \
+         least 50 non-`let` binders (for-loop vars, fn params, closure params) across \
+         mds-cli/src, found {total_non_let}"
     );
     assert!(
         total_helper_calls >= 10,
@@ -632,6 +680,93 @@ fn the_guard_reports_an_untraceable_helper_argument() {
 }
 
 #[test]
+fn the_guard_refuses_to_resolve_a_non_let_binder() {
+    // The bypass this closes: `let` bindings are matched file-wide, so a name introduced
+    // by a `for` variable / parameter / closure param used to be judged by whatever
+    // unrelated `let`s of that name the file contained — and accepted if all of them were
+    // safe. This is the exact construct, against the exact shape `lint.rs` carries
+    // (`let label = safe_path(…)`, three times). Before `collect_non_let_binders` it
+    // produced ZERO sites.
+    let for_var = r#"
+        fn render(p: &Path, source: &str, fixed: &str) -> String {
+            let label = safe_path(p);
+            render_unified_diff(source, fixed, &label)
+        }
+        fn atk_v12(rules: &[String]) {
+            for label in rules {
+                eprint_warning(label);
+            }
+        }
+    "#;
+    let sites = collect_sites(for_var);
+    assert_eq!(
+        sites.len(),
+        1,
+        "the `for label in rules` binder must be reported even though every `let label` \
+         in the file is safe; got {sites:?}"
+    );
+    assert_eq!(sites[0].exprs, vec!["label".to_string()]);
+    assert!(
+        sites[0].kind.ends_with("(untraced)"),
+        "it must land in the untraced position so ALLOWED_UNTRACED_HELPER_ARGS is what \
+         exempts it, not the general allowlist; got {:?}",
+        sites[0].kind
+    );
+
+    // Same hole through a function parameter and through a closure parameter.
+    for src in [
+        r#"
+            fn render(p: &Path) -> String { let note = safe_path(p); wrap(note) }
+            fn atk(note: &str) { eprint_warning(note); }
+        "#,
+        r#"
+            fn render(p: &Path) -> String { let note = safe_path(p); wrap(note) }
+            fn atk(v: &[String]) { v.iter().for_each(|note| eprint_warning(note)); }
+        "#,
+    ] {
+        let sites = collect_sites(src);
+        assert_eq!(
+            sites.len(),
+            1,
+            "a parameter / closure param must not be resolved through an unrelated \
+             `let` of the same name; got {sites:?}"
+        );
+        assert!(sites[0].kind.ends_with("(untraced)"));
+    }
+
+    // The collector must find each shape it claims to model.
+    let binders = collect_non_let_binders(
+        "fn f(alpha: &str, beta: usize) { for gamma in xs { xs.map(|delta| delta); } }",
+    );
+    for want in ["alpha", "beta", "gamma", "delta"] {
+        assert!(
+            binders.iter().any(|b| b == want),
+            "`{want}` must be collected as a non-`let` binder; got {binders:?}"
+        );
+    }
+
+    // …and must not read a bitwise / logical `|` as a closure, which would poison the
+    // names of arbitrary operands and turn the guard into noise.
+    let bitwise = collect_non_let_binders("fn f() { let m = flag_a | flag_b; let n = x || y; }");
+    assert!(
+        !bitwise
+            .iter()
+            .any(|b| b == "flag_a" || b == "flag_b" || b == "x" || b == "y"),
+        "an operand of `|` / `||` is not a closure parameter; got {bitwise:?}"
+    );
+
+    // A name that is ONLY `let`-bound is still resolved — the fix must not have made the
+    // trace useless.
+    assert!(
+        collect_sites(
+            r#"fn f(p: &Path) { let only_let = safe_path(p); eprint_warning(&only_let); }"#
+        )
+        .is_empty(),
+        "a purely `let`-bound safe local must still be accepted"
+    );
+}
+
+#[test]
 fn the_guard_scans_writes_to_a_stream_but_not_to_a_buffer() {
     // B4: `writeln!(std::io::stderr(), …)` reaches a terminal exactly like `eprintln!`.
     // There are none in the crate today; this pins the rule before the first one lands.
@@ -792,6 +927,7 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 fn collect_sites(src: &str) -> Vec<Site> {
     let masked = mask_comments(src);
     let bindings = collect_let_bindings(&masked);
+    let non_let = collect_non_let_binders(&masked);
     let mut sites = Vec::new();
 
     for inv in find_invocations(&masked, PRINT_MACROS) {
@@ -822,7 +958,7 @@ fn collect_sites(src: &str) -> Vec<Site> {
     // its own right — and the argument may be a local rather than an inline `format!`,
     // so classify it, tracing one hop through its `let` binding.
     for call in find_invocations(&masked, SANITIZING_PRINT_HELPERS) {
-        match classify_helper_arg(&call.body, &bindings, TRACE_BUDGET) {
+        match classify_helper_arg(&call.body, &bindings, &non_let, TRACE_BUDGET) {
             ArgVerdict::Safe => {}
             // A `format!` with nothing interpolated, or a binding that resolved wholly to
             // sanitizer calls, has nothing left to judge — do not record an empty site.
@@ -919,6 +1055,125 @@ fn collect_let_bindings(text: &str) -> Vec<Binding> {
     out
 }
 
+/// Collect every name in already-masked source that is introduced by something *other*
+/// than a `let` — a `for`-loop variable, a function parameter, or a closure parameter.
+///
+/// # Why
+///
+/// `collect_let_bindings` matches names file-wide, not per scope. Without this set, a
+/// name bound by one of the shapes above was resolved against whatever unrelated `let`s
+/// of the same name the file happened to contain, and was accepted if all of them were
+/// safe. On real source that was a live bypass:
+///
+/// ```ignore
+/// // in lint.rs, which has three unrelated `let label = safe_path(…);` bindings
+/// fn atk(rules: &[String]) { for label in rules { eprint_warning(label); } }
+/// ```
+///
+/// Every name returned here **poisons** itself for [`classify_helper_arg`]: a bare
+/// argument with that name is reported instead of resolved, whatever its `let`s say. A
+/// name collected here that is genuinely safe costs one allowlist entry; the opposite
+/// mistake costs a review round.
+///
+/// Over-collection is the safe direction, so the shapes are matched loosely: for a `for`
+/// pattern and a parameter pattern, *every* identifier-shaped token in the pattern is
+/// taken, keywords aside. `if let` / `while let` / `match`-arm binders are **not**
+/// modelled — limit 5 in the module doc.
+fn collect_non_let_binders(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if let Some(next) = skip_literal(text, b, i) {
+            i = next;
+            continue;
+        }
+        // `for <pattern> in …` — the pattern ends at the ` in ` that follows it.
+        if text[i..].starts_with("for")
+            && !prev_is_ident(b, i)
+            && b.get(i + 3).is_some_and(u8::is_ascii_whitespace)
+        {
+            let tail = &text[i + 3..];
+            // Bound the search: a `for` header never runs past its opening brace.
+            let head = &tail[..tail.find('{').unwrap_or(tail.len()).min(400)];
+            if let Some(kw) = head.find(" in ") {
+                push_pattern_idents(&head[..kw], &mut out);
+            }
+            i += 3;
+            continue;
+        }
+        // `fn name(<params>)` — one entry per parameter.
+        if text[i..].starts_with("fn")
+            && !prev_is_ident(b, i)
+            && b.get(i + 2).is_some_and(u8::is_ascii_whitespace)
+        {
+            if let Some(rel) = text[i..].find('(') {
+                let open = i + rel;
+                if let Some(close) = matching_paren(text, b, open) {
+                    for param in split_top_level(&text[open + 1..close]) {
+                        // `name: Type` — the pattern is everything before the top-level `:`.
+                        let pat = param.split(':').next().unwrap_or(&param);
+                        push_pattern_idents(pat, &mut out);
+                    }
+                    i = close;
+                    continue;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        // Closure parameters, `|a, b|` / `|a: &T|`. A `|` is only read as the opening
+        // delimiter when what follows, up to the next `|`, is parameter-shaped: nothing
+        // but identifiers, commas, `&`, `mut`, `ref` and type annotations. That excludes
+        // `a | b` (bitwise or) and `a || b`, whose operands are arbitrary expressions.
+        if b[i] == b'|' && b.get(i + 1) != Some(&b'|') {
+            let tail = &text[i + 1..];
+            if let Some(rel) = tail.find('|') {
+                let params = &tail[..rel];
+                if is_closure_param_list(params) {
+                    for param in split_top_level(params) {
+                        let pat = param.split(':').next().unwrap_or(&param);
+                        push_pattern_idents(pat, &mut out);
+                    }
+                    // Resume *past* the closing `|`, so the text after a closure is never
+                    // read as the parameter list of the next one.
+                    i += rel + 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Binding-position keywords and the receiver, none of which name a value a caller
+/// controls.
+const PATTERN_KEYWORDS: &[&str] = &["mut", "ref", "self", "impl", "dyn", "in"];
+
+/// Push every identifier-shaped token in a binding pattern.
+fn push_pattern_idents(pattern: &str, out: &mut Vec<String>) {
+    for tok in pattern.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+        if is_ident(tok) && !PATTERN_KEYWORDS.contains(&tok) {
+            out.push(tok.to_string());
+        }
+    }
+}
+
+/// Does `s` look like the inside of a closure's `|…|`, rather than the right-hand side
+/// of a bitwise `|`? Empty is a closure (`||` is handled by the caller as an early-out,
+/// so this only sees `| |`); otherwise every character must be pattern-shaped.
+fn is_closure_param_list(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c.is_ascii_whitespace()
+                || matches!(c, '_' | ',' | ':' | '&' | '<' | '>' | '\'' | '[' | ']')
+        })
+}
+
 /// From the start of a binding's `: Type = init;` tail, find the top-level `=` and the
 /// top-level `;` that closes it.
 fn find_init_bounds(text: &str, b: &[u8], from: usize) -> Option<(usize, usize)> {
@@ -970,8 +1225,14 @@ fn skip_ws(b: &[u8], mut i: usize) -> usize {
 /// Accepts a string literal, a whole-expression sanitizer call, or a whole-expression
 /// `format!` (whose interpolations are returned for the caller to check). A bare
 /// identifier is resolved through its `let` bindings, up to `budget` hops; a name with no
-/// visible binding, or with any binding that is itself unrecognised, is `Unchecked`.
-fn classify_helper_arg(arg: &str, bindings: &[Binding], budget: u8) -> ArgVerdict {
+/// visible binding, with any binding that is itself unrecognised, or that appears in
+/// `non_let` (see [`collect_non_let_binders`]), is `Unchecked`.
+fn classify_helper_arg(
+    arg: &str,
+    bindings: &[Binding],
+    non_let: &[String],
+    budget: u8,
+) -> ArgVerdict {
     let e = arg.trim().trim_start_matches(['&', ' ']).trim();
     if e.is_empty() {
         return ArgVerdict::Unchecked;
@@ -997,16 +1258,18 @@ fn classify_helper_arg(arg: &str, bindings: &[Binding], budget: u8) -> ArgVerdic
         };
     }
 
-    // A bare local: follow its binding(s).
+    // A bare local: follow its binding(s) — unless the name is also introduced by a
+    // `for` variable, a parameter or a closure param somewhere in the file, in which case
+    // the file's `let`s of that name say nothing about this value. Fail closed.
     if is_ident(e) {
-        if budget == 0 {
+        if budget == 0 || non_let.iter().any(|n| n == e) {
             return ArgVerdict::Unchecked;
         }
         let mut matched = false;
         let mut exprs = Vec::new();
         for binding in bindings.iter().filter(|b| b.name == e) {
             matched = true;
-            match classify_helper_arg(&binding.init, bindings, budget - 1) {
+            match classify_helper_arg(&binding.init, bindings, non_let, budget - 1) {
                 ArgVerdict::Safe => {}
                 ArgVerdict::Checked { exprs: mut v, .. } => exprs.append(&mut v),
                 // One unrecognised binding of this name poisons the whole trace.
