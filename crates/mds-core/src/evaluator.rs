@@ -1144,9 +1144,10 @@ fn evaluate_include(
         Some(body) => body.clone(),
         None => {
             if ctx.warnings.len() < MAX_WARNINGS {
+                // Untrusted identifier from template source — WIRE (spec 7.5).
                 ctx.warnings.push(format!(
                     "warning: @include of '{}' produced empty output — module has no body text",
-                    inc.alias
+                    crate::lint::sanitize_control_chars_wire(&inc.alias)
                 ));
             }
             return Ok(String::new());
@@ -1300,9 +1301,10 @@ fn collect_messages_strict(
             Node::Include(inc) => {
                 // @include in messages mode is not meaningful — warn.
                 if ctx.warnings.len() < MAX_WARNINGS {
+                    // Untrusted identifier from template source — WIRE (spec 7.5).
                     ctx.warnings.push(format!(
                         "warning: @include '{}' inside messages mode is ignored",
-                        inc.alias
+                        crate::lint::sanitize_control_chars_wire(&inc.alias)
                     ));
                 }
             }
