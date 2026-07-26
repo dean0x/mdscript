@@ -294,8 +294,9 @@ pub(crate) fn resolve_output_path_for_kind(
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     let expected = kind.extension();
                     if ext != expected {
-                        // The `-o` value and the extension derived from it are
-                        // filenames: WIRE on every surface (spec §7.5 per-field rule).
+                        // The `-o` value and the extension derived from it occupy a
+                        // diagnostic `file` field on a status line: WIRE (spec §7.5
+                        // per-field rule).
                         // The escape call is repeated rather than bound to a local so it
                         // is visible at each interpolation — the print-discipline guard
                         // reads call sites, not bindings.
@@ -1210,6 +1211,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                         write_output(Some(out.clone()), &content, quiet, true)?;
                         if let Some(ref sm) = source_map {
                             let map_path = map_path_for(out);
+                            // The sidecar's `file` / `sources` / `sourcesContent` are
+                            // written VERBATIM, by decision — spec §7.5 "Carve-out:
+                            // functional path references". They are resolved against the
+                            // filesystem by devtools and bundlers, so a `\uXXXX`-escaped
+                            // path would not exist. Consumers must treat them as
+                            // untrusted; see the `mds::SourceMap` rustdoc. The status
+                            // line below is a diagnostic surface and IS escaped.
                             let map_json = sm.to_json();
                             std::fs::write(&map_path, &map_json).map_err(|e| {
                                 miette::miette!("cannot write {}: {e}", map_path.display())

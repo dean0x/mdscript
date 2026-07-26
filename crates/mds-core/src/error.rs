@@ -916,13 +916,19 @@ impl MdsError {
 
     /// Return a terminal-safe, sanitized version of this error's `Display` text.
     ///
-    /// All C0 control characters (except `\t` and `\n`), DEL (U+007F), C1 control
-    /// characters (U+0080–U+009F), all twelve Unicode bidi controls (U+061C,
-    /// U+200E/U+200F, U+202A–U+202E, U+2066–U+2069), U+2028/U+2029, and U+FEFF are replaced by their
-    /// six-character `\uXXXX` escape literals.  `\t` and `\n` are preserved so that
-    /// multi-line miette renders remain readable — this is the one deliberate
-    /// difference from [`MdsError::serialize`], which is a machine-readable (wire)
-    /// boundary and escapes `\n` as well.
+    /// The escaped class is the one spec §7.5 defines: C0 (U+0000–U+001F) with `\t`
+    /// (U+0009) as the sole exemption, DEL (U+007F), C1 (U+0080–U+009F), all twelve
+    /// Unicode bidi controls (U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069),
+    /// U+2028/U+2029, and U+FEFF.  Each is replaced by its six-character `\uXXXX` escape
+    /// literal.
+    ///
+    /// This is **HUMAN mode**, so `\n` — which *is* in the class — is preserved, keeping
+    /// multi-line miette renders readable.  Whether `\n` is escaped is a property of the
+    /// mode, not of the class; describing the class as "C0 except `\t` and `\n`" folds
+    /// the two together and is exactly the framing spec §7.5 retired.  That mode choice
+    /// is the one deliberate difference from [`MdsError::serialize`], which is a
+    /// machine-readable (wire) boundary and escapes `\n` as well.  `\t` is preserved in
+    /// both modes.
     ///
     /// The escaping is one-way: see [`mds::sanitize_control_chars`][crate::sanitize_control_chars]
     /// — consumers must not un-escape `\uXXXX` sequences back into bytes.

@@ -333,7 +333,7 @@ def test_e13_lint_virtual_newline_in_frontmatter_key_escaped_on_wire() -> None:
     a second, independent finding in any line-oriented consumer of the value (log
     forging, YAML key injection). On the wire it must arrive as the six-character
     ``\\u000A`` literal -- and the Python surface must emit the same bytes as the
-    other four surfaces (PF-007).
+    other three surfaces: CLI, napi and WASM (PF-007).
 
     Reachability: a newline inside an ``@import "..."`` path is rejected by the lexer
     (that route would be vacuous, PF-013). A YAML *double-quoted* frontmatter key is

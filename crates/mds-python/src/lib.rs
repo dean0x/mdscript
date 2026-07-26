@@ -861,7 +861,7 @@ impl LintResult {
 ///
 /// WIRE mode: this backing store feeds `as_json()` / `to_dict()` as well as the typed
 /// getters, and must stay byte-identical to `LintResult::to_canonical_json()` on the
-/// other four surfaces (PF-007) — including the `\n` escape.
+/// other three surfaces — CLI, napi and WASM (PF-007) — including the `\n` escape.
 ///
 /// Uses `Cow` so clean strings (the common case) cause no allocation — only strings
 /// that actually contain hostile characters are replaced. No-op when the field is

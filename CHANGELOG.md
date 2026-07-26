@@ -85,7 +85,7 @@ field is present across all binding surfaces: CLI JSON output, napi
   terminal-bound text. (#176)
 
 - **CLI error *message* text is now escaped too (#176).** The hardening above
-  covered rendered source excerpts, filenames, and every wire boundary, but a
+  covered rendered source excerpts, filenames, and the diagnostic wire boundaries, but a
   diagnostic's own message and help text still reached stderr raw. Both CLI error
   families interpolate untrusted input into their messages — compiler errors carry
   template text (`invalid include alias: '<alias>'`) and CLI errors carry `mds.json`
@@ -125,21 +125,37 @@ field is present across all binding surfaces: CLI JSON output, napi
   (HUMAN-mode escaping alone is not sufficient — it preserves `\n`, which is the
   line-forgery vector), including when the message has been hoisted into a local:
   a bare identifier is traced one hop through its `let` binding and judged the same
-  way, and an argument the trace cannot resolve is **reported**, not trusted. It also
+  way, and an argument the trace cannot resolve is **reported**, not trusted. Because
+  `let`s are matched file-wide, every `for` variable, function parameter and closure
+  parameter **poisons** its own name, so a value arriving through one of those is
+  reported rather than resolved against an unrelated `let` that happens to share the
+  name. It also
   scans `write!` / `writeln!` to a stdout/stderr handle. Deliberate exceptions — the
   compiled artefact written to stdout, `&'static str` labels, integer counters, and
   whole warning strings produced by `mds-core` — live in explicit allowlists with a
   written justification per entry, and a companion test fails if an entry ever stops
   matching. The guard is a **lexical** scanner: it catches accidental reintroduction,
-  and its four known limits (name-matched sanitizers, anti-rot-not-anti-reuse
-  allowlists, the one-hop single-file trace, name-based stream detection) are stated
+  and its five known limits (name-matched sanitizers, anti-rot-not-anti-reuse
+  allowlists, the one-hop single-file trace, name-based stream detection, and the
+  `if let` / `while let` / `match`-arm binders the poison set does not model) are stated
   in its own rustdoc rather than implied away. Four successive reviews of this change
-  each found a *different* unescaped print; the guard is what ends that. (#176)
+  each found a *different* unescaped print; the guard is what ends that.
+
+  The one precondition the guard depends on and cannot check — that `mds-core` WIRE-escapes
+  the identifiers its warning producers interpolate, since `mds-cli` prints whole
+  warning strings — is now pinned by `crates/mds-cli/tests/producer_discipline.rs` for
+  the only producer whose input can carry a hostile character (`resolver.rs`'s
+  imported-module filename). The other two producers interpolate an `@include` alias,
+  which the parser restricts to `[A-Za-z_][A-Za-z0-9_]*`, so they are upheld by review
+  and stated as such rather than claimed to be tested. (#176)
 
 - **The escape mode is chosen per field, not per surface (#176).** Normative in spec
-  §7.5: **untrusted identifiers, filenames and error causes are WIRE-escaped on every
-  surface, human terminal output included; prose — a diagnostic message or help body —
-  stays HUMAN so multi-line frames keep rendering.** The discriminator is whether the
+  §7.5: **on the diagnostic surfaces — the `"version": 1` JSON wire, CLI status and
+  warning lines, `[file:line:col]` frame headers — untrusted identifiers, filenames and
+  error causes are WIRE-escaped, human terminal output included; prose — a diagnostic
+  message or help body — stays HUMAN so multi-line frames keep rendering.** The
+  rule governs *diagnostic* output; the two carve-outs below are not diagnostics and are
+  not escaped at all. The discriminator is whether the
   value is ever legitimately multi-line: a filename, a config key, a `--format`
   argument and an `io::Error` never are, so preserving a raw `\n` in one buys nothing
   and lets it forge a standalone line byte-identical in form to genuine output
@@ -147,6 +163,21 @@ field is present across all binding surfaces: CLI JSON output, napi
   exactly four boundaries" enumeration. A new `mds::sanitize_control_chars_wire` and
   `mds::named_source_for_render` are public in `mds-core` for consumers that need to
   apply the same rule.
+
+  **Declared carve-out: functional path references are NOT escaped.** Source-map
+  documents (the `mds build --source-map` sidecar, and the `sourceMap` embedded in
+  `CompileResult.to_canonical_json()`) emit their `file`, `sources` and `sourcesContent`
+  values **verbatim**, as does the `dependencies` array. These are functional references
+  that devtools, bundlers and IDEs resolve against the filesystem — rewriting a path to a
+  `\uXXXX` literal would point at a path that does not exist, breaking source-map
+  resolution and dependency tracking to defend against a pathological filename. That is
+  the same product-versus-display distinction that keeps compiled output byte-faithful.
+  **Consumers of a source map or of `dependencies` must treat every path in them as
+  untrusted** and escape it for whatever destination they render it to; JSON string
+  encoding is not that escaping, since a decoded `"\n"` is a real newline again. The CLI
+  does not rely on this: its `Compiled to …` and `Source map written to …` lines print
+  through `safe_path` and carry the escaped form even though the sidecar does not.
+  Specified in spec §7.5 ("Carve-out: functional path references"). (#176)
 
   **Declared residual.** "Identifier / filename / cause" means the value occupies such a
   *field* — a CLI status line, a `[file:line:col]` frame header, the JSON `file` key. A
@@ -170,8 +201,9 @@ field is present across all binding surfaces: CLI JSON output, napi
   preserves newlines by design so that multi-line diagnostic *messages* keep rendering,
   so a file named `evil.mds<LF>Clean: real.mds<LF>OK: all-fine.mds` made
   `mds build`/`lint`/`fmt`/`check` emit attacker-authored lines byte-identical in form
-  to genuine status output — unframed, unindented, and indistinguishable. **Filename
-  fields are now escaped in WIRE mode on every surface, human included**: `safe_path`
+  to genuine status output — unframed, unindented, and indistinguishable. **Diagnostic
+  filename fields are now escaped in WIRE mode on every surface that renders one, human
+  included** (source-map paths and `dependencies` are the declared carve-out): `safe_path`
   and the status-line printers, and the `[file:line:col]` frame header via a new shared
   `mds::named_source_for_render` builder that `MdsError::at()`, the formatter and the
   lint renderer all call. Message and help text are unchanged (still HUMAN, still
@@ -189,7 +221,7 @@ field is present across all binding surfaces: CLI JSON output, napi
 
 - **Widened escape class: bidi / separator / BOM characters (#176).** The
   escaped set now covers characters outside C0 / DEL / C1 that are still
-  display-hazardous, on every surface:
+  display-hazardous, on every surface that escapes:
   - **U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069** — the complete
     Unicode `Bidi_Control=Yes` set (all twelve codepoints), behind Trojan Source
     (CVE-2021-42574). A single U+202E in a filename or diagnostic message
@@ -218,10 +250,12 @@ field is present across all binding surfaces: CLI JSON output, napi
   **Human-render output of diagnostic PROSE is unchanged** — the CLI renderer,
   `MdsError::display_sanitized()`, and warning *bodies* on stderr still preserve
   raw newlines so multi-line diagnostic frames stay readable. Human output of
-  filenames, identifiers and causes **did** change, by design: under the per-field
-  rule above those are WIRE-escaped on every surface, human included, so a newline
+  diagnostic filenames, identifiers and causes **did** change, by design: under the
+  per-field rule above those are WIRE-escaped on every surface that renders a
+  diagnostic, human included, so a newline
   in one now renders as the six-character `\u000A` literal instead of forging a
-  line. See the two entries below.
+  line. Source-map paths and `dependencies` are unaffected: they are the declared
+  carve-out and stay verbatim. See the two entries below.
 
   **Migration:** consumers that split a `message` / `help` / warning string on
   `\n` will now see a single line containing the literal `\u000A` where a real

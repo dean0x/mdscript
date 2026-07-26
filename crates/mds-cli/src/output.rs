@@ -1118,9 +1118,12 @@ pub(crate) fn safe_file_display(name: &str) -> String {
 ///
 /// # Why WIRE, on human surfaces too
 ///
-/// Per the governing per-field rule (spec §7.5): **untrusted identifiers, filenames and
-/// causes are WIRE-escaped on every surface, human output included; only *prose* — a
-/// diagnostic message or help body — stays HUMAN.** The discriminator is whether the
+/// Per the governing per-field rule (spec §7.5): **on the diagnostic surfaces — the
+/// `"version": 1` JSON wire, CLI status and warning lines, `[file:line:col]` frame
+/// headers — untrusted identifiers, filenames and causes are WIRE-escaped, human output
+/// included; only *prose* — a diagnostic message or help body — stays HUMAN.** (Source-map
+/// paths and `CompileResult.dependencies` are the named carve-out: not diagnostics, not
+/// escaped.) The discriminator is whether the
 /// value is legitimately multi-line. A rule name, a path, a `--format` value and an
 /// `io::Error` never are; a diagnostic body genuinely is. Leaving `\n` raw in the first
 /// group buys nothing and lets the value forge a standalone status line that is

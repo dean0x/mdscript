@@ -30,9 +30,16 @@
 //! **Mode is chosen per FIELD, not per surface** — the governing rule, re-ratified
 //! 2026-07-26 and normative in spec §7.5:
 //!
-//! > Untrusted **identifiers, filenames and error causes are WIRE** on every surface,
-//! > human terminal output included. **Prose** — a diagnostic message body or help body
-//! > — stays **HUMAN** on terminal surfaces so multi-line frames keep rendering.
+//! > On the **diagnostic** surfaces — the `"version": 1` JSON wire, CLI status and
+//! > warning lines, and `[file:line:col]` frame headers — untrusted **identifiers,
+//! > filenames and error causes are WIRE**, human terminal output included. **Prose** —
+//! > a diagnostic message body or help body — stays **HUMAN** on terminal surfaces so
+//! > multi-line frames keep rendering.
+//!
+//! The rule governs diagnostic output. Two categories of output are named carve-outs and
+//! are not escaped at all — the command's **product** (compiled template output) and
+//! **functional path references** (source-map `file`/`sources`/`sourcesContent`,
+//! `CompileResult.dependencies`). Both are in "Scope of the table" below.
 //!
 //! The discriminator is whether the value is ever legitimately multi-line. A filename, an
 //! `mds.json` rule name, a `--format` argument and an `io::Error` cause are each rendered
@@ -79,7 +86,7 @@
 //! would have meant an allowlist entry in `print_discipline.rs` — a deliberate hole in
 //! the guard rather than a documented one.
 //!
-//! Two categories remain outside the table, deliberately and without a coverage claim:
+//! Three categories remain outside the table, deliberately and without a coverage claim:
 //!
 //! - **Untrusted values interpolated into a diagnostic MESSAGE BODY**, at either of its
 //!   two construction sites:
@@ -100,12 +107,27 @@
 //!   not a closed one, disclosed here and in spec §7.5 ("Residual: paths and identifiers
 //!   inside a message body").
 //!
-//!   Note the asymmetry this preserves: a path in a `file` **field** — a status line, a
-//!   `[file:line:col]` header, the JSON `file` key — *is* WIRE-escaped on every surface.
-//!   The residual is specifically a path or identifier that has been interpolated into
-//!   prose, where the per-field rule makes the surrounding body HUMAN.
+//!   Note the asymmetry this preserves: a path in a **diagnostic** `file` field — a
+//!   status line, a `[file:line:col]` header, the JSON `file` key — *is* WIRE-escaped on
+//!   every surface that renders one. The residual is specifically a path or identifier
+//!   that has been interpolated into prose, where the per-field rule makes the
+//!   surrounding body HUMAN.
 //! - **Compiled template output** (`mds build -o -`, `mds lint --fix -`). That is the
 //!   command's product, not a diagnostic; escaping it would corrupt every redirect.
+//! - **Functional path references**: the source-map `file`, `sources` and
+//!   `sourcesContent` fields — in the `mds build --source-map` sidecar and in the
+//!   `sourceMap` object embedded in [`crate::CompileResult::to_canonical_json`] — and the
+//!   `dependencies` array of that same method. These are emitted **verbatim**: a
+//!   filename containing a control byte, a `\n` or a bidi control reaches the consumer
+//!   unmodified, and JSON string encoding is not escaping (a decoded `"\n"` is a real
+//!   newline again). Devtools, bundlers and IDEs resolve `file` / `sources` against the
+//!   filesystem and the bundler plugins watch `dependencies`, so rewriting a path to a
+//!   `\uXXXX` literal would point at a path that does not exist — breaking resolution to
+//!   defend against a pathological filename. **Consumers MUST treat these paths as
+//!   untrusted and escape them for whatever destination they render them to.** Specified
+//!   in spec §7.5 ("Carve-out: functional path references"). The CLI does not depend on
+//!   this contract for its own output: `Compiled to …` and `Source map written to …`
+//!   print through `safe_path` and so carry the WIRE-escaped form.
 //!
 //! **CLI terminal path.** `mds build` / `check` / `fmt` / `lint` / `watch` all render
 //! errors through the single `eprint_error` choke-point, which wraps the `miette::Report`

@@ -141,6 +141,14 @@ pub struct CompileResult {
     pub warnings: Vec<String>,
     /// Normalized keys of all modules imported during compilation, in
     /// first-resolution (depth-first) order. Excludes the entry module.
+    ///
+    /// These are **functional path references**, not display text: bundler plugins feed
+    /// them straight back into a watcher. They are a named carve-out from the
+    /// sanitization rule (spec §7.5, "Carve-out: functional path references") and are
+    /// emitted verbatim by [`CompileResult::to_canonical_json`] — a key may contain any
+    /// byte a filesystem permits, control characters and `\n` included. Consumers that
+    /// display one must escape it themselves; [`sanitize_control_chars_wire`] applies the
+    /// same escaping the diagnostic surfaces use.
     pub dependencies: Vec<String>,
     /// Source map for the compiled output.  Present only when
     /// `CompileOptions::source_map` is `true` (AC-API-02: absent, not null, when off).
@@ -180,6 +188,16 @@ impl CompileResult {
     /// The **inactive payload field is ABSENT** — a markdown result has no `messages`
     /// key; a messages result has no `output` key. Explicit field-by-field construction
     /// via `serde_json::json!()` prevents serde derive from injecting unwanted keys.
+    ///
+    /// # Sanitization
+    ///
+    /// `warnings` entries are WIRE-escaped here (spec §7.5): a warning is display text,
+    /// and an embedded `\n` would forge an extra warning line in a line-oriented
+    /// consumer. `output` / `messages` are the command's **product** and are byte-faithful.
+    /// `dependencies` and the embedded `sourceMap` are the **functional path reference**
+    /// carve-out — emitted verbatim, so their paths reach the consumer with whatever
+    /// bytes the filesystem allowed. See [`CompileResult::dependencies`] and
+    /// [`crate::SourceMap`]; consumers that display those paths must escape them.
     pub fn to_canonical_json(self) -> serde_json::Value {
         // Sanitize warnings at the serialization boundary (issue #176 / CWE-150):
         // warning strings may embed a hostile filename.  WIRE mode — this value is
