@@ -258,11 +258,16 @@ fn collect_mds_files_inner(
     excluded_count: &mut usize,
 ) {
     if depth > max_depth {
-        eprintln!(
+        // The directory name is discovered by the walk — the user never types it — so it
+        // is untrusted on every subcommand that shares this walker (build / check / fmt /
+        // lint / watch).  Prose through `eprint_warning` (HUMAN), the path through
+        // `safe_path` (WIRE): a directory name is never legitimately multi-line, and a
+        // raw one here forged a standalone `Clean: …` line as well as emitting raw ESC.
+        eprint_warning(&format!(
             "warning: directory depth limit ({max_depth}) reached at {}; \
              deeper files will not be processed",
-            dir.display()
-        );
+            safe_path(dir)
+        ));
         return;
     }
     let read_dir = match std::fs::read_dir(dir) {
@@ -378,10 +383,13 @@ pub(crate) fn probe_and_remove_stale(base_no_ext: &Path, kind: OutputKind) {
                 // user normally needs to know about (mirrors watch "Removed …" style).
             }
             Err(e) => {
-                eprintln!(
-                    "warning: could not remove stale output {}: {e}",
-                    stale_path.display()
-                );
+                // Same shape as the depth-limit warning above: the path is walker-derived
+                // and the `io::Error` Display embeds a path of its own, so both are WIRE.
+                eprint_warning(&format!(
+                    "warning: could not remove stale output {}: {}",
+                    safe_path(&stale_path),
+                    safe_inline(&e)
+                ));
             }
         }
     }
@@ -894,36 +902,48 @@ pub(crate) fn eprint_error(report: miette::Report) {
     eprintln!("{}", render_error_sanitized(report));
 }
 
-/// Print a compiler warning to stderr — the single choke-point for all CLI warning
-/// output on the `*_collecting_warnings` code paths (CWE-150 / PF-004 / #176).
+/// Print a CLI warning to stderr with HUMAN-mode escaping applied to the whole line
+/// (CWE-150 / PF-004 / #176).
 ///
-/// Applies HUMAN-mode [`mds::sanitize_control_chars`] (preserves `\n` and `\t`;
-/// escapes all other C0 / DEL / C1 controls and bidi / separator / BOM characters to
-/// their six-character `\uXXXX` literals) before printing, so a hostile warning
-/// message — e.g. the resolver warning that interpolates an untrusted module filename
-/// — cannot inject ANSI terminal commands into stderr.
+/// Applies [`mds::sanitize_control_chars`] (preserves `\n` and `\t`; escapes all other
+/// C0 / DEL / C1 controls and bidi / separator / BOM characters to their six-character
+/// `\uXXXX` literals) before printing, so a hostile warning message cannot inject ANSI
+/// terminal commands into stderr.
 ///
-/// This closes the parallel-path gap (PF-004) that existed on the five CLI sites
-/// that call `*_collecting_warnings` variants: those variants bypass the
-/// [`emit_warnings`](mds) function in `mds-core`, which already sanitizes warnings on
-/// the primary code paths.
+/// # This helper alone is NOT sufficient — it is the prose half of the rule
 ///
-/// **Routing those five was not sufficient, and an earlier revision of this rustdoc
-/// wrongly claimed it was** ("no sixth warning print can silently reopen the gap").  A
-/// sixth already existed: `load_lint_config` in `lint.rs` printed the unknown-`mds.json`-
-/// rule warning — whose rule NAME is an arbitrary attacker-supplied JSON object key —
-/// with a bare `eprintln!`.  That is the PF-004 failure mode exactly: a guarantee stated
-/// as a property of a code path is only ever a property of the sites someone remembered
-/// to enumerate.
+/// HUMAN mode preserves `\n` on purpose, so that a multi-line warning body still renders
+/// as multiple lines. That means routing a hostile *identifier* through this function
+/// closes CWE-150 on it and leaves CWE-117 open: `lint.rs`'s unknown-`mds.json`-rule
+/// warning already called this helper, and a rule name of
+/// `x<LF>Clean: totally-real.mds<LF>0 problems found` still emitted three standalone
+/// lines byte-identical in form to genuine status output.
 ///
-/// The honest statement is therefore about *coverage now*, not about foreclosure: as of
-/// #176, every warning print in `main.rs` (~279, ~288, ~341), `build.rs` (~694, ~1148)
-/// and `lint.rs` (~202) routes through this helper.  Any new warning print must too;
-/// nothing in the type system enforces it.
+/// The governing rule is per FIELD, not per surface (spec §7.5):
 ///
-/// `watch.rs`'s lifecycle status lines (`Watching {}`, `Removed {}`,
-/// `warning: could not remove {}: {e}`) are a separate, pre-existing gap outside #176's
-/// diff — they are **not** covered by this helper and are not claimed to be.
+/// | Part of the line | Mode | Helper |
+/// |------------------|------|--------|
+/// | warning prose / body | HUMAN | this function |
+/// | interpolated filename or path | WIRE | [`safe_path`] |
+/// | interpolated identifier, config value, or error cause | WIRE | [`safe_inline`] |
+///
+/// So the correct shape is `eprint_warning(&format!("warning: … {} …", safe_path(p)))` —
+/// both escapes, not either one.
+///
+/// # Enumeration is not a guarantee — the guard is
+///
+/// Two earlier revisions of this rustdoc asserted coverage by listing the sites that had
+/// been routed. Each list was correct when written and stale by the next review: first
+/// `lint.rs`'s rule warning was missed, then the walker's own depth-limit warning inside
+/// this very file. A guarantee stated as a property of a code path is only ever a
+/// property of the sites someone remembered to enumerate — that is PF-004.
+///
+/// The property is therefore no longer asserted in prose here. It is enforced by
+/// `crates/mds-cli/tests/print_discipline.rs`, which fails if any print macro under
+/// `crates/mds-cli/src/**` interpolates a value that is not passed through one of the
+/// escape helpers, and which applies the same rule to `format!` invocations nested
+/// inside `eprint_warning` calls. `watch.rs`'s lifecycle status lines — previously
+/// carved out as a pre-existing gap — are in scope and now routed like everything else.
 pub(crate) fn eprint_warning(w: &str) {
     eprintln!("{}", mds::sanitize_control_chars(w));
 }
@@ -1075,7 +1095,7 @@ pub(crate) fn colorize_unified_diff(unified: &str) -> String {
 /// `lint`, `fmt`, and `build` must route through this helper (avoids PF-004 /
 /// security-5: unsanitized filename vector in status output).
 pub(crate) fn safe_path(p: &std::path::Path) -> String {
-    safe_file_display(&p.display().to_string())
+    safe_inline(p.display())
 }
 
 /// [`safe_path`] for a filename that is already a `&str` (e.g. a `LintDiagnostic::file`
@@ -1085,7 +1105,39 @@ pub(crate) fn safe_path(p: &std::path::Path) -> String {
 /// exact PF-004 shape that left `Clean: {filename}` on HUMAN mode while every other
 /// status line was on WIRE.
 pub(crate) fn safe_file_display(name: &str) -> String {
-    mds::sanitize_control_chars_wire(name).into_owned()
+    safe_inline(name)
+}
+
+/// WIRE-escape any untrusted value that is interpolated into a **single-line** status,
+/// warning, or error line.
+///
+/// This is the general form of [`safe_path`] / [`safe_file_display`]: the same WIRE
+/// escape, for values that are neither a `Path` nor a filename — an `io::Error`
+/// `Display` (which embeds a filesystem path), an `mds.json` rule name or config value,
+/// a `--format` argument, a fix-rejection reason.
+///
+/// # Why WIRE, on human surfaces too
+///
+/// Per the governing per-field rule (spec §7.5): **untrusted identifiers, filenames and
+/// causes are WIRE-escaped on every surface, human output included; only *prose* — a
+/// diagnostic message or help body — stays HUMAN.** The discriminator is whether the
+/// value is legitimately multi-line. A rule name, a path, a `--format` value and an
+/// `io::Error` never are; a diagnostic body genuinely is. Leaving `\n` raw in the first
+/// group buys nothing and lets the value forge a standalone status line that is
+/// byte-identical in form to genuine output (CWE-117).
+///
+/// The surrounding warning prose stays HUMAN — pass the assembled string to
+/// [`eprint_warning`], and WIRE-escape each interpolated value with this helper.
+///
+/// Idempotent (a property of [`mds::sanitize_control_chars_wire`]), so wrapping a value
+/// that was already escaped at construction — e.g.
+/// `mds::fix::FixOutcome::Rejected.reason` — is a no-op rather than a double escape.
+/// That matters: it lets every call site apply the rule unconditionally instead of
+/// tracking which values arrived pre-escaped (PF-004).
+///
+/// Enforced mechanically by `tests/print_discipline.rs`.
+pub(crate) fn safe_inline(value: impl std::fmt::Display) -> String {
+    mds::sanitize_control_chars_wire(&value.to_string()).into_owned()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1932,17 +1984,33 @@ mod tests {
     // The tests below exercise the transformation directly (the pure function that the
     // wrapper applies) to keep assertions deterministic without capturing stderr.
     //
-    // Test strategy — why helper unit tests, not end-to-end vectors:
+    // Test strategy — corrected.
     //
-    // The only warning that interpolates untrusted text is the resolver warning:
-    //   "MAX_SOURCEMAP_SEGMENTS exceeded in imported module '<file_str>'"
-    // (crates/mds-core/src/resolver.rs). It requires a hostile module filename AND a
-    // MAX_SOURCEMAP_SEGMENTS overflow in that module — a large contrived fixture that
-    // would make a vacuous e2e test (the warning path would never fire under normal
-    // compilation). The single-choke-point guarantee is by construction: every warning
-    // print in `main.rs` and `build.rs` now calls `eprint_warning`, which is the only
-    // place the warning text can leave the process. A unit test that proves the
-    // transformation is correct is therefore sufficient; no e2e vector is required.
+    // An earlier revision of this block claimed that "the only warning that interpolates
+    // untrusted text is the resolver warning" (which needs a MAX_SOURCEMAP_SEGMENTS
+    // overflow in a hostile-named module, so an e2e vector for it would be contrived),
+    // and concluded that no e2e test was required because "every warning print in
+    // main.rs and build.rs now calls eprint_warning". Both halves were false, and the
+    // unreachability argument was the load-bearing one:
+    //
+    //   * lint.rs's unknown-`mds.json`-rule warning (added in e145e41) interpolates an
+    //     arbitrary JSON object key — reachable in about thirty seconds by writing an
+    //     mds.json into any linted directory. It is covered e2e by T-ESC-RULE-1 in
+    //     tests/security.rs, whose vector now carries newlines as well as C0 and bidi
+    //     controls, because routing it through eprint_warning (HUMAN, `\n` preserved)
+    //     closed CWE-150 on it while leaving the CWE-117 line forgery open.
+    //   * The walker's own depth-limit warning, ~40 lines up in THIS file, printed
+    //     `dir.display()` through a bare eprintln!. It is neither main.rs nor build.rs,
+    //     so the enumeration above walked straight past it. Covered e2e by T-ESC-WALK-1.
+    //
+    // The unit tests below stay — they pin the transformation deterministically without
+    // capturing stderr — but they are no longer offered as a substitute for e2e vectors.
+    //
+    // Coverage is now enforced rather than enumerated: tests/print_discipline.rs fails if
+    // ANY print macro under crates/mds-cli/src interpolates a value that is not passed
+    // through safe_path / safe_file_display / safe_inline / sanitize_control_chars*, and
+    // applies the same rule to `format!`s nested inside eprint_warning calls. That is
+    // what makes a claim about warning-path coverage checkable instead of remembered.
     //
     // Guard-removal RED evidence (T-WARN-1):
     //   Replace `mds::sanitize_control_chars(&hostile)` with

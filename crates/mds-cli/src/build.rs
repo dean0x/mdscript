@@ -189,6 +189,18 @@ impl OutputKind {
     }
 }
 
+/// Human-readable label for an [`OutputKind`], for the extension-mismatch warning.
+///
+/// Returns one of two `&'static str` literals and carries no runtime data — which is
+/// why `kind_label(kind)` is allowlisted in `tests/print_discipline.rs` instead of
+/// being wrapped in a sanitizer.
+fn kind_label(kind: OutputKind) -> &'static str {
+    match kind {
+        OutputKind::Markdown => "markdown (.md)",
+        OutputKind::Messages => "messages JSON (.json)",
+    }
+}
+
 impl From<&CompiledOutput> for OutputKind {
     fn from(output: &CompiledOutput) -> Self {
         match output {
@@ -282,13 +294,18 @@ pub(crate) fn resolve_output_path_for_kind(
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     let expected = kind.extension();
                     if ext != expected {
+                        // The `-o` value and the extension derived from it are
+                        // filenames: WIRE on every surface (spec §7.5 per-field rule).
+                        // The escape call is repeated rather than bound to a local so it
+                        // is visible at each interpolation — the print-discipline guard
+                        // reads call sites, not bindings.
                         eprintln!(
-                            "warning: output path '{o}' has extension '.{ext}' but compiled \
-                             output is {kind_name}; writing to '{o}' anyway",
-                            kind_name = match kind {
-                                OutputKind::Markdown => "markdown (.md)",
-                                OutputKind::Messages => "messages JSON (.json)",
-                            }
+                            "warning: output path '{}' has extension '.{}' but compiled \
+                             output is {}; writing to '{}' anyway",
+                            crate::output::safe_inline(o),
+                            crate::output::safe_inline(ext),
+                            kind_label(kind),
+                            crate::output::safe_inline(o)
                         );
                     }
                 }
@@ -1020,8 +1037,9 @@ pub(crate) fn verify_then_delete_map(map_path: &Path, expected_basename: &str, q
     if let Err(e) = std::fs::remove_file(map_path) {
         if !quiet {
             eprintln!(
-                "warning: could not remove stale map {}: {e}",
-                crate::output::safe_path(map_path)
+                "warning: could not remove stale map {}: {}",
+                crate::output::safe_path(map_path),
+                crate::output::safe_inline(&e)
             );
         }
     } else if !quiet {
@@ -1313,9 +1331,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
                             .map(|(_, p)| p.display().to_string())
                             .unwrap_or_else(|| "mds.json".to_owned());
                         eprintln!(
-                            "warning: source_map in {cfg_path} has no effect when writing to \
+                            "warning: source_map in {} has no effect when writing to \
                              stdout (sidecar requires -o <file> or --out-dir); use --inline to \
-                             embed the map, or --no-source-map to silence this warning"
+                             embed the map, or --no-source-map to silence this warning",
+                            crate::output::safe_inline(&cfg_path)
                         );
                     }
                     return write_output(None, &compiled.content, quiet, true);
@@ -1472,8 +1491,9 @@ fn run_build_directory(
                     if !parent.as_os_str().is_empty() {
                         if let Err(e) = std::fs::create_dir_all(parent) {
                             eprintln!(
-                                "error: cannot create output directory {}: {e}",
-                                crate::output::safe_path(parent)
+                                "error: cannot create output directory {}: {}",
+                                crate::output::safe_path(parent),
+                                crate::output::safe_inline(&e)
                             );
                             fail_count += 1;
                             continue;
@@ -1511,8 +1531,9 @@ fn run_build_directory(
                                 let map_json = sm.to_json();
                                 if let Err(e) = std::fs::write(&map_path, &map_json) {
                                     eprintln!(
-                                        "error: cannot write {}: {e}",
-                                        crate::output::safe_path(&map_path)
+                                        "error: cannot write {}: {}",
+                                        crate::output::safe_path(&map_path),
+                                        crate::output::safe_inline(&e)
                                     );
                                     fail_count += 1;
                                     continue;
@@ -1550,8 +1571,9 @@ fn run_build_directory(
                     }
                     Err(e) => {
                         eprintln!(
-                            "error: cannot write {}: {e}",
-                            crate::output::safe_path(&out_path)
+                            "error: cannot write {}: {}",
+                            crate::output::safe_path(&out_path),
+                            crate::output::safe_inline(&e)
                         );
                         fail_count += 1;
                     }

@@ -396,8 +396,8 @@ Your items:
     if !quiet {
         eprintln!(
             "Created {}\n  Try: mds build {}",
-            filename.display(),
-            filename.display()
+            output::safe_path(&filename),
+            output::safe_path(&filename)
         );
     }
     Ok(())
@@ -457,7 +457,8 @@ fn run(cli: Cli) -> Result<()> {
                 "json" => lint::LintFormat::Json,
                 other => {
                     eprintln!(
-                        "error: unknown --format value '{other}'; expected 'human' or 'json'"
+                        "error: unknown --format value '{}'; expected 'human' or 'json'",
+                        output::safe_inline(other)
                     );
                     std::process::exit(2);
                 }

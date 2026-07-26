@@ -39,7 +39,7 @@ use crate::build::{
 };
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
-    render_unified_diff, safe_file_display, safe_path,
+    render_unified_diff, safe_file_display, safe_inline, safe_path,
 };
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -195,12 +195,20 @@ fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
             //
             // `name` is an arbitrary attacker-supplied JSON object key: `mds.json` is
             // read from the working tree, and JSON `\uXXXX` escapes decode to real
-            // control bytes. It must go through `eprint_warning`, never a bare
-            // `eprintln!` (CWE-150 / PF-004).
+            // control bytes.
+            //
+            // Two escapes, deliberately different (spec §7.5 per-field rule): the warning
+            // PROSE goes through `eprint_warning` (HUMAN — it is the message body), while
+            // the rule NAME goes through `safe_inline` (WIRE). Routing the whole line
+            // through `eprint_warning` alone was NOT sufficient: HUMAN mode preserves
+            // `\n`, so a rule name of `x\nClean: totally-real.mds\n0 problems found\n`
+            // still emitted three standalone lines byte-identical to genuine status
+            // output (CWE-117). A JSON object key is never legitimately multi-line.
             for name in mds_config.lint.rules.keys() {
                 if !KNOWN_RULES.contains(&name.as_str()) {
                     eprint_warning(&format!(
-                        "warning: unknown lint rule '{name}' in mds.json; ignoring"
+                        "warning: unknown lint rule '{}' in mds.json; ignoring",
+                        safe_inline(name)
                     ));
                 }
             }
@@ -675,7 +683,7 @@ fn run_lint_stdin(
                 }
                 PreviewOutcome::Rejected(ref reason) => {
                     if !quiet {
-                        eprintln!("fix rejected: {reason}");
+                        eprintln!("fix rejected: {}", safe_inline(reason));
                     }
                 }
                 PreviewOutcome::NothingToFix => {}
@@ -713,7 +721,7 @@ fn run_lint_stdin(
                 (new_source, residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("fix rejected: {reason}");
+                eprintln!("fix rejected: {}", safe_inline(&reason));
                 (source, original)
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
@@ -829,7 +837,7 @@ fn run_lint_file(
                 exit_by_severity(&residual);
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("fix rejected: {reason}");
+                eprintln!("fix rejected: {}", safe_inline(&reason));
                 emit_result(format, &original, quiet, named_source);
                 exit_by_severity(&original);
             }
@@ -867,7 +875,7 @@ fn run_lint_file(
             PreviewOutcome::Rejected(ref reason) => {
                 // Surface the rejection reason so --fix --check is as honest as --fix.
                 if !quiet {
-                    eprintln!("fix rejected: {reason}");
+                    eprintln!("fix rejected: {}", safe_inline(reason));
                 }
             }
             PreviewOutcome::NothingToFix => {}
@@ -1152,7 +1160,7 @@ fn lint_one_file_accumulating(
                 set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", safe_path(file));
+                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
                 tally_from_result(&residual)
@@ -1173,13 +1181,17 @@ fn lint_one_file_accumulating(
                 set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", safe_path(file));
+                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("{}: fix rejected: {reason}", safe_path(file));
+                eprintln!(
+                    "{}: fix rejected: {}",
+                    safe_path(file),
+                    safe_inline(&reason)
+                );
                 accumulate_result_json(&original, json_files);
                 tally_from_result(&original)
             }
@@ -1216,7 +1228,7 @@ fn lint_one_file_accumulating(
                 }
             }
             PreviewOutcome::Rejected(ref reason) => {
-                eprintln!("{}: fix rejected: {reason}", safe_path(file));
+                eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
             }
             PreviewOutcome::NothingToFix => {}
         }
@@ -1312,7 +1324,7 @@ fn lint_one_file_human(
                 set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", safe_path(file));
+                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
                 if !quiet {
@@ -1336,13 +1348,17 @@ fn lint_one_file_human(
                 set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {e}", safe_path(file));
+                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("{}: fix rejected: {reason}", safe_path(file));
+                eprintln!(
+                    "{}: fix rejected: {}",
+                    safe_path(file),
+                    safe_inline(&reason)
+                );
                 render_result_human(&original, quiet, named_source);
                 tally_from_result(&original)
             }
@@ -1373,7 +1389,7 @@ fn lint_one_file_human(
             }
             PreviewOutcome::Rejected(ref reason) => {
                 if !quiet {
-                    eprintln!("{}: fix rejected: {reason}", safe_path(file));
+                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
                 }
             }
             PreviewOutcome::NothingToFix => {}
