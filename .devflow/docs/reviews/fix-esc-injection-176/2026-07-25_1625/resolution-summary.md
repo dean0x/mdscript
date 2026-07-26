@@ -213,6 +213,92 @@ Consequences recorded here because they change earlier decisions:
 
 **Round-2 implementing commits:** see the branch log for `fix/esc-injection-176` after `35195d4`.
 
+### Round 3 — the guard hardened, the normative claim narrowed (2026-07-26)
+
+A **third** adversarial alignment review attacked the guard itself rather than the
+prints, and falsified the spec's central claim. Both are closed here; this is intended
+as the final code round.
+
+**B1 (critical) — hoisting `format!` into a `let` defeated the guard.** `collect_sites`
+looked for `format!` only where it appeared lexically inside the `eprint_warning(...)`
+parens, so `let msg = format!("... {name}"); eprint_warning(&msg);` — completely
+idiomatic — reintroduced M2 verbatim and invisibly. **B2 — `eprint_warning(<bare
+identifier>)` was unchecked**, with five live instances (`build.rs:711`, `build.rs:1166`,
+`main.rs:279`, `main.rs:288`, `main.rs:341`).
+
+Fixed together. The helper's argument is now classified in its own right: a string
+literal, a whole-expression sanitizer call, or a `format!` whose interpolations are each
+accepted. A bare local is traced **one hop** through its `let` binding in the same file
+and judged by the same rule. Anything unresolved is **reported, not trusted** — the
+guard fails closed. Disposition of the five bare-`w` sites: **allowlisted with written
+justification** in a new `ALLOWED_UNTRACED_HELPER_ARGS`, kept separate from the general
+allowlist so the exemption applies *only* in the helper-argument position. The
+justification states plainly what the reviewer observed: their safety rests on mds-core
+producer discipline (`resolver.rs`, `evaluator.rs` WIRE-escape at construction), which
+this lexical guard cannot verify across a crate boundary. Nothing mechanical holds it;
+that is now written down rather than implied.
+
+**B3 — `is_sanitizer_call` accepted postfix continuations** (`safe_path(p) + &evil`,
+`safe_path(p).replace("a", &evil)`), contradicting the guard's own self-test, which
+asserted the property but tested only the prefix direction. The call must now be the
+whole expression; the self-test covers both directions and asserts strictly more than
+before. **B4 — `write!` / `writeln!` to a stream handle was unscanned** (latent: zero
+instances in the crate). Now scanned when the first argument names stdout/stderr,
+including through a `let` binding.
+
+**B5 / B6 accepted as limits, not chased**, and stated in the guard's own rustdoc under
+"Accepted limits": sanitizers are matched by the last path segment (an alias, or a local
+`fn safe_path`, defeats it); allowlist entries are **anti-rot, not anti-reuse** (keyed by
+`(file, expression)`, so a future variable reusing an exempted name in the same file
+inherits the exemption). Added alongside them: the trace is one hop within one file, and
+stream detection is by name. The rustdoc now says outright that this is a lexical
+scanner whose bar is *accidental* reintroduction, and that closing the remaining gaps
+would need a rustc lint or a `syn`-based HIR analysis.
+
+Each of B1-B4 was proven by **injecting the bypass into real source**, confirming the
+guard fails naming the exact site, then reverting.
+
+### Normative claim narrowed — option (b), with the mds-core residual named
+
+spec 7.5 asserted filenames, paths and causes are "**WIRE everywhere**". Falsified:
+mds-core `MdsError` message bodies interpolate exactly those values and stay HUMAN on
+terminal surfaces (`fs.rs:478` `cannot read {normalized}: {e}`, `:487` invalid-UTF-8,
+`parser_helpers.rs:853` `invalid import alias: '{alias}'`). The declared residual had
+also been scoped to *CLI `miette!()` construction* only, understating it — the same
+defect exists at a second construction site of equal severity.
+
+**Chose (b) — narrow the claim — over (a) — make it true.** The blast radius of (a) is
+not small: 110+ `MdsError::*(format!(...))` construction sites across `parser_helpers.rs`,
+`evaluator.rs`, `resolver.rs`, `builtins.rs`, `fs.rs` and `lib.rs`, changing the public
+`MdsError` message text seen by all three binding layers (a further breaking wire change
+beyond what is already declared) and churning goldens in four suites. Decisively: fixing
+only the two sites the reviewer named would leave the claim false at ~100 others — the
+exact overclaim that reopened this issue twice already.
+
+The rule is therefore stated per FIELD, precisely: a path in a `file` **field** (CLI
+status line, `[file:line:col]` header, JSON `file` key) is WIRE on every surface; a path
+or identifier interpolated into a message **body** is prose and follows the message row.
+The residual is named in all four places — a new "Residual: paths and identifiers inside
+a message body" section in spec 7.5, the boundary table in
+`crates/mds-core/src/lint/diagnostic.rs`, a "Declared residual" paragraph in the
+CHANGELOG, and this ledger. The reviewer's characterization is preserved: frame content
+is indented and box-prefixed, and the prefix survives `strip()`, so it cannot masquerade
+as a bare status line — the surface is genuinely weaker, only its scope was understated.
+
+**Documentation overclaims corrected:** "All serialization and diagnostic-render
+boundaries are now hardened" (closed-set-by-enumeration, in the file that retires
+enumeration) is now an audit list; "Human-render output is unchanged" is scoped to
+diagnostic prose; "sanitizes renderer inputs byte-length-preservingly" is scoped to
+source text (`message` / `help` are escaped to `\uXXXX` literals, not length-preserved);
+"all five surfaces" corrected to four; two bidi rustdoc lists that omitted U+061C (11 of
+12) completed; and the escape class, previously defined as "C0 except `\n` / `\t`" in
+`diagnostic.rs` against the spec's "`\n` in class, `\t` sole exemption", now reads the
+same in both — `\n` is in the class, and HUMAN/WIRE is the mode choice, not a class
+difference.
+
+**Round-3 implementing commits:** `0e79385` (guard hardening), `c973331` (normative
+claim + overclaims).
+
 ## Blocked
 | Issue | File:Line | Blocker |
 |-------|-----------|---------|
