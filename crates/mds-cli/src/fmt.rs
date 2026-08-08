@@ -22,15 +22,14 @@
 //! - 2: file not found / not `.mds` / I/O / bad UTF-8
 //! - 3: oversized source
 
-use std::io::{IsTerminal, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use mds::{effective_parent, FileSystem};
 use miette::Result;
 
 use crate::build::{ensure_existing_mds_file, load_config, read_stdin, resolve_input};
-use crate::output::atomic_write_file;
-use crate::output::collect_mds_files_detailed;
+use crate::output::{atomic_write_file, collect_mds_files_detailed, render_unified_diff};
 
 pub(crate) struct FmtArgs {
     pub(crate) input: Option<PathBuf>,
@@ -58,7 +57,7 @@ pub(crate) fn run_fmt(args: FmtArgs) -> Result<()> {
 
     let (input, auto_detected) = resolve_input(input, "fmt")?;
     if auto_detected && !quiet {
-        eprintln!("Formatting {}", input.display());
+        eprintln!("Formatting {}", crate::output::safe_path(&input));
     }
 
     let flags = FmtFlags { check, diff, quiet };
@@ -134,7 +133,7 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
     let result = format_source_named(&source, Some(&cwd), "<stdin>")?;
 
     if diff {
-        print_diff(&render_diff(&source, &result.formatted, "<stdin>"))?;
+        print_diff(&render_unified_diff(&source, &result.formatted, "<stdin>"))?;
     } else if !check {
         // Plain filter mode: formatted content is the output.
         write_stdout(&result.formatted)?;
@@ -163,8 +162,8 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     let result = format_source_named(&source, base_dir, &file_name)?;
 
     if diff && result.changed {
-        let label = path.display().to_string();
-        print_diff(&render_diff(&source, &result.formatted, &label))?;
+        let label = crate::output::safe_path(path);
+        print_diff(&render_unified_diff(&source, &result.formatted, &label))?;
     }
 
     let read_only = check || diff;
@@ -175,10 +174,10 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
             // commit c5aa086 — both write paths now share the same helper).
             atomic_write_file(path, &result.formatted)?;
             if !quiet {
-                eprintln!("Formatted: {}", path.display());
+                eprintln!("Formatted: {}", crate::output::safe_path(path));
             }
         } else if !quiet {
-            eprintln!("Unchanged: {}", path.display());
+            eprintln!("Unchanged: {}", crate::output::safe_path(path));
         }
         return Ok(());
     }
@@ -186,12 +185,12 @@ fn run_fmt_file(path: &Path, flags: FmtFlags) -> Result<()> {
     if check {
         if result.changed {
             if !quiet {
-                eprintln!("Would reformat: {}", path.display());
+                eprintln!("Would reformat: {}", crate::output::safe_path(path));
             }
             std::process::exit(1);
         }
         if !quiet {
-            eprintln!("Unchanged: {}", path.display());
+            eprintln!("Unchanged: {}", crate::output::safe_path(path));
         }
     }
     Ok(())
@@ -247,7 +246,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
 
     if diff && result.changed {
         let label = file_name.clone();
-        if let Err(e) = print_diff(&render_diff(&source, &result.formatted, &label)) {
+        if let Err(e) = print_diff(&render_unified_diff(&source, &result.formatted, &label)) {
             crate::output::eprint_error(e);
             return FileOutcome::Failed;
         }
@@ -269,7 +268,7 @@ fn format_one_file(file: &Path, flags: FmtFlags) -> FileOutcome {
         match atomic_write_file(file, &result.formatted) {
             Ok(()) => {
                 if !quiet {
-                    eprintln!("Formatted: {}", file.display());
+                    eprintln!("Formatted: {}", crate::output::safe_path(file));
                 }
                 FileOutcome::Formatted
             }
@@ -315,7 +314,7 @@ fn run_fmt_directory(dir: &Path, flags: FmtFlags) -> Result<()> {
             std::process::exit(1);
         }
         if !flags.quiet {
-            eprintln!("No .mds files found in {}", dir.display());
+            eprintln!("No .mds files found in {}", crate::output::safe_path(dir));
         }
         return Ok(());
     }
@@ -381,74 +380,6 @@ fn print_diff(rendered: &str) -> Result<()> {
         return Ok(());
     }
     write_stdout(rendered)
-}
-
-// ── unified diff rendering ───────────────────────────────────────────────────
-
-/// Render a unified diff between `original` and `formatted`, colorized with
-/// raw ANSI escapes ONLY when stdout is a terminal (mirrors `watch.rs`'s
-/// `clear_terminal`, which does the same TTY gate for its own raw escapes;
-/// this repo has no color crate dependency).
-fn render_diff(original: &str, formatted: &str, label: &str) -> String {
-    let diff = similar::TextDiff::from_lines(original, formatted);
-    let unified = diff
-        .unified_diff()
-        .context_radius(3)
-        .header(label, label)
-        .to_string();
-
-    if unified.is_empty() || !std::io::stdout().is_terminal() {
-        return unified;
-    }
-    colorize_unified_diff(&unified)
-}
-
-fn colorize_unified_diff(unified: &str) -> String {
-    const RED: &str = "\x1b[31m";
-    const GREEN: &str = "\x1b[32m";
-    const CYAN: &str = "\x1b[36m";
-    const RESET: &str = "\x1b[0m";
-
-    let mut out = String::with_capacity(unified.len() + 64);
-    // `---`/`+++` file headers appear before the first `@@` hunk marker.
-    // Inside a hunk a removed line starts with `-` and an added line starts
-    // with `+` — but if that line's *content* itself starts with `-` or `+`,
-    // the rendered diff line looks like `---` or `+++`, which the old global
-    // prefix check mis-colored as CYAN (file header) instead of RED/GREEN.
-    // A state machine keyed on the first `@@` avoids the ambiguity.
-    let mut in_hunk = false;
-    for line in unified.split_inclusive('\n') {
-        let color = if line.starts_with("@@") {
-            in_hunk = true;
-            CYAN
-        } else if !in_hunk && (line.starts_with("---") || line.starts_with("+++")) {
-            // File header — always precedes the first @@ hunk.
-            CYAN
-        } else if in_hunk && line.starts_with('+') {
-            GREEN
-        } else if in_hunk && line.starts_with('-') {
-            RED
-        } else {
-            ""
-        };
-        if color.is_empty() {
-            out.push_str(line);
-            continue;
-        }
-        out.push_str(color);
-        match line.strip_suffix('\n') {
-            Some(stripped) => {
-                out.push_str(stripped);
-                out.push_str(RESET);
-                out.push('\n');
-            }
-            None => {
-                out.push_str(line);
-                out.push_str(RESET);
-            }
-        }
-    }
-    out
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -520,47 +451,5 @@ mod tests {
             format_source_named("Hello!\r\n\r\n\r\n\r\nBye.\r\n", None, "<source>").unwrap();
         assert!(result.changed);
         assert!(!result.formatted.contains('\r'));
-    }
-
-    #[test]
-    fn render_diff_empty_for_identical_input() {
-        let rendered = render_diff("same\n", "same\n", "label");
-        assert!(rendered.is_empty());
-    }
-
-    #[test]
-    fn render_diff_contains_unified_markers_for_changed_input() {
-        let rendered = render_diff("a\n", "b\n", "label");
-        assert!(rendered.contains("---"));
-        assert!(rendered.contains("+++"));
-        assert!(rendered.contains("-a"));
-        assert!(rendered.contains("+b"));
-    }
-
-    #[test]
-    fn colorize_unified_diff_wraps_add_remove_lines_with_ansi_when_requested() {
-        let unified = "--- a\n+++ b\n@@ -1 +1 @@\n-old\n+new\n";
-        let colorized = colorize_unified_diff(unified);
-        assert!(colorized.contains("\x1b[32m+new\x1b[0m"));
-        assert!(colorized.contains("\x1b[31m-old\x1b[0m"));
-        assert!(colorized.contains("\x1b[36m--- a\x1b[0m"));
-    }
-
-    #[test]
-    fn colorize_unified_diff_correctly_colors_content_starting_with_dashes_or_pluses() {
-        // Regression: a removed line whose content starts with "-- " produces
-        // "--- ..." in the rendered unified diff. The old global prefix check
-        // matched `starts_with("---")` and mis-colored it CYAN (file header)
-        // instead of RED (removal). Same defect for "++" content → "+++ " →
-        // mis-colored CYAN instead of GREEN.
-        let unified = "--- a\n+++ b\n@@ -1,2 +1,2 @@\n--- dashes content\n+++ plus content\n";
-        let colorized = colorize_unified_diff(unified);
-        // Inside the hunk: removal of a line whose content starts with "-- "
-        assert!(colorized.contains("\x1b[31m--- dashes content\x1b[0m"));
-        // Inside the hunk: addition of a line whose content starts with "++"
-        assert!(colorized.contains("\x1b[32m+++ plus content\x1b[0m"));
-        // File headers (before @@) must still be CYAN
-        assert!(colorized.contains("\x1b[36m--- a\x1b[0m"));
-        assert!(colorized.contains("\x1b[36m+++ b\x1b[0m"));
     }
 }

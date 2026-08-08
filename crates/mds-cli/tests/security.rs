@@ -1,5 +1,5 @@
 mod common;
-use common::{fixture, mds_bin};
+use common::{assert_no_control_chars, fixture, mds_bin};
 use std::collections::HashMap;
 
 #[test]
@@ -419,4 +419,445 @@ fn load_vars_file_rejects_symlinked_path() {
         err.contains("symlink") || err.contains("not allowed"),
         "error must mention symlink restriction; got: {err}"
     );
+}
+
+// ── CWE-150: control bytes in the error MESSAGE on the CLI human path (#176) ──
+//
+// The pre-existing ESC e2e tests in `cli_build.rs` / `cli_fmt.rs` / `cli_lint.rs`
+// all use the `@define \x1bfoo:` vector, whose message is the *fixed* string
+// "syntax error: @define must have parameter list: @define name(params):" — the
+// hostile byte only ever reaches the rendered **source excerpt**, which
+// `MdsError::at()` already neutralized. Those tests therefore never exercised the
+// message text at all (PF-013: a hostile-input test that cannot fail for the
+// reason it claims). The two tests below use vectors that put attacker-controlled
+// bytes into the message itself, on both of the CLI's error families:
+//
+//   1. `MdsError` — `parser.rs` formats the raw alias into
+//      `invalid include alias: '{alias}'`.
+//   2. CLI-authored `miette::miette!()` — `output.rs` formats the raw `mds.json`
+//      value into `mds.json output_dir '{}' must not contain '..' components`.
+//
+// Both render through `eprint_error`, the single CLI stderr choke-point.
+
+/// T-ESC-MSG-1 [security-11 / CWE-150 / PF-013 / #176]: an `MdsError` whose message
+/// interpolates attacker-controlled template text must reach stderr escaped.
+///
+/// Non-vacuity guard: the command must actually fail *and* stderr must contain the
+/// expected error text, so the escape assertions cannot pass by the build silently
+/// succeeding or failing for an unrelated reason.
+#[test]
+fn build_mds_error_message_escapes_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("inc.mds");
+    // ESC (U+001B) and RIGHT-TO-LEFT OVERRIDE (U+202E) inside the include alias.
+    // `is_valid_identifier` rejects it, and the raw alias is formatted into the message.
+    std::fs::write(&src, "@include \u{1b}[31mBAD\u{202e}alias\n").unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // ── Non-vacuity ──────────────────────────────────────────────────────────
+    assert!(
+        !out.status.success(),
+        "build of an invalid include alias must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid include alias"),
+        "non-vacuity: the alias error must be the one rendered; got: {stderr}"
+    );
+
+    // ── Negative: no raw hostile bytes survive ───────────────────────────────
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not reach stderr in the error message; got: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "mds build MdsError message");
+
+    // ── Positive: the escaped literals are present ───────────────────────────
+    assert!(
+        stderr.contains("\\u001B"),
+        "ESC must be rendered as the \\u001B literal in the message; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("\\u202E"),
+        "U+202E must be rendered as the \\u202E literal in the message; got: {stderr}"
+    );
+}
+
+/// T-ESC-MSG-2 [security-11 / CWE-150 / PF-004 / #176]: a CLI-authored
+/// `miette::miette!()` error that interpolates attacker-controlled config text must
+/// reach stderr escaped too.
+///
+/// This is the PF-004 sibling path: `miette!()` reports do **not** downcast to
+/// `MdsError` (see `exit_code`'s rustdoc), so a fix that only handled `MdsError`
+/// would leave this vector open while claiming the boundary was closed.
+#[test]
+fn build_cli_authored_error_message_escapes_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.mds"), "Hello!\n").unwrap();
+    // JSON `\u001b` decodes to a raw ESC byte in the parsed config value. The `..`
+    // component trips the traversal guard in `resolve_output_base`, which formats the
+    // raw value into its message.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"build": {"output_dir": "../\u001b[31mBAD"}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // ── Non-vacuity ──────────────────────────────────────────────────────────
+    assert!(
+        !out.status.success(),
+        "build with output_dir containing '..' must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("output_dir"),
+        "non-vacuity: the output_dir traversal error must be the one rendered; got: {stderr}"
+    );
+
+    // ── Negative + positive ──────────────────────────────────────────────────
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not reach stderr from a miette!() message; got: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "mds build miette!() message");
+    assert!(
+        stderr.contains("\\u001B"),
+        "ESC must be rendered as the \\u001B literal; got: {stderr}"
+    );
+}
+
+// ── S14 / PF-004: the two boundaries the #176 alignment review found still open ──
+//
+// Both are reproduced-first vectors: on the pre-fix binary each command below emits
+// the raw hostile bytes (verified with `od -c`).
+
+/// T-ESC-RULE-1 [security-11 / CWE-150 / PF-004 / PF-013 / #176]: an unknown lint rule
+/// NAME from `mds.json` reaches stderr escaped.
+///
+/// Vector: `mds.json` is read from the working tree and its rule names are arbitrary
+/// JSON object keys. A JSON `\uXXXX` escape decodes to a real byte, so a repository can
+/// carry a rule name containing a raw ESC without the file itself looking hostile.
+/// This print site sat on a bare `eprintln!`, bypassing both `eprint_error` and
+/// `eprint_warning` — the "sixth warning print" that `eprint_warning`'s own rustdoc
+/// claimed was foreclosed.
+///
+/// `serde_json` writes the ESC as a LOWERCASE-hex JSON escape; the sanitizer emits
+/// UPPERCASE. Asserting the uppercase form proves the byte genuinely decoded on the way
+/// in and was genuinely escaped on the way out, rather than passing through as literal
+/// text.
+///
+/// The vector also carries **newlines**, and the assertions below include a standalone
+/// forged-line check. That combination is deliberate: routing this print through
+/// `eprint_warning` closed CWE-150 on this vector (no raw control byte) while leaving
+/// CWE-117 wide open, because `eprint_warning` is HUMAN mode and HUMAN mode preserves
+/// `\n` by design. The earlier version of this test used a newline-free rule name and
+/// `assert_no_control_chars`, which permits `\n` — so it certified the fix while the
+/// forgery still worked. A rule name is a JSON object key: never legitimately
+/// multi-line, so it is WIRE per the spec §7.5 per-field rule.
+#[test]
+fn lint_unknown_rule_name_escapes_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+
+    // One member of each escape sub-class: a C0 byte, a 3-byte bidi control, the 2-byte
+    // bidi control (U+061C) that the class originally missed — and newlines carrying two
+    // complete forged status lines.
+    let rule_name = format!(
+        "{}[31mEVIL{}RULE{}ALM\nClean: totally-real.mds\nOK: all-fine.mds",
+        '\u{1b}', '\u{202e}', '\u{061c}'
+    );
+    let mut rules = serde_json::Map::new();
+    rules.insert(rule_name, serde_json::Value::String("warn".to_string()));
+    let config = serde_json::json!({ "lint": { "rules": rules } });
+    std::fs::write(
+        dir.path().join("mds.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // ── Non-vacuity: the warning actually fired, naming the rule ─────────────
+    assert!(
+        stderr.contains("unknown lint rule"),
+        "non-vacuity: the unknown-rule warning must be the one rendered; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("EVIL"),
+        "non-vacuity: the rule name itself must be printed; got: {stderr}"
+    );
+
+    // ── Negative: no raw hostile byte survives ───────────────────────────────
+    assert!(
+        !out.stderr.contains(&0x1Bu8),
+        "raw ESC byte (0x1B) must not reach stderr from an mds.json rule name; got: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "mds lint unknown-rule warning");
+
+    // ── Negative: neither forged line appears on a line of its own ───────────
+    //
+    // `assert_no_control_chars` deliberately permits `\n` so it can be used on HUMAN-mode
+    // prose, so it cannot see this. Mirrors T-ESC-FNAME-1's standalone-line assertion.
+    for forged in ["Clean: totally-real.mds", "OK: all-fine.mds"] {
+        assert!(
+            !stderr.lines().any(|l| l.trim() == forged),
+            "an mds.json rule name must not be able to forge the standalone status line \
+             {forged:?}; got: {stderr}"
+        );
+    }
+
+    // ── Positive: the escaped literals are present ───────────────────────────
+    for escaped in ["\\u001B", "\\u202E", "\\u061C"] {
+        assert!(
+            stderr.contains(escaped),
+            "{escaped} must appear in the unknown-rule warning; got: {stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.matches("\\u000A").count(),
+        2,
+        "both embedded newlines must be escaped to their WIRE literal; got: {stderr}"
+    );
+
+    // ── Non-vacuity: the whole rule name landed on ONE line ──────────────────
+    let warning_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .collect();
+    assert_eq!(
+        warning_lines.len(),
+        1,
+        "the warning must occupy exactly one line; got: {stderr}"
+    );
+    assert!(
+        warning_lines[0].contains("EVIL") && warning_lines[0].ends_with("; ignoring"),
+        "the single warning line must carry the whole rule name and the trailing prose; \
+         got: {stderr}"
+    );
+}
+
+/// T-ESC-FNAME-1 [S14 / CWE-117 / PF-013 / #176]: a filename containing newlines
+/// cannot forge CLI status lines.
+///
+/// Vector: POSIX permits a newline inside a filename and the user never types the name
+/// — `mds build <dir>` discovers it by directory walk. `safe_path` used HUMAN mode,
+/// which preserves newlines by design so that multi-line diagnostic *messages* keep
+/// rendering, so a file named `evil.mds<LF>Clean: real.mds<LF>OK: all-fine.mds` emitted
+/// two attacker-authored lines byte-identical in form to genuine status output,
+/// unframed and unindented.
+///
+/// Unix-only: Windows filesystems reject a newline in a filename outright.
+#[cfg(unix)]
+#[test]
+fn build_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = "evil.mds\nClean: real.mds\nOK: all-fine.mds";
+    std::fs::write(dir.path().join(hostile), "Hello!\n").unwrap();
+    let out_dir = dir.path().join("out");
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ── Non-vacuity: the build ran and printed a status line naming the file ─
+    assert!(
+        out.status.success(),
+        "the build must succeed; stdout+stderr: {combined}"
+    );
+    assert!(
+        combined.contains("evil.mds"),
+        "non-vacuity: the status line must name the built file; got: {combined}"
+    );
+
+    // ── Negative: neither forged line appears on a line of its own ───────────
+    for forged in ["Clean: real.mds", "OK: all-fine.mds"] {
+        assert!(
+            !combined.lines().any(|l| l.trim() == forged),
+            "a filename must not be able to forge the standalone status line \
+             {forged:?}; got: {combined}"
+        );
+    }
+
+    // ── Positive: both newlines escaped to their literal form ────────────────
+    assert_eq!(
+        combined.matches("\\u000A").count(),
+        2,
+        "both embedded newlines must be escaped; got: {combined}"
+    );
+}
+
+/// T-ESC-FNAME-2 [S14 / PF-004 / #176]: the `Clean:` status line — which sanitized its
+/// filename inline rather than through `safe_path` — is covered by the same guarantee.
+///
+/// This is the PF-004 sibling of T-ESC-FNAME-1: two status-line printers, one of which
+/// open-coded its own escape call and so would have kept HUMAN mode when `safe_path`
+/// moved to WIRE. The vector also carries U+061C, the bidi control the escape class
+/// originally missed, so this pins both fixes on one line of output.
+///
+/// Unix-only: Windows filesystems reject a newline in a filename outright.
+#[cfg(unix)]
+#[test]
+fn lint_clean_status_line_cannot_be_forged_by_a_newline_in_a_filename() {
+    let dir = tempfile::tempdir().unwrap();
+    let hostile = "ok.mds\nClean: real\u{061c}.mds";
+    let path = dir.path().join(hostile);
+    std::fs::write(&path, "Hello!\n").unwrap();
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // ── Non-vacuity: the Clean: line actually printed, naming the file ───────
+    assert!(
+        stderr.contains("Clean: ok.mds"),
+        "non-vacuity: the Clean: status line must name the linted file; got: {stderr}"
+    );
+
+    // ── Negative: no forged standalone line, no raw hostile codepoint ────────
+    assert!(
+        !stderr.lines().any(|l| l.trim().starts_with("Clean: real")),
+        "a filename must not be able to forge a second Clean: line; got: {stderr}"
+    );
+    assert_no_control_chars(&stderr, "mds lint Clean: status line");
+
+    // ── Positive: newline and U+061C both escaped ───────────────────────────
+    assert!(
+        stderr.contains("\\u000A"),
+        "the embedded newline must be escaped; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("\\u061C"),
+        "U+061C must be escaped; got: {stderr}"
+    );
+}
+
+/// T-ESC-WALK-1 [security-11 / CWE-150 / CWE-117 / PF-004 / PF-013 / #176]: the shared
+/// walker's depth-limit warning escapes the directory name it interpolates.
+///
+/// Vector: `collect_mds_files_inner` in `mds-cli/src/output.rs` warns when recursion
+/// exceeds `MAX_DEPTH` (64) and names the directory it stopped at. The name is
+/// *discovered by the walk* — the user never types it — and every directory-mode
+/// subcommand shares this walker, so one hostile directory name reached `mds build`,
+/// `check`, `fmt`, `lint` and `watch` at once.
+///
+/// This print sat on a bare `eprintln!` inside `output.rs` itself: it was neither one of
+/// the `*_collecting_warnings` sites nor `watch.rs`, so two rounds of "route the warning
+/// prints through `eprint_warning`" walked straight past it while the CHANGELOG claimed
+/// no raw control byte reached human stderr on any warning path.
+///
+/// The vector carries all three sub-classes at once — a C0 byte (ESC), a 3-byte bidi
+/// control (U+202E), and a newline that forges a complete status line. The ESC goes into
+/// the directory name as a RAW byte and is asserted on the way out as the uppercase
+/// six-character literal, which proves a genuine decode-then-escape rather than literal
+/// passthrough.
+///
+/// Unix-only: Windows filesystems reject a newline in a path component outright.
+#[cfg(unix)]
+#[test]
+fn walker_depth_limit_warning_cannot_be_forged_by_a_hostile_directory_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.mds"), "Hello!\n").unwrap();
+
+    // MAX_DEPTH is 64; the warning fires on the first directory at depth 65.
+    let mut deep = root.clone();
+    for i in 1..=64 {
+        deep = deep.join(format!("d{i}"));
+    }
+    let hostile = format!(
+        "evil{}[31m{}dir\nClean: totally-real.mds",
+        '\u{1b}', '\u{202e}'
+    );
+    deep = deep.join(&hostile);
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("deep.mds"), "Hello!\n").unwrap();
+
+    // The walker is shared, so assert on all three directory-mode subcommands rather
+    // than trusting that one of them stands in for the others (PF-004).
+    for subcommand in ["lint", "check", "fmt"] {
+        let out = mds_bin()
+            .arg(subcommand)
+            .arg(&root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let label = format!("mds {subcommand} depth-limit warning");
+
+        // ── Non-vacuity: the warning actually fired and named the directory ──
+        assert!(
+            stderr.contains("directory depth limit"),
+            "non-vacuity [{label}]: the depth-limit warning must fire; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("evil"),
+            "non-vacuity [{label}]: the directory name must be printed; got: {stderr}"
+        );
+
+        // ── Negative: no raw hostile byte, no forged standalone line ─────────
+        assert!(
+            !out.stderr.contains(&0x1Bu8),
+            "raw ESC byte (0x1B) must not reach stderr from a directory name [{label}]; \
+             got: {stderr}"
+        );
+        assert_no_control_chars(&stderr, &label);
+        assert!(
+            !stderr
+                .lines()
+                .any(|l| l.trim() == "Clean: totally-real.mds"),
+            "a directory name must not be able to forge a standalone status line \
+             [{label}]; got: {stderr}"
+        );
+
+        // ── Positive: each hostile codepoint appears in escaped form ─────────
+        for escaped in ["\\u001B", "\\u202E", "\\u000A"] {
+            assert!(
+                stderr.contains(escaped),
+                "{escaped} must appear in the depth-limit warning [{label}]; got: {stderr}"
+            );
+        }
+    }
 }

@@ -570,6 +570,7 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

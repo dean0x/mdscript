@@ -1088,7 +1088,7 @@ fn build_load_config_finds_grandparent_mds_json() {
     );
 }
 
-// ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
+// ── ESC injection regression (issue #176 / ESC-INJECTION) ─────────────────────
 
 /// Regression gate: `mds build` (single-file mode) must not emit raw ESC bytes to
 /// stderr when the source file embeds a raw ESC byte (U+001B) in content that reaches

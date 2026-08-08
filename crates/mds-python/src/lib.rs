@@ -710,11 +710,17 @@ pub struct LintResult {
 #[pymethods]
 impl LintResult {
     /// Reconstruct from a canonical mapping (used by unpickling).
+    ///
+    /// Calls [`sanitize_lint_value`] after deserializing so the backing store is
+    /// always sanitized — the same guarantee `to_canonical_json()` provides on the
+    /// live lint path. This closes the parallel-path gap for the
+    /// `LintResult(canonical)` constructor (PF-004).
     #[new]
     fn new(canonical: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let value: serde_json::Value = depythonize(canonical).map_err(|e| {
+        let mut value: serde_json::Value = depythonize(canonical).map_err(|e| {
             options_error(canonical.py(), &format!("invalid LintResult state: {e}"))
         })?;
+        sanitize_lint_value(&mut value);
         Ok(LintResult { value })
     }
 
@@ -749,6 +755,9 @@ impl LintResult {
 
         arr.iter()
             .map(|file_val| {
+                // `self.value` is always sanitized: `to_canonical_json()` sanitizes at
+                // the lint boundary; `sanitize_lint_value()` in `new()` covers the
+                // `LintResult(canonical)` / pickle path. Plain read is safe (avoids PF-004).
                 let file_key = json_str(file_val, "file");
                 let diagnostics: Vec<LintDiagnostic> = file_val
                     .get("diagnostics")
@@ -772,6 +781,8 @@ impl LintResult {
                                 LintDiagnostic {
                                     rule: json_str(d, "rule"),
                                     severity: json_str(d, "severity"),
+                                    // Plain reads: `self.value` is sanitized before reaching here
+                                    // (see file_key comment above). No allocation on clean strings.
                                     message: json_str(d, "message"),
                                     help: d
                                         .get("help")
@@ -840,6 +851,60 @@ impl LintResult {
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyType>, (Bound<'py, PyAny>,))> {
         Ok((py.get_type::<LintResult>(), (self.to_dict(py)?,)))
+    }
+}
+
+// ── Lint value sanitization ─────────────────────────────────────────────────────
+
+/// Sanitize a string field in a JSON object in-place via
+/// [`mds::sanitize_control_chars_wire`].
+///
+/// WIRE mode: this backing store feeds `as_json()` / `to_dict()` as well as the typed
+/// getters, and must stay byte-identical to `LintResult::to_canonical_json()` on the
+/// other three surfaces — CLI, napi and WASM (PF-007) — including the `\n` escape.
+///
+/// Uses `Cow` so clean strings (the common case) cause no allocation — only strings
+/// that actually contain hostile characters are replaced. No-op when the field is
+/// absent or not a string.
+fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+    // Clone the field value to release the immutable borrow of `obj` before the
+    // subsequent `obj.insert(...)` mutable borrow.
+    let s_owned = match obj.get(key) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => return,
+    };
+    if let std::borrow::Cow::Owned(sanitized) = mds::sanitize_control_chars_wire(&s_owned) {
+        obj.insert(key.to_string(), serde_json::Value::String(sanitized));
+    }
+}
+
+/// Sanitize all message, help, and file string fields in a canonical lint result value
+/// in-place.
+///
+/// Called in [`LintResult::new`] so any data arriving through the
+/// `LintResult(canonical)` / pickle path is sanitized before the typed getters or
+/// `to_dict()` read from the backing store. Mirrors what
+/// `LintResult::to_canonical_json()` does on the live lint path, closing the
+/// parallel-path gap (PF-004).
+fn sanitize_lint_value(value: &mut serde_json::Value) {
+    let Some(files) = value.get_mut("files").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for file_val in files.iter_mut() {
+        let Some(obj) = file_val.as_object_mut() else {
+            continue;
+        };
+        sanitize_json_str_field(obj, "file");
+        let Some(diags) = obj.get_mut("diagnostics").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for d in diags.iter_mut() {
+            let Some(d_obj) = d.as_object_mut() else {
+                continue;
+            };
+            sanitize_json_str_field(d_obj, "message");
+            sanitize_json_str_field(d_obj, "help");
+        }
     }
 }
 

@@ -61,7 +61,8 @@ pub(crate) mod value;
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
-    fix, sanitize_control_chars, FixLineSpan, LintConfig, LintDiagnostic, LintResult, Severity,
+    fix, named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
+    sanitize_control_chars_wire, FixLineSpan, LintConfig, LintDiagnostic, LintResult, Severity,
 };
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
@@ -140,6 +141,14 @@ pub struct CompileResult {
     pub warnings: Vec<String>,
     /// Normalized keys of all modules imported during compilation, in
     /// first-resolution (depth-first) order. Excludes the entry module.
+    ///
+    /// These are **functional path references**, not display text: bundler plugins feed
+    /// them straight back into a watcher. They are a named carve-out from the
+    /// sanitization rule (spec §7.5, "Carve-out: functional path references") and are
+    /// emitted verbatim by [`CompileResult::to_canonical_json`] — a key may contain any
+    /// byte a filesystem permits, control characters and `\n` included. Consumers that
+    /// display one must escape it themselves; [`sanitize_control_chars_wire`] applies the
+    /// same escaping the diagnostic surfaces use.
     pub dependencies: Vec<String>,
     /// Source map for the compiled output.  Present only when
     /// `CompileOptions::source_map` is `true` (AC-API-02: absent, not null, when off).
@@ -179,11 +188,27 @@ impl CompileResult {
     /// The **inactive payload field is ABSENT** — a markdown result has no `messages`
     /// key; a messages result has no `output` key. Explicit field-by-field construction
     /// via `serde_json::json!()` prevents serde derive from injecting unwanted keys.
+    ///
+    /// # Sanitization
+    ///
+    /// `warnings` entries are WIRE-escaped here (spec §7.5): a warning is display text,
+    /// and an embedded `\n` would forge an extra warning line in a line-oriented
+    /// consumer. `output` / `messages` are the command's **product** and are byte-faithful.
+    /// `dependencies` and the embedded `sourceMap` are the **functional path reference**
+    /// carve-out — emitted verbatim, so their paths reach the consumer with whatever
+    /// bytes the filesystem allowed. See [`CompileResult::dependencies`] and
+    /// [`crate::SourceMap`]; consumers that display those paths must escape them.
     pub fn to_canonical_json(self) -> serde_json::Value {
+        // Sanitize warnings at the serialization boundary (issue #176 / CWE-150):
+        // warning strings may embed a hostile filename.  WIRE mode — this value is
+        // consumed as JSON by the bindings, so an embedded newline could forge an
+        // extra warning line downstream.
         let warnings: serde_json::Value = self
             .warnings
             .into_iter()
-            .map(serde_json::Value::String)
+            .map(|w| {
+                serde_json::Value::String(crate::lint::sanitize_control_chars_wire(&w).into_owned())
+            })
             .collect::<Vec<_>>()
             .into();
         let dependencies: serde_json::Value = self
@@ -504,9 +529,14 @@ fn path_to_str(path: &Path) -> Result<&str, MdsError> {
 }
 
 /// Print warnings to stderr. Each warning is printed on its own line.
+///
+/// Sanitizes each warning before printing (issue #176 / CWE-150): warning strings
+/// may embed a hostile filename, so control/bidi/separator characters are escaped to
+/// `\uXXXX` literals. HUMAN mode — this is terminal output, so `\n` stays raw
+/// (the wire counterpart is `CompileResult::to_canonical_json`, which escapes it).
 fn emit_warnings(warnings: &[String]) {
     for w in warnings {
-        eprintln!("{w}");
+        eprintln!("{}", crate::lint::sanitize_control_chars(w));
     }
 }
 

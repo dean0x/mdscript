@@ -1189,3 +1189,247 @@ describe('source maps (F-SM)', () => {
     );
   });
 });
+
+// ── T-12/T-13 (E-10/E-11): ESC-injection hardening — napi direct (issue #176 / CWE-150) ────────
+//
+// Four vectors (E-10..E-13):
+//  (E-10) error path: `@include fo<ESC>o` — parser rejects invalid alias, message
+//      embeds the raw alias. After fix: err.message has no raw C0/DEL/C1 chars.
+//  (E-11) lint path: lintVirtual with module name containing U+001B, imported twice —
+//      duplicate-import fires; diagnostic message has no raw ESC char.
+//  (E-12) error path with DEL (U+007F) — same as E-10 with a different control char.
+//  (E-13) lint path with U+0085 (NEL/C1) — passes serde_yaml_ng, provides C1 coverage.
+
+describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
+  // Helper: assert no raw C0 (excl. \t \n), DEL, or C1 chars in a string.
+  // Uses charCodeAt (UTF-16 code units); all C0/DEL/C1 codepoints are in BMP so
+  // charCodeAt correctly identifies them without surrogate pair handling.
+  function assertNoControlChars(s, label) {
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      const isC0 = code < 0x20 && code !== 0x09 && code !== 0x0a;
+      const isDel = code === 0x7f;
+      const isC1 = code >= 0x80 && code <= 0x9f;
+      // Bidi controls (Trojan Source, CVE-2021-42574), U+2028/U+2029 (JS string
+      // literal terminators), and U+FEFF (invisible BOM) — all escaped by the
+      // sanitizers. `\n` is allowed here; wire-mode newline escaping is asserted
+      // explicitly by E-15.
+      const isFormatHazard =
+        code === 0x200e || code === 0x200f ||
+        code === 0x2028 || code === 0x2029 ||
+        (code >= 0x202a && code <= 0x202e) ||
+        (code >= 0x2066 && code <= 0x2069) ||
+        code === 0xfeff;
+      assert.ok(
+        !isC0 && !isDel && !isC1 && !isFormatHazard,
+        `${label}: raw hostile char U+${code.toString(16).toUpperCase().padStart(4,'0')} ` +
+        `at index ${i} must not appear; got: ${JSON.stringify(s)}`
+      );
+    }
+  }
+
+  test('T-12 / E-10: error path — compile error message sanitized for ESC-in-alias', () => {
+    const esc = String.fromCharCode(0x1b);
+    const source = `@include fo${esc}o\n`;
+    try {
+      compile(source);
+      assert.fail('expected compile to throw');
+    } catch (err) {
+      const msg = err.message;
+      assert.ok(typeof msg === 'string' && msg.length > 0, 'message must be non-empty');
+      assertNoControlChars(msg, 'err.message');
+      assert.ok(
+        msg.includes('\\u001B'),
+        `sanitized \\u001B must appear in err.message; got: ${JSON.stringify(msg)}`
+      );
+    }
+  });
+
+  test('T-13 / E-11: lint path — lintVirtual with ESC in module name sanitizes duplicate-import message', () => {
+    // Use lintVirtual with a module whose NAME contains a raw ESC byte (U+001B),
+    // imported twice so duplicate-import fires and embeds the raw path in its message.
+    // Mirrors Python E12 (test_e12_lint_virtual_esc_in_import_path_message_sanitized).
+    // Verifies:
+    //   (1) No raw C0/DEL/C1 bytes in any diagnostic message.
+    //   (2) Sanitized \u001B literal IS present (positive evidence, non-vacuous).
+    //   (3) Result shape: version 1, duplicate-import rule present.
+    const esc = String.fromCharCode(0x1b);
+    const moduleName = `fo${esc}o.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    const result = lintVirtual(modules, 'main.mds');
+
+    // (3) Result shape: version 1.
+    assert.equal(result.version, 1, 'T-13/E-11: version must be 1');
+    assert.ok(Array.isArray(result.files), 'T-13/E-11: files must be an array');
+
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.length > 0,
+      'T-13/E-11: expected at least one diagnostic (duplicate-import should fire); got: ' +
+        JSON.stringify(allDiags),
+    );
+
+    // (1) No raw control bytes in any diagnostic message.
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `T-13/E-11: diag[${diag.rule}].message`);
+      }
+    }
+
+    // (2) At least one message carries the sanitized \u001B literal (positive evidence).
+    const hasSanitizedEsc = allDiags.some(
+      (d) =>
+        typeof d.message === 'string' &&
+        d.message.includes('\\u001B'),
+    );
+    assert.ok(
+      hasSanitizedEsc,
+      'T-13/E-11: expected \\u001B in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+
+    // (3) Expected rule: duplicate-import must be among the diagnostics.
+    const hasDupImport = allDiags.some((d) => d.rule === 'duplicate-import');
+    assert.ok(
+      hasDupImport,
+      'T-13/E-11: expected duplicate-import diagnostic; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+  });
+
+  test('E-12: error path — compile error message sanitized for DEL (U+007F) in alias', () => {
+    // DEL (U+007F) in @include alias; parser rejects the invalid alias and embeds
+    // the raw bytes in the error message. After fix, serialize() sanitizes DEL to \u007F.
+    const del = String.fromCharCode(0x7f);
+    const source = `@include fo${del}o\n`;
+    try {
+      compile(source);
+      assert.fail('expected compile to throw');
+    } catch (err) {
+      const msg = err.message;
+      assert.ok(typeof msg === 'string' && msg.length > 0, 'E-12: message must be non-empty');
+      assertNoControlChars(msg, 'E-12: err.message');
+      assert.ok(
+        msg.includes('\\u007F'),
+        `E-12: sanitized \\u007F must appear in err.message; got: ${JSON.stringify(msg)}`
+      );
+    }
+  });
+
+  test('E-13: lint path — lintVirtual with U+0085 (NEL/C1) in module name sanitizes message', () => {
+    // U+0085 (NEL) is a C1 control char that passes serde_yaml_ng YAML parsing
+    // (unlike ESC/DEL), making it a reachable C1 ESC-injection vector for lintVirtual.
+    // The duplicate-import rule fires and embeds the raw module name in its message;
+    // after sanitization the message must carry  and no raw C1 chars.
+    const nel = String.fromCharCode(0x85);
+    const moduleName = `fo${nel}o.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1, 'E-13: version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.length > 0,
+      'E-13: expected at least one diagnostic; got: ' + JSON.stringify(allDiags),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `E-13: diag[${diag.rule}].message`);
+      }
+    }
+    const hasSanitizedNel = allDiags.some(
+      (d) => typeof d.message === 'string' && d.message.includes('\\u0085'),
+    );
+    assert.ok(
+      hasSanitizedNel,
+      'E-13: expected \\u0085 in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
+  test('E-14: lint path — U+202E (RLO) in module name is escaped on the wire', () => {
+    // Trojan Source (CVE-2021-42574): U+202E is not a C0/DEL/C1 control char, so it
+    // used to travel the wire untouched and reverse the display order of everything
+    // after it in any bidi-aware renderer (terminal, IDE, code-review UI).
+    // "fo<RLO>gnp.mds" renders as "fopng.mds".
+    const rlo = String.fromCharCode(0x202e);
+    const moduleName = `fo${rlo}gnp.mds`;
+    const modules = {
+      [moduleName]: 'hi\n',
+      'main.mds': `@import "./${moduleName}"\n@import "./${moduleName}"\n`,
+    };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1, 'E-14: version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.length > 0,
+      'E-14: expected at least one diagnostic; got: ' + JSON.stringify(allDiags),
+    );
+    assert.ok(
+      allDiags.some((d) => d.rule === 'duplicate-import'),
+      'E-14: expected duplicate-import; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      if (typeof diag.message === 'string') {
+        assertNoControlChars(diag.message, `E-14: diag[${diag.rule}].message`);
+      }
+    }
+    // Cheap invariant check only — NOT coverage of the `file`-key escape. The
+    // hostile RLO is in the *imported* module's name, but this key is the *entry*
+    // filename ("main.mds"), so no hostile byte reaches it and this cannot fail via
+    // this vector (PF-013). Real `file`-key coverage: mds-core
+    // `to_canonical_json_escapes_bidi_override`.
+    for (const f of result.files) {
+      assertNoControlChars(f.file, 'E-14: files[].file');
+    }
+    assert.ok(
+      allDiags.some((d) => typeof d.message === 'string' && d.message.includes('\\u202E')),
+      'E-14: expected \\u202E in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+
+  test('E-15: lint path — newline in a frontmatter key is escaped to \\u000A on the wire', () => {
+    // Log/YAML-key forging: a raw newline inside a diagnostic message lets an
+    // attacker forge what reads as a second, independent finding in any
+    // line-oriented consumer of the JSON string value. WIRE mode escapes it.
+    //
+    // Reachability: a newline inside an `@import "..."` path is rejected by the
+    // lexer, so that route is vacuous. A YAML *double-quoted* frontmatter key is
+    // not: serde_yaml_ng decodes the \n escape into a real newline and
+    // unused-variable embeds the decoded key verbatim in its message.
+    const source =
+      '---\n"a\\nerror[mds::forged]: FAKE\\nb": 1\n---\nHello\n';
+    const result = lintVirtual({ 'main.mds': source }, 'main.mds');
+    assert.equal(result.version, 1, 'E-15: version must be 1');
+    const allDiags = result.files.flatMap((f) => f.diagnostics);
+    assert.ok(
+      allDiags.some((d) => d.rule === 'unused-variable'),
+      'E-15: expected unused-variable; got rules: ' +
+        JSON.stringify(allDiags.map((d) => d.rule)),
+    );
+    for (const diag of allDiags) {
+      assert.ok(
+        !diag.message.includes('\n'),
+        `E-15: raw newline must not survive into the wire message; got: ${JSON.stringify(diag.message)}`,
+      );
+    }
+    assert.ok(
+      allDiags.some((d) => d.message.includes('\\u000A')),
+      'E-15: expected \\u000A in at least one diagnostic message; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+    // Escaped, not stripped — the payload text itself is preserved verbatim.
+    assert.ok(
+      allDiags.some((d) => d.message.includes('error[mds::forged]')),
+      'E-15: message body must be preserved verbatim; got: ' +
+        JSON.stringify(allDiags.map((d) => d.message)),
+    );
+  });
+});

@@ -39,8 +39,9 @@ use crate::build::{
     resolve_output_path_for_kind, write_output, OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
-    canonicalize_out_dir, collect_mds_files, is_partial, is_within_default_excluded_dir,
-    output_base_no_ext, output_path_for, probe_and_remove_stale, resolve_output_base, OutputBase,
+    canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
+    is_within_default_excluded_dir, output_base_no_ext, output_path_for, probe_and_remove_stale,
+    resolve_output_base, safe_inline, safe_path, OutputBase,
 };
 
 // ── Public args struct ────────────────────────────────────────────────────────
@@ -382,7 +383,11 @@ pub(crate) fn resync_watches(
     // Watch new directories.
     for dir in new_dirs.difference(current_dirs) {
         if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
-            eprintln!("warning: failed to watch {}: {e}", dir.display());
+            eprint_warning(&format!(
+                "warning: failed to watch {}: {}",
+                safe_path(dir),
+                safe_inline(&e)
+            ));
         } else {
             result.insert(dir.clone());
         }
@@ -471,7 +476,10 @@ fn drain_debounce(rx: &mpsc::Receiver<Msg>, debounce_ms: u64) -> (BTreeSet<PathB
                 }
             }
             Ok(Msg::Fs(Err(e))) => {
-                eprintln!("warning: watch error during debounce: {e}");
+                eprint_warning(&format!(
+                    "warning: watch error during debounce: {}",
+                    safe_inline(&e)
+                ));
             }
             Ok(Msg::Interrupt) => return (paths, true),
             Err(mpsc::RecvTimeoutError::Timeout) => break,
@@ -726,7 +734,7 @@ fn handle_fs_event_file(
     let interrupted = match msg {
         Msg::Interrupt => true,
         Msg::Fs(Err(e)) => {
-            eprintln!("warning: watch error: {e}");
+            eprint_warning(&format!("warning: watch error: {}", safe_inline(&e)));
             // Non-fatal watch error — skip but don't rebuild.
             return FileEventAction::Skip;
         }
@@ -786,7 +794,7 @@ fn rebuild_file(
     }) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             state.last_mtimes = snapshot_state(&state.foi);
             return;
         }
@@ -860,12 +868,14 @@ fn rebuild_file(
                         if !ctx.quiet {
                             eprintln!(
                                 "Recompiled {} ({} deps) in {}ms",
-                                out_display, dep_count, elapsed
+                                safe_inline(&out_display),
+                                dep_count,
+                                elapsed
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("{e:?}");
+                        eprint_error(e);
                         // Error-settle: update snapshot so we don't re-fire.
                         state.last_mtimes = snapshot_state(&state.foi);
                     }
@@ -873,7 +883,7 @@ fn rebuild_file(
             }
         }
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             // Error-settle: snapshot current state so the tick gate
             // won't re-fire on the same unchanged files (AC-R7/W6).
             state.last_mtimes = snapshot_state(&state.foi);
@@ -912,7 +922,7 @@ fn run_watch_file(
         set_string_vars: static_set_string_vars.clone(),
     })?;
     if !quiet {
-        eprintln!("Watching {}", entry.display());
+        eprintln!("Watching {}", safe_path(&entry));
     }
 
     // Load project config (for output_dir) — used if no explicit -o / --out-dir.
@@ -933,7 +943,7 @@ fn run_watch_file(
         Ok(result) => result,
         Err(e) => {
             // Initial compile error: print and continue watching (entry dir still watched).
-            eprintln!("{e:?}");
+            eprint_error(e);
             // Fall back: resolve output path with Markdown kind as a placeholder so we
             // know where to watch. This path may not match a later successful compile if
             // the template has @message blocks, but it will correct on first successful rebuild.
@@ -1237,7 +1247,7 @@ fn compile_one_source(
                         if !quiet {
                             eprintln!(
                                 "Recompiled {} ({} deps) in {}ms",
-                                out.display(),
+                                safe_path(&out),
                                 dep_count,
                                 elapsed
                             );
@@ -1276,7 +1286,7 @@ fn compile_one_source(
                         );
                     }
                     Err(e) => {
-                        eprintln!("{e:?}");
+                        eprint_error(e);
                         // Error-settle: update mtime so the gate won't re-fire.
                         state.record_error(src);
                     }
@@ -1288,7 +1298,7 @@ fn compile_one_source(
             }
         }
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             state.record_error(src);
         }
     }
@@ -1456,7 +1466,7 @@ fn liveness_probe_dir(
             }) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("{e:?}");
+                    eprint_error(e);
                     state.last_mtimes = snapshot_state(&state.known_set());
                     return;
                 }
@@ -1507,7 +1517,7 @@ fn handle_fs_event_dir(
     let interrupted = match msg {
         Msg::Interrupt => true,
         Msg::Fs(Err(e)) => {
-            eprintln!("warning: watch error: {e}");
+            eprint_warning(&format!("warning: watch error: {}", safe_inline(&e)));
             return DirEventOutcome::Skip;
         }
         Msg::Fs(Ok(event)) => {
@@ -1584,7 +1594,7 @@ fn handle_fs_event_dir(
     }) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("{e:?}");
+            eprint_error(e);
             state.last_mtimes = snapshot_state(&state.known_set());
             return DirEventOutcome::Done;
         }
@@ -1646,7 +1656,7 @@ fn dir_watch_startup(
     };
 
     if !quiet {
-        eprintln!("Watching directory {}", root.display());
+        eprintln!("Watching directory {}", safe_path(&root));
     }
 
     // Startup compile: compile all .mds files found under root.
@@ -1699,14 +1709,14 @@ fn dir_watch_startup(
                     let out = output_path_for(&key, &root, &output_base, ext);
                     if let Err(e) = write_output(Some(out.clone()), &compiled.content, quiet, true)
                     {
-                        eprintln!("{e:?}");
+                        eprint_error(e);
                     } else {
                         state.last_written.insert(out, compiled.content);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("{e:?}");
+                eprint_error(e);
                 state.forward_deps.insert(key.clone(), vec![]);
                 state.errored.insert(key.clone());
                 state.known_files.insert(key);
@@ -1745,10 +1755,11 @@ fn dir_watch_startup(
     // Watch external dep dirs NonRecursive (DD3).
     for ext_dir in &state.external_dep_dirs {
         if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
-            eprintln!(
-                "warning: failed to watch external dep dir {}: {e}",
-                ext_dir.display()
-            );
+            eprint_warning(&format!(
+                "warning: failed to watch external dep dir {}: {}",
+                safe_path(ext_dir),
+                safe_inline(&e)
+            ));
         }
     }
 
@@ -1767,10 +1778,11 @@ fn dir_watch_startup(
     // a transient failure must not abort the session, applies ADR-021 / consistency fix).
     if let Some(ref vd) = vars_dir_extra {
         if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
-            eprintln!(
-                "warning: failed to watch vars directory {}: {e}",
-                vd.display()
-            );
+            eprint_warning(&format!(
+                "warning: failed to watch vars directory {}: {}",
+                safe_path(vd),
+                safe_inline(&e)
+            ));
         }
     }
 
@@ -1971,11 +1983,15 @@ fn process_dir_batch_vars_changed(
                 match std::fs::remove_file(&out) {
                     Ok(()) => {
                         if !quiet {
-                            eprintln!("Removed {} (source deleted)", out.display());
+                            eprintln!("Removed {} (source deleted)", safe_path(&out));
                         }
                     }
                     Err(e) => {
-                        eprintln!("warning: could not remove {}: {e}", out.display());
+                        eprint_warning(&format!(
+                            "warning: could not remove {}: {}",
+                            safe_path(&out),
+                            safe_inline(&e)
+                        ));
                     }
                 }
                 // Use the canonical forget() helper so ALL state maps are cleaned up uniformly
@@ -2095,7 +2111,7 @@ fn process_dir_batch_incremental(
                     state.errored.remove(src);
                 }
                 Err(e) => {
-                    eprintln!("{e:?}");
+                    eprint_error(e);
                     state.errored.insert(src.clone());
                     settle_mtime(src, &mut state.last_mtimes);
                 }
@@ -2117,11 +2133,15 @@ fn process_dir_batch_incremental(
                 match std::fs::remove_file(&out) {
                     Ok(()) => {
                         if !quiet {
-                            eprintln!("Removed {} (source deleted)", out.display());
+                            eprintln!("Removed {} (source deleted)", safe_path(&out));
                         }
                     }
                     Err(e) => {
-                        eprintln!("warning: could not remove {}: {e}", out.display());
+                        eprint_warning(&format!(
+                            "warning: could not remove {}: {}",
+                            safe_path(&out),
+                            safe_inline(&e)
+                        ));
                     }
                 }
             }

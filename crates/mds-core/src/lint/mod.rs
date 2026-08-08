@@ -34,7 +34,8 @@ pub(crate) mod tier;
 
 pub use config::LintConfig;
 pub use diagnostic::{
-    sanitize_control_chars, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit,
+    named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
+    sanitize_control_chars_wire, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit,
 };
 
 use crate::error::MdsError;

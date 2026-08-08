@@ -307,6 +307,14 @@ where
                     let err_obj =
                         raw_create_error(raw_env, "mds::internal", "internal compiler error");
                     if !err_obj.is_null() {
+                        // NOTE: `err.detail` carries the raw panic payload and is
+                        // intentionally NOT passed through `MdsError::serialize()` or
+                        // `sanitize_control_chars`.  This is a deliberate exclusion from
+                        // the sanitization boundary enumeration (see diagnostic.rs module
+                        // doc).  The path exists only when the `debug-panics` Cargo
+                        // feature is enabled, which must never ship in a production build
+                        // — see CLAUDE.md: "`debug-panics` Cargo feature must never ship
+                        // enabled (all three binding crates)".
                         raw_set_string_prop(raw_env, err_obj, "detail", &detail);
                         let _ = sys::napi_throw(raw_env, err_obj);
                         return Err(napi::Error::new(Status::PendingException, ""));

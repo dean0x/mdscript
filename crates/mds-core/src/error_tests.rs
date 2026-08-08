@@ -232,6 +232,228 @@ fn serialized_error_to_json_null_span() {
     assert!(v["span"].is_null(), "span should be null in JSON when None");
 }
 
+// ── T-1..T-3: serialize() sanitizes control chars (issue #176 / ESC-INJECTION) ──
+
+/// T-1 [AC-F3]: serialize() sanitizes raw ESC (U+001B) in the message field.
+/// The message string must not contain the raw ESC byte; the sanitized 6-char
+/// literal `\u001B` must appear instead.
+#[test]
+fn serialize_sanitizes_esc_in_message() {
+    // Build a Syntax error whose message embeds a raw ESC byte mid-string.
+    let e = MdsError::syntax("bad\x1Btoken");
+    let s = e.serialize();
+    assert!(
+        !s.message.contains('\x1B'),
+        "raw ESC byte must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in message; got: {:?}",
+        s.message
+    );
+}
+
+/// T-2 [AC-F3]: serialize() sanitizes raw ESC in both message and help fields.
+/// UndefinedVariable embeds `name` in both the message ("undefined variable 'name'")
+/// and the help ("define 'name' in frontmatter or imports").
+#[test]
+fn serialize_sanitizes_esc_in_help() {
+    // The name `a\x1Bb` embeds an ESC byte — miette uses it in both fields.
+    let e = MdsError::undefined_var("a\x1Bb");
+    let s = e.serialize();
+    // Message must be sanitized.
+    assert!(
+        !s.message.contains('\x1B'),
+        "raw ESC byte must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in message; got: {:?}",
+        s.message
+    );
+    // Help must also be sanitized.
+    let help = s.help.expect("UndefinedVariable should carry help text");
+    assert!(
+        !help.contains('\x1B'),
+        "raw ESC byte must not appear in serialized help; got: {:?}",
+        help
+    );
+    assert!(
+        help.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in help; got: {:?}",
+        help
+    );
+}
+
+/// T-3 [AC-F3]: serialize() sanitizes DEL (U+007F) and C1 NEL (U+0085) in addition
+/// to ESC, producing the corresponding `\uXXXX` literals.
+#[test]
+fn serialize_sanitizes_del_and_c1() {
+    let e = MdsError::syntax("del\u{007F}and\u{0085}nel");
+    let s = e.serialize();
+    // Raw DEL byte must be sanitized.
+    assert!(
+        !s.message.contains('\u{007F}'),
+        "raw DEL must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u007F"),
+        "sanitized \\u007F must appear in message; got: {:?}",
+        s.message
+    );
+    // Raw C1 NEL (U+0085) must be sanitized.
+    assert!(
+        !s.message.contains('\u{0085}'),
+        "raw C1 NEL must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u0085"),
+        "sanitized \\u0085 must appear in message; got: {:?}",
+        s.message
+    );
+}
+
+/// T-3b [AC-F3]: `serialize()` escapes the widened class — bidi overrides
+/// (Trojan Source, CVE-2021-42574), U+2028/U+2029, and U+FEFF — none of which
+/// are C0/DEL/C1 and all of which previously passed straight through.
+#[test]
+fn serialize_sanitizes_bidi_separators_and_bom() {
+    let e = MdsError::syntax("rlo\u{202E}iso\u{2066}ls\u{2028}ps\u{2029}bom\u{FEFF}end");
+    let s = e.serialize();
+    for (ch, escaped) in [
+        ('\u{202E}', "\\u202E"),
+        ('\u{2066}', "\\u2066"),
+        ('\u{2028}', "\\u2028"),
+        ('\u{2029}', "\\u2029"),
+        ('\u{FEFF}', "\\uFEFF"),
+    ] {
+        assert!(
+            !s.message.contains(ch),
+            "raw U+{:04X} must not appear in serialized message; got: {:?}",
+            ch as u32,
+            s.message
+        );
+        assert!(
+            s.message.contains(escaped),
+            "sanitized {escaped} must appear in message; got: {:?}",
+            s.message
+        );
+    }
+    // Non-vacuity: the surrounding prose survives.
+    assert!(
+        s.message.contains("rlo") && s.message.contains("end"),
+        "clean text must be preserved; got: {:?}",
+        s.message
+    );
+}
+
+/// T-3c [AC-F3]: `serialize()` is a WIRE boundary — an embedded newline (U+000A)
+/// becomes its 6-char escape literal so a hostile message cannot forge an extra
+/// line in a line-oriented consumer of `SerializedError.message`.
+#[test]
+fn serialize_escapes_newline_on_the_wire() {
+    let e = MdsError::syntax("a\nerror[mds::forged]: FAKE\nb");
+    let s = e.serialize();
+    assert!(
+        !s.message.contains('\n'),
+        "raw newline must not appear in serialized message; got: {:?}",
+        s.message
+    );
+    assert!(
+        s.message.contains("\\u000A"),
+        "sanitized \\u000A must appear in serialized message; got: {:?}",
+        s.message
+    );
+    // Non-vacuity: the message body itself is untouched.
+    assert!(
+        s.message.contains("error[mds::forged]"),
+        "message body must be preserved verbatim; got: {:?}",
+        s.message
+    );
+}
+
+// ── display_sanitized() ───────────────────────────────────────────────────
+
+/// T-DS: `display_sanitized()` escapes raw ESC (U+001B) bytes in the terminal-
+/// safe output while `to_string()` / `Display` leaves them raw.
+///
+/// This test is the regression anchor for rust-5/architecture-2 (PF-004 on
+/// the published API, CWE-150 / issue #176).  It FAILS if `display_sanitized()`
+/// is removed or reverted to a bare `self.to_string()` call (avoids PF-013).
+#[test]
+fn display_sanitized_escapes_esc_byte() {
+    let e = MdsError::syntax("bad\x1Btoken");
+    let displayed = e.display_sanitized();
+    assert!(
+        !displayed.contains('\x1B'),
+        "raw ESC byte must not appear in display_sanitized(); got: {:?}",
+        displayed
+    );
+    // Positive assertion — FAILS if display_sanitized() reverts to to_string().
+    assert!(
+        displayed.contains("\\u001B"),
+        "sanitized literal \\u001B must appear in display_sanitized(); got: {:?}",
+        displayed
+    );
+}
+
+/// T-DS-BIDI: `display_sanitized()` also covers the widened class — a bidi
+/// override reaching a TTY reverses the visible order of the rest of the line.
+#[test]
+fn display_sanitized_escapes_bidi_override() {
+    let e = MdsError::syntax("bad\u{202E}token");
+    let displayed = e.display_sanitized();
+    assert!(
+        !displayed.contains('\u{202E}'),
+        "raw U+202E must not appear in display_sanitized(); got: {displayed:?}"
+    );
+    assert!(
+        displayed.contains("\\u202E"),
+        "sanitized literal \\u202E must appear in display_sanitized(); got: {displayed:?}"
+    );
+}
+
+/// T-DS-NL: `display_sanitized()` is the HUMAN boundary — newlines stay raw so
+/// multi-line miette frames remain readable. This is the deliberate asymmetry
+/// with `serialize()` (see T-3c); pinning it here prevents an accidental
+/// "sanitize everything the same way" regression.
+#[test]
+fn display_sanitized_preserves_newline() {
+    let e = MdsError::syntax("line one\nline two");
+    let displayed = e.display_sanitized();
+    assert!(
+        displayed.contains('\n'),
+        "display_sanitized() must preserve raw newlines; got: {displayed:?}"
+    );
+    assert!(
+        !displayed.contains("\\u000A"),
+        "display_sanitized() must not escape newlines; got: {displayed:?}"
+    );
+}
+
+/// `display_sanitized()` and `to_string()` differ on ESC-bearing input, proving
+/// that `display_sanitized()` is not a trivial alias for the raw Display impl.
+#[test]
+fn display_sanitized_differs_from_to_string_on_esc() {
+    let e = MdsError::syntax("msg\x1Bend");
+    // Raw Display keeps the ESC byte.
+    assert!(
+        e.to_string().contains('\x1B'),
+        "to_string() must keep raw ESC (display contract); got: {:?}",
+        e.to_string()
+    );
+    // Sanitized form must not.
+    assert!(
+        !e.display_sanitized().contains('\x1B'),
+        "display_sanitized() must not keep raw ESC; got: {:?}",
+        e.display_sanitized()
+    );
+}
+
 // ── Display output ────────────────────────────────────────────────────────
 
 #[test]

@@ -225,12 +225,13 @@ fn main() {
 
     let result = run(cli);
     if let Err(e) = result {
-        // Sanitize at the last-resort render boundary: every subcommand's error propagates
-        // here, and MdsError::Syntax embeds user-controlled source fragments that may contain
-        // raw ESC bytes. Guarding here makes the protection hold by construction for any
-        // future error path, not just the ones we remember to sanitize individually (PF-004).
-        eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
-        process::exit(exit_code(&e));
+        // Route through the single render choke point (avoids PF-004 /
+        // architecture-6: hand-rolled sanitize_control_chars bypass). Every subcommand's
+        // error propagates here; guarding here makes the protection hold by construction
+        // for any future error path, not just the ones we remember to sanitize individually.
+        let code = exit_code(&e);
+        output::eprint_error(e);
+        process::exit(code);
     }
 }
 
@@ -275,7 +276,7 @@ fn run_check(
             .map_err(miette::Error::from)?;
         if !quiet {
             for w in &warnings {
-                eprintln!("{w}");
+                output::eprint_warning(w);
             }
             eprintln!("OK: <stdin>");
         }
@@ -284,9 +285,9 @@ fn run_check(
             mds::check_collecting_warnings(&input, runtime_vars).map_err(miette::Error::from)?;
         if !quiet {
             for w in &warnings {
-                eprintln!("{w}");
+                output::eprint_warning(w);
             }
-            eprintln!("OK: {}", input.display());
+            eprintln!("OK: {}", output::safe_path(&input));
         }
     }
     Ok(())
@@ -319,7 +320,7 @@ fn run_check_directory(
             std::process::exit(1);
         }
         if !quiet {
-            eprintln!("No .mds files found in {}", dir.display());
+            eprintln!("No .mds files found in {}", output::safe_path(dir));
         }
         return Ok(());
     }
@@ -337,15 +338,15 @@ fn run_check_directory(
             Ok(((), warnings)) => {
                 if !quiet {
                     for w in &warnings {
-                        eprintln!("{w}");
+                        output::eprint_warning(w);
                     }
                 }
                 ok_count += 1;
             }
             Err(e) => {
-                // Sanitize at the render boundary: MdsError::Syntax embeds user-controlled
-                // source fragments that may contain raw ESC bytes (PF-004 parallel-path guard).
-                eprintln!("{}", mds::sanitize_control_chars(&format!("{e:?}")));
+                // Route through the single render choke point (avoids PF-004 /
+                // architecture-6: hand-rolled sanitize_control_chars bypass).
+                output::eprint_error(e);
                 fail_count += 1;
             }
         }
@@ -395,8 +396,8 @@ Your items:
     if !quiet {
         eprintln!(
             "Created {}\n  Try: mds build {}",
-            filename.display(),
-            filename.display()
+            output::safe_path(&filename),
+            output::safe_path(&filename)
         );
     }
     Ok(())
@@ -456,7 +457,8 @@ fn run(cli: Cli) -> Result<()> {
                 "json" => lint::LintFormat::Json,
                 other => {
                     eprintln!(
-                        "error: unknown --format value '{other}'; expected 'human' or 'json'"
+                        "error: unknown --format value '{}'; expected 'human' or 'json'",
+                        output::safe_inline(other)
                     );
                     std::process::exit(2);
                 }

@@ -62,6 +62,222 @@ field is present across all binding surfaces: CLI JSON output, napi
   project root (located via `.mdsroot` / `.git` walk-up), and `..`-escaping
   references outside the project root fall back to the basename. (#3)
 
+- **Control-byte injection hardening (CWE-150 / #176):** Raw C0 / DEL / C1
+  control bytes in `.mds` source content could reach terminal stderr and
+  JS / Python / WASM API error messages, enabling terminal escape-sequence
+  injection. The serialization and diagnostic-render boundaries hardened here are
+  `MdsError::serialize()` (inherited by all three binding layers),
+  `LintResult::to_canonical_json()` including the `"file"` group key,
+  `CompileResult::to_canonical_json()` warnings, and the CLI render path. That is
+  an audit list, **not a closed set**: the governing rule is the per-field one
+  below, and the residual it leaves is named there. Enumerating boundaries is
+  exactly the framing this changelog retires further down.
+  The CLI render path (PF-014 redesign) sanitizes the renderer's *source-excerpt*
+  input byte-length-preservingly — hostile C0/DEL/C1 bytes become `?` (C0/DEL) or
+  NBSP (C1) so span offsets and caret columns stay exact and miette's own SGR
+  colour codes survive intact on TTY. `message` and `help` are renderer inputs too,
+  but they are `\uXXXX`-escaped rather than length-preserved; only source text
+  carries the byte-length invariant. A new
+  `MdsError::display_sanitized()` public API is provided for Rust consumers;
+  the raw `Display` impl is preserved with an explicit unsafety contract in
+  its rustdoc. `span` byte offsets, `fix_edits` byte ranges, and `rule`
+  identifiers are deliberate exclusions — they carry position data, not
+  terminal-bound text. (#176)
+
+- **CLI error *message* text is now escaped too (#176).** The hardening above
+  covered rendered source excerpts, filenames, and the diagnostic wire boundaries, but a
+  diagnostic's own message and help text still reached stderr raw. Both CLI error
+  families interpolate untrusted input into their messages — compiler errors carry
+  template text (`invalid include alias: '<alias>'`) and CLI errors carry `mds.json`
+  values and filesystem paths (`mds.json output_dir '<value>' must not contain '..'`)
+  — so a hostile `.mds` file or config value could still emit raw ANSI escape
+  sequences to a terminal. `mds build`, `check`, `fmt`, `lint`, and `watch` now escape
+  each report's message, help, and caret-label text at the single `eprint_error`
+  choke-point, *before* the diagnostic renderer runs. The rendered frame is still never
+  post-processed, so terminal colour and caret alignment are unaffected, and output for
+  well-formed input is byte-for-byte unchanged. (#176)
+
+- **Every CLI print now escapes what it interpolates, and CI enforces it (#176).**
+  Warning and status prints scattered across `main.rs`, `build.rs`, `fmt.rs`, `lint.rs`,
+  `watch.rs` and `output.rs` interpolated filenames, `mds.json` rule names, `--format`
+  arguments and `io::Error` causes into `eprintln!` raw, bypassing the
+  `sanitize_control_chars` call that `mds-core`'s `emit_warnings` applies on the primary
+  code paths (a PF-004 parallel-path gap). The two most directly reachable:
+
+  - a rule NAME in `mds.json` is an arbitrary JSON object key, and a JSON `\uXXXX`
+    escape decodes to a real byte, so any repository could put a raw ESC on a
+    developer's stderr — or forge whole `Clean: …` / `0 problems found` status lines —
+    just by being linted;
+  - the shared directory walker's depth-limit warning named the directory it stopped at,
+    so one hostile directory name reached `mds build`, `check`, `fmt`, `lint` and
+    `watch` at once.
+
+  All of them now apply the per-field rule below: the warning *body* goes through
+  `eprint_warning` (HUMAN), and every value interpolated into it goes through
+  `safe_path` / `safe_inline` (WIRE). `watch.rs`'s lifecycle status lines
+  (`Watching {}`, `Removed {}`, `warning: could not remove {}: {e}`) — previously
+  carved out as a pre-existing gap — are included.
+
+  **This is now a machine-checked invariant, not an enumeration.** A new
+  `crates/mds-cli/tests/print_discipline.rs` fails CI if *any* print macro under
+  `crates/mds-cli/src/**` interpolates a value that is not passed through one of the
+  escape helpers. It applies the same rule to the argument of `eprint_warning`
+  (HUMAN-mode escaping alone is not sufficient — it preserves `\n`, which is the
+  line-forgery vector), including when the message has been hoisted into a local:
+  a bare identifier is traced one hop through its `let` binding and judged the same
+  way, and an argument the trace cannot resolve is **reported**, not trusted. Because
+  `let`s are matched file-wide, every `for` variable, function parameter and closure
+  parameter **poisons** its own name, so a value arriving through one of those is
+  reported rather than resolved against an unrelated `let` that happens to share the
+  name. It also
+  scans `write!` / `writeln!` to a stdout/stderr handle. Deliberate exceptions — the
+  compiled artefact written to stdout, `&'static str` labels, integer counters, and
+  whole warning strings produced by `mds-core` — live in explicit allowlists with a
+  written justification per entry, and a companion test fails if an entry ever stops
+  matching. The guard is a **lexical** scanner: it catches accidental reintroduction,
+  and its five known limits (name-matched sanitizers, anti-rot-not-anti-reuse
+  allowlists, the one-hop single-file trace, name-based stream detection, and the
+  `if let` / `while let` / `match`-arm binders the poison set does not model) are stated
+  in its own rustdoc rather than implied away. Four successive reviews of this change
+  each found a *different* unescaped print; the guard is what ends that.
+
+  The one precondition the guard depends on and cannot check — that `mds-core` WIRE-escapes
+  the identifiers its warning producers interpolate, since `mds-cli` prints whole
+  warning strings — is now pinned by `crates/mds-cli/tests/producer_discipline.rs` for
+  the only producer whose input can carry a hostile character (`resolver.rs`'s
+  imported-module filename). The other two producers interpolate an `@include` alias,
+  which the parser restricts to `[A-Za-z_][A-Za-z0-9_]*`, so they are upheld by review
+  and stated as such rather than claimed to be tested. (#176)
+
+- **The escape mode is chosen per field, not per surface (#176).** Normative in spec
+  §7.5: **on the diagnostic surfaces — the `"version": 1` JSON wire, CLI status and
+  warning lines, `[file:line:col]` frame headers — untrusted identifiers, filenames and
+  error causes are WIRE-escaped, human terminal output included; prose — a diagnostic
+  message or help body — stays HUMAN so multi-line frames keep rendering.** The
+  rule governs *diagnostic* output; the two carve-outs below are not diagnostics and are
+  not escaped at all. The discriminator is whether the
+  value is ever legitimately multi-line: a filename, a config key, a `--format`
+  argument and an `io::Error` never are, so preserving a raw `\n` in one buys nothing
+  and lets it forge a standalone line byte-identical in form to genuine output
+  (CWE-117). This supersedes the earlier per-surface framing and the "wire mode at
+  exactly four boundaries" enumeration. A new `mds::sanitize_control_chars_wire` and
+  `mds::named_source_for_render` are public in `mds-core` for consumers that need to
+  apply the same rule.
+
+  **Declared carve-out: functional path references are NOT escaped.** Source-map
+  documents (the `mds build --source-map` sidecar, and the `sourceMap` embedded in
+  `CompileResult.to_canonical_json()`) emit their `file`, `sources` and `sourcesContent`
+  values **verbatim**, as does the `dependencies` array. These are functional references
+  that devtools, bundlers and IDEs resolve against the filesystem — rewriting a path to a
+  `\uXXXX` literal would point at a path that does not exist, breaking source-map
+  resolution and dependency tracking to defend against a pathological filename. That is
+  the same product-versus-display distinction that keeps compiled output byte-faithful.
+  **Consumers of a source map or of `dependencies` must treat every path in them as
+  untrusted** and escape it for whatever destination they render it to; JSON string
+  encoding is not that escaping, since a decoded `"\n"` is a real newline again. The CLI
+  does not rely on this: its `Compiled to …` and `Source map written to …` lines print
+  through `safe_path` and carry the escaped form even though the sidecar does not.
+  Specified in spec §7.5 ("Carve-out: functional path references"). (#176)
+
+  **Declared residual.** "Identifier / filename / cause" means the value occupies such a
+  *field* — a CLI status line, a `[file:line:col]` frame header, the JSON `file` key. A
+  path or identifier interpolated into a diagnostic **message body** is part of prose,
+  so it follows the message row and stays HUMAN on terminal surfaces. That applies at
+  both message-construction sites: the CLI's `miette::miette!()` reports **and**
+  `mds-core`'s `MdsError` message bodies (`fs.rs`'s `cannot read {path}: {e}`,
+  `parser_helpers.rs`'s `invalid import alias: '{alias}'`). A `\n` in one of those
+  survives into the rendered frame and takes a line there. It is a weaker surface than a
+  status line — frame content is indented and `│`-prefixed, and the prefix survives
+  `strip()`, so it cannot masquerade as genuine bare status output — and no raw control
+  byte reaches the terminal either way. Closing it means WIRE-escaping over a hundred
+  `MdsError` construction sites and changing the public message text seen by all three
+  binding layers; that is a separate change. Disclosed in spec §7.5 ("Residual: paths and
+  identifiers inside a message body") and in the boundary table in
+  `crates/mds-core/src/lint/diagnostic.rs`. (#176)
+
+- **Hostile filenames can no longer forge CLI status lines (CWE-117 / #176).** POSIX
+  permits a newline inside a filename, and directory-mode commands discover names by
+  walking the tree — the user never types them. Filename display used HUMAN mode, which
+  preserves newlines by design so that multi-line diagnostic *messages* keep rendering,
+  so a file named `evil.mds<LF>Clean: real.mds<LF>OK: all-fine.mds` made
+  `mds build`/`lint`/`fmt`/`check` emit attacker-authored lines byte-identical in form
+  to genuine status output — unframed, unindented, and indistinguishable. **Diagnostic
+  filename fields are now escaped in WIRE mode on every surface that renders one, human
+  included** (source-map paths and `dependencies` are the declared carve-out): `safe_path`
+  and the status-line printers, and the `[file:line:col]` frame header via a new shared
+  `mds::named_source_for_render` builder that `MdsError::at()`, the formatter and the
+  lint renderer all call. Message and help text are unchanged (still HUMAN, still
+  multi-line). A filename is never legitimately multi-line, so nothing legitimate is
+  lost. (#176)
+
+- **Fix-rejection reasons are display-safe by construction (#176).**
+  `mds::fix::FixOutcome::Rejected.reason` interpolated an `MdsError`'s deliberately-raw
+  `Display` — whose variants embed template text (`syntax error: {message}`) and
+  filesystem paths (`file not found: {path}`) — and the CLI prints that value as an
+  unframed `fix rejected: {reason}` status line. The embedded error is now escaped in
+  WIRE mode at the single construction site in `fix.rs`, so the field is single-line and
+  control-byte-free for **every** consumer of the published `mds::fix` API, not just the
+  CLI's own print sites. (#176)
+
+- **Widened escape class: bidi / separator / BOM characters (#176).** The
+  escaped set now covers characters outside C0 / DEL / C1 that are still
+  display-hazardous, on every surface that escapes:
+  - **U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069** — the complete
+    Unicode `Bidi_Control=Yes` set (all twelve codepoints), behind Trojan Source
+    (CVE-2021-42574). A single U+202E in a filename or diagnostic message
+    reverses how the rest of the line renders in any bidi-aware terminal, IDE, or
+    code-review UI. U+061C ARABIC LETTER MARK is the only member outside
+    U+200E–U+2069 and is easy to miss for exactly that reason.
+  - **U+2028, U+2029** — LINE / PARAGRAPH SEPARATOR, which terminate a
+    JavaScript string literal.
+  - **U+FEFF** — BOM / ZWNBSP, invisible in every renderer.
+
+  Each becomes its uppercase six-character `\uXXXX` literal, exactly like the
+  existing C0 / DEL / C1 escapes. Source excerpts inside a rendered diagnostic
+  frame are neutralized to a **same-width** substitute instead, preserving the
+  byte-length invariant that keeps span offsets and caret columns exact: 1-byte
+  C0/DEL → `?`, 2-byte C1 and U+061C → U+00A0, 3-byte bidi controls, separators
+  and BOM → U+FFFD. (#176)
+
+- **BREAKING (wire format): machine-readable boundaries now escape `\n` (#176).**
+  `MdsError::serialize()`, `LintResult::to_canonical_json()` (message, help, and
+  the `"file"` group key), `CompileResult::to_canonical_json()` warnings, and the
+  Python typed lint surface now emit `\n` as the six-character `\u000A` literal.
+  A raw newline inside a diagnostic string is a line-forging vector: any consumer
+  that prints or line-splits the value can be made to render an attacker-authored
+  line as a genuine second finding. `\t` is unaffected.
+
+  **Human-render output of diagnostic PROSE is unchanged** — the CLI renderer,
+  `MdsError::display_sanitized()`, and warning *bodies* on stderr still preserve
+  raw newlines so multi-line diagnostic frames stay readable. Human output of
+  diagnostic filenames, identifiers and causes **did** change, by design: under the
+  per-field rule above those are WIRE-escaped on every surface that renders a
+  diagnostic, human included, so a newline
+  in one now renders as the six-character `\u000A` literal instead of forging a
+  line. Source-map paths and `dependencies` are unaffected: they are the declared
+  carve-out and stay verbatim. See the two entries below.
+
+  **Migration:** consumers that split a `message` / `help` / warning string on
+  `\n` will now see a single line containing the literal `\u000A` where a real
+  newline used to be. Split on that literal instead, or render the value verbatim.
+
+- **Escaping is one-way — consumers must not un-escape (#176).** The
+  transformation is lossy and non-injective by design: a template that literally
+  contains the six characters `\u001B` and one containing an actual ESC byte are
+  indistinguishable after serialization. **Do not** convert `\uXXXX` sequences
+  back into bytes — that reconstitutes the injection the escape prevents. Round-tripping is
+  an explicit non-goal; no backslash-escaping will be added to make the mapping
+  reversible. Consumers needing original bytes must read them from the source via
+  the raw `span` / `fix_edits` byte offsets, which stay unsanitized for this
+  purpose. Documented normatively in spec §7.5.
+
+- **`--diff` preview output is TTY-gated (#176).** Applies to both
+  `mds lint --fix --diff` and `mds fmt --diff`, which share one renderer.
+  Preview diff text is neutralized when stdout is a terminal (where control bytes
+  would execute) and emitted **byte-faithful when piped or redirected**, so a
+  redirected diff remains applicable. Preview output is not part of the
+  `"version": 1` JSON wire format.
+
 ### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
 
 These changes alter observable runtime behavior and compiled output. Templates relying
@@ -155,6 +371,21 @@ directly via `ModuleCache::with_fs`.
   that initializes `CompileOptions` with a struct literal must either add
   `source_map_base: None` or use the `..Default::default()` tail.  Binding surfaces
   (napi, Python, WASM) are not affected. (#3)
+
+### **BREAKING** — Error/lint messages now carry `\uXXXX` literals for embedded control bytes (#176)
+
+Across the JS / Python / WASM API surfaces, `err.message`, `err.help`, and lint
+`LintDiagnostic.message` / `LintDiagnostic.help` now contain six-character `\uXXXX`
+Unicode escape literals (e.g. `\u001B`, `\u007F`, `\u0085`) wherever MDS source
+content caused raw C0-minus-`\n`/`\t`, DEL (U+007F), or C1 (U+0080–U+009F) control
+bytes to appear in error or diagnostic messages.
+
+**Not affected:** `span.offset`, `span.length`, and `fix_edits` byte ranges are raw
+byte offsets and are never sanitized. The `rule` field is a fixed ASCII identifier.
+The `"file"` key in lint JSON output is sanitized on the same pass as `message`/`help`.
+
+**Migration:** consumers that test for exact control byte sequences in error or
+diagnostic messages must update to check for the `\uXXXX` literal form instead.
 
 ### Added
 

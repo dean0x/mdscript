@@ -1149,7 +1149,7 @@ fn fmt_bare_filename_propagates_syntax_error() {
     assert_eq!(after, src, "broken file must be left untouched");
 }
 
-// ── ESC injection regression — mds fmt (issue #5 / ESC-INJECTION) ────────────
+// ── ESC injection regression — mds fmt (issue #176 / ESC-INJECTION) ──────────
 
 /// Regression gate: `mds fmt <file>` (single-file mode) must not emit raw ESC
 /// bytes to stderr when the source file contains a raw ESC byte that reaches

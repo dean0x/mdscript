@@ -1062,11 +1062,15 @@ impl ModuleCache {
             // silently yields a partial FragmentMap (incorrect splice attributions) with
             // no AC-PERF-03 warning.  Mirror the top-level degradation logic exactly.
             let fmap = if returned.segments_dropped {
+                // The module filename is an untrusted identifier — WIRE, per the
+                // spec 7.5 per-field rule: a filename is never legitimately multi-line,
+                // and `emit_warnings` prints this string to stderr in HUMAN mode, where a
+                // raw `\n` would forge a standalone status line (CWE-117).
                 warnings.push(format!(
                     "source map segment cap ({} segments) exceeded in imported module '{}'; \
                      no source map will be generated",
                     crate::limits::MAX_SOURCEMAP_SEGMENTS,
-                    ctx.file_str,
+                    crate::lint::sanitize_control_chars_wire(ctx.file_str),
                 ));
                 None
             } else {

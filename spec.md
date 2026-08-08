@@ -994,6 +994,185 @@ mode, which uses a single config located from the directory argument.
 
 Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is absent for diagnostics that lack a source location.
 
+#### Sanitization invariant (v1)
+
+Under `"version": 1`, the following guarantees are normative. The prior behavior of
+passing raw control bytes through to JSON is superseded.
+
+The **escaped class** is:
+
+| Codepoints | Why |
+|------------|-----|
+| C0 (U+0000–U+001F) except `\t` (U+0009) | Terminal escape-sequence injection (CWE-150) |
+| `\n` (U+000A) | Line forging in any consumer that prints or line-splits the value |
+| DEL (U+007F) | Interpreted as a destructive backspace by some terminals |
+| C1 (U+0080–U+009F) | Terminal control, incl. NEL (U+0085) |
+| U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069 | The complete Unicode `Bidi_Control=Yes` set (12 codepoints) — they visually reorder the line (Trojan Source, CVE-2021-42574). U+061C ARABIC LETTER MARK is the only member outside U+200E–U+2069. |
+| U+2028, U+2029 | Terminate a JavaScript string literal |
+| U+FEFF | Invisible BOM / ZWNBSP — hides or splits content |
+
+Each is replaced with its six-character `\uXXXX` literal (uppercase hex) before
+serialization. `\t` (U+0009) is the sole exemption from the C0 range: it is never
+escaped, in either mode.
+
+| Field | Invariant |
+|-------|-----------|
+| `message`, `help` | Every codepoint in the escaped class above is replaced with its six-character `\uXXXX` literal before serialization. |
+| `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into this JSON output. A filename occupying one of the **diagnostic** `file` fields — this JSON key, a CLI status line, or a `[file:line:col]` frame header — is escaped with the **full** class including `\n` on each of those, human surfaces included, because it is always rendered on a single line and POSIX permits a newline inside a filename. Two path positions are outside that rule and are **not** escaped: a path interpolated into a diagnostic *message body*, which is prose (see "Residual" below), and a path in a source map or in `CompileResult.dependencies`, which is a functional reference (see "Carve-out" below). |
+| `rule` | Fixed ASCII identifier; never contains control bytes by construction. Not sanitized. |
+| `span`, `fix_edits` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
+
+This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
+(`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
+(`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
+All four surfaces emit byte-identical values.
+
+##### Mode is chosen per field, not per surface
+
+The escape class above is fixed. The only thing that varies is whether `\n` is escaped
+with it, and that choice is **normatively a property of the field, not of the output
+surface**:
+
+> **On the diagnostic surfaces — the `"version": 1` JSON wire, CLI status and warning
+> lines, and `[file:line:col]` frame headers — untrusted identifiers, filenames, and
+> error causes are escaped in WIRE mode, human terminal output included. Prose — a
+> diagnostic message body or help body — is escaped in HUMAN mode on terminal surfaces,
+> so that multi-line frames keep rendering.**
+
+The rule governs *diagnostic* output. Two categories of output are named carve-outs and
+are not escaped at all, because escaping them would destroy their function rather than
+protect it: the command's **product** (compiled template output) and **functional path
+references** (source-map `file`/`sources`, `CompileResult.dependencies`). Both are
+listed in the table below and the second is specified under "Carve-out" further down.
+
+The discriminator is whether the value is ever *legitimately* multi-line. A filename, a
+config key, a `--format` argument, an `io::Error` cause, and a fix-rejection reason are
+each displayed on exactly one line, so preserving a raw `\n` in one buys nothing and
+lets it forge a standalone line that is byte-identical in form to genuine output
+(CWE-117). A diagnostic body genuinely is multi-line, so escaping its newlines would
+break the frame.
+
+This rule supersedes any per-surface reading of the earlier "human escapes the class
+minus `\n`" formulation: `\n` is escaped on all machine-readable boundaries listed
+above, **and** on every identifier / filename / cause field of a diagnostic, on every
+surface that renders one — human terminal output included. It says nothing about the
+two carve-outs, which are not diagnostics.
+
+Applied, that means:
+
+| Value | Mode | Because |
+|-------|------|---------|
+| `message`, `help`, warning bodies, `LabeledSpan` text | HUMAN on terminal surfaces, WIRE on the JSON wire | Prose; legitimately multi-line in a rendered frame |
+| A filename or path in a diagnostic `file` **field**: the JSON `file` key, a CLI status line, a `[file:line:col]` frame header | WIRE on every surface that renders one | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
+| `mds.json` rule names and config values, `--format` arguments | WIRE on every surface that renders one | Single-line identifiers read from the working tree or the command line |
+| `io::Error` / `MdsError` causes interpolated into a CLI status or warning line | WIRE on every surface that renders one | Single-line, and they embed paths of their own |
+| A path, identifier or cause interpolated into a diagnostic **message body** | HUMAN on terminal surfaces, WIRE on the JSON wire | Follows the message row above — it is part of prose. This is the **residual** below: it is not covered by the WIRE rows |
+| Compiled template output (`mds build -o -`) | not escaped | It is the command's product, not a diagnostic; redirects must stay byte-faithful |
+| Source-map `file` / `sources` / `sourcesContent`, and `CompileResult.dependencies` | not escaped | Functional references, not display text; escaping would break resolution. This is the **carve-out** below |
+
+Source excerpts embedded in a rendered diagnostic frame are neutralized
+byte-length-preservingly instead of escaped, so span offsets and caret columns stay
+exact. The substitute is chosen per UTF-8 width: 1-byte C0/DEL → `?`; 2-byte C1 and
+U+061C → U+00A0; 3-byte bidi controls, separators and BOM → U+FFFD.
+
+On the CLI this is enforced at a single choke-point: every diagnostic printed to
+stderr — compiler errors and CLI-authored errors alike — has its message, help, and
+caret-label text escaped **before** the diagnostic renderer runs. The rendered frame is
+never post-processed, so the renderer's own terminal styling is left intact and caret
+columns stay aligned.
+
+##### Residual: paths and identifiers inside a message body
+
+The rule above is per field, and a value interpolated into a diagnostic **message body**
+is part of that body. It is therefore escaped in HUMAN mode on terminal surfaces, which
+preserves `\n`. Two construction sites produce such messages:
+
+- **CLI `miette::miette!()` messages**, which interpolate `mds.json` values and
+  filesystem paths.
+- **`mds-core` `MdsError` message bodies**, which interpolate paths and `io::Error`
+  causes (`cannot read {path}: {e}`, `invalid UTF-8 in {path}: {e}` in
+  `crates/mds-core/src/fs.rs`) and template identifiers (`invalid import alias:
+  '{alias}'` in `parser_helpers.rs`).
+
+Both are **known residuals, not closed boundaries**, and they are the same defect at two
+different construction sites. A hostile path or identifier containing `\n` survives into
+the rendered frame and occupies a line of its own there.
+
+The residual is a *weaker* surface than a status line, and deliberately so: everything
+inside a rendered frame is indented and `│`-prefixed by the renderer, and that prefix
+survives `strip()`, so forged frame content cannot masquerade as a bare CLI status line
+the way an unescaped filename in a `Clean: …` line could. No raw control byte reaches
+the terminal from either path — HUMAN mode still escapes the whole class except `\n`.
+
+Closing it would mean WIRE-escaping every untrusted interpolation at every `MdsError`
+and `miette!()` construction site — over a hundred in `mds-core` alone — and changing
+the public `MdsError` message text seen by all three binding layers. That is a larger,
+separately-specified change; until it is made, this section is the disclosure, not a
+gap someone forgot.
+
+##### Carve-out: functional path references (source maps, `dependencies`)
+
+Source-map documents and `CompileResult.dependencies` are **explicitly outside** the
+per-field rule. The paths they carry are emitted **verbatim** — no escaping, no
+neutralization — in every one of these positions:
+
+- the sidecar written by `mds build --source-map` (`<output>.map`): its `file` key,
+  every entry of `sources`, and every entry of `sourcesContent`;
+- the `sourceMap` object embedded in `CompileResult::to_canonical_json()`, and hence in
+  the napi / WASM / Python compile results;
+- the `dependencies` array of `CompileResult::to_canonical_json()`.
+
+These are **functional references, not display text**. Source Map v3 `file` and
+`sources` are resolved against the filesystem by devtools, bundlers and IDEs;
+`dependencies` is a watch/rebuild input for the bundler plugins. Rewriting a path to a
+`\uXXXX` literal would produce a path that does not exist, breaking source-map
+resolution and dependency tracking in order to defend against a pathological filename.
+That is the same product-versus-display distinction that keeps compiled output
+unescaped: escaping the artefact corrupts the artefact.
+
+Consequently, and normatively:
+
+> **Consumers of a source map or of `dependencies` MUST treat every path they contain
+> as untrusted input.** A path may contain any byte a filesystem permits, including C0
+> control characters, `\n`, bidi controls and U+FEFF. A consumer that prints such a path
+> to a terminal, writes it into a log line, or interpolates it into HTML must escape it
+> for that destination itself. JSON string encoding is *not* that escaping: it makes the
+> document parseable, and a decoded `"\n"` is a real newline again.
+
+The CLI does not rely on this contract for its own output: the `Compiled to …` and
+`Source map written to …` status lines print the path through `safe_path`, so they carry
+the WIRE-escaped form even though the sidecar they name does not.
+
+Closing this differently — rejecting control characters in filenames at the input
+boundary rather than escaping them at output — is a plausible longer-term design and is
+deliberately not specified here.
+
+##### Escaping is one-way
+
+The transformation is **lossy and non-injective, by design**. A template that
+literally contains the six characters `\`, `u`, `0`, `0`, `1`, `B` and a template
+containing an actual ESC byte both serialize to the identical six-character
+string `\u001B`;
+after serialization they are indistinguishable.
+
+Consumers **MUST NOT** un-escape `\uXXXX` sequences back into bytes. Doing so
+reconstitutes exactly the injection this invariant prevents — an attacker who
+controls a diagnostic message controls what a naive un-escaper writes to your
+terminal. The escape exists for display, not for transport.
+
+Round-tripping is an explicit **non-goal**: no backslash-escaping (`\` → `\\`)
+will be added to make the mapping reversible, in this or any later wire version. A
+consumer that needs the original bytes must read them from the source file using the
+raw `span` / `fix_edits` byte offsets, which are deliberately left unsanitized for
+precisely this purpose.
+
+##### `--diff` preview output (`mds lint --fix --diff` and `mds fmt --diff`)
+
+Preview output is diff text, not a diagnostic field, and is governed separately: it
+is neutralized when stdout is a TTY (where control bytes would execute), and emitted
+**byte-faithful when stdout is piped or redirected** (where the diff must remain
+applicable). It is not part of the `"version": 1` JSON wire format.
+
 ### 7.6 `mds init`
 
 ```bash

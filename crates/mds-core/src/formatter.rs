@@ -78,6 +78,7 @@ use std::sync::Arc;
 
 use crate::error::MdsError;
 use crate::lexer::{self, Token};
+use crate::lint::named_source_for_render;
 
 /// Format MDS source code, returning the rewritten source string.
 ///
@@ -470,10 +471,9 @@ fn assert_equivalent(
         Err(MdsError::Syntax { message, span, .. }) => Err(MdsError::Syntax {
             message,
             span,
-            src: Some(Arc::new(miette::NamedSource::new(
-                file_name,
-                source.to_string(),
-            ))),
+            // Same shared boundary `MdsError::at()` uses: byte-length-preserving source
+            // neutralization (PF-014) plus WIRE-mode filename escaping.
+            src: Some(Arc::new(named_source_for_render(file_name, source))),
         }),
         // Any other compile failure (undefined var/fn, unresolved import, …)
         // means the token stream is well-formed and only later analysis failed,

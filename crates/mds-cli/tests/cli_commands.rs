@@ -609,7 +609,7 @@ fn cli_init_rejects_path_traversal() {
     );
 }
 
-// ── ESC injection regression — mds check (issue #5 / ESC-INJECTION) ──────────
+// ── ESC injection regression — mds check (issue #176 / ESC-INJECTION) ────────
 
 /// Regression gate: `mds check <file>` (single-file mode) must not emit raw
 /// ESC bytes to stderr when the source file contains a raw ESC byte that reaches

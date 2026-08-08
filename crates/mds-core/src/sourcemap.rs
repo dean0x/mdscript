@@ -117,6 +117,26 @@ pub(crate) fn map_source_label(name: &str) -> &str {
 /// sourcesContent → names → mappings); `serde` emits struct fields in
 /// declaration order.
 ///
+/// # Paths here are untrusted and unescaped
+///
+/// `file`, `sources` and `sources_content` carry values derived from the filesystem —
+/// including names produced by a directory walk, which the user never typed. They are a
+/// **named carve-out** from the sanitization rule in spec §7.5 ("Carve-out: functional
+/// path references"): they are emitted **verbatim**, with no `\uXXXX` escaping, because
+/// devtools, bundlers and IDEs resolve them against the filesystem and an escaped path
+/// would not exist.
+///
+/// A path in this type may therefore contain any byte a filesystem permits: C0 control
+/// characters, `\n`, DEL, bidi controls (Trojan Source, CVE-2021-42574), U+FEFF. JSON
+/// string encoding is **not** escaping — it makes the document parseable, and a decoded
+/// `"\n"` is a real newline again.
+///
+/// **Consumers MUST escape these paths for whatever destination they render them to** —
+/// a terminal, a log line, HTML. [`crate::sanitize_control_chars_wire`] applies the same
+/// escaping the diagnostic surfaces use. The MDS CLI does exactly that for its own
+/// output: `Compiled to …` and `Source map written to …` print the escaped form even
+/// though the sidecar they name does not.
+///
 /// [Source Map v3 / ECMAScript 426]: https://tc39.es/ecma426/
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize)]

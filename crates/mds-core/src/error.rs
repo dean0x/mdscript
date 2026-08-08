@@ -3,6 +3,8 @@ use std::sync::Arc;
 use miette::{Diagnostic, SourceSpan};
 use thiserror::Error;
 
+use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_control_chars_wire};
+
 // ── Serializable error types ──────────────────────────────────────────────────
 
 /// A serializable representation of a source span.
@@ -119,13 +121,39 @@ fn at(
         return (Some(SourceSpan::new(offset.into(), len)), None);
     }
 
+    // `named_source_for_render` applies the per-half sanitization: byte-length-preserving
+    // neutralization for the span-indexed source (PF-014), WIRE-mode \uXXXX escaping for
+    // the single-line filename (a newline-bearing filename must not forge a line).
     (
         Some(SourceSpan::new(offset.into(), len)),
-        Some(Arc::new(miette::NamedSource::new(file, source.to_string()))),
+        Some(Arc::new(named_source_for_render(file, source))),
     )
 }
 
 /// All errors produced by the MDS compiler.
+///
+/// ## Display contract — sanitization split (CWE-150 / issue #176)
+///
+/// `MdsError` implements `std::fmt::Display` via `thiserror`.  The `Display`
+/// output is the **raw, unsanitized** message string: it may contain C0/DEL/C1
+/// control bytes from untrusted `.mds` source input.
+///
+/// | Method / path | Sanitized | Intended context |
+/// |---|---|---|
+/// | `e.to_string()` / `format!("{e}")` | **No** | Machine-readable pipelines, structured loggers |
+/// | [`MdsError::display_sanitized()`] | **Yes** | Terminal output, user-facing render |
+/// | [`MdsError::serialize()`]`.message` | **Yes** | JSON API / binding surfaces |
+///
+/// **Do not write `eprintln!("{e}")` or `e.to_string()` when the output goes
+/// to a TTY or is embedded in a user-visible string without further escaping.**
+/// Use [`MdsError::display_sanitized()`] instead to avoid terminal injection
+/// (CWE-150).  All three published binding surfaces (napi, WASM, Python)
+/// already use `serialize()` and are unaffected.
+///
+/// This contract governs **direct** rendering by a consumer of this crate.  The `mds`
+/// CLI never renders an `MdsError` directly: it hands the `miette::Report` to
+/// `eprint_error`, which escapes the message, help, and label text of every report it
+/// prints.  See the boundary table in `mds-core/src/lint/diagnostic.rs` for the full set.
 #[must_use]
 #[non_exhaustive]
 #[derive(Error, Debug, Diagnostic, Clone)]
@@ -823,8 +851,13 @@ impl MdsError {
         let code = Diagnostic::code(self)
             .map(|c| c.to_string())
             .unwrap_or_default();
-        let message = self.to_string();
-        let help = Diagnostic::help(self).map(|h| h.to_string());
+        // WIRE mode: this value is consumed as JSON / as a binding error object, so
+        // `\n` is escaped too — an embedded newline would let a hostile message forge
+        // an extra line in any line-oriented consumer.  The HUMAN counterpart is
+        // `display_sanitized()`, which keeps newlines raw for terminal rendering.
+        let message = sanitize_control_chars_wire(&self.to_string()).into_owned();
+        let help = Diagnostic::help(self)
+            .map(|h| sanitize_control_chars_wire(&h.to_string()).into_owned());
 
         // Extract (span, src) from each span-bearing variant; no-span variants
         // use the wildcard arm and produce span: None.
@@ -879,6 +912,44 @@ impl MdsError {
             help,
             span: serialized_span,
         }
+    }
+
+    /// Return a terminal-safe, sanitized version of this error's `Display` text.
+    ///
+    /// The escaped class is the one spec §7.5 defines: C0 (U+0000–U+001F) with `\t`
+    /// (U+0009) as the sole exemption, DEL (U+007F), C1 (U+0080–U+009F), all twelve
+    /// Unicode bidi controls (U+061C, U+200E/U+200F, U+202A–U+202E, U+2066–U+2069),
+    /// U+2028/U+2029, and U+FEFF.  Each is replaced by its six-character `\uXXXX` escape
+    /// literal.
+    ///
+    /// This is **HUMAN mode**, so `\n` — which *is* in the class — is preserved, keeping
+    /// multi-line miette renders readable.  Whether `\n` is escaped is a property of the
+    /// mode, not of the class; describing the class as "C0 except `\t` and `\n`" folds
+    /// the two together and is exactly the framing spec §7.5 retired.  That mode choice
+    /// is the one deliberate difference from [`MdsError::serialize`], which is a
+    /// machine-readable (wire) boundary and escapes `\n` as well.  `\t` is preserved in
+    /// both modes.
+    ///
+    /// The escaping is one-way: see [`mds::sanitize_control_chars`][crate::sanitize_control_chars]
+    /// — consumers must not un-escape `\uXXXX` sequences back into bytes.
+    ///
+    /// Use this method — not `e.to_string()` / `eprintln!("{e}")` — whenever the
+    /// string will be written to a TTY or embedded in a user-visible context
+    /// without further escaping.  See the [type-level doc][MdsError] for the full
+    /// Display-contract table.
+    ///
+    /// # Audience
+    ///
+    /// This is an affordance for **downstream Rust consumers** of the published crate
+    /// who render an `MdsError` themselves.  It is deliberately not on the `mds` CLI's
+    /// render path: the CLI hands `miette::Report`s to `eprint_error`, which sanitizes
+    /// the message, help, and label text of *every* report — including CLI-authored
+    /// `miette::miette!()` errors that are not `MdsError`s at all, and so could never
+    /// be covered by this method.  Routing the CLI through here instead would leave
+    /// that second family unescaped (PF-004).
+    #[must_use]
+    pub fn display_sanitized(&self) -> String {
+        sanitize_control_chars(&self.to_string()).into_owned()
     }
 }
 

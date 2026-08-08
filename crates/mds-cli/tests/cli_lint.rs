@@ -24,7 +24,7 @@
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
 
 mod common;
-use common::{fixture, mds_bin};
+use common::{assert_no_control_chars, fixture, mds_bin};
 
 use std::fs;
 use std::path::Path;
@@ -1551,7 +1551,7 @@ fn lint_fix_bare_filename_applies_fix() {
     );
 }
 
-// ── ESC injection regression (issue #5 / ESC-INJECTION) ──────────────────────
+// ── ESC injection regression (issue #176 / ESC-INJECTION) ─────────────────────
 
 /// Regression gate: a .mds file containing a raw ESC byte (U+001B) that reaches
 /// `MdsError::Syntax` must not emit raw ESC bytes to stderr — single-file mode.
@@ -1582,6 +1582,445 @@ fn lint_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         "raw ESC byte (0x1B) must be sanitized before writing to stderr; \
          got (hex): {:02x?}",
         &out.stderr[..out.stderr.len().min(512)]
+    );
+}
+
+// ── T-5..T-9: complete ESC-injection hardening for lint output (issue #176) ───
+//
+// The vector used by T-5..T-8 is a .mds file whose template body line contains a
+// raw ESC byte (U+001B) as part of a `legacy-interpolation` finding.  The line
+// "Hello \x1b{name} world" contains both the friendly word "Hello" (guard against
+// vacuous passes) and the raw ESC byte; `legacy-interpolation` fires because `{name}`
+// matches the old single-brace syntax.
+//
+// C1 note (T-8): raw 0x80–0x9F bytes are invalid UTF-8 so they are rejected by the
+// MDS lexer before any lint rule runs.  The C1 representative used here is U+0085
+// (NEL, UTF-8 0xC2 0x85), which is valid UTF-8 and is neutralized by
+// `neutralize_source_for_render` before miette renders the source frame.
+//
+// Neutralization model (PF-014): control bytes in source are substituted at the INPUT
+// boundary before miette renders, not post-processed over the rendered frame.
+// - C0/DEL (1-byte) → '?' (1 byte, byte-length-preserving)
+// - C1 (2-byte UTF-8 0x80–0x9F) → U+00A0 NBSP (2 bytes, byte-length-preserving)
+// `sanitize_control_chars` (\\uXXXX expansion) is used only for message and help text.
+//
+// All tests use `NO_COLOR=1` so ANSI colour codes in miette output don't interfere
+// with the raw-byte search.
+
+/// T-5 [AC-F1]: single-file mode — human-format lint on a file whose diagnostic
+/// source line contains a raw ESC byte must produce no raw 0x1B byte on stderr.
+#[test]
+fn lint_single_file_esc_in_diagnostic_frame_is_sanitized() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("esc_lint.mds");
+    // "Hello \x1b{name} world" — legacy-interpolation fires on `{name}`;
+    // the raw ESC byte on the same line reaches the source frame.
+    fs::write(&file, b"Hello \x1b{name} world\n").unwrap();
+
+    let out = lint_path(&file, &[]);
+
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    // Exit 1 — legacy-interpolation is Warn severity.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "legacy-interpolation is warn-only; expected exit 1; stderr: {stderr_str}"
+    );
+    // No raw control bytes on stderr (char-based check — catches ESC, DEL, and C1).
+    assert_no_control_chars(&stderr_str, "T-5 stderr");
+    // Under input-neutralization (PF-014): ESC → '?' in the source frame.
+    // "Hello" must be visible, confirming source context is non-vacuous.
+    assert!(
+        stderr_str.contains("Hello"),
+        "source context word 'Hello' must be visible in output; got: {stderr_str:?}"
+    );
+    // Stdout must be empty (human mode only writes to stderr).
+    assert!(
+        out.stdout.is_empty(),
+        "human mode must not write to stdout; got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// T-6 [AC-F1]: directory mode — same vector via dir walk.
+#[test]
+fn lint_directory_esc_in_diagnostic_frame_is_sanitized() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("esc_lint.mds"), b"Hello \x1b{name} world\n").unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "directory mode: expected exit 1; stderr: {stderr_str}"
+    );
+    // No raw control bytes on stderr (char-based check).
+    assert_no_control_chars(&stderr_str, "T-6 stderr");
+    // Under input-neutralization (PF-014): ESC → '?' in the source frame.
+    assert!(
+        stderr_str.contains("Hello"),
+        "directory mode: 'Hello' must be visible in output; got: {stderr_str:?}"
+    );
+    // Stdout must be empty (human mode).
+    assert!(
+        out.stdout.is_empty(),
+        "directory mode: stdout must be empty; got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// T-7 [AC-F1]: stdin mode — same vector via the BrokenPipe-safe `lint_stdin` helper.
+#[test]
+fn lint_stdin_esc_in_diagnostic_frame_is_sanitized() {
+    let input = "Hello \x1b{name} world\n";
+    let out = lint_stdin(input, &[]);
+
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdin mode: expected exit 1; stderr: {stderr_str}"
+    );
+    // No raw control bytes on stderr (char-based check).
+    assert_no_control_chars(&stderr_str, "T-7 stderr");
+    // Under input-neutralization (PF-014): ESC → '?' in the source frame.
+    assert!(
+        stderr_str.contains("Hello"),
+        "stdin mode: 'Hello' must be visible in output; got: {stderr_str:?}"
+    );
+}
+
+/// T-8 [AC-F1]: DEL (U+007F) and C1 NEL (U+0085, UTF-8 0xC2 0x85) must both be
+/// sanitized in the rendered source frame.
+#[test]
+fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
+    let dir = tempfile::tempdir().unwrap();
+    // U+007F = DEL; U+0085 = C1 NEL (valid UTF-8, 0xC2 0x85).
+    // `{name}` trips legacy-interpolation so we get a diagnostic and a source frame.
+    let content = "Hello\u{007F}and\u{0085}{name}world\n";
+    fs::write(dir.path().join("del_c1_lint.mds"), content.as_bytes()).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "del/c1 test: expected exit 1; stderr: {stderr_str}"
+    );
+    // DEL must be neutralized: 0x7F → '?' (1-byte → 1-byte, PF-014).
+    assert!(
+        !stderr_str.contains('\u{007F}'),
+        "raw DEL must not appear on stderr; got: {stderr_str:?}"
+    );
+    // C1 NEL must be neutralized: U+0085 → U+00A0 NBSP (2-byte → 2-byte, PF-014).
+    assert!(
+        !stderr_str.contains('\u{0085}'),
+        "raw C1 NEL must not appear on stderr; got: {stderr_str:?}"
+    );
+    assert!(
+        stderr_str.contains('\u{00A0}'),
+        "neutralized C1 NEL must appear as NBSP (U+00A0) in source frame; got: {stderr_str:?}"
+    );
+    // Source context guard: "Hello" confirms output is non-vacuous.
+    assert!(
+        stderr_str.contains("Hello"),
+        "source context word 'Hello' must be visible; got: {stderr_str:?}"
+    );
+}
+
+/// T-9 [AC-C3]: `mds lint --format json` on a source whose `duplicate-import`
+/// diagnostic message embeds a raw C1 control character (U+0085 NEL) must emit
+/// valid JSON with no raw control bytes anywhere — in particular the embedded
+/// path must be escaped to the 6-char literal ``.
+///
+/// ## Why this vector?
+///
+/// The original T-9 used a YAML frontmatter key containing a raw ESC byte
+/// (`"a\x1Bb": 1`).  `serde_yaml_ng` rejects raw ESC/DEL bytes inside
+/// double-quoted YAML keys, so the test never reached the lint code path at all
+/// — the YAML parser rejected the input before any sanitizer ran, making every
+/// assertion vacuous (PF-013 shape).
+///
+/// U+0085 (NEL, C1 NEL) is a C1 control character whose UTF-8 encoding
+/// (0xC2 0x85) **passes** `serde_yaml_ng` YAML parsing.  We exploit a
+/// different route: the `duplicate-import` rule fires when the same module is
+/// imported twice and embeds the raw import path in its message.  A module
+/// whose file *name* contains U+0085 therefore injects that byte into the
+/// diagnostic message.  When `to_canonical_json` serializes the result, it
+/// must sanitize U+0085 → `` (6-char ASCII literal); if that
+/// sanitization is removed the raw 0xC2 0x85 bytes appear in the JSON wire.
+///
+/// ## Failure mode (regression guard)
+///
+/// Removing the `sanitize_control_chars` call in `to_canonical_json` causes:
+///   - Gate 1 still passes (the JSON is syntactically valid)
+///   - Gate 2 FAILS: `assert_no_control_chars` finds U+0085 (a C1 char) in
+///     the JSON wire output
+///   - Gate 3 FAILS: the per-message check finds U+0085 in the diagnostic message
+///   - The positive assertion FAILS: `` is not present when raw bytes leak
+#[test]
+fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Helper module whose file name contains U+0085 (NEL, C1).  This character
+    // survives serde_yaml_ng YAML parsing (unlike ESC/DEL which are rejected).
+    let nel_name = "fo\u{0085}o.mds";
+    let nel_module = dir.path().join(nel_name);
+    fs::write(&nel_module, "hi\n").unwrap();
+
+    // main.mds imports the NEL-named module twice → duplicate-import fires.
+    // The diagnostic message embeds the raw import path (including U+0085).
+    let import_line = format!("@import \"./{nel_name}\"\n");
+    let main_content = format!("{import_line}{import_line}");
+    let main_file = dir.path().join("main.mds");
+    fs::write(&main_file, main_content.as_bytes()).unwrap();
+
+    let out = lint_path(&main_file, &["--format", "json"]);
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+
+    // Gate 1 (fail-closed): stdout must be valid JSON with version 1.
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
+        panic!(
+            "T-9: lint --format json must emit valid JSON; parse error: {e}; \
+             stdout: {stdout_str:?}"
+        )
+    });
+    assert_eq!(json["version"], 1, "T-9: JSON version must be 1");
+
+    // Gate 2 (fail-closed, char-based): the entire JSON wire must contain no raw
+    // C0 (excl. \t \n), DEL, or C1 control codepoints.
+    // Uses `assert_no_control_chars` which iterates over Unicode codepoints, not
+    // raw bytes, to avoid false-positives on continuation bytes of non-C1 chars.
+    assert_no_control_chars(&stdout_str, "T-9 JSON wire output");
+
+    // Gate 3 (fail-closed): assert diagnostics ARE present and the rule fired.
+    let files = json["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("T-9: JSON must have 'files' array; got: {json}"));
+    assert!(
+        !files.is_empty(),
+        "T-9: files array must be non-empty (duplicate-import should fire); got: {json}"
+    );
+    let all_diags: Vec<&serde_json::Value> = files
+        .iter()
+        .flat_map(|f| {
+            f["diagnostics"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "T-9: every file entry must have a 'diagnostics' array; \
+                                           got: {f}"
+                )
+            })
+        })
+        .collect();
+    assert!(
+        !all_diags.is_empty(),
+        "T-9: must have at least one diagnostic; got: {files:?}"
+    );
+    let has_dup_import = all_diags.iter().any(|d| d["rule"] == "duplicate-import");
+    assert!(
+        has_dup_import,
+        "T-9: duplicate-import must be among the diagnostics; got rules: {:?}",
+        all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
+    );
+    // Per-message sanitization check (char-based).
+    for diag in &all_diags {
+        let msg = diag["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("T-9: diagnostic must have a string 'message'; got: {diag}"));
+        assert_no_control_chars(msg, "T-9 diagnostic message");
+    }
+
+    // Positive assertion (non-vacuous, PF-013): the sanitized literal ``
+    // must appear in at least one message.  If sanitization is removed the raw
+    // U+0085 character leaks and this assertion fails because the 6-char literal
+    // is absent while the raw codepoint (caught by Gate 2/3) is present.
+    //
+    // After JSON deserialisation by serde_json the string value is ``
+    // (6 chars: backslash, u, 0, 0, 8, 5).
+    let has_sanitized_nel = all_diags.iter().any(|d| {
+        d["message"]
+            .as_str()
+            .map(|m| m.contains("\\u0085"))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_sanitized_nel,
+        "T-9: sanitized \\u0085 literal must appear in at least one diagnostic message; \
+         got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
+}
+
+/// T-9b [AC-C3]: the Trojan Source vector (CVE-2021-42574) end-to-end through
+/// `mds lint --format json`.
+///
+/// U+202E RIGHT-TO-LEFT OVERRIDE is not a C0/DEL/C1 control character, so before
+/// the escape class was widened it passed through the wire untouched. A single RLO
+/// inside a filename makes every downstream renderer (terminal, IDE, code-review UI)
+/// display the remainder of the line in reverse — a benign-looking diagnostic can be
+/// made to read as something entirely different from its bytes.
+///
+/// Reachability: the same `duplicate-import` route T-9 uses. The rule embeds the raw
+/// import path in its message, and the path is a plain string (not YAML), so U+202E
+/// reaches the lint engine intact.
+///
+/// Non-vacuity (PF-013): asserts the `files` array is non-empty, that
+/// `duplicate-import` actually fired, AND the POSITIVE assertion that the escaped
+/// `\\u202E` literal is present — all three fail if the widened class is reverted.
+#[test]
+fn lint_json_bidi_override_in_import_path_is_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // "fo<RLO>gnp.mds" renders as "fopng.mds" in a bidi-aware terminal.
+    let rlo_name = "fo\u{202E}gnp.mds";
+    fs::write(dir.path().join(rlo_name), "hi\n").unwrap();
+
+    let import_line = format!("@import \"./{rlo_name}\"\n");
+    let main_file = dir.path().join("main.mds");
+    fs::write(&main_file, format!("{import_line}{import_line}").as_bytes()).unwrap();
+
+    let out = lint_path(&main_file, &["--format", "json"]);
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+
+    // Gate 1 (fail-closed): valid JSON, version 1.
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
+        panic!("T-9b: lint --format json must emit valid JSON; parse error: {e}; stdout: {stdout_str:?}")
+    });
+    assert_eq!(json["version"], 1, "T-9b: JSON version must be 1");
+
+    // Gate 2 (fail-closed): no raw hostile codepoint anywhere in the wire output.
+    assert_no_control_chars(&stdout_str, "T-9b JSON wire output");
+
+    // Gate 3 (non-vacuity): the rule actually fired.
+    let files = json["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("T-9b: JSON must have 'files' array; got: {json}"));
+    assert!(
+        !files.is_empty(),
+        "T-9b: files array must be non-empty (duplicate-import should fire); got: {json}"
+    );
+    let all_diags: Vec<&serde_json::Value> = files
+        .iter()
+        .flat_map(|f| {
+            f["diagnostics"]
+                .as_array()
+                .unwrap_or_else(|| panic!("T-9b: every file entry needs 'diagnostics'; got: {f}"))
+        })
+        .collect();
+    assert!(
+        all_diags.iter().any(|d| d["rule"] == "duplicate-import"),
+        "T-9b: duplicate-import must be among the diagnostics; got rules: {:?}",
+        all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
+    );
+
+    // Positive assertion (PF-013): the escaped form must be present.
+    let has_escaped_rlo = all_diags
+        .iter()
+        .any(|d| d["message"].as_str().is_some_and(|m| m.contains("\\u202E")));
+    assert!(
+        has_escaped_rlo,
+        "T-9b: escaped \\u202E literal must appear in at least one diagnostic message; \
+         got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
+}
+
+/// T-9c [AC-C3]: wire-mode newline escaping end-to-end — the log/YAML-key forging
+/// vector.
+///
+/// A raw newline inside a diagnostic message lets an attacker forge what reads as a
+/// second, independent finding in any consumer that prints or line-splits the JSON
+/// string value. On the wire that newline (U+000A) must arrive as its 6-char escape
+/// literal.
+///
+/// ## Why this vector?
+///
+/// The obvious route — a POSIX filename containing a newline, imported twice — is
+/// **not reachable**: the lexer rejects a newline inside an `@import "..."` path with
+/// `syntax error: unclosed quote in path` before any lint rule runs, which would make
+/// every assertion below vacuous (PF-013 shape).
+///
+/// A YAML **double-quoted frontmatter key** does reach it: `serde_yaml_ng` decodes the
+/// `\n` escape into a real newline, and `unused-variable` embeds the decoded key
+/// verbatim in its message. The forged payload mimics a real diagnostic header, so a
+/// naive line-oriented consumer would render it as a genuine second finding.
+#[test]
+fn lint_json_newline_in_frontmatter_key_is_escaped_on_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("forge.mds");
+
+    // The `\n` sequences below are YAML escapes inside a double-quoted key — after
+    // YAML parsing the key contains two REAL newline characters.
+    fs::write(
+        &file,
+        b"---\n\"a\\nerror[mds::forged]: FAKE\\nb\": 1\n---\nHello\n",
+    )
+    .unwrap();
+
+    let out = lint_path(&file, &["--format", "json"]);
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout_str).unwrap_or_else(|e| {
+        panic!("T-9c: lint --format json must emit valid JSON; parse error: {e}; stdout: {stdout_str:?}")
+    });
+    assert_eq!(json["version"], 1, "T-9c: JSON version must be 1");
+
+    let files = json["files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("T-9c: JSON must have 'files' array; got: {json}"));
+    assert!(
+        !files.is_empty(),
+        "T-9c: files array must be non-empty; got: {json}"
+    );
+    let all_diags: Vec<&serde_json::Value> = files
+        .iter()
+        .flat_map(|f| {
+            f["diagnostics"]
+                .as_array()
+                .unwrap_or_else(|| panic!("T-9c: every file entry needs 'diagnostics'; got: {f}"))
+        })
+        .collect();
+
+    // Non-vacuity: the vector really did reach the lint engine.
+    assert!(
+        all_diags.iter().any(|d| d["rule"] == "unused-variable"),
+        "T-9c: unused-variable must fire; got rules: {:?}",
+        all_diags.iter().map(|d| &d["rule"]).collect::<Vec<_>>()
+    );
+
+    // No parsed message may contain a raw newline …
+    for diag in &all_diags {
+        let msg = diag["message"].as_str().unwrap_or_else(|| {
+            panic!("T-9c: diagnostic must have a string 'message'; got: {diag}")
+        });
+        assert!(
+            !msg.contains('\n'),
+            "T-9c: raw newline must not survive into a wire message; got: {msg:?}"
+        );
+    }
+
+    // … and the escaped form must be present (positive, non-vacuous).
+    assert!(
+        all_diags
+            .iter()
+            .any(|d| d["message"].as_str().is_some_and(|m| m.contains("\\u000A"))),
+        "T-9c: escaped \\u000A literal must appear in at least one diagnostic message; \
+         got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
+    );
+
+    // The forged payload text itself is preserved verbatim (only the newline changed),
+    // proving the guard escapes rather than strips.
+    assert!(
+        all_diags.iter().any(|d| d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("error[mds::forged]"))),
+        "T-9c: message body must be preserved verbatim; got messages: {:?}",
+        all_diags.iter().map(|d| &d["message"]).collect::<Vec<_>>()
     );
 }
 
