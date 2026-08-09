@@ -1938,7 +1938,7 @@ mod tests {
     ///
     /// Pins the HUMAN-mode choice: `\n` in a diagnostic body is legitimate prose
     /// punctuation (multi-line miette frame) and must survive the round-trip.
-    /// ESC (U+001B) is a hostile control and must be replaced by ``.
+    /// ESC (U+001B) is a hostile control and must be replaced by `\\u001B`.
     #[test]
     fn sanitized_for_render_escapes_esc_preserves_newline() {
         let diag = LintDiagnostic {
