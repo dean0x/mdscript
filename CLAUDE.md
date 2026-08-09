@@ -19,8 +19,7 @@ maturin develop -m crates/mds-python/Cargo.toml && pytest crates/mds-python/test
 ## Release
 
 All packages ship as a single coordinated release at the same version, driven by
-`release.yml`. **Release via tag-push** (the `workflow_dispatch -f version=` path is
-currently blocked by branch protection — see #127):
+`release.yml`. **Release via tag-push:**
 
 ```bash
 node scripts/bump-version.mjs X.Y.Z   # bump all manifests + stamp CHANGELOG
@@ -28,14 +27,10 @@ node scripts/bump-version.mjs X.Y.Z   # bump all manifests + stamp CHANGELOG
 git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
 ```
 
-Pushing the `vX.Y.Z` tag triggers `release.yml` (prepare is skipped): build 7 native
-targets + WASM, A3 name-gate, publish to crates.io and npm (with provenance), create a
-GitHub Release. Run `gh workflow run release.yml` (no version) first for a dry-run that
-validates the build + A3 gate and publishes nothing.
-
-> The `workflow_dispatch -f version=X.Y.Z` "one command" path is **currently broken**
-> (#127): its prepare job can't push the release commit to protected `main` (GH006),
-> so it leaves an orphaned tag and publishes nothing. Use tag-push until #127 is fixed.
+Pushing the `vX.Y.Z` tag triggers `release.yml`: build 7 native targets + WASM,
+A3 name-gate, publish to crates.io and npm (with provenance), create a GitHub Release.
+Run `gh workflow run release.yml` (no inputs) for a dry-run that validates the build +
+A3 gate and publishes nothing.
 
 See @RELEASING.md for the full runbook.
 

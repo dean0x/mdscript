@@ -102,12 +102,14 @@ const stamped = cl
     `$1\n## [${version}] — ${today}\n`,
   )
   .replace(
-    /^(\[Unreleased\]:.*\/compare\/)v[\d.]+(...HEAD)$/m,
-    `$1v${version}$2`,
-  )
-  .replace(
-    /^(\[[\d.]+\]:.*\/releases\/tag\/)v[\d.]+$/m,
-    `$1v${version}\n[${version}]: https://github.com/dean0x/mdscript/releases/tag/v${version}`,
+    // Update [Unreleased] to reference the new tag, and insert a new [version]
+    // compare link immediately after it. Captures the repo base URL from the
+    // existing [Unreleased] line so the URL is never hardcoded in this script.
+    // The old approach repointed [0.1.0]'s releases/tag line instead of inserting
+    // a new compare link, corrupting the link table on every bump.
+    /^(\[Unreleased\]: (https:\/\/[^\s/]+\/[^\s/]+\/[^\s/]+)\/compare\/)v([\d.]+)(\.\.\.HEAD)$/m,
+    (_, _prefix, baseUrl, prevVersion) =>
+      `[Unreleased]: ${baseUrl}/compare/v${version}...HEAD\n[${version}]: ${baseUrl}/compare/v${prevVersion}...v${version}`,
   );
 
 if (stamped !== cl) {

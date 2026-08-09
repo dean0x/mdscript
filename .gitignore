@@ -15,6 +15,18 @@ packages/*/dist-cjs/
 examples/*/dist/
 examples/*/package-lock.json
 
+# Generated compiler output — each tracked .mds source compiles to a sibling
+# .md (or .json for @message templates). READMEs and config/data JSON files
+# are tracked and excluded from the ignore via negation patterns below.
+examples/**/*.md
+!examples/**/README.md
+examples/**/*.json
+!examples/**/package.json
+!examples/**/mds.json
+!examples/**/vars.json
+!examples/**/vars-minimal.json
+!examples/**/tsconfig.json
+
 # Python bindings (crates/mds-python) build/test artifacts.
 # `maturin develop` drops the compiled extension into the source tree; caches and
 # venvs are local-only. Sources (.py/.pyi/py.typed) are tracked.
