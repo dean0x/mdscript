@@ -22,6 +22,7 @@
 //!   unused import or function must produce byte-identical compiled output.
 
 /// Fix tier for a lint rule.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixTier {
     /// Auto-fixable with a reverify gate. Diagnostic `fixable` = `true`.

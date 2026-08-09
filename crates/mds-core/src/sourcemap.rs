@@ -440,6 +440,7 @@ pub(crate) fn encode_mappings(mut points: Vec<(u32, u32, u32, u32, u32)>) -> Str
 /// (`compile_with_deps_opts`, `compile_str_with_deps_opts`,
 /// `compile_virtual_with_deps_opts`) and threaded through the resolver and
 /// evaluator.
+#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct CompileOptions {
     /// Generate a [`SourceMap`] and attach it to [`crate::CompileResult::source_map`].
@@ -469,6 +470,7 @@ pub struct CompileOptions {
 ///
 /// Each binding maps this to its own error type and message; the unit struct intentionally
 /// carries no context — the per-binding wording is always determined at the call site.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidOptionsError;
 
@@ -488,6 +490,60 @@ impl CompileOptions {
         } else {
             Ok(())
         }
+    }
+
+    /// Enable or disable source map generation.
+    ///
+    /// When `true`, [`crate::CompileResult::source_map`] will be populated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let opts = mds::CompileOptions::default().with_source_map(true);
+    /// assert!(opts.source_map);
+    /// ```
+    #[must_use]
+    pub fn with_source_map(mut self, source_map: bool) -> Self {
+        self.source_map = source_map;
+        self
+    }
+
+    /// Enable or disable embedding source file contents in the map.
+    ///
+    /// When `true`, `sourcesContent` is included in the generated source map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let opts = mds::CompileOptions::default()
+    ///     .with_source_map(true)
+    ///     .with_include_sources_content(true);
+    /// assert!(opts.include_sources_content);
+    /// ```
+    #[must_use]
+    pub fn with_include_sources_content(mut self, include: bool) -> Self {
+        self.include_sources_content = include;
+        self
+    }
+
+    /// Set the directory the source map file will be written to.
+    ///
+    /// When `Some`, `sources[]` paths are emitted relative to this directory;
+    /// when `None` (the default), paths are root-relative.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::path::PathBuf;
+    /// let opts = mds::CompileOptions::default()
+    ///     .with_source_map(true)
+    ///     .with_source_map_base(Some(PathBuf::from("out")));
+    /// assert!(opts.source_map_base.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_source_map_base(mut self, base: Option<std::path::PathBuf>) -> Self {
+        self.source_map_base = base;
+        self
     }
 }
 

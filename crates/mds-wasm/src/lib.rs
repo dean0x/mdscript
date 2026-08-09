@@ -364,6 +364,8 @@ fn extract_vars(obj: &js_sys::Object) -> Result<Option<HashMap<String, Value>>, 
     parse_json_vars(vars_json).map(Some).map_err(|e| match e {
         VarsError::InvalidType(msg) => options_error(&msg),
         VarsError::Conversion(mds_err) => mds_error_to_js(mds_err),
+        // VarsError is #[non_exhaustive]; handle future variants gracefully.
+        _ => options_error(&format!("vars error: {e}")),
     })
 }
 
@@ -391,11 +393,9 @@ fn extract_bool_wasm(obj: &js_sys::Object, key: &str, default_val: bool) -> Resu
 fn extract_compile_options_wasm(obj: &js_sys::Object) -> Result<mds::CompileOptions, JsValue> {
     let source_map = extract_bool_wasm(obj, "sourceMap", false)?;
     let include_sources_content = extract_bool_wasm(obj, "sourcesContent", false)?;
-    let opts = mds::CompileOptions {
-        source_map,
-        include_sources_content,
-        ..Default::default()
-    };
+    let opts = mds::CompileOptions::default()
+        .with_source_map(source_map)
+        .with_include_sources_content(include_sources_content);
     opts.validate().map_err(|_| {
         options_error("option \"sourcesContent\" requires \"sourceMap\" to be true")
     })?;
@@ -493,7 +493,7 @@ fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
         })?;
         rules.insert(key, severity);
     }
-    Ok(mds::LintConfig { rules })
+    Ok(mds::LintConfig::from_rules(rules))
 }
 
 /// Parse the JS options for `lint` and `lint_virtual`.
@@ -719,11 +719,9 @@ pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 
     catch_panic(AssertUnwindSafe(move || {
         let opts = parse_options(options)?;
-        let compile_opts = mds::CompileOptions {
-            source_map: opts.source_map,
-            include_sources_content: opts.include_sources_content,
-            ..Default::default()
-        };
+        let compile_opts = mds::CompileOptions::default()
+            .with_source_map(opts.source_map)
+            .with_include_sources_content(opts.include_sources_content);
         let modules = build_modules(source, &opts.filename, opts.extra_modules)?;
         let result =
             mds::compile_virtual_with_deps_opts(modules, &opts.filename, opts.vars, compile_opts)

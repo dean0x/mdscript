@@ -63,6 +63,7 @@ pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
     fix, named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
     sanitize_control_chars_wire, FixLineSpan, LintConfig, LintDiagnostic, LintResult, Severity,
+    TextEdit,
 };
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
@@ -971,7 +972,7 @@ pub fn compile_virtual_with_deps(
 ///
 /// ```rust,no_run
 /// use std::path::Path;
-/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() })?;
+/// let result = mds::compile_with_deps_opts(Path::new("t.mds"), None, mds::CompileOptions::default().with_source_map(true))?;
 /// if let Some(sm) = result.source_map { println!("{}", sm.to_json()); }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -1015,7 +1016,7 @@ pub fn compile_with_deps_opts(
 ///     "Hello!\n",
 ///     None,
 ///     None,
-///     mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() },
+///     mds::CompileOptions::default().with_source_map(true),
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1056,7 +1057,7 @@ pub fn compile_str_with_deps_opts(
 ///     modules,
 ///     "main.mds",
 ///     None,
-///     mds::CompileOptions { source_map: true, include_sources_content: false, ..Default::default() },
+///     mds::CompileOptions::default().with_source_map(true),
 /// )?;
 /// assert!(result.source_map.is_some());
 /// # Ok::<(), Box<dyn std::error::Error>>(())

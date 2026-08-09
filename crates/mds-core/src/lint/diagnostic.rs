@@ -225,6 +225,10 @@ impl fmt::Display for Severity {
 ///
 /// Used by the fix planner for in-place replacement edits (e.g. `{x}` → `{{x}}`).
 /// An empty `new_text` is equivalent to a pure deletion.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Construct via [`TextEdit::new`]; do not use a struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextEdit {
     /// Inclusive start byte offset of the range to replace.
@@ -233,6 +237,32 @@ pub struct TextEdit {
     pub end: usize,
     /// Replacement text (empty string for pure deletion).
     pub new_text: String,
+}
+
+impl TextEdit {
+    /// Construct a `TextEdit` with all fields.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::TextEdit;
+    /// let edit = TextEdit::new(6, 12, "{{name}}");
+    /// assert_eq!(edit.start, 6);
+    /// assert_eq!(edit.end, 12);
+    /// assert_eq!(edit.new_text, "{{name}}");
+    /// ```
+    #[must_use]
+    pub fn new(start: usize, end: usize, new_text: impl Into<String>) -> Self {
+        debug_assert!(start <= end, "TextEdit::new: start ({start}) > end ({end})");
+        TextEdit {
+            start,
+            end,
+            new_text: new_text.into(),
+        }
+    }
 }
 
 // ── FixLineSpan ───────────────────────────────────────────────────────────────
@@ -252,6 +282,13 @@ pub struct TextEdit {
 ///
 /// **Single-line helper**: use `FixLineSpan::single(offset)` to remove exactly
 /// the one line that contains `offset`.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Construct via [`FixLineSpan::single`] (single-line),
+/// [`FixLineSpan::range_inclusive`] (multi-line, inclusive), or
+/// [`FixLineSpan::range_exclusive`] (multi-line, exclusive);
+/// external crates must not use a struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct FixLineSpan {
     /// Byte offset of any character in the first line to remove.
@@ -267,12 +304,55 @@ pub struct FixLineSpan {
 impl FixLineSpan {
     /// Remove exactly the one line that contains `offset`.
     ///
-    /// Equivalent to `FixLineSpan { from: offset, to: offset, to_inclusive: true }`.
+    /// Equivalent to `FixLineSpan::range_inclusive(offset, offset)`.
+    #[must_use]
     pub fn single(offset: usize) -> Self {
         FixLineSpan {
             from: offset,
             to: offset,
             to_inclusive: true,
+        }
+    }
+
+    /// Remove a range of lines **including** the line containing `to`.
+    ///
+    /// Both `from` and `to` are byte offsets within their respective lines.
+    /// The planner translates them to exact line boundaries.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds when `from > to`.
+    #[must_use]
+    pub fn range_inclusive(from: usize, to: usize) -> Self {
+        debug_assert!(
+            from <= to,
+            "FixLineSpan::range_inclusive: from ({from}) > to ({to})"
+        );
+        FixLineSpan {
+            from,
+            to,
+            to_inclusive: true,
+        }
+    }
+
+    /// Remove a range of lines **excluding** the line containing `to`.
+    ///
+    /// The line containing `to` is kept; removal stops at the start of that line.
+    /// Use this when a closing token (e.g. `@end`) must remain in the source.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds when `from > to`.
+    #[must_use]
+    pub fn range_exclusive(from: usize, to: usize) -> Self {
+        debug_assert!(
+            from <= to,
+            "FixLineSpan::range_exclusive: from ({from}) > to ({to})"
+        );
+        FixLineSpan {
+            from,
+            to,
+            to_inclusive: false,
         }
     }
 }
@@ -286,6 +366,11 @@ impl FixLineSpan {
 /// `Error` → Error; `Off` diagnostics are never constructed (the lint engine filters
 /// them before collecting).
 ///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from `mds::lint_str`, `mds::lint`, and similar lint API functions, or
+/// construct via [`LintDiagnostic::new`] and the `with_*` builder methods; do not
+/// construct via struct literal.
+///
 /// **CLI render**: always use `mds_cli::output::eprint_error` to render diagnostics on
 /// a TTY — never call `eprintln!("{report:?}")` on a raw `miette::Report`. Writing the
 /// rendered frame directly bypasses input-level sanitization and can inject C0/C1
@@ -297,6 +382,7 @@ impl FixLineSpan {
 /// **Sanitization**: see the module-level "Sanitization discipline" note — `message`
 /// and `help` are sanitized at every output boundary; constructors keep raw bytes so
 /// span offsets and `fix_edits` stay byte-accurate.
+#[non_exhaustive]
 pub struct LintDiagnostic {
     /// Short rule identifier, e.g. `"unused-variable"`. Becomes the miette code
     /// `mds::lint::<rule>`.
@@ -327,6 +413,139 @@ pub struct LintDiagnostic {
     /// (e.g. `legacy-interpolation` replaces `{x}` with `{{x}}`). `None` for
     /// rules that use `fix_removals` or have no fix.
     pub fix_edits: Option<Vec<TextEdit>>,
+}
+
+impl LintDiagnostic {
+    /// Construct a `LintDiagnostic` with required fields; all optional fields default
+    /// to `None`.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::{LintDiagnostic, Severity};
+    /// let diag = LintDiagnostic::new("unused-variable", Severity::Warn, "Variable 'x' is unused");
+    /// assert_eq!(diag.rule, "unused-variable");
+    /// assert_eq!(diag.severity, Severity::Warn);
+    /// assert!(diag.help.is_none());
+    /// ```
+    #[must_use]
+    pub fn new(rule: impl Into<String>, severity: Severity, message: impl Into<String>) -> Self {
+        LintDiagnostic {
+            rule: rule.into(),
+            severity,
+            message: message.into(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: None,
+            fix_edits: None,
+        }
+    }
+
+    /// Set the help text for this diagnostic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::{LintDiagnostic, Severity};
+    /// let diag = LintDiagnostic::new("unused-variable", Severity::Warn, "Variable 'x' is unused")
+    ///     .with_help("Remove the frontmatter key or reference it in the template body.");
+    /// assert!(diag.help.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+
+    /// Set the source span for this diagnostic.
+    #[must_use]
+    pub fn with_span(mut self, span: crate::SerializedSpan) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    /// Set the source file path for this diagnostic.
+    #[must_use]
+    pub fn with_file(mut self, file: impl Into<String>) -> Self {
+        self.file = Some(file.into());
+        self
+    }
+
+    /// Set line-removal fix spans for this diagnostic.
+    #[must_use]
+    pub fn with_fix_removals(mut self, fix_removals: Vec<FixLineSpan>) -> Self {
+        self.fix_removals = Some(fix_removals);
+        self
+    }
+
+    /// Set in-place replacement edits for this diagnostic.
+    #[must_use]
+    pub fn with_fix_edits(mut self, fix_edits: Vec<TextEdit>) -> Self {
+        self.fix_edits = Some(fix_edits);
+        self
+    }
+
+    /// Return a sanitized clone of this diagnostic for use at the miette render boundary.
+    ///
+    /// Sanitizes `message` and `help` in HUMAN mode (preserves `\n`; escapes C0/DEL/C1
+    /// controls, bidi controls, and BOM — see module-level "Sanitization discipline").
+    /// Preserves `rule`, `severity`, `span`, and `file` unchanged. Intentionally sets
+    /// `fix_removals` and `fix_edits` to `None` — miette's `Diagnostic` impl does not
+    /// read those fields, so cloning them would waste allocations (architecture-3 /
+    /// rust-1).
+    ///
+    /// This method is the architecturally correct home for render-boundary sanitization
+    /// (PF-014): the CLI should not assemble sanitized copies itself. It owns the escape
+    /// logic because it lives alongside the sanitizers and the struct definition.
+    ///
+    /// **Behavior is byte-identical to the original CLI render path** — this is
+    /// security-critical code (#176 / CWE-150). Do not alter the escape mode or field
+    /// selection without a corresponding audit of all render boundaries.
+    ///
+    /// # Escaping is one-way
+    ///
+    /// The HUMAN-mode escaping applied to `message` and `help` is **lossy and
+    /// non-injective** — see the `# Escaping is one-way` section on
+    /// [`sanitize_control_chars`]. Callers **MUST NOT** un-escape `\uXXXX` sequences
+    /// back into bytes.
+    ///
+    /// # Result is render-only — do not serialize to a WIRE surface
+    ///
+    /// The returned diagnostic has `message` and `help` sanitized in **HUMAN mode**,
+    /// which preserves `\n`. Passing this value to `LintResult::to_canonical_json` or
+    /// any JSON / binding serializer would double-escape already-escaped text and, more
+    /// importantly, would emit raw newlines inside JSON string values — violating the
+    /// WIRE contract (log forging, YAML key injection). For JSON/binding output, call
+    /// `to_canonical_json()` on the *original* `LintResult` instead; it applies WIRE
+    /// mode at the correct boundary.
+    ///
+    /// # Fix data is intentionally stripped
+    ///
+    /// `fix_removals` and `fix_edits` are set to `None` in the returned value. A caller
+    /// that reuses the sanitized clone for the fix pipeline would silently lose every
+    /// `fixable` flag and every edit plan — the `fixable` field in the JSON wire format
+    /// is derived from `fix_removals`/`fix_edits`, so it would always serialize as
+    /// `false`.
+    #[must_use]
+    pub fn sanitized_for_render(&self) -> Self {
+        LintDiagnostic {
+            rule: self.rule.clone(),
+            severity: self.severity,
+            message: sanitize_control_chars(&self.message).into_owned(),
+            help: self
+                .help
+                .as_deref()
+                .map(|h| sanitize_control_chars(h).into_owned()),
+            span: self.span.clone(),
+            file: self.file.clone(),
+            fix_removals: None,
+            fix_edits: None,
+        }
+    }
 }
 
 impl fmt::Debug for LintDiagnostic {
@@ -402,6 +621,12 @@ impl miette::Diagnostic for LintDiagnostic {
 /// directives — used to determine whether Tier B fixes (unused-import, unused-function)
 /// are safe to apply (they change compiled output for non-standalone files because the
 /// importer's compiled output depends on what the imported module exports).
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from `mds::lint_str`, `mds::lint`, and similar lint API functions,
+/// or construct via [`LintResult::new`] (and chain [`.truncated()`] / [`.standalone()`]);
+/// do not construct via struct literal.
+#[non_exhaustive]
 #[derive(Debug)]
 pub struct LintResult {
     /// Collected lint findings. Never contains `Severity::Off` diagnostics.
@@ -413,6 +638,48 @@ pub struct LintResult {
 }
 
 impl LintResult {
+    /// Construct a `LintResult` from a diagnostic list.
+    ///
+    /// Defaults: `truncated = false`, `is_standalone = false`.
+    /// Chain [`.truncated()`] or [`.standalone()`] to override.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::LintResult;
+    /// let result = LintResult::new(vec![]).standalone();
+    /// assert!(result.diagnostics.is_empty());
+    /// assert!(!result.truncated);
+    /// assert!(result.is_standalone);
+    /// ```
+    #[must_use]
+    pub fn new(diagnostics: Vec<LintDiagnostic>) -> Self {
+        LintResult {
+            diagnostics,
+            truncated: false,
+            is_standalone: false,
+        }
+    }
+
+    /// Mark this result as truncated (the diagnostic cap was reached).
+    #[must_use]
+    pub fn truncated(mut self) -> Self {
+        self.truncated = true;
+        self
+    }
+
+    /// Mark this result as standalone (the file has no `@import` or `@extends`).
+    ///
+    /// Standalone status gates Tier B `--fix` eligibility.
+    #[must_use]
+    pub fn standalone(mut self) -> Self {
+        self.is_standalone = true;
+        self
+    }
+
     /// Produce the canonical, LSP-stable JSON wire format.
     ///
     /// Schema:
@@ -1659,5 +1926,121 @@ mod tests {
             fix_edits: None,
         };
         assert_eq!(err.severity(), Some(miette::Severity::Error));
+    }
+
+    // ── sanitized_for_render ──────────────────────────────────────────────────
+    //
+    // Security-critical: this method is the CLI's render-boundary sanitizer.
+    // It lives in mds-core and must pass these invariants even when no CLI test
+    // exercises it, so `cargo test -p mds-core` stays green independently.
+
+    /// T-SFR-1: ESC byte in `message` is escaped; `\n` is preserved (HUMAN mode).
+    ///
+    /// Pins the HUMAN-mode choice: `\n` in a diagnostic body is legitimate prose
+    /// punctuation (multi-line miette frame) and must survive the round-trip.
+    /// ESC (U+001B) is a hostile control and must be replaced by `\\u001B`.
+    #[test]
+    fn sanitized_for_render_escapes_esc_preserves_newline() {
+        let diag = LintDiagnostic {
+            rule: "unused-variable".to_string(),
+            severity: Severity::Warn,
+            message: "line one\x1Bline two\nline three".to_string(),
+            help: Some("help\x1Btext\nwith newline".to_string()),
+            span: None,
+            file: None,
+            fix_removals: None,
+            fix_edits: None,
+        };
+
+        let rendered = diag.sanitized_for_render();
+
+        // ESC is replaced by the \uXXXX literal.
+        assert!(
+            !rendered.message.contains('\x1B'),
+            "raw ESC must not appear in sanitized message; got: {:?}",
+            rendered.message
+        );
+        assert!(
+            rendered.message.contains("\\u001B"),
+            "\\u001B literal must appear in sanitized message; got: {:?}",
+            rendered.message
+        );
+
+        // \n is preserved (HUMAN mode).
+        assert!(
+            rendered.message.contains('\n'),
+            "newline must be preserved in HUMAN-mode message; got: {:?}",
+            rendered.message
+        );
+
+        // help is also sanitized.
+        let help = rendered.help.as_deref().expect("help must be Some");
+        assert!(!help.contains('\x1B'), "raw ESC must not appear in help");
+        assert!(
+            help.contains("\\u001B"),
+            "\\u001B must appear in sanitized help"
+        );
+        assert!(help.contains('\n'), "newline must be preserved in help");
+    }
+
+    /// T-SFR-2: `span` and `file` pass through byte-identical; fix data is stripped.
+    ///
+    /// Pins three behaviours together:
+    /// - `span` offset/length/line/column are raw values, not altered by sanitization.
+    /// - `file` is copied verbatim — including hostile control bytes (WIRE escaping of
+    ///   the filename is the caller's responsibility via `named_source_for_render`).
+    /// - `fix_removals` and `fix_edits` are set to `None` so the sanitized clone
+    ///   cannot be mistaken for a fix-bearing diagnostic.
+    ///
+    /// The hostile filename `"a\u{1B}/b\u{202E}.mds"` exercises the no-sanitize
+    /// guarantee: `sanitized_for_render` must copy `file` byte-for-byte regardless of
+    /// what control bytes it contains.  This is intentional — WIRE-escaping happens in
+    /// `named_source_for_render`, not here (PF-014).
+    #[test]
+    fn sanitized_for_render_span_file_unchanged_fix_nulled() {
+        let span = crate::error::SerializedSpan::new(42, 7)
+            .with_line(3)
+            .with_column(1);
+        let hostile_file = "a\u{1B}/b\u{202E}.mds".to_string();
+        let diag = LintDiagnostic::new("duplicate-import", Severity::Error, "msg")
+            .with_span(span.clone())
+            .with_file(hostile_file.clone())
+            .with_fix_removals(vec![FixLineSpan::single(42)])
+            .with_fix_edits(vec![TextEdit::new(0, 3, "x")]);
+
+        let rendered = diag.sanitized_for_render();
+
+        // span is byte-identical, including line and column.
+        let rendered_span = rendered.span.as_ref().expect("span must survive");
+        assert_eq!(rendered_span.offset, 42, "span.offset must be unchanged");
+        assert_eq!(rendered_span.length, 7, "span.length must be unchanged");
+        assert_eq!(
+            rendered_span.line,
+            Some(3),
+            "span.line must survive sanitization"
+        );
+        assert_eq!(
+            rendered_span.column,
+            Some(1),
+            "span.column must survive sanitization"
+        );
+
+        // file is copied verbatim — hostile bytes are NOT sanitized by sanitized_for_render
+        // (the caller's named_source_for_render is responsible for WIRE-escaping the filename).
+        assert_eq!(
+            rendered.file.as_deref(),
+            Some(hostile_file.as_str()),
+            "file must be byte-identical, including hostile control bytes"
+        );
+
+        // fix data is intentionally stripped.
+        assert!(
+            rendered.fix_removals.is_none(),
+            "fix_removals must be None in the sanitized clone"
+        );
+        assert!(
+            rendered.fix_edits.is_none(),
+            "fix_edits must be None in the sanitized clone"
+        );
     }
 }

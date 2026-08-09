@@ -40,14 +40,51 @@ mds lint --fix && mds fmt
 Dynamic message roles now use double braces: `@message {{role}}:` instead of
 `@message {role}:`. Bare-word roles (`@message system:`) are unchanged.
 
+#### `LintDiagnostic` is now `#[non_exhaustive]`; use the constructor, not struct literals
+
+`LintDiagnostic` is marked `#[non_exhaustive]` so future minor releases can add
+fields without a breaking change. External Rust crates can no longer construct it
+via a struct literal. Use `LintDiagnostic::new(rule, severity, message)` to create
+a diagnostic with required fields and all optional fields defaulting to `None`, then
+chain the builder methods `with_help`, `with_span`, `with_file`, `with_fix_removals`,
+and `with_fix_edits` to set optional fields.
+
+#### Nine additional public types are now `#[non_exhaustive]`; migrate struct literals to constructors
+
+The following types are marked `#[non_exhaustive]` so future minor releases can add
+fields without a breaking change. External Rust crates can no longer construct them
+via struct literals. Use the named constructor or builder listed for each:
+
+- **`LintResult`** — use `LintResult::new(diagnostics)` (defaults: `truncated=false`, `is_standalone=false`),
+  then chain `.truncated()` or `.standalone()` to override.
+- **`SerializedError`** — not externally constructable by design; obtain via `MdsError::serialize()`.
+- **`SerializedSpan`** — use `SerializedSpan::new(offset, length)`, then chain `.with_line(n)` and/or `.with_column(n)`.
+- **`TextEdit`** — use `TextEdit::new(start, end, new_text)`. Previously this type was `pub`
+  inside a `pub(crate)` module and was thus unnameable from external crates; this PR re-exports
+  it at the crate root, making `mds::TextEdit` accessible for the first time. The `fix_edits`
+  field on `LintDiagnostic` (and the corresponding JSON field) was effectively unusable from
+  Rust until this change.
+- **`FixLineSpan`** — use `FixLineSpan::single(offset)` for single-line removals,
+  `FixLineSpan::range_inclusive(from, to)` to remove through the line containing `to`,
+  or `FixLineSpan::range_exclusive(from, to)` to keep the line containing `to`.
+- **`ByteEdit`** — use `ByteEdit::deletion(start, end, rule)` for pure deletions or
+  `ByteEdit::replacement(start, end, rule, text)` for in-place replacements.
+- **`RejectedEdit`** — use `RejectedEdit::new(edit, reason)`.
+- **`FixPlan`** — use `FixPlan::default()` for an empty plan; its fields are `pub`, so they
+  remain directly readable and writable from external crates.
+- **`LintConfig`** — use `LintConfig::from_rules(rules)` or `LintConfig::default()` for no overrides.
+- **`LintDiagnostic::sanitized_for_render()`** — a new method that returns a sanitized clone
+  suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
+  this method instead of assembling sanitized copies itself, keeping the escape logic co-located
+  with the struct definition (PF-014).
+
 #### New `fix_edits` field on `LintDiagnostic`
 
 `LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;
 an array of `{start, end, new_text}` byte-span edit objects when fixable). This
 field is present across all binding surfaces: CLI JSON output, napi
 (`LintDiagnostic.fix_edits?: …`), WASM, and Python
-(`LintDiagnostic.fix_edits: list[dict] | None`). Code that constructs
-`LintDiagnostic` objects directly must add `fix_edits: null` or the typed field.
+(`LintDiagnostic.fix_edits: list[dict] | None`).
 
 ### Security
 

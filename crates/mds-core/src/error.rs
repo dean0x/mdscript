@@ -13,6 +13,11 @@ use crate::lint::{named_source_for_render, sanitize_control_chars, sanitize_cont
 /// matching `miette::SourceSpan`. `line` is 1-indexed; `column` is the
 /// 1-indexed character position (Unicode scalar values) from the start of the
 /// line — NOT a byte offset and NOT UTF-16 code units.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Construct via [`SerializedSpan::new`] and the optional `with_line` /
+/// `with_column` builders; do not construct via struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SerializedSpan {
     pub offset: usize,
@@ -21,9 +26,71 @@ pub struct SerializedSpan {
     pub column: Option<usize>,
 }
 
+impl SerializedSpan {
+    /// Construct a `SerializedSpan` with byte `offset` and `length`; line and
+    /// column default to `None`.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::SerializedSpan;
+    /// let span = SerializedSpan::new(10, 5);
+    /// assert_eq!(span.offset, 10);
+    /// assert_eq!(span.length, 5);
+    /// assert!(span.line.is_none());
+    /// assert!(span.column.is_none());
+    /// ```
+    #[must_use]
+    pub fn new(offset: usize, length: usize) -> Self {
+        SerializedSpan {
+            offset,
+            length,
+            line: None,
+            column: None,
+        }
+    }
+
+    /// Set the 1-indexed line number.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::SerializedSpan;
+    /// let span = SerializedSpan::new(10, 5).with_line(3);
+    /// assert_eq!(span.line, Some(3));
+    /// ```
+    #[must_use]
+    pub fn with_line(mut self, line: usize) -> Self {
+        self.line = Some(line);
+        self
+    }
+
+    /// Set the 1-indexed character column.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::SerializedSpan;
+    /// let span = SerializedSpan::new(10, 5).with_column(7);
+    /// assert_eq!(span.column, Some(7));
+    /// ```
+    #[must_use]
+    pub fn with_column(mut self, column: usize) -> Self {
+        self.column = Some(column);
+        self
+    }
+}
+
 /// A serializable, `serde`-friendly representation of an [`MdsError`].
 ///
 /// Suitable for embedding in JSON API responses or structured log output.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values via [`MdsError::serialize`]; do not construct via struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SerializedError {
     pub code: String,

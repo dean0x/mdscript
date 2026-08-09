@@ -1126,6 +1126,8 @@ fn extract_vars(
     parse_json_vars(json).map(Some).map_err(|e| match e {
         VarsError::InvalidType(msg) => options_error(py, &msg),
         VarsError::Conversion(mds_err) => mds_err_to_py(py, &mds_err),
+        // VarsError is #[non_exhaustive]; handle future variants as conversion errors.
+        _ => options_error(py, &format!("vars error: {e}")),
     })
 }
 
@@ -1260,7 +1262,7 @@ fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<m
             })?;
         rules_map.insert(key, severity);
     }
-    Ok(mds::LintConfig { rules: rules_map })
+    Ok(mds::LintConfig::from_rules(rules_map))
 }
 
 /// Build a [`mds::CompileOptions`] from the `source_map` and `sources_content`
@@ -1274,11 +1276,9 @@ fn extract_compile_options(
     source_map: bool,
     sources_content: bool,
 ) -> PyResult<mds::CompileOptions> {
-    let opts = mds::CompileOptions {
-        source_map,
-        include_sources_content: sources_content,
-        ..Default::default()
-    };
+    let opts = mds::CompileOptions::default()
+        .with_source_map(source_map)
+        .with_include_sources_content(sources_content);
     opts.validate().map_err(|_| {
         options_error(
             py,

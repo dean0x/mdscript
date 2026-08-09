@@ -47,23 +47,14 @@ fn vfs_with_map(modules: HashMap<String, String>, entry: &str) -> CompileResult 
     vfs_opts(
         modules,
         entry,
-        CompileOptions {
-            source_map: true,
-            include_sources_content: true,
-            ..Default::default()
-        },
+        CompileOptions::default()
+            .with_source_map(true)
+            .with_include_sources_content(true),
     )
 }
 
 fn vfs_no_map(modules: HashMap<String, String>, entry: &str) -> CompileResult {
-    vfs_opts(
-        modules,
-        entry,
-        CompileOptions {
-            source_map: false,
-            ..Default::default()
-        },
-    )
+    vfs_opts(modules, entry, CompileOptions::default())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -872,10 +863,7 @@ fn source_map_messages_mode_degrades_to_none() {
     let result = vfs_opts(
         modules,
         "chat.mds",
-        CompileOptions {
-            source_map: true,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     );
 
     // source_map must be None (messages-mode degrades gracefully).
@@ -941,10 +929,7 @@ fn source_map_segment_cap_degrades_to_none() {
         modules,
         "big.mds",
         Some(vars),
-        CompileOptions {
-            source_map: true,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     )
     .expect("compilation must succeed even when cap is hit");
 
@@ -1061,19 +1046,9 @@ fn extends_output_byte_identical_with_and_without_source_map() {
     let with_map = vfs_opts(
         modules.clone(),
         "child.mds",
-        CompileOptions {
-            source_map: true,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     );
-    let without_map = vfs_opts(
-        modules,
-        "child.mds",
-        CompileOptions {
-            source_map: false,
-            ..Default::default()
-        },
-    );
+    let without_map = vfs_opts(modules, "child.mds", CompileOptions::default());
 
     // ADR-002: byte-identical output regardless of source-map mode.
     assert_eq!(
@@ -1136,10 +1111,7 @@ fn for_max_total_iterations_across_extends_regions_source_map() {
         modules,
         "child.mds",
         Some(vars),
-        CompileOptions {
-            source_map: true,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     )
     .expect_err(
         "REL-1: cumulative iteration budget across @extends regions must trip MAX_TOTAL_ITERATIONS",
@@ -1167,11 +1139,7 @@ fn d1_string_source_sources_label_is_input_mds() {
         "Hello World!\n",
         None,
         None,
-        CompileOptions {
-            source_map: true,
-            include_sources_content: false,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     )
     .expect("should compile");
     let sm = result.source_map.expect("source_map must be present");
@@ -1206,11 +1174,7 @@ fn d1_s8_locally_defined_function_no_source_sentinel() {
         "@define greet():\nHello!\n@end\n{{greet()}}\n",
         None,
         None,
-        CompileOptions {
-            source_map: true,
-            include_sources_content: false,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     )
     .expect("should compile");
     let sm = result.source_map.expect("source_map must be present");
@@ -1245,11 +1209,7 @@ fn d1_extends_from_string_no_source_sentinel() {
         child,
         Some(dir.path()),
         None,
-        CompileOptions {
-            source_map: true,
-            include_sources_content: false,
-            ..Default::default()
-        },
+        CompileOptions::default().with_source_map(true),
     )
     .expect("should compile");
     let sm = result.source_map.expect("source_map must be present");

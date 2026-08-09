@@ -58,7 +58,7 @@ const ESCAPED_RLO: &str = "\\u202E";
 /// `resolver.rs` branch that names the module in its warning.
 #[test]
 fn hostile_module_name_reaches_the_warning() {
-    use mds::{CompileOptions, Value};
+    use mds::Value;
 
     let items: Vec<Value> = (0..100_000)
         .map(|_| Value::String("x".to_string()))
@@ -83,10 +83,7 @@ fn hostile_module_name_reaches_the_warning() {
         modules,
         "entry.mds",
         Some(vars),
-        CompileOptions {
-            source_map: true,
-            ..Default::default()
-        },
+        mds::CompileOptions::default().with_source_map(true),
     )
     .expect("compilation must succeed even when the segment cap is hit");
 
