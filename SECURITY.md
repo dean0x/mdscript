@@ -25,11 +25,6 @@ investigate.
 MDS is pre-1.0. Security fixes are applied to the latest released minor series
 only; please upgrade to the newest release before reporting.
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | ✅        |
-| < 0.1.0 | ❌        |
-
 ## Security model & built-in controls
 
 MDS treats template sources, imported modules, and runtime variables as untrusted
