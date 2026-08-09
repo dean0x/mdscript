@@ -1018,7 +1018,7 @@ fn lint_types_exist() {
     let _err = Severity::Error;
 
     // LintConfig has a `rules` field (HashMap<String, Severity>).
-    let config = LintConfig::with_rules(HashMap::from([(
+    let config = LintConfig::from_rules(HashMap::from([(
         "unused-variable".to_string(),
         Severity::Off,
     )]));
@@ -1049,7 +1049,7 @@ fn lint_types_exist() {
     assert!(diag.span.is_some(), "with_span must set the span field");
 
     // LintResult has diagnostics, truncated, and is_standalone fields.
-    let result = LintResult::new(vec![diag], false, false);
+    let result = LintResult::new(vec![diag]);
     assert_eq!(result.diagnostics.len(), 1);
     assert!(!result.truncated);
 }
@@ -1097,18 +1097,14 @@ fn max_diagnostics_pinned() {
 fn lint_canonical_json_schema() {
     use mds::SerializedSpan;
 
-    let result = LintResult::new(
-        vec![LintDiagnostic::new(
-            "unused-variable",
-            Severity::Warn,
-            "Variable 'name' is never used",
-        )
-        .with_help("Remove the frontmatter key or reference it in the body")
-        .with_span(SerializedSpan::new(4, 4).with_line(2).with_column(1))
-        .with_file("test.mds")],
-        false,
-        false,
-    );
+    let result = LintResult::new(vec![LintDiagnostic::new(
+        "unused-variable",
+        Severity::Warn,
+        "Variable 'name' is never used",
+    )
+    .with_help("Remove the frontmatter key or reference it in the body")
+    .with_span(SerializedSpan::new(4, 4).with_line(2).with_column(1))
+    .with_file("test.mds")]);
 
     let json = result.to_canonical_json();
 
@@ -1151,54 +1147,48 @@ fn lint_canonical_json_fixable_semantics() {
     use mds::LintDiagnostic;
 
     // Tier A rule (duplicate-import) with fix_removals → fixable regardless of is_standalone.
-    let tier_a = LintResult::new(
-        vec![
-            LintDiagnostic::new("duplicate-import", Severity::Error, "Duplicate import")
-                .with_file("a.mds")
-                .with_fix_removals(vec![FixLineSpan::single(0)]),
-        ],
-        false,
-        false, // even non-standalone Tier A is fixable
-    );
+    let tier_a = LintResult::new(vec![LintDiagnostic::new(
+        "duplicate-import",
+        Severity::Error,
+        "Duplicate import",
+    )
+    .with_file("a.mds")
+    .with_fix_removals(vec![FixLineSpan::single(0)])]); // even non-standalone Tier A is fixable
     let json = tier_a.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
 
     // Tier B rule (unused-function) — fixable only for standalone files.
     // fix_removals: Some(...) + non-standalone → fixable: false
-    let tier_b_non_standalone = LintResult::new(
-        vec![
-            LintDiagnostic::new("unused-function", Severity::Warn, "Unused function")
-                .with_file("b.mds")
-                .with_fix_removals(vec![FixLineSpan::single(0)]),
-        ],
-        false,
-        false,
-    );
+    let tier_b_non_standalone = LintResult::new(vec![LintDiagnostic::new(
+        "unused-function",
+        Severity::Warn,
+        "Unused function",
+    )
+    .with_file("b.mds")
+    .with_fix_removals(vec![FixLineSpan::single(0)])]);
     let json = tier_b_non_standalone.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
 
     // fix_removals: Some(...) + standalone → fixable: true
-    let tier_b_standalone = LintResult::new(
-        vec![
-            LintDiagnostic::new("unused-function", Severity::Warn, "Unused function")
-                .with_file("c.mds")
-                .with_fix_removals(vec![FixLineSpan::single(0)]),
-        ],
-        false,
-        true,
-    );
+    let tier_b_standalone = LintResult::new(vec![LintDiagnostic::new(
+        "unused-function",
+        Severity::Warn,
+        "Unused function",
+    )
+    .with_file("c.mds")
+    .with_fix_removals(vec![FixLineSpan::single(0)])])
+    .standalone();
     let json = tier_b_standalone.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
 
     // Tier C rule (unused-variable) → never fixable (fix_removals: None also → false).
-    let tier_c = LintResult::new(
-        vec![
-            LintDiagnostic::new("unused-variable", Severity::Warn, "Unused variable")
-                .with_file("d.mds"),
-        ],
-        false,
-        true, // even standalone Tier C is not fixable
-    );
+    let tier_c = LintResult::new(vec![LintDiagnostic::new(
+        "unused-variable",
+        Severity::Warn,
+        "Unused variable",
+    )
+    .with_file("d.mds")])
+    .standalone(); // even standalone Tier C is not fixable
     let json = tier_c.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
 }
@@ -1316,19 +1306,13 @@ fn native_fs_check_symlink_is_public() {
 #[test]
 fn compile_options_has_source_map_and_include_sources_content() {
     // T1: both fields must exist and be independently settable.
-    let off = mds::CompileOptions {
-        source_map: false,
-        include_sources_content: false,
-        ..Default::default()
-    };
+    let off = mds::CompileOptions::default();
     assert!(!off.source_map);
     assert!(!off.include_sources_content);
 
-    let on = mds::CompileOptions {
-        source_map: true,
-        include_sources_content: true,
-        ..Default::default()
-    };
+    let on = mds::CompileOptions::default()
+        .with_source_map(true)
+        .with_include_sources_content(true);
     assert!(on.source_map);
     assert!(on.include_sources_content);
 
@@ -1350,11 +1334,7 @@ fn include_sources_content_false_omits_sources_content() {
         modules,
         "main.mds",
         None,
-        mds::CompileOptions {
-            source_map: true,
-            include_sources_content: false,
-            ..Default::default()
-        },
+        mds::CompileOptions::default().with_source_map(true),
     )
     .expect("should compile");
 
@@ -1376,11 +1356,9 @@ fn include_sources_content_true_includes_sources_content() {
         modules,
         "main.mds",
         None,
-        mds::CompileOptions {
-            source_map: true,
-            include_sources_content: true,
-            ..Default::default()
-        },
+        mds::CompileOptions::default()
+            .with_source_map(true)
+            .with_include_sources_content(true),
     )
     .expect("should compile");
 
@@ -1417,20 +1395,20 @@ fn fix_api_incremental_exists() {
     }
 
     // RejectedEdit struct has `edit` and `reason` fields.
-    let edit = ByteEdit::new(0, 5, "duplicate-import", "");
+    let edit = ByteEdit::deletion(0, 5, "duplicate-import");
     let rejected = RejectedEdit::new(edit, "simulated reverify failure");
     assert_eq!(rejected.reason, "simulated reverify failure");
     assert_eq!(rejected.edit.rule, "duplicate-import");
 
     // apply_fixes_incremental is callable with F: Fn — compile-time and runtime check.
     let source = "Hello!\n";
-    let original = LintResult::new(vec![], false, false);
+    let original = LintResult::new(vec![]);
     let plan = plan_fixes(&original, source);
     let outcome = apply_fixes_incremental(
         source,
         plan,
         &original,
-        |_s| -> Result<LintResult, MdsError> { Ok(LintResult::new(vec![], false, false)) },
+        |_s| -> Result<LintResult, MdsError> { Ok(LintResult::new(vec![])) },
     );
     // Empty source with no diagnostics → NothingToFix (no reverify called).
     assert!(
@@ -1453,4 +1431,53 @@ fn string_source_map_label_is_in_public_api() {
         "STRING_SOURCE_MAP_LABEL must equal \"input.mds\"; changing it requires \
          updating every surface that uses it"
     );
+}
+
+/// F-API-2: TextEdit is publicly nameable and LintDiagnostic::with_fix_edits wires through.
+///
+/// Pins:
+/// - `mds::TextEdit` is a public type (was previously unnameable: pub inside pub(crate) mod).
+/// - `LintDiagnostic::with_fix_edits` stores and exposes the edits.
+/// - `LintResult::to_canonical_json()` emits the `fix_edits` array for a diagnostic that has them.
+#[test]
+fn text_edit_and_fix_edits_public_api() {
+    use mds::TextEdit;
+
+    // TextEdit is publicly constructable.
+    let edit = TextEdit::new(6, 12, "{{name}}");
+    assert_eq!(edit.start, 6);
+    assert_eq!(edit.end, 12);
+    assert_eq!(edit.new_text, "{{name}}");
+
+    // with_fix_edits stores the edits on LintDiagnostic.
+    let diag = LintDiagnostic::new(
+        "legacy-interpolation",
+        Severity::Warn,
+        "legacy brace syntax",
+    )
+    .with_file("t.mds")
+    .with_fix_edits(vec![edit]);
+    assert!(
+        diag.fix_edits.is_some(),
+        "with_fix_edits must populate fix_edits"
+    );
+    let edits = diag.fix_edits.as_ref().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].start, 6);
+    assert_eq!(edits[0].new_text, "{{name}}");
+
+    // to_canonical_json emits fix_edits as an array (not null) for this diagnostic.
+    let result = LintResult::new(vec![diag]);
+    let json = result.to_canonical_json();
+    let diags = &json["files"][0]["diagnostics"];
+    let fix_edits = &diags[0]["fix_edits"];
+    assert!(
+        fix_edits.is_array(),
+        "fix_edits must be a JSON array when present; got: {fix_edits:?}"
+    );
+    let arr = fix_edits.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["start"], 6);
+    assert_eq!(arr[0]["end"], 12);
+    assert_eq!(arr[0]["new_text"], "{{name}}");
 }

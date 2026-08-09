@@ -1529,11 +1529,7 @@ fn source_map_extends_type_mismatch_span_not_misattributed_to_child() {
         modules,
         "child.mds",
         None,
-        mds::CompileOptions {
-            source_map: true,
-            include_sources_content: false,
-            ..Default::default()
-        },
+        mds::CompileOptions::default().with_source_map(true),
     )
     .expect_err("cross-type mismatch in an inherited @if must error");
     let serialized = err.serialize();
@@ -1569,11 +1565,7 @@ fn source_map_standalone_type_mismatch_carries_span() {
         src,
         None,
         None,
-        mds::CompileOptions {
-            source_map: true,
-            include_sources_content: false,
-            ..Default::default()
-        },
+        mds::CompileOptions::default().with_source_map(true),
     )
     .expect_err("cross-type == in @if must fail");
     let serialized = err.serialize();
