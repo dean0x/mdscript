@@ -55,15 +55,28 @@ The following types are marked `#[non_exhaustive]` so future minor releases can 
 fields without a breaking change. External Rust crates can no longer construct them
 via struct literals. Use the named constructor or builder listed for each:
 
-- **`LintResult`** — use `LintResult::new(diagnostics, truncated, is_standalone)`.
+- **`LintResult`** — use `LintResult::new(diagnostics)` (defaults: `truncated=false`, `is_standalone=false`),
+  then chain `.truncated()` or `.standalone()` to override.
 - **`SerializedError`** — not externally constructable by design; obtain via `MdsError::serialize()`.
 - **`SerializedSpan`** — use `SerializedSpan::new(offset, length)`, then chain `.with_line(n)` and/or `.with_column(n)`.
-- **`TextEdit`** — use `TextEdit::new(start, end, new_text)`.
-- **`FixLineSpan`** — use `FixLineSpan::single(offset)` for single-line removals or the new `FixLineSpan::range(from, to, to_inclusive)` for multi-line spans.
-- **`ByteEdit`** — use `ByteEdit::new(start, end, rule, replacement)`.
+- **`TextEdit`** — use `TextEdit::new(start, end, new_text)`. Previously this type was `pub`
+  inside a `pub(crate)` module and was thus unnameable from external crates; this PR re-exports
+  it at the crate root, making `mds::TextEdit` accessible for the first time. The `fix_edits`
+  field on `LintDiagnostic` (and the corresponding JSON field) was effectively unusable from
+  Rust until this change.
+- **`FixLineSpan`** — use `FixLineSpan::single(offset)` for single-line removals,
+  `FixLineSpan::range_inclusive(from, to)` to remove through the line containing `to`,
+  or `FixLineSpan::range_exclusive(from, to)` to keep the line containing `to`.
+- **`ByteEdit`** — use `ByteEdit::deletion(start, end, rule)` for pure deletions or
+  `ByteEdit::replacement(start, end, rule, text)` for in-place replacements.
 - **`RejectedEdit`** — use `RejectedEdit::new(edit, reason)`.
-- **`FixPlan`** — use `FixPlan::default()` for an empty plan; all mutation methods remain available.
-- **`LintConfig`** — use `LintConfig::with_rules(rules)` or `LintConfig::default()` for no overrides.
+- **`FixPlan`** — use `FixPlan::default()` for an empty plan; its fields are `pub`, so they
+  remain directly readable and writable from external crates.
+- **`LintConfig`** — use `LintConfig::from_rules(rules)` or `LintConfig::default()` for no overrides.
+- **`LintDiagnostic::sanitized_for_render()`** — a new method that returns a sanitized clone
+  suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
+  this method instead of assembling sanitized copies itself, keeping the escape logic co-located
+  with the struct definition (PF-014).
 
 #### New `fix_edits` field on `LintDiagnostic`
 
