@@ -462,7 +462,10 @@ pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
         match std::fs::metadata(path) {
             Ok(m) => Some(m.permissions().mode()),
             Err(e) => {
-                eprint_error(miette::miette!("cannot get metadata for {}: {e}", path.display()));
+                eprint_error(miette::miette!(
+                    "cannot get metadata for {}: {e}",
+                    path.display()
+                ));
                 None
             }
         }
