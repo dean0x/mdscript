@@ -441,6 +441,10 @@ pub(crate) fn output_base_no_ext(source: &Path, root: &Path, base: &OutputBase) 
 ///   file would silently become owner-only after the rename.
 /// - Calls `sync_all()` (not `flush()` — `flush()` is a no-op on unbuffered
 ///   `File`) for crash durability before the rename.
+///
+/// Note: Due to the temp-file-then-rename approach, this function does NOT
+/// preserve hard links, ACLs, extended attributes (xattrs), or owner/group
+/// metadata of the original file.
 pub(crate) fn atomic_write_file(path: &Path, content: &str) -> Result<()> {
     use mds::{effective_parent, NativeFs};
 

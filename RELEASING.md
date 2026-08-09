@@ -107,41 +107,14 @@ gh workflow run release.yml -f version=X.Y.Z   # DOES NOT WORK YET — see #127
 
 Intended to do everything in one command, but its `prepare` job pushes the release
 commit directly to protected `main`, which branch protection rejects for the Actions
-bot (`GH006`). It leaves an orphaned tag and publishes nothing. Re-enable it by giving
-a release PAT/GitHub App branch-protection bypass, or by having `prepare` open a PR
-instead of pushing to `main` (#127). Until then, use tag-push above.
+bot (`GH006`). It leaves an orphaned tag and publishes nothing. Use tag-push until
+#127 is fixed.
 
-### What happens after tagging
-
-The `release.yml` workflow runs, in order:
-   1. **version-gate** — synchronized-version check (fails fast).
-   2. **build-napi** — cross-compiles the addon for all 7 targets.
-   3. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
-      LICENSE into each platform dir, runs the **A3 name-gate**.
-   4. **publish-crates** — `cargo publish` `mds-core`, wait for the index, then
-      `mds-cli`.
-   5. **publish-npm** — regenerate `index.d.ts`, re-run the A3 gate, then publish
-      (with provenance): the **platform packages** (`napi prepublish`), the
-      **host** `@mdscript/mds-napi`, **`@mdscript/mds-wasm`**, the **universal**
-      `@mdscript/mds`, and the **bundler** packages.
-   6. **github-release** — `gh release create` with generated notes.
-
-## Post-release
-
-- Verify each package on its registry (crates.io, npmjs.com) and that npm shows
-  the **provenance** attestation.
-- Smoke test a clean install on a fresh machine/container:
-  `npm i @mdscript/mds` then `node -e "import('@mdscript/mds').then(m=>m.init())"`.
-- Open a fresh `## [Unreleased]` section in `CHANGELOG.md`.
+See @RELEASING.md for the full runbook.
 
 ## Notes
 
-- The 7 native targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-  `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`,
-  `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`,
-  `x86_64-pc-windows-msvc`. Linux musl/arm builds use napi's `--use-napi-cross`.
-- `wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...]` is enabled in `crates/mds-wasm/Cargo.toml`; CI installs
-  wasm-pack and Binaryen v129 via the composite action at `.github/actions/setup-wasm/` (version pins live there). Local builds need Binaryen separately
-  (`brew install binaryen` / `apt install binaryen`).
-- Platform packages are generated **in CI only** — they cannot be validated with a
-  local `npm pack`; use the dry-run workflow above instead.
+- The 7 native targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. Linux musl/arm builds use napi's --use-napi-cross.
+- wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds need Binaryen separately (brew install binaryen / apt install binaryen).
+- Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.
+- Due to its temp-file-then-rename implementation, atomic_write_file does not preserve hard links, ACLs, extended attributes (xattrs), or owner/group metadata of the original file.
