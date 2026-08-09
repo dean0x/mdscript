@@ -1024,16 +1024,13 @@ fn lint_types_exist() {
     assert_eq!(config.rules.get("unused-variable"), Some(&Severity::Off));
 
     // LintDiagnostic has the expected fields.
-    let diag = LintDiagnostic {
-        rule: "unused-variable".to_string(),
-        severity: Severity::Warn,
-        message: "Variable 'name' is never used".to_string(),
-        help: Some("Remove the frontmatter key or reference it in the body".to_string()),
-        span: None,
-        file: Some("test.mds".to_string()),
-        fix_removals: None,
-        fix_edits: None,
-    };
+    let diag = LintDiagnostic::new(
+        "unused-variable",
+        Severity::Warn,
+        "Variable 'name' is never used",
+    )
+    .with_help("Remove the frontmatter key or reference it in the body")
+    .with_file("test.mds");
     assert_eq!(diag.rule, "unused-variable");
     assert_eq!(diag.severity, Severity::Warn);
 
@@ -1091,21 +1088,19 @@ fn lint_canonical_json_schema() {
     use mds::SerializedSpan;
 
     let result = LintResult {
-        diagnostics: vec![LintDiagnostic {
-            rule: "unused-variable".to_string(),
-            severity: Severity::Warn,
-            message: "Variable 'name' is never used".to_string(),
-            help: Some("Remove the frontmatter key or reference it in the body".to_string()),
-            span: Some(SerializedSpan {
-                offset: 4,
-                length: 4,
-                line: Some(2),
-                column: Some(1),
-            }),
-            file: Some("test.mds".to_string()),
-            fix_removals: None,
-            fix_edits: None,
-        }],
+        diagnostics: vec![LintDiagnostic::new(
+            "unused-variable",
+            Severity::Warn,
+            "Variable 'name' is never used",
+        )
+        .with_help("Remove the frontmatter key or reference it in the body")
+        .with_span(SerializedSpan {
+            offset: 4,
+            length: 4,
+            line: Some(2),
+            column: Some(1),
+        })
+        .with_file("test.mds")],
         truncated: false,
         is_standalone: false,
     };
@@ -1152,16 +1147,13 @@ fn lint_canonical_json_fixable_semantics() {
 
     // Tier A rule (duplicate-import) with fix_removals → fixable regardless of is_standalone.
     let tier_a = LintResult {
-        diagnostics: vec![LintDiagnostic {
-            rule: "duplicate-import".to_string(),
-            severity: Severity::Error,
-            message: "Duplicate import".to_string(),
-            help: None,
-            span: None,
-            file: Some("a.mds".to_string()),
-            fix_removals: Some(vec![FixLineSpan::single(0)]),
-            fix_edits: None,
-        }],
+        diagnostics: vec![LintDiagnostic::new(
+            "duplicate-import",
+            Severity::Error,
+            "Duplicate import",
+        )
+        .with_file("a.mds")
+        .with_fix_removals(vec![FixLineSpan::single(0)])],
         truncated: false,
         is_standalone: false, // even non-standalone Tier A is fixable
     };
@@ -1171,16 +1163,13 @@ fn lint_canonical_json_fixable_semantics() {
     // Tier B rule (unused-function) — fixable only for standalone files.
     // fix_removals: Some(...) + non-standalone → fixable: false
     let tier_b_non_standalone = LintResult {
-        diagnostics: vec![LintDiagnostic {
-            rule: "unused-function".to_string(),
-            severity: Severity::Warn,
-            message: "Unused function".to_string(),
-            help: None,
-            span: None,
-            file: Some("b.mds".to_string()),
-            fix_removals: Some(vec![FixLineSpan::single(0)]),
-            fix_edits: None,
-        }],
+        diagnostics: vec![LintDiagnostic::new(
+            "unused-function",
+            Severity::Warn,
+            "Unused function",
+        )
+        .with_file("b.mds")
+        .with_fix_removals(vec![FixLineSpan::single(0)])],
         truncated: false,
         is_standalone: false,
     };
@@ -1189,16 +1178,13 @@ fn lint_canonical_json_fixable_semantics() {
 
     // fix_removals: Some(...) + standalone → fixable: true
     let tier_b_standalone = LintResult {
-        diagnostics: vec![LintDiagnostic {
-            rule: "unused-function".to_string(),
-            severity: Severity::Warn,
-            message: "Unused function".to_string(),
-            help: None,
-            span: None,
-            file: Some("c.mds".to_string()),
-            fix_removals: Some(vec![FixLineSpan::single(0)]),
-            fix_edits: None,
-        }],
+        diagnostics: vec![LintDiagnostic::new(
+            "unused-function",
+            Severity::Warn,
+            "Unused function",
+        )
+        .with_file("c.mds")
+        .with_fix_removals(vec![FixLineSpan::single(0)])],
         truncated: false,
         is_standalone: true,
     };
@@ -1207,16 +1193,12 @@ fn lint_canonical_json_fixable_semantics() {
 
     // Tier C rule (unused-variable) → never fixable (fix_removals: None also → false).
     let tier_c = LintResult {
-        diagnostics: vec![LintDiagnostic {
-            rule: "unused-variable".to_string(),
-            severity: Severity::Warn,
-            message: "Unused variable".to_string(),
-            help: None,
-            span: None,
-            file: Some("d.mds".to_string()),
-            fix_removals: None,
-            fix_edits: None,
-        }],
+        diagnostics: vec![LintDiagnostic::new(
+            "unused-variable",
+            Severity::Warn,
+            "Unused variable",
+        )
+        .with_file("d.mds")],
         truncated: false,
         is_standalone: true, // even standalone Tier C is not fixable
     };

@@ -286,6 +286,11 @@ impl FixLineSpan {
 /// `Error` → Error; `Off` diagnostics are never constructed (the lint engine filters
 /// them before collecting).
 ///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Obtain values from `mds::lint_str`, `mds::lint`, and similar lint API functions, or
+/// construct via [`LintDiagnostic::new`] and the `with_*` builder methods; do not
+/// construct via struct literal.
+///
 /// **CLI render**: always use `mds_cli::output::eprint_error` to render diagnostics on
 /// a TTY — never call `eprintln!("{report:?}")` on a raw `miette::Report`. Writing the
 /// rendered frame directly bypasses input-level sanitization and can inject C0/C1
@@ -297,6 +302,7 @@ impl FixLineSpan {
 /// **Sanitization**: see the module-level "Sanitization discipline" note — `message`
 /// and `help` are sanitized at every output boundary; constructors keep raw bytes so
 /// span offsets and `fix_edits` stay byte-accurate.
+#[non_exhaustive]
 pub struct LintDiagnostic {
     /// Short rule identifier, e.g. `"unused-variable"`. Becomes the miette code
     /// `mds::lint::<rule>`.
@@ -327,6 +333,107 @@ pub struct LintDiagnostic {
     /// (e.g. `legacy-interpolation` replaces `{x}` with `{{x}}`). `None` for
     /// rules that use `fix_removals` or have no fix.
     pub fix_edits: Option<Vec<TextEdit>>,
+}
+
+impl LintDiagnostic {
+    /// Construct a `LintDiagnostic` with required fields; all optional fields default
+    /// to `None`.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::{LintDiagnostic, Severity};
+    /// let diag = LintDiagnostic::new("unused-variable", Severity::Warn, "Variable 'x' is unused");
+    /// assert_eq!(diag.rule, "unused-variable");
+    /// assert_eq!(diag.severity, Severity::Warn);
+    /// assert!(diag.help.is_none());
+    /// ```
+    pub fn new(rule: impl Into<String>, severity: Severity, message: impl Into<String>) -> Self {
+        LintDiagnostic {
+            rule: rule.into(),
+            severity,
+            message: message.into(),
+            help: None,
+            span: None,
+            file: None,
+            fix_removals: None,
+            fix_edits: None,
+        }
+    }
+
+    /// Set the help text for this diagnostic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::{LintDiagnostic, Severity};
+    /// let diag = LintDiagnostic::new("unused-variable", Severity::Warn, "Variable 'x' is unused")
+    ///     .with_help("Remove the frontmatter key or reference it in the template body.");
+    /// assert!(diag.help.is_some());
+    /// ```
+    pub fn with_help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+
+    /// Set the source span for this diagnostic.
+    pub fn with_span(mut self, span: crate::error::SerializedSpan) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    /// Set the source file path for this diagnostic.
+    pub fn with_file(mut self, file: impl Into<String>) -> Self {
+        self.file = Some(file.into());
+        self
+    }
+
+    /// Set line-removal fix spans for this diagnostic.
+    pub fn with_fix_removals(mut self, fix_removals: Vec<FixLineSpan>) -> Self {
+        self.fix_removals = Some(fix_removals);
+        self
+    }
+
+    /// Set in-place replacement edits for this diagnostic.
+    pub fn with_fix_edits(mut self, fix_edits: Vec<TextEdit>) -> Self {
+        self.fix_edits = Some(fix_edits);
+        self
+    }
+
+    /// Return a sanitized clone of this diagnostic for use at the miette render boundary.
+    ///
+    /// Sanitizes `message` and `help` in HUMAN mode (preserves `\n`; escapes C0/DEL/C1
+    /// controls, bidi controls, and BOM — see module-level "Sanitization discipline").
+    /// Preserves `rule`, `severity`, `span`, and `file` unchanged. Intentionally sets
+    /// `fix_removals` and `fix_edits` to `None` — miette's `Diagnostic` impl does not
+    /// read those fields, so cloning them would waste allocations (architecture-3 /
+    /// rust-1).
+    ///
+    /// This method is the architecturally correct home for render-boundary sanitization
+    /// (PF-014): the CLI should not assemble sanitized copies itself. It owns the escape
+    /// logic because it lives alongside the sanitizers and the struct definition.
+    ///
+    /// **Behavior is byte-identical to the original CLI render path** — this is
+    /// security-critical code (#176 / CWE-150). Do not alter the escape mode or field
+    /// selection without a corresponding audit of all render boundaries.
+    pub fn sanitized_for_render(&self) -> Self {
+        LintDiagnostic {
+            rule: self.rule.clone(),
+            severity: self.severity,
+            message: sanitize_control_chars(&self.message).into_owned(),
+            help: self
+                .help
+                .as_deref()
+                .map(|h| sanitize_control_chars(h).into_owned()),
+            span: self.span.clone(),
+            file: self.file.clone(),
+            fix_removals: None,
+            fix_edits: None,
+        }
+    }
 }
 
 impl fmt::Debug for LintDiagnostic {

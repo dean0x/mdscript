@@ -294,22 +294,10 @@ fn render_diag_human(diag: &mds::LintDiagnostic, quiet: bool, named_source: (&st
     if quiet && matches!(diag.severity, Severity::Info | Severity::Warn) {
         return;
     }
-    // Sanitize message and help at the input boundary.
-    // fix_removals/fix_edits are not read by miette's Diagnostic impl — set to None
-    // to avoid unnecessary allocations (architecture-3 / rust-1).
-    let sanitized = mds::LintDiagnostic {
-        rule: diag.rule.clone(),
-        severity: diag.severity,
-        message: mds::sanitize_control_chars(&diag.message).into_owned(),
-        help: diag
-            .help
-            .as_deref()
-            .map(|h| mds::sanitize_control_chars(h).into_owned()),
-        span: diag.span.clone(),
-        file: diag.file.clone(),
-        fix_removals: None,
-        fix_edits: None,
-    };
+    // Sanitize message and help at the input boundary via the core method.
+    // fix_removals/fix_edits are set to None inside sanitized_for_render to avoid
+    // unnecessary allocations (architecture-3 / rust-1).
+    let sanitized = diag.sanitized_for_render();
     let (filename, src) = named_source;
     let report = miette::Report::from(sanitized)
         .with_source_code(mds::named_source_for_render(filename, src));
@@ -1489,36 +1477,22 @@ mod tests {
     fn preview_fixes_surfaces_rejected_on_overlap() {
         let source = "line0\nline1\nline2\n";
         // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
-        let diag_a = LintDiagnostic {
-            rule: "duplicate-import".to_string(),
-            severity: Severity::Error,
-            message: "a".to_string(),
-            help: None,
-            span: None,
-            file: None,
-            fix_removals: Some(vec![FixLineSpan {
+        let diag_a = LintDiagnostic::new("duplicate-import", Severity::Error, "a")
+            .with_fix_removals(vec![FixLineSpan {
                 from: 0, // inside line0
                 to: 6,   // inside line1; extend_to_line_end(6) = 12
                 to_inclusive: true,
-            }]),
-            fix_edits: None,
-        };
+            }]);
         // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
         // Partially overlaps A at [6, 12).
-        let diag_b = LintDiagnostic {
-            rule: "empty-block".to_string(),
-            severity: Severity::Warn,
-            message: "b".to_string(),
-            help: None,
-            span: None,
-            file: None,
-            fix_removals: Some(vec![FixLineSpan {
-                from: 6, // inside line1
-                to: 12,  // inside line2; extend_to_line_end(12) = 18
-                to_inclusive: true,
-            }]),
-            fix_edits: None,
-        };
+        let diag_b =
+            LintDiagnostic::new("empty-block", Severity::Warn, "b").with_fix_removals(vec![
+                FixLineSpan {
+                    from: 6, // inside line1
+                    to: 12,  // inside line2; extend_to_line_end(12) = 18
+                    to_inclusive: true,
+                },
+            ]);
         let result = LintResult {
             diagnostics: vec![diag_a, diag_b],
             truncated: false,

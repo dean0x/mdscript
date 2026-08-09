@@ -40,14 +40,22 @@ mds lint --fix && mds fmt
 Dynamic message roles now use double braces: `@message {{role}}:` instead of
 `@message {role}:`. Bare-word roles (`@message system:`) are unchanged.
 
+#### `LintDiagnostic` is now `#[non_exhaustive]`; use the constructor, not struct literals
+
+`LintDiagnostic` is marked `#[non_exhaustive]` so future minor releases can add
+fields without a breaking change. External Rust crates can no longer construct it
+via a struct literal. Use `LintDiagnostic::new(rule, severity, message)` to create
+a diagnostic with required fields and all optional fields defaulting to `None`, then
+chain the builder methods `with_help`, `with_span`, `with_file`, `with_fix_removals`,
+and `with_fix_edits` to set optional fields.
+
 #### New `fix_edits` field on `LintDiagnostic`
 
 `LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;
 an array of `{start, end, new_text}` byte-span edit objects when fixable). This
 field is present across all binding surfaces: CLI JSON output, napi
 (`LintDiagnostic.fix_edits?: …`), WASM, and Python
-(`LintDiagnostic.fix_edits: list[dict] | None`). Code that constructs
-`LintDiagnostic` objects directly must add `fix_edits: null` or the typed field.
+(`LintDiagnostic.fix_edits: list[dict] | None`).
 
 ### Security
 
