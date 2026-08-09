@@ -1260,7 +1260,7 @@ fn extract_rules(py: Python<'_>, rules: Option<&Bound<'_, PyAny>>) -> PyResult<m
             })?;
         rules_map.insert(key, severity);
     }
-    Ok(mds::LintConfig { rules: rules_map })
+    Ok(mds::LintConfig::with_rules(rules_map))
 }
 
 /// Build a [`mds::CompileOptions`] from the `source_map` and `sources_content`

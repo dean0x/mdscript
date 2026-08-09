@@ -1018,9 +1018,10 @@ fn lint_types_exist() {
     let _err = Severity::Error;
 
     // LintConfig has a `rules` field (HashMap<String, Severity>).
-    let config = LintConfig {
-        rules: HashMap::from([("unused-variable".to_string(), Severity::Off)]),
-    };
+    let config = LintConfig::with_rules(HashMap::from([(
+        "unused-variable".to_string(),
+        Severity::Off,
+    )]));
     assert_eq!(config.rules.get("unused-variable"), Some(&Severity::Off));
 
     // LintDiagnostic has the expected fields.
@@ -1030,16 +1031,25 @@ fn lint_types_exist() {
         "Variable 'name' is never used",
     )
     .with_help("Remove the frontmatter key or reference it in the body")
-    .with_file("test.mds");
+    .with_file("test.mds")
+    .with_span(mds::SerializedSpan::new(0, 4));
     assert_eq!(diag.rule, "unused-variable");
     assert_eq!(diag.severity, Severity::Warn);
+    // Verify that the builder methods actually set their fields.
+    assert_eq!(
+        diag.help.as_deref(),
+        Some("Remove the frontmatter key or reference it in the body"),
+        "with_help must set the help field"
+    );
+    assert_eq!(
+        diag.file.as_deref(),
+        Some("test.mds"),
+        "with_file must set the file field"
+    );
+    assert!(diag.span.is_some(), "with_span must set the span field");
 
     // LintResult has diagnostics, truncated, and is_standalone fields.
-    let result = LintResult {
-        diagnostics: vec![diag],
-        truncated: false,
-        is_standalone: false,
-    };
+    let result = LintResult::new(vec![diag], false, false);
     assert_eq!(result.diagnostics.len(), 1);
     assert!(!result.truncated);
 }
@@ -1087,23 +1097,18 @@ fn max_diagnostics_pinned() {
 fn lint_canonical_json_schema() {
     use mds::SerializedSpan;
 
-    let result = LintResult {
-        diagnostics: vec![LintDiagnostic::new(
+    let result = LintResult::new(
+        vec![LintDiagnostic::new(
             "unused-variable",
             Severity::Warn,
             "Variable 'name' is never used",
         )
         .with_help("Remove the frontmatter key or reference it in the body")
-        .with_span(SerializedSpan {
-            offset: 4,
-            length: 4,
-            line: Some(2),
-            column: Some(1),
-        })
+        .with_span(SerializedSpan::new(4, 4).with_line(2).with_column(1))
         .with_file("test.mds")],
-        truncated: false,
-        is_standalone: false,
-    };
+        false,
+        false,
+    );
 
     let json = result.to_canonical_json();
 
@@ -1146,62 +1151,54 @@ fn lint_canonical_json_fixable_semantics() {
     use mds::LintDiagnostic;
 
     // Tier A rule (duplicate-import) with fix_removals → fixable regardless of is_standalone.
-    let tier_a = LintResult {
-        diagnostics: vec![LintDiagnostic::new(
-            "duplicate-import",
-            Severity::Error,
-            "Duplicate import",
-        )
-        .with_file("a.mds")
-        .with_fix_removals(vec![FixLineSpan::single(0)])],
-        truncated: false,
-        is_standalone: false, // even non-standalone Tier A is fixable
-    };
+    let tier_a = LintResult::new(
+        vec![
+            LintDiagnostic::new("duplicate-import", Severity::Error, "Duplicate import")
+                .with_file("a.mds")
+                .with_fix_removals(vec![FixLineSpan::single(0)]),
+        ],
+        false,
+        false, // even non-standalone Tier A is fixable
+    );
     let json = tier_a.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
 
     // Tier B rule (unused-function) — fixable only for standalone files.
     // fix_removals: Some(...) + non-standalone → fixable: false
-    let tier_b_non_standalone = LintResult {
-        diagnostics: vec![LintDiagnostic::new(
-            "unused-function",
-            Severity::Warn,
-            "Unused function",
-        )
-        .with_file("b.mds")
-        .with_fix_removals(vec![FixLineSpan::single(0)])],
-        truncated: false,
-        is_standalone: false,
-    };
+    let tier_b_non_standalone = LintResult::new(
+        vec![
+            LintDiagnostic::new("unused-function", Severity::Warn, "Unused function")
+                .with_file("b.mds")
+                .with_fix_removals(vec![FixLineSpan::single(0)]),
+        ],
+        false,
+        false,
+    );
     let json = tier_b_non_standalone.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
 
     // fix_removals: Some(...) + standalone → fixable: true
-    let tier_b_standalone = LintResult {
-        diagnostics: vec![LintDiagnostic::new(
-            "unused-function",
-            Severity::Warn,
-            "Unused function",
-        )
-        .with_file("c.mds")
-        .with_fix_removals(vec![FixLineSpan::single(0)])],
-        truncated: false,
-        is_standalone: true,
-    };
+    let tier_b_standalone = LintResult::new(
+        vec![
+            LintDiagnostic::new("unused-function", Severity::Warn, "Unused function")
+                .with_file("c.mds")
+                .with_fix_removals(vec![FixLineSpan::single(0)]),
+        ],
+        false,
+        true,
+    );
     let json = tier_b_standalone.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], true);
 
     // Tier C rule (unused-variable) → never fixable (fix_removals: None also → false).
-    let tier_c = LintResult {
-        diagnostics: vec![LintDiagnostic::new(
-            "unused-variable",
-            Severity::Warn,
-            "Unused variable",
-        )
-        .with_file("d.mds")],
-        truncated: false,
-        is_standalone: true, // even standalone Tier C is not fixable
-    };
+    let tier_c = LintResult::new(
+        vec![
+            LintDiagnostic::new("unused-variable", Severity::Warn, "Unused variable")
+                .with_file("d.mds"),
+        ],
+        false,
+        true, // even standalone Tier C is not fixable
+    );
     let json = tier_c.to_canonical_json();
     assert_eq!(json["files"][0]["diagnostics"][0]["fixable"], false);
 }
@@ -1420,38 +1417,20 @@ fn fix_api_incremental_exists() {
     }
 
     // RejectedEdit struct has `edit` and `reason` fields.
-    let edit = ByteEdit {
-        start: 0,
-        end: 5,
-        rule: "duplicate-import".to_string(),
-        replacement: String::new(),
-    };
-    let rejected = RejectedEdit {
-        edit,
-        reason: "simulated reverify failure".to_string(),
-    };
+    let edit = ByteEdit::new(0, 5, "duplicate-import", "");
+    let rejected = RejectedEdit::new(edit, "simulated reverify failure");
     assert_eq!(rejected.reason, "simulated reverify failure");
     assert_eq!(rejected.edit.rule, "duplicate-import");
 
     // apply_fixes_incremental is callable with F: Fn — compile-time and runtime check.
     let source = "Hello!\n";
-    let original = LintResult {
-        diagnostics: vec![],
-        truncated: false,
-        is_standalone: false,
-    };
+    let original = LintResult::new(vec![], false, false);
     let plan = plan_fixes(&original, source);
     let outcome = apply_fixes_incremental(
         source,
         plan,
         &original,
-        |_s| -> Result<LintResult, MdsError> {
-            Ok(LintResult {
-                diagnostics: vec![],
-                truncated: false,
-                is_standalone: false,
-            })
-        },
+        |_s| -> Result<LintResult, MdsError> { Ok(LintResult::new(vec![], false, false)) },
     );
     // Empty source with no diagnostics → NothingToFix (no reverify called).
     assert!(

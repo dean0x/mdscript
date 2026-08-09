@@ -1478,26 +1478,22 @@ mod tests {
         let source = "line0\nline1\nline2\n";
         // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
         let diag_a = LintDiagnostic::new("duplicate-import", Severity::Error, "a")
-            .with_fix_removals(vec![FixLineSpan {
-                from: 0, // inside line0
-                to: 6,   // inside line1; extend_to_line_end(6) = 12
-                to_inclusive: true,
-            }]);
+            .with_fix_removals(vec![FixLineSpan::range(
+                0, // inside line0
+                6, // inside line1; extend_to_line_end(6) = 12
+                true,
+            )]);
         // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
         // Partially overlaps A at [6, 12).
         let diag_b =
             LintDiagnostic::new("empty-block", Severity::Warn, "b").with_fix_removals(vec![
-                FixLineSpan {
-                    from: 6, // inside line1
-                    to: 12,  // inside line2; extend_to_line_end(12) = 18
-                    to_inclusive: true,
-                },
+                FixLineSpan::range(
+                    6,  // inside line1
+                    12, // inside line2; extend_to_line_end(12) = 18
+                    true,
+                ),
             ]);
-        let result = LintResult {
-            diagnostics: vec![diag_a, diag_b],
-            truncated: false,
-            is_standalone: false,
-        };
+        let result = LintResult::new(vec![diag_a, diag_b], false, false);
 
         let outcome = preview_fixes(
             &result,

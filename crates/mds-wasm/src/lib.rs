@@ -493,7 +493,7 @@ fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
         })?;
         rules.insert(key, severity);
     }
-    Ok(mds::LintConfig { rules })
+    Ok(mds::LintConfig::with_rules(rules))
 }
 
 /// Parse the JS options for `lint` and `lint_virtual`.

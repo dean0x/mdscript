@@ -107,6 +107,10 @@ pub use super::tier::{is_fixable, is_output_neutral, rule_tier, FixTier};
 ///
 /// **CRLF note**: `end` must be chosen to include the complete line terminator
 /// (call [`extend_to_line_end`] to adjust if needed) for line-removal edits.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Construct via [`ByteEdit::new`]; do not use a struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ByteEdit {
     /// Inclusive start byte offset of the range to replace.
@@ -119,7 +123,31 @@ pub struct ByteEdit {
     pub replacement: String,
 }
 
+impl ByteEdit {
+    /// Construct a `ByteEdit` with all fields.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    pub fn new(
+        start: usize,
+        end: usize,
+        rule: impl Into<String>,
+        replacement: impl Into<String>,
+    ) -> Self {
+        ByteEdit {
+            start,
+            end,
+            rule: rule.into(),
+            replacement: replacement.into(),
+        }
+    }
+}
+
 /// A fix edit that was rejected by the per-edit reverify gate in [`apply_fixes_incremental`].
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Construct via [`RejectedEdit::new`]; do not use a struct literal.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RejectedEdit {
     /// The edit that was rejected.
@@ -127,6 +155,19 @@ pub struct RejectedEdit {
     /// Human-readable reason for rejection. Sanitized at construction — see
     /// [`FixOutcome::Rejected::reason`].
     pub reason: String,
+}
+
+impl RejectedEdit {
+    /// Construct a `RejectedEdit` with an edit and a rejection reason.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    pub fn new(edit: ByteEdit, reason: impl Into<String>) -> Self {
+        RejectedEdit {
+            edit,
+            reason: reason.into(),
+        }
+    }
 }
 
 /// Render a reverify failure into a single-line, display-safe rejection reason.
@@ -158,6 +199,15 @@ fn reverify_failure_reason(err: &MdsError) -> String {
 }
 
 /// A plan of fix edits for a single file's source.
+///
+/// Obtain via [`plan_fixes`] or [`plan_fixes_with_options`], then pass to
+/// [`apply_fixes`] or [`apply_fixes_incremental`]. External crates that need an
+/// empty plan can use `FixPlan::default()`.
+///
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
+/// Construct via the planning functions or `FixPlan::default()`; do not use a
+/// struct literal in external crates.
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct FixPlan {
     /// Sorted (start ASC, end DESC), deduplicated, non-overlapping byte edits

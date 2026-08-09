@@ -54,7 +54,7 @@ pub(crate) struct LintCliConfig {
 impl LintCliConfig {
     /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions.
     pub(crate) fn into_core_config(self) -> mds::LintConfig {
-        mds::LintConfig { rules: self.rules }
+        mds::LintConfig::with_rules(self.rules)
     }
 }
 

@@ -49,6 +49,22 @@ a diagnostic with required fields and all optional fields defaulting to `None`, 
 chain the builder methods `with_help`, `with_span`, `with_file`, `with_fix_removals`,
 and `with_fix_edits` to set optional fields.
 
+#### Nine additional public types are now `#[non_exhaustive]`; migrate struct literals to constructors
+
+The following types are marked `#[non_exhaustive]` so future minor releases can add
+fields without a breaking change. External Rust crates can no longer construct them
+via struct literals. Use the named constructor or builder listed for each:
+
+- **`LintResult`** — use `LintResult::new(diagnostics, truncated, is_standalone)`.
+- **`SerializedError`** — not externally constructable by design; obtain via `MdsError::serialize()`.
+- **`SerializedSpan`** — use `SerializedSpan::new(offset, length)`, then chain `.with_line(n)` and/or `.with_column(n)`.
+- **`TextEdit`** — use `TextEdit::new(start, end, new_text)`.
+- **`FixLineSpan`** — use `FixLineSpan::single(offset)` for single-line removals or the new `FixLineSpan::range(from, to, to_inclusive)` for multi-line spans.
+- **`ByteEdit`** — use `ByteEdit::new(start, end, rule, replacement)`.
+- **`RejectedEdit`** — use `RejectedEdit::new(edit, reason)`.
+- **`FixPlan`** — use `FixPlan::default()` for an empty plan; all mutation methods remain available.
+- **`LintConfig`** — use `LintConfig::with_rules(rules)` or `LintConfig::default()` for no overrides.
+
 #### New `fix_edits` field on `LintDiagnostic`
 
 `LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;

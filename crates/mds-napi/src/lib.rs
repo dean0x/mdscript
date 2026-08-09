@@ -832,7 +832,7 @@ fn extract_rules_direct(env: &Env, obj: &Object) -> napi::Result<mds::LintConfig
                     })?;
                 rules.insert(key, severity);
             }
-            Ok(mds::LintConfig { rules })
+            Ok(mds::LintConfig::with_rules(rules))
         }
         other => Err(throw_options_error(
             env,
