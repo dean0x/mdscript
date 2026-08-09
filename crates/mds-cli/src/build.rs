@@ -54,7 +54,7 @@ pub(crate) struct LintCliConfig {
 impl LintCliConfig {
     /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions.
     pub(crate) fn into_core_config(self) -> mds::LintConfig {
-        mds::LintConfig::with_rules(self.rules)
+        mds::LintConfig::from_rules(self.rules)
     }
 }
 
@@ -1153,11 +1153,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         }
 
         let source_map_base = compute_source_map_base(Path::new("-"), &output, &out_dir, &None);
-        let opts = mds::CompileOptions {
-            source_map: use_source_map,
-            include_sources_content: use_embed_sources,
-            source_map_base,
-        };
+        let opts = mds::CompileOptions::default()
+            .with_source_map(use_source_map)
+            .with_include_sources_content(use_embed_sources)
+            .with_source_map_base(source_map_base);
 
         let (source, cwd) = read_stdin()?;
         let result = mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
@@ -1272,11 +1271,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
     }
 
     let source_map_base = compute_source_map_base(&input, &output, &out_dir, &config);
-    let opts = mds::CompileOptions {
-        source_map: use_source_map,
-        include_sources_content: use_embed_sources,
-        source_map_base,
-    };
+    let opts = mds::CompileOptions::default()
+        .with_source_map(use_source_map)
+        .with_include_sources_content(use_embed_sources)
+        .with_source_map_base(source_map_base);
 
     let compiled = compile_to_content(&input, runtime_vars, quiet, opts)?;
     let output_path = resolve_output_path_for_kind(
@@ -1482,11 +1480,10 @@ fn run_build_directory(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        let opts = mds::CompileOptions {
-            source_map,
-            include_sources_content: embed_sources,
-            source_map_base: Some(source_map_base),
-        };
+        let opts = mds::CompileOptions::default()
+            .with_source_map(source_map)
+            .with_include_sources_content(embed_sources)
+            .with_source_map_base(Some(source_map_base));
 
         // Compile (all reads go through mds-core which enforces MAX_FILE_SIZE — PF-004).
         match compile_to_content(file, runtime_vars.clone(), quiet, opts) {

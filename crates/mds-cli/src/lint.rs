@@ -1465,8 +1465,8 @@ mod tests {
     ///
     /// Math (identical to ISS-02):
     ///   source = "line0\nline1\nline2\n"
-    ///   Edit A: FixLineSpan { from: 0, to: 6,  to_inclusive: true } → ByteEdit [0,  12)
-    ///   Edit B: FixLineSpan { from: 6, to: 12, to_inclusive: true } → ByteEdit [6,  18)
+    ///   Edit A: FixLineSpan::range_inclusive(0, 6)  → ByteEdit [0,  12)
+    ///   Edit B: FixLineSpan::range_inclusive(6, 12) → ByteEdit [6,  18)
     ///   A.end=12 > B.start=6, B.end=18 > A.end=12 → partial overlap → overlap_rejected.
     ///
     /// `preview_fixes` must return `PreviewOutcome::Rejected` — the rejection must be
@@ -1478,22 +1478,20 @@ mod tests {
         let source = "line0\nline1\nline2\n";
         // Edit A covers bytes [0, 12): line0 start through line1 end (inclusive).
         let diag_a = LintDiagnostic::new("duplicate-import", Severity::Error, "a")
-            .with_fix_removals(vec![FixLineSpan::range(
+            .with_fix_removals(vec![FixLineSpan::range_inclusive(
                 0, // inside line0
                 6, // inside line1; extend_to_line_end(6) = 12
-                true,
             )]);
         // Edit B covers bytes [6, 18): line1 start through line2 end (inclusive).
         // Partially overlaps A at [6, 12).
         let diag_b =
             LintDiagnostic::new("empty-block", Severity::Warn, "b").with_fix_removals(vec![
-                FixLineSpan::range(
+                FixLineSpan::range_inclusive(
                     6,  // inside line1
                     12, // inside line2; extend_to_line_end(12) = 18
-                    true,
                 ),
             ]);
-        let result = LintResult::new(vec![diag_a, diag_b], false, false);
+        let result = LintResult::new(vec![diag_a, diag_b]);
 
         let outcome = preview_fixes(
             &result,

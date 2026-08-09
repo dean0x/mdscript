@@ -464,6 +464,8 @@ fn extract_vars_direct(env: &Env, obj: &Object) -> napi::Result<Option<HashMap<S
             parse_json_vars(vars_json).map(Some).map_err(|e| match e {
                 VarsError::InvalidType(msg) => throw_options_error(env, &msg),
                 VarsError::Conversion(mds_err) => throw_mds_error(env, mds_err),
+                // VarsError is #[non_exhaustive]; handle future variants gracefully.
+                _ => throw_options_error(env, &format!("vars error: {e}")),
             })
         }
         other => Err(throw_options_error(
@@ -516,11 +518,9 @@ fn extract_bool_direct(
 fn extract_compile_options_direct(env: &Env, obj: &Object) -> napi::Result<mds::CompileOptions> {
     let source_map = extract_bool_direct(env, obj, "sourceMap", false)?;
     let include_sources_content = extract_bool_direct(env, obj, "sourcesContent", false)?;
-    let opts = mds::CompileOptions {
-        source_map,
-        include_sources_content,
-        ..Default::default()
-    };
+    let opts = mds::CompileOptions::default()
+        .with_source_map(source_map)
+        .with_include_sources_content(include_sources_content);
     opts.validate().map_err(|_| {
         throw_options_error(
             env,
@@ -832,7 +832,7 @@ fn extract_rules_direct(env: &Env, obj: &Object) -> napi::Result<mds::LintConfig
                     })?;
                 rules.insert(key, severity);
             }
-            Ok(mds::LintConfig::with_rules(rules))
+            Ok(mds::LintConfig::from_rules(rules))
         }
         other => Err(throw_options_error(
             env,
