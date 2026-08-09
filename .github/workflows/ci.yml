@@ -212,6 +212,45 @@ jobs:
         continue-on-error: true
         run: pytest crates/mds-python/tests -q -m perf
 
+  # Lightweight guard: every file ignored under examples/ must have a sibling
+  # .mds source (generated output). If it doesn't, the file is hand-authored
+  # content being silently dropped by the .gitignore catch-alls — the author
+  # must add an explicit '!' exception. See the FOOTGUN WARNING comment in
+  # .gitignore. This job runs checkout-only; no build dependencies needed.
+  examples-guard:
+    name: examples/ gitignore guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify no hand-authored file is caught by the examples catch-alls
+        run: |
+          # Collect all files that .gitignore ignores under examples/.
+          # For each, check that a sibling .mds source exists.
+          # Bounded: MAX=500 is far above the real examples count; exits 1 if exceeded.
+          OFFENDERS=()
+          COUNT=0
+          MAX=500
+          while IFS= read -r path; do
+            COUNT=$((COUNT + 1))
+            if [ "$COUNT" -gt "$MAX" ]; then
+              echo "::error::Ignored file count exceeded $MAX — review .gitignore examples patterns"
+              exit 1
+            fi
+            sibling="${path%.*}.mds"
+            if [ ! -f "$sibling" ]; then
+              OFFENDERS+=("$path")
+            fi
+          done < <(git ls-files --others --ignored --exclude-standard -- examples/ || true)
+          if [ "${#OFFENDERS[@]}" -gt 0 ]; then
+            echo "::error::The following files under examples/ are ignored but have no .mds sibling."
+            echo "         They look like hand-authored content being silently dropped by"
+            echo "         the .gitignore catch-all patterns. Add an explicit '!examples/**/yourfile.ext'"
+            echo "         exception in .gitignore for each one."
+            for f in "${OFFENDERS[@]}"; do echo "  $f"; done
+            exit 1
+          fi
+          echo "examples-guard passed: $COUNT ignored file(s) each have a sibling .mds source."
+
   python-wheel:
     name: Python — wheel install smoke
     runs-on: ubuntu-latest

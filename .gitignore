@@ -18,6 +18,16 @@ examples/*/package-lock.json
 # Generated compiler output — each tracked .mds source compiles to a sibling
 # .md (or .json for @message templates). READMEs and config/data JSON files
 # are tracked and excluded from the ignore via negation patterns below.
+#
+# FOOTGUN WARNING: These are open-ended catch-alls. git cannot express
+# "ignore X.md only when a sibling X.mds exists", so any hand-authored .md or
+# .json added under examples/ is silently ignored unless you add an explicit
+# '!examples/**/your-file.ext' exception here.
+#
+# A CI guard in .github/workflows/ci.yml (job: examples-guard) enforces this
+# invariant: it fails if any ignored file under examples/ lacks a sibling .mds
+# source. If you add a hand-authored file, add the '!' exception FIRST, before
+# the CI guard can catch it.
 examples/**/*.md
 !examples/**/README.md
 examples/**/*.json
