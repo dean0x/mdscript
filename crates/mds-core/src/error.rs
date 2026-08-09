@@ -43,6 +43,7 @@ impl SerializedSpan {
     /// assert!(span.line.is_none());
     /// assert!(span.column.is_none());
     /// ```
+    #[must_use]
     pub fn new(offset: usize, length: usize) -> Self {
         SerializedSpan {
             offset,

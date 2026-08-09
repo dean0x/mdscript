@@ -45,6 +45,7 @@ pub fn json_type_name(v: &serde_json::Value) -> &'static str {
 // ── VarsError ─────────────────────────────────────────────────────────────────
 
 /// Errors that can occur when parsing the `vars` option.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum VarsError {
     /// The `vars` value was not a JSON object (e.g. it was an array or string).

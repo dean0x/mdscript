@@ -27,7 +27,7 @@ use super::diagnostic::Severity;
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
 /// Use `LintConfig::default()` for a config with all rules at engine defaults, or
-/// [`LintConfig::with_rules`] to supply per-rule overrides; do not construct via
+/// [`LintConfig::from_rules`] to supply per-rule overrides; do not construct via
 /// struct literal.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
@@ -43,18 +43,22 @@ impl LintConfig {
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
     ///
+    /// Per Rust API guidelines (C-CTOR): constructors are named `new`, `from_*`,
+    /// or `with_*` only when taking `self`. This function does not take `self`,
+    /// so it is named `from_rules`.
+    ///
     /// # Examples
     ///
     /// ```
     /// use std::collections::HashMap;
     /// use mds::{LintConfig, Severity};
-    /// let config = LintConfig::with_rules(HashMap::from([
+    /// let config = LintConfig::from_rules(HashMap::from([
     ///     ("unused-variable".to_string(), Severity::Off),
     /// ]));
     /// assert_eq!(config.severity_for("unused-variable"), Some(&Severity::Off));
     /// ```
     #[must_use]
-    pub fn with_rules(rules: HashMap<String, Severity>) -> Self {
+    pub fn from_rules(rules: HashMap<String, Severity>) -> Self {
         LintConfig { rules }
     }
 

@@ -109,7 +109,7 @@ pub use super::tier::{is_fixable, is_output_neutral, rule_tier, FixTier};
 /// (call [`extend_to_line_end`] to adjust if needed) for line-removal edits.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
-/// Construct via [`ByteEdit::new`]; do not use a struct literal.
+/// Construct via [`ByteEdit::deletion`] or [`ByteEdit::replacement`]; do not use a struct literal.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ByteEdit {
@@ -124,21 +124,54 @@ pub struct ByteEdit {
 }
 
 impl ByteEdit {
-    /// Construct a `ByteEdit` with all fields.
+    /// Construct a `ByteEdit` that **deletes** the byte range `[start, end)`.
+    ///
+    /// Equivalent to a replacement with an empty string.
     ///
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
-    pub fn new(
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::fix::ByteEdit;
+    /// let edit = ByteEdit::deletion(0, 6, "duplicate-import");
+    /// assert_eq!(edit.replacement, "");
+    /// ```
+    #[must_use]
+    pub fn deletion(start: usize, end: usize, rule: impl Into<String>) -> Self {
+        ByteEdit {
+            start,
+            end,
+            rule: rule.into(),
+            replacement: String::new(),
+        }
+    }
+
+    /// Construct a `ByteEdit` that **replaces** the byte range `[start, end)` with `text`.
+    ///
+    /// This is the supported construction path for external crates — struct literals
+    /// are not available because this type is `#[non_exhaustive]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mds::fix::ByteEdit;
+    /// let edit = ByteEdit::replacement(6, 12, "legacy-interpolation", "{{name}}");
+    /// assert_eq!(edit.replacement, "{{name}}");
+    /// ```
+    #[must_use]
+    pub fn replacement(
         start: usize,
         end: usize,
         rule: impl Into<String>,
-        replacement: impl Into<String>,
+        text: impl Into<String>,
     ) -> Self {
         ByteEdit {
             start,
             end,
             rule: rule.into(),
-            replacement: replacement.into(),
+            replacement: text.into(),
         }
     }
 }
@@ -162,6 +195,7 @@ impl RejectedEdit {
     ///
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
+    #[must_use]
     pub fn new(edit: ByteEdit, reason: impl Into<String>) -> Self {
         RejectedEdit {
             edit,
@@ -202,11 +236,11 @@ fn reverify_failure_reason(err: &MdsError) -> String {
 ///
 /// Obtain via [`plan_fixes`] or [`plan_fixes_with_options`], then pass to
 /// [`apply_fixes`] or [`apply_fixes_incremental`]. External crates that need an
-/// empty plan can use `FixPlan::default()`.
+/// empty plan can use `FixPlan::default()`; its fields are `pub`, so they remain
+/// directly readable and writable.
 ///
-/// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
-/// Construct via the planning functions or `FixPlan::default()`; do not use a
-/// struct literal in external crates.
+/// This type is `#[non_exhaustive]`: new fields may be added in minor releases;
+/// do not use a struct literal in external crates.
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct FixPlan {

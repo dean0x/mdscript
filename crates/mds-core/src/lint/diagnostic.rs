@@ -254,7 +254,9 @@ impl TextEdit {
     /// assert_eq!(edit.end, 12);
     /// assert_eq!(edit.new_text, "{{name}}");
     /// ```
+    #[must_use]
     pub fn new(start: usize, end: usize, new_text: impl Into<String>) -> Self {
+        debug_assert!(start <= end, "TextEdit::new: start ({start}) > end ({end})");
         TextEdit {
             start,
             end,
@@ -282,8 +284,10 @@ impl TextEdit {
 /// the one line that contains `offset`.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
-/// Construct via [`FixLineSpan::single`] (single-line) or [`FixLineSpan::range`]
-/// (multi-line); external crates must not use a struct literal.
+/// Construct via [`FixLineSpan::single`] (single-line),
+/// [`FixLineSpan::range_inclusive`] (multi-line, inclusive), or
+/// [`FixLineSpan::range_exclusive`] (multi-line, exclusive);
+/// external crates must not use a struct literal.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct FixLineSpan {
@@ -300,7 +304,8 @@ pub struct FixLineSpan {
 impl FixLineSpan {
     /// Remove exactly the one line that contains `offset`.
     ///
-    /// Equivalent to `FixLineSpan::range(offset, offset, true)`.
+    /// Equivalent to `FixLineSpan::range_inclusive(offset, offset)`.
+    #[must_use]
     pub fn single(offset: usize) -> Self {
         FixLineSpan {
             from: offset,
@@ -309,16 +314,45 @@ impl FixLineSpan {
         }
     }
 
-    /// Remove a range of lines spanning byte offsets `from` through `to`.
+    /// Remove a range of lines **including** the line containing `to`.
     ///
-    /// - `to_inclusive: true` → the line containing `to` is removed.
-    /// - `to_inclusive: false` → removal stops at the start of the line containing
-    ///   `to` (that line is kept).
-    pub fn range(from: usize, to: usize, to_inclusive: bool) -> Self {
+    /// Both `from` and `to` are byte offsets within their respective lines.
+    /// The planner translates them to exact line boundaries.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds when `from > to`.
+    #[must_use]
+    pub fn range_inclusive(from: usize, to: usize) -> Self {
+        debug_assert!(
+            from <= to,
+            "FixLineSpan::range_inclusive: from ({from}) > to ({to})"
+        );
         FixLineSpan {
             from,
             to,
-            to_inclusive,
+            to_inclusive: true,
+        }
+    }
+
+    /// Remove a range of lines **excluding** the line containing `to`.
+    ///
+    /// The line containing `to` is kept; removal stops at the start of that line.
+    /// Use this when a closing token (e.g. `@end`) must remain in the source.
+    ///
+    /// # Panics (debug)
+    ///
+    /// Panics in debug builds when `from > to`.
+    #[must_use]
+    pub fn range_exclusive(from: usize, to: usize) -> Self {
+        debug_assert!(
+            from <= to,
+            "FixLineSpan::range_exclusive: from ({from}) > to ({to})"
+        );
+        FixLineSpan {
+            from,
+            to,
+            to_inclusive: false,
         }
     }
 }
@@ -397,6 +431,7 @@ impl LintDiagnostic {
     /// assert_eq!(diag.severity, Severity::Warn);
     /// assert!(diag.help.is_none());
     /// ```
+    #[must_use]
     pub fn new(rule: impl Into<String>, severity: Severity, message: impl Into<String>) -> Self {
         LintDiagnostic {
             rule: rule.into(),
@@ -589,7 +624,8 @@ impl miette::Diagnostic for LintDiagnostic {
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
 /// Obtain values from `mds::lint_str`, `mds::lint`, and similar lint API functions,
-/// or construct via [`LintResult::new`]; do not construct via struct literal.
+/// or construct via [`LintResult::new`] (and chain [`.truncated()`] / [`.standalone()`]);
+/// do not construct via struct literal.
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct LintResult {
@@ -602,7 +638,10 @@ pub struct LintResult {
 }
 
 impl LintResult {
-    /// Construct a `LintResult` with all fields.
+    /// Construct a `LintResult` from a diagnostic list.
+    ///
+    /// Defaults: `truncated = false`, `is_standalone = false`.
+    /// Chain [`.truncated()`] or [`.standalone()`] to override.
     ///
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
@@ -611,17 +650,34 @@ impl LintResult {
     ///
     /// ```
     /// use mds::LintResult;
-    /// let result = LintResult::new(vec![], false, true);
+    /// let result = LintResult::new(vec![]).standalone();
     /// assert!(result.diagnostics.is_empty());
     /// assert!(!result.truncated);
     /// assert!(result.is_standalone);
     /// ```
-    pub fn new(diagnostics: Vec<LintDiagnostic>, truncated: bool, is_standalone: bool) -> Self {
+    #[must_use]
+    pub fn new(diagnostics: Vec<LintDiagnostic>) -> Self {
         LintResult {
             diagnostics,
-            truncated,
-            is_standalone,
+            truncated: false,
+            is_standalone: false,
         }
+    }
+
+    /// Mark this result as truncated (the diagnostic cap was reached).
+    #[must_use]
+    pub fn truncated(mut self) -> Self {
+        self.truncated = true;
+        self
+    }
+
+    /// Mark this result as standalone (the file has no `@import` or `@extends`).
+    ///
+    /// Standalone status gates Tier B `--fix` eligibility.
+    #[must_use]
+    pub fn standalone(mut self) -> Self {
+        self.is_standalone = true;
+        self
     }
 
     /// Produce the canonical, LSP-stable JSON wire format.
@@ -1930,42 +1986,51 @@ mod tests {
     /// T-SFR-2: `span` and `file` pass through byte-identical; fix data is stripped.
     ///
     /// Pins three behaviours together:
-    /// - `span` offset/length are raw byte values, not altered by sanitization.
-    /// - `file` is copied verbatim (WIRE escaping of the filename is the caller's
-    ///   responsibility via `named_source_for_render`).
+    /// - `span` offset/length/line/column are raw values, not altered by sanitization.
+    /// - `file` is copied verbatim — including hostile control bytes (WIRE escaping of
+    ///   the filename is the caller's responsibility via `named_source_for_render`).
     /// - `fix_removals` and `fix_edits` are set to `None` so the sanitized clone
     ///   cannot be mistaken for a fix-bearing diagnostic.
+    ///
+    /// The hostile filename `"a\u{1B}/b\u{202E}.mds"` exercises the no-sanitize
+    /// guarantee: `sanitized_for_render` must copy `file` byte-for-byte regardless of
+    /// what control bytes it contains.  This is intentional — WIRE-escaping happens in
+    /// `named_source_for_render`, not here (PF-014).
     #[test]
     fn sanitized_for_render_span_file_unchanged_fix_nulled() {
-        let span = crate::error::SerializedSpan {
-            offset: 42,
-            length: 7,
-            line: Some(3),
-            column: Some(1),
-        };
-        let diag = LintDiagnostic {
-            rule: "duplicate-import".to_string(),
-            severity: Severity::Error,
-            message: "msg".to_string(),
-            help: None,
-            span: Some(span.clone()),
-            file: Some("a/b.mds".to_string()),
-            fix_removals: Some(vec![FixLineSpan::single(42)]),
-            fix_edits: Some(vec![TextEdit::new(0, 3, "x")]),
-        };
+        let span = crate::error::SerializedSpan::new(42, 7)
+            .with_line(3)
+            .with_column(1);
+        let hostile_file = "a\u{1B}/b\u{202E}.mds".to_string();
+        let diag = LintDiagnostic::new("duplicate-import", Severity::Error, "msg")
+            .with_span(span.clone())
+            .with_file(hostile_file.clone())
+            .with_fix_removals(vec![FixLineSpan::single(42)])
+            .with_fix_edits(vec![TextEdit::new(0, 3, "x")]);
 
         let rendered = diag.sanitized_for_render();
 
-        // span is byte-identical.
+        // span is byte-identical, including line and column.
         let rendered_span = rendered.span.as_ref().expect("span must survive");
         assert_eq!(rendered_span.offset, 42, "span.offset must be unchanged");
         assert_eq!(rendered_span.length, 7, "span.length must be unchanged");
+        assert_eq!(
+            rendered_span.line,
+            Some(3),
+            "span.line must survive sanitization"
+        );
+        assert_eq!(
+            rendered_span.column,
+            Some(1),
+            "span.column must survive sanitization"
+        );
 
-        // file is copied verbatim.
+        // file is copied verbatim — hostile bytes are NOT sanitized by sanitized_for_render
+        // (the caller's named_source_for_render is responsible for WIRE-escaping the filename).
         assert_eq!(
             rendered.file.as_deref(),
-            Some("a/b.mds"),
-            "file must be byte-identical"
+            Some(hostile_file.as_str()),
+            "file must be byte-identical, including hostile control bytes"
         );
 
         // fix data is intentionally stripped.
