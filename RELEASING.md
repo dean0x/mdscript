@@ -82,9 +82,9 @@ runtime on the affected platform. Do not proceed past a failing gate.
 
 ## Release
 
-### Tag-push (current working path)
+### Tag-push (the only path)
 
-The release is driven by pushing a `vX.Y.Z` tag. This is how v0.1.0–v0.3.0 shipped.
+The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have shipped.
 
 1. **Bump versions:** `node scripts/bump-version.mjs X.Y.Z` (updates all
    manifests and stamps the CHANGELOG, opening a fresh `[Unreleased]`).
@@ -96,21 +96,30 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how v0.1.0–v0.3.0 shi
    git tag -a vX.Y.Z -m vX.Y.Z
    git push origin vX.Y.Z
    ```
-   The tag push triggers `release.yml`; the `prepare` job is skipped and the
-   build+publish jobs run from the tag.
+   The tag push triggers `release.yml`; the build+publish jobs run from the tag.
 
-### Automated `workflow_dispatch` — currently BLOCKED (#127)
+### What happens after tagging
 
-```bash
-gh workflow run release.yml -f version=X.Y.Z   # DOES NOT WORK YET — see #127
-```
+The `release.yml` workflow runs, in order:
+   1. **version-gate** — synchronized-version check (fails fast).
+   2. **build-napi** — cross-compiles the addon for all 7 targets.
+   3. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
+      LICENSE into each platform dir, runs the **A3 name-gate**.
+   4. **publish-crates** — `cargo publish` `mds-core`, polls the crates.io index
+      for up to 5 min (bounded, max 20 × 15 s), then `mds-cli`.
+   5. **publish-npm** — regenerate `index.d.ts`, re-run the A3 gate, then publish
+      (with provenance): the **platform packages** (`napi prepublish`), the
+      **host** `@mdscript/mds-napi`, **`@mdscript/mds-wasm`**, the **universal**
+      `@mdscript/mds`, and the **bundler** packages.
+   6. **github-release** — `gh release create` with generated notes.
 
-Intended to do everything in one command, but its `prepare` job pushes the release
-commit directly to protected `main`, which branch protection rejects for the Actions
-bot (`GH006`). It leaves an orphaned tag and publishes nothing. Use tag-push until
-#127 is fixed.
+## Post-release
 
-See @RELEASING.md for the full runbook.
+- Verify each package on its registry (crates.io, npmjs.com) and that npm shows
+  the **provenance** attestation.
+- Smoke test a clean install on a fresh machine/container:
+  `npm i @mdscript/mds` then `node -e "import('@mdscript/mds').then(m=>m.init())"`.
+- Open a fresh `## [Unreleased]` section in `CHANGELOG.md`.
 
 ## Notes
 

@@ -15,6 +15,30 @@ packages/*/dist-cjs/
 examples/*/dist/
 examples/*/package-lock.json
 
+# Generated compiler output — each tracked .mds source compiles to a sibling
+# .md (or .json for @message templates). READMEs and config/data JSON files
+# are tracked and excluded from the ignore via negation patterns below.
+#
+# FOOTGUN WARNING: These are open-ended catch-alls. git cannot express
+# "ignore X.md only when a sibling X.mds exists", so any hand-authored .md or
+# .json added under examples/ is silently ignored unless you add an explicit
+# '!examples/**/your-file.ext' exception here. This is LOCAL discipline only —
+# CI cannot detect it. Always add the '!' exception before adding a hand-authored
+# file; otherwise git will silently drop it.
+#
+# What CI DOES enforce (job: examples-gitignore-coverage in ci.yml): after
+# running mds build over the examples tree, git must report no untracked files
+# under examples/. This catches a new compiler output extension that is not yet
+# covered by the patterns below — it does NOT catch the hand-authored-file footgun.
+examples/**/*.md
+!examples/**/README.md
+examples/**/*.json
+!examples/**/package.json
+!examples/**/mds.json
+!examples/**/vars.json
+!examples/**/vars-minimal.json
+!examples/**/tsconfig.json
+
 # Python bindings (crates/mds-python) build/test artifacts.
 # `maturin develop` drops the compiled extension into the source tree; caches and
 # venvs are local-only. Sources (.py/.pyi/py.typed) are tracked.
@@ -31,4 +55,16 @@ crates/mds-python/dist/
 .cargo/
 
 # devflow local state — local-only, not shared via git (reverses ADR-019; see ADR-023)
-.devflow/
+
+# Devflow runtime data — local by default (memory, learning, docs, locks).
+# Exception: feature knowledge bases under .devflow/features/ are shared via git —
+# index.md and every {slug}/KNOWLEDGE.md are tracked and committed; everything else
+# under .devflow/features/ stays local. To stop sharing, re-add `.devflow/features/`
+# to your own .gitignore.
+.devflow/*
+!.devflow/features/
+.devflow/features/*
+!.devflow/features/index.md
+!.devflow/features/*/
+.devflow/features/*/*
+!.devflow/features/*/KNOWLEDGE.md

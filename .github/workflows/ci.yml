@@ -212,6 +212,69 @@ jobs:
         continue-on-error: true
         run: pytest crates/mds-python/tests -q -m perf
 
+  # Build the CLI, compile every example that is expected to succeed, then assert
+  # that git sees no untracked files under examples/.  If the compiler ever starts
+  # emitting a new extension that is not covered by the .gitignore catch-alls, this
+  # job fails with a concrete list of the uncovered files.
+  #
+  # What this catches: a new output extension added by the compiler that is not yet
+  # covered by .gitignore.
+  # What this does NOT catch: a hand-authored file being silently dropped by the
+  # catch-alls (that is a local-discipline concern; see the FOOTGUN WARNING in
+  # .gitignore).
+  #
+  # examples/stress-test/errors/ contains five intentionally-failing fixtures
+  # (bad-arity, bad-circular-a/b, bad-type, bad-undefined) — those are skipped.
+  examples-gitignore-coverage:
+    name: examples/ gitignore coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build mds CLI
+        run: cargo build -p mds-cli
+      - name: Compile examples (excluding intentionally-failing fixtures)
+        run: |
+          MDS=./target/debug/mds
+
+          # Directories that compile cleanly without runtime variables.
+          for dir in \
+            examples/ai-agent \
+            examples/api-docs \
+            examples/blog-generator \
+            examples/formatting \
+            examples/inheritance \
+            examples/linting \
+            examples/prompt-library \
+            examples/source-maps \
+            examples/stress-test/agents \
+            examples/stress-test/edge \
+            examples/stress-test/lib \
+            examples/stress-test/shared; do
+            $MDS build "$dir"
+          done
+
+          # stress-test root entry point.
+          $MDS build examples/stress-test/main.mds
+
+          # edge-cases: supply vars.json so the runtime-vars example (08) compiles;
+          # vars are silently ignored by the other 30 templates.
+          $MDS build examples/edge-cases --vars examples/edge-cases/vars.json
+
+      - name: Assert all outputs are gitignored
+        run: |
+          UNTRACKED=$(git status --porcelain --untracked-files=all -- examples/)
+          if [ -n "$UNTRACKED" ]; then
+            echo "::error::examples/ has untracked files after mds build."
+            echo "         A compiler output extension is not covered by .gitignore."
+            echo "         Add a catch-all pattern AND any needed '!' exceptions."
+            echo ""
+            echo "$UNTRACKED"
+            exit 1
+          fi
+          echo "examples/ gitignore coverage check passed — all compiler outputs are gitignored."
+
   python-wheel:
     name: Python — wheel install smoke
     runs-on: ubuntu-latest

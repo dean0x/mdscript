@@ -1,19 +1,13 @@
 name: Release
 
-# Three entry points:
+# Two entry points:
 #   * push a version tag (v*) -> full coordinated release
-#   * workflow_dispatch with version -> automated release (bump, commit, tag, publish)
-#   * workflow_dispatch without version -> DRY RUN (build + verify, no publish)
+#   * workflow_dispatch (no inputs) -> dry run (build + verify, no publish)
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to release (e.g. 0.2.0). Leave empty for dry-run."
-        required: false
-        type: string
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -23,50 +17,15 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Prepare — only runs on workflow_dispatch with a version input.
-  # Bumps all manifests, stamps CHANGELOG, commits to main, creates the tag.
-  # Subsequent jobs see the updated code via the tag ref.
-  # ---------------------------------------------------------------------------
-  prepare:
-    name: Prepare v${{ inputs.version }}
-    if: inputs.version != ''
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      tag: v${{ inputs.version }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: actions/setup-node@v6
-        with: { node-version: 22 }
-      - name: Bump versions and stamp CHANGELOG
-        run: node scripts/bump-version.mjs "${{ inputs.version }}"
-      - name: Verify version consistency
-        run: node scripts/verify-versions.mjs
-      - name: Commit, tag, and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "release: v${{ inputs.version }}"
-          git tag "v${{ inputs.version }}"
-          git push origin main "v${{ inputs.version }}"
-
-  # ---------------------------------------------------------------------------
   # D1 — version-consistency gate. Cheap; fails fast before any build/publish.
   # ---------------------------------------------------------------------------
   version-gate:
     name: Version gate
-    needs: [prepare]
-    if: ${{ !cancelled() && (needs.prepare.result == 'success' || needs.prepare.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
+          ref: ${{ github.ref }}
       - uses: actions/setup-node@v6
         with: { node-version: 22 }
       - name: "Assert synchronized versions, no file: refs"
@@ -120,7 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
+          ref: ${{ github.ref }}
       - uses: actions/setup-node@v6
         with: { node-version: 22, cache: npm }
       - uses: dtolnay/rust-toolchain@stable
@@ -157,7 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
+          ref: ${{ github.ref }}
       - uses: actions/setup-node@v6
         with: { node-version: 22, cache: npm }
       - run: npm ci
@@ -185,8 +144,9 @@ jobs:
             crates/mds-napi/*.node
 
   # ===========================================================================
-  # Everything below publishes — gated to tag pushes or dispatch with version.
-  # Plain workflow_dispatch (no version) stops above (dry run).
+  # Everything below publishes — gated to tag pushes only.
+  # workflow_dispatch (no inputs) stops above; publish jobs see a non-tag ref
+  # and their startsWith(github.ref, 'refs/tags/v') condition evaluates false.
   # ===========================================================================
 
   # ---------------------------------------------------------------------------
@@ -196,17 +156,17 @@ jobs:
   publish-crates:
     name: Publish to crates.io
     needs: [version-gate]
-    if: ${{ !cancelled() && needs.version-gate.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
+          ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Verify tag matches workspace version
         run: |
-          TAG="${{ inputs.version || github.ref_name }}"
+          TAG="${{ github.ref_name }}"
           TAG="${TAG#v}"
           CRATE_VER="$(cargo metadata --no-deps --format-version 1 \
             | grep -o '"name":"mds-core","version":"[^"]*"' \
@@ -215,14 +175,53 @@ jobs:
           test "$TAG" = "$CRATE_VER" || { echo "::error::tag v$TAG != crate version $CRATE_VER"; exit 1; }
       - name: Publish mds-core
         run: |
-          cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1 \
-            || { echo "::warning::mds-core publish failed (may already exist)"; true; }
+          # Idempotency: a re-run where the version is already published should pass.
+          # Any other failure (bad token, outage, genuine version conflict) must fail loudly.
+          if OUTPUT=$(cargo publish -p mds-core --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1); then
+            echo "$OUTPUT"
+          elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
+            echo "::notice::mds-core already published — idempotent re-run, skipping"
+            echo "$OUTPUT"
+          else
+            echo "::error::mds-core publish failed"
+            echo "$OUTPUT"
+            exit 1
+          fi
       - name: Wait for crates.io index to update
-        run: sleep 30
+        run: |
+          # Bounded poll — max 20 attempts × 15 s = 300 s (5 min), then fail with
+          # a clear message. Avoids the former unbounded sleep 30 that silently
+          # masked races on slow registry propagation.
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | grep -o '"name":"mds-core","version":"[^"]*"' \
+            | grep -o '[0-9][^"]*' | head -1)
+          echo "Polling crates.io for mds-core@${VERSION} (max 20 × 15 s)"
+          MAX=20
+          for i in $(seq 1 "$MAX"); do
+            if curl -sf "https://crates.io/api/v1/crates/mds-core/${VERSION}" \
+                 -H "User-Agent: mds-release-ci/1.0" \
+                 | grep -qF "\"num\":\"${VERSION}\""; then
+              echo "mds-core@${VERSION} is visible in crates.io (attempt $i/$MAX)"
+              exit 0
+            fi
+            echo "  Attempt $i/$MAX: not yet visible — sleeping 15 s..."
+            sleep 15
+          done
+          echo "::error::mds-core@${VERSION} not visible in crates.io after $((MAX * 15)) s"
+          exit 1
       - name: Publish mds-cli
         run: |
-          cargo publish -p mds-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1 \
-            || { echo "::warning::mds-cli publish failed (may already exist)"; true; }
+          # Same idempotency guard as mds-core above.
+          if OUTPUT=$(cargo publish -p mds-cli --token "${{ secrets.CARGO_REGISTRY_TOKEN }}" 2>&1); then
+            echo "$OUTPUT"
+          elif echo "$OUTPUT" | grep -qE "already (uploaded|exists|published)"; then
+            echo "::notice::mds-cli already published — idempotent re-run, skipping"
+            echo "$OUTPUT"
+          else
+            echo "::error::mds-cli publish failed"
+            echo "$OUTPUT"
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # A7/B4/D3 — publish all npm packages with provenance (OIDC).
@@ -232,7 +231,7 @@ jobs:
   publish-npm:
     name: Publish to npm
     needs: [stage-and-verify-napi, publish-crates]
-    if: ${{ !cancelled() && needs.stage-and-verify-napi.result == 'success' && needs.publish-crates.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
+    if: ${{ !cancelled() && needs.stage-and-verify-napi.result == 'success' && needs.publish-crates.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write # OIDC for npm provenance
@@ -244,7 +243,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
+          ref: ${{ github.ref }}
       - uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -293,17 +292,17 @@ jobs:
   github-release:
     name: GitHub Release
     needs: [publish-crates, publish-npm]
-    if: ${{ !cancelled() && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || inputs.version != '') }}
+    if: ${{ !cancelled() && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.version && format('v{0}', inputs.version) || github.ref }}
+          ref: ${{ github.ref }}
       - name: Create release
         run: |
-          TAG="${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}"
+          TAG="${{ github.ref_name }}"
           gh release create "$TAG" --title "$TAG" --generate-notes 2>&1 \
             || gh release edit "$TAG" --generate-notes
         env:

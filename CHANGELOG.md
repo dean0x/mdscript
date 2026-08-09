@@ -1008,8 +1008,7 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/dean0x/mdscript/compare/v0.3.0...v0.4.0
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dean0x/mdscript/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/dean0x/mdscript/releases/tag/v0.1.0
