@@ -40,7 +40,6 @@
  * Usage:
  *   node scripts/verify-pr-checks.mjs <pr-number>
  *   node scripts/verify-pr-checks.mjs <pr-number> --required-from <branch>
- *   node scripts/verify-pr-checks.mjs <pr-number> --head-sha <sha>
  *
  * Exit codes:
  *   0 — all required contexts completed+success; prints `gh pr merge` command
@@ -177,6 +176,14 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   if (nChecks === 0) {
     lines.push(`  check-runs: ${nChecks}, statuses: ${nStatuses}, required contexts: ${nRequired}`);
     lines.push('✖ FAIL: zero check-runs (the #239 shape — not a pass, avoids PF-013)');
+    // AC-22: still name every required context that was absent so the caller
+    // knows exactly what was missing, even though the non-vacuity guard is
+    // already sufficient to FAIL. This matches the Tier A loop's behavior for
+    // a partial check-run set and eliminates vacuous "zero check-runs" messages
+    // that don't say which contexts were expected.
+    for (const ctx of requiredContexts) {
+      lines.push(`✖ Tier A (required): "${ctx}" — not found in check-runs (never ran)`);
+    }
     return { pass: false, exitCode: 1, lines };
   }
 
@@ -430,7 +437,7 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
 }
 
 const USAGE =
-  'Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>] [--head-sha <sha>]';
+  'Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>]';
 
 /**
  * Live entry point. Returns an exit code; never calls process.exit, so tests
@@ -461,13 +468,6 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
   }
   const requiredFrom = rfIdx !== -1 ? argv[rfIdx + 1] : null;
 
-  const hsIdx = argv.indexOf('--head-sha');
-  if (hsIdx !== -1 && !argv[hsIdx + 1]) {
-    fail(`--head-sha requires a SHA\n${USAGE}`);
-    return 2;
-  }
-  const headShaOverride = hsIdx !== -1 ? argv[hsIdx + 1] : null;
-
   // ---- Check gh version (D-PR5) ----
   const ver = ghVersionFn();
   if (!ver || ver.major < MIN_GH_MAJOR || (ver.major === MIN_GH_MAJOR && ver.minor < MIN_GH_MINOR)) {
@@ -485,7 +485,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     fail(`cannot read PR ${prNumber}: ${prData.stderr}`);
     return 2;
   }
-  const headSha = headShaOverride ?? prData.head?.sha;
+  const headSha = prData.head?.sha;
   const baseBranch = prData.base?.ref;
   if (!headSha || !baseBranch) {
     fail(`cannot determine head SHA or base branch for PR ${prNumber}`);

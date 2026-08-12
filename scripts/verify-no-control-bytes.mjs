@@ -36,9 +36,10 @@
  * Exit codes:
  *   0 — no hazards found (prints file count and byte count for non-vacuity)
  *   1 — hazard found, zero files scanned, invalid UTF-8, un-allowlisted NUL,
- *       an unreadable tracked path, or a stale/unmatched allowlist entry
- *   2 — tool error: git missing, not inside a git work tree, or a git
- *       subcommand (ls-files / diff --cached / cat-file) failed
+ *       unreadable tracked path, stale/unmatched allowlist entry, git missing
+ *       from PATH, or not inside a git work tree (all fail-closed)
+ *   2 — indeterminate: a git subcommand (ls-files / diff --cached / cat-file)
+ *       failed unexpectedly
  */
 'use strict';
 
@@ -237,8 +238,10 @@ function gitExec(args, cwd = process.cwd()) {
   const result = spawnSync('git', args, { cwd, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
   if (result.error) {
     if (result.error.code === 'ENOENT') {
+      // AC-16: fail-closed (exit 1) — "git missing" is a known, named failure,
+      // not an indeterminate tool error.
       console.error('✖ verify-no-control-bytes: git is not on PATH');
-      process.exit(2);
+      process.exit(1);
     }
     console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
     process.exit(2);
@@ -246,12 +249,14 @@ function gitExec(args, cwd = process.cwd()) {
   return result;
 }
 
-/** Verify we are inside a git work tree (exit 2 if not). */
+/** Verify we are inside a git work tree (exit 1 if not — AC-16: fail-closed). */
 function assertGitRepo(cwd) {
   const r = gitExec(['rev-parse', '--is-inside-work-tree'], cwd);
   if (r.status !== 0) {
+    // AC-16: fail-closed (exit 1) — "not a git repo" is a known, named failure,
+    // not an indeterminate tool error.
     console.error('✖ verify-no-control-bytes: not inside a git work tree');
-    process.exit(2);
+    process.exit(1);
   }
 }
 
@@ -403,10 +408,15 @@ function main() {
       .map(e => ({ ...e, absolutePath: resolve(cwd, e.path) }));
   }
 
-  // ---- D-CB5: Non-vacuity guard ----
-  if (fileEntries.length === 0 && !isStaged) {
+  // ---- D-CB5: Non-vacuity guard (AC-6) ----
+  // Zero files scanned — including in --staged mode — is exit 1, never 0.
+  // "Scanned 0 file(s), 0 byte(s): clean" is indistinguishable from a broken
+  // path-discovery that never found anything (the exact shape D-CB5 forbids).
+  if (fileEntries.length === 0) {
     console.error('✖ verify-no-control-bytes: zero files scanned (D-CB5: empty scan is not a pass)');
-    console.error('  If this is a new repo with no commits, run `git add` first.');
+    console.error(isStaged
+      ? '  No staged files found — stage at least one file before running the pre-commit hook.'
+      : '  If this is a new repo with no commits, run `git add` first.');
     process.exit(1);
   }
 
@@ -426,7 +436,9 @@ function main() {
   let totalBytes = 0;
   let scannedFiles = 0;
   const exercisedAllowlist = new Set(); // tracks which allowlist entries are hit
-  const hazardHits = []; // { path, codepoint, byteOffset, buf }
+  // AC-30: hexCtx is pre-computed so the file buffer is not retained beyond the
+  // scan of a single file. { path, codepoint, byteOffset, hexCtx }
+  const hazardHits = [];
 
   for (const entry of fileEntries) {
     let buf;
@@ -457,7 +469,8 @@ function main() {
         // stale-entry check below does not flag it.
         exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
       } else {
-        hazardHits.push({ path: entry.path, codepoint: hit.codepoint, byteOffset: hit.byteOffset, buf });
+        // AC-30: compute hex context now so buf is not retained after this iteration.
+        hazardHits.push({ path: entry.path, codepoint: hit.codepoint, byteOffset: hit.byteOffset, hexCtx: hexContext(buf, hit.byteOffset) });
       }
     }
   }
@@ -505,9 +518,8 @@ function main() {
     }
     for (const hit of hazardHits) {
       const cpHex = `U+${hit.codepoint.toString(16).toUpperCase().padStart(4, '0')}`;
-      const ctx = hexContext(hit.buf, hit.byteOffset);
       console.error(`✖ ${hit.path}: hazardous codepoint ${cpHex} at byte offset ${hit.byteOffset}`);
-      console.error(`  context: ${ctx}`);
+      console.error(`  context: ${hit.hexCtx}`);
     }
     console.error(`✖ source-hygiene gate FAILED — ${passStats}`);
     process.exit(1);

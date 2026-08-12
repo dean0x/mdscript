@@ -361,6 +361,22 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
+  test('AC-6: --staged with nothing staged → exits 1 with non-vacuity message', () => {
+    // D-CB5 mandates exit 1 when zero files are scanned, unconditionally — including
+    // in --staged mode. The previous `&& !isStaged` carve-out silently exempted the
+    // pre-commit hook from the guard it was designed to protect.
+    const { dir } = mkTempGitRepo();
+    try {
+      // Nothing staged — `git diff --cached` returns empty, yielding zero file entries.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 1, '--staged with nothing staged must exit 1 (non-vacuity guard)');
+      assert.ok(
+        r.stderr.includes('zero files scanned') || r.stderr.includes('empty scan'),
+        `error must mention zero files; got: ${r.stderr}`
+      );
+    } finally { cleanup(dir); }
+  });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -397,11 +413,14 @@ describe('AC-16 AC-20: error cases', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-16: not inside a git work tree → exits 2', () => {
+  test('AC-16: not inside a git work tree → exits 1 (fail-closed)', () => {
+    // AC-16 mandates exit 1 for all four named failure conditions. "Not a git
+    // work tree" is a known, named failure — it is fail-closed (exit 1), not
+    // indeterminate (exit 2).
     const dir = mkdtempSync(join(tmpdir(), 'mds-nogit-'));
     try {
       const r = runScanner([], { cwd: dir });
-      assert.equal(r.status, 2, 'non-git directory must exit 2');
+      assert.equal(r.status, 1, 'non-git directory must exit 1 (fail-closed)');
     } finally { cleanup(dir); }
   });
 
@@ -478,6 +497,41 @@ describe('AC-15: scanner source is self-clean', () => {
   test('scanner source contains no grep -P invocation', () => {
     const src = readFileSync(join(ROOT, 'scripts/verify-no-control-bytes.mjs'), 'utf8');
     assert.ok(!src.includes('grep -P'), 'scanner must not use grep -P (BSD grep lacks -P, exits 2)');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// AC-30: hex context is pre-computed — file buffer not retained beyond each
+//        individual file scan (avoids accumulating all file contents in memory)
+// ---------------------------------------------------------------------------
+describe('AC-30: hex context pre-computation', () => {
+
+  test('scanner reports hex context for every hazard across multiple files', () => {
+    // Verify that hexCtx is computed and stored correctly for each hit.
+    // When this works, buf is NOT retained in hazardHits — the fix is structural
+    // (hazardHits stores { hexCtx } not { buf }) and this test proves the
+    // correct string reaches the output regardless of how many files are scanned.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Construct two files each with an ESC at a known position
+      // a.md: "hello " (6 bytes) then ESC — offset 6
+      // b.md: "foo "   (4 bytes) then ESC — offset 4
+      const esc = Buffer.from([0x1b]);
+      writeFileSync(join(dir, 'a.md'), Buffer.concat([Buffer.from('hello '), esc, Buffer.from(' world')]));
+      writeFileSync(join(dir, 'b.md'), Buffer.concat([Buffer.from('foo '), esc]));
+      git('add', 'a.md', 'b.md');
+
+      const r = runScanner([], { cwd: dir });
+      assert.equal(r.status, 1, 'scanner must exit 1 for files with hazard bytes');
+      // Both files must be named
+      assert.ok(r.stderr.includes('a.md'), 'must report hazard in a.md');
+      assert.ok(r.stderr.includes('b.md'), 'must report hazard in b.md');
+      // Hex context lines must appear (proves hexCtx is pre-computed and stored)
+      assert.ok(r.stderr.includes('context:'), 'must include hex context lines');
+      // The codepoint must be identified
+      assert.ok(r.stderr.includes('U+001B'), 'must name the hazardous codepoint');
+    } finally { cleanup(dir); }
   });
 
 });
@@ -628,11 +682,14 @@ describe('AC-20: symlinks are skipped and counted, not read', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC-16: git missing from PATH fails closed with exit 2
+// AC-16: git missing from PATH fails closed with exit 1
 // ---------------------------------------------------------------------------
 describe('AC-16: git not on PATH', () => {
 
-  test('scanner exits 2 when git cannot be found', () => {
+  test('scanner exits 1 when git cannot be found (fail-closed)', () => {
+    // AC-16 mandates exit 1 for all four named failure conditions. "Git not on
+    // PATH" is a known, named failure — it is fail-closed (exit 1), not
+    // indeterminate (exit 2).
     // Give the child a PATH containing node but not git, so the failure is
     // specifically "git is missing" and not "node is missing".
     const binDir = mkdtempSync(join(tmpdir(), 'mds-nopath-'));
@@ -644,7 +701,7 @@ describe('AC-16: git not on PATH', () => {
         env: { PATH: binDir },
         timeout: 30000,
       });
-      assert.equal(r.status, 2, `missing git must exit 2; stdout: ${r.stdout}, stderr: ${r.stderr}`);
+      assert.equal(r.status, 1, `missing git must exit 1 (fail-closed); stdout: ${r.stdout}, stderr: ${r.stderr}`);
       assert.ok(/git is not on PATH/.test(r.stderr), `must name the condition; got: ${r.stderr}`);
     } finally { cleanup(binDir); }
   });

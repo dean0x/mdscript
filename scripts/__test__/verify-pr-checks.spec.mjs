@@ -75,9 +75,15 @@ describe('AC-21 AC-22: historical fixture evaluation', () => {
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses, headSha: HEAD_F168944 });
     assert.equal(result.exitCode, 1, `expected FAIL; lines: ${result.lines.join('\n')}`);
     assert.ok(!result.pass);
-    // Non-vacuity guard fires: zero check-runs → FAIL immediately
     const allLines = result.lines.join('\n');
+    // Non-vacuity guard fires: zero check-runs → FAIL
     assert.ok(allLines.includes('zero check-runs'), `must mention zero check-runs; got: ${allLines}`);
+    // AC-22: every required context must be named so the operator knows what was absent,
+    // not just that "zero check-runs" occurred (avoids vacuous failure messages).
+    for (const ctx of REQUIRED) {
+      assert.ok(allLines.includes(ctx),
+        `must name absent required context "${ctx}"; got:\n${allLines}`);
+    }
   });
 
   test('e9dace1 (PR #240, zero check-runs, Snyk error status) → FAIL (exit 1)', () => {
