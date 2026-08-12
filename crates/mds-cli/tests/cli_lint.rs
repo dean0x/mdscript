@@ -1734,7 +1734,7 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
 /// T-9 [AC-C3]: `mds lint --format json` on a source whose `duplicate-import`
 /// diagnostic message embeds a raw C1 control character (U+0085 NEL) must emit
 /// valid JSON with no raw control bytes anywhere — in particular the embedded
-/// path must be escaped to the 6-char literal ``.
+/// path must be escaped to the 6-char literal `\u{0085}`.
 ///
 /// ## Why this vector?
 ///
@@ -1750,7 +1750,7 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
 /// imported twice and embeds the raw import path in its message.  A module
 /// whose file *name* contains U+0085 therefore injects that byte into the
 /// diagnostic message.  When `to_canonical_json` serializes the result, it
-/// must sanitize U+0085 → `` (6-char ASCII literal); if that
+/// must sanitize U+0085 → `\u{0085}` (6-char ASCII literal); if that
 /// sanitization is removed the raw 0xC2 0x85 bytes appear in the JSON wire.
 ///
 /// ## Failure mode (regression guard)
@@ -1760,7 +1760,7 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
 ///   - Gate 2 FAILS: `assert_no_control_chars` finds U+0085 (a C1 char) in
 ///     the JSON wire output
 ///   - Gate 3 FAILS: the per-message check finds U+0085 in the diagnostic message
-///   - The positive assertion FAILS: `` is not present when raw bytes leak
+///   - The positive assertion FAILS: `\u{0085}` is not present when raw bytes leak
 #[test]
 fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1834,12 +1834,12 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
         assert_no_control_chars(msg, "T-9 diagnostic message");
     }
 
-    // Positive assertion (non-vacuous, PF-013): the sanitized literal ``
+    // Positive assertion (non-vacuous, PF-013): the sanitized literal `\u{0085}`
     // must appear in at least one message.  If sanitization is removed the raw
     // U+0085 character leaks and this assertion fails because the 6-char literal
     // is absent while the raw codepoint (caught by Gate 2/3) is present.
     //
-    // After JSON deserialisation by serde_json the string value is ``
+    // After JSON deserialisation by serde_json the string value is `\u{0085}`
     // (6 chars: backslash, u, 0, 0, 8, 5).
     let has_sanitized_nel = all_diags.iter().any(|d| {
         d["message"]

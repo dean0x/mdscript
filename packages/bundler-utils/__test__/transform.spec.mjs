@@ -180,8 +180,8 @@ describe('createMdsTransformer', () => {
   });
 
   test('U+2028 and U+2029 in output are escaped in export default line', async () => {
-    const u2028 = ' ';
-    const u2029 = ' ';
+    const u2028 = String.fromCodePoint(0x2028);
+    const u2029 = String.fromCodePoint(0x2029);
     const mds = createMockMds({
       async compileFile() {
         return {
@@ -223,8 +223,8 @@ describe('createMdsTransformer', () => {
   });
 
   test('metadata is safe for inline script embedding (no </script> or U+2028/U+2029)', async () => {
-    const u2028 = ' ';
-    const u2029 = ' ';
+    const u2028 = String.fromCodePoint(0x2028);
+    const u2029 = String.fromCodePoint(0x2029);
     const mds = createMockMds({
       async compileFile() {
         return {
@@ -377,8 +377,8 @@ describe('createMdsTransformer — intrinsic bundler export', () => {
   });
 
   test('AC-API-14: messages with U+2028/U+2029 are safe in JSON array export', async () => {
-    const u2028 = ' ';
-    const u2029 = ' ';
+    const u2028 = String.fromCodePoint(0x2028);
+    const u2029 = String.fromCodePoint(0x2029);
     const mds = createMockMds({
       async compileFile() {
         return {

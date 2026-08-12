@@ -1323,7 +1323,7 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     // U+0085 (NEL) is a C1 control char that passes serde_yaml_ng YAML parsing
     // (unlike ESC/DEL), making it a reachable C1 ESC-injection vector for lintVirtual.
     // The duplicate-import rule fires and embeds the raw module name in its message;
-    // after sanitization the message must carry  and no raw C1 chars.
+    // after sanitization the message must carry \u{0085} and no raw C1 chars.
     const nel = String.fromCharCode(0x85);
     const moduleName = `fo${nel}o.mds`;
     const modules = {
