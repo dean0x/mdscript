@@ -121,6 +121,16 @@ every context is `status=completed` AND `conclusion=success`, and on pass
 emits a `gh pr merge --squash --match-head-commit <sha>` command pinned to
 the verified SHA (closes the TOCTOU window).
 
+Exit codes are a contract: `0` verified, `1` a required context is missing or
+not successful, `2` the tool could not tell (protection unreadable, no required
+contexts configured, `gh` older than 2.31, incomplete pagination). **Only `0`
+means verified** — never read `2` as a pass.
+
+Scope, stated so it is not assumed: the verifier checks the checks *on one
+commit*. It does **not** assert that the head is up to date with the base
+branch, so a stale-but-green head can still be merged under `--admin` even
+after the verifier passes. Keep the branch rebased.
+
 If the base branch is unprotected (e.g. a wave branch), supply `--required-from`:
 
 ```bash

@@ -12,12 +12,14 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { evaluateChecks } from '../verify-pr-checks.mjs';
+import { evaluateChecks, main, fetchRequiredContexts } from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
 const FIXTURES = join(ROOT, 'scripts/__test__/fixtures');
@@ -241,39 +243,258 @@ describe('AC-26 AC-27: exit codes and merge command', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC-28: Pagination bounded (tested via the max-page logic in the verifier)
+// AC-26, AC-28, AC-29: the live path, driven end-to-end with an injected gh
+// runner. These replace source-text greps: asserting that a file CONTAINS the
+// string "process.exit(2)" proves nothing about whether that branch is
+// reachable (applies ADR-009, avoids PF-013). Each case below drives main()
+// and asserts the returned exit code.
 // ---------------------------------------------------------------------------
-describe('AC-28: pagination is bounded', () => {
-  // The pagination logic is in the live path (main()), not evaluateChecks.
-  // We verify the contract constant is defined at a sane value.
-  test('MAX_PAGES constant is bounded (not unbounded while-true)', async () => {
-    // Import the module to check the constant is exported or used
-    // The MAX_PAGES is defined in the module; the test verifies the concept.
-    // Since it's a module-internal constant, we verify the pagination logic
-    // exits 2 by examining the source text.
-    const src = readFileSync(join(ROOT, 'scripts/verify-pr-checks.mjs'), 'utf8');
-    assert.ok(src.includes('MAX_PAGES'), 'verify-pr-checks.mjs must define MAX_PAGES');
-    assert.ok(src.includes('process.exit(2)'), 'must call process.exit(2) on page cap');
-    // Verify it's used in a conditional: `page > MAX_PAGES` or similar
-    assert.ok(src.includes('MAX_PAGES') && src.includes('exit(2)'),
-      'pagination must be bounded with exit 2 on overflow');
+
+const OK_GH_VERSION = () => ({ major: 2, minor: 88 });
+
+/**
+ * Build a gh runner stub from a route table. Each entry is matched against the
+ * API path by substring; the value is either a JSON object (success) or an
+ * `{ __error: true, status }` shape mirroring defaultGhRunner's failure return.
+ */
+function stubRunner(routes, callLog = []) {
+  return (args) => {
+    const url = args[args.length - 1];
+    callLog.push(url);
+    for (const [needle, value] of routes) {
+      if (url.includes(needle)) {
+        return typeof value === 'function' ? value(url) : value;
+      }
+    }
+    return { __error: true, status: 404, stderr: `no stub route for ${url}` };
+  };
+}
+
+const PR_OK = { head: { sha: HEAD_113F472 }, base: { ref: 'main' } };
+const PROTECTION_OK = JSON.parse(readFileSync(join(FIXTURES, 'protection-main.json'), 'utf8'));
+const CHECKS_OK = JSON.parse(readFileSync(join(FIXTURES, 'checks-main-113f472.json'), 'utf8'));
+
+describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
+
+  test('happy path → exit 0', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
   });
+
+  test('AC-29: unprotected base (404 on protection) → exit 2, never 0', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', { __error: true, status: 404, stderr: 'Not Found' }],
+      ['/check-runs', CHECKS_OK],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('AC-29: --required-from branch also unprotected → exit 2', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', { __error: true, status: 404, stderr: 'Not Found' }],
+    ]);
+    assert.equal(main(['1', '--required-from', 'nope'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('AC-26: protection unreadable (403) → exit 2', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', { __error: true, status: 403, stderr: 'Forbidden' }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('AC-26: gh older than 2.31 → exit 2 before any API call', () => {
+    const calls = [];
+    const runner = stubRunner([['/pulls/', PR_OK]], calls);
+    assert.equal(main(['1'], runner, () => ({ major: 2, minor: 30 })), 2);
+    assert.equal(calls.length, 0, 'must not query the API when gh is too old');
+  });
+
+  test('AC-26: gh missing entirely (version probe returns null) → exit 2', () => {
+    const runner = stubRunner([['/pulls/', PR_OK]]);
+    assert.equal(main(['1'], runner, () => null), 2);
+  });
+
+  test('AC-26: no PR number argument → exit 2', () => {
+    const runner = stubRunner([]);
+    assert.equal(main([], runner, OK_GH_VERSION), 2);
+  });
+
+  test('AC-26: --required-from with no value → exit 2', () => {
+    const runner = stubRunner([['/pulls/', PR_OK]]);
+    assert.equal(main(['1', '--required-from'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('protected branch listing ZERO required contexts → exit 2, not 0', () => {
+    // The vacuous-green shape: protection exists, required set is empty.
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', { required_status_checks: { contexts: [], checks: [] } }],
+      ['/check-runs', CHECKS_OK],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('required contexts are read from the UNION of contexts[] and checks[]', () => {
+    // A protection payload that populates only the newer `checks` array must
+    // still yield a required set — reading `contexts` alone would be empty.
+    const onlyChecks = {
+      required_status_checks: {
+        contexts: [],
+        checks: REQUIRED.map(c => ({ context: c, app_id: 15368 })),
+      },
+    };
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', onlyChecks],
+      ['/check-runs', CHECKS_OK],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
+
+    const res = fetchRequiredContexts('main', null, runner);
+    assert.ok(res.ok);
+    assert.deepEqual([...res.contexts].sort(), [...REQUIRED].sort());
+  });
+
+  test('AC-28: pagination stops at the page bound and exits 2 (never loops)', () => {
+    // Stub a server that always reports more pages than it will ever deliver.
+    let pages = 0;
+    const fullPage = {
+      total_count: 100000,
+      check_runs: Array.from({ length: 100 }, (_, i) => ({
+        name: `job-${i}`, status: 'completed', conclusion: 'success',
+      })),
+    };
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', () => { pages++; return fullPage; }],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2, 'page cap must exit 2');
+    assert.ok(pages <= 20, `pagination must be bounded; issued ${pages} page requests`);
+    assert.ok(pages >= 2, 'the stub must actually have been paginated');
+  });
+
+  test('AC-28: total_count larger than the collected set → exit 2, not a partial verdict', () => {
+    const truncated = { total_count: 18, check_runs: CHECKS_OK.check_runs.slice(0, 5) };
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', truncated],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('AC-30: the live path issues at most page-bound + 3 API calls', () => {
+    const calls = [];
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK],
+      ['/status', { statuses: [] }],
+    ], calls);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
+    assert.equal(calls.length, 4, `expected 4 API calls (pr, protection, checks, status); got ${calls.length}`);
+    const checkCall = calls.find(u => u.includes('/check-runs'));
+    assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
+  });
+
+  test('check-runs API error → exit 2 (indeterminate), not 1', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', { __error: true, status: 500, stderr: 'server error' }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('a real FAIL still exits 1, so exit 2 has not swallowed the FAIL path', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', { total_count: 0, check_runs: [] }],
+      ['/status', { statuses: [] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 1);
+  });
+
 });
 
 // ---------------------------------------------------------------------------
-// AC-29: Unprotected base branch exits 2 (tested via the module source)
+// Entry-point guard: the verifier must actually RUN wherever it is checked out
 // ---------------------------------------------------------------------------
-describe('AC-29: unprotected base branch exits 2', () => {
-  test('404 protection endpoint → handled as exit 2 (not exit 0)', () => {
-    // The fetchRequiredContexts function in the live path handles 404 by
-    // calling process.exit(2). Verify the source has this logic.
-    const src = readFileSync(join(ROOT, 'scripts/verify-pr-checks.mjs'), 'utf8');
-    assert.ok(src.includes('404'), 'must handle 404 protection response');
-    assert.ok(
-      src.includes('process.exit(2)'),
-      'must exit 2 on unprotected base (never 0)'
-    );
+describe('the verifier runs from a spaced / symlinked path', () => {
+
+  test('invoked with no arguments it exits 2 (usage), never a silent 0', () => {
+    // A merge gate that no-ops and exits 0 is the worst possible failure mode:
+    // the operator reads it as "verified" and merges. Copy the script to a path
+    // with a space (mkdtemp is also symlinked on macOS) and confirm it runs.
+    const dir = mkdtempSync(join(tmpdir(), 'mds verify space-'));
+    try {
+      assert.ok(dir.includes(' '), 'this test is meaningless unless the path has a space');
+      const target = join(dir, 'verify-pr-checks.mjs');
+      writeFileSync(target, readFileSync(join(ROOT, 'scripts/verify-pr-checks.mjs')));
+      const r = spawnSync(process.execPath, [target], { encoding: 'utf8', timeout: 30000 });
+      assert.equal(r.status, 2,
+        `expected usage exit 2; got ${r.status} (0 means the script never ran). stdout: ${r.stdout}`);
+      assert.ok(r.stderr.includes('Usage:'), `must print usage; got: ${r.stderr}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
+
+});
+
+// ---------------------------------------------------------------------------
+// Duplicate check-run names must not mask a failure
+// ---------------------------------------------------------------------------
+describe('duplicate check-run names are all evaluated', () => {
+
+  test('a failing run is not masked by a later success under the same name', () => {
+    const ctx = REQUIRED[0];
+    const runs = [
+      ...loadCheckRuns('checks-main-113f472.json').filter(cr => cr.name !== ctx),
+      { name: ctx, status: 'completed', conclusion: 'failure' },
+      { name: ctx, status: 'completed', conclusion: 'success' },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1,
+      'a failing required check-run must fail even when a later run shares its name');
+    assert.ok(result.lines.join('\n').includes('failure'), 'must quote the observed conclusion');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Vacuity guard on the pure function itself
+// ---------------------------------------------------------------------------
+describe('empty required set is indeterminate, never a pass', () => {
+
+  test('evaluateChecks with zero required contexts → exit 2', () => {
+    const result = evaluateChecks({
+      requiredContexts: [],
+      checkRuns: [{ name: 'anything', status: 'completed', conclusion: 'success' }],
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 2, 'zero required contexts must be indeterminate (exit 2)');
+    assert.equal(result.pass, false);
+    assert.ok(!result.mergeCommand, 'must not emit a merge command it cannot justify');
+  });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -305,18 +526,32 @@ describe('D-PR2a: required context satisfied by commit status', () => {
 // Code of Conduct fixture verification (AC-1, AC-2)
 // ---------------------------------------------------------------------------
 describe('AC-1 AC-2: Code of Conduct verification', () => {
-  test('fixture sha256 and size are recorded', () => {
-    // The fixture records the upstream CC 2.1 text.
-    // sha256 and size are the provenance record for offline verification.
+  // D-COC2: the fixture is the recorded UPSTREAM text, and the sha256 below is
+  // the whole point of recording it — without a pinned digest, "CODE_OF_CONDUCT.md
+  // differs from the fixture in exactly one line" can be satisfied by editing the
+  // fixture. `hash.length === 64` is true of every sha256 ever computed and
+  // asserts nothing (applies ADR-009, avoids PF-013).
+  //
+  // Provenance, re-verified at review time:
+  //   https://raw.githubusercontent.com/EthicalSource/contributor_covenant/
+  //     release/content/version/2/1/code_of_conduct.md
+  //   The upstream file carries a TOML front-matter block (+++ ... +++) that is
+  //   site metadata, not part of the document. With it stripped, the body is
+  //   byte-identical to this fixture: 5478 bytes, sha256 369bf730...339b.
+  //   (The plan recorded 977d7813.../5480 bytes for a capture that does not
+  //   reproduce against upstream today; the digest below is measured, not copied.)
+  const FIXTURE_SHA256 = '369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b';
+  const FIXTURE_BYTES = 5478;
+
+  test('fixture matches its recorded sha256 and byte count exactly', () => {
     const fixturePath = join(FIXTURES, 'contributor-covenant-2.1.md');
     const buf = readFileSync(fixturePath);
     const hash = createHash('sha256').update(buf).digest('hex');
     const size = statSync(fixturePath).size;
-    // Record actual sha256 of the committed fixture:
-    // (fetched from contributor-covenant.org at planning time; exact byte-match
-    //  may vary by LF vs CRLF and trailing newlines — functional check below is authoritative)
-    assert.ok(hash.length === 64, `sha256 must be 64 hex chars; got: ${hash.length}`);
-    assert.ok(size > 5000 && size < 6000, `fixture size ${size} bytes should be ~5400-5500 bytes`);
+    assert.equal(size, FIXTURE_BYTES, `fixture must be exactly ${FIXTURE_BYTES} bytes; got ${size}`);
+    assert.equal(hash, FIXTURE_SHA256,
+      'fixture no longer matches the recorded upstream digest — the vendored Contributor ' +
+      'Covenant text was modified; restore it rather than updating this constant');
   });
 
   test('CODE_OF_CONDUCT.md differs from fixture in exactly one line (contact substitution)', () => {

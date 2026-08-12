@@ -35,17 +35,43 @@
  *
  * Exit codes:
  *   0 — no hazards found (prints file count and byte count for non-vacuity)
- *   1 — hazard found, or zero files scanned, or stale/unmatched allowlist entry
- *   2 — tool error: git missing, not a repo, non-UTF-8, pagination error
+ *   1 — hazard found, zero files scanned, invalid UTF-8, un-allowlisted NUL,
+ *       an unreadable tracked path, or a stale/unmatched allowlist entry
+ *   2 — tool error: git missing, not inside a git work tree, or a git
+ *       subcommand (ls-files / diff --cached / cat-file) failed
  */
 'use strict';
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFileSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+/**
+ * True when this module is the process entry point.
+ *
+ * Two traps make the obvious `import.meta.url === 'file://' + process.argv[1]`
+ * wrong, and both fail SILENTLY: main() never runs, the process exits 0, and a
+ * gate that scanned nothing is indistinguishable from a clean tree.
+ *   1. Percent-encoding — any path containing a space never matches.
+ *   2. Symlinks — Node resolves import.meta.url through realpath, while
+ *      process.argv[1] keeps the path as typed (on macOS /tmp and
+ *      /var/folders are symlinks, so this is the common case, not a corner).
+ * Comparing realpaths handles both (applies ADR-009, avoids PF-013).
+ *
+ * @param {string} metaUrl — the caller's import.meta.url
+ * @returns {boolean}
+ */
+export function isMainModule(metaUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const modulePath = fileURLToPath(metaUrl);
+  try {
+    return realpathSync(entry) === realpathSync(modulePath);
+  } catch {
+    return pathToFileURL(resolve(entry)).href === metaUrl;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // D-CB1: Hazard class definition.
@@ -271,8 +297,15 @@ function getTrackedFiles(cwd) {
 function getStagedFiles(cwd) {
   const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR'], cwd);
   if (r.status !== 0) {
-    // No staged files is not an error in --staged mode
-    return [];
+    // D-CB5: fail closed. `git diff --cached` exits 0 even when nothing is
+    // staged, so a non-zero status is a real tool failure (corrupt index,
+    // unreadable object). Treating it as "no staged files" would let the
+    // pre-commit hook report success on a scan that never happened.
+    console.error(
+      `✖ verify-no-control-bytes: git diff --cached failed (status ${r.status}): ` +
+      `${r.stderr.toString('utf8').trim()}`,
+    );
+    process.exit(2);
   }
   const paths = r.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
   return paths.map(p => ({ path: p, mode: 0o100644, skip: false, staged: true }));
@@ -300,9 +333,12 @@ function readIndexBlob(path, cwd) {
  * @param {Buffer} buf    — raw file bytes
  * @param {string} relPath — repo-relative path (for error messages)
  * @param {Set<number>} allowedCps — codepoints explicitly allowlisted for this file
- * @returns {{ codepoint: number, byteOffset: number }[]} — list of hazard hits
+ * @returns {{ codepoint: number, byteOffset: number, allowed?: boolean }[]}
+ *   Every hazard occurrence, including allowlisted ones. Allowlisted hits carry
+ *   `allowed: true` so the caller can record the entry as exercised — dropping
+ *   them here would make every HAZARD_ALLOWLIST entry look stale (D-CB6).
  */
-function scanBuffer(buf, relPath, allowedCps) {
+export function scanBuffer(buf, relPath, allowedCps) {
   // Check for NUL (binary file indicator)
   if (buf.includes(0x00)) {
     const inBinaryAllowlist = BINARY_ALLOWLIST.some(e => e.path === relPath);
@@ -322,9 +358,7 @@ function scanBuffer(buf, relPath, allowedCps) {
     const { cp, byteOffset } = codepoints[i];
     const nextCp = i + 1 < codepoints.length ? codepoints[i + 1].cp : null;
     if (isHazardous(cp, nextCp)) {
-      if (!allowedCps.has(cp)) {
-        hits.push({ codepoint: cp, byteOffset });
-      }
+      hits.push({ codepoint: cp, byteOffset, allowed: allowedCps.has(cp) });
     }
   }
   return hits;
@@ -418,12 +452,12 @@ function main() {
         errors.push(`${entry.path}: invalid UTF-8 content (not a text file?)`);
       } else if (hit.binaryError) {
         errors.push(`${entry.path}: contains NUL bytes — add to BINARY_ALLOWLIST with a reason`);
+      } else if (hit.allowed) {
+        // D-CB6: the allowlist entry is genuinely exercised — record it so the
+        // stale-entry check below does not flag it.
+        exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
       } else {
         hazardHits.push({ path: entry.path, codepoint: hit.codepoint, byteOffset: hit.byteOffset, buf });
-        // Track exercised allowlist entries
-        if (allowedCps.has(hit.codepoint)) {
-          exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
-        }
       }
     }
   }
@@ -454,9 +488,14 @@ function main() {
   const passStats = `Scanned ${scannedFiles} file(s), ${totalBytes} byte(s)` +
     (skippedCount > 0 ? `, ${skippedCount} symlink/gitlink skipped` : '');
 
-  if (exercisedAllowlist.size > 0 && HAZARD_ALLOWLIST.length > 0) {
-    for (const entry of HAZARD_ALLOWLIST) {
-      console.log(`  allowlist: ${entry.path} (reason: ${entry.reason})`);
+  // AC-17: name every allowlist entry that was actually exercised by this run.
+  for (const entry of HAZARD_ALLOWLIST) {
+    const exercisedCps = entry.codepoints.filter(cp => exercisedAllowlist.has(`${entry.path}:${cp}`));
+    if (exercisedCps.length > 0) {
+      const cpList = exercisedCps
+        .map(cp => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`)
+        .join(', ');
+      console.log(`  allowlist exercised: ${entry.path} [${cpList}] (reason: ${entry.reason})`);
     }
   }
 
@@ -475,13 +514,10 @@ function main() {
   }
 
   console.log(`✓ source-hygiene gate: ${passStats}`);
-  if (HAZARD_ALLOWLIST.length > 0) {
-    console.log(`  (${HAZARD_ALLOWLIST.length} allowlist entr${HAZARD_ALLOWLIST.length === 1 ? 'y' : 'ies'} exercised)`);
-  }
   process.exit(0);
 }
 
-// Run only when executed directly (not imported by tests)
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Run only when executed directly (not imported by tests). See isMainModule.
+if (isMainModule(import.meta.url)) {
   main();
 }

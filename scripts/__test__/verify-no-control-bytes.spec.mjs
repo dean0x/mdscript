@@ -13,7 +13,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, symlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync, execFileSync } from 'node:child_process';
@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url';
 import {
   HAZARD_RANGES,
   isHazardous,
+  scanBuffer,
   BINARY_ALLOWLIST,
   HAZARD_ALLOWLIST,
 } from '../verify-no-control-bytes.mjs';
@@ -482,12 +483,9 @@ describe('AC-15: scanner source is self-clean', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC-17: stale allowlist entries exit 1
+// AC-17: allowlist entries are exercised-or-stale
 // ---------------------------------------------------------------------------
-describe('AC-17: stale allowlist entries are self-invalidating', () => {
-
-  // These tests verify the allowlist behavior using the exported constants.
-  // The HAZARD_ALLOWLIST is currently empty — an empty allowlist is always valid.
+describe('AC-17: allowlist entries are self-invalidating', () => {
 
   test('BINARY_ALLOWLIST is empty (no entries)', () => {
     assert.equal(BINARY_ALLOWLIST.length, 0, 'BINARY_ALLOWLIST must be empty (D-CB4, D-CB6)');
@@ -495,6 +493,160 @@ describe('AC-17: stale allowlist entries are self-invalidating', () => {
 
   test('HAZARD_ALLOWLIST is empty (no entries)', () => {
     assert.equal(HAZARD_ALLOWLIST.length, 0, 'HAZARD_ALLOWLIST must be empty (D-CB4, D-CB6)');
+  });
+
+  test('scanBuffer reports allowlisted hazards as allowed, others as not', () => {
+    // The allowlist is empty in the shipped file, so the exercised/stale
+    // machinery below can only be reached by an entry that does not exist yet.
+    // Assert the predicate the machinery depends on, then drive the whole
+    // script with a patched allowlist in the integration cases that follow.
+    const esc = Buffer.from([0x61, 0x1b, 0x62]);
+    const notAllowed = scanBuffer(esc, 'x.md', new Set());
+    assert.equal(notAllowed.length, 1);
+    assert.equal(notAllowed[0].codepoint, 0x1b);
+    assert.equal(notAllowed[0].allowed, false);
+
+    const allowed = scanBuffer(esc, 'x.md', new Set([0x1b]));
+    assert.equal(allowed.length, 1, 'an allowlisted hazard must still be REPORTED to the caller');
+    assert.equal(allowed[0].allowed, true, 'so the entry can be recorded as exercised, not stale');
+  });
+
+  /**
+   * Write a copy of the scanner with a patched HAZARD_ALLOWLIST into `dir`.
+   * Patching the source is the only way to exercise a non-empty allowlist
+   * while keeping the shipped allowlist empty (D-CB4).
+   */
+  function writePatchedScanner(dir, entryLiteral) {
+    const marker = 'export const HAZARD_ALLOWLIST = [';
+    const src = readFileSync(SCANNER, 'utf8');
+    assert.ok(src.includes(marker), 'scanner must declare HAZARD_ALLOWLIST for this test to patch');
+    const patched = src.replace(marker, `${marker} ${entryLiteral},`);
+    assert.notEqual(patched, src, 'patch must have applied');
+    const target = join(dir, 'scan.mjs');
+    writeFileSync(target, patched);
+    return target;
+  }
+
+  function runPatched(dir, target) {
+    const r = spawnSync(process.execPath, [target], { cwd: dir, encoding: 'utf8', timeout: 30000 });
+    return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  }
+
+  test('Case 1: an exercised entry exits 0 and is named in the output', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      writeFileSync(join(dir, 'evil.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'evil.md', 'scan.mjs');
+      const r = runPatched(dir, target);
+      assert.equal(r.status, 0, `exercised allowlist entry must pass; stderr: ${r.stderr}`);
+      assert.ok(r.stdout.includes('evil.md'), `output must name the exercised entry; got: ${r.stdout}`);
+      assert.ok(r.stdout.includes('U+001B'), `output must name the allowed codepoint; got: ${r.stdout}`);
+      assert.ok(r.stdout.includes('test fixture'), `output must quote the written reason; got: ${r.stdout}`);
+    } finally { cleanup(dir); }
+  });
+
+  test('Case 2: an entry naming a file that is not tracked exits 1 as stale', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      writeFileSync(join(dir, 'clean.md'), 'nothing to see\n');
+      const target = writePatchedScanner(dir, "{ path: 'gone.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'clean.md', 'scan.mjs');
+      const r = runPatched(dir, target);
+      assert.equal(r.status, 1, 'an allowlist entry for an untracked path must fail');
+      assert.ok(r.stderr.includes('stale'), `must identify the entry as stale; got: ${r.stderr}`);
+      assert.ok(r.stderr.includes('gone.md'), 'must name the stale path');
+    } finally { cleanup(dir); }
+  });
+
+  test('Case 3: an entry whose declared codepoint no longer occurs exits 1 as stale', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      writeFileSync(join(dir, 'evil.md'), 'the hazard byte has since been removed\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'evil.md', 'scan.mjs');
+      const r = runPatched(dir, target);
+      assert.equal(r.status, 1, 'an allowlist entry whose codepoint is gone must fail');
+      assert.ok(r.stderr.includes('U+001B'), `must name the declared codepoint; got: ${r.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Entry-point guard: the gate must actually RUN wherever the repo is checked out
+// ---------------------------------------------------------------------------
+describe('the scanner runs from a path containing a space', () => {
+
+  test('planted ESC is still caught when the script path contains a space', () => {
+    // `import.meta.url === "file://" + process.argv[1]` is false for any path a
+    // file URL percent-encodes, so main() never runs and the gate exits 0
+    // having scanned nothing — a silent pass indistinguishable from a clean
+    // tree. The scanner has no local imports, so a copy is a faithful subject.
+    const dir = mkdtempSync(join(tmpdir(), 'mds scan space-'));
+    try {
+      assert.ok(dir.includes(' '), 'this test is meaningless unless the path has a space');
+      execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.email', 'test@test.test'], { cwd: dir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir, stdio: 'pipe' });
+      const target = join(dir, 'scan.mjs');
+      writeFileSync(target, readFileSync(SCANNER));
+      writeFileSync(join(dir, 'evil.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      execFileSync('git', ['add', 'evil.md', 'scan.mjs'], { cwd: dir, stdio: 'pipe' });
+
+      const r = spawnSync(process.execPath, [target], { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(r.status, 1,
+        `scanner must run (and fail) from a spaced path; got status ${r.status}, stdout: ${r.stdout}`);
+      assert.ok(r.stderr.includes('U+001B'), 'must report the planted byte');
+    } finally { cleanup(dir); }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// AC-20: non-regular git entries are skipped, not read
+// ---------------------------------------------------------------------------
+describe('AC-20: symlinks are skipped and counted, not read', () => {
+
+  test('a tracked symlink (mode 120000) is skipped and reported', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      writeFileSync(join(dir, 'real.md'), 'clean content\n');
+      symlinkSync('real.md', join(dir, 'link.md'));
+      git('add', 'real.md', 'link.md');
+      const modes = execFileSync('git', ['ls-files', '-s'], { cwd: dir, encoding: 'utf8' });
+      assert.ok(modes.includes('120000'), 'the fixture must actually stage a symlink');
+
+      const r = runScanner([], { cwd: dir });
+      assert.equal(r.status, 0, `symlink must not produce a read error; stderr: ${r.stderr}`);
+      assert.ok(/1 symlink\/gitlink skipped/.test(r.stdout),
+        `skipped entries must be counted separately; got: ${r.stdout}`);
+      assert.ok(/Scanned 1 file\(s\)/.test(r.stdout), 'only the regular file is scanned');
+    } finally { cleanup(dir); }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// AC-16: git missing from PATH fails closed with exit 2
+// ---------------------------------------------------------------------------
+describe('AC-16: git not on PATH', () => {
+
+  test('scanner exits 2 when git cannot be found', () => {
+    // Give the child a PATH containing node but not git, so the failure is
+    // specifically "git is missing" and not "node is missing".
+    const binDir = mkdtempSync(join(tmpdir(), 'mds-nopath-'));
+    try {
+      symlinkSync(process.execPath, join(binDir, 'node'));
+      const r = spawnSync(process.execPath, [SCANNER], {
+        cwd: ROOT,
+        encoding: 'utf8',
+        env: { PATH: binDir },
+        timeout: 30000,
+      });
+      assert.equal(r.status, 2, `missing git must exit 2; stdout: ${r.stdout}, stderr: ${r.stderr}`);
+      assert.ok(/git is not on PATH/.test(r.stderr), `must name the condition; got: ${r.stderr}`);
+    } finally { cleanup(binDir); }
   });
 
 });

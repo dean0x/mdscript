@@ -11,7 +11,9 @@
  *
  * D-PR2: Required contexts are read LIVE from branch protection — never
  * hardcoded. On 403 the script exits 2. On 404 (unprotected base) the script
- * exits 2 unless --required-from <branch> is supplied.
+ * exits 2 unless --required-from <branch> is supplied. A protected branch that
+ * lists ZERO required contexts also exits 2: "all 0 required contexts passed"
+ * is a vacuous green, and vacuous greens are what PF-017 was made of.
  *
  * D-PR2a: A required context is resolved against the UNION of check-runs AND
  * commit statuses (GitHub branch protection accepts either namespace).
@@ -48,6 +50,30 @@
 'use strict';
 
 import { spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/**
+ * True when this module is the process entry point.
+ *
+ * Deliberately not `import.meta.url === 'file://' + process.argv[1]`: that
+ * comparison is false for any path a file URL percent-encodes (a space) and
+ * for any symlinked path (Node resolves import.meta.url through realpath but
+ * leaves argv[1] as typed — on macOS /tmp and /var/folders are symlinks). Both
+ * failures are silent: main() never runs and the merge gate exits 0 having
+ * verified nothing. Kept local so each scripts/verify-*.mjs stays standalone.
+ */
+function isMainModule(metaUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const modulePath = fileURLToPath(metaUrl);
+  try {
+    return realpathSync(entry) === realpathSync(modulePath);
+  } catch {
+    return pathToFileURL(resolve(entry)).href === metaUrl;
+  }
+}
 
 // D-PR4a: hard page cap — exit 2 rather than evaluating a partial result
 const MAX_PAGES = 20;
@@ -67,12 +93,10 @@ const MIN_GH_MINOR = 31;
 function defaultGhRunner(args) {
   const r = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
   if (r.error) {
-    if (r.error.code === 'ENOENT') {
-      console.error('✖ verify-pr-checks: gh is not on PATH');
-      process.exit(2);
-    }
-    console.error(`✖ verify-pr-checks: gh error: ${r.error.message}`);
-    process.exit(2);
+    const stderr = r.error.code === 'ENOENT'
+      ? 'gh is not on PATH'
+      : `gh error: ${r.error.message}`;
+    return { __error: true, status: -1, stderr };
   }
   if (r.status !== 0) {
     // Return status code so caller can handle 404/403
@@ -135,6 +159,20 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   const nStatuses = statuses.length;
   const nRequired = requiredContexts.length;
 
+  // D-PR4: Non-vacuity guard — an empty required set can never be evidence of
+  // merge safety. "All 0 required contexts passed" is the same vacuous green
+  // that ADR-009 forbids: the tool cannot tell, so it exits 2, never 0.
+  // Reachable whenever protection exists but lists no required status checks,
+  // or when a future API shape stops populating `contexts`.
+  if (nRequired === 0) {
+    lines.push(`  check-runs: ${nChecks}, statuses: ${nStatuses}, required contexts: ${nRequired}`);
+    lines.push(
+      '✖ INDETERMINATE: zero required contexts — nothing to verify, so this is not a pass ' +
+      '(applies ADR-009). Point --required-from at a branch whose protection lists required checks.',
+    );
+    return { pass: false, exitCode: 2, lines };
+  }
+
   // D-PR4: Non-vacuity guard — zero check-runs is the #239 shape (not a pass)
   if (nChecks === 0) {
     lines.push(`  check-runs: ${nChecks}, statuses: ${nStatuses}, required contexts: ${nRequired}`);
@@ -145,10 +183,17 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   // Always print counts (D-PR4 / avoids PF-013)
   lines.push(`  check-runs: ${nChecks}, statuses: ${nStatuses}, required contexts: ${nRequired}`);
 
-  // Build lookup maps
-  const checkByName = new Map(); // name -> CheckRun (latest, filter=latest already applied)
+  // Build lookup maps.
+  // A name maps to EVERY check-run carrying it, not just the last one seen:
+  // `filter=latest` de-duplicates within a check-suite, but two suites (two
+  // workflows) can publish the same name, and a required context is satisfied
+  // by the name. Keeping only the last entry lets a later success mask an
+  // earlier failure — a fail-open in a merge gate.
+  const checksByName = new Map(); // name -> CheckRun[]
   for (const cr of checkRuns) {
-    checkByName.set(cr.name, cr);
+    const list = checksByName.get(cr.name);
+    if (list) list.push(cr);
+    else checksByName.set(cr.name, [cr]);
   }
   const statusByContext = new Map(); // context -> CommitStatus
   for (const st of statuses) {
@@ -159,17 +204,20 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   // D-PR2a: resolved against the UNION of check-runs and commit statuses.
   // avoids PF-017: must be status=completed AND conclusion=success.
   for (const ctx of requiredContexts) {
-    const cr = checkByName.get(ctx);
+    const crs = checksByName.get(ctx);
     const st = statusByContext.get(ctx);
 
-    if (cr) {
-      // Found in check-runs namespace
-      if (cr.status !== 'completed' || cr.conclusion !== 'success') {
-        failures.push(
-          `Tier A (required): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'}` +
-          ` (avoids PF-017: cancelled/skipped/in_progress are not success)`,
-        );
-        pass = false;
+    if (crs) {
+      // Found in check-runs namespace — EVERY run under this name must pass.
+      for (const cr of crs) {
+        if (cr.status !== 'completed' || cr.conclusion !== 'success') {
+          failures.push(
+            `Tier A (required): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'}` +
+            (crs.length > 1 ? ` (1 of ${crs.length} runs sharing this name)` : '') +
+            ` (avoids PF-017: cancelled/skipped/in_progress are not success)`,
+          );
+          pass = false;
+        }
       }
     } else if (st) {
       // Found in commit statuses namespace
@@ -235,6 +283,15 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
 
 // ---------------------------------------------------------------------------
 // Main (live path with real gh API calls)
+//
+// Every step below returns a Result ({ ok: true, ... } | { ok: false, exitCode,
+// message }) instead of calling process.exit. Only the CLI wrapper at the
+// bottom of this file translates an exit code into a process exit, which is
+// what makes the exit-2 paths (404, 403, stale gh, unbounded pagination)
+// reachable from an offline test with an injected runner. A tool whose
+// failure paths can only be asserted by grepping its own source text is
+// exactly the vacuous verification this script exists to eliminate
+// (applies ADR-009, avoids PF-013).
 // ---------------------------------------------------------------------------
 
 function ghVersion() {
@@ -249,22 +306,26 @@ function ghVersion() {
 /**
  * Fetch all pages of check-runs for a given sha, bounded at MAX_PAGES.
  * D-PR4a: filter=latest pinned; paginate with hard cap; exit 2 on incomplete.
+ *
+ * @returns {{ ok: true, checkRuns: CheckRun[] } | { ok: false, exitCode: 2, message: string }}
  */
-function fetchCheckRuns(headSha, runner) {
-  // Use gh api with --paginate to collect all pages
-  // gh api --paginate emits one JSON object per page (not merged)
+export function fetchCheckRuns(headSha, runner) {
   const perPage = 100;
   let page = 1;
   const allCheckRuns = [];
   let totalCount = null;
 
+  // Bounded loop (reliability rule): at most MAX_PAGES iterations, always.
   while (page <= MAX_PAGES) {
     // D-PR4a: filter=latest pinned explicitly to prevent default-change surprises
     const url = `/repos/{owner}/{repo}/commits/${headSha}/check-runs?per_page=${perPage}&page=${page}&filter=latest`;
     const data = runner(['api', url]);
     if (data.__error) {
-      console.error(`✖ verify-pr-checks: check-runs API error (page ${page}): ${data.stderr}`);
-      process.exit(2);
+      return {
+        ok: false,
+        exitCode: 2,
+        message: `check-runs API error (page ${page}): ${data.stderr}`,
+      };
     }
     if (totalCount === null) {
       totalCount = data.total_count ?? 0;
@@ -276,137 +337,202 @@ function fetchCheckRuns(headSha, runner) {
   }
 
   if (page > MAX_PAGES) {
-    console.error(`✖ verify-pr-checks: pagination exceeded ${MAX_PAGES} pages; exiting 2 (D-PR4a)`);
-    process.exit(2);
+    return {
+      ok: false,
+      exitCode: 2,
+      message: `pagination exceeded ${MAX_PAGES} pages (D-PR4a) — refusing to evaluate a partial set`,
+    };
   }
 
   // D-PR4a: assert we collected everything declared by total_count
   if (totalCount !== null && allCheckRuns.length !== totalCount) {
-    console.error(
-      `✖ verify-pr-checks: collected ${allCheckRuns.length} check-runs but total_count=${totalCount}; exiting 2`,
-    );
-    process.exit(2);
+    return {
+      ok: false,
+      exitCode: 2,
+      message: `collected ${allCheckRuns.length} check-runs but total_count=${totalCount} — partial page set`,
+    };
   }
 
-  return allCheckRuns;
+  return { ok: true, checkRuns: allCheckRuns };
 }
 
 /**
  * Fetch commit statuses for a sha.
+ * @returns {{ ok: true, statuses: CommitStatus[] } | { ok: false, exitCode: 2, message: string }}
  */
-function fetchStatuses(headSha, runner) {
+export function fetchStatuses(headSha, runner) {
   const url = `/repos/{owner}/{repo}/commits/${headSha}/status`;
   const data = runner(['api', url]);
   if (data.__error) {
-    console.error(`✖ verify-pr-checks: commit-status API error: ${data.stderr}`);
-    process.exit(2);
+    return { ok: false, exitCode: 2, message: `commit-status API error: ${data.stderr}` };
   }
-  return data.statuses ?? [];
+  return { ok: true, statuses: data.statuses ?? [] };
 }
 
 /**
  * Fetch required contexts from branch protection.
- * D-PR2: exits 2 on 403 or when no protection and no fallback.
+ * D-PR2: exit 2 on 403 or when the base has no protection and no fallback.
  * AC-29: unprotected base (404) exits 2 unless --required-from is given.
+ *
+ * The required set is the UNION of the legacy `contexts` array and the newer
+ * `checks[].context` array. GitHub populates both today; reading only the
+ * deprecated `contexts` would silently yield an empty required set — and an
+ * empty required set is a vacuous pass, not a pass.
+ *
+ * @returns {{ ok: true, contexts: string[], resolvedBranch: string, notes: string[] }
+ *          | { ok: false, exitCode: 2, message: string }}
  */
-function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
+export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
   const branch = requiredFrom ?? baseBranch;
   const url = `/repos/{owner}/{repo}/branches/${branch}/protection`;
   const data = runner(['api', url]);
 
   if (data.__error) {
     if (data.status === 404) {
-      if (requiredFrom) {
-        console.error(
-          `✖ verify-pr-checks: --required-from branch "${requiredFrom}" has no protection (404); exit 2`,
-        );
-      } else {
-        console.error(
-          `✖ verify-pr-checks: base branch "${baseBranch}" has no protection (404). ` +
-          `Use --required-from <branch> to specify a protected branch, e.g. --required-from main. ` +
-          `(AC-29: unprotected base is not a pass — D-PR2)`
-        );
-      }
-      process.exit(2);
+      const message = requiredFrom
+        ? `--required-from branch "${requiredFrom}" has no protection (404)`
+        : `base branch "${baseBranch}" has no protection (404). ` +
+          `Use --required-from <branch> to name a protected branch, e.g. --required-from main. ` +
+          `(AC-29: an unprotected base is not a pass — D-PR2)`;
+      return { ok: false, exitCode: 2, message };
     }
     if (data.status === 403) {
-      console.error(
-        `✖ verify-pr-checks: branch protection unreadable (403 — insufficient permissions); exit 2`,
-      );
-      process.exit(2);
+      return {
+        ok: false,
+        exitCode: 2,
+        message: 'branch protection unreadable (403 — insufficient permissions)',
+      };
     }
-    console.error(`✖ verify-pr-checks: protection API error: ${data.stderr}`);
-    process.exit(2);
+    return { ok: false, exitCode: 2, message: `protection API error: ${data.stderr}` };
   }
 
-  const contexts = data?.required_status_checks?.contexts ?? [];
-  if (requiredFrom && requiredFrom !== baseBranch) {
-    console.log(`  Required contexts read from: ${requiredFrom} (base branch "${baseBranch}" is unprotected)`);
+  const rsc = data?.required_status_checks;
+  const contexts = [...new Set([
+    ...(rsc?.contexts ?? []),
+    ...(rsc?.checks ?? []).map(c => c?.context).filter(c => typeof c === 'string'),
+  ])];
+
+  if (contexts.length === 0) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message:
+        `branch "${branch}" is protected but lists zero required status checks — ` +
+        `there is nothing to verify, which is indeterminate, not a pass (applies ADR-009)`,
+    };
   }
-  return { contexts, resolvedBranch: branch };
+
+  const notes = [];
+  if (requiredFrom && requiredFrom !== baseBranch) {
+    notes.push(`  Required contexts read from: ${requiredFrom} (base branch "${baseBranch}" is unprotected)`);
+  }
+  return { ok: true, contexts, resolvedBranch: branch, notes };
 }
 
-export function main(argv = process.argv.slice(2), runner = defaultGhRunner) {
+const USAGE =
+  'Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>] [--head-sha <sha>]';
+
+/**
+ * Live entry point. Returns an exit code; never calls process.exit, so tests
+ * can drive it end-to-end with an injected runner.
+ *
+ * @param {string[]} argv
+ * @param {(args: string[]) => any} runner       — gh API shim
+ * @param {() => ({major:number,minor:number}|null)} ghVersionFn — version probe
+ * @returns {0|1|2}
+ */
+export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghVersionFn = ghVersion) {
+  const fail = (message) => {
+    console.error(`✖ verify-pr-checks: ${message}`);
+  };
+
   // ---- Parse args ----
   const prArg = argv.find(a => /^\d+$/.test(a));
   if (!prArg) {
-    console.error('Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>] [--head-sha <sha>]');
-    process.exit(2);
+    console.error(USAGE);
+    return 2;
   }
   const prNumber = parseInt(prArg, 10);
 
   const rfIdx = argv.indexOf('--required-from');
+  if (rfIdx !== -1 && !argv[rfIdx + 1]) {
+    fail(`--required-from requires a branch name\n${USAGE}`);
+    return 2;
+  }
   const requiredFrom = rfIdx !== -1 ? argv[rfIdx + 1] : null;
 
   const hsIdx = argv.indexOf('--head-sha');
+  if (hsIdx !== -1 && !argv[hsIdx + 1]) {
+    fail(`--head-sha requires a SHA\n${USAGE}`);
+    return 2;
+  }
   const headShaOverride = hsIdx !== -1 ? argv[hsIdx + 1] : null;
 
   // ---- Check gh version (D-PR5) ----
-  const ver = ghVersion();
+  const ver = ghVersionFn();
   if (!ver || ver.major < MIN_GH_MAJOR || (ver.major === MIN_GH_MAJOR && ver.minor < MIN_GH_MINOR)) {
     const found = ver ? `${ver.major}.${ver.minor}` : 'unknown';
-    console.error(
-      `✖ verify-pr-checks: gh >= ${MIN_GH_MAJOR}.${MIN_GH_MINOR} required (found ${found}); ` +
-      `needed for --match-head-commit (D-PR5)`
+    fail(
+      `gh >= ${MIN_GH_MAJOR}.${MIN_GH_MINOR} required (found ${found}); ` +
+      `needed for --match-head-commit (D-PR5)`,
     );
-    process.exit(2);
+    return 2;
   }
 
   // ---- Fetch PR metadata ----
   const prData = runner(['api', `/repos/{owner}/{repo}/pulls/${prNumber}`]);
   if (prData.__error) {
-    console.error(`✖ verify-pr-checks: cannot read PR ${prNumber}: ${prData.stderr}`);
-    process.exit(2);
+    fail(`cannot read PR ${prNumber}: ${prData.stderr}`);
+    return 2;
   }
   const headSha = headShaOverride ?? prData.head?.sha;
   const baseBranch = prData.base?.ref;
   if (!headSha || !baseBranch) {
-    console.error(`✖ verify-pr-checks: cannot determine head SHA or base branch for PR ${prNumber}`);
-    process.exit(2);
+    fail(`cannot determine head SHA or base branch for PR ${prNumber}`);
+    return 2;
   }
 
   console.log(`PR #${prNumber}: base=${baseBranch} head=${headSha.slice(0, 7)}`);
 
   // ---- Fetch required contexts (D-PR2) ----
-  const { contexts: requiredContexts, resolvedBranch } = fetchRequiredContexts(baseBranch, requiredFrom, runner);
-  console.log(`  Required contexts (${requiredContexts.length}) from ${resolvedBranch}: ${requiredContexts.join(', ') || '(none)'}`);
+  const req = fetchRequiredContexts(baseBranch, requiredFrom, runner);
+  if (!req.ok) {
+    fail(req.message);
+    return req.exitCode;
+  }
+  for (const note of req.notes) console.log(note);
+  console.log(`  Required contexts (${req.contexts.length}) from ${req.resolvedBranch}: ${req.contexts.join(', ')}`);
 
   // ---- Fetch check-runs (D-PR4a) ----
-  const checkRuns = fetchCheckRuns(headSha, runner);
+  const cr = fetchCheckRuns(headSha, runner);
+  if (!cr.ok) {
+    fail(cr.message);
+    return cr.exitCode;
+  }
 
   // ---- Fetch commit statuses (D-PR2a) ----
-  const statuses = fetchStatuses(headSha, runner);
+  const st = fetchStatuses(headSha, runner);
+  if (!st.ok) {
+    fail(st.message);
+    return st.exitCode;
+  }
 
   // ---- Evaluate (D-PR1: pure function) ----
-  const result = evaluateChecks({ requiredContexts, checkRuns, statuses, headSha });
+  const result = evaluateChecks({
+    requiredContexts: req.contexts,
+    checkRuns: cr.checkRuns,
+    statuses: st.statuses,
+    headSha,
+  });
 
   for (const line of result.lines) {
     console.log(line);
   }
 
-  process.exit(result.exitCode);
+  return result.exitCode;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
+// Run only when executed directly (not imported by tests). See isMainModule.
+if (isMainModule(import.meta.url)) {
+  process.exit(main());
 }
