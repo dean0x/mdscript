@@ -1,0 +1,32 @@
+#!/bin/sh
+# Pre-commit hook: run the source-hygiene gate in --staged mode.
+#
+# Opt-in: git config core.hooksPath scripts/hooks
+#
+# IMPORTANT: Setting core.hooksPath REPLACES .git/hooks entirely rather than
+# merging with it. Any local hooks you have in .git/hooks will no longer run
+# while this setting is active. Document your local hooks before opting in.
+#
+# This hook reads staged file content from the git index (git cat-file blob
+# :<path>), not from the working tree. Staging a clean file then modifying
+# the working copy will NOT bypass the check. (D-CB8)
+#
+# D-CB7: Uses pure Node codepoint iteration. BSD grep (macOS default) lacks
+# -P and exits 2 with empty output, making absence of hazard bytes look the
+# same as a broken invocation. This hook never invokes grep.
+#
+# Exit 0: commit proceeds (no hazard bytes in staged content).
+# Exit 1: commit rejected (hazard byte found; fix the file before staging).
+
+set -e
+
+REPO_ROOT=$(git rev-parse --show-toplevel)
+HOOK_SCRIPT="$REPO_ROOT/scripts/verify-no-control-bytes.mjs"
+
+if [ ! -f "$HOOK_SCRIPT" ]; then
+  echo "pre-commit: scripts/verify-no-control-bytes.mjs not found — skipping" >&2
+  exit 0
+fi
+
+# Run in --staged mode: reads git index, not working tree (D-CB8).
+exec node "$HOOK_SCRIPT" --staged

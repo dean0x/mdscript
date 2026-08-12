@@ -30,6 +30,11 @@ jobs:
         with: { node-version: 22 }
       - name: "Assert synchronized versions, no file: refs"
         run: node scripts/verify-versions.mjs
+      # #288: Source-hygiene gate — also runs on tag pushes via this job.
+      # ci.yml does not run on tag pushes, so this step ensures the gate is
+      # enforced at release time. Uses the same Node 22 install above.
+      - name: "Assert no hazardous codepoints in tracked source"
+        run: node scripts/verify-no-control-bytes.mjs
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.

@@ -326,7 +326,8 @@ See [spec.md](spec.md) for the full MDS v0.4.0 language specification.
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the local
-workflow and quality gates.
+workflow and quality gates. By participating you agree to the
+[Contributor Covenant 2.1](CODE_OF_CONDUCT.md).
 
 ## Security
 

@@ -34,7 +34,6 @@ These are **not** automated and must be done before the first release:
    `mds-core` and `mds-cli` on crates.io.
 4. **Enable GitHub private vulnerability reporting** (Settings → Code security →
    Private vulnerability reporting) so the SECURITY.md flow works.
-5. Add **`CODE_OF_CONDUCT.md`** (tracked in #38) if not already present.
 
 ## Pre-flight (before tagging)
 
@@ -57,6 +56,11 @@ npm run build -w @mdscript/mds-wasm
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
 node scripts/verify-versions.mjs
+
+# Source hygiene and pre-merge check gates
+node scripts/verify-no-control-bytes.mjs
+# Before any --admin merge (PF-017 guard — cancelled runs read as green):
+# node scripts/verify-pr-checks.mjs <pr-number>
 
 # Packaging spot-check (inspect tarball contents)
 npm pack -w @mdscript/mds --dry-run
