@@ -237,16 +237,6 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
 // Main (live path with real gh API calls)
 // ---------------------------------------------------------------------------
 
-function checkGhVersion(runner) {
-  const r = runner(['--version']);
-  if (r.__error) {
-    console.error('✖ verify-pr-checks: cannot determine gh version');
-    process.exit(2);
-  }
-  // gh --version returns an object from gh api; for --version we call gh directly
-  return;
-}
-
 function ghVersion() {
   const r = spawnSync('gh', ['--version'], { encoding: 'utf8' });
   if (r.error || r.status !== 0) return null;
@@ -356,7 +346,7 @@ function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
   return { contexts, resolvedBranch: branch };
 }
 
-export async function main(argv = process.argv.slice(2), runner = defaultGhRunner) {
+export function main(argv = process.argv.slice(2), runner = defaultGhRunner) {
   // ---- Parse args ----
   const prArg = argv.find(a => /^\d+$/.test(a));
   if (!prArg) {

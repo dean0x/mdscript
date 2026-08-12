@@ -14,7 +14,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { evaluateChecks } from '../verify-pr-checks.mjs';
@@ -60,7 +60,6 @@ describe('AC-21 AC-22: historical fixture evaluation', () => {
 
   test('113f472 (main baseline, 18 check-runs, all success) → PASS (exit 0)', () => {
     const checkRuns = loadCheckRuns('checks-main-113f472.json');
-    const statuses = loadStatuses('status-pr239-f168944.json'); // empty statuses
     assert.equal(checkRuns.length, 18, 'fixture must have 18 check-runs');
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0, `expected PASS; lines: ${result.lines.join('\n')}`);

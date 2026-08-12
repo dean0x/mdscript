@@ -40,9 +40,9 @@
  */
 'use strict';
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { join, resolve, dirname } from 'node:path';
+import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -148,7 +148,8 @@ function hexContext(buf, offset) {
   const end = Math.min(buf.length, offset + 10);
   const hex = [];
   for (let i = start; i < end; i++) {
-    hex.push((i === offset ? '[' : '') + buf[i].toString(16).padStart(2, '0') + (i === offset ? ']' : ''));
+    const byte = buf[i].toString(16).padStart(2, '0');
+    hex.push(i === offset ? `[${byte}]` : byte);
   }
   return hex.join(' ');
 }
@@ -396,7 +397,7 @@ function main() {
   for (const entry of fileEntries) {
     let buf;
     try {
-      if (isStaged || entry.staged) {
+      if (isStaged) {
         buf = readIndexBlob(entry.path, cwd);
       } else {
         buf = readFileSync(entry.absolutePath || resolve(cwd, entry.path));
