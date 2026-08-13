@@ -1063,7 +1063,7 @@ impl MdsError {
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,
         };
-        src.map_or(false, |ns| ns.name() == SOURCE_LABEL)
+        src.is_some_and(|ns| ns.name() == SOURCE_LABEL)
     }
 }
 

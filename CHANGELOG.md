@@ -137,6 +137,13 @@ virtual-FS entry key, not a display label. The napi, WASM and Python lint APIs
 continue to report `"input.mds"` for string-source input. The relabel is applied
 only at the CLI output boundary.
 
+**Zero-diagnostic behaviour:** when stdin lint completes with no findings, the
+JSON is `{"files":[],"truncated":false,"version":1}` — no file entry. The
+`<stdin>` sentinel appears in `files[0].file` only when at least one diagnostic is
+emitted. This matches non-stdin zero-diagnostic behaviour and keeps the JSON
+identical across the CLI and binding surfaces (napi, WASM, Python) for the clean
+case.
+
 **3. `unused-import` spans anchor at the unused name (#203).** For selective
 imports (`@import { name1, name2 } from "path"`), the span now covers the unused
 name rather than the `@import` keyword, and `span.length` is the name's length

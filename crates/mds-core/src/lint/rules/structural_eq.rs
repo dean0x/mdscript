@@ -288,7 +288,7 @@ mod tests {
         let b = ImportDirective::Selective {
             names: vec!["foo".to_string(), "bar".to_string()],
             path: "./lib.mds".to_string(),
-            offset: 42, // different import-keyword offset too
+            offset: 42,                 // different import-keyword offset too
             name_offsets: vec![53, 58], // shifted positions in another source
         };
         assert!(

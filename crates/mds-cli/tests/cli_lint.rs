@@ -1754,16 +1754,17 @@ fn stdin_fix_preview_messages_use_bracketed_sentinel() {
 // undefined for a clean source; the correct assertion is that `files` is empty
 // and that no VFS key or source-identity sentinel leaks into the document.
 
-/// AC-P1-26 scope-out: clean stdin produces `files:[]` (not a file entry with
-/// `file:"<stdin>"`), `truncated:false`, `version:1`.  Per AC-P1-06 the binding
-/// surfaces also produce `files:[]` for clean string-source input, making the
-/// JSON identical across CLI and bindings in the zero-diagnostic case.
+/// AC-P1-26 zero-diagnostic carve-out: clean stdin produces `files:[]`
+/// (no file entry), `truncated:false`, `version:1`.  The `<stdin>` sentinel
+/// appears in `files[0].file` only when at least one diagnostic is emitted.
+/// Per AC-P1-06 the binding surfaces also produce `files:[]` for clean
+/// string-source input, making the JSON identical across CLI and bindings
+/// in the zero-diagnostic case.  See CHANGELOG for the documented wire contract.
 #[test]
 fn stdin_json_clean_source_emits_empty_files_array() {
     let out = lint_stdin("Hello World!\n", &["--format", "json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value =
-        serde_json::from_str(&stdout).expect("clean stdin JSON must parse");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("clean stdin JSON must parse");
     assert_eq!(
         v["files"],
         serde_json::json!([]),
