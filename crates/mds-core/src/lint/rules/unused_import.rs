@@ -109,6 +109,7 @@ pub(crate) fn check(
                                 .to_string(),
                         ),
                         imp.offset,
+                        "@import".len(),
                     ))
                 {
                     return;
@@ -116,12 +117,16 @@ pub(crate) fn check(
             }
             ImportKind::Selective => {
                 // Per-name flagging: each name checked individually.
-                for name in &imp.names {
+                // AD-203-1 / PF-012: anchor the span at the name, not @import.
+                for (i, name) in imp.names.iter().enumerate() {
                     let is_used = ctx.used_calls.contains(name)
                         || ctx.used_vars.contains(name)
                         || reexport_names.contains(name);
-                    if !is_used
-                        && !builder.push(make_diag(
+                    if !is_used {
+                        // Prefer the per-name offset; fall back to @import offset
+                        // if name_offsets is unexpectedly short (defensive).
+                        let name_offset = imp.name_offsets.get(i).copied().unwrap_or(imp.offset);
+                        if !builder.push(make_diag(
                             severity,
                             filename,
                             format!(
@@ -132,10 +137,11 @@ pub(crate) fn check(
                                 "Remove '{}' from the selective import or use it in the body.",
                                 name
                             )),
-                            imp.offset,
-                        ))
-                    {
-                        return;
+                            name_offset,
+                            name.len(),
+                        )) {
+                            return;
+                        }
                     }
                 }
             }
@@ -147,14 +153,24 @@ fn resolve_severity(config: &LintConfig) -> Severity {
     config.severity_for(RULE).copied().unwrap_or(Severity::Warn)
 }
 
-/// Build an unused-import diagnostic. The span always covers the `@import` keyword
-/// (length = 7), so `offset` is the only caller-supplied span parameter.
+/// Build an unused-import diagnostic.
+///
+/// `offset` is the byte position of the span anchor within the source.
+/// `length` is the byte length of the highlighted token.
+///
+/// For Alias and Merge forms the caller passes `imp.offset` /
+/// `"@import".len()` so the span covers the `@import` keyword.
+///
+/// For Selective forms the caller passes the per-name offset from
+/// `imp.name_offsets` and `name.len()` so the span covers the unused name
+/// (AD-203-1 / PF-012).
 fn make_diag(
     severity: Severity,
     filename: &str,
     message: String,
     help: Option<String>,
     offset: usize,
+    length: usize,
 ) -> LintDiagnostic {
     LintDiagnostic {
         rule: RULE.to_string(),
@@ -163,7 +179,7 @@ fn make_diag(
         help,
         span: Some(SerializedSpan {
             offset,
-            length: "@import".len(),
+            length,
             line: None,
             column: None,
         }),
@@ -342,5 +358,112 @@ mod tests {
         };
         check(&module, &ctx, "test.mds", &config, &mut builder);
         assert!(builder.build(false).diagnostics.is_empty());
+    }
+
+    // ── AC-P1-19 / AD-203-1: span anchors at the unused name ─────────────────
+
+    /// AC-P1-19: for a single unused name in a selective import, the span offset
+    /// must point at the name's first byte, not at the `@import` keyword.
+    ///
+    /// Source: `@import { greet } from "./lib.mds"\n`
+    ///          0123456789012345...
+    ///                    ^ 'greet' starts at byte 10 (after "@import { ")
+    #[test]
+    fn selective_span_anchors_at_name_not_at_import_keyword() {
+        let src = "@import { greet } from \"./lib.mds\"\nHello!\n";
+        let diags = lint_src(src);
+        let diag = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("greet"))
+            .expect("unused-import diagnostic for 'greet' must fire");
+        let span = diag.span.as_ref().expect("span must be present");
+
+        // "@import { " = 10 bytes before 'greet'.
+        let expected_offset = "@import { ".len();
+        assert_eq!(
+            span.offset, expected_offset,
+            "span.offset must point at the name 'greet' (byte {}), not at @import (byte 0); \
+             got span.offset={}",
+            expected_offset, span.offset
+        );
+        assert_eq!(
+            span.length,
+            "greet".len(),
+            "span.length must equal the name length; got span.length={}",
+            span.length
+        );
+    }
+
+    /// AC-P1-19 (second name): in a multi-name selective import, each unused name
+    /// has an independently anchored span.
+    ///
+    /// Source: `@import { foo, bar } from "./lib.mds"\n`
+    ///          0123456789012345678...
+    ///                    ^ 'foo' at 10, 'bar' at 15
+    #[test]
+    fn selective_multi_name_each_span_anchored_independently() {
+        let src = "@import { foo, bar } from \"./lib.mds\"\nHello!\n";
+        let diags = lint_src(src);
+
+        let foo_diag = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("'foo'"))
+            .expect("diagnostic for 'foo' must fire");
+        let bar_diag = diags
+            .iter()
+            .find(|d| d.rule == RULE && d.message.contains("'bar'"))
+            .expect("diagnostic for 'bar' must fire");
+
+        let foo_span = foo_diag
+            .span
+            .as_ref()
+            .expect("span for 'foo' must be present");
+        let bar_span = bar_diag
+            .span
+            .as_ref()
+            .expect("span for 'bar' must be present");
+
+        // "@import { " = 10 bytes.
+        assert_eq!(
+            foo_span.offset,
+            "@import { ".len(),
+            "span for 'foo' must start at byte {}; got {}",
+            "@import { ".len(),
+            foo_span.offset
+        );
+        assert_eq!(foo_span.length, "foo".len());
+
+        // "@import { foo, " = 15 bytes.
+        assert_eq!(
+            bar_span.offset,
+            "@import { foo, ".len(),
+            "span for 'bar' must start at byte {}; got {}",
+            "@import { foo, ".len(),
+            bar_span.offset
+        );
+        assert_eq!(bar_span.length, "bar".len());
+    }
+
+    /// Alias form still anchors at the `@import` keyword (not changed by #203).
+    #[test]
+    fn alias_span_anchors_at_import_keyword() {
+        let src = "@import \"./lib.mds\" as lib\nHello!\n";
+        let diags = lint_src(src);
+        let diag = diags
+            .iter()
+            .find(|d| d.rule == RULE)
+            .expect("unused alias import diagnostic must fire");
+        let span = diag.span.as_ref().expect("span must be present");
+        assert_eq!(
+            span.offset, 0,
+            "alias span must start at byte 0 (@import); got {}",
+            span.offset
+        );
+        assert_eq!(
+            span.length,
+            "@import".len(),
+            "alias span.length must equal '@import' length; got {}",
+            span.length
+        );
     }
 }

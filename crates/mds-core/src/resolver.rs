@@ -1924,6 +1924,7 @@ impl ModuleCache {
                 names,
                 path,
                 offset,
+                ..
             } => self.resolve_selective_import(names, path, *offset, scope, ctx, warnings),
         }
     }

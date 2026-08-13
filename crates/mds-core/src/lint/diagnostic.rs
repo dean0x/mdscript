@@ -696,7 +696,8 @@ impl LintResult {
     ///           "message": "...",
     ///           "help": "...",
     ///           "fixable": false,
-    ///           "span": { "offset": 0, "length": 5, "line": 1, "column": 1 }
+    ///           "span": { "offset": 0, "length": 5, "line": 1, "column": 1 },
+    ///           "fix_edits": [{ "start": 0, "end": 7, "new_text": "" }]
     ///         }
     ///       ]
     ///     }
@@ -710,6 +711,13 @@ impl LintResult {
     /// Some(..)`).
     /// The `fixable` field reflects tier semantics: `true` for Tier A rules and for
     /// Tier B rules when the file is standalone, `false` otherwise.
+    /// The `fix_edits` field is `null` when no machine-applicable fix is available.
+    ///
+    /// **AD-202-3 (ordering guarantee):** within each file group, diagnostics are
+    /// ordered by ascending byte offset (`span.offset`).  Diagnostics without a span
+    /// sort to the end of the group. The sort is stable so equal-offset diagnostics
+    /// preserve rule-insertion order.  Files are ordered lexicographically by file
+    /// path (BTreeMap property).
     ///
     /// **NEVER** build this JSON via `format!()` — use `serde_json::json!()` so
     /// control characters in message/help are serialized safely.
@@ -827,12 +835,41 @@ impl LintResultBuilder {
     }
 
     pub(crate) fn build(self, is_standalone: bool) -> LintResult {
+        let mut diagnostics = self.diagnostics;
+        // AD-202-1: sort after truncation (some diagnostics may have been dropped),
+        // before JSON emission.  Stable sort preserves rule-insertion order for
+        // equal-offset diagnostics (AD-202-2).
+        sort_diagnostics(&mut diagnostics);
         LintResult {
-            diagnostics: self.diagnostics,
+            diagnostics,
             truncated: self.truncated,
             is_standalone,
         }
     }
+}
+
+// ── Diagnostic ordering ───────────────────────────────────────────────────────
+
+/// Sort `diagnostics` in-place by `(file, span.offset)` — ascending, stable.
+///
+/// **AD-202-1:** called in `LintResultBuilder::build`, after truncation, before
+/// JSON emission.
+///
+/// **AD-202-2:** the sort is stable (`sort_by`, not `sort_unstable_by`) so
+/// equal-offset diagnostics preserve the insertion order established by the rule
+/// dispatch loop — rule tests that assert exact ordering remain deterministic.
+///
+/// **AD-202-3:** diagnostics without a span sort to the end of their file group
+/// (we use `usize::MAX` as a sentinel offset).  Diagnostics without a file sort
+/// to the end of the overall list.
+fn sort_diagnostics(diagnostics: &mut [LintDiagnostic]) {
+    diagnostics.sort_by(|a, b| {
+        let file_a = a.file.as_deref().unwrap_or("\u{FFFF}");
+        let file_b = b.file.as_deref().unwrap_or("\u{FFFF}");
+        let off_a = a.span.as_ref().map(|s| s.offset).unwrap_or(usize::MAX);
+        let off_b = b.span.as_ref().map(|s| s.offset).unwrap_or(usize::MAX);
+        file_a.cmp(file_b).then(off_a.cmp(&off_b))
+    });
 }
 
 // ── sanitize_control_chars ────────────────────────────────────────────────────
@@ -2041,6 +2078,113 @@ mod tests {
         assert!(
             rendered.fix_edits.is_none(),
             "fix_edits must be None in the sanitized clone"
+        );
+    }
+
+    // ── AC-P1-14 / AD-202-1: sort by byte offset ─────────────────────────────
+
+    fn make_span_diag(file: Option<&str>, offset: Option<usize>, rule: &str) -> LintDiagnostic {
+        LintDiagnostic {
+            rule: rule.to_string(),
+            severity: Severity::Warn,
+            message: format!("{rule} at {offset:?}"),
+            help: None,
+            span: offset.map(|o| SerializedSpan {
+                offset: o,
+                length: 1,
+                line: None,
+                column: None,
+            }),
+            file: file.map(str::to_string),
+            fix_removals: None,
+            fix_edits: None,
+        }
+    }
+
+    /// AC-P1-14: `LintResultBuilder::build` sorts diagnostics by ascending byte
+    /// offset within each file.
+    #[test]
+    fn build_sorts_diagnostics_by_offset() {
+        let mut builder = LintResultBuilder::new();
+        // Insert in reverse offset order.
+        builder.push(make_span_diag(Some("a.mds"), Some(20), "r1"));
+        builder.push(make_span_diag(Some("a.mds"), Some(5), "r2"));
+        builder.push(make_span_diag(Some("a.mds"), Some(10), "r3"));
+        let result = builder.build(false);
+        let offsets: Vec<_> = result
+            .diagnostics
+            .iter()
+            .map(|d| d.span.as_ref().map(|s| s.offset))
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![Some(5), Some(10), Some(20)],
+            "diagnostics must be ordered by ascending byte offset; got: {:?}",
+            offsets
+        );
+    }
+
+    /// AC-P1-14 (multi-file): files are ordered lexicographically; within a file
+    /// diagnostics are ordered by byte offset.
+    #[test]
+    fn build_sorts_multi_file_diagnostics() {
+        let mut builder = LintResultBuilder::new();
+        builder.push(make_span_diag(Some("b.mds"), Some(1), "r1"));
+        builder.push(make_span_diag(Some("a.mds"), Some(10), "r2"));
+        builder.push(make_span_diag(Some("a.mds"), Some(3), "r3"));
+        let result = builder.build(false);
+        let keys: Vec<_> = result
+            .diagnostics
+            .iter()
+            .map(|d| (d.file.as_deref(), d.span.as_ref().map(|s| s.offset)))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (Some("a.mds"), Some(3)),
+                (Some("a.mds"), Some(10)),
+                (Some("b.mds"), Some(1)),
+            ],
+            "multi-file diagnostics must sort by (file, offset); got: {:?}",
+            keys
+        );
+    }
+
+    /// AC-P1-15 / AD-202-2: diagnostics with the same file and offset preserve
+    /// insertion order (stable sort).
+    #[test]
+    fn build_stable_sort_preserves_insertion_order_for_equal_offsets() {
+        let mut builder = LintResultBuilder::new();
+        builder.push(make_span_diag(Some("a.mds"), Some(5), "first"));
+        builder.push(make_span_diag(Some("a.mds"), Some(5), "second"));
+        builder.push(make_span_diag(Some("a.mds"), Some(5), "third"));
+        let result = builder.build(false);
+        let rules: Vec<_> = result.diagnostics.iter().map(|d| d.rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            vec!["first", "second", "third"],
+            "equal-offset diagnostics must preserve insertion order; got: {:?}",
+            rules
+        );
+    }
+
+    /// AC-P1-14 (no-span): diagnostics without a span sort to the end of their
+    /// file group.
+    #[test]
+    fn build_no_span_sorts_to_end() {
+        let mut builder = LintResultBuilder::new();
+        builder.push(make_span_diag(Some("a.mds"), None, "no-span"));
+        builder.push(make_span_diag(Some("a.mds"), Some(3), "has-span"));
+        let result = builder.build(false);
+        assert_eq!(
+            result.diagnostics[0].rule, "has-span",
+            "spanned diagnostic must sort before no-span; got: {:?}",
+            result.diagnostics
+        );
+        assert_eq!(
+            result.diagnostics[1].rule, "no-span",
+            "no-span diagnostic must sort to the end; got: {:?}",
+            result.diagnostics
         );
     }
 }

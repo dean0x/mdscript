@@ -990,7 +990,8 @@ pub(crate) fn apply_source_map_file_label(
     if stdin_label {
         for src in &mut sm.sources {
             if src == STRING_SOURCE_MAP_LABEL {
-                *src = "<stdin>".to_string();
+                // AD-211-3: use the centralised sentinel from output.rs.
+                *src = crate::output::STDIN_DISPLAY_LABEL.to_string();
             }
         }
     }

@@ -813,11 +813,32 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
             .find('}')
             .ok_or_else(|| MdsError::syntax("unclosed { in selective import"))?;
         let names_str = &rest[1..brace_end];
-        let names: Vec<String> = names_str
-            .split(',')
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .collect();
+
+        // AD-203-1 / PF-012: compute per-name byte offsets in a single pass
+        // alongside name collection so the two vectors cannot desync.
+        //
+        // We use trim_start (not trim) to get the exact byte distance from the
+        // start of `directive` to the `{`: trim() on the right side might collapse
+        // trailing whitespace and shift the length, yielding a wrong delta.
+        let delta = directive.len() - directive.trim_start_matches("@import").trim_start().len();
+        // `names_str` begins at `offset + delta + 1` (past the `{`).
+        let names_str_start = offset + delta + 1;
+
+        let mut names: Vec<String> = Vec::new();
+        let mut name_offsets: Vec<usize> = Vec::new();
+        let mut cursor = 0usize; // byte cursor within `names_str`
+        for seg in names_str.split(',') {
+            let seg_byte_len = seg.len();
+            let trimmed = seg.trim();
+            if !trimmed.is_empty() {
+                // Count leading whitespace bytes within this segment so we land
+                // on the first byte of the identifier, not on the space before it.
+                let leading_ws = seg.len() - seg.trim_start().len();
+                name_offsets.push(names_str_start + cursor + leading_ws);
+                names.push(trimmed.to_string());
+            }
+            cursor += seg_byte_len + 1; // +1 for the comma separator
+        }
 
         for name in &names {
             if !is_valid_identifier(name) {
@@ -837,6 +858,7 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
             names,
             path,
             offset,
+            name_offsets,
         }));
     }
 

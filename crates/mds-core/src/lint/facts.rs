@@ -32,6 +32,12 @@ pub struct ImportFact {
     pub alias: Option<String>,
     /// Names for `@import { name1, name2 } from "path"` forms.
     pub names: Vec<String>,
+    /// Byte offset of each name in `names` within the source file (Selective only).
+    ///
+    /// **AD-203-1 / PF-012:** parallel to `names`; always `Vec::new()` for Alias
+    /// and Merge forms.  Used by the `unused-import` rule to anchor the diagnostic
+    /// span at the unused name rather than at the `@import` keyword.
+    pub name_offsets: Vec<usize>,
     /// Byte offset of the `@import` token in the source.
     pub offset: usize,
 }
@@ -415,6 +421,7 @@ fn collect_import_fact(imp: &ImportDirective, ctx: &mut AnalysisContext) {
                 kind: ImportKind::Alias,
                 alias: Some(alias.clone()),
                 names: vec![],
+                name_offsets: vec![],
                 offset: *offset,
             });
         }
@@ -424,6 +431,7 @@ fn collect_import_fact(imp: &ImportDirective, ctx: &mut AnalysisContext) {
                 kind: ImportKind::Merge,
                 alias: None,
                 names: vec![],
+                name_offsets: vec![],
                 offset: *offset,
             });
         }
@@ -431,12 +439,16 @@ fn collect_import_fact(imp: &ImportDirective, ctx: &mut AnalysisContext) {
             names,
             path,
             offset,
+            name_offsets,
         } => {
             ctx.imports.push(ImportFact {
                 path: path.clone(),
                 kind: ImportKind::Selective,
                 alias: None,
                 names: names.clone(),
+                // AD-203-1: thread per-name offsets through to the rule so the
+                // unused-import diagnostic can anchor at the name, not @import.
+                name_offsets: name_offsets.clone(),
                 offset: *offset,
             });
         }

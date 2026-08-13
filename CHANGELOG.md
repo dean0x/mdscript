@@ -78,6 +78,42 @@ via struct literals. Use the named constructor or builder listed for each:
   this method instead of assembling sanitized copies itself, keeping the escape logic co-located
   with the struct definition (PF-014).
 
+#### Lint JSON wire contract: diagnostics sorted by byte offset (#202)
+
+Within each `files[].diagnostics` array in `mds lint --format json` output,
+diagnostics are now ordered by ascending byte offset (`span.offset`). Previously
+the order was rule-insertion order (implementation-defined). This is a **wire
+contract change**: consumers that relied on a fixed rule-application order may
+see reordered JSON output.
+
+- Diagnostics without a span sort to the end of their file group.
+- Equal-offset diagnostics preserve the previous rule-insertion order (stable sort).
+- File groups themselves remain lexicographically ordered (BTreeMap).
+
+#### Lint JSON wire contract: stdin source key is always `"<stdin>"` (#211)
+
+`mds lint --format json -` now emits `"<stdin>"` in the `files[].file` key.
+Previously this field emitted `"input.mds"` (the internal VFS sentinel), which
+was an implementation detail leaking into the public wire contract.
+
+Human-readable diagnostic output (stderr) now also consistently shows `<stdin>`
+as the source identity in span headers and status lines (e.g.
+`Would fix: <stdin>`, diff headers).
+
+#### `unused-import` diagnostic spans anchor at the unused name (#203)
+
+For selective imports (`@import { name1, name2 } from "path"`), the
+`unused-import` diagnostic span now anchors at the **unused name's first byte**
+rather than at the `@import` keyword. The `span.length` covers only the name
+token.
+
+Before: `{ "offset": 0, "length": 7 }` (always the `@import` keyword)
+After:  `{ "offset": 10, "length": 5 }` (the name, e.g. `greet` in
+         `@import { greet } from ...`)
+
+Alias imports (`@import "path" as alias`) are unchanged — their span still
+covers the `@import` keyword.
+
 #### New `fix_edits` field on `LintDiagnostic`
 
 `LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;

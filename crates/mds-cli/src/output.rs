@@ -24,6 +24,22 @@ use miette::Result;
 
 use crate::build::{MdsConfig, OutputKind};
 
+// ── Stdin display sentinel ────────────────────────────────────────────────────
+
+/// AD-211-1 / AD-211-3: the single stdin source-identity sentinel used by every
+/// CLI diagnostic context.
+///
+/// Every user-visible emission of stdin's source identity — human diagnostics, JSON
+/// `files[].file`, fix-preview status lines, diff headers, source-map `sources[]`,
+/// and the analysis-failure envelope — uses this exact string.  The remap is applied
+/// at the CLI output boundary; `crates/mds-core` continues to carry `"input.mds"`
+/// (STRING_SOURCE_MAP_LABEL) as the internal VFS entry key, which is NOT changed.
+///
+/// Centralised here so the CLI has exactly one definition of the sentinel (AD-211-3),
+/// replacing the five previous scattered literals including the hardcoded `"<stdin>"`
+/// in `build.rs:993`.
+pub(crate) const STDIN_DISPLAY_LABEL: &str = "<stdin>";
+
 // ── Output base for directory mode ────────────────────────────────────────────
 
 /// Describes where directory-mode output files are written.

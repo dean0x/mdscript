@@ -1274,10 +1274,11 @@ fn stdin_lint_diagnostic_includes_code_frame() {
         "diagnostic must appear in stdin report-only mode; got: {stderr}"
     );
 
-    // "input.mds" must appear: miette renders it as the file reference in the span header.
+    // "<stdin>" must appear: AD-211-1 relabels the span header from the internal
+    // STRING_SOURCE_MAP_LABEL ("input.mds") to the uniform CLI sentinel.
     assert!(
-        stderr.contains("input.mds"),
-        "stdin mode must show 'input.mds' in the code frame; got: {stderr}"
+        stderr.contains("<stdin>"),
+        "stdin mode must show '<stdin>' in the code frame; got: {stderr}"
     );
 
     // At least one token from the source must appear in the code frame context.
@@ -1286,6 +1287,75 @@ fn stdin_lint_diagnostic_includes_code_frame() {
         stderr.contains("@export"),
         "code frame must include the offending source line '@export greet'; got: {stderr}"
     );
+}
+
+// ── AC-P1-01: stdin JSON wire `files[].file` emits "<stdin>" ─────────────────
+//
+// Pins issue #211: every stdin lint path must emit `"<stdin>"` in the JSON
+// `files[].file` key, not the internal VFS sentinel `"input.mds"`.
+//
+// Covers: run_lint_stdin report-only mode with --format json.
+
+#[test]
+fn stdin_json_wire_file_key_is_stdin_sentinel() {
+    // Source with a known lint finding that needs no file imports so lint_str_with
+    // succeeds and emits a regular diagnostic JSON (not an analysis-failure envelope).
+    // duplicate-export fires without any resolver look-ups.
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &["--format", "json"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    let files = v["files"].as_array().expect("JSON must have 'files' array");
+    assert!(
+        !files.is_empty(),
+        "stdin JSON must have at least one file group (duplicate-export fires); got: {stdout}"
+    );
+    for entry in files {
+        let file_key = entry["file"]
+            .as_str()
+            .expect("each file entry must have a 'file' string");
+        assert_eq!(
+            file_key, "<stdin>",
+            "AC-P1-01: JSON files[].file must be '<stdin>' for stdin input, not '{file_key}'"
+        );
+    }
+}
+
+// ── AC-P1-14/#202: JSON wire diagnostics sorted by byte offset ───────────────
+//
+// Pins issue #202: within a file group, diagnostics must appear in ascending
+// byte-offset order regardless of the order rules were applied.
+
+#[test]
+fn stdin_json_diagnostics_sorted_by_offset() {
+    // Two diagnostics at different offsets: the one at the lower offset must
+    // come first.  Use a source with two distinct export violations placed at
+    // known positions.
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &["--format", "json"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    let files = v["files"].as_array().expect("JSON must have 'files' array");
+    for entry in files {
+        let diags = entry["diagnostics"]
+            .as_array()
+            .expect("must have 'diagnostics'");
+        let offsets: Vec<i64> = diags
+            .iter()
+            .filter_map(|d| d["span"]["offset"].as_i64())
+            .collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            offsets, sorted,
+            "AC-P1-14: diagnostics must be in ascending byte-offset order; \
+             got offsets: {offsets:?}"
+        );
+    }
 }
 
 // ── Test (i): Auto-detect hint names the invoking subcommand ─────────────────

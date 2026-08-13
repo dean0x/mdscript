@@ -281,6 +281,13 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
     ),
     (
         "lint.rs",
+        "STDIN_DISPLAY_LABEL",
+        "`&'static str` compile-time constant defined in `output.rs` as `\"<stdin>\"`. \
+         It is the uniform stdin source-identity sentinel (AD-211-3 / issue #211); \
+         it contains only ASCII printable characters and cannot carry hostile bytes.",
+    ),
+    (
+        "lint.rs",
         "applied_count",
         "`usize` tally of lint fixes actually applied, in the `Partially fixed:` line.",
     ),
