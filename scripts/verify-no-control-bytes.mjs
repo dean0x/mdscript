@@ -195,7 +195,6 @@ function hexContext(buf, offset) {
   return hex.join(' ');
 }
 
-
 // ---------------------------------------------------------------------------
 // git helpers
 // ---------------------------------------------------------------------------
@@ -215,14 +214,14 @@ function gitExec(args, cwd = process.cwd()) {
       // not an indeterminate tool error.
       console.error('✖ verify-no-control-bytes: git is not on PATH');
       process.exit(1);
-    }
-    if (result.error.code === 'ETIMEDOUT') {
+    } else if (result.error.code === 'ETIMEDOUT') {
       // Timeout is indeterminate — a hung git call is not evidence of a clean tree.
       console.error('✖ verify-no-control-bytes: git timed out after 30 s — indeterminate, not clean');
       process.exit(2);
+    } else {
+      console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
+      process.exit(2);
     }
-    console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
-    process.exit(2);
   }
   return result;
 }
@@ -379,9 +378,9 @@ function readAllIndexBlobs(paths, cwd) {
   if (r.error) {
     if (r.error.code === 'ETIMEDOUT') {
       console.error('✖ verify-no-control-bytes: git cat-file --batch timed out after 30 s — indeterminate, not clean');
-      process.exit(2);
+    } else {
+      console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
     }
-    console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
     process.exit(2);
   }
   if (r.status !== 0) {
@@ -661,7 +660,12 @@ function main() {
         exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
       } else {
         // AC-30: compute hex context now so buf is not retained after this iteration.
-        hazardHits.push({ path: entry.path, codepoint: hit.codepoint, byteOffset: hit.byteOffset, hexCtx: hexContext(buf, hit.byteOffset) });
+        hazardHits.push({
+          path: entry.path,
+          codepoint: hit.codepoint,
+          byteOffset: hit.byteOffset,
+          hexCtx: hexContext(buf, hit.byteOffset),
+        });
       }
     }
   }

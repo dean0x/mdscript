@@ -150,11 +150,14 @@ function defaultGhRunner(args) {
     timeout: 30_000,
   });
   if (r.error) {
-    const stderr = r.error.code === 'ENOENT'
-      ? 'gh is not on PATH'
-      : r.error.code === 'ETIMEDOUT'
-      ? 'gh timed out after 30 s (AC-30: indeterminate, not clean)'
-      : `gh error: ${r.error.message}`;
+    let stderr;
+    if (r.error.code === 'ENOENT') {
+      stderr = 'gh is not on PATH';
+    } else if (r.error.code === 'ETIMEDOUT') {
+      stderr = 'gh timed out after 30 s (AC-30: indeterminate, not clean)';
+    } else {
+      stderr = `gh error: ${r.error.message}`;
+    }
     return { __error: true, status: -1, httpStatus: null, stderr };
   }
   if (r.status !== 0) {

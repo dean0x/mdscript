@@ -728,6 +728,11 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
 // stderr strings ensures the stubs used throughout this file mirror the value the
 // production runner actually produces (applies ADR-009, avoids PF-013: dead
 // branches that only trigger on a value the runner never produces).
+//
+// Stub shape reminder: stubRunner error objects use `httpStatus: 404` (not
+// `status: 404`). The process exit code is always 1 regardless of HTTP status;
+// `status` alone cannot distinguish 404 from 403. The stubRunner JSDoc documents
+// this contract; these tests pin the parser output that defines it.
 // ---------------------------------------------------------------------------
 describe('high finding: parseGhStderrHttpStatus parses real gh stderr format', () => {
 
@@ -758,17 +763,6 @@ describe('high finding: parseGhStderrHttpStatus parses real gh stderr format', (
   test('returns null for null/undefined (guard against caller passing undefined stderr)', () => {
     assert.equal(parseGhStderrHttpStatus(null), null);
     assert.equal(parseGhStderrHttpStatus(undefined), null);
-  });
-
-  test('stub stubs use the same shape this function produces (contract parity check)', () => {
-    // All stubRunner error objects in this file use `httpStatus: 404` or `httpStatus: 403`
-    // which mirrors what parseGhStderrHttpStatus returns for real gh stderr strings.
-    // This test makes the mapping explicit and prevents future stubs from drifting
-    // back to `status: 404` (the old, broken shape) (avoids PF-013).
-    assert.equal(parseGhStderrHttpStatus('gh: Not Found (HTTP 404)'), 404,
-      'stub must use httpStatus: 404 (not status: 404) to mirror production');
-    assert.equal(parseGhStderrHttpStatus('gh: Forbidden (HTTP 403)'), 403,
-      'stub must use httpStatus: 403 (not status: 403) to mirror production');
   });
 
 });

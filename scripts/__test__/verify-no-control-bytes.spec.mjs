@@ -721,21 +721,20 @@ describe('AC-15: scanner source is self-clean', () => {
 //   (a) Wall-clock full-tree scan < 5 s — asserted with Date.now() in the
 //       AC-5 test above (generous CI-safe bound).
 //   (b) --staged mode < 2 s for a 20-file commit — not directly timed here.
-//       NOTE: readAllIndexBlobs() (added after the original AC-30 comment was
-//       written) collapses N per-file `git cat-file blob` spawns into ONE
-//       `git cat-file --batch` call. The entire staged set is materialized
-//       into a single r.stdout buffer; out.slice(pos, pos+size) returns Buffer
-//       views that pin that buffer. --staged mode therefore holds all staged
-//       file contents in memory simultaneously, bounded by the 256 MB maxBuffer
-//       cap (r.error -> exit 2). This is a known trade-off (spawn cost vs memory)
-//       that was accepted when readAllIndexBlobs() replaced readIndexBlob().
-//   (c) hazardHits MUST NOT retain file buffers — verified by code shape: at
-//       verify-no-control-bytes.mjs:611, hazardHits.push stores { hexCtx }
-//       (a pre-computed string) not { buf } (the raw buffer). In full-tree mode
-//       buf is GC-eligible after each loop iteration. In --staged mode buf is a
-//       view into the already-pinned blobMap buffer (clause b), so GC-eligibility
-//       at the hazardHits level is academic there — but the key property holds:
-//       hazardHits does NOT additionally retain file buffers.
+//       NOTE: readAllIndexBlobs() collapses N per-file `git cat-file blob`
+//       spawns into ONE `git cat-file --batch` call. The entire staged set is
+//       materialized into a single r.stdout buffer; out.slice(pos, pos+size)
+//       returns Buffer views that pin that buffer. --staged mode therefore holds
+//       all staged file contents in memory simultaneously, bounded by the 256 MB
+//       maxBuffer cap (r.error -> exit 2). This is a known trade-off (spawn cost
+//       vs memory) that was accepted when readAllIndexBlobs() replaced readIndexBlob().
+//   (c) hazardHits MUST NOT retain file buffers — verified by code shape:
+//       hazardHits.push stores { hexCtx } (a pre-computed string) not { buf }
+//       (the raw buffer). In full-tree mode buf is GC-eligible after each loop
+//       iteration. In --staged mode buf is a view into the already-pinned blobMap
+//       buffer (clause b), so GC-eligibility at the hazardHits level is academic
+//       there — but the key property holds: hazardHits does NOT additionally
+//       retain file buffers.
 //
 // This describe block tests clause (c) indirectly: by proving the correct
 // hexCtx string reaches the output across multiple files, it demonstrates
@@ -746,12 +745,13 @@ describe('AC-30: hex context stored as string per hit, not as file buffer', () =
 
   test('scanner reports hex context for every hazard across multiple files', () => {
     // Verify that hexCtx is computed and stored correctly for each hit.
-    // Memory discipline (clause c) is by code shape: hazardHits stores { hexCtx }
-    // not { buf } (scanner:611), so buf is not additionally retained in hazardHits.
-    // In full-tree mode buf is GC-eligible after each iteration; in --staged mode
-    // buf is a view into the blobMap buffer (all blobs held simultaneously per
-    // clause b). This test proves the correct context string reaches the output
-    // regardless of how many files are scanned.
+    // Memory discipline (clause c) is by code shape: hazardHits.push stores
+    // { hexCtx } (a pre-computed string) not { buf } (the raw buffer), so buf
+    // is not additionally retained in hazardHits. In full-tree mode buf is
+    // GC-eligible after each iteration; in --staged mode buf is a view into
+    // the blobMap buffer (all blobs held simultaneously per clause b). This
+    // test proves the correct context string reaches the output regardless of
+    // how many files are scanned.
     const { dir, git } = mkTempGitRepo();
     try {
       // Construct two files each with an ESC at a known position
