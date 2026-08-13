@@ -264,7 +264,7 @@ function getTrackedFiles(cwd) {
 
 /**
  * Get staged file list for --staged mode.
- * Uses `git diff --cached --name-only -z --diff-filter=ACMR` for paths.
+ * Uses `git diff --cached --name-only -z --diff-filter=ACMRT` for paths.
  * D-CB8: content is fetched later in batch via readAllIndexBlobs().
  *
  * D-CB5a divergence: `git diff --cached --name-only` does not carry git mode
@@ -276,7 +276,11 @@ function getTrackedFiles(cwd) {
  * narrower scope where only newly-committed content is checked.
  */
 function getStagedFiles(cwd) {
-  const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR'], cwd);
+  // D-CB5b: include T (type-change) so a tracked symlink replaced by a regular
+  // file containing a hazard codepoint is not silently excluded.  A T change
+  // from regular-file → symlink is benign (symlink blob = ASCII target path),
+  // which is already documented in the D-CB5a JSDoc above.
+  const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMRT'], cwd);
   if (r.status !== 0) {
     // D-CB5: fail closed. `git diff --cached` exits 0 even when nothing is
     // staged, so a non-zero status is a real tool failure (corrupt index,
@@ -308,15 +312,26 @@ function getStagedFiles(cwd) {
 function readAllIndexBlobs(paths, cwd) {
   if (paths.length === 0) return new Map();
 
-  // Input: ":<path>\n" for every staged path
-  const stdin = Buffer.from(paths.map(p => `:${p}\n`).join(''), 'utf8');
-  const r = spawnSync('git', ['cat-file', '--batch'], {
+  // Input: ":<path>\0" for every staged path.
+  // Use NUL as delimiter (matching getStagedFiles' -z output) so that git paths
+  // containing a literal LF do not split into two batch requests and
+  // desynchronize the response parser.
+  const stdin = Buffer.from(paths.map(p => `:${p}\0`).join(''), 'utf8');
+  // Hard bound: mirrors gitExec's contract. An index lock, network-FS hang, or
+  // stuck git subprocess in the pre-commit hook must not block indefinitely.
+  // ETIMEDOUT is indeterminate → exit 2, never 0.
+  const r = spawnSync('git', ['cat-file', '--batch', '-z'], {
     cwd,
     input: stdin,
     encoding: 'buffer',
     maxBuffer: 256 * 1024 * 1024,
+    timeout: 30_000,
   });
   if (r.error) {
+    if (r.error.code === 'ETIMEDOUT') {
+      console.error('✖ verify-no-control-bytes: git cat-file --batch timed out after 30 s — indeterminate, not clean');
+      process.exit(2);
+    }
     console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
     process.exit(2);
   }
@@ -507,21 +522,25 @@ function main() {
       console.error('  If this is a new repo with no commits, run `git add` first.');
       process.exit(1);
     }
-    // --staged: check unfiltered diff to provide an accurate message.
-    const rAll = gitExec(['diff', '--cached', '--name-only', '-z'], cwd);
-    if (rAll.status !== 0) {
+    // --staged: query actual deletions via --diff-filter=D rather than
+    // inferring from the unfiltered diff.  Using the unfiltered set is wrong
+    // when a T (type-change) is the only staged path: ACMRT already captures
+    // T-type content-bearing blobs, so if we arrive here the staged set truly
+    // contains only deletions (D) or nothing at all.
+    const rDel = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=D'], cwd);
+    if (rDel.status !== 0) {
       console.error(
-        `✖ verify-no-control-bytes: git diff --cached (unfiltered) failed: ` +
-        `${rAll.stderr.toString('utf8').trim()}`,
+        `✖ verify-no-control-bytes: git diff --cached (deletions) failed: ` +
+        `${rDel.stderr.toString('utf8').trim()}`,
       );
       process.exit(2);
     }
-    const allPaths = rAll.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
-    if (allPaths.length > 0) {
+    const deletionPaths = rDel.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
+    if (deletionPaths.length > 0) {
       // Staged changes exist but are all deletions — nothing for the content scanner to do.
       console.log(
         `✓ source-hygiene gate: 0 content-bearing staged paths` +
-        ` (${allPaths.length} deletion(s)) — nothing to scan`,
+        ` (${deletionPaths.length} deletion(s)) — nothing to scan`,
       );
     } else {
       // Index equals HEAD (amend --no-edit, reword, --allow-empty, etc.).
