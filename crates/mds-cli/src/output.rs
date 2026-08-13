@@ -157,7 +157,7 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// - `mds check -`: `crates/mds-cli/src/main.rs:279`
 /// - `mds build -` (single-file path): `crates/mds-cli/src/build.rs:714`
 /// - `mds build -` (directory stdin path): `crates/mds-cli/src/build.rs:1176`
-/// - `mds lint -`: `crates/mds-cli/src/lint.rs:1482` (via
+/// - `mds lint -`: `crates/mds-cli/src/lint.rs:1509` (via
 ///   `emit_analysis_failure_json_or_stderr`)
 ///
 /// Any new CLI boundary that renders a stdin analysis failure must call this
