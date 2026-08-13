@@ -609,6 +609,40 @@ describe('AC-18: --staged mode reads index blob, not working tree', () => {
     } finally { cleanup(dir); }
   });
 
+  test('Case C: type-change (T) staged blob with hostile content exits 1 (ACMRT positive control)', () => {
+    // A git type-change (T) occurs when a tracked symlink is replaced by a regular
+    // file (or vice versa) and the result is staged.  --diff-filter=ACMR excludes T,
+    // which silently bypasses the pre-commit hook for any hostile content in that blob.
+    // D-CB5b fix: --diff-filter=ACMRT captures T-type changes for scanning.
+    //
+    // This test is the positive control required by ADR-009 / PF-013: it proves the
+    // scanner DETECTS hostile content in a T-type staged blob.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // 1. Commit a symlink (mode 120000) so victim.md is tracked as a symlink.
+      writeFileSync(join(dir, 'target.txt'), 'clean target\n');
+      symlinkSync('target.txt', join(dir, 'victim.md'));
+      git('add', 'target.txt', 'victim.md');
+      git('commit', '-m', 'add symlink');
+
+      // 2. Replace the symlink with a regular file containing ESC (0x1B).
+      //    rmSync removes the symlink inode; writeFileSync creates a regular file.
+      rmSync(join(dir, 'victim.md'));
+      const esc = Buffer.from([0x1b]); // ESC constructed at runtime, not a literal (PF-018)
+      writeFileSync(join(dir, 'victim.md'), Buffer.concat([Buffer.from('evil '), esc]));
+      // git add produces T (type-change): victim.md was symlink (120000), now regular (100644)
+      git('add', 'victim.md');
+
+      // Pre-delta (ACMR filter): would exit 0, silently passing a hostile blob.
+      // Post-fix (ACMRT filter): blob is scanned and exits 1.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 1,
+        'T-type staged change (symlink to file) with hostile ESC must exit 1 (ACMRT positive control)');
+      assert.ok(r.stderr.includes('victim.md'), `error must name the file; got: ${r.stderr}`);
+      assert.ok(r.stderr.includes('U+001B'), `error must name U+001B; got: ${r.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
 });
 
 // ---------------------------------------------------------------------------
