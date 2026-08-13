@@ -65,7 +65,10 @@ MDS_BACKEND=wasm   npm test -w @mdscript/mds
 ### Source hygiene
 
 All tracked source must be free of hazardous codepoints. The gate runs
-automatically in CI (`source-hygiene` job) and can be run locally:
+automatically in CI (job key `source-hygiene`, display name `Source hygiene`;
+`scripts/verify-pr-checks.mjs` matches on the display name — renaming it in
+`ci.yml` requires updating `EXPECTED_CONTEXTS` in that script) and can be run
+locally:
 
 ```bash
 node scripts/verify-no-control-bytes.mjs          # full tracked-tree scan
@@ -134,26 +137,38 @@ every context is `status=completed` AND `conclusion=success`, and on pass
 emits a `gh pr merge --squash --match-head-commit <sha>` command pinned to
 the verified SHA (closes the TOCTOU window).
 
-Exit codes are a contract: `0` all Tier A and Tier B checks passed, `1` any
-Tier A failure (required context missing or non-success), any Tier B failure
-(non-required check-run concluded failure/cancelled/timed_out/action_required/
-stale), or zero check-runs found, `2` the tool could not tell (protection
-unreadable, no required contexts configured, `gh` older than 2.31, incomplete
-pagination). **Only `0` means verified** — never read `2` as a pass.
+Exit codes are a contract: `0` all Tier A, Tier A+, and Tier B checks passed,
+`1` any Tier A failure (required context missing or non-success), any Tier A+
+failure (a job listed in `EXPECTED_CONTEXTS` is absent or non-success), any
+Tier B failure (non-required check-run concluded
+failure/cancelled/timed_out/action_required/stale), or zero check-runs found,
+`2` the tool could not tell (protection unreadable, no required contexts
+configured, `gh` older than 2.31, incomplete pagination). **Only `0` means
+verified** — never read `2` as a pass.
 
-Tier B is load-bearing: `source-hygiene` is not among `main`'s required
-branch-protection contexts, so Tier B is the sole mechanism that makes a
-failing `source-hygiene` run block an `--admin` merge.
+Tier A+ is the binding mechanism for the `Source hygiene` gate: the CI job key
+is `source-hygiene` (ci.yml), but its display name — `Source hygiene` — is what
+GitHub reports as the check-run name and what `EXPECTED_CONTEXTS` in
+`scripts/verify-pr-checks.mjs` matches. The job is not among `main`'s required
+branch-protection contexts. Tier B alone cannot make it binding: Tier B only
+iterates check-runs that already exist in the check-run list — an absent job has
+nothing to iterate. Tier A+ (`EXPECTED_CONTEXTS`) closes this gap by asserting
+presence and passing with the same semantics as Tier A, so an absent, renamed,
+or pre-start-cancelled `Source hygiene` run is FAIL, not a pass (applies
+ADR-009, avoids PF-013). Tier B still applies when the run exists but concluded
+badly. **Renaming the display `name:` in `ci.yml` requires updating
+`EXPECTED_CONTEXTS` in `scripts/verify-pr-checks.mjs` to match.**
 
 Scope, stated so it is not assumed: the verifier checks the checks *on one
 commit*. It does **not** assert that the head is up to date with the base
 branch, so a stale-but-green head can still be merged under `--admin` even
 after the verifier passes. Keep the branch rebased. It does **not** assert that
 `source-hygiene` is a required context — `--admin` bypasses required-status
-enforcement outright for non-required checks, and Tier B is the binding
-mechanism. Tier B fails on non-required check-runs that are still `queued` or
-`in_progress` — a non-completed run is not evidence of success (avoids PF-017).
-Ensure all jobs have completed before running the verifier.
+enforcement outright for non-required checks, so Tier A+ (`EXPECTED_CONTEXTS`)
+and Tier B are the binding mechanisms for non-required jobs. Tier B fails on
+non-required check-runs that are still `queued` or `in_progress` — a
+non-completed run is not evidence of success (avoids PF-017). Ensure all jobs
+have completed before running the verifier.
 
 If the base branch is unprotected (e.g. a wave branch), supply `--required-from`:
 
