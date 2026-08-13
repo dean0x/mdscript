@@ -41,9 +41,10 @@
  *         `filter=latest` is pinned explicitly (default today, but implicit
  *         defaults can change and this gate's verdict depends on it).
  *
- * D-PR5: On PASS the tool prints a merge command with --match-head-commit
- *        <headSha>, closing the TOCTOU window where the verified SHA diverges
- *        from HEAD by the time the merge runs.
+ * D-PR5: On PASS the tool prints `gh pr merge --squash --admin --match-head-commit
+ *        <headSha>` so the operator copies it verbatim. --admin is required for
+ *        protected main; --match-head-commit closes the TOCTOU window where the
+ *        verified SHA diverges from HEAD by the time the merge runs (avoids PF-017).
  *
  * D-PR6: Exit codes — 0 PASS, 1 FAIL, 2 indeterminate. "Cannot tell" is
  *        never 0.
