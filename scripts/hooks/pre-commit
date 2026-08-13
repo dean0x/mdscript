@@ -16,7 +16,11 @@
 # same as a broken invocation. This hook never invokes grep.
 #
 # Exit 0: commit proceeds (no hazard bytes in staged content).
-# Exit 1: commit rejected (hazard byte found; fix the file before staging).
+# Exit 1: commit rejected — hazard byte found, OR scanner script is missing
+#         (restore scripts/verify-no-control-bytes.mjs or pass --no-verify
+#         explicitly to bypass the gate intentionally).
+# Exit 2: scanner reported an unexpected error (three-value contract from
+#         verify-no-control-bytes.mjs); git treats this as rejection.
 
 set -e
 
@@ -24,8 +28,9 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 HOOK_SCRIPT="$REPO_ROOT/scripts/verify-no-control-bytes.mjs"
 
 if [ ! -f "$HOOK_SCRIPT" ]; then
-  echo "pre-commit: scripts/verify-no-control-bytes.mjs not found — skipping" >&2
-  exit 0
+  echo "pre-commit: scripts/verify-no-control-bytes.mjs not found — commit blocked (D-CB5)." >&2
+  echo "pre-commit: Restore the script or use --no-verify to bypass intentionally." >&2
+  exit 1
 fi
 
 # Run in --staged mode: reads git index, not working tree (D-CB8).
