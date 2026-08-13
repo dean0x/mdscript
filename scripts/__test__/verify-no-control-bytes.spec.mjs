@@ -492,7 +492,7 @@ describe('AC-18: --staged mode reads index blob, not working tree', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC-15: scanner source itself has no hazard bytes and no grep -P
+// AC-15: scanner source itself has no hazard bytes and no PCRE grep flag
 // ---------------------------------------------------------------------------
 describe('AC-15: scanner source is self-clean', () => {
 
@@ -505,14 +505,19 @@ describe('AC-15: scanner source is self-clean', () => {
     assert.equal(r.status, 0, `scanner source files must pass their own gate; stderr: ${r.stderr}`);
   });
 
-  test('scanner source files contain no grep -P and no backslash-u escape (AC-15, PF-018)', () => {
-    // AC-15: the scripts, spec files, and hook must not invoke 'grep -P' (BSD grep
-    // lacks -P, exits 2 with empty output that reads as clean — D-CB7), and must
-    // not contain a backslash-u-plus-4-hex escape (the edit-tooling decode vector
-    // that injected live hazard bytes into this repo three times — PF-018, D-CB2).
+  test('scanner source files contain no forbidden grep flag and no backslash-u escape (AC-15, PF-018)', () => {
+    // AC-15: the scripts, spec files, and hook must not invoke the BSD-incompatible
+    // grep PCRE flag (BSD grep lacks it, exits 2 with empty output that reads as
+    // clean — D-CB7), and must not contain a backslash-u-plus-4-hex escape (the
+    // edit-tooling decode vector that injected live hazard bytes into this repo
+    // three times — PF-018, D-CB2).
     //
-    // Build the backslash-u search pattern from numeric char codes so this test
-    // does not trip its own rule: 0x5C = backslash, then 'u' and 4 hex digits.
+    // Both search patterns are built from parts / numeric char codes so this test
+    // does not trip its own rule when the spec file is in the checked file set.
+    // The forbidden grep invocation is 'grep' joined with ' -P'; split here so
+    // the contiguous substring is absent from this source file.
+    const grepPFlag = 'grep' + ' -P';
+    // 0x5C = backslash, then 'u' and 4 hex digits:
     const bs = String.fromCodePoint(0x5c);
     const bsUPattern = new RegExp(bs + 'u[0-9a-fA-F]{4}');
 
@@ -527,8 +532,8 @@ describe('AC-15: scanner source is self-clean', () => {
     for (const rel of fileSet) {
       const src = readFileSync(join(ROOT, rel), 'utf8');
       assert.ok(
-        !src.includes('grep -P'),
-        `${rel}: must not invoke grep -P (BSD grep lacks -P, exits 2 — AC-15, D-CB7)`
+        !src.includes(grepPFlag),
+        `${rel}: must not invoke the POSIX-extension grep flag (BSD grep lacks PCRE support, exits 2 — AC-15, D-CB7)`
       );
       assert.ok(
         !bsUPattern.test(src),
