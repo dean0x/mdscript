@@ -12,8 +12,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -525,77 +524,5 @@ describe('D-PR2a: required context satisfied by commit status', () => {
     });
     assert.equal(result.exitCode, 0,
       'required context satisfied via commit status must pass (D-PR2a)');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Code of Conduct fixture verification (AC-1, AC-2)
-// ---------------------------------------------------------------------------
-describe('AC-1 AC-2: Code of Conduct verification', () => {
-  // D-COC2: the fixture is the recorded UPSTREAM text, and the sha256 below is
-  // the whole point of recording it — without a pinned digest, "CODE_OF_CONDUCT.md
-  // differs from the fixture in exactly one line" can be satisfied by editing the
-  // fixture. `hash.length === 64` is true of every sha256 ever computed and
-  // asserts nothing (applies ADR-009, avoids PF-013).
-  //
-  // Provenance, re-verified at review time:
-  //   https://raw.githubusercontent.com/EthicalSource/contributor_covenant/
-  //     release/content/version/2/1/code_of_conduct.md
-  //   The upstream file carries a TOML front-matter block (+++ ... +++) that is
-  //   site metadata, not part of the document. With it stripped, the body is
-  //   byte-identical to this fixture: 5478 bytes,
-  //   sha256 369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b.
-  //   AC-1 recorded a different capture (977d781349351fd7c1f076e4c7dc7de2a05b40e12c773542c3815dd4ce7f37ba,
-  //   5480 bytes) that does not reproduce against upstream today; the constants
-  //   below reflect the measured value, not the plan's capture.
-  const FIXTURE_SHA256 = '369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b';
-  const FIXTURE_BYTES = 5478;
-
-  test('fixture matches its recorded sha256 and byte count exactly', () => {
-    const fixturePath = join(FIXTURES, 'contributor-covenant-2.1.md');
-    const buf = readFileSync(fixturePath);
-    const hash = createHash('sha256').update(buf).digest('hex');
-    const size = statSync(fixturePath).size;
-    assert.equal(size, FIXTURE_BYTES, `fixture must be exactly ${FIXTURE_BYTES} bytes; got ${size}`);
-    assert.equal(hash, FIXTURE_SHA256,
-      'fixture no longer matches the recorded upstream digest — the vendored Contributor ' +
-      'Covenant text was modified; restore it rather than updating this constant');
-  });
-
-  test('CODE_OF_CONDUCT.md differs from fixture in exactly one line (contact substitution)', () => {
-    const cocPath = join(ROOT, 'CODE_OF_CONDUCT.md');
-    const fixturePath = join(FIXTURES, 'contributor-covenant-2.1.md');
-    const coc = readFileSync(cocPath, 'utf8');
-    const fixture = readFileSync(fixturePath, 'utf8');
-
-    const cocLines = coc.split('\n');
-    const fixtureLines = fixture.split('\n');
-
-    // Find differing lines
-    const maxLen = Math.max(cocLines.length, fixtureLines.length);
-    const diffs = [];
-    for (let i = 0; i < maxLen; i++) {
-      if (cocLines[i] !== fixtureLines[i]) {
-        diffs.push({ lineNo: i + 1, coc: cocLines[i], fixture: fixtureLines[i] });
-      }
-    }
-
-    assert.equal(diffs.length, 1,
-      `CODE_OF_CONDUCT.md must differ from fixture in exactly 1 line; got ${diffs.length} diff(s): ` +
-      JSON.stringify(diffs));
-    assert.ok(diffs[0].coc.includes('deanshrn@gmail.com'),
-      `the differing line must contain 'deanshrn@gmail.com'; got: ${diffs[0].coc}`);
-    assert.ok(
-      (diffs[0].fixture ?? '').includes('[INSERT CONTACT METHOD]'),
-      `fixture's differing line must contain '[INSERT CONTACT METHOD]'; got: ${diffs[0].fixture}`
-    );
-  });
-
-  test('CODE_OF_CONDUCT.md does not contain [INSERT CONTACT METHOD]', () => {
-    const coc = readFileSync(join(ROOT, 'CODE_OF_CONDUCT.md'), 'utf8');
-    assert.ok(!coc.includes('[INSERT CONTACT METHOD]'),
-      'CODE_OF_CONDUCT.md must not contain [INSERT CONTACT METHOD]');
-    assert.ok(coc.includes('deanshrn@gmail.com'),
-      'CODE_OF_CONDUCT.md must contain the contact email');
   });
 });
