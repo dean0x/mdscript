@@ -865,6 +865,89 @@ describe('AC-17: allowlist entries are self-invalidating', () => {
     } finally { cleanup(dir); }
   });
 
+  /**
+   * D-CB6a: staleness is a whole-tree claim, so it is adjudicated in full-tree
+   * mode only. --staged scans a SUBSET; judging staleness there reports every
+   * allowlisted file the commit did not happen to touch as "no longer tracked"
+   * and rejects the commit. That would make the pre-commit hook unusable from
+   * the first legitimate allowlist entry onward and push contributors to
+   * --no-verify, which disables the gate for ALL commits.
+   *
+   * Case 4 is paired with an explicit positive control (Case 5) so the fix
+   * cannot be satisfied by simply deleting the staleness check
+   * (applies ADR-009, avoids PF-013).
+   */
+  test('Case 4: --staged does not misreport an untouched allowlisted file as stale', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // evil.md carries its declared hazard and stays tracked but UNTOUCHED
+      // by the staged change.
+      writeFileSync(join(dir, 'evil.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      writeFileSync(join(dir, 'notes.md'), 'first\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'evil.md', 'notes.md', 'scan.mjs');
+      git('commit', '-m', 'init');
+
+      // Stage an edit to a DIFFERENT, clean file — the ordinary commit shape.
+      writeFileSync(join(dir, 'notes.md'), 'second\n');
+      git('add', 'notes.md');
+
+      const r = spawnSync(process.execPath, [target, '--staged'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(r.status, 0,
+        'a commit that does not touch the allowlisted file must not be rejected; ' +
+        `stdout: ${r.stdout} stderr: ${r.stderr}`);
+      assert.ok(!/stale/.test(r.stderr),
+        `evil.md is still tracked, so "stale" is a false claim; got: ${r.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
+  test('Case 5 (positive control): the same entry IS reported stale by the full-tree scan', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Identical patched scanner and identical entry as Case 4 — but here
+      // evil.md is genuinely absent, so full-tree mode must still catch it.
+      // Without this control, Case 4 would also pass if staleness detection
+      // were removed outright rather than scoped to full-tree mode.
+      writeFileSync(join(dir, 'notes.md'), 'first\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'notes.md', 'scan.mjs');
+
+      const r = runPatched(dir, target);
+      assert.equal(r.status, 1, 'full-tree mode must still adjudicate staleness');
+      assert.ok(r.stderr.includes('stale'), `must identify the entry as stale; got: ${r.stderr}`);
+      assert.ok(r.stderr.includes('evil.md'), 'must name the stale path');
+    } finally { cleanup(dir); }
+  });
+
+  test('Case 6: --staged still SUPPRESSES an allowlisted hazard in a staged file', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Suppression is path-keyed and unaffected by D-CB6a: staging the
+      // allowlisted file itself must still pass, while an identical hazard in a
+      // NON-allowlisted staged file must still fail (the discriminating half).
+      writeFileSync(join(dir, 'notes.md'), 'first\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'notes.md', 'scan.mjs');
+      git('commit', '-m', 'init');
+
+      writeFileSync(join(dir, 'evil.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      git('add', 'evil.md');
+      const allowed = spawnSync(process.execPath, [target, '--staged'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(allowed.status, 0,
+        `an allowlisted staged file must pass; stdout: ${allowed.stdout} stderr: ${allowed.stderr}`);
+
+      writeFileSync(join(dir, 'other.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      git('add', 'other.md');
+      const denied = spawnSync(process.execPath, [target, '--staged'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(denied.status, 1,
+        'the same hazard in a NON-allowlisted staged file must still fail');
+      assert.ok(denied.stderr.includes('other.md'), `must name the offending path; got: ${denied.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
 });
 
 // ---------------------------------------------------------------------------

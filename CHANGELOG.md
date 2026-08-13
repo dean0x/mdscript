@@ -306,10 +306,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protection — absence is FAIL, not advisory (ADR-009, PF-013); Tier B fails on
   any non-required check-run that concluded
   `failure/cancelled/timed_out/action_required/stale`; Tier C (legacy commit
-  statuses) is advisory. It emits a `gh pr merge --squash --match-head-commit
-  <sha>` command pinned to the verified SHA. Exit 0: Tier A, Tier A+, and Tier B
-  pass; exit 1: any Tier A, Tier A+, or Tier B failure, or zero check-runs found;
-  exit 2: tool/permission errors.
+  statuses) is advisory. It emits a `gh pr merge --squash --admin
+  --match-head-commit <sha>` command pinned to the verified SHA. Exit 0: Tier A,
+  Tier A+, and Tier B pass; exit 1: any Tier A, Tier A+, or Tier B failure, or
+  zero check-runs found; exit 2: tool/permission errors.
 
 
 ### Changed

@@ -37,6 +37,11 @@
  * deliberate, tested (see spec test "D-CB5 --staged carve-out from AC-6"),
  * and leaves the full-tree CI scan as the authoritative AC-6 gate.
  *
+ * D-CB6a: allowlist STALENESS is adjudicated in full-tree mode only. Staleness
+ * is a claim about the whole tracked tree, and --staged / explicit-path modes
+ * scan a subset that cannot support it. Hazard SUPPRESSION by an allowlist
+ * entry still applies in every mode. See the stale-allowlist block in main().
+ *
  * D-CB8: --staged mode reads file content from the git index via a single
  * `git cat-file --batch` subprocess (all staged blobs at once), never from
  * the working tree. Staging a clean file then modifying the working copy
@@ -529,6 +534,11 @@ function main() {
 
   const cwd = process.cwd();
 
+  // Full-tree mode is the only mode in which `fileEntries` is the COMPLETE
+  // tracked set. --staged and explicit-path modes scan a subset, which changes
+  // what the allowlist staleness check below can legitimately conclude.
+  const isFullTree = explicitPaths.length === 0 && !isStaged;
+
   // Verify git is accessible and we are in a repo (D-CB5)
   assertGitRepo(cwd);
 
@@ -671,22 +681,40 @@ function main() {
   }
 
   // ---- Stale allowlist check (D-CB6) ----
-  for (const entry of BINARY_ALLOWLIST) {
-    const exists = fileEntries.some(e => e.path === entry.path);
-    if (!exists) {
-      errors.push(`BINARY_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+  //
+  // D-CB6a: FULL-TREE MODE ONLY. Staleness is a claim about the whole tracked
+  // tree ("this entry no longer corresponds to anything"), and only full-tree
+  // mode holds the evidence for it. In --staged and explicit-path modes
+  // `fileEntries` is a SUBSET, so every allowlist entry outside that subset
+  // would be reported as "no longer tracked" — a factually false message that
+  // fails every commit not touching the allowlisted file. That turns the
+  // pre-commit hook into a wall the moment a first legitimate entry is added,
+  // and trains contributors toward `--no-verify`, which disables the gate for
+  // ALL commits — the same reasoning that drives the AC-6 --staged carve-out
+  // above. The full-tree CI scan is the authoritative allowlist validator, and
+  // it runs on every pull_request and on every tag push.
+  //
+  // Hazard SUPPRESSION is unaffected and still applies in every mode:
+  // hazardAllowMap is keyed by path, so an allowlisted file staged with its
+  // declared codepoints still passes. Only the staleness verdict is deferred.
+  if (isFullTree) {
+    for (const entry of BINARY_ALLOWLIST) {
+      const exists = fileEntries.some(e => e.path === entry.path);
+      if (!exists) {
+        errors.push(`BINARY_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+      }
     }
-  }
-  for (const entry of HAZARD_ALLOWLIST) {
-    const exists = fileEntries.some(e => e.path === entry.path);
-    if (!exists) {
-      errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
-    } else {
-      // Verify the declared codepoints actually occur in the file
-      for (const cp of entry.codepoints) {
-        const key = `${entry.path}:${cp}`;
-        if (!exercisedAllowlist.has(key)) {
-          errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" cp U+${cp.toString(16).toUpperCase().padStart(4, '0')} — codepoint not found in file`);
+    for (const entry of HAZARD_ALLOWLIST) {
+      const exists = fileEntries.some(e => e.path === entry.path);
+      if (!exists) {
+        errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+      } else {
+        // Verify the declared codepoints actually occur in the file
+        for (const cp of entry.codepoints) {
+          const key = `${entry.path}:${cp}`;
+          if (!exercisedAllowlist.has(key)) {
+            errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" cp U+${cp.toString(16).toUpperCase().padStart(4, '0')} — codepoint not found in file`);
+          }
         }
       }
     }

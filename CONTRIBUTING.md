@@ -134,8 +134,9 @@ node scripts/verify-pr-checks.mjs <pr-number>
 
 The verifier reads required contexts from live branch protection, checks that
 every context is `status=completed` AND `conclusion=success`, and on pass
-emits a `gh pr merge --squash --match-head-commit <sha>` command pinned to
-the verified SHA (closes the TOCTOU window).
+emits a `gh pr merge --squash --admin --match-head-commit <sha>` command pinned
+to the verified SHA (closes the TOCTOU window). Copy it verbatim — hand-editing
+the command is where `--match-head-commit` gets dropped.
 
 Exit codes are a contract: `0` all Tier A, Tier A+, and Tier B checks passed,
 `1` any Tier A failure (required context missing or non-success), any Tier A+
