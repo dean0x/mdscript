@@ -306,3 +306,26 @@ jobs:
       - name: pytest against the installed wheel (perf, advisory)
         continue-on-error: true
         run: pytest crates/mds-python/tests -q -m perf
+
+  # -------------------------------------------------------------------------
+  # #288: Source-hygiene gate — rejects hazardous codepoints (control bytes,
+  # bidi overrides, BOM) from tracked source. Scans the full tracked tree via
+  # `git ls-files`, reads content at codepoint level (pure Node; no grep -P
+  # which BSD grep lacks). Positive-control suite proves the check is live.
+  #
+  # D-CB7: BSD grep lacks -P and exits 2 with empty output, making the absence
+  # of hazard bytes indistinguishable from a broken invocation (avoids PF-013).
+  # D-CB5: Zero-files-scanned is exit 1, not exit 0 (avoids PF-016).
+  # -------------------------------------------------------------------------
+  source-hygiene:
+    name: Source hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Scan tracked source for hazardous codepoints
+        run: node scripts/verify-no-control-bytes.mjs
+      - name: Run positive-control and class-completeness suite
+        run: node --test scripts/__test__/*.spec.mjs

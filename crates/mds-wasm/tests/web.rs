@@ -930,7 +930,7 @@ fn wasm_del_in_error_message_is_escaped() {
 fn wasm_lint_virtual_nel_in_module_name_sanitizes_message() {
     // T-15/F6-C1: U+0085 (NEL/C1) in lintVirtual module name — same lint-path pattern
     // as F6 with a C1 control character. NEL passes serde_yaml_ng (unlike ESC/DEL),
-    // making it a reachable C1 vector. Verifies the sanitized  literal appears.
+    // making it a reachable C1 vector. Verifies the sanitized U+0085 literal appears.
     let nel = '\u{0085}';
     let module_name = format!("fo{nel}o.mds");
     let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");

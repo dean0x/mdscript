@@ -30,6 +30,16 @@ jobs:
         with: { node-version: 22 }
       - name: "Assert synchronized versions, no file: refs"
         run: node scripts/verify-versions.mjs
+      # #288: Source-hygiene gate — also runs on tag pushes via this job.
+      # ci.yml does not run on tag pushes, so these two steps ensure the full
+      # gate (scanner + positive-control suite) is enforced at release time.
+      # The positive-control suite pins HAZARD_RANGES (D-CB1a) so a silently-
+      # narrowed hazard class cannot exit 0 on the release path (ADR-009/PF-013).
+      # Uses the same Node 22 install above.
+      - name: "Assert no hazardous codepoints in tracked source"
+        run: node scripts/verify-no-control-bytes.mjs
+      - name: "Run positive-control and class-completeness suite"
+        run: node --test scripts/__test__/*.spec.mjs
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.

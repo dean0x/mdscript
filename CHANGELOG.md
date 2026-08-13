@@ -624,6 +624,32 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   (span attribution machinery, `end_offset` fields, `FixLineSpan` planner) pushed
   the optimized WASM binary to ~808 KB. The guard in `ci.yml` was raised accordingly.
 
+- **Code of Conduct** (#38): `CODE_OF_CONDUCT.md` at the repository root, using
+  Contributor Covenant 2.1 with `deanshrn@gmail.com` as the enforcement contact.
+  Linked from `CONTRIBUTING.md` and `README.md`.
+
+- **Source-hygiene CI gate** (#288): `scripts/verify-no-control-bytes.mjs` scans
+  every tracked file for hazardous codepoints — C0 control characters (excluding
+  TAB and LF), DEL, C1 (at codepoint level, catching UTF-8-encoded NEL U+0085),
+  the twelve `Bidi_Control=Yes` characters (Trojan Source / CVE-2021-42574), the
+  JavaScript line/paragraph separators U+2028 and U+2029, and U+FEFF (BOM).
+  Runs in CI on every pull_request and on tag pushes (release.yml). An opt-in
+  pre-commit hook (`scripts/hooks/pre-commit`) is provided; it reads the staged
+  blob via `git cat-file`, not the working tree. Also remediates seven live
+  U+0085 bytes that had been injected into tracked source by the edit tooling
+  (PF-018).
+
+- **Pre-merge check verifier** (#289): `scripts/verify-pr-checks.mjs` guards
+  against PF-017 (a cancelled CI run reads as "not failing" to `gh pr merge
+  --admin`). It evaluates three tiers: Tier A asserts every required
+  branch-protection context is `completed+success`; Tier B fails on any
+  non-required check-run that concluded
+  `failure/cancelled/timed_out/action_required/stale`; Tier C (legacy commit
+  statuses) is advisory. It emits a `gh pr merge --squash --match-head-commit
+  <sha>` command pinned to the verified SHA. Exit 0: Tier A and Tier B pass;
+  exit 1: any Tier A/B failure or zero check-runs found; exit 2:
+  tool/permission errors.
+
 ### Changed
 
 - **napi and Python `compileFile` / `compile_file` now emit root-relative
