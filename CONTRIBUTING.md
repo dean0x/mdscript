@@ -165,7 +165,9 @@ branch, so a stale-but-green head can still be merged under `--admin` even
 after the verifier passes. Keep the branch rebased. It does **not** assert that
 `source-hygiene` is a required context — `--admin` bypasses required-status
 enforcement outright for non-required checks, so Tier A+ (`EXPECTED_CONTEXTS`)
-and Tier B are the binding mechanisms for non-required jobs. Tier B fails on
+and Tier B are complementary binding mechanisms for non-required jobs — Tier A+
+covers absent and renamed jobs (Tier B cannot: it only iterates existing
+check-runs); Tier B covers existing runs that concluded badly. Tier B fails on
 non-required check-runs that are still `queued` or `in_progress` — a
 non-completed run is not evidence of success (avoids PF-017). Ensure all jobs
 have completed before running the verifier.
