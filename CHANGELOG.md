@@ -113,7 +113,9 @@ output, matches `<source>` in an `error.message` or rendered frame, relies on
 spans have length 7.
 
 **1. Diagnostics are sorted by byte offset (#202).** Within each
-`files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`.
+`files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`
+for results produced by the lint engine; a `LintResult` assembled directly via
+`LintResult::new` is emitted in the order the caller supplied.
 Previously the order was rule-execution order (implementation-defined).
 
 - Diagnostics without a span sort to the end of their file group.
@@ -129,6 +131,9 @@ Previously the order was rule-execution order (implementation-defined).
 - **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is
   `true`, the retained diagnostics are still the first `MAX_DIAGNOSTICS` (1,000)
   in rule-execution order, re-sorted afterwards — not the 1,000 smallest offsets.
+- **Sort cost (AC-P1-22):** The sort key is a borrowed tuple `(bool, &str, bool,
+  usize)` — zero per-comparison heap allocations. The sort runs at most once per
+  `LintResultBuilder::build` call over n <= `MAX_DIAGNOSTICS` (1,000) items.
 
 **2. The stdin source identity is always `<stdin>` (#211).** Every CLI context
 that names a stdin source now uses the single sentinel `<stdin>`:
