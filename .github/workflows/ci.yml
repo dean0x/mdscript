@@ -362,4 +362,6 @@ jobs:
       - name: Scan tracked source for hazardous codepoints
         run: node scripts/verify-no-control-bytes.mjs
       - name: Run positive-control and class-completeness suite
-        run: node --test scripts/__test__/*.spec.mjs
+        run: |
+          shopt -s failglob
+          node --test scripts/__test__/*.spec.mjs
