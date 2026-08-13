@@ -372,18 +372,41 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6: --staged with nothing staged → exits 1 with non-vacuity message', () => {
-    // D-CB5 mandates exit 1 when zero files are scanned, unconditionally — including
-    // in --staged mode. The previous `&& !isStaged` carve-out silently exempted the
-    // pre-commit hook from the guard it was designed to protect.
+  test('AC-6 --staged: no staged content (amend/nothing staged) → exits 0 with explicit message', () => {
+    // D-CB5's non-vacuity guard applies to full-tree mode only. In --staged mode
+    // an empty ACMR-filtered set is a legitimate state — `git commit --amend
+    // --no-edit` and `--allow-empty` produce exactly this. Exiting 1 here blocks
+    // valid commits and trains contributors to reach for --no-verify, which
+    // disables the gate for ALL commits. Fix: exit 0 with an explicit message.
     const { dir } = mkTempGitRepo();
     try {
-      // Nothing staged — `git diff --cached` returns empty, yielding zero file entries.
+      // Nothing staged — `git diff --cached` returns empty.
       const r = runScanner(['--staged'], { cwd: dir });
-      assert.equal(r.status, 1, '--staged with nothing staged must exit 1 (non-vacuity guard)');
+      assert.equal(r.status, 0, '--staged with nothing staged must exit 0 (no content to scan)');
       assert.ok(
-        r.stderr.includes('zero files scanned') || r.stderr.includes('empty scan'),
-        `error must mention zero files; got: ${r.stderr}`
+        r.stdout.includes('nothing to scan') || r.stdout.includes('no staged'),
+        `stdout must explain why scanning was skipped; got stdout: ${r.stdout}`
+      );
+    } finally { cleanup(dir); }
+  });
+
+  test('AC-6 --staged: deletion-only commit → exits 0 with deletion count', () => {
+    // A commit that removes files only (git rm) yields zero ACMR-filtered paths
+    // because D = deletion is excluded from the ACMR filter. The scanner must
+    // exit 0, not 1. D-CB5 non-vacuity applies to full-tree mode only.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Commit a clean file, then stage its deletion
+      writeFileSync(join(dir, 'to-delete.md'), 'content\n');
+      git('add', 'to-delete.md');
+      git('commit', '-m', 'add file');
+      git('rm', 'to-delete.md');
+      // The deletion is staged; ACMR filter excludes it → zero content-bearing paths
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0, 'deletion-only staged set must exit 0');
+      assert.ok(
+        r.stdout.includes('deletion') || r.stdout.includes('nothing to scan'),
+        `stdout must explain why scanning was skipped; got stdout: ${r.stdout}`
       );
     } finally { cleanup(dir); }
   });

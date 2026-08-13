@@ -21,12 +21,16 @@
  * lacks -P and exits 2 with empty output, making the absence of hazard bytes
  * indistinguishable from a grep invocation that cannot run (avoids PF-013).
  *
- * D-CB5: Fails closed. Zero-files-scanned is exit 1, not exit 0 (avoids
- * PF-016 — an empty scan masquerades as clean).
+ * D-CB5: Fails closed. In full-tree mode, zero-files-scanned is exit 1, not
+ * exit 0 (avoids PF-016 — an empty scan masquerades as clean). In --staged
+ * mode, an empty ACMR-filtered set is a legitimate state (deletion-only
+ * commits, amend with no content changes) and exits 0 with an explicit
+ * message; the full-tree scan is the authoritative non-vacuity gate.
  *
- * D-CB8: --staged mode reads file content from the git index (git cat-file
- * blob :<path>), never from the working tree. Staging a clean file then
- * modifying the working copy does not bypass the hook.
+ * D-CB8: --staged mode reads file content from the git index via a single
+ * `git cat-file --batch` subprocess (all staged blobs at once), never from
+ * the working tree. Staging a clean file then modifying the working copy
+ * does not bypass the hook.
  *
  * Usage:
  *   node scripts/verify-no-control-bytes.mjs              # full tree scan
@@ -181,54 +185,6 @@ function hexContext(buf, offset) {
   return hex.join(' ');
 }
 
-// ---------------------------------------------------------------------------
-// UTF-8 decoder (returns array of {cp, byteOffset} objects)
-// ---------------------------------------------------------------------------
-
-/**
- * Decode a UTF-8 buffer into an array of {cp, byteOffset}.
- * Returns null if the buffer is not valid UTF-8 (after NUL check).
- * @param {Buffer} buf
- * @returns {{ cp: number, byteOffset: number }[] | null}
- */
-function decodeUtf8(buf) {
-  const codepoints = [];
-  let i = 0;
-  while (i < buf.length) {
-    const b0 = buf[i];
-    let cp, len;
-    if (b0 <= 0x7f) {
-      cp = b0;
-      len = 1;
-    } else if ((b0 & 0xe0) === 0xc0) {
-      if (i + 1 >= buf.length) return null;
-      const b1 = buf[i + 1];
-      if ((b1 & 0xc0) !== 0x80) return null;
-      cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
-      len = 2;
-    } else if ((b0 & 0xf0) === 0xe0) {
-      if (i + 2 >= buf.length) return null;
-      const b1 = buf[i + 1];
-      const b2 = buf[i + 2];
-      if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80) return null;
-      cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
-      len = 3;
-    } else if ((b0 & 0xf8) === 0xf0) {
-      if (i + 3 >= buf.length) return null;
-      const b1 = buf[i + 1];
-      const b2 = buf[i + 2];
-      const b3 = buf[i + 3];
-      if ((b1 & 0xc0) !== 0x80 || (b2 & 0xc0) !== 0x80 || (b3 & 0xc0) !== 0x80) return null;
-      cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
-      len = 4;
-    } else {
-      return null; // Invalid lead byte
-    }
-    codepoints.push({ cp, byteOffset: i });
-    i += len;
-  }
-  return codepoints;
-}
 
 // ---------------------------------------------------------------------------
 // git helpers
@@ -297,7 +253,7 @@ function getTrackedFiles(cwd) {
 /**
  * Get staged file list for --staged mode.
  * Uses `git diff --cached --name-only -z --diff-filter=ACMR` for paths.
- * D-CB8: content read from git index via `git cat-file blob :<path>`.
+ * D-CB8: content is fetched later in batch via readAllIndexBlobs().
  */
 function getStagedFiles(cwd) {
   const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR'], cwd);
@@ -317,16 +273,83 @@ function getStagedFiles(cwd) {
 }
 
 /**
- * Read file content from the git index (staged blob) via `git cat-file blob :<path>`.
- * D-CB8: never reads from the working tree in --staged mode.
+ * Read all staged blobs in one `git cat-file --batch` subprocess.
+ * D-CB8: collapses N per-file spawns into one, never reads the working tree.
+ *
+ * `git cat-file --batch` output for each valid blob:
+ *   <sha> blob <size>\n
+ *   <content — exactly <size> bytes>
+ *   \n   ← one-byte LF terminator after content
+ *
+ * @param {string[]} paths — repo-relative staged paths
+ * @param {string}   cwd
+ * @returns {Map<string, Buffer>}
  */
-function readIndexBlob(path, cwd) {
-  const r = gitExec(['cat-file', 'blob', `:${path}`], cwd);
-  if (r.status !== 0) {
-    console.error(`✖ verify-no-control-bytes: cannot read staged blob for ${path}`);
+function readAllIndexBlobs(paths, cwd) {
+  if (paths.length === 0) return new Map();
+
+  // Input: ":<path>\n" for every staged path
+  const stdin = Buffer.from(paths.map(p => `:${p}\n`).join(''), 'utf8');
+  const r = spawnSync('git', ['cat-file', '--batch'], {
+    cwd,
+    input: stdin,
+    encoding: 'buffer',
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  if (r.error) {
+    console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
     process.exit(2);
   }
-  return r.stdout; // Buffer
+  if (r.status !== 0) {
+    console.error(
+      `✖ verify-no-control-bytes: git cat-file --batch exited ${r.status}: ` +
+      `${r.stderr.toString('utf8').trim()}`,
+    );
+    process.exit(2);
+  }
+
+  const out = r.stdout;
+  const results = new Map();
+  let pos = 0;
+
+  for (const path of paths) {
+    if (pos >= out.length) {
+      console.error(`✖ verify-no-control-bytes: unexpected end of cat-file output for ${path}`);
+      process.exit(2);
+    }
+    // Find header line (terminated by LF)
+    let nlPos = pos;
+    while (nlPos < out.length && out[nlPos] !== 0x0a) nlPos++;
+    if (nlPos >= out.length) {
+      console.error(`✖ verify-no-control-bytes: malformed cat-file header for ${path}`);
+      process.exit(2);
+    }
+    const header = out.slice(pos, nlPos).toString('utf8');
+    pos = nlPos + 1; // advance past header LF
+
+    // Check for "missing" response (no content follows)
+    if (header.endsWith(' missing')) {
+      console.error(`✖ verify-no-control-bytes: staged path not in index: ${path}`);
+      process.exit(2);
+    }
+    // Parse "<sha> blob <size>"
+    const parts = header.split(' ');
+    if (parts.length !== 3 || parts[1] !== 'blob') {
+      console.error(
+        `✖ verify-no-control-bytes: unexpected cat-file response for ${path}: ${header}`,
+      );
+      process.exit(2);
+    }
+    const size = parseInt(parts[2], 10);
+    if (Number.isNaN(size) || size < 0) {
+      console.error(`✖ verify-no-control-bytes: invalid blob size for ${path}: ${header}`);
+      process.exit(2);
+    }
+    results.set(path, out.slice(pos, pos + size));
+    pos += size + 1; // advance past content + terminator LF
+  }
+
+  return results;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +358,16 @@ function readIndexBlob(path, cwd) {
 
 /**
  * Scan a single file buffer for hazardous codepoints.
+ *
+ * The UTF-8 decode and hazard check are fused into one inline pass — no
+ * intermediate {cp, byteOffset} array is allocated. Only hit records are
+ * retained. This eliminates the ~53x heap amplification of the former
+ * decodeUtf8() materialisation (AC-30).
+ *
+ * nextCp look-ahead: isHazardous() uses nextCp only to check `nextCp !== 0x0A`
+ * (CRLF exception for CR). LF is ASCII, so `buf[nextStart] === 0x0A` iff the
+ * next codepoint is LF — passing the raw lead byte is correct here.
+ *
  * @param {Buffer} buf    — raw file bytes
  * @param {string} relPath — repo-relative path (for error messages)
  * @param {Set<number>} allowedCps — codepoints explicitly allowlisted for this file
@@ -353,18 +386,51 @@ export function scanBuffer(buf, relPath, allowedCps) {
     return []; // Allowed binary file
   }
 
-  const codepoints = decodeUtf8(buf);
-  if (codepoints === null) {
-    return [{ codepoint: -1, byteOffset: 0, invalidUtf8: true }];
-  }
-
+  // Inline UTF-8 decode + hazard scan (no intermediate codepoint array).
   const hits = [];
-  for (let i = 0; i < codepoints.length; i++) {
-    const { cp, byteOffset } = codepoints[i];
-    const nextCp = i + 1 < codepoints.length ? codepoints[i + 1].cp : null;
-    if (isHazardous(cp, nextCp)) {
-      hits.push({ codepoint: cp, byteOffset, allowed: allowedCps.has(cp) });
+  let i = 0;
+  while (i < buf.length) {
+    const b0 = buf[i];
+    let cp, len;
+
+    if (b0 <= 0x7f) {
+      cp = b0;
+      len = 1;
+    } else if ((b0 & 0xe0) === 0xc0) {
+      if (i + 1 >= buf.length || (buf[i + 1] & 0xc0) !== 0x80) {
+        return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }];
+      }
+      cp = ((b0 & 0x1f) << 6) | (buf[i + 1] & 0x3f);
+      len = 2;
+    } else if ((b0 & 0xf0) === 0xe0) {
+      if (i + 2 >= buf.length || (buf[i + 1] & 0xc0) !== 0x80 || (buf[i + 2] & 0xc0) !== 0x80) {
+        return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }];
+      }
+      cp = ((b0 & 0x0f) << 12) | ((buf[i + 1] & 0x3f) << 6) | (buf[i + 2] & 0x3f);
+      len = 3;
+    } else if ((b0 & 0xf8) === 0xf0) {
+      if (i + 3 >= buf.length ||
+          (buf[i + 1] & 0xc0) !== 0x80 ||
+          (buf[i + 2] & 0xc0) !== 0x80 ||
+          (buf[i + 3] & 0xc0) !== 0x80) {
+        return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }];
+      }
+      cp = ((b0 & 0x07) << 18) |
+           ((buf[i + 1] & 0x3f) << 12) |
+           ((buf[i + 2] & 0x3f) << 6) |
+           (buf[i + 3] & 0x3f);
+      len = 4;
+    } else {
+      return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }]; // Invalid lead byte
     }
+
+    // Peek first byte of next sequence for CRLF look-ahead (see JSDoc above).
+    const nextStart = i + len;
+    const nextCp = nextStart < buf.length ? buf[nextStart] : null;
+    if (isHazardous(cp, nextCp)) {
+      hits.push({ codepoint: cp, byteOffset: i, allowed: allowedCps.has(cp) });
+    }
+    i += len;
   }
   return hits;
 }
@@ -409,15 +475,39 @@ function main() {
   }
 
   // ---- D-CB5: Non-vacuity guard (AC-6) ----
-  // Zero files scanned — including in --staged mode — is exit 1, never 0.
-  // "Scanned 0 file(s), 0 byte(s): clean" is indistinguishable from a broken
-  // path-discovery that never found anything (the exact shape D-CB5 forbids).
+  // Full-tree mode: zero tracked files means path discovery broke — fail closed.
+  // --staged mode: an empty ACMR-filtered set is a LEGITIMATE state:
+  //   • deletion-only commit (git rm): ACMR excludes deletions; files ARE staged.
+  //   • amend with no content changes: index equals HEAD; diff is empty.
+  // In both cases exit 0 with an explicit message. The full-tree scan is the
+  // authoritative non-vacuity gate; the hook must not block valid commits.
   if (fileEntries.length === 0) {
-    console.error('✖ verify-no-control-bytes: zero files scanned (D-CB5: empty scan is not a pass)');
-    console.error(isStaged
-      ? '  No staged files found — stage at least one file before running the pre-commit hook.'
-      : '  If this is a new repo with no commits, run `git add` first.');
-    process.exit(1);
+    if (!isStaged) {
+      console.error('✖ verify-no-control-bytes: zero files scanned (D-CB5: empty scan is not a pass)');
+      console.error('  If this is a new repo with no commits, run `git add` first.');
+      process.exit(1);
+    }
+    // --staged: check unfiltered diff to provide an accurate message.
+    const rAll = gitExec(['diff', '--cached', '--name-only', '-z'], cwd);
+    if (rAll.status !== 0) {
+      console.error(
+        `✖ verify-no-control-bytes: git diff --cached (unfiltered) failed: ` +
+        `${rAll.stderr.toString('utf8').trim()}`,
+      );
+      process.exit(2);
+    }
+    const allPaths = rAll.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
+    if (allPaths.length > 0) {
+      // Staged changes exist but are all deletions — nothing for the content scanner to do.
+      console.log(
+        `✓ source-hygiene gate: 0 content-bearing staged paths` +
+        ` (${allPaths.length} deletion(s)) — nothing to scan`,
+      );
+    } else {
+      // Index equals HEAD (amend --no-edit, reword, --allow-empty, etc.).
+      console.log('✓ source-hygiene gate: no staged content — nothing to scan');
+    }
+    process.exit(0);
   }
 
   // ---- Validate allowlists upfront (D-CB6) ----
@@ -432,6 +522,11 @@ function main() {
     }
   }
 
+  // ---- In --staged mode, pre-fetch all blobs in one subprocess (D-CB8) ----
+  // readAllIndexBlobs() collapses N per-file `git cat-file blob` spawns into a
+  // single `git cat-file --batch` call (~11 ms/file saved for large staged sets).
+  const blobMap = isStaged ? readAllIndexBlobs(fileEntries.map(e => e.path), cwd) : null;
+
   // ---- Scan each file ----
   let totalBytes = 0;
   let scannedFiles = 0;
@@ -444,7 +539,11 @@ function main() {
     let buf;
     try {
       if (isStaged) {
-        buf = readIndexBlob(entry.path, cwd);
+        buf = blobMap.get(entry.path);
+        if (buf === undefined) {
+          errors.push(`Cannot read staged blob for ${entry.path}: not in batch output`);
+          continue;
+        }
       } else {
         buf = readFileSync(entry.absolutePath || resolve(cwd, entry.path));
       }
