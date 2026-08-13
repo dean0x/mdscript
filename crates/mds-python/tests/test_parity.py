@@ -311,8 +311,9 @@ def test_ac_p1_24_cross_surface_diagnostic_order_parity(
         text=True,
         encoding="utf-8",
     )
-    # Exit 1 is expected: the source has findings (legacy-interpolation is a warning).
-    assert cli_out.returncode in (0, 1), (
+    # Exit 1 (warning-severity findings) or 2 (error-severity findings) are both
+    # valid: legacy-interpolation is a warning, duplicate-export is an error.
+    assert cli_out.returncode in (0, 1, 2), (
         f"CLI lint exited unexpectedly with {cli_out.returncode}: {cli_out.stderr}"
     )
     cli_result = json.loads(cli_out.stdout)

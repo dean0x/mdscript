@@ -1604,7 +1604,10 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
 
     // Non-vacuity guard: the message must be non-empty so the absence checks below
     // are not trivially satisfied by an empty string.
-    assert!(!message.is_empty(), "AC-P1-07: error.message must not be empty");
+    assert!(
+        !message.is_empty(),
+        "AC-P1-07: error.message must not be empty"
+    );
 
     // ADR-009 / PF-013 positive controls: these fabricated strings WOULD trigger
     // the assertions below to FAIL, proving the detection logic is sound.
@@ -1642,7 +1645,7 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
 /// AC-P1-04: `lint`, `check`, `build`, and `fmt` all name a stdin source with the
 /// SAME sentinel per the §0a ruling.
 ///
-/// This test has two parts because the subcommands have different output shapes:
+/// This test has three parts because the subcommands have different output shapes:
 ///
 /// **Error-frame part** (`lint`, `check`, `build`): a broken source triggers a
 /// miette code frame and `frame_source_identity` extracts the label.  `mds build -`
@@ -1653,6 +1656,13 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
 /// **Status-line part** (`fmt --check`): a valid but reformattable source causes
 /// `mds fmt --check -` to print `"Would reformat: <stdin>"` — a different output
 /// shape, covered separately after the loop.
+///
+/// **Success-line part** (`check`): a valid source causes `mds check -` to print
+/// `"OK: <stdin>"`.  This is the third distinct output shape: the
+/// `output::STDIN_DISPLAY_LABEL` constant at `main.rs` is shared with
+/// `fmt.rs`; a regression pointing the constant at the wrong value must be
+/// caught here, not by the print-discipline allowlist (which pins the sanitizer
+/// exemption, not the emitted text).
 ///
 /// Before the relabels landed, `mds check -` and `mds build -` rendered
 /// `[<source>:1:1]` and `mds lint -` rendered `[input.mds:1:1]`.  `mds fmt -`
@@ -1710,6 +1720,32 @@ fn stdin_source_identity_is_uniform_across_subcommands() {
             !fmt_stderr.contains("input.mds") && !fmt_stderr.contains("<source>"),
             "AC-P1-04: `mds fmt --check -` must not emit old source labels; \
              got:\n{fmt_stderr}"
+        );
+    }
+
+    // Part 3 — check success line: `mds check -` emits "OK: <stdin>" when stdin
+    // passes validation (AD-211-3 / AC-P1-04).  This pins the `main.rs`
+    // `output::STDIN_DISPLAY_LABEL` usage at the `OK:` status line; a regression
+    // that swapped the constant back to a bare literal would be caught here.
+    {
+        // Plain valid MDS source — no syntax errors, no undefined variables.
+        let valid_source = "Hello!\n";
+        let out = run_mds_stdin("check", valid_source);
+        let check_stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "AC-P1-04: `mds check -` must succeed for valid stdin; \
+             got:\n{check_stderr}"
+        );
+        assert!(
+            check_stderr.contains("OK: <stdin>"),
+            "AC-P1-04: `mds check -` must emit 'OK: <stdin>' on success; \
+             got:\n{check_stderr}"
+        );
+        assert!(
+            !check_stderr.contains("input.mds") && !check_stderr.contains("<source>"),
+            "AC-P1-04: `mds check -` must not emit old source labels; \
+             got:\n{check_stderr}"
         );
     }
 }
