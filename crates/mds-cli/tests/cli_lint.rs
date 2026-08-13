@@ -1750,6 +1750,93 @@ fn stdin_source_identity_is_uniform_across_subcommands() {
     }
 }
 
+// ── PF-012 guard: imported-file errors must not be relabelled as <stdin> ───────
+
+/// Pins the conditional guard inside `relabel_stdin_error` (output.rs).
+///
+/// The guard — `e.source_name().is_some_and(|n| n == "<source>")` — prevents
+/// relabelling errors whose embedded source belongs to an IMPORTED file.  When
+/// stdin imports a file that fails to parse (broken lib.mds), the `MdsError`
+/// carries the imported file's real path as its source name.  Because that path
+/// is not the sentinel `"<source>"`, the guard is false and `StdinRelabeledError`
+/// is constructed with `source: None`, which makes `source_code()` delegate to
+/// the inner error — preserving lib.mds's path in the miette code frame.
+///
+/// **Why the existing tests do not cover this path:** every prior stdin test
+/// passes an import-free broken source (`@if\nbroken\n`) so the error always
+/// originates in the stdin source itself and always carries `"<source>"` — the
+/// guard is always true and the mutation of removing it does not change the
+/// observable output.
+///
+/// **Proven necessary by mutation:** removing the guard (making the relabel
+/// unconditional) lets all 681 prior tests pass while silently mis-anchoring
+/// the miette caret.  The relabelled report uses stdin text as source content
+/// but the span is lib.mds's byte offset — exactly the PF-012
+/// in-bounds-but-wrong-source class the guard was added to prevent.
+///
+/// PF-013 positive control: asserts that "lib.mds" IS in the frame identity
+/// before asserting that "<stdin>" is NOT, so neither assertion can pass
+/// vacuously.
+#[test]
+fn stdin_import_error_frame_names_imported_file_not_stdin() {
+    use std::io::Write;
+
+    // A syntactically broken imported file: @if without a condition is a hard
+    // parse error.  The resolver embeds lib.mds's canonical path in the error's
+    // NamedSource (MdsError::Syntax { src: Some(NamedSource::new(key, …)) }),
+    // so source_name() returns the real path, not "<source>", and the guard is
+    // false.  attach_import_span passes MdsError::Syntax through unchanged, so
+    // the source identity is preserved end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("lib.mds");
+    fs::write(&lib, "@if\n").unwrap();
+
+    // The stdin source itself is syntactically valid (@import is well-formed).
+    // The analysis failure originates entirely inside lib.mds, not in stdin.
+    let stdin_src = "@import { x } from \"./lib.mds\"\n";
+
+    for subcommand in ["lint", "check"] {
+        let mut child = mds_bin()
+            .arg(subcommand)
+            .arg("-")
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Ignore BrokenPipe — process may exit before reading stdin.
+        let _ = child.stdin.take().unwrap().write_all(stdin_src.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // Non-vacuity: a miette code frame must be rendered at all.
+        let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
+            panic!(
+                "PF-012: `mds {subcommand} -` (stdin importing broken lib.mds) must \
+                 render a miette code frame; got:\n{stderr}"
+            )
+        });
+
+        // PF-013 positive control: the frame must identify lib.mds so the
+        // absence check below cannot pass vacuously on an empty or wrong identity.
+        assert!(
+            identity.contains("lib.mds"),
+            "PF-012: `mds {subcommand} -` frame must name 'lib.mds', not '<stdin>'; \
+             got '{identity}'.\n{stderr}"
+        );
+
+        // Guard assertion: imported-file errors must NOT be relabelled to <stdin>.
+        // If the guard in relabel_stdin_error is removed, the frame shows
+        // "<stdin>" instead of the real lib.mds path — this assertion catches that.
+        assert_ne!(
+            identity, "<stdin>",
+            "PF-012: `mds {subcommand} -` must not relabel an imported-file error \
+             as '<stdin>'; the relabel_stdin_error guard is broken.\n{stderr}"
+        );
+    }
+}
+
 // ── AC-P1-10: `files[]` array ordering is part of the wire contract ──────────
 
 /// Directory mode path-sorts `files[]`; single-file and stdin emit exactly one
