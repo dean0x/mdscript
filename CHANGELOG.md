@@ -118,12 +118,12 @@ Previously the order was rule-execution order (implementation-defined).
 
 - Diagnostics without a span sort to the end of their file group.
 - Equal-offset diagnostics preserve rule-execution order (stable sort).
-- File groups have a defined order: in `mds lint <dir>` the CLI sorts by
-  `Path::Ord` (component-wise, via `Vec<PathBuf>::sort()`), not byte-wise. On
-  the binding surfaces (napi / WASM / Python) `to_canonical_json` uses a
-  `BTreeMap` and orders file groups byte-wise on the file key string. The two
-  rules agree for ordinary paths; they diverge only when a path-separator
-  character appears within a filename component.
+- File groups have a defined order: `mds lint <dir>` sorts by the byte-wise
+  (lexicographic) string representation of the relative display path, matching
+  the `BTreeMap` key ordering that `to_canonical_json` uses on the binding
+  surfaces (napi / WASM / Python). Both order by byte-wise string on the file
+  key — e.g. `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) <
+  `'/'` (0x2F).
 - Ordering is established on `LintResult.diagnostics` itself, so the CLI human
   path and the napi / WASM / Python surfaces observe the same order.
 - **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is

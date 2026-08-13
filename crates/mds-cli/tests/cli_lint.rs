@@ -1839,17 +1839,27 @@ fn stdin_import_error_frame_names_imported_file_not_stdin() {
 
 // ── AC-P1-10: `files[]` array ordering is part of the wire contract ──────────
 
-/// Directory mode path-sorts `files[]`; single-file and stdin emit exactly one
-/// entry. Both halves are frozen here because a published contract has to pin the
-/// order of the outer array too, not only the diagnostics inside each entry.
+/// Directory mode path-sorts `files[]` by byte-wise (lexicographic) string order
+/// on the relative display path; single-file and stdin emit exactly one entry.
+/// Both halves are frozen here because a published contract has to pin the order
+/// of the outer array too, not only the diagnostics inside each entry.
+///
+/// **Non-vacuity (PF-013):** the fixture intentionally includes `api-utils.mds`
+/// (flat) alongside `api/x.mds` (in a subdirectory).  Under `Path::Ord`
+/// (component-wise), `api/x.mds` sorts before `api-utils.mds` because the first
+/// component `"api"` is shorter than `"api-utils.mds"`.  Under byte-wise string
+/// order, `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'`
+/// (0x2F).  The oracle (`sorted.sort_unstable()` on strings) expects byte-wise
+/// order, so a regression that reverts to `Path::Ord` produces a different
+/// sequence and the assertion fails.
 #[test]
 fn json_files_array_is_path_sorted_in_directory_mode() {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join("sub")).unwrap();
-    // Written in an order that is neither alphabetical nor reverse-alphabetical,
-    // so passing cannot be an accident of filesystem enumeration order.
+    fs::create_dir(dir.path().join("api")).unwrap();
+    // Written in an order that is neither the expected string-sorted order nor
+    // the Path::Ord order, so passing cannot be an accident of enumeration order.
     let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
-    for rel in ["b.mds", "a.mds", "sub/c.mds"] {
+    for rel in ["b.mds", "api/x.mds", "api-utils.mds"] {
         fs::write(dir.path().join(rel), dupe).unwrap();
     }
 
@@ -1868,15 +1878,19 @@ fn json_files_array_is_path_sorted_in_directory_mode() {
         3,
         "all three files must report findings; got: {files:?}"
     );
+    // Oracle: byte-wise string sort. Expected: ["api-utils.mds", "api/x.mds", "b.mds"].
+    // Under Path::Ord (component-wise) the order would be ["api/x.mds", "api-utils.mds",
+    // "b.mds"], so a Path::Ord regression would fail this assertion (PF-013 positive
+    // control).
     let mut sorted = files.clone();
     sorted.sort_unstable();
     assert_eq!(
         files, sorted,
-        "AC-P1-10: files[] must be in ascending path order; got: {files:?}"
+        "AC-P1-10: files[] must be in ascending byte-wise path order; got: {files:?}"
     );
 
     // Single-file mode: exactly one entry.
-    let single = lint_path(&dir.path().join("a.mds"), &["--format", "json"]);
+    let single = lint_path(&dir.path().join("b.mds"), &["--format", "json"]);
     let single_stdout = String::from_utf8_lossy(&single.stdout);
     let sv: serde_json::Value = serde_json::from_str(&single_stdout).unwrap();
     assert_eq!(
