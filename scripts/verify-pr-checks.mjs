@@ -122,10 +122,19 @@ export const EXPECTED_CONTEXTS = ['Source hygiene'];
  * @returns {any}
  */
 function defaultGhRunner(args) {
-  const r = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  // AC-30: hard wall per gh invocation so a hung or throttled connection cannot
+  // block the tool indefinitely (avoids PF-017: indeterminate ≠ success).
+  // ETIMEDOUT maps to the __error path, which callers classify as exit 2.
+  const r = spawnSync('gh', args, {
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 30_000,
+  });
   if (r.error) {
     const stderr = r.error.code === 'ENOENT'
       ? 'gh is not on PATH'
+      : r.error.code === 'ETIMEDOUT'
+      ? 'gh timed out after 30 s (AC-30: indeterminate, not clean)'
       : `gh error: ${r.error.message}`;
     return { __error: true, status: -1, httpStatus: null, stderr };
   }
@@ -265,11 +274,11 @@ export function evaluateChecks({
       found = true;
       // Every run under this name must pass — keeping only the last entry would
       // let a later success mask an earlier failure from a different check-suite.
-      for (const cr of crs) {
+      for (const [idx, cr] of crs.entries()) {
         if (cr.status !== 'completed' || cr.conclusion !== 'success') {
           failures.push(
             `Tier A (required): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'}` +
-            (crs.length > 1 ? ` (1 of ${crs.length} runs sharing this name)` : '') +
+            (crs.length > 1 ? ` (${idx + 1} of ${crs.length} runs sharing this name)` : '') +
             ` (avoids PF-017: cancelled/skipped/in_progress are not success)`,
           );
           pass = false;
@@ -417,7 +426,9 @@ export function evaluateChecks({
 // ---------------------------------------------------------------------------
 
 function ghVersion() {
-  const r = spawnSync('gh', ['--version'], { encoding: 'utf8' });
+  // Short timeout: --version is a local binary probe with no network I/O.
+  // ETIMEDOUT sets r.error → null return → main() exits 2 (indeterminate).
+  const r = spawnSync('gh', ['--version'], { encoding: 'utf8', timeout: 10_000 });
   if (r.error || r.status !== 0) return null;
   // Output: "gh version 2.88.1 (2026-07-17)"
   const m = r.stdout.match(/gh version (\d+)\.(\d+)/);

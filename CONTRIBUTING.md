@@ -78,6 +78,13 @@ for non-vacuity), `1` hazard found or scan failed closed (zero files scanned,
 unreadable path, stale allowlist entry, git not on PATH), `2` indeterminate
 (a git subcommand failed unexpectedly — never treat `2` as clean).
 
+Note on exit-code symmetry: the scanner folds a missing `git` executable into
+its fail-closed exit 1 (a known, named failure — the tool can say definitively
+it could not run), whereas the verifier (`verify-pr-checks.mjs`) treats a missing
+or outdated `gh` as indeterminate exit 2 (the tool cannot assess merge safety).
+Both refuse to report success; they differ in whether tool absence is a named
+failure (exit 1) or an indeterminate error (exit 2).
+
 **Opt-in pre-commit hook** (replaces `.git/hooks` wholesale — document your
 existing local hooks before enabling):
 
@@ -144,10 +151,9 @@ branch, so a stale-but-green head can still be merged under `--admin` even
 after the verifier passes. Keep the branch rebased. It does **not** assert that
 `source-hygiene` is a required context — `--admin` bypasses required-status
 enforcement outright for non-required checks, and Tier B is the binding
-mechanism. Tier B skips non-required check-runs still `queued` or `in_progress`:
-a verifier pass issued while `source-hygiene` is still running has verified
-nothing about source hygiene. Ensure all jobs have completed before running the
-verifier.
+mechanism. Tier B fails on non-required check-runs that are still `queued` or
+`in_progress` — a non-completed run is not evidence of success (avoids PF-017).
+Ensure all jobs have completed before running the verifier.
 
 If the base branch is unprotected (e.g. a wave branch), supply `--required-from`:
 

@@ -67,7 +67,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
  * @param {string} metaUrl — the caller's import.meta.url
  * @returns {boolean}
  */
-export function isMainModule(metaUrl) {
+function isMainModule(metaUrl) {
   const entry = process.argv[1];
   if (!entry) return false;
   const modulePath = fileURLToPath(metaUrl);
@@ -191,13 +191,25 @@ function hexContext(buf, offset) {
 // ---------------------------------------------------------------------------
 
 function gitExec(args, cwd = process.cwd()) {
-  const result = spawnSync('git', args, { cwd, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+  // Hard per-call bound: an index lock or credential prompt must not hang the
+  // pre-commit hook indefinitely. ETIMEDOUT is indeterminate → exit 2, never 0.
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'buffer',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
   if (result.error) {
     if (result.error.code === 'ENOENT') {
       // AC-16: fail-closed (exit 1) — "git missing" is a known, named failure,
       // not an indeterminate tool error.
       console.error('✖ verify-no-control-bytes: git is not on PATH');
       process.exit(1);
+    }
+    if (result.error.code === 'ETIMEDOUT') {
+      // Timeout is indeterminate — a hung git call is not evidence of a clean tree.
+      console.error('✖ verify-no-control-bytes: git timed out after 30 s — indeterminate, not clean');
+      process.exit(2);
     }
     console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
     process.exit(2);

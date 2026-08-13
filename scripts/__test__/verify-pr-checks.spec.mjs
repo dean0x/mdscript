@@ -768,6 +768,80 @@ describe('the verifier runs from a spaced / symlinked path', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tier B: non-required, non-expected check-runs
+//
+// Tier B FAILs on:  failure, cancelled, timed_out, action_required, stale
+//                   queued, in_progress (non-completed = indeterminate → FAIL)
+// Tier B advises on: skipped, neutral (reported but not fatal)
+//
+// Coverage requirement (from review finding): explicit tests for each category
+// so `grep -c "Tier B"` on this file is non-zero for every shape, and the
+// positive control (advisory case → PASS) confirms the suite is not
+// unconditionally failing.
+// ---------------------------------------------------------------------------
+describe('Tier B: non-required non-expected check-run states', () => {
+
+  // Helper: 6 required contexts pass + Source hygiene passes; inject one extra.
+  function baseRunsWith(extra) {
+    return [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      extra,
+    ];
+  }
+
+  test('queued (non-completed) → FAIL (avoids PF-017: indeterminate ≠ success)', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'queued', conclusion: null });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: queued non-required run must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('queued'), `must quote observed status; got: ${allLines}`);
+    assert.ok(allLines.includes('Some background job'), `must name the job; got: ${allLines}`);
+  });
+
+  test('in_progress (non-completed) → FAIL (avoids PF-017: indeterminate ≠ success)', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'in_progress', conclusion: null });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: in_progress non-required run must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('in_progress'), `must quote observed status; got: ${allLines}`);
+  });
+
+  test('failure (completed) → FAIL', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'failure' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: completed/failure non-required run must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('failure'), `must quote conclusion; got: ${allLines}`);
+  });
+
+  test('cancelled (completed) → FAIL', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'cancelled' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: completed/cancelled non-required run must exit 1');
+  });
+
+  test('skipped (completed) → advisory only, PASS (Tier B does not fatal-fail skipped)', () => {
+    // skipped/neutral are ADVISORY in Tier B — the run completed, just not with work.
+    // This positive control proves the describe block is not unconditionally failing.
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'skipped' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'Tier B: skipped is advisory — must not block PASS');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('skipped'), `advisory line must name the conclusion; got: ${allLines}`);
+  });
+
+  test('neutral (completed) → advisory only, PASS (Tier B does not fatal-fail neutral)', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'neutral' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'Tier B: neutral is advisory — must not block PASS');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('neutral'), `advisory line must name the conclusion; got: ${allLines}`);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
 // Duplicate check-run names must not mask a failure
 // ---------------------------------------------------------------------------
 describe('duplicate check-run names are all evaluated', () => {
@@ -784,6 +858,26 @@ describe('duplicate check-run names are all evaluated', () => {
     assert.equal(result.exitCode, 1,
       'a failing required check-run must fail even when a later run shares its name');
     assert.ok(result.lines.join('\n').includes('failure'), 'must quote the observed conclusion');
+  });
+
+  test('loop index is printed correctly when multiple runs share a name', () => {
+    // Review finding: the message hardcoded "(1 of N)" for every run.
+    // After fix: each failing run shows its own 1-based index.
+    const ctx = REQUIRED[0];
+    const runs = [
+      ...loadCheckRuns('checks-main-113f472.json').filter(cr => cr.name !== ctx),
+      { name: ctx, status: 'completed', conclusion: 'failure' },
+      { name: ctx, status: 'completed', conclusion: 'failure' },
+      { name: ctx, status: 'completed', conclusion: 'failure' },
+      SOURCE_HYGIENE_PASS,
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1);
+    const allLines = result.lines.join('\n');
+    // All three runs share the name; each must show its own position.
+    assert.ok(allLines.includes('1 of 3'), `first failing run must show "1 of 3"; got: ${allLines}`);
+    assert.ok(allLines.includes('2 of 3'), `second failing run must show "2 of 3"; got: ${allLines}`);
+    assert.ok(allLines.includes('3 of 3'), `third failing run must show "3 of 3"; got: ${allLines}`);
   });
 
 });
