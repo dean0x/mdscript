@@ -1544,10 +1544,10 @@ fn emit_analysis_failure_json_or_stderr(
                 // error in a delegate that REPLACES source_code() with the relabeled
                 // NamedSource — the same "sanitize inputs, not outputs" discipline as
                 // named_source_for_render elsewhere (PF-014).
-                let named = mds::named_source_for_render(label, src);
                 miette::Report::new(StdinRelabeledError {
                     inner: e.clone(),
-                    source: miette::Diagnostic::source_code(e).map(|_| named),
+                    source: miette::Diagnostic::source_code(e)
+                        .map(|_| mds::named_source_for_render(label, src)),
                 })
             }
             None => miette::Report::from(e.clone()),

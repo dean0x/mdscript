@@ -828,7 +828,6 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
         let mut name_offsets: Vec<usize> = Vec::new();
         let mut cursor = 0usize; // byte cursor within `names_str`
         for seg in names_str.split(',') {
-            let seg_byte_len = seg.len();
             let trimmed = seg.trim();
             if !trimmed.is_empty() {
                 // Count leading whitespace bytes within this segment so we land
@@ -837,7 +836,7 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
                 name_offsets.push(names_str_start + cursor + leading_ws);
                 names.push(trimmed.to_string());
             }
-            cursor += seg_byte_len + 1; // +1 for the comma separator
+            cursor += seg.len() + 1; // +1 for the comma separator
         }
 
         for name in &names {
