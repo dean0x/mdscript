@@ -405,7 +405,12 @@ export function evaluateChecks({
   // in state=error due to account-plan limits — not a workflow in this repo.
   for (const st of statuses) {
     if (requiredSet.has(st.context)) continue; // Already handled in Tier A
-    if (st.state !== 'success' && st.state !== 'pending') {
+    if (st.state === 'pending') {
+      // Asymmetric with Tier B (which FAILs on not-yet-completed runs): a
+      // non-required pending status is advisory only, but it must not be
+      // silently swallowed — the caller cannot know if this is benign.
+      lines.push(`  advisory (Tier C): "${st.context}" — state=pending (not yet resolved)`);
+    } else if (st.state !== 'success') {
       lines.push(`  advisory (Tier C): "${st.context}" — state=${st.state}`);
     }
   }
@@ -416,13 +421,17 @@ export function evaluateChecks({
   }
 
   if (pass) {
-    const cmd = `gh pr merge --squash --match-head-commit ${headSha}`;
+    // D-PR5: --admin is required because main is protected and the sole
+    // code-owner cannot self-approve. Emit it here so the operator can
+    // copy the command verbatim without hand-editing (avoids PF-017: a
+    // hand-edited command is where --match-head-commit gets dropped).
+    const cmd = `gh pr merge --squash --admin --match-head-commit ${headSha}`;
     lines.push(`✓ PASS — all ${nRequired} required contexts completed+success`);
     lines.push(`  Verified SHA: ${headSha}`);
     lines.push(`  Merge command: ${cmd}`);
     return { pass: true, exitCode: 0, lines, mergeCommand: cmd };
   } else {
-    lines.push(`✖ FAIL — ${failures.length} check(s) did not pass`);
+    lines.push(`✖ FAIL — ${failures.length} required context(s) not satisfied`);
     return { pass: false, exitCode: 1, lines };
   }
 }

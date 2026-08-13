@@ -229,9 +229,26 @@ describe('AC-24: non-success states → FAIL, quoting the observed state', () =>
 // ---------------------------------------------------------------------------
 describe('D-PR3b: Source hygiene absence detection (EXPECTED_CONTEXTS)', () => {
 
-  test('EXPECTED_CONTEXTS is [Source hygiene]', () => {
-    assert.deepEqual(EXPECTED_CONTEXTS, ['Source hygiene'],
-      'EXPECTED_CONTEXTS must list exactly "Source hygiene"');
+  test('EXPECTED_CONTEXTS entries each match a job name: in .github/workflows/ci.yml', () => {
+    // avoids PF-013: pinning the constant against itself is a tautology — it proves nothing
+    // about the real CI workflow. Renaming the job in ci.yml must make this test fail so the
+    // developer knows EXPECTED_CONTEXTS needs updating too, rather than silently shipping a
+    // verifier that reports "never ran" at merge time with a misleading diagnosis.
+    const ciYml = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
+    // Job-level names appear at exactly 4-space indent: "    name: ..."
+    // Step-level names have a leading dash:             "      - name: ..."
+    const jobNames = ciYml
+      .split('\n')
+      .filter(line => /^    name: /.test(line))
+      .map(line => line.replace(/^    name:\s+/, '').trim());
+    assert.ok(EXPECTED_CONTEXTS.length > 0, 'EXPECTED_CONTEXTS must be non-empty');
+    for (const ctx of EXPECTED_CONTEXTS) {
+      assert.ok(
+        jobNames.includes(ctx),
+        `EXPECTED_CONTEXTS entry "${ctx}" must be a job name: in .github/workflows/ci.yml; ` +
+        `found job names: ${jobNames.join(', ')}`,
+      );
+    }
   });
 
   test('Source hygiene ABSENT from check-runs → FAIL (the described PoC, D-PR3b)', () => {
@@ -389,14 +406,18 @@ describe('AC-25: zero check-runs never passes', () => {
 // ---------------------------------------------------------------------------
 describe('AC-26 AC-27: exit codes and merge command', () => {
 
-  test('PASS → exit 0 with --match-head-commit <sha> in output', () => {
+  test('PASS → exit 0 with --admin --match-head-commit <sha> in output', () => {
     const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0);
     assert.ok(result.mergeCommand, 'PASS must produce a mergeCommand');
-    // D-PR5: merge command must include --match-head-commit <headSha>
+    // D-PR5: merge command must include --match-head-commit <headSha> (TOCTOU protection)
     assert.ok(result.mergeCommand.includes('--match-head-commit'), 'merge command must include --match-head-commit');
     assert.ok(result.mergeCommand.includes(HEAD_113F472), 'merge command must include the verified SHA');
+    // --admin is required: main is protected and the sole code-owner cannot self-approve.
+    // Emitting it here ensures the operator can copy the command verbatim — hand-editing
+    // is where --match-head-commit gets dropped (avoids PF-017 recurrence).
+    assert.ok(result.mergeCommand.includes('--admin'), 'merge command must include --admin');
   });
 
   test('FAIL → exit 1 (not 0, not 2)', () => {
@@ -616,7 +637,14 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
     ], calls);
+    const start = Date.now();
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
+    const elapsed = Date.now() - start;
+    // AC-30 (clause b): verifier must complete in under 15 s wall-clock.
+    // With a synchronous stub runner, elapsed time reflects the verifier's own
+    // CPU cost and any unexpected loops — network latency is zero.
+    assert.ok(elapsed < 15000,
+      `verifier must complete in < 15 s wall-clock (AC-30 clause b); took ${elapsed}ms`);
     assert.equal(calls.length, 4, `expected 4 API calls (pr, protection, checks, status); got ${calls.length}`);
     const checkCall = calls.find(u => u.includes('/check-runs'));
     assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
@@ -1012,6 +1040,54 @@ describe('D-PR2a: required context satisfied by commit status', () => {
     assert.equal(result.exitCode, 0,
       'required context satisfied via commit status must pass (D-PR2a)');
   });
+});
+
+// ---------------------------------------------------------------------------
+// Tier C: pending statuses are reported as advisory, not silently dropped
+// ---------------------------------------------------------------------------
+describe('Tier C: pending non-required status is reported as advisory', () => {
+
+  test('state=pending non-required status emits an advisory line (not silently ignored)', () => {
+    // A pending non-required status is the same indeterminate condition as a
+    // non-completed Tier B run — both are "not yet resolved". Tier B now FAILs
+    // on queued/in_progress (same delta). Tier C is advisory-only, but the
+    // operator must still be able to see it, not have it vanish silently.
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const statuses = [{ context: 'security/snyk (dean0x)', state: 'pending' }];
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses,
+      headSha: HEAD_113F472,
+    });
+    // PASS overall (non-required, advisory only)
+    assert.equal(result.exitCode, 0, `pending non-required status must not cause FAIL; lines: ${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    // The advisory line must be present so the operator sees the pending status
+    assert.ok(
+      allLines.includes('advisory (Tier C)') && allLines.includes('pending'),
+      `must emit an advisory line for pending non-required status; got:\n${allLines}`,
+    );
+  });
+
+  test('state=error non-required status still emits advisory (regression guard)', () => {
+    // Guard against the Tier C rewrite accidentally dropping non-pending errors.
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const statuses = [{ context: 'security/snyk (dean0x)', state: 'error' }];
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses,
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 0, 'non-required error status must not cause FAIL');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('advisory (Tier C)') && allLines.includes('error'),
+      `must emit an advisory line for error non-required status; got:\n${allLines}`,
+    );
+  });
+
 });
 
 // Code of Conduct tests (AC-1, AC-2) live in code-of-conduct.spec.mjs —
