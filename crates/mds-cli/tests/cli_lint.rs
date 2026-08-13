@@ -1601,28 +1601,70 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
     let message = v["error"]["message"]
         .as_str()
         .expect("error.message must be a string");
+
+    // Non-vacuity guard: the message must be non-empty so the absence checks below
+    // are not trivially satisfied by an empty string.
+    assert!(!message.is_empty(), "AC-P1-07: error.message must not be empty");
+
+    // ADR-009 / PF-013 positive controls: these fabricated strings WOULD trigger
+    // the assertions below to FAIL, proving the detection logic is sound.
+    // `MdsError::serialize()` emits `code`/`message`/`help`/`span` only; no
+    // `MdsError` Display template interpolates `ctx.file_str`, so the source
+    // identity structurally cannot reach `error.message` (AD-211-5 rustdoc).
+    // A future Display change that adds a file reference would be caught here.
     assert!(
-        !message.contains("<source>") && !message.contains("input.mds"),
-        "AC-P1-07: error.message must not leak a core source label; got: {message}"
+        "<source>:1:1 — parse error".contains("<source>"),
+        "control: '<source>' is detectable by .contains() (ADR-009 non-vacuity)"
     );
     assert!(
-        !stdout.contains("<source>") && !stdout.contains("input.mds"),
-        "AC-P1-27: no core source label may appear in stdout; got: {stdout}"
+        "failed to read input.mds".contains("input.mds"),
+        "control: 'input.mds' is detectable by .contains() (ADR-009 non-vacuity)"
+    );
+
+    assert!(
+        !message.contains("<source>"),
+        "AC-P1-07: error.message must not embed '<source>'; got: {message}"
+    );
+    assert!(
+        !message.contains("input.mds"),
+        "AC-P1-07: error.message must not embed 'input.mds'; got: {message}"
+    );
+    assert!(
+        !stdout.contains("<source>"),
+        "AC-P1-27: '<source>' must not appear in stdout; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("input.mds"),
+        "AC-P1-27: 'input.mds' must not appear in stdout; got: {stdout}"
     );
 }
 
-/// AC-P1-04: `lint`, `check`, `build` and `fmt` all name a stdin source with the
-/// SAME sentinel. The §0a ruling names all four; a leg that renders `<source>`
-/// makes the uniform-sentinel rule false on day one.
+/// AC-P1-04: `lint`, `check`, `build`, and `fmt` all name a stdin source with the
+/// SAME sentinel per the §0a ruling.
 ///
-/// This is the reproduction the plan's step 1a asked for, turned into a pin:
-/// before the relabel landed in `run_check` / `compile_to_content`, `mds check -`
-/// and `mds build -` both rendered `[<source>:1:1]` here.
+/// This test has two parts because the subcommands have different output shapes:
+///
+/// **Error-frame part** (`lint`, `check`, `build`): a broken source triggers a
+/// miette code frame and `frame_source_identity` extracts the label.  `mds build -`
+/// reaches the check gate at `build.rs` (`run_check` → `check_stdin`), not the
+/// compile-to-content stdin site; the assertion still holds — it is the same
+/// AD-211-5 relabel that applies on that path.
+///
+/// **Status-line part** (`fmt --check`): a valid but reformattable source causes
+/// `mds fmt --check -` to print `"Would reformat: <stdin>"` — a different output
+/// shape, covered separately after the loop.
+///
+/// Before the relabels landed, `mds check -` and `mds build -` rendered
+/// `[<source>:1:1]` and `mds lint -` rendered `[input.mds:1:1]`.  `mds fmt -`
+/// already used `<stdin>` (AD-211-3 extended the same constant).
 #[test]
 fn stdin_source_identity_is_uniform_across_subcommands() {
-    let source = "@if\nbroken\n";
+    // Part 1 — error path: a parse-failing source forces a miette frame.
+    // All three subcommands below reach their respective analysis-failure paths,
+    // each of which applies the AD-211-5 / AD-211-3 <stdin> relabel.
+    let broken = "@if\nbroken\n";
     for subcommand in ["lint", "check", "build"] {
-        let out = run_mds_stdin(subcommand, source);
+        let out = run_mds_stdin(subcommand, broken);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
             panic!("`mds {subcommand} -` must render a code frame; got:\n{stderr}")
@@ -1635,6 +1677,39 @@ fn stdin_source_identity_is_uniform_across_subcommands() {
         assert!(
             !stderr.contains("<source>"),
             "AC-P1-04: `mds {subcommand} -` must not emit '<source>'; got:\n{stderr}"
+        );
+    }
+
+    // Part 2 — fmt status line: `mds fmt --check -` emits "Would reformat: <stdin>"
+    // when a source needs reformatting (not a code frame).  A directive with
+    // trailing whitespace triggers the formatter's R4 strip rule.
+    {
+        use std::io::Write;
+        // Three trailing spaces after the @define directive are stripped by the
+        // formatter (R4: directive trailing-whitespace strip), so --check reports
+        // that a reformat would occur.
+        let fmt_source = "@define greet(name):   \nHello {{name}}!\n@end\n";
+        let mut child = mds_bin()
+            .arg("fmt")
+            .arg("--check")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(fmt_source.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        let fmt_stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            fmt_stderr.contains("Would reformat: <stdin>"),
+            "AC-P1-04: `mds fmt --check -` must emit 'Would reformat: <stdin>'; \
+             got:\n{fmt_stderr}"
+        );
+        assert!(
+            !fmt_stderr.contains("input.mds") && !fmt_stderr.contains("<source>"),
+            "AC-P1-04: `mds fmt --check -` must not emit old source labels; \
+             got:\n{fmt_stderr}"
         );
     }
 }
