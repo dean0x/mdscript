@@ -277,6 +277,96 @@ def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib
     )
 
 
+def test_ac_p1_24_cross_surface_diagnostic_order_parity(
+    mds_cli: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """AC-P1-24 (PF-007): CLI and Python surfaces must agree on diagnostics[] order.
+
+    Per-surface goldens each lock in their OWN ordering value and therefore cannot
+    detect a cross-surface divergence (PF-007).  This test compares surfaces to each
+    other — a differential, not a golden — using a multi-diagnostic fixture so that
+    ordering divergence IS detectable.
+
+    The fixture uses rules NOT touched by #203 (legacy-interpolation and
+    duplicate-export), placed so the RULE-EXECUTION order differs from the OFFSET
+    order.  After the AD-202-1 sort both surfaces must report the same ascending
+    order.  Both surfaces sort via LintResultBuilder::build; a per-renderer
+    deviation would be caught here but not by test_par4 (single-diagnostic goldens)
+    or test_par5 (zero-diagnostic clean source).
+    """
+    # Source whose rule-execution order is the REVERSE of its offset order:
+    # - legacy-interpolation (single-brace {name}) fires at a LOW offset (line 2).
+    # - duplicate-export fires at a HIGH offset (end of file).
+    # run_rules dispatches duplicate_export (5th) BEFORE legacy_interpolation (10th),
+    # so without the sort the order is duplicate-export first — opposite of offsets.
+    src = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
+    entry_key = "parity.mds"
+    mds_file = tmp_path / entry_key
+    mds_file.write_text(src, encoding="utf-8")
+
+    # CLI surface: lint the file in JSON mode.
+    cli_out = subprocess.run(
+        [str(mds_cli), "lint", "--format", "json", str(mds_file)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    # Exit 1 is expected: the source has findings (legacy-interpolation is a warning).
+    assert cli_out.returncode in (0, 1), (
+        f"CLI lint exited unexpectedly with {cli_out.returncode}: {cli_out.stderr}"
+    )
+    cli_result = json.loads(cli_out.stdout)
+
+    # Python surface: lint_virtual with the same entry key so the "file" value matches.
+    py_result = json.loads(m.lint_virtual({entry_key: src}, entry_key).to_json())
+
+    # Non-vacuity guard: both surfaces must produce findings; an empty files[] would
+    # make the ordering comparison vacuously pass (PF-013 analog).
+    assert cli_result.get("files"), (
+        f"CLI must produce findings for the ordering fixture; got: {cli_out.stdout}"
+    )
+    assert py_result.get("files"), "Python must produce findings for the ordering fixture"
+    cli_diags = cli_result["files"][0].get("diagnostics", [])
+    py_diags = py_result["files"][0].get("diagnostics", [])
+    assert len(cli_diags) >= 2, (
+        f"CLI must produce at least 2 diagnostics to test ordering; got {len(cli_diags)}"
+    )
+    assert len(py_diags) >= 2, (
+        f"Python must produce at least 2 diagnostics to test ordering; got {len(py_diags)}"
+    )
+
+    # Normalize: strip the "file" key from each files[] entry so the comparison
+    # is not skewed by per-surface file-key conventions (AC-P1-06 allows CLI and
+    # bindings to differ on "file" for stdin mode; in file mode they match here).
+    def drop_file_key(result: dict) -> list:  # type: ignore[type-arg]
+        return [
+            {k: v for k, v in f.items() if k != "file"}
+            for f in result.get("files", [])
+        ]
+
+    cli_norm = drop_file_key(cli_result)
+    py_norm = drop_file_key(py_result)
+
+    assert cli_norm == py_norm, (
+        "AC-P1-24 (PF-007): CLI and Python surfaces disagree on diagnostics[] content "
+        "when the 'file' key is excluded.\n"
+        "This indicates a per-surface ordering or shape divergence; the common choke "
+        "point LintResultBuilder::build must establish the order both surfaces inherit.\n"
+        f"  CLI    (file excluded): {json.dumps(cli_norm)}\n"
+        f"  python (file excluded): {json.dumps(py_norm)}"
+    )
+
+    # Separately verify each surface's file key (they match in file mode).
+    cli_files = [f.get("file") for f in cli_result.get("files", [])]
+    py_files = [f.get("file") for f in py_result.get("files", [])]
+    assert all(f == entry_key for f in cli_files), (
+        f"AC-P1-24: CLI file keys must all be '{entry_key}'; got: {cli_files}"
+    )
+    assert all(f == entry_key for f in py_files), (
+        f"AC-P1-24: Python file keys must all be '{entry_key}'; got: {py_files}"
+    )
+
+
 def test_par5b_live_cli_lint_differential_with_findings(mds_cli: pathlib.Path) -> None:
     """AC-P1-24: CLI stdin and Python lint() produce identical diagnostics[] (file key excluded).
 
