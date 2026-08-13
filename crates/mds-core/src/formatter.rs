@@ -873,16 +873,21 @@ mod tests {
         );
     }
 
-    /// AC-P1-18 / AD-203-2: `ImportDirective::Selective::name_offsets` must stay
-    /// OUT of structural equality.
+    /// AD-203-2 (complementary): the formatter safety gate (`structural_equivalent`)
+    /// must not reject a correct reformat when `name_offsets` shift due to earlier
+    /// edits.
     ///
-    /// `imports_eq` (lint/rules/structural_eq.rs) destructures `Selective` with
-    /// `..` and compares only `names` and `path`. That exclusion is load-bearing
-    /// here, not merely tidy: this is the formatter's safety gate, and stripping
-    /// trailing whitespace from an EARLIER directive line shifts every later byte
-    /// offset — including the per-name offsets #203 added. If `name_offsets`
-    /// participated, the gate would call a correct reformat "non-equivalent" and
-    /// silently refuse to write it.
+    /// `structural_equivalent` is a token-based comparison (lexer tokens, not the
+    /// AST) and therefore never calls `imports_eq`.  The regression pin for
+    /// `imports_eq` itself — confirming that `name_offsets` is excluded from
+    /// structural equality and that `duplicate-import` behaves correctly — lives in
+    /// `lint/rules/structural_eq.rs::selective_name_offsets_excluded_from_imports_eq`.
+    ///
+    /// This test covers the **formatter boundary**: stripping trailing whitespace on
+    /// an EARLIER line shifts every subsequent byte offset, including the per-name
+    /// offsets that `parse_import_directive` computed.  Since `structural_equivalent`
+    /// compares tokens by their text (not by their byte offset), the shifted offsets
+    /// are invisible to it and the reformat is correctly accepted.
     ///
     /// The source below is exactly that shape: line 1 carries trailing spaces, so
     /// formatting shifts the selective import on line 2 three bytes left.

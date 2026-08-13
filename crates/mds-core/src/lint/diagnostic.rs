@@ -655,6 +655,15 @@ impl LintResult {
     /// here carries whatever order you supply, and `to_canonical_json` will emit
     /// that order.
     ///
+    /// **AD-202-1b:** this constructor does NOT sort because `LintResult::new`
+    /// is a public, ADR-010 construction path.  Sorting here would silently
+    /// reorder an external caller's deliberately-ordered `Vec<LintDiagnostic>`,
+    /// which is a semantic change to a published API.  The internal builder
+    /// (`LintResultBuilder::build`) sorts after truncation, so results produced
+    /// by `lint`/`lint_source` always carry the canonical offset order.  Sort
+    /// before calling this constructor if you want canonical ordering in the
+    /// emitted JSON.
+    ///
     /// This is deliberate: sorting here would silently reorder a caller's
     /// intentionally-ordered vector, which is a behaviour change to a published
     /// construction path. Sort before calling if you want the canonical order.

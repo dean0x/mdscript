@@ -1433,6 +1433,44 @@ fn string_source_map_label_is_in_public_api() {
     );
 }
 
+/// AC-P1-27 positive control (PF-013 / ADR-009): the core library still uses
+/// `STRING_SOURCE_MAP_LABEL` ("input.mds") as the `file` key for string-source
+/// lint results.
+///
+/// This test confirms that the CLI's output-boundary relabel (`set_diag_display_path`
+/// in `mds-cli/src/lint.rs`) is doing real work and is not dead code — without the
+/// relabel, `"input.mds"` would appear in the `files[].file` key of the CLI JSON
+/// output.  The 113f472 baseline would fail AC-P1-01 on this exact property: the
+/// core has always used `STRING_SOURCE_MAP_LABEL` and the PR's relabel is the only
+/// thing that makes the CLI emit `"<stdin>"` instead.
+#[test]
+fn lint_str_uses_string_source_map_label_as_file_key() {
+    // Source that triggers `duplicate-export` — no imports needed, so lint_str
+    // succeeds without a filesystem base directory.
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    let result = mds::lint_str(source).expect("lint_str must succeed for this source");
+    // AC-P1-27: every diagnostic must carry STRING_SOURCE_MAP_LABEL as the file key.
+    // The CLI relabels this at the output boundary; the core must not.
+    let all_files: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.file.as_deref())
+        .collect();
+    assert!(
+        !all_files.is_empty(),
+        "AC-P1-27: duplicate-export must fire and produce at least one diagnostic"
+    );
+    for file_key in &all_files {
+        assert_eq!(
+            *file_key,
+            mds::STRING_SOURCE_MAP_LABEL,
+            "AC-P1-27: core must use STRING_SOURCE_MAP_LABEL ('input.mds') as the \
+             file key for string-source lint — got '{file_key}' instead; \
+             the CLI relabel happens at the output boundary, not in core"
+        );
+    }
+}
+
 /// F-API-2: TextEdit is publicly nameable and LintDiagnostic::with_fix_edits wires through.
 ///
 /// Pins:

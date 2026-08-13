@@ -94,6 +94,50 @@ describe('lint', () => {
     assert.ok(typeof d.message === 'string', 'diagnostic.message must be a string');
     assert.ok(typeof d.fixable === 'boolean', 'diagnostic.fixable must be a boolean');
   });
+
+  // AC-P1-24 / AC-P1-06: the binding surface (napi/WASM via universal package)
+  // must use "input.mds" as the file key for string-source lint, NOT "<stdin>".
+  // PF-007 governs this: each surface asserts its OWN expected value — asserting
+  // "<stdin>" here would lock in the wrong value for the binding side.
+  test('U-L9: AC-P1-24 — binding surface file key is input.mds (not <stdin>)', () => {
+    const result = lint(UNUSED_SOURCE);
+    assert.ok(result.files.length > 0, 'AC-P1-24: lint(UNUSED_SOURCE) must produce at least one file entry');
+    for (const f of result.files) {
+      assert.equal(
+        f.file,
+        'input.mds',
+        `AC-P1-24: binding surface file key must be 'input.mds' (not '<stdin>'); got '${f.file}'`,
+      );
+    }
+  });
+
+  // AC-P1-24 / AC-P1-08 / AC-P1-09: diagnostics within each file group must
+  // be in non-decreasing byte-offset order.  The sort is established in core
+  // at LintResultBuilder::build (AD-202-1) — all surfaces inherit it.
+  // Fixture: source whose rule-execution order is the REVERSE of offset order
+  // (legacy-interpolation at low offset, duplicate-export at high offset;
+  // run_rules dispatches duplicate_export before legacy_interpolation).
+  test('U-L10: AC-P1-24 — diagnostics within a file are in non-decreasing offset order', () => {
+    // {name} triggers legacy-interpolation at offset ~19 (line 2);
+    // duplicate @export greet triggers duplicate-export at a high offset.
+    // Without the sort these appear in reverse offset order.
+    const source =
+      '@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n';
+    const result = lint(source);
+    assert.ok(result.files.length > 0, 'AC-P1-24: fixture must produce at least one file entry');
+    for (const f of result.files) {
+      const offsets = f.diagnostics
+        .filter((d) => d.span !== null && d.span !== undefined)
+        .map((d) => d.span.offset);
+      for (let i = 1; i < offsets.length; i++) {
+        assert.ok(
+          offsets[i] >= offsets[i - 1],
+          `AC-P1-24: diagnostics must be in non-decreasing offset order; ` +
+            `got offsets[${i - 1}]=${offsets[i - 1]} > offsets[${i}]=${offsets[i]}`,
+        );
+      }
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

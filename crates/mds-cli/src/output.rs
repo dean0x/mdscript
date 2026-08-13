@@ -68,8 +68,14 @@ pub(crate) const STDIN_DISPLAY_LABEL: &str = "<stdin>";
 /// 1 — see the downcast ladder there.
 pub(crate) struct StdinRelabeledError {
     inner: mds::MdsError,
-    /// `Some(named)` when `inner` had embedded source code (so spans still render).
-    /// `None` when `inner` had no source code (`MdsError::Io` and similar).
+    /// `Some(named)` when the inner error's embedded source is the stdin sentinel
+    /// `"<source>"` — replaced with a `NamedSource` labelled `"<stdin>"`.
+    ///
+    /// `None` in two cases:
+    /// - The inner error had no embedded source at all (e.g. `MdsError::Io`).
+    /// - The inner error's embedded source belongs to an **imported file** — its
+    ///   real path must be preserved so miette renders the caret at the correct
+    ///   location.  `source_code()` delegates to `inner` in both sub-cases.
     source: Option<miette::NamedSource<String>>,
 }
 
@@ -112,7 +118,14 @@ impl miette::Diagnostic for StdinRelabeledError {
         miette::Diagnostic::labels(&self.inner)
     }
     fn source_code(&self) -> Option<&dyn miette::SourceCode> {
-        self.source.as_ref().map(|s| s as &dyn miette::SourceCode)
+        match &self.source {
+            Some(ns) => Some(ns as &dyn miette::SourceCode),
+            // When `source` is None the relabel decided NOT to replace: either the
+            // inner error carries no source at all (MdsError::Io) or it carries a
+            // real imported-file source that must be preserved intact.  Delegate so
+            // miette still renders the imported-file code frame correctly.
+            None => miette::Diagnostic::source_code(&self.inner),
+        }
     }
     fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
         miette::Diagnostic::related(&self.inner)
@@ -125,21 +138,43 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// AD-211-5: build a report whose embedded source identity reads
 /// [`STDIN_DISPLAY_LABEL`] instead of the core's `"<source>"`.
 ///
-/// This is a pure label swap — the source text used for span rendering, the
-/// message, the code, the help and the labels are all untouched. `miette`'s own
+/// This is a **conditional** label swap: the replacement only happens when the
+/// inner error's embedded `NamedSource` carries the stdin sentinel `"<source>"`
+/// set by `resolve_source_intrinsic`.  Errors whose embedded source belongs to an
+/// **imported file** carry the real file path and are left untouched — replacing
+/// them would render the caret against stdin text at the wrong location, which is
+/// exactly the PF-012 in-bounds-but-wrong class this PR set out to avoid.
+/// AD-211-5 only authorised relabelling stdin's OWN source identity.
+///
+/// The source text used for span rendering, the message, the code, the help and
+/// the labels are all untouched.  `miette`'s own
 /// [`miette::Report::with_source_code`] cannot do this: its `WithSourceCode`
 /// wrapper returns `self.error.source_code().or(Some(&self.source_code))`, so an
-/// inner diagnostic that already carries a `NamedSource` (which these do) wins and
-/// the replacement is ignored.
+/// inner diagnostic that already carries a `NamedSource` (which these do) wins
+/// and the replacement is ignored.
 ///
-/// Call this at every CLI boundary that renders an analysis failure for stdin
-/// input — `lint`, `check` and `build` all reach the same core errors, so a leg
-/// that skips it renders `<source>` and breaks the uniform-sentinel rule.
+/// Call sites (verified line numbers, §5 step 1a of the implementation plan):
+/// - `mds check -`: `crates/mds-cli/src/main.rs:279`
+/// - `mds build -` (single-file path): `crates/mds-cli/src/build.rs:714`
+/// - `mds build -` (directory stdin path): `crates/mds-cli/src/build.rs:1176`
+/// - `mds lint -`: `crates/mds-cli/src/lint.rs:1482` (via
+///   `emit_analysis_failure_json_or_stderr`)
+///
+/// Any new CLI boundary that renders a stdin analysis failure must call this
+/// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.
 pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Report {
+    // Only replace the embedded source when the inner error's source name is the
+    // stdin sentinel "<source>" set by `resolve_source_intrinsic`.  Errors from
+    // imported files carry the real file path; replacing them would render the
+    // caret against stdin text at the wrong location (PF-012 / AD-211-5 scope).
     miette::Report::new(StdinRelabeledError {
+        source: if e.source_label_is_stdin_sentinel() {
+            miette::Diagnostic::source_code(e)
+                .map(|_| mds::named_source_for_render(STDIN_DISPLAY_LABEL, source))
+        } else {
+            None
+        },
         inner: e.clone(),
-        source: miette::Diagnostic::source_code(e)
-            .map(|_| mds::named_source_for_render(STDIN_DISPLAY_LABEL, source)),
     })
 }
 

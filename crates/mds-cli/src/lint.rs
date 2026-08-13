@@ -677,11 +677,15 @@ fn run_lint_stdin(
             match preview {
                 PreviewOutcome::WouldFix(ref fixed) => {
                     if diff {
+                        // AD-211-2: fix-preview diff header uses STDIN_DISPLAY_LABEL
+                        // (was bare "stdin" before this PR).
                         let diff_str = render_unified_diff(&source, fixed, STDIN_DISPLAY_LABEL);
                         let _ = write_stdout(&diff_str);
                     }
                     if check {
                         if !quiet {
+                            // AD-211-2: "Would fix:" status line uses STDIN_DISPLAY_LABEL
+                            // (was bare "stdin" before this PR).
                             eprintln!("Would fix: {STDIN_DISPLAY_LABEL}");
                         }
                         std::process::exit(1);
@@ -722,6 +726,8 @@ fn run_lint_stdin(
                 total_count,
             } => {
                 if !quiet {
+                    // AD-211-2: "Partially fixed:" status line uses STDIN_DISPLAY_LABEL
+                    // (was bare "stdin" before this PR).
                     eprintln!(
                         "Partially fixed: {STDIN_DISPLAY_LABEL} ({applied_count} of {total_count} fixes applied)"
                     );

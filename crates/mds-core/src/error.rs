@@ -1018,6 +1018,53 @@ impl MdsError {
     pub fn display_sanitized(&self) -> String {
         sanitize_control_chars(&self.to_string()).into_owned()
     }
+
+    /// Return `true` when this error's embedded `NamedSource` carries the stdin
+    /// analysis sentinel `"<source>"` — the name that `resolve_source_intrinsic`
+    /// assigns to `ctx.file_str` for string-source inputs.
+    ///
+    /// The CLI uses this at its output boundary to decide whether to relabel the
+    /// embedded source name as `"<stdin>"`.  Only errors produced by a string-source
+    /// analysis carry that sentinel; errors from imported files carry the real file
+    /// path and must not be relabelled (PF-012 — in-bounds-but-wrong caret class;
+    /// the AD-211-5 ruling only authorised relabelling stdin's OWN source identity).
+    ///
+    /// Returns `false` when the error has no embedded source at all (e.g.
+    /// `MdsError::Io`), because there is nothing to relabel in that case.
+    #[must_use]
+    pub fn source_label_is_stdin_sentinel(&self) -> bool {
+        // "<source>" is resolver::SOURCE_LABEL — the value assigned to ctx.file_str
+        // by resolve_source_intrinsic.  Defined as a local const so error.rs needs
+        // no coupling to resolver.rs's crate-private symbol.
+        const SOURCE_LABEL: &str = "<source>";
+        let src = match self {
+            MdsError::Syntax { src, .. }
+            | MdsError::UndefinedVariable { src, .. }
+            | MdsError::UndefinedFunction { src, .. }
+            | MdsError::ArityMismatch { src, .. }
+            | MdsError::TypeError { src, .. }
+            | MdsError::TypeMismatch { src, .. }
+            | MdsError::CircularImport { src, .. }
+            | MdsError::FileNotFound { src, .. }
+            | MdsError::ImportError { src, .. }
+            | MdsError::NameCollision { src, .. }
+            | MdsError::Recursion { src, .. }
+            | MdsError::ExportError { src, .. }
+            | MdsError::BuiltinError { src, .. }
+            | MdsError::Extends { src, .. }
+            | MdsError::MixedContent { src, .. } => src.as_deref(),
+            MdsError::NotMdsFile { .. }
+            | MdsError::Io { .. }
+            | MdsError::ResourceLimit { .. }
+            | MdsError::YamlError { .. }
+            | MdsError::JsonError { .. }
+            | MdsError::InvalidVars { .. }
+            | MdsError::ExpectedMarkdown
+            | MdsError::ExpectedMessages
+            | MdsError::FormatterInvariant { .. } => None,
+        };
+        src.map_or(false, |ns| ns.name() == SOURCE_LABEL)
+    }
 }
 
 #[cfg(test)]

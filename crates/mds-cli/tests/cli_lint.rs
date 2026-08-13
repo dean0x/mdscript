@@ -1745,6 +1745,95 @@ fn stdin_fix_preview_messages_use_bracketed_sentinel() {
     }
 }
 
+// ── AC-P1-26: zero-diagnostic stdin JSON scope-out ───────────────────────────
+//
+// When stdin produces no diagnostics the JSON envelope correctly emits
+// `files: []` — there is no file entry at all, so no `file` key to check.
+// This is intentional and consistent with how directory-mode lint omits
+// zero-diagnostic files.  Asserting "files[0].file == <stdin>" would be
+// undefined for a clean source; the correct assertion is that `files` is empty
+// and that no VFS key or source-identity sentinel leaks into the document.
+
+/// AC-P1-26 scope-out: clean stdin produces `files:[]` (not a file entry with
+/// `file:"<stdin>"`), `truncated:false`, `version:1`.  Per AC-P1-06 the binding
+/// surfaces also produce `files:[]` for clean string-source input, making the
+/// JSON identical across CLI and bindings in the zero-diagnostic case.
+#[test]
+fn stdin_json_clean_source_emits_empty_files_array() {
+    let out = lint_stdin("Hello World!\n", &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("clean stdin JSON must parse");
+    assert_eq!(
+        v["files"],
+        serde_json::json!([]),
+        "AC-P1-26: clean stdin must emit files:[] (no file entry); got: {stdout}"
+    );
+    assert_eq!(v["truncated"], false, "truncated must be false");
+    assert_eq!(v["version"], 1, "version must be 1");
+    // No VFS key or source sentinel may leak even for zero-diagnostic output.
+    assert!(
+        !stdout.contains("input.mds"),
+        "AC-P1-26: 'input.mds' must not appear in clean-stdin JSON; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<stdin>"),
+        "AC-P1-26: '<stdin>' must not appear in clean-stdin JSON (files is empty); \
+         got: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean source must exit 0; stdout: {stdout}"
+    );
+}
+
+// ── AC-P1-03(c): Partially fixed: <stdin> ────────────────────────────────────
+//
+// The partial-fix write path must emit "Partially fixed: <stdin>" (not
+// "Partially fixed: stdin") when some fixes are applied but others are
+// rejected by the reverify gate.
+//
+// Fixture (inline): empty @define with orphaned @export (empty-block fix
+// rejected — removing the define leaves an unreferenced @export) plus a
+// duplicate @export (applied successfully).  This is the same scenario as
+// the file-mode partial-fix fixture; the stdin variant confirms the sentinel
+// is STDIN_DISPLAY_LABEL, not a file path (AD-211-2).
+
+/// AC-P1-03(c): the "Partially fixed:" status line uses the bracketed sentinel.
+#[test]
+fn stdin_partial_fix_message_uses_bracketed_sentinel() {
+    // Source: empty @define (empty-block, Tier A) + duplicate export.
+    // The empty-block fix is rejected (orphaned @export after removal);
+    // the duplicate-export fix succeeds.  1 of 2 fixes applied.
+    let source = "\
+@define empty_fn():
+
+@end
+
+@export empty_fn
+
+@define greet(name):
+  Hello {{name}}!
+@end
+
+@export greet
+@export greet
+";
+    let out = lint_stdin(source, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Partially fixed: <stdin>"),
+        "AC-P1-03: 'Partially fixed: <stdin>' must appear in stderr; got:\n{stderr}"
+    );
+    // Must not leak bare `stdin` without angle brackets.
+    assert!(
+        !stderr.contains("Partially fixed: stdin\n")
+            && !stderr.starts_with("Partially fixed: stdin "),
+        "AC-P1-03: must not use bare 'stdin' in partial-fix message; got:\n{stderr}"
+    );
+}
+
 // ── Test (i): Auto-detect hint names the invoking subcommand ─────────────────
 //
 // Pins bugs 22/23: auto_detect_mds_file and resolve_input now take a `subcommand:

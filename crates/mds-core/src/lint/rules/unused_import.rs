@@ -177,6 +177,12 @@ fn resolve_severity(config: &LintConfig) -> Severity {
 /// `offset` is the byte position of the span anchor within the source.
 /// `length` is the byte length of the highlighted token.
 ///
+/// **AD-203-4:** only the `Selective` branch passes per-name offsets here.
+/// Alias and Merge forms still anchor at the `@import` keyword (offset =
+/// `imp.offset`, length = `"@import".len()`) — open decision 2 covers
+/// whether alias spans should be narrowed in a follow-up.  Every caller
+/// passes both parameters explicitly; there is no default.
+///
 /// For Alias and Merge forms the caller passes `imp.offset` /
 /// `"@import".len()` so the span covers the `@import` keyword.
 ///
