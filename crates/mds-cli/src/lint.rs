@@ -664,8 +664,10 @@ fn run_lint_stdin(
     // AD-211-4 / AD-211-1: relabel diag.file from STRING_SOURCE_MAP_LABEL →
     // STDIN_DISPLAY_LABEL at the CLI output boundary.  fix.rs never reads diag.file
     // (verified: zero reads in fix.rs), so this relabel is safe upstream of both
-    // preview_fixes and plan_and_apply_fixes.  The JSON wire output's "files[].file"
-    // key therefore emits "<stdin>" for every stdin lint, satisfying AC-P1-01.
+    // preview_fixes and plan_and_apply_fixes.  For the report-only and preview branches
+    // this single call ensures "files[].file" emits "<stdin>" (AC-P1-01).  The write
+    // path's residual is a fresh LintResult from the reverify lint_str_with call; it
+    // is relabeled separately after the fix_outcome match below.
     set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
 
     if fix {
@@ -714,7 +716,7 @@ fn run_lint_stdin(
 
         // ── Write path: apply fixes, emit fixed source to stdout ─────────────────
         let fix_outcome = plan_and_apply_fixes(result, &source, &cwd, runtime_vars, &config);
-        let (output_src, diag_result) = match fix_outcome {
+        let (output_src, mut diag_result) = match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
                 residual,
@@ -740,6 +742,17 @@ fn run_lint_stdin(
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
+        // AD-211-4 (write-path residual): for Fixed/PartiallyFixed the residual comes
+        // from the reverify lint_str_with call and therefore carries diag.file ==
+        // STRING_SOURCE_MAP_LABEL ("input.mds").  Relabel here so every emission path
+        // is symmetric with directory mode (lint.rs:1176/1197/1340/1364) and with the
+        // report-only/preview relabel above.  For Rejected/NothingToFix the original
+        // was already relabeled above — a second call is a harmless no-op.
+        // Note: --fix --format json + stdin is a hard usage error at lint.rs:141-147
+        // (AC-F-22b), so this relabel is not currently reachable via the JSON path;
+        // it is applied here as defence-in-depth so that lifting AC-F-22b in a future
+        // PR does not break AC-P1-27 silently.
+        set_diag_display_path(&mut diag_result, STDIN_DISPLAY_LABEL);
         // Stdin diagnostics: pass source text for span context rendering.
         // AD-211-1: use STDIN_DISPLAY_LABEL so source frame header reads "<stdin>".
         let named_source = (STDIN_DISPLAY_LABEL, output_src.as_str());
@@ -827,8 +840,14 @@ fn run_lint_file(
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                residual,
+                mut residual,
             } => {
+                // The reverify closure in plan_and_apply_fixes calls lint_str_with,
+                // which sets diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").
+                // Relabel to the file's basename so the JSON wire output uses the
+                // real filename rather than the internal VFS key.  Mirrors the
+                // set_diag_display_path call in directory mode (lint.rs:1176/1340).
+                set_diag_display_path(&mut residual, filename);
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source)?;
                 if !quiet {
@@ -838,7 +857,7 @@ fn run_lint_file(
             }
             FixFileOutcome::PartiallyFixed {
                 new_source,
-                residual,
+                mut residual,
                 applied_count,
                 total_count,
             } => {
@@ -848,6 +867,8 @@ fn run_lint_file(
                         safe_path(path)
                     );
                 }
+                // Same reverify relabel as the Fixed arm — see comment above.
+                set_diag_display_path(&mut residual, filename);
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source)?;
                 exit_by_severity(&residual);

@@ -977,6 +977,122 @@ fn vars_file_missing_exits_2_with_file_not_found() {
     );
 }
 
+// ── stdin exit-code preservation (AD-211-5 / StdinRelabeledError ladder) ─────
+
+/// `mds build -` on a stdin source whose `@import` target does not exist must
+/// exit 2 (file-system error), not 1.
+///
+/// Error path: the resolver returns `MdsError::FileNotFound`; `compile_to_content`
+/// wraps it in `StdinRelabeledError` via `relabel_stdin_error`; `build::exit_code`
+/// must unwrap the wrapper before classifying.  Without the
+/// `downcast_ref::<StdinRelabeledError>().map(inner)` ladder the outer downcast
+/// for `MdsError` misses and the process silently exits 1.
+#[test]
+fn build_stdin_missing_import_exits_2() {
+    let mut child = mds_bin()
+        .args(["build", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"@import \"./nonexistent_module_xyz_12345.mds\"\nHello!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "build stdin with missing @import must exit 2 (file-system error, not 1); got: {:?}",
+        output.status.code()
+    );
+}
+
+/// `mds check -` on a stdin source whose `@import` target does not exist must
+/// exit 2 (file-system error), not 1.
+///
+/// Same ladder gap as `build_stdin_missing_import_exits_2`: `run_check` calls
+/// `relabel_stdin_error` then propagates the wrapped `StdinRelabeledError`
+/// to `build::exit_code`.
+#[test]
+fn check_stdin_missing_import_exits_2() {
+    let mut child = mds_bin()
+        .args(["check", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"@import \"./nonexistent_module_xyz_12345.mds\"\nHello!\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "check stdin with missing @import must exit 2 (file-system error, not 1); got: {:?}",
+        output.status.code()
+    );
+}
+
+/// `mds check -` on a stdin source that trips `MAX_TOTAL_ITERATIONS` must exit 3
+/// (resource limit), not 1.
+///
+/// Error path: the evaluator returns `MdsError::ResourceLimit`; `run_check` wraps
+/// it in `StdinRelabeledError`; `build::exit_code` must unwrap the wrapper to
+/// reach the inner `ResourceLimit` variant and return 3.  Without the ladder the
+/// process exits 1.
+///
+/// Source: nested `@for` loops — 1001 outer x 1000 inner = 1_001_000 total
+/// iterations, which exceeds `MAX_TOTAL_ITERATIONS` (1_000_000).  Both arrays are
+/// declared inline in the YAML frontmatter so no `--vars` flag is needed.
+#[test]
+fn check_stdin_resource_limit_exits_3() {
+    let outer: Vec<String> = (0..1001usize).map(|i| format!("  - {i}")).collect();
+    let inner: Vec<String> = (0..1000usize).map(|i| format!("  - {i}")).collect();
+    let source = format!(
+        "---\nouter:\n{}\ninner:\n{}\n---\n@for o in outer:\n@for i in inner:\n@end\n@end\n",
+        outer.join("\n"),
+        inner.join("\n")
+    );
+
+    let mut child = mds_bin()
+        .args(["check", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(source.as_bytes())
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "check stdin hitting MAX_TOTAL_ITERATIONS must exit 3 (resource limit, not 1); got: {:?}",
+        output.status.code()
+    );
+}
+
 // ── Bare-filename regression (PF-006 / issue #11) ────────────────────────────
 
 /// `mds watch hello.mds` from the directory containing `hello.mds` must start up,

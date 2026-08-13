@@ -12,8 +12,34 @@ import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { SIMPLE_MDS, FIXTURES } from './helpers.mjs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { existsSync, statSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { lint, lintFile, lintVirtual, isMdsError, init } from '../dist/node.js';
 import { assertResultShape } from '../dist/backend/contract.js';
+
+// ---------------------------------------------------------------------------
+// CLI helper for AC-P1-24 cross-surface differential (U-L11).
+// Resolution order: MDS_CLI_BIN env var > freshest release/debug build > null.
+// ---------------------------------------------------------------------------
+
+/** Absolute path to the repository root (three levels above this test file). */
+const REPO_ROOT = path.resolve(fileURLToPath(new URL('.', import.meta.url)), '../../..');
+
+/** Return the absolute path to the `mds` CLI binary, or null if none can be found. */
+function findMdsCli() {
+  const envBin = process.env.MDS_CLI_BIN;
+  if (envBin) {
+    if (!existsSync(envBin)) throw new Error(`MDS_CLI_BIN=${envBin} does not exist`);
+    return envBin;
+  }
+  const exe = process.platform === 'win32' ? 'mds.exe' : 'mds';
+  const candidates = ['release', 'debug']
+    .map((profile) => path.join(REPO_ROOT, 'target', profile, exe))
+    .filter(existsSync);
+  if (!candidates.length) return null;
+  return candidates.reduce((a, b) => (statSync(a).mtimeMs >= statSync(b).mtimeMs ? a : b));
+}
 
 // Fixture with unused frontmatter variable (triggers unused-variable finding).
 const LINT_WARN_MDS = path.join(FIXTURES, 'lint_warn.mds');
@@ -97,8 +123,9 @@ describe('lint', () => {
 
   // AC-P1-24 / AC-P1-06: the binding surface (napi/WASM via universal package)
   // must use "input.mds" as the file key for string-source lint, NOT "<stdin>".
-  // PF-007 governs this: each surface asserts its OWN expected value — asserting
-  // "<stdin>" here would lock in the wrong value for the binding side.
+  // This is a per-surface assertion that pins the binding side's expected value;
+  // the CLI uses "<stdin>" (AC-P1-01). The cross-surface differential that compares
+  // diagnostics[] between binding and CLI surfaces is in U-L11 (avoids PF-007).
   test('U-L9: AC-P1-24 — binding surface file key is input.mds (not <stdin>)', () => {
     const result = lint(UNUSED_SOURCE);
     assert.ok(result.files.length > 0, 'AC-P1-24: lint(UNUSED_SOURCE) must produce at least one file entry');
@@ -129,6 +156,13 @@ describe('lint', () => {
       const offsets = f.diagnostics
         .filter((d) => d.span !== null && d.span !== undefined)
         .map((d) => d.span.offset);
+      // Non-vacuity guard: a loop over 0 or 1 elements executes no iterations and
+      // proves nothing (avoids PF-013). The Rust counterpart asserts offsets.len() >= 2.
+      assert.ok(
+        offsets.length >= 2,
+        `AC-P1-24: fixture must produce at least two spanned diagnostics for a meaningful ` +
+          `ordering assertion; got ${offsets.length} in file "${f.file}"`,
+      );
       for (let i = 1; i < offsets.length; i++) {
         assert.ok(
           offsets[i] >= offsets[i - 1],
@@ -137,6 +171,108 @@ describe('lint', () => {
         );
       }
     }
+  });
+
+  // AC-P1-24 cross-surface differential: the napi/WASM binding surface and the CLI
+  // must produce byte-identical diagnostics[] when the file key is excluded.
+  //
+  // The file key intentionally differs ("input.mds" on binding vs "<stdin>" on CLI
+  // stdin) — this is by design (AC-P1-01 / AC-P1-06). Comparing surfaces to each
+  // other with the file key stripped is the only comparison that can catch a
+  // divergence in diagnostic content, span offsets, or ordering (avoids PF-007,
+  // which states per-surface goldens cannot prove cross-surface byte parity).
+  //
+  // The same fixture as U-L10 is reused: legacy-interpolation fires at a lower
+  // offset than duplicate-export, but run_rules dispatches duplicate-export first,
+  // so the offset sort must have run for the arrays to match.
+  //
+  // In CI the CLI is required; locally, if no binary is found, the test warns and
+  // exits early (avoids a hard-fail when building only the JS side).
+  test('U-L11: AC-P1-24 cross-surface — napi/WASM and CLI diagnostics[] are byte-identical (file key excluded)', () => {
+    const mdsCli = findMdsCli();
+    if (mdsCli == null) {
+      if (process.env.CI) {
+        throw new Error(
+          'U-L11: mds CLI binary is required in CI for AC-P1-24 cross-surface parity. ' +
+            'Set MDS_CLI_BIN or run `cargo build -p mds-cli`.',
+        );
+      }
+      // Local dev without a built CLI: warn and skip (not a hard failure).
+      console.warn(
+        'U-L11: skipping CLI surface — mds binary not found ' +
+          '(run `cargo build -p mds-cli` to enable this check)',
+      );
+      return;
+    }
+
+    // Fixture: {name} triggers legacy-interpolation at a low byte offset; duplicate
+    // @export greet triggers duplicate-export at a higher offset. rule-execution order
+    // is the REVERSE of offset order — correct sort changes the observed array order.
+    const source =
+      '@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n';
+
+    // -- Binding surface (napi or WASM, whichever init() selected) --
+    const bindingResult = lint(source);
+    assert.ok(
+      bindingResult.files.length > 0,
+      'U-L11: fixture must produce at least one file entry from the binding surface',
+    );
+
+    // -- CLI surface: stdin lint in JSON mode; file key will be "<stdin>" --
+    const cliProc = spawnSync(mdsCli, ['lint', '-', '--format', 'json'], {
+      input: source,
+      encoding: 'utf-8',
+    });
+    // exit 0 = clean, exit 1 = warn-only findings, exit 2 = at least one error-severity
+    // finding.  The fixture's duplicate-export rule fires at "error" severity, so exit 2
+    // is the expected normal outcome (not a CLI failure).
+    assert.ok(
+      cliProc.status === 0 || cliProc.status === 1 || cliProc.status === 2,
+      `U-L11: CLI lint exited unexpected status ${cliProc.status}: ${cliProc.stderr}`,
+    );
+    const cliResult = JSON.parse(cliProc.stdout);
+    assert.ok(
+      cliResult.files.length > 0,
+      'U-L11: fixture must produce at least one file entry from the CLI surface',
+    );
+
+    // Normalize: strip the file key from each files[] entry so the comparison is
+    // over diagnostics[], not the deliberately-different source identity.
+    function normalizeFiles(result) {
+      return result.files.map(({ file: _file, ...rest }) => rest);
+    }
+    const bindingNorm = normalizeFiles(bindingResult);
+    const cliNorm = normalizeFiles(cliResult);
+
+    // Non-vacuity guard: two empty arrays compare equal and prove nothing (PF-013).
+    const totalDiags = bindingNorm.reduce((n, f) => n + (f.diagnostics?.length ?? 0), 0);
+    assert.ok(
+      totalDiags >= 2,
+      `U-L11: AC-P1-24 needs at least two diagnostics for a meaningful cross-surface ` +
+        `differential; got ${totalDiags}`,
+    );
+
+    // Primary assertion: diagnostics[], spans, rule, severity, fixable are identical
+    // across the two surfaces (the cross-surface differential, avoids PF-007).
+    assert.deepEqual(
+      bindingNorm,
+      cliNorm,
+      'U-L11: AC-P1-24: napi/WASM and CLI diagnostics[] must be identical when ' +
+        `file key is excluded.\n  binding: ${JSON.stringify(bindingNorm)}\n` +
+        `  CLI:     ${JSON.stringify(cliNorm)}`,
+    );
+
+    // Separately assert the per-surface file key values (AC-P1-24 / AC-P1-01 / AC-P1-06).
+    assert.equal(
+      bindingResult.files[0].file,
+      'input.mds',
+      'U-L11: binding surface string-source file key must be "input.mds"',
+    );
+    assert.equal(
+      cliResult.files[0].file,
+      '<stdin>',
+      'U-L11: CLI stdin file key must be "<stdin>"',
+    );
   });
 });
 

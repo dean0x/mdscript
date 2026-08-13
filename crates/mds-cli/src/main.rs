@@ -243,6 +243,7 @@ fn run_check(
     quiet: bool,
 ) -> Result<()> {
     use build::read_stdin;
+    use output::STDIN_DISPLAY_LABEL;
     let runtime_vars = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
@@ -282,7 +283,7 @@ fn run_check(
                 output::eprint_warning(w);
             }
             // AD-211-3: one definition of the sentinel, shared with lint/build/fmt.
-            eprintln!("OK: {}", output::STDIN_DISPLAY_LABEL);
+            eprintln!("OK: {STDIN_DISPLAY_LABEL}");
         }
     } else {
         let ((), warnings) =

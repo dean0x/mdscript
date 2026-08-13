@@ -95,18 +95,16 @@ selective import:
 
 ```jsonc
 // before
-{ "version": 1, "truncated": false, "files": [ { "file": "input.mds",
-  "diagnostics": [
-    { "rule": "duplicate-export", "span": { "offset": 59, "length": 7 } },
-    { "rule": "unused-import",    "span": { "offset":  0, "length": 7 } }
-  ] } ] }
+{ "files": [ { "diagnostics": [
+    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } },
+    { "rule": "unused-import",    "span": { "length": 7, "offset":  0 } }
+  ], "file": "input.mds" } ], "truncated": false, "version": 1 }
 
 // after
-{ "version": 1, "truncated": false, "files": [ { "file": "<stdin>",
-  "diagnostics": [
-    { "rule": "unused-import",    "span": { "offset": 10, "length": 5 } },
-    { "rule": "duplicate-export", "span": { "offset": 59, "length": 7 } }
-  ] } ] }
+{ "files": [ { "diagnostics": [
+    { "rule": "unused-import",    "span": { "length": 5, "offset": 10 } },
+    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } }
+  ], "file": "<stdin>" } ], "truncated": false, "version": 1 }
 ```
 
 **A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
@@ -120,7 +118,12 @@ Previously the order was rule-execution order (implementation-defined).
 
 - Diagnostics without a span sort to the end of their file group.
 - Equal-offset diagnostics preserve rule-execution order (stable sort).
-- File groups themselves remain lexicographically ordered (BTreeMap).
+- File groups have a defined order: in `mds lint <dir>` the CLI sorts by
+  `Path::Ord` (component-wise, via `Vec<PathBuf>::sort()`), not byte-wise. On
+  the binding surfaces (napi / WASM / Python) `to_canonical_json` uses a
+  `BTreeMap` and orders file groups byte-wise on the file key string. The two
+  rules agree for ordinary paths; they diverge only when a path-separator
+  character appears within a filename component.
 - Ordering is established on `LintResult.diagnostics` itself, so the CLI human
   path and the napi / WASM / Python surfaces observe the same order.
 - **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is

@@ -1010,6 +1010,64 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
     }
 }
 
+// ── Test (b2): --fix --format json single-file residuals keyed by basename ────
+//
+// Pins that after --fix in SINGLE-FILE mode, residual diagnostics in the JSON
+// output are keyed by the file's basename, NOT by "input.mds".
+//
+// The plan_and_apply_fixes reverify closure calls lint_str_with, which sets
+// diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").  Without set_diag_display_path
+// in the single-file Fixed/PartiallyFixed arms, `mds lint --fix --format json <file>`
+// emitted "input.mds" instead of the real basename.  Directory mode already had the
+// correct relabel (lint.rs:1176/1197); this test pins the single-file parity.
+//
+// Fixture: a file with duplicate-export (Tier A, auto-fixed) + unused-variable
+// (Tier C, residual after fix).  After --fix, the residual must appear under
+// the actual filename, not "input.mds".
+
+#[test]
+fn file_fix_json_residuals_keyed_by_filename_not_input_mds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Use the same fixture shape as dir_fix_json_residuals_keyed_by_relative_path_not_input_mds:
+    // duplicate-export (fixable) + unused-variable (residual after fix).
+    let mixed = "---\ngreeting: Hello\nunused_key: not referenced\n---\n\n\
+                  @define greet(name):\n  Hello {{name}}!\n@end\n\n\
+                  @export greet\n@export greet\n";
+    let target = dir.path().join("mixed.mds");
+    fs::write(&target, mixed).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}; stderr: {stderr}")
+    });
+
+    // After fixing duplicate-export, unused-variable residual remains → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "residual unused-variable must produce exit 1; stderr: {stderr}"
+    );
+
+    let files = json["files"].as_array().expect("must have files[]");
+    assert!(!files.is_empty(), "files[] must be non-empty after fix");
+
+    // Every file key must be the real basename, not "input.mds".
+    for entry in files {
+        let file_key = entry["file"].as_str().unwrap_or("");
+        assert!(
+            !file_key.contains("input.mds"),
+            "file key must NOT be 'input.mds'; got: {file_key}"
+        );
+        assert_eq!(
+            file_key, "mixed.mds",
+            "file key must be the real filename basename; got: {file_key}"
+        );
+    }
+}
+
 // ── Test (c): --fix --check on overlap-fix fixture → "Would fix" after coalescing ──
 //
 // Pins bug-5 / PF-004 fix for the check path: preview_fixes returns a
@@ -1510,7 +1568,14 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
         "an analysis failure must still exit 2; stderr:\n{stderr}"
     );
 
-    // JSON channel: the error envelope must carry no source identity but the sentinel.
+    // JSON channel: the analysis-failure envelope is `{"version":1,"error":{...}}`.
+    //
+    // The `error` object carries `code`, `message`, `help`, and `span` — there is
+    // NO top-level `file` key and NO `file` key inside `error`.  A JSON consumer
+    // MUST NOT look for `files[].file` in this envelope; it is only present on
+    // the success envelope (`{"version":1,"files":[...],"truncated":...}`).
+    // This contract is documented in the CHANGELOG "Lint JSON wire contract" block
+    // (AC-P1-07 / AD-211-5) and pinned here so it cannot regress silently.
     let json = lint_stdin(source, &["--format", "json"]);
     let stdout = String::from_utf8_lossy(&json.stdout);
     let v: serde_json::Value =
@@ -1518,6 +1583,20 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
     assert!(
         v["error"].is_object(),
         "JSON analysis failure must use the error envelope; got: {stdout}"
+    );
+    // AC-P1-07 / AD-211-5: the error envelope has no `file` key at the top level —
+    // a stdin source identity never appears here.  Asserting null explicitly so a
+    // regression that adds `"file": "<stdin>"` to this envelope is caught.
+    assert!(
+        v.get("file").is_none() || v["file"].is_null(),
+        "AC-P1-07: analysis-failure JSON envelope must have NO top-level 'file' key; \
+         got: {stdout}"
+    );
+    // Also confirm `files` (the success envelope's array) is absent — both keys
+    // would indicate a confused merge of the two envelope shapes.
+    assert!(
+        v.get("files").is_none() || v["files"].is_null(),
+        "AC-P1-07: analysis-failure JSON envelope must have NO 'files' array; got: {stdout}"
     );
     let message = v["error"]["message"]
         .as_str()

@@ -648,25 +648,14 @@ impl LintResult {
     ///
     /// # Ordering
     ///
-    /// **`diagnostics` is stored as given — this constructor does not sort.** The
-    /// offset ordering documented on [`LintResult::to_canonical_json`] is
-    /// established by the internal builder that `lint`/`lint_source` use, so a
-    /// result produced by this crate always carries it. A `LintResult` you build
-    /// here carries whatever order you supply, and `to_canonical_json` will emit
-    /// that order.
-    ///
     /// **AD-202-1b:** this constructor does NOT sort because `LintResult::new`
     /// is a public, ADR-010 construction path.  Sorting here would silently
     /// reorder an external caller's deliberately-ordered `Vec<LintDiagnostic>`,
     /// which is a semantic change to a published API.  The internal builder
     /// (`LintResultBuilder::build`) sorts after truncation, so results produced
-    /// by `lint`/`lint_source` always carry the canonical offset order.  Sort
-    /// before calling this constructor if you want canonical ordering in the
-    /// emitted JSON.
-    ///
-    /// This is deliberate: sorting here would silently reorder a caller's
-    /// intentionally-ordered vector, which is a behaviour change to a published
-    /// construction path. Sort before calling if you want the canonical order.
+    /// by `lint`/`lint_source` always carry the canonical offset order.
+    /// [`to_canonical_json`] re-sorts defensively at the serialization boundary,
+    /// so the emitted JSON is always in canonical order.
     ///
     /// # Examples
     ///
@@ -757,11 +746,19 @@ impl LintResult {
     pub fn to_canonical_json(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
 
+        // Defensive sort: enforce canonical (file, offset) order at the serialization
+        // boundary.  LintResultBuilder::build establishes this order on the internal
+        // path; this pass makes the guarantee self-enforcing for LintResult::new callers
+        // too.  Cost is bounded at MAX_DIAGNOSTICS items (idempotent when already sorted).
+        // LintDiagnostic is not Clone, so we sort a vec of references.
+        let mut sorted: Vec<&LintDiagnostic> = self.diagnostics.iter().collect();
+        sorted.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+
         // Group diagnostics by file, preserving insertion order within each group.
         // BTreeMap gives deterministic (sorted) file ordering in the output.
         let mut by_file: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
 
-        for diag in &self.diagnostics {
+        for diag in &sorted {
             let key = diag.file.clone().unwrap_or_else(|| "<unknown>".to_string());
             let span_json = diag.span.as_ref().map(|s| {
                 let mut obj = serde_json::json!({
@@ -2135,21 +2132,15 @@ mod tests {
     // ── AC-P1-08 / AD-202-1: sort by byte offset ─────────────────────────────
 
     fn make_span_diag(file: Option<&str>, offset: Option<usize>, rule: &str) -> LintDiagnostic {
-        LintDiagnostic {
-            rule: rule.to_string(),
-            severity: Severity::Warn,
-            message: format!("{rule} at {offset:?}"),
-            help: None,
-            span: offset.map(|o| SerializedSpan {
-                offset: o,
-                length: 1,
-                line: None,
-                column: None,
-            }),
-            file: file.map(str::to_string),
-            fix_removals: None,
-            fix_edits: None,
+        let mut diag =
+            LintDiagnostic::new(rule, Severity::Warn, format!("{rule} at {offset:?}"));
+        if let Some(o) = offset {
+            diag = diag.with_span(SerializedSpan::new(o, 1));
         }
+        if let Some(f) = file {
+            diag = diag.with_file(f);
+        }
+        diag
     }
 
     /// AC-P1-08: `LintResultBuilder::build` sorts diagnostics by ascending byte

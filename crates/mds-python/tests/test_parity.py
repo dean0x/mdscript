@@ -275,3 +275,85 @@ def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib
         f"  CLI: {cli_json}\n"
         f"  py:  {py_json}"
     )
+
+
+def test_par5b_live_cli_lint_differential_with_findings(mds_cli: pathlib.Path) -> None:
+    """AC-P1-24: CLI stdin and Python lint() produce identical diagnostics[] (file key excluded).
+
+    test_par5 proves byte-identity for a clean source, where the ``{"files":[]}`` result
+    avoids the file-key divergence entirely.  This test covers the case WITH findings,
+    where the file key differs by design — CLI stdin emits ``"<stdin>"``, Python
+    ``lint()`` emits ``"input.mds"`` — and asserts cross-surface parity only on the
+    fields that are *supposed* to match: ``diagnostics[]``, spans, rule, severity,
+    fixable.
+
+    Avoids PF-007: surfaces are compared to *each other* (with the file key stripped),
+    not each to its own golden.  Per-surface goldens cannot catch a divergence in
+    diagnostic content, span offsets, or sort order across surfaces.
+
+    Fixture: ``{name}`` triggers ``legacy-interpolation`` at a low byte offset;
+    duplicate ``@export greet`` triggers ``duplicate-export`` at a higher offset.
+    ``run_rules`` dispatches ``duplicate-export`` before ``legacy-interpolation``,
+    so without the offset sort the array order would be reversed.  Using this fixture
+    confirms the sort ran while keeping the rule-set isolated from the #203
+    span-anchoring changes.
+    """
+    # Source: two diagnostics whose rule-execution order is the REVERSE of offset order.
+    src = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
+
+    # -- CLI surface: stdin lint in JSON mode; file key = "<stdin>" --
+    out = subprocess.run(
+        [str(mds_cli), "lint", "-", "--format", "json"],
+        input=src,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    # exit 0 = clean, exit 1 = warn-only findings, exit 2 = at least one error-severity
+    # finding.  The fixture's duplicate-export rule fires at "error" severity, so exit 2
+    # is the expected normal outcome (not a CLI failure).
+    assert out.returncode in (0, 1, 2), (
+        f"AC-P1-24: CLI lint exited unexpected status {out.returncode} "
+        f"(expected 0/1/2 for a lint result):\n{out.stderr}"
+    )
+    assert out.returncode != 0, (
+        "AC-P1-24: fixture must produce at least one finding (exit non-zero); got clean exit"
+    )
+    cli_result = json.loads(out.stdout.strip())
+
+    # -- Python surface: string-source lint; file key = "input.mds" --
+    py_result = json.loads(m.lint(src).to_json())
+
+    # Normalize: strip the file key from each files[] entry (it differs by design).
+    # Compare the remaining structure — diagnostics[], spans, rule, severity, fixable.
+    def strip_file_key(result: dict) -> list:
+        return [{k: v for k, v in entry.items() if k != "file"} for entry in result["files"]]
+
+    cli_norm = strip_file_key(cli_result)
+    py_norm = strip_file_key(py_result)
+
+    # Non-vacuity guard: empty arrays compare equal and prove nothing (PF-013).
+    total_diags = sum(len(entry.get("diagnostics", [])) for entry in cli_norm)
+    assert total_diags >= 2, (
+        f"AC-P1-24: fixture must produce at least two diagnostics for a meaningful "
+        f"cross-surface differential; got {total_diags} from CLI"
+    )
+
+    # Cross-surface assertion: diagnostics[], spans, rule, severity, fixable must be
+    # identical across surfaces when the file key is excluded (avoids PF-007).
+    assert cli_norm == py_norm, (
+        "AC-P1-24: CLI stdin and Python lint() diagnostics[] must be identical "
+        "when the file key is excluded.\n"
+        f"  CLI: {json.dumps(cli_norm)}\n"
+        f"  py:  {json.dumps(py_norm)}"
+    )
+
+    # Separately assert the per-surface file key values (AC-P1-24 / AC-P1-01 / AC-P1-06).
+    assert cli_result["files"][0]["file"] == "<stdin>", (
+        f"AC-P1-24: CLI stdin file key must be '<stdin>'; "
+        f"got '{cli_result['files'][0]['file']}'"
+    )
+    assert py_result["files"][0]["file"] == "input.mds", (
+        f"AC-P1-24: Python string-source file key must be 'input.mds'; "
+        f"got '{py_result['files'][0]['file']}'"
+    )
