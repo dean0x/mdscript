@@ -23,7 +23,7 @@
  *
  * D-CB5: Fails closed. In full-tree mode, zero-files-scanned is exit 1, not
  * exit 0 (avoids PF-016 — an empty scan masquerades as clean). In --staged
- * mode, an empty ACMR-filtered set is a legitimate state (deletion-only
+ * mode, an empty ACMRT-filtered set is a legitimate state (deletion-only
  * commits, amend with no content changes) and exits 0 with an explicit
  * message; the full-tree scan is the authoritative non-vacuity gate.
  *
@@ -511,8 +511,8 @@ function main() {
 
   // ---- D-CB5: Non-vacuity guard (AC-6) ----
   // Full-tree mode: zero tracked files means path discovery broke — fail closed.
-  // --staged mode: an empty ACMR-filtered set is a LEGITIMATE state:
-  //   • deletion-only commit (git rm): ACMR excludes deletions; files ARE staged.
+  // --staged mode: an empty ACMRT-filtered set is a LEGITIMATE state:
+  //   • deletion-only commit (git rm): ACMRT excludes deletions; files ARE staged.
   //   • amend with no content changes: index equals HEAD; diff is empty.
   // In both cases exit 0 with an explicit message. The full-tree scan is the
   // authoritative non-vacuity gate; the hook must not block valid commits.
