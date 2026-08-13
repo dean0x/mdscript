@@ -2132,8 +2132,7 @@ mod tests {
     // ── AC-P1-08 / AD-202-1: sort by byte offset ─────────────────────────────
 
     fn make_span_diag(file: Option<&str>, offset: Option<usize>, rule: &str) -> LintDiagnostic {
-        let mut diag =
-            LintDiagnostic::new(rule, Severity::Warn, format!("{rule} at {offset:?}"));
+        let mut diag = LintDiagnostic::new(rule, Severity::Warn, format!("{rule} at {offset:?}"));
         if let Some(o) = offset {
             diag = diag.with_span(SerializedSpan::new(o, 1));
         }
