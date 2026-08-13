@@ -12,13 +12,20 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, statSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { evaluateChecks, main, fetchRequiredContexts } from '../verify-pr-checks.mjs';
+import {
+  evaluateChecks,
+  main,
+  fetchRequiredContexts,
+  fetchStatuses,
+  EXPECTED_CONTEXTS,
+} from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
 const FIXTURES = join(ROOT, 'scripts/__test__/fixtures');
@@ -54,14 +61,22 @@ const HEAD_113F472 = '113f472684d6ee7e398d54c1aadc22b2ad747ae1';
 const HEAD_F168944 = 'f168944'; // PR #239
 const HEAD_E9DACE1 = 'e9dace1'; // PR #240
 
+// A synthetic Source hygiene run (D-PR3b). The 113f472 fixture predates the
+// source-hygiene job (#288); tests that verify a PASSING run today must inject one.
+const SOURCE_HYGIENE_PASS = { name: 'Source hygiene', status: 'completed', conclusion: 'success' };
+
 // ---------------------------------------------------------------------------
 // AC-22: Historical fixtures reproduce correctly
 // ---------------------------------------------------------------------------
 describe('AC-21 AC-22: historical fixture evaluation', () => {
 
-  test('113f472 (main baseline, 18 check-runs, all success) → PASS (exit 0)', () => {
-    const checkRuns = loadCheckRuns('checks-main-113f472.json');
-    assert.equal(checkRuns.length, 18, 'fixture must have 18 check-runs');
+  test('113f472 (main baseline + Source hygiene) → PASS (exit 0)', () => {
+    // The 113f472 fixture predates the source-hygiene job (added in #288).
+    // A passing run today requires Source hygiene to be present and successful
+    // (D-PR3b, EXPECTED_CONTEXTS). We inject a synthetic run to represent the
+    // current expected state.
+    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    assert.equal(checkRuns.length, 19, 'fixture must have 18+1 check-runs');
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0, `expected PASS; lines: ${result.lines.join('\n')}`);
     assert.ok(result.pass, 'evaluateChecks must return pass=true');
@@ -106,14 +121,14 @@ describe('AC-21 AC-22: historical fixture evaluation', () => {
 // ---------------------------------------------------------------------------
 describe('AC-23: partial case (5 of 6 required present)', () => {
 
-  test('17 of 18 check-runs (MSRV deleted) → FAIL naming MSRV', () => {
+  test('17 of 18 check-runs (MSRV deleted) + Source hygiene → FAIL naming MSRV', () => {
     // Synthesize by removing the MSRV check-run from the 113f472 fixture.
     // This is the case `gh pr checks --required` exits 0 on (all present checks are green)
     // but the tool catches: a required context is absent.
     const allRuns = loadCheckRuns('checks-main-113f472.json');
     const msrvName = 'MSRV (Rust 1.88)';
-    const withoutMsrv = allRuns.filter(cr => cr.name !== msrvName);
-    assert.equal(withoutMsrv.length, 17, 'should have 17 runs after removing MSRV');
+    const withoutMsrv = [...allRuns.filter(cr => cr.name !== msrvName), SOURCE_HYGIENE_PASS];
+    assert.equal(withoutMsrv.length, 18, 'should have 17+1 runs after removing MSRV');
 
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
@@ -136,9 +151,9 @@ describe('AC-23: partial case (5 of 6 required present)', () => {
 // ---------------------------------------------------------------------------
 describe('AC-24: non-success states → FAIL, quoting the observed state', () => {
 
-  // Build a passing baseline from the 113f472 fixture, then mutate one required check
+  // Build a passing baseline from the 113f472 fixture + Source hygiene.
   function buildPassingRuns() {
-    return loadCheckRuns('checks-main-113f472.json').map(cr => ({ ...cr }));
+    return [...loadCheckRuns('checks-main-113f472.json').map(cr => ({ ...cr })), { ...SOURCE_HYGIENE_PASS }];
   }
 
   const NON_SUCCESS_CASES = [
@@ -171,10 +186,171 @@ describe('AC-24: non-success states → FAIL, quoting the observed state', () =>
     });
   }
 
-  test('control: all-success baseline still exits 0 (suite is not failing unconditionally)', () => {
+  test('control: all-success baseline (with Source hygiene) still exits 0 (suite is not failing unconditionally)', () => {
     const runs = buildPassingRuns();
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0, 'all-success baseline must pass');
+  });
+
+  // D-PR3b: non-required check in queued/in_progress must also FAIL (Tier B fix).
+  // PoC from the review: "6 required contexts completed+success plus
+  // {name:'Source hygiene', status:'queued', conclusion:null} → exits 0" — WRONG.
+  // After the fix, Tier B FAILs on any non-completed non-required run.
+  test('non-required check with status=queued → FAIL (Tier B, D-PR3 fix)', () => {
+    const runs = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { name: 'Source hygiene', status: 'queued', conclusion: null },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1,
+      'a non-required queued run must prevent PASS (Tier B fix, D-PR3)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Source hygiene'), `must name the pending job; got: ${allLines}`);
+    assert.ok(allLines.includes('queued'), `must quote the observed status; got: ${allLines}`);
+  });
+
+  test('non-required check with status=in_progress → FAIL (Tier B, D-PR3 fix)', () => {
+    const runs = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { name: 'Some other job', status: 'in_progress', conclusion: null },
+      { ...SOURCE_HYGIENE_PASS },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'a non-required in_progress run must prevent PASS');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('in_progress'), `must quote the observed status; got: ${allLines}`);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR3b: EXPECTED_CONTEXTS (Source hygiene) — absence detection
+// Closing the gap: source-hygiene ABSENT → exit 0 was the described PoC.
+// ---------------------------------------------------------------------------
+describe('D-PR3b: Source hygiene absence detection (EXPECTED_CONTEXTS)', () => {
+
+  test('EXPECTED_CONTEXTS is [Source hygiene]', () => {
+    assert.deepEqual(EXPECTED_CONTEXTS, ['Source hygiene'],
+      'EXPECTED_CONTEXTS must list exactly "Source hygiene"');
+  });
+
+  test('Source hygiene ABSENT from check-runs → FAIL (the described PoC, D-PR3b)', () => {
+    // PoC: 6 required contexts completed+success, Source hygiene absent entirely.
+    // Before the fix, Tier B had nothing to iterate and emitted exitCode=0.
+    // After the fix (EXPECTED_CONTEXTS with Tier A semantics), absence = FAIL.
+    const checkRuns = loadCheckRuns('checks-main-113f472.json'); // no Source hygiene
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'Source hygiene absent must exit 1, not 0 (PoC from the review finding)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Source hygiene'),
+      `failure must name "Source hygiene"; got: ${allLines}`);
+    // The absence message must indicate the job was not found
+    assert.ok(
+      allLines.includes('not found') || allLines.includes('never ran') || allLines.includes('absence'),
+      `failure must indicate the job was not found; got: ${allLines}`,
+    );
+  });
+
+  test('Source hygiene queued → FAIL (Tier A+ catches non-completed expected run)', () => {
+    const checkRuns = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { name: 'Source hygiene', status: 'queued', conclusion: null },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'queued expected run must FAIL');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Source hygiene'), `must name the job; got: ${allLines}`);
+    assert.ok(allLines.includes('queued'), `must quote the status; got: ${allLines}`);
+  });
+
+  test('Source hygiene in_progress → FAIL (Tier A+ catches non-completed expected run)', () => {
+    const checkRuns = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { name: 'Source hygiene', status: 'in_progress', conclusion: null },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'in_progress expected run must FAIL');
+  });
+
+  test('Source hygiene failure → FAIL (Tier A+ catches failed expected run)', () => {
+    const checkRuns = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { name: 'Source hygiene', status: 'completed', conclusion: 'failure' },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'failed expected run must FAIL');
+  });
+
+  test('Source hygiene present+success → does not fail (Tier A+ does not false-fail)', () => {
+    const checkRuns = [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      SOURCE_HYGIENE_PASS,
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'present-and-successful Source hygiene must not fail');
+  });
+
+  test('Source hygiene already in requiredContexts → not double-reported by Tier A+', () => {
+    // If Open Decision 1 is applied and Source hygiene enters branch protection,
+    // it appears in both requiredContexts and EXPECTED_CONTEXTS. The Tier A+
+    // loop must skip it (already handled in Tier A), not double-fail it.
+    const requiredWithHygiene = [...REQUIRED, 'Source hygiene'];
+    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const result = evaluateChecks({ requiredContexts: requiredWithHygiene, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'Source hygiene in required set must not be double-reported');
+    const allLines = result.lines.join('\n');
+    const tierAplusCount = (allLines.match(/Tier A\+/g) ?? []).length;
+    assert.equal(tierAplusCount, 0, 'Tier A+ must not fire when context is already in Tier A');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR2a: Tier A checks BOTH namespaces independently (not if/else-if)
+// A failing commit status must not be masked by a passing check-run.
+// ---------------------------------------------------------------------------
+describe('D-PR2a: Tier A checks both check-runs AND statuses independently', () => {
+
+  test('required context in check-runs (success) AND statuses (failure) → FAIL', () => {
+    // Before the fix, if/else-if meant the status branch was only reached when
+    // no check-run existed. A failing status was silently ignored when a
+    // check-run of the same name was green (narrow divergence from GitHub's
+    // enforcement model per D-PR2a).
+    const allRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const msrvName = 'MSRV (Rust 1.88)';
+    // MSRV exists in check-runs (success), also in statuses (failure)
+    const statuses = [{ context: msrvName, state: 'failure' }];
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: allRuns,
+      statuses,
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'failing status must not be masked by passing check-run (D-PR2a)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes(msrvName), `must name the failing context; got: ${allLines}`);
+    assert.ok(allLines.includes('failure'), `must quote the failing state; got: ${allLines}`);
+  });
+
+  test('required context in check-runs (success) AND statuses (success) → PASS', () => {
+    const allRuns = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const msrvName = 'MSRV (Rust 1.88)';
+    const statuses = [{ context: msrvName, state: 'success' }];
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: allRuns,
+      statuses,
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 0,
+      'required context in both namespaces (both success) must pass (D-PR2a)');
   });
 
 });
@@ -198,7 +374,7 @@ describe('AC-25: zero check-runs never passes', () => {
   });
 
   test('output always includes counts (applies ADR-009)', () => {
-    const runs = loadCheckRuns('checks-main-113f472.json');
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     const allLines = result.lines.join('\n');
     // Counts must appear whether pass or fail
@@ -214,7 +390,7 @@ describe('AC-25: zero check-runs never passes', () => {
 describe('AC-26 AC-27: exit codes and merge command', () => {
 
   test('PASS → exit 0 with --match-head-commit <sha> in output', () => {
-    const runs = loadCheckRuns('checks-main-113f472.json');
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 0);
     assert.ok(result.mergeCommand, 'PASS must produce a mergeCommand');
@@ -237,7 +413,7 @@ describe('AC-26 AC-27: exit codes and merge command', () => {
 
     const passResult = evaluateChecks({
       requiredContexts: REQUIRED,
-      checkRuns: loadCheckRuns('checks-main-113f472.json'),
+      checkRuns: [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS],
       statuses: [],
       headSha: HEAD_113F472,
     });
@@ -260,7 +436,13 @@ const OK_GH_VERSION = () => ({ major: 2, minor: 88 });
 /**
  * Build a gh runner stub from a route table. Each entry is matched against the
  * API path by substring; the value is either a JSON object (success) or an
- * `{ __error: true, status }` shape mirroring defaultGhRunner's failure return.
+ * error shape mirroring defaultGhRunner's output.
+ *
+ * Error shape uses `httpStatus` (not `status`) for HTTP error codes — the
+ * process exit code is always 1 regardless of HTTP status, so `status` alone
+ * cannot distinguish 404 from 403. The stub mirrors the parsed shape that
+ * defaultGhRunner produces after fixing the medium finding (avoids PF-013:
+ * dead branches that only trigger on a value the runner never produces).
  */
 function stubRunner(routes, callLog = []) {
   return (args) => {
@@ -271,7 +453,7 @@ function stubRunner(routes, callLog = []) {
         return typeof value === 'function' ? value(url) : value;
       }
     }
-    return { __error: true, status: 404, stderr: `no stub route for ${url}` };
+    return { __error: true, httpStatus: 404, stderr: `no stub route for ${url}` };
   };
 }
 
@@ -279,24 +461,35 @@ const PR_OK = { head: { sha: HEAD_113F472 }, base: { ref: 'main' } };
 const PROTECTION_OK = JSON.parse(readFileSync(join(FIXTURES, 'protection-main.json'), 'utf8'));
 const CHECKS_OK = JSON.parse(readFileSync(join(FIXTURES, 'checks-main-113f472.json'), 'utf8'));
 
+// CHECKS_OK_WITH_HYGIENE: the 113f472 fixture + Source hygiene run, for happy-path
+// tests that drive main() and expect exit 0. The 113f472 fixture predates #288;
+// a PASS today requires Source hygiene to be present (D-PR3b, EXPECTED_CONTEXTS).
+const CHECKS_OK_WITH_HYGIENE = {
+  ...CHECKS_OK,
+  check_runs: [...CHECKS_OK.check_runs, SOURCE_HYGIENE_PASS],
+  total_count: CHECKS_OK.total_count + 1,
+};
+
 describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
 
   test('happy path → exit 0', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
-      ['/check-runs', CHECKS_OK],
-      ['/status', { statuses: [] }],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
   });
 
   test('AC-29: unprotected base (404 on protection) → exit 2, never 0', () => {
+    // httpStatus mirrors what defaultGhRunner produces after parsing "(HTTP NNN)"
+    // from gh's stderr — the process exit code is always 1, not 404.
     const runner = stubRunner([
       ['/pulls/', PR_OK],
-      ['/protection', { __error: true, status: 404, stderr: 'Not Found' }],
-      ['/check-runs', CHECKS_OK],
-      ['/status', { statuses: [] }],
+      ['/protection', { __error: true, httpStatus: 404, stderr: 'gh: Not Found (HTTP 404)' }],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
   });
@@ -304,7 +497,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
   test('AC-29: --required-from branch also unprotected → exit 2', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
-      ['/protection', { __error: true, status: 404, stderr: 'Not Found' }],
+      ['/protection', { __error: true, httpStatus: 404, stderr: 'gh: Not Found (HTTP 404)' }],
     ]);
     assert.equal(main(['1', '--required-from', 'nope'], runner, OK_GH_VERSION), 2);
   });
@@ -312,9 +505,21 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
   test('AC-26: protection unreadable (403) → exit 2', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
-      ['/protection', { __error: true, status: 403, stderr: 'Forbidden' }],
+      ['/protection', { __error: true, httpStatus: 403, stderr: 'gh: Forbidden (HTTP 403)' }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
+  });
+
+  test('AC-29: message for unprotected base names the branch and suggests --required-from', () => {
+    // Drives fetchRequiredContexts 404 path directly to verify message content.
+    const runner = (_args) => ({ __error: true, httpStatus: 404, stderr: 'gh: Not Found (HTTP 404)' });
+    const result = fetchRequiredContexts('wave/v0.4.0-wave1', null, runner);
+    assert.ok(!result.ok);
+    assert.equal(result.exitCode, 2);
+    assert.ok(result.message.includes('wave/v0.4.0-wave1'),
+      `message must name the base branch; got: ${result.message}`);
+    assert.ok(result.message.includes('--required-from'),
+      `message must mention --required-from; got: ${result.message}`);
   });
 
   test('AC-26: gh older than 2.31 → exit 2 before any API call', () => {
@@ -344,8 +549,8 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
       ['/protection', { required_status_checks: { contexts: [], checks: [] } }],
-      ['/check-runs', CHECKS_OK],
-      ['/status', { statuses: [] }],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
   });
@@ -362,8 +567,8 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
       ['/protection', onlyChecks],
-      ['/check-runs', CHECKS_OK],
-      ['/status', { statuses: [] }],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
 
@@ -385,7 +590,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
       ['/check-runs', () => { pages++; return fullPage; }],
-      ['/status', { statuses: [] }],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2, 'page cap must exit 2');
     assert.ok(pages <= 20, `pagination must be bounded; issued ${pages} page requests`);
@@ -398,7 +603,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
       ['/check-runs', truncated],
-      ['/status', { statuses: [] }],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
   });
@@ -408,8 +613,8 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
-      ['/check-runs', CHECKS_OK],
-      ['/status', { statuses: [] }],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
     ], calls);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
     assert.equal(calls.length, 4, `expected 4 API calls (pr, protection, checks, status); got ${calls.length}`);
@@ -421,7 +626,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     const runner = stubRunner([
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
-      ['/check-runs', { __error: true, status: 500, stderr: 'server error' }],
+      ['/check-runs', { __error: true, httpStatus: 500, stderr: 'server error' }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
   });
@@ -431,9 +636,109 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
       ['/check-runs', { total_count: 0, check_runs: [] }],
-      ['/status', { statuses: [] }],
+      ['/status', { statuses: [], total_count: 0 }],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 1);
+  });
+
+  // D-PR4a parity: fetchStatuses total_count guard.
+  // The combined-status endpoint caps at 30 statuses. If total_count > returned
+  // count, a required context beyond position 30 would be falsely absent — fail
+  // closed rather than silently evaluate a partial set (consistent with D-PR4a).
+  test('fetchStatuses: total_count > returned statuses → exit 2 (partial set)', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      // total_count claims 35 but only 2 are returned (API cap at 30 simulated)
+      ['/status', { total_count: 35, statuses: [
+        { context: 'foo', state: 'success' },
+        { context: 'bar', state: 'success' },
+      ] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2,
+      'truncated status list (total_count > returned) must exit 2');
+  });
+
+  test('fetchStatuses: total_count === returned statuses → proceeds normally', () => {
+    // Non-truncated status response — should not block a passing run.
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { total_count: 1, statuses: [{ context: 'foo', state: 'success' }] }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
+      'non-truncated status list must not block a passing run');
+  });
+
+  test('fetchStatuses: status omitting total_count → proceeds (no false-fail)', () => {
+    // Some stubs (and older fixtures) omit total_count; guard must not
+    // fire when total_count is absent.
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [] }],  // no total_count
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
+      'missing total_count must not cause a false exit 2');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Medium finding: defaultGhRunner populates httpStatus from stderr, not status.
+// fetchRequiredContexts must branch on httpStatus (not the process exit code).
+// Stubs mirror the parsed shape (applies ADR-009, avoids PF-013 dead branches).
+// ---------------------------------------------------------------------------
+describe('medium finding: fetchRequiredContexts branches on httpStatus, not process exit code', () => {
+
+  test('httpStatus:404 → 404-specific message branch (not generic protection API error)', () => {
+    const runner = (_args) => ({ __error: true, httpStatus: 404, stderr: 'gh: Not Found (HTTP 404)' });
+    const result = fetchRequiredContexts('some-branch', null, runner);
+    assert.ok(!result.ok);
+    assert.equal(result.exitCode, 2);
+    // The 404 branch must fire — not the generic fallthrough
+    assert.ok(result.message.includes('no protection') || result.message.includes('404'),
+      `must use the 404 branch; got: ${result.message}`);
+    assert.ok(!result.message.includes('protection API error'),
+      `must NOT fall through to generic error; got: ${result.message}`);
+  });
+
+  test('httpStatus:403 → 403-specific message branch (not generic protection API error)', () => {
+    const runner = (_args) => ({ __error: true, httpStatus: 403, stderr: 'gh: Forbidden (HTTP 403)' });
+    const result = fetchRequiredContexts('some-branch', null, runner);
+    assert.ok(!result.ok);
+    assert.equal(result.exitCode, 2);
+    assert.ok(result.message.includes('403') || result.message.includes('permissions'),
+      `must use the 403 branch; got: ${result.message}`);
+    assert.ok(!result.message.includes('protection API error'),
+      `must NOT fall through to generic error; got: ${result.message}`);
+  });
+
+  test('httpStatus:null (no HTTP code in stderr) → generic error branch', () => {
+    // Simulates a non-API error (e.g. connection refused) where gh prints no HTTP code.
+    // This is what the OLD runner returned for ALL errors (always status:1, never 404).
+    // The fix: only the generic branch fires when httpStatus is null.
+    const runner = (_args) => ({ __error: true, status: 1, httpStatus: null, stderr: 'connection refused' });
+    const result = fetchRequiredContexts('some-branch', null, runner);
+    assert.ok(!result.ok);
+    assert.equal(result.exitCode, 2);
+    assert.ok(result.message.includes('protection API error'),
+      `non-HTTP error must fall through to generic branch; got: ${result.message}`);
+  });
+
+  test('httpStatus:undefined (old-shape stub) → generic error branch, not a throw', () => {
+    // Backward-compat: a stub that only sets status (not httpStatus) must not
+    // accidentally trigger the 404 or 403 branch via undefined === 404 → false.
+    const runner = (_args) => ({ __error: true, status: 404, stderr: 'Not Found' });
+    const result = fetchRequiredContexts('some-branch', null, runner);
+    assert.ok(!result.ok);
+    assert.equal(result.exitCode, 2);
+    // httpStatus is undefined → neither 404 nor 403 branch fires → generic
+    assert.ok(result.message.includes('protection API error'),
+      `undefined httpStatus must not trigger the 404 branch; got: ${result.message}`);
   });
 
 });
@@ -474,6 +779,7 @@ describe('duplicate check-run names are all evaluated', () => {
       ...loadCheckRuns('checks-main-113f472.json').filter(cr => cr.name !== ctx),
       { name: ctx, status: 'completed', conclusion: 'failure' },
       { name: ctx, status: 'completed', conclusion: 'success' },
+      SOURCE_HYGIENE_PASS,
     ];
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1,
@@ -511,7 +817,7 @@ describe('D-PR2a: required context satisfied by commit status', () => {
     // but that context is present in commit statuses as success.
     const allRuns = loadCheckRuns('checks-main-113f472.json');
     const msrvName = 'MSRV (Rust 1.88)';
-    const withoutMsrv = allRuns.filter(cr => cr.name !== msrvName);
+    const withoutMsrv = [...allRuns.filter(cr => cr.name !== msrvName), SOURCE_HYGIENE_PASS];
 
     // Simulate MSRV being satisfied via commit status instead
     const statuses = [{ context: msrvName, state: 'success' }];
@@ -524,5 +830,75 @@ describe('D-PR2a: required context satisfied by commit status', () => {
     });
     assert.equal(result.exitCode, 0,
       'required context satisfied via commit status must pass (D-PR2a)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Code of Conduct fixture verification (AC-1, AC-2)
+// ---------------------------------------------------------------------------
+describe('AC-1 AC-2: Code of Conduct verification', () => {
+  // D-COC2: the fixture is the recorded UPSTREAM text, and the sha256 below is
+  // the whole point of recording it — without a pinned digest, "CODE_OF_CONDUCT.md
+  // differs from the fixture in exactly one line" can be satisfied by editing the
+  // fixture. `hash.length === 64` is true of every sha256 ever computed and
+  // asserts nothing (applies ADR-009, avoids PF-013).
+  //
+  // Provenance, re-verified at review time:
+  //   https://raw.githubusercontent.com/EthicalSource/contributor_covenant/
+  //     release/content/version/2/1/code_of_conduct.md
+  //   The upstream file carries a TOML front-matter block (+++ ... +++) that is
+  //   site metadata, not part of the document. With it stripped, the body is
+  //   byte-identical to this fixture: 5478 bytes, sha256 369bf730...339b.
+  //   (The plan recorded 977d7813.../5480 bytes for a capture that does not
+  //   reproduce against upstream today; the digest below is measured, not copied.)
+  const FIXTURE_SHA256 = '369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b';
+  const FIXTURE_BYTES = 5478;
+
+  test('fixture matches its recorded sha256 and byte count exactly', () => {
+    const fixturePath = join(FIXTURES, 'contributor-covenant-2.1.md');
+    const buf = readFileSync(fixturePath);
+    const hash = createHash('sha256').update(buf).digest('hex');
+    const size = statSync(fixturePath).size;
+    assert.equal(size, FIXTURE_BYTES, `fixture must be exactly ${FIXTURE_BYTES} bytes; got ${size}`);
+    assert.equal(hash, FIXTURE_SHA256,
+      'fixture no longer matches the recorded upstream digest — the vendored Contributor ' +
+      'Covenant text was modified; restore it rather than updating this constant');
+  });
+
+  test('CODE_OF_CONDUCT.md differs from fixture in exactly one line (contact substitution)', () => {
+    const cocPath = join(ROOT, 'CODE_OF_CONDUCT.md');
+    const fixturePath = join(FIXTURES, 'contributor-covenant-2.1.md');
+    const coc = readFileSync(cocPath, 'utf8');
+    const fixture = readFileSync(fixturePath, 'utf8');
+
+    const cocLines = coc.split('\n');
+    const fixtureLines = fixture.split('\n');
+
+    // Find differing lines
+    const maxLen = Math.max(cocLines.length, fixtureLines.length);
+    const diffs = [];
+    for (let i = 0; i < maxLen; i++) {
+      if (cocLines[i] !== fixtureLines[i]) {
+        diffs.push({ lineNo: i + 1, coc: cocLines[i], fixture: fixtureLines[i] });
+      }
+    }
+
+    assert.equal(diffs.length, 1,
+      `CODE_OF_CONDUCT.md must differ from fixture in exactly 1 line; got ${diffs.length} diff(s): ` +
+      JSON.stringify(diffs));
+    assert.ok(diffs[0].coc.includes('deanshrn@gmail.com'),
+      `the differing line must contain 'deanshrn@gmail.com'; got: ${diffs[0].coc}`);
+    assert.ok(
+      (diffs[0].fixture ?? '').includes('[INSERT CONTACT METHOD]'),
+      `fixture's differing line must contain '[INSERT CONTACT METHOD]'; got: ${diffs[0].fixture}`
+    );
+  });
+
+  test('CODE_OF_CONDUCT.md does not contain [INSERT CONTACT METHOD]', () => {
+    const coc = readFileSync(join(ROOT, 'CODE_OF_CONDUCT.md'), 'utf8');
+    assert.ok(!coc.includes('[INSERT CONTACT METHOD]'),
+      'CODE_OF_CONDUCT.md must not contain [INSERT CONTACT METHOD]');
+    assert.ok(coc.includes('deanshrn@gmail.com'),
+      'CODE_OF_CONDUCT.md must contain the contact email');
   });
 });
