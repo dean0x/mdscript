@@ -59,8 +59,9 @@ node scripts/verify-versions.mjs
 
 # Source hygiene and pre-merge check gates
 node scripts/verify-no-control-bytes.mjs
+npm run test:gates                           # positive-control spec suite
 # Before any --admin merge (PF-017 guard — cancelled runs read as green):
-# node scripts/verify-pr-checks.mjs <pr-number>
+node scripts/verify-pr-checks.mjs <pr-number>
 
 # Packaging spot-check (inspect tarball contents)
 npm pack -w @mdscript/mds --dry-run
@@ -92,9 +93,19 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 
 1. **Bump versions:** `node scripts/bump-version.mjs X.Y.Z` (updates all
    manifests and stamps the CHANGELOG, opening a fresh `[Unreleased]`).
-2. **Land the bump on `main`:** open a PR (CI-gated). `main` is protected and the
-   sole code-owner can't self-approve, so the merge needs an admin override
-   (`enforce_admins=false` permits it). Squash-merge to keep linear history.
+2. **Land the bump on `main`:** open a PR (CI-gated). Once CI is green, run the
+   pre-merge check verifier before merging — a cancelled run reads as green under
+   `--admin` (PF-017):
+   ```bash
+   node scripts/verify-pr-checks.mjs <pr-number>
+   ```
+   On exit 0 the script prints the exact merge command — copy and run it verbatim:
+   ```bash
+   gh pr merge --squash --match-head-commit <headSha>
+   ```
+   (`main` is protected; the sole code-owner can't self-approve so `--admin` is
+   required. `--match-head-commit` closes the TOCTOU window between verification
+   and merge.)
 3. **Tag the merged commit and push:**
    ```bash
    git tag -a vX.Y.Z -m vX.Y.Z
