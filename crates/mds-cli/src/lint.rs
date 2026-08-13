@@ -1040,8 +1040,19 @@ fn run_lint_directory(
         return Ok(());
     }
 
-    // F1: path-sort explicitly — collect_mds_files does NOT guarantee order.
-    files.sort();
+    // F1: sort by the byte-wise (lexicographic) string of the relative display path.
+    // `Path::Ord` (component-wise) diverges from byte-order when a path-separator
+    // character appears WITHIN a filename component — e.g. `api-utils.mds` sorts
+    // AFTER `api/x.mds` under Path::Ord ("api" < "api-utils"), but BEFORE under
+    // byte-wise string order ('-' = 0x2D < '/' = 0x2F).  Sorting on the relative
+    // display string keeps the CLI wire contract consistent with the BTreeMap
+    // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
+    files.sort_by_key(|p| {
+        p.strip_prefix(dir)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .into_owned()
+    });
 
     let mut max_tally = FileTally::Clean;
     let mut json_files: Vec<serde_json::Value> = Vec::new();

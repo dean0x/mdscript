@@ -6,6 +6,7 @@
  */
 
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,31 @@ const require = createRequire(import.meta.url);
 // Load the native addon from the built .node file.
 const addon = require('../mds-napi.node');
 const { compile, compileFile, check, checkFile } = addon;
+
+// ---------------------------------------------------------------------------
+// CLI helper for AC-P1-24 cross-surface differential (P-L-4).
+// Resolution order: MDS_CLI_BIN env var > freshest release/debug build > null.
+// ---------------------------------------------------------------------------
+
+/** Absolute path to the repository root (two levels above this test file). */
+const REPO_ROOT = path.resolve(__dirname, '../..');
+
+/** Return the absolute path to the `mds` CLI binary, or null if none can be found. */
+function findMdsCli() {
+  const envBin = process.env.MDS_CLI_BIN;
+  if (envBin) {
+    if (!fs.existsSync(envBin)) throw new Error(`MDS_CLI_BIN=${envBin} does not exist`);
+    return envBin;
+  }
+  const exe = process.platform === 'win32' ? 'mds.exe' : 'mds';
+  const candidates = ['release', 'debug']
+    .map((profile) => path.join(REPO_ROOT, 'target', profile, exe))
+    .filter(fs.existsSync);
+  if (!candidates.length) return null;
+  return candidates.reduce((a, b) =>
+    fs.statSync(a).mtimeMs >= fs.statSync(b).mtimeMs ? a : b,
+  );
+}
 
 // Fixture directory.
 const FIXTURES = path.join(__dirname, 'fixtures');
@@ -1051,6 +1077,131 @@ describe('lint parity (AC-API-06 guard)', () => {
       JSON.stringify(result),
       UNUSED_GOLDEN,
       `napi lintVirtual unused-variable golden mismatch:\n  got:    ${JSON.stringify(result)}\n  expect: ${UNUSED_GOLDEN}`,
+    );
+  });
+
+  // P-L-4: AC-P1-24 cross-surface differential: napi lint() and CLI stdin must
+  // produce byte-identical diagnostics[] when the file key is excluded.
+  //
+  // The file key intentionally differs ("input.mds" on napi vs "<stdin>" on CLI
+  // stdin) — this is by design (AC-P1-01 / AC-P1-06). Comparing surfaces to each
+  // other with the file key stripped is the only comparison that can catch a
+  // divergence in diagnostic content, span offsets, or ordering — per-surface
+  // goldens (P-L-2, P-L-3) cannot prove cross-surface byte parity (PF-007).
+  //
+  // The fixture uses rules NOT touched by #203: legacy-interpolation at a low byte
+  // offset and duplicate-export at a high offset. run_rules dispatches
+  // duplicate-export (5th) BEFORE legacy-interpolation (10th), so without the
+  // AD-202-1 offset sort the array order would be reversed. Confirming that both
+  // surfaces agree on offset-ascending order proves the sort ran and both surfaces
+  // inherited it from LintResultBuilder::build.
+  //
+  // In CI the CLI is required; locally, if no binary is found, the test warns and
+  // exits early (avoids a hard-fail when building only the JS side).
+  test('P-L-4: AC-P1-24 cross-surface — napi and CLI diagnostics[] are byte-identical (file key excluded)', () => {
+    const mdsCli = findMdsCli();
+    if (mdsCli == null) {
+      if (process.env.CI) {
+        throw new Error(
+          'P-L-4: mds CLI binary is required in CI for AC-P1-24 cross-surface parity. ' +
+            'Set MDS_CLI_BIN or run `cargo build -p mds-cli`.',
+        );
+      }
+      // Local dev without a built CLI: warn and skip (not a hard failure).
+      console.warn(
+        'P-L-4: skipping CLI surface — mds binary not found ' +
+          '(run `cargo build -p mds-cli` to enable this check)',
+      );
+      return;
+    }
+
+    // Fixture: {name} triggers legacy-interpolation at a low byte offset; duplicate
+    // @export greet triggers duplicate-export at a higher offset. Rule-execution order
+    // is the REVERSE of offset order — correct sort changes the observed array order.
+    const source =
+      '@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n';
+
+    // -- napi surface: string-source lint; file key = "input.mds" --
+    const napiResult = lint(source);
+    assert.ok(
+      napiResult.files.length > 0,
+      'P-L-4: fixture must produce at least one file entry from the napi surface',
+    );
+
+    // -- CLI surface: stdin lint in JSON mode; file key = "<stdin>" --
+    const cliProc = spawnSync(mdsCli, ['lint', '-', '--format', 'json'], {
+      input: source,
+      encoding: 'utf-8',
+    });
+    // exit 0 = clean, exit 1 = warn-only findings, exit 2 = at least one error-severity
+    // finding. The fixture's duplicate-export rule fires at "error" severity, so exit 2
+    // is the expected normal outcome (not a CLI failure).
+    assert.ok(
+      cliProc.status === 0 || cliProc.status === 1 || cliProc.status === 2,
+      `P-L-4: CLI lint exited unexpected status ${cliProc.status}: ${cliProc.stderr}`,
+    );
+    const cliResult = JSON.parse(cliProc.stdout);
+    assert.ok(
+      cliResult.files.length > 0,
+      'P-L-4: fixture must produce at least one file entry from the CLI surface',
+    );
+
+    // Normalize: strip the file key from each files[] entry so the comparison is
+    // over diagnostics[], not the deliberately-different source identity.
+    function normalizeFiles(result) {
+      return result.files.map(({ file: _file, ...rest }) => rest);
+    }
+    const napiNorm = normalizeFiles(napiResult);
+    const cliNorm = normalizeFiles(cliResult);
+
+    // Non-vacuity guard: two empty arrays compare equal and prove nothing (PF-013).
+    const totalDiags = napiNorm.reduce((n, f) => n + (f.diagnostics?.length ?? 0), 0);
+    assert.ok(
+      totalDiags >= 2,
+      `P-L-4: AC-P1-24 needs at least two diagnostics for a meaningful cross-surface ` +
+        `differential; got ${totalDiags}`,
+    );
+
+    // Rule-position pinning: both rules must have fired, and legacy-interpolation must
+    // appear BEFORE duplicate-export (proves the AD-202-1 sort reordered against
+    // run_rules dispatch order). Delete the sort in LintResultBuilder::build and this fails.
+    const rules = napiNorm.flatMap((f) => (f.diagnostics ?? []).map((d) => d.rule));
+    const legacyIdx = rules.indexOf('legacy-interpolation');
+    const dupIdx = rules.indexOf('duplicate-export');
+    assert.ok(
+      legacyIdx !== -1,
+      `P-L-4: fixture must produce a legacy-interpolation diagnostic; got rules: ${JSON.stringify(rules)}`,
+    );
+    assert.ok(
+      dupIdx !== -1,
+      `P-L-4: fixture must produce a duplicate-export diagnostic; got rules: ${JSON.stringify(rules)}`,
+    );
+    assert.ok(
+      legacyIdx < dupIdx,
+      `P-L-4: legacy-interpolation (lower offset) must appear before duplicate-export ` +
+        `(higher offset); got indices legacy=${legacyIdx} dup=${dupIdx}`,
+    );
+
+    // Primary assertion: diagnostics[], spans, rule, severity, fixable are identical
+    // across the two surfaces (the cross-surface differential, avoids PF-007).
+    assert.deepEqual(
+      napiNorm,
+      cliNorm,
+      'P-L-4: AC-P1-24: napi and CLI diagnostics[] must be identical when ' +
+        `file key is excluded.\n  napi: ${JSON.stringify(napiNorm)}\n` +
+        `  CLI:  ${JSON.stringify(cliNorm)}`,
+    );
+
+    // Separately assert the per-surface file key values (AC-P1-24 / AC-P1-01 / AC-P1-06).
+    assert.equal(
+      napiResult.files[0].file,
+      'input.mds',
+      'P-L-4: napi string-source file key must be "input.mds"',
+    );
+    assert.equal(
+      cliResult.files[0].file,
+      '<stdin>',
+      'P-L-4: CLI stdin file key must be "<stdin>"',
     );
   });
 });

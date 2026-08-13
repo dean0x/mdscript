@@ -707,7 +707,7 @@ impl LintResult {
     ///           "message": "...",
     ///           "help": "...",
     ///           "fixable": false,
-    ///           "span": { "offset": 0, "length": 5, "line": 1, "column": 1 },
+    ///           "span": { "offset": 0, "length": 5 },
     ///           "fix_edits": [{ "start": 0, "end": 7, "new_text": "" }]
     ///         }
     ///       ]
@@ -719,18 +719,30 @@ impl LintResult {
     ///
     /// Per-file grouping: diagnostics without a `file` are grouped under the string
     /// key `"<unknown>"` (a defensive fallback; in practice every rule sets `file:
-    /// Some(..)`).
+    /// Some(..)`).  Note: `"<unknown>"` sorts before alphabetic paths in the JSON
+    /// `files` array (BTreeMap, `<` precedes letters), which disagrees with the
+    /// ordering of `LintResult.diagnostics` where file-less entries sort last —
+    /// this is academic because no lint rule emits `file: None`.
     /// The `fixable` field reflects tier semantics: `true` for Tier A rules and for
     /// Tier B rules when the file is standalone, `false` otherwise.
-    /// The `fix_edits` field is `null` when no machine-applicable fix is available.
+    ///
+    /// Absence conventions: `"help"`, `"span"`, and `"fix_edits"` are JSON `null`
+    /// when the field is `None`.  Within a present `"span"` object, `"offset"` and
+    /// `"length"` are always present; `"line"` and `"column"` are **omitted** (the
+    /// key is absent, not `null`) when not set.  No current lint rule sets `line`
+    /// or `column`, so live output contains only `"offset"` and `"length"`.  The
+    /// `mds-python` binding unconditionally emits only `"offset"` and `"length"`.
     ///
     /// **AD-202-1 (ordering guarantee):** within each file group, diagnostics are
     /// ordered by ascending byte offset (`span.offset`).  Diagnostics without a span
     /// sort to the end of the group. The sort is stable so equal-offset diagnostics
-    /// preserve rule-insertion order.  Files are ordered lexicographically by file
-    /// path (BTreeMap property).  The order is established once on
-    /// `LintResult.diagnostics` by `LintResultBuilder::build`, not here, so every
-    /// surface that reads a `LintResult` observes the same order (PF-007).
+    /// preserve rule-insertion order.  Within this function, file groups are ordered
+    /// lexicographically by file key (BTreeMap / byte-wise string order on the
+    /// `diag.file` value).  This applies to a single `LintResult` whose diagnostics
+    /// span multiple files.  The CLI directory mode instead processes one file per
+    /// `LintResult` and sorts the outer `files[]` array by the byte-wise string of
+    /// the relative display path (matching this function's key ordering so the two
+    /// surfaces agree — PF-007 notwithstanding).
     /// A `LintResult` assembled by an external caller via [`LintResult::new`] is
     /// emitted in the order that caller supplied — see that constructor's
     /// `# Ordering` note.

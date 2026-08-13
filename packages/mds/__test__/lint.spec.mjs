@@ -153,15 +153,18 @@ describe('lint', () => {
     const result = lint(source);
     assert.ok(result.files.length > 0, 'AC-P1-24: fixture must produce at least one file entry');
     for (const f of result.files) {
-      const offsets = f.diagnostics
+      const allDiags = f.diagnostics;
+      const offsets = allDiags
         .filter((d) => d.span !== null && d.span !== undefined)
         .map((d) => d.span.offset);
       // Non-vacuity guard: a loop over 0 or 1 elements executes no iterations and
-      // proves nothing (avoids PF-013). The Rust counterpart asserts offsets.len() >= 2.
+      // proves nothing; equal offsets make the ordering assertion trivially true (PF-013).
+      // Mirrors the Rust counterpart which asserts offsets.len() >= 2 && offsets[0] !=
+      // offsets[last].
       assert.ok(
-        offsets.length >= 2,
-        `AC-P1-24: fixture must produce at least two spanned diagnostics for a meaningful ` +
-          `ordering assertion; got ${offsets.length} in file "${f.file}"`,
+        offsets.length >= 2 && offsets[0] !== offsets[offsets.length - 1],
+        `AC-P1-24: fixture needs at least 2 spanned diagnostics at DISTINCT offsets for ` +
+          `a meaningful ordering assertion; got offsets ${JSON.stringify(offsets)} in file "${f.file}"`,
       );
       for (let i = 1; i < offsets.length; i++) {
         assert.ok(
@@ -170,6 +173,31 @@ describe('lint', () => {
             `got offsets[${i - 1}]=${offsets[i - 1]} > offsets[${i}]=${offsets[i]}`,
         );
       }
+      // Rule-position pinning: both rules must have fired, and legacy-interpolation must
+      // appear BEFORE duplicate-export in the output array (proves the AD-202-1 sort
+      // reordered against run_rules dispatch order, which dispatches duplicate-export
+      // 5th and legacy-interpolation 10th — without the sort, duplicate-export would
+      // appear first). Removing the sort in LintResultBuilder::build makes this fail.
+      const rules = allDiags.map((d) => d.rule);
+      const legacyIdx = rules.indexOf('legacy-interpolation');
+      const dupIdx = rules.indexOf('duplicate-export');
+      assert.ok(
+        legacyIdx !== -1,
+        `AC-P1-24: fixture must produce a legacy-interpolation diagnostic; ` +
+          `got rules: ${JSON.stringify(rules)} in file "${f.file}"`,
+      );
+      assert.ok(
+        dupIdx !== -1,
+        `AC-P1-24: fixture must produce a duplicate-export diagnostic; ` +
+          `got rules: ${JSON.stringify(rules)} in file "${f.file}"`,
+      );
+      assert.ok(
+        legacyIdx < dupIdx,
+        `AC-P1-24: emitted order must follow byte offset, not rule-dispatch order ` +
+          `(duplicate-export dispatched 5th but fires at a later offset than ` +
+          `legacy-interpolation dispatched 10th); got indices legacy=${legacyIdx} ` +
+          `dup=${dupIdx} in file "${f.file}"`,
+      );
     }
   });
 
