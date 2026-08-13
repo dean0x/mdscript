@@ -116,6 +116,18 @@ pub(crate) fn check(
                 }
             }
             ImportKind::Selective => {
+                // AD-203-3 / PF-005: `name_offsets` is index-aligned with `names` by
+                // construction — `parse_import_directive` builds both in one pass and
+                // carries a `debug_assert_eq!` on their lengths at that site, which is
+                // where a regression would originate. Per PF-005 that assertion is dev
+                // feedback only; it compiles away in release. The real guard is the
+                // unconditional fallback below, which is why it is written as a total
+                // match rather than an `expect`.
+                //
+                // Deliberately NOT duplicated as a `debug_assert!` here: it would abort
+                // debug builds before the fallback could run, making the degradation
+                // path (AC-P1-19) untestable under `cargo test`.
+                //
                 // Per-name flagging: each name checked individually.
                 // AD-203-1 / PF-012: anchor the span at the name, not @import.
                 for (i, name) in imp.names.iter().enumerate() {
@@ -123,9 +135,16 @@ pub(crate) fn check(
                         || ctx.used_vars.contains(name)
                         || reexport_names.contains(name);
                     if !is_used {
-                        // Prefer the per-name offset; fall back to @import offset
-                        // if name_offsets is unexpectedly short (defensive).
-                        let name_offset = imp.name_offsets.get(i).copied().unwrap_or(imp.offset);
+                        // AD-203-3: prefer the per-name offset. If `name_offsets` is
+                        // unexpectedly short, degrade to the WHOLE `@import` keyword
+                        // span — offset AND length together. Falling back on the
+                        // offset alone while keeping `name.len()` would highlight an
+                        // arbitrary prefix of `@import`, which is exactly the
+                        // in-bounds-but-wrong span PF-012 warns about.
+                        let (name_offset, name_length) = match imp.name_offsets.get(i) {
+                            Some(&off) => (off, name.len()),
+                            None => (imp.offset, "@import".len()),
+                        };
                         if !builder.push(make_diag(
                             severity,
                             filename,
@@ -138,7 +157,7 @@ pub(crate) fn check(
                                 name
                             )),
                             name_offset,
-                            name.len(),
+                            name_length,
                         )) {
                             return;
                         }
@@ -360,88 +379,284 @@ mod tests {
         assert!(builder.build(false).diagnostics.is_empty());
     }
 
-    // ── AC-P1-19 / AD-203-1: span anchors at the unused name ─────────────────
+    // ── AC-P1-14/15/16 / AD-203-1: span anchors at the unused name ───────────
 
-    /// AC-P1-19: for a single unused name in a selective import, the span offset
-    /// must point at the name's first byte, not at the `@import` keyword.
+    /// Extract every `unused-import` diagnostic as
+    /// `(reported name, source slice under its span)`.
     ///
-    /// Source: `@import { greet } from "./lib.mds"\n`
-    ///          0123456789012345...
-    ///                    ^ 'greet' starts at byte 10 (after "@import { ")
+    /// **This is the AC-P1-14 positive control**, and it is deliberately stronger
+    /// than an offset comparison: it re-reads `src` at the emitted span and hands
+    /// back what a consumer would actually highlight. An offset that is in bounds
+    /// but points at the wrong token — the PF-012 failure class this whole change
+    /// risks introducing — produces a mismatching slice and fails. Asserting only
+    /// that the offset moved, or that it is in bounds, would not.
+    ///
+    /// Panics if a span is missing or does not land on UTF-8 char boundaries, so a
+    /// malformed span can never be silently skipped.
+    fn unused_import_name_and_slice(src: &str) -> Vec<(String, String)> {
+        lint_src(src)
+            .iter()
+            .filter(|d| d.rule == RULE)
+            .map(|d| {
+                let span = d
+                    .span
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("unused-import diagnostic must carry a span: {d:?}"));
+                let end = span.offset + span.length;
+                assert!(
+                    end <= src.len()
+                        && src.is_char_boundary(span.offset)
+                        && src.is_char_boundary(end),
+                    "span {}..{} is out of bounds or not on a char boundary for a \
+                     {}-byte source",
+                    span.offset,
+                    end,
+                    src.len()
+                );
+                // The message is `Imported name '<name>' from '<path>' is never used.`
+                let name = d
+                    .message
+                    .split('\'')
+                    .nth(1)
+                    .expect("message must quote the name")
+                    .to_string();
+                (name, src[span.offset..end].to_string())
+            })
+            .collect()
+    }
+
+    /// Assert that every emitted `unused-import` span slices to exactly the name
+    /// the diagnostic reports, and that the reported names are `expected`.
+    ///
+    /// The `expected` check is what keeps this non-vacuous: a source that produced
+    /// zero diagnostics would otherwise satisfy "every span slices correctly"
+    /// trivially (PF-013).
+    fn assert_spans_slice_to_their_names(src: &str, expected: &[&str]) {
+        let found = unused_import_name_and_slice(src);
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names, expected,
+            "unexpected set/order of unused-import diagnostics for {src:?}"
+        );
+        for (name, slice) in &found {
+            assert_eq!(
+                slice, name,
+                "AC-P1-14: the span for '{name}' must slice to '{name}', got {slice:?} \
+                 — an in-bounds but mis-anchored span (PF-012). Source: {src:?}"
+            );
+        }
+    }
+
+    /// AC-P1-14: for a single unused name in a selective import, the span slices
+    /// to the name, not to the `@import` keyword.
     #[test]
     fn selective_span_anchors_at_name_not_at_import_keyword() {
         let src = "@import { greet } from \"./lib.mds\"\nHello!\n";
-        let diags = lint_src(src);
-        let diag = diags
-            .iter()
-            .find(|d| d.rule == RULE && d.message.contains("greet"))
-            .expect("unused-import diagnostic for 'greet' must fire");
-        let span = diag.span.as_ref().expect("span must be present");
+        assert_spans_slice_to_their_names(src, &["greet"]);
 
-        // "@import { " = 10 bytes before 'greet'.
-        let expected_offset = "@import { ".len();
-        assert_eq!(
-            span.offset, expected_offset,
-            "span.offset must point at the name 'greet' (byte {}), not at @import (byte 0); \
-             got span.offset={}",
-            expected_offset, span.offset
-        );
-        assert_eq!(
-            span.length,
-            "greet".len(),
-            "span.length must equal the name length; got span.length={}",
-            span.length
-        );
+        // Pin the concrete offset too, so a change that shifted every name by a
+        // constant (and therefore still sliced to *some* name) is caught.
+        let diags = lint_src(src);
+        let span = diags
+            .iter()
+            .find(|d| d.rule == RULE)
+            .and_then(|d| d.span.as_ref())
+            .expect("unused-import diagnostic for 'greet' must fire with a span");
+        assert_eq!(span.offset, "@import { ".len());
+        assert_eq!(span.length, "greet".len());
     }
 
-    /// AC-P1-19 (second name): in a multi-name selective import, each unused name
+    /// AC-P1-14 (second name): in a multi-name selective import, each unused name
     /// has an independently anchored span.
-    ///
-    /// Source: `@import { foo, bar } from "./lib.mds"\n`
-    ///          0123456789012345678...
-    ///                    ^ 'foo' at 10, 'bar' at 15
     #[test]
     fn selective_multi_name_each_span_anchored_independently() {
         let src = "@import { foo, bar } from \"./lib.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["foo", "bar"]);
+
         let diags = lint_src(src);
-
-        let foo_diag = diags
+        let offsets: Vec<usize> = diags
             .iter()
-            .find(|d| d.rule == RULE && d.message.contains("'foo'"))
-            .expect("diagnostic for 'foo' must fire");
-        let bar_diag = diags
+            .filter(|d| d.rule == RULE)
+            .filter_map(|d| d.span.as_ref().map(|s| s.offset))
+            .collect();
+        assert_eq!(
+            offsets,
+            vec!["@import { ".len(), "@import { foo, ".len()],
+            "each name must anchor at its own byte position"
+        );
+    }
+
+    /// AC-P1-15: a comma segment that trims to nothing is dropped from `names`
+    /// AFTER the split. A per-segment offset vector built independently of that
+    /// filter desyncs, and every later name silently anchors at the previous
+    /// name's offset — in bounds, plausible, wrong (PF-012). `unwrap_or` cannot
+    /// rescue this: the indices shift rather than run short.
+    #[test]
+    fn empty_comma_segment_does_not_desync_name_offsets() {
+        let src = "@import { a, , b } from \"./l.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["a", "b"]);
+
+        // Explicit anti-desync pin: 'b' must NOT land on 'a'.
+        let diags = lint_src(src);
+        let offsets: Vec<usize> = diags
             .iter()
-            .find(|d| d.rule == RULE && d.message.contains("'bar'"))
-            .expect("diagnostic for 'bar' must fire");
+            .filter(|d| d.rule == RULE)
+            .filter_map(|d| d.span.as_ref().map(|s| s.offset))
+            .collect();
+        assert_eq!(offsets, vec!["@import { ".len(), "@import { a, , ".len()]);
+    }
 
-        let foo_span = foo_diag
-            .span
-            .as_ref()
-            .expect("span for 'foo' must be present");
-        let bar_span = bar_diag
-            .span
-            .as_ref()
-            .expect("span for 'bar' must be present");
+    /// AC-P1-15 (trailing comma): same desync hazard, the form users actually
+    /// write.
+    #[test]
+    fn trailing_comma_does_not_desync_name_offsets() {
+        let src = "@import { a, b, } from \"./l.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["a", "b"]);
+    }
 
-        // "@import { " = 10 bytes.
-        assert_eq!(
-            foo_span.offset,
-            "@import { ".len(),
-            "span for 'foo' must start at byte {}; got {}",
-            "@import { ".len(),
-            foo_span.offset
+    /// AC-P1-16(d): trailing whitespace on the directive line must not shift name
+    /// offsets.
+    ///
+    /// End-to-end pin of the lexer → `parse_directive` → `parse_import_directive`
+    /// offset chain. Note it does NOT discriminate `trim()` from `trim_start()` in
+    /// the delta computation: `parse_directive` trims the token before
+    /// `parse_import_directive` ever sees it, so the trailing run is already gone
+    /// by then. `parse_import_directive_delta_ignores_trailing_whitespace` in
+    /// `parser_tests.rs` is the test that does discriminate them.
+    #[test]
+    fn trailing_whitespace_on_directive_line_does_not_shift_offsets() {
+        let src = "@import { a, b } from \"./l.mds\"   \nHello!\n";
+        assert_spans_slice_to_their_names(src, &["a", "b"]);
+    }
+
+    /// AC-P1-16(a): irregular interior whitespace.
+    #[test]
+    fn irregular_interior_whitespace_anchors_correctly() {
+        let src = "@import {  a ,   b  } from \"./l.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["a", "b"]);
+    }
+
+    /// AC-P1-16(b): a name that is a strict prefix of another name in the same
+    /// import. A source re-scan would anchor `foobar` at `foo`'s position; the
+    /// parser-supplied offsets do not.
+    #[test]
+    fn prefix_name_collision_anchors_at_own_offset() {
+        let src = "@import { foo, foobar } from \"./l.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["foo", "foobar"]);
+
+        let diags = lint_src(src);
+        let offsets: Vec<usize> = diags
+            .iter()
+            .filter(|d| d.rule == RULE)
+            .filter_map(|d| d.span.as_ref().map(|s| s.offset))
+            .collect();
+        assert_eq!(offsets, vec!["@import { ".len(), "@import { foo, ".len()]);
+    }
+
+    /// AC-P1-16(c): a name that also occurs inside the quoted import path. The
+    /// span must land between the braces, never inside the path literal.
+    #[test]
+    fn name_also_present_in_path_anchors_inside_braces() {
+        let src = "@import { lib } from \"./lib.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["lib"]);
+
+        let diags = lint_src(src);
+        let span = diags
+            .iter()
+            .find(|d| d.rule == RULE)
+            .and_then(|d| d.span.as_ref())
+            .expect("diagnostic must fire");
+        let quote = src.find('"').expect("path is quoted");
+        assert!(
+            span.offset < quote,
+            "span must land inside the braces (before byte {quote}), got {}",
+            span.offset
         );
-        assert_eq!(foo_span.length, "foo".len());
+    }
 
-        // "@import { foo, " = 15 bytes.
+    /// AC-P1-16(e): CRLF line endings. `scan_directive` strips only the trailing
+    /// `\r`, so name offsets are unaffected.
+    #[test]
+    fn crlf_line_endings_do_not_shift_offsets() {
+        let src = "@import { a, b } from \"./l.mds\"\r\nHello!\r\n";
+        assert_spans_slice_to_their_names(src, &["a", "b"]);
+    }
+
+    /// AC-P1-16(f): multi-byte UTF-8 content preceding the import shifts the BASE
+    /// offset. Import names themselves are ASCII-only (`is_valid_identifier`), so
+    /// `name.len()` is always a safe span length — what this pins is the base
+    /// offset chain from the lexer through to the diagnostic.
+    #[test]
+    fn multibyte_prefix_shifts_base_offset_without_splitting_names() {
+        let src = "héllo wörld\n@import { a, b } from \"./l.mds\"\nHello!\n";
+        assert_spans_slice_to_their_names(src, &["a", "b"]);
+
+        let diags = lint_src(src);
+        let span = diags
+            .iter()
+            .find(|d| d.rule == RULE)
+            .and_then(|d| d.span.as_ref())
+            .expect("diagnostic must fire");
+        let directive_start = src.find("@import").expect("directive present");
         assert_eq!(
-            bar_span.offset,
-            "@import { foo, ".len(),
-            "span for 'bar' must start at byte {}; got {}",
-            "@import { foo, ".len(),
-            bar_span.offset
+            span.offset,
+            directive_start + "@import { ".len(),
+            "the base offset must account for the multi-byte prefix"
         );
-        assert_eq!(bar_span.length, "bar".len());
+    }
+
+    /// AC-P1-19 / AD-203-3 / PF-005: if `name_offsets` ever runs short, the
+    /// diagnostic degrades to the whole `@import` keyword span rather than
+    /// mis-anchoring or panicking.
+    ///
+    /// Built by hand because the parser cannot produce a desynced `ImportFact` —
+    /// which is the point: the unconditional fallback, not the `debug_assert!`,
+    /// is the guard that survives a release build.
+    #[test]
+    fn short_name_offsets_degrade_to_import_keyword_span() {
+        use crate::lint::facts::{ImportFact, ImportKind};
+
+        let src = "@import { a, b } from \"./l.mds\"\nHello!\n";
+        let tokens = tokenize(src, "test.mds").unwrap();
+        let module = parse_with_ctx(&tokens, "test.mds", src).unwrap();
+        let mut ctx = collect_facts(&module, false, src).unwrap();
+
+        // Truncate the offset vector to simulate the desync AD-203-3 guards.
+        for imp in &mut ctx.imports {
+            if imp.kind == ImportKind::Selective {
+                imp.name_offsets.truncate(1);
+            }
+        }
+        assert!(
+            ctx.imports
+                .iter()
+                .any(|i: &ImportFact| i.kind == ImportKind::Selective && i.name_offsets.len() == 1),
+            "the fixture must actually be desynced, or this test proves nothing"
+        );
+
+        let mut builder = LintResultBuilder::new();
+        check(
+            &module,
+            &ctx,
+            "test.mds",
+            &LintConfig::default(),
+            &mut builder,
+        );
+        let diags = builder.build(false).diagnostics;
+        let spans: Vec<(usize, usize)> = diags
+            .iter()
+            .filter(|d| d.rule == RULE)
+            .filter_map(|d| d.span.as_ref().map(|s| (s.offset, s.length)))
+            .collect();
+
+        // 'a' still has an offset; 'b' falls back to the whole @import keyword.
+        assert_eq!(
+            spans,
+            vec![(0, "@import".len()), ("@import { ".len(), "a".len())],
+            "the name that lost its offset must degrade to the @import keyword span"
+        );
+        // And the degraded span must still slice to something meaningful.
+        assert_eq!(&src[0.."@import".len()], "@import");
     }
 
     /// Alias form still anchors at the `@import` keyword (not changed by #203).

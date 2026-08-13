@@ -817,13 +817,34 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
         // AD-203-1 / PF-012: compute per-name byte offsets in a single pass
         // alongside name collection so the two vectors cannot desync.
         //
-        // We use trim_start (not trim) to get the exact byte distance from the
-        // start of `directive` to the `{`: trim() on the right side might collapse
-        // trailing whitespace and shift the length, yielding a wrong delta.
+        // `delta` is the byte distance from the start of `directive` to the `{`,
+        // computed with `trim_start` — NOT with the `trim()` used for `rest` above.
+        // `trim()` also removes the trailing run, so `directive.len() - rest.len()`
+        // over-counts by any trailing whitespace and shifts every name offset right.
+        //
+        // Today the two agree, because `parse_directive` already trims both ends of
+        // the token before calling here — so no source line currently reaches this
+        // function with trailing whitespace. `trim_start` is used anyway because it
+        // is the form that stays correct without depending on that caller-side trim:
+        // it derives the delta from the same edge it is measuring. Do not
+        // "simplify" it to `directive.len() - rest.len()`; that reintroduces a
+        // silent dependency on a trim performed in another file.
+        //
+        // `directive` starts at source byte `offset`: the lexer only emits a
+        // Directive token when `@` is the first character of a line
+        // (`scan_directive`'s `is_line_start()` precondition), so `parse_directive`'s
+        // leading `trim()` is a no-op and byte 0 of `directive` is byte `offset` of
+        // the source.
         let delta = directive.len() - directive.trim_start_matches("@import").trim_start().len();
         // `names_str` begins at `offset + delta + 1` (past the `{`).
         let names_str_start = offset + delta + 1;
 
+        // The `filter` that drops empty segments runs AFTER the split, so a
+        // segment-indexed offset vector built separately would desync on
+        // `@import { a, , b }` and `@import { a, b, }` — both of which parse today.
+        // Under desync the indices SHIFT rather than run short, so `b` would anchor
+        // at `a`'s offset: in bounds, plausible, wrong (PF-012). Pushing the name
+        // and its offset together in one pass makes that unrepresentable.
         let mut names: Vec<String> = Vec::new();
         let mut name_offsets: Vec<usize> = Vec::new();
         let mut cursor = 0usize; // byte cursor within `names_str`
@@ -838,6 +859,15 @@ pub(super) fn parse_import_directive(directive: &str, offset: usize) -> Result<N
             }
             cursor += seg.len() + 1; // +1 for the comma separator
         }
+        // AD-203-3 / PF-005: dev-only feedback at the site that establishes the
+        // index-alignment invariant. It compiles away in release, so it is NOT the
+        // guard — `unused_import::check` carries an unconditional fallback for that.
+        debug_assert_eq!(
+            names.len(),
+            name_offsets.len(),
+            "parse_import_directive: name_offsets must be index-aligned with names \
+             (directive: {directive:?})"
+        );
 
         for name in &names {
             if !is_valid_identifier(name) {

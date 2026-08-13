@@ -646,6 +646,19 @@ impl LintResult {
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
     ///
+    /// # Ordering
+    ///
+    /// **`diagnostics` is stored as given — this constructor does not sort.** The
+    /// offset ordering documented on [`LintResult::to_canonical_json`] is
+    /// established by the internal builder that `lint`/`lint_source` use, so a
+    /// result produced by this crate always carries it. A `LintResult` you build
+    /// here carries whatever order you supply, and `to_canonical_json` will emit
+    /// that order.
+    ///
+    /// This is deliberate: sorting here would silently reorder a caller's
+    /// intentionally-ordered vector, which is a behaviour change to a published
+    /// construction path. Sort before calling if you want the canonical order.
+    ///
     /// # Examples
     ///
     /// ```
@@ -713,11 +726,21 @@ impl LintResult {
     /// Tier B rules when the file is standalone, `false` otherwise.
     /// The `fix_edits` field is `null` when no machine-applicable fix is available.
     ///
-    /// **AD-202-3 (ordering guarantee):** within each file group, diagnostics are
+    /// **AD-202-1 (ordering guarantee):** within each file group, diagnostics are
     /// ordered by ascending byte offset (`span.offset`).  Diagnostics without a span
     /// sort to the end of the group. The sort is stable so equal-offset diagnostics
     /// preserve rule-insertion order.  Files are ordered lexicographically by file
-    /// path (BTreeMap property).
+    /// path (BTreeMap property).  The order is established once on
+    /// `LintResult.diagnostics` by `LintResultBuilder::build`, not here, so every
+    /// surface that reads a `LintResult` observes the same order (PF-007).
+    /// A `LintResult` assembled by an external caller via [`LintResult::new`] is
+    /// emitted in the order that caller supplied — see that constructor's
+    /// `# Ordering` note.
+    ///
+    /// **AD-202-2 (truncation is NOT offset-ranked):** when `truncated` is `true`
+    /// the retained diagnostics are the first `MAX_DIAGNOSTICS` in *rule-execution*
+    /// order, re-sorted by offset afterwards.  They are **not** the
+    /// `MAX_DIAGNOSTICS` smallest offsets in the file.
     ///
     /// **NEVER** build this JSON via `format!()` — use `serde_json::json!()` so
     /// control characters in message/help are serialized safely.
@@ -836,9 +859,9 @@ impl LintResultBuilder {
 
     pub(crate) fn build(self, is_standalone: bool) -> LintResult {
         let mut diagnostics = self.diagnostics;
-        // AD-202-1: sort after truncation (some diagnostics may have been dropped),
-        // before JSON emission.  Stable sort preserves rule-insertion order for
-        // equal-offset diagnostics (AD-202-2).
+        // AD-202-2: the sort runs AFTER truncation, deliberately. `push` enforces the
+        // MAX_DIAGNOSTICS cap in rule-execution order, so `build` reorders only the
+        // already-retained set — it never changes WHICH diagnostics are retained.
         sort_diagnostics(&mut diagnostics);
         LintResult {
             diagnostics,
@@ -850,26 +873,45 @@ impl LintResultBuilder {
 
 // ── Diagnostic ordering ───────────────────────────────────────────────────────
 
+/// Sort key for one diagnostic: `(file-is-absent, file, span-is-absent, offset)`.
+///
+/// Every component borrows from `diag`, so the comparator allocates nothing
+/// (AC-P1-22). The two leading `bool`s make "absent sorts last" explicit rather
+/// than encoding it as a magic sentinel value: `false < true`, so `Some(..)`
+/// always precedes `None` without relying on any particular string or integer
+/// comparing greater than every real value.
+fn sort_key(diag: &LintDiagnostic) -> (bool, &str, bool, usize) {
+    let (file_absent, file) = match diag.file.as_deref() {
+        Some(f) => (false, f),
+        None => (true, ""),
+    };
+    let (span_absent, offset) = match diag.span.as_ref() {
+        Some(s) => (false, s.offset),
+        None => (true, 0),
+    };
+    (file_absent, file, span_absent, offset)
+}
+
 /// Sort `diagnostics` in-place by `(file, span.offset)` — ascending, stable.
 ///
-/// **AD-202-1:** called in `LintResultBuilder::build`, after truncation, before
-/// JSON emission.
+/// **AD-202-1:** the single ordering choke point, called from
+/// `LintResultBuilder::build` so every surface (CLI human, CLI JSON, napi, WASM,
+/// Python) inherits the same order from `LintResult.diagnostics` itself rather
+/// than each renderer sorting its own copy (avoids PF-007).
 ///
-/// **AD-202-2:** the sort is stable (`sort_by`, not `sort_unstable_by`) so
-/// equal-offset diagnostics preserve the insertion order established by the rule
-/// dispatch loop — rule tests that assert exact ordering remain deterministic.
+/// **AD-202-1 (stability is load-bearing):** the sort is stable (`sort_by`, not
+/// `sort_unstable_by`) so equal-offset diagnostics preserve the insertion order
+/// established by the fixed 10-call `run_rules` dispatch sequence — rule tests
+/// that assert exact ordering remain deterministic.
 ///
-/// **AD-202-3:** diagnostics without a span sort to the end of their file group
-/// (we use `usize::MAX` as a sentinel offset).  Diagnostics without a file sort
-/// to the end of the overall list.
+/// **AD-202-2:** callers must invoke this AFTER truncation. Sorting reorders the
+/// retained set only; it never changes which diagnostics were retained. The
+/// result is NOT "the first `MAX_DIAGNOSTICS` by offset".
+///
+/// Diagnostics without a span sort to the end of their file group; diagnostics
+/// without a file sort to the end of the overall list. See [`sort_key`].
 fn sort_diagnostics(diagnostics: &mut [LintDiagnostic]) {
-    diagnostics.sort_by(|a, b| {
-        let file_a = a.file.as_deref().unwrap_or("\u{FFFF}");
-        let file_b = b.file.as_deref().unwrap_or("\u{FFFF}");
-        let off_a = a.span.as_ref().map(|s| s.offset).unwrap_or(usize::MAX);
-        let off_b = b.span.as_ref().map(|s| s.offset).unwrap_or(usize::MAX);
-        file_a.cmp(file_b).then(off_a.cmp(&off_b))
-    });
+    diagnostics.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
 }
 
 // ── sanitize_control_chars ────────────────────────────────────────────────────
@@ -2081,7 +2123,7 @@ mod tests {
         );
     }
 
-    // ── AC-P1-14 / AD-202-1: sort by byte offset ─────────────────────────────
+    // ── AC-P1-08 / AD-202-1: sort by byte offset ─────────────────────────────
 
     fn make_span_diag(file: Option<&str>, offset: Option<usize>, rule: &str) -> LintDiagnostic {
         LintDiagnostic {
@@ -2101,7 +2143,7 @@ mod tests {
         }
     }
 
-    /// AC-P1-14: `LintResultBuilder::build` sorts diagnostics by ascending byte
+    /// AC-P1-08: `LintResultBuilder::build` sorts diagnostics by ascending byte
     /// offset within each file.
     #[test]
     fn build_sorts_diagnostics_by_offset() {
@@ -2124,7 +2166,7 @@ mod tests {
         );
     }
 
-    /// AC-P1-14 (multi-file): files are ordered lexicographically; within a file
+    /// AC-P1-10 (multi-file): files are ordered lexicographically; within a file
     /// diagnostics are ordered by byte offset.
     #[test]
     fn build_sorts_multi_file_diagnostics() {
@@ -2150,8 +2192,8 @@ mod tests {
         );
     }
 
-    /// AC-P1-15 / AD-202-2: diagnostics with the same file and offset preserve
-    /// insertion order (stable sort).
+    /// AC-P1-08 (stable ties) / AD-202-1: diagnostics with the same file and
+    /// offset preserve insertion order (stable sort).
     #[test]
     fn build_stable_sort_preserves_insertion_order_for_equal_offsets() {
         let mut builder = LintResultBuilder::new();
@@ -2168,7 +2210,7 @@ mod tests {
         );
     }
 
-    /// AC-P1-14 (no-span): diagnostics without a span sort to the end of their
+    /// AC-P1-08 (no-span): diagnostics without a span sort to the end of their
     /// file group.
     #[test]
     fn build_no_span_sorts_to_end() {
@@ -2185,6 +2227,84 @@ mod tests {
             result.diagnostics[1].rule, "no-span",
             "no-span diagnostic must sort to the end; got: {:?}",
             result.diagnostics
+        );
+    }
+
+    /// AC-P1-08 (file-less diagnostics): a diagnostic with `file: None` sorts
+    /// after every diagnostic that has a file — including a file name whose first
+    /// character is outside the BMP.
+    ///
+    /// This is a regression pin for the sentinel-string approach the sort key used
+    /// to take: `unwrap_or("\u{FFFF}")` compares byte-wise, and a name starting
+    /// with an astral-plane character (UTF-8 lead byte `0xF0`) sorts AFTER
+    /// `U+FFFF` (lead byte `0xEF`), which silently placed the file-less
+    /// diagnostic in the middle of the list instead of at the end.
+    #[test]
+    fn build_file_less_diagnostic_sorts_after_astral_plane_filename() {
+        let mut builder = LintResultBuilder::new();
+        builder.push(make_span_diag(None, Some(0), "no-file"));
+        // U+1F600 GRINNING FACE — first byte 0xF0, greater than U+FFFF's 0xEF.
+        builder.push(make_span_diag(
+            Some("\u{1F600}.mds"),
+            Some(0),
+            "astral-file",
+        ));
+        let result = builder.build(false);
+        let rules: Vec<_> = result.diagnostics.iter().map(|d| d.rule.as_str()).collect();
+        assert_eq!(
+            rules,
+            vec!["astral-file", "no-file"],
+            "a file-less diagnostic must sort last regardless of the other file \
+             names present; got: {rules:?}"
+        );
+    }
+
+    /// AC-P1-12 / AD-202-2: truncation selects by rule-execution order, NOT by
+    /// offset. Sorting reorders the retained set; it never changes which
+    /// diagnostics were retained.
+    ///
+    /// Diagnostics are pushed with DESCENDING offsets, so the one rejected by the
+    /// cap carries the SMALLEST offset — the very diagnostic that would sort first
+    /// if the cap were offset-ranked. It must still be absent.
+    #[test]
+    fn truncation_selects_by_insertion_order_not_by_offset() {
+        let mut builder = LintResultBuilder::new();
+        for i in 0..MAX_DIAGNOSTICS {
+            let offset = MAX_DIAGNOSTICS - i; // descending: 1000, 999, … 1
+            assert!(
+                builder.push(make_span_diag(Some("a.mds"), Some(offset), "kept")),
+                "diagnostic {i} should be accepted below the cap"
+            );
+        }
+        // Offset 0 is smaller than every retained offset, and is pushed last.
+        let rejected = builder.push(make_span_diag(Some("a.mds"), Some(0), "rejected"));
+        assert!(!rejected, "push beyond the cap must return false");
+
+        let result = builder.build(false);
+        assert_eq!(result.diagnostics.len(), MAX_DIAGNOSTICS);
+        assert!(
+            result.truncated,
+            "truncated must be true when the cap was hit"
+        );
+        assert!(
+            !result.diagnostics.iter().any(|d| d.rule == "rejected"),
+            "the over-cap diagnostic must stay dropped even though its offset (0) \
+             would sort first — truncation is not offset-ranked (AD-202-2)"
+        );
+        // The retained set is sorted ascending among itself: first offset is 1.
+        let offsets: Vec<usize> = result
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.span.as_ref().map(|s| s.offset))
+            .collect();
+        assert_eq!(
+            offsets.first().copied(),
+            Some(1),
+            "the retained set must be sorted ascending among itself"
+        );
+        assert!(
+            offsets.windows(2).all(|w| w[0] <= w[1]),
+            "the retained set must be in non-decreasing offset order"
         );
     }
 }

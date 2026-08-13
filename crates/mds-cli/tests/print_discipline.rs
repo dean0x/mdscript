@@ -287,6 +287,20 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
          it contains only ASCII printable characters and cannot carry hostile bytes.",
     ),
     (
+        "fmt.rs",
+        "STDIN_DISPLAY_LABEL",
+        "Same `output.rs` constant as the `lint.rs` entry above — `mds fmt -`'s \
+         `Would reformat:` status line names the source with the shared sentinel \
+         instead of its own literal (AD-211-3).",
+    ),
+    (
+        "main.rs",
+        "output::STDIN_DISPLAY_LABEL",
+        "Same `output.rs` constant, path-qualified — `mds check -`'s `OK:` status \
+         line names the source with the shared sentinel instead of its own literal \
+         (AD-211-3).",
+    ),
+    (
         "lint.rs",
         "applied_count",
         "`usize` tally of lint fixes actually applied, in the `Partially fixed:` line.",

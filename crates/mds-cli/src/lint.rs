@@ -39,7 +39,8 @@ use crate::build::{
 };
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
-    render_unified_diff, safe_file_display, safe_inline, safe_path, STDIN_DISPLAY_LABEL,
+    relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
+    STDIN_DISPLAY_LABEL,
 };
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -642,14 +643,11 @@ fn run_lint_stdin(
             let mds_err = MdsError::Io {
                 message: format!("{e}"),
             };
-            // AD-211-5: config errors (MdsError::Io) have no embedded NamedSource,
-            // so stdin_source = Some(...) is a no-op for relabelling purposes but
-            // keeps the pattern consistent across all stdin failure paths.
-            emit_analysis_failure_json_or_stderr(
-                &mds_err,
-                format,
-                Some((STDIN_DISPLAY_LABEL, &source)),
-            );
+            // AD-211-5: config errors (MdsError::Io) carry no embedded NamedSource,
+            // so the relabel is a no-op here. Passed anyway so the envelope rule holds
+            // for EVERY stdin failure path — a future error variant routed here that
+            // does carry a source inherits the sentinel instead of needing a new call.
+            emit_analysis_failure_json_or_stderr(&mds_err, format, Some(&source));
             std::process::exit(2);
         }
     };
@@ -658,7 +656,7 @@ fn run_lint_stdin(
         Ok(r) => r,
         Err(e) => {
             // AD-211-5: relabel <source> → <stdin> in the rendered failure envelope.
-            emit_analysis_failure_json_or_stderr(&e, format, Some((STDIN_DISPLAY_LABEL, &source)));
+            emit_analysis_failure_json_or_stderr(&e, format, Some(&source));
             std::process::exit(mds_error_exit_code(&e));
         }
     };
@@ -1440,79 +1438,24 @@ fn emit_result(
     }
 }
 
-// ── Analysis-failure rendering ────────────────────────────────────────────────
-
-/// AD-211-5: thin wrapper that overrides `source_code()` to relabel the embedded
-/// `NamedSource` in an `MdsError` when rendering analysis failures for stdin input.
-///
-/// `resolve_source_intrinsic` sets `ctx.file_str = "<source>"` so errors it produces
-/// carry `NamedSource::new("<source>", src)`.  Replacing it at this boundary (not in
-/// core) matches the "sanitize miette inputs, not rendered output" rule (PF-014) and
-/// the "relabel at the CLI output boundary" discipline (AD-211-1).
-///
-/// Delegates all `Diagnostic` methods to `inner` except `source_code`, which returns
-/// the pre-built replacement `NamedSource` (or `None` when the inner error had no
-/// embedded source — avoids miette trying to render spans against a missing source).
-struct StdinRelabeledError {
-    inner: MdsError,
-    /// `Some(named)` when `inner` had embedded source code (so spans still render).
-    /// `None` when `inner` had no source code (MdsError::Io and similar).
-    source: Option<miette::NamedSource<String>>,
-}
-
-impl std::fmt::Display for StdinRelabeledError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.inner, f)
-    }
-}
-
-impl std::fmt::Debug for StdinRelabeledError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.inner, f)
-    }
-}
-
-impl std::error::Error for StdinRelabeledError {}
-
-impl miette::Diagnostic for StdinRelabeledError {
-    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        miette::Diagnostic::code(&self.inner)
-    }
-    fn severity(&self) -> Option<miette::Severity> {
-        miette::Diagnostic::severity(&self.inner)
-    }
-    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        miette::Diagnostic::help(&self.inner)
-    }
-    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        miette::Diagnostic::url(&self.inner)
-    }
-    fn labels<'a>(&'a self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + 'a>> {
-        miette::Diagnostic::labels(&self.inner)
-    }
-    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
-        // Return the relabeled NamedSource only when the inner error actually has
-        // embedded source code; otherwise return None so miette skips code-frame
-        // rendering entirely.
-        self.source.as_ref().map(|s| s as &dyn miette::SourceCode)
-    }
-    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
-        miette::Diagnostic::related(&self.inner)
-    }
-    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
-        miette::Diagnostic::diagnostic_source(&self.inner)
-    }
-}
-
 /// AD-211-5 (2026-08-12 ruling): this envelope is the single CLI choke-point for
-/// analysis failures (config load, IO, resolution, parse).  When `stdin_source` is
-/// `Some((display_label, source_text))`, the embedded source identity in the rendered
-/// output is replaced with `display_label` (e.g. `STDIN_DISPLAY_LABEL = "<stdin>"`),
-/// so every CLI diagnostic context for stdin input uses the uniform sentinel instead
-/// of the core's internal `SOURCE_LABEL` (`"<source>"`) that `resolve_source_intrinsic`
-/// embeds in `MdsError` spans.  This is a pure label swap at the output boundary —
-/// core keeps `"<source>"` as `ctx.file_str` for non-stdin paths, and the source
-/// content used for span rendering is unchanged.
+/// **lint's** analysis failures (config load, IO, resolution, parse).  When
+/// `stdin_source` is `Some(source_text)` the embedded source identity in the rendered
+/// output is replaced with [`STDIN_DISPLAY_LABEL`], so every CLI diagnostic context
+/// for stdin input uses the uniform sentinel instead of the core's internal
+/// `SOURCE_LABEL` (`"<source>"`) that `resolve_source_intrinsic` embeds in `MdsError`
+/// spans.
+///
+/// **State it as a rule about this envelope, not about stdin:** every
+/// `MdsError` reaching this function for a stdin run labels its source `<stdin>`.
+/// Any error later routed here — a config rejection, a new IO failure — inherits
+/// that label instead of inventing a second convention.
+///
+/// The JSON leg needs no relabel and takes none: `MdsError::serialize()` emits
+/// `code` / `message` / `help` / `span`, and no `MdsError` `Display` template
+/// interpolates `ctx.file_str`, so the source identity never reaches
+/// `error.message`.  `cli_lint.rs::stdin_analysis_failure_labels_source_as_stdin`
+/// pins that on both channels rather than leaving it as an assumption.
 ///
 /// For errors from a file source, pass `stdin_source: None`; the error's embedded
 /// `NamedSource` (which already carries the correct filename) is used as-is.
@@ -1521,7 +1464,7 @@ impl miette::Diagnostic for StdinRelabeledError {
 fn emit_analysis_failure_json_or_stderr(
     e: &MdsError,
     format: LintFormat,
-    stdin_source: Option<(&str, &str)>,
+    stdin_source: Option<&str>,
 ) {
     if format == LintFormat::Json {
         let envelope = serde_json::json!({
@@ -1536,20 +1479,7 @@ fn emit_analysis_failure_json_or_stderr(
         // Route through the single render choke point (avoids PF-004 /
         // architecture-6: hand-rolled sanitize_control_chars bypass).
         let report = match stdin_source {
-            Some((label, src)) => {
-                // AD-211-5: override the embedded <source> NamedSource with the stdin
-                // sentinel.  miette's WithSourceCode wrapper (used by with_source_code)
-                // returns self.error.source_code().or(Some(&self.source_code)), so the
-                // inner diagnostic's source_code takes priority.  Instead, wrap the
-                // error in a delegate that REPLACES source_code() with the relabeled
-                // NamedSource — the same "sanitize inputs, not outputs" discipline as
-                // named_source_for_render elsewhere (PF-014).
-                miette::Report::new(StdinRelabeledError {
-                    inner: e.clone(),
-                    source: miette::Diagnostic::source_code(e)
-                        .map(|_| mds::named_source_for_render(label, src)),
-                })
-            }
+            Some(src) => relabel_stdin_error(e, src),
             None => miette::Report::from(e.clone()),
         };
         eprint_error(report);

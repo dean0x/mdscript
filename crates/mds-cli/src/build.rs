@@ -431,7 +431,15 @@ pub(crate) fn parse_cli_value(val: String) -> mds::Value {
 /// and correctly fall through to exit code 1. Only `MdsError` values converted via
 /// `.map_err(miette::Error::from)` are categorized.
 pub(crate) fn exit_code(err: &miette::Error) -> i32 {
-    if let Some(mds_err) = err.downcast_ref::<MdsError>() {
+    // AD-211-5: `StdinRelabeledError` is a render-only wrapper around an `MdsError`.
+    // It must be unwrapped here or wrapping an error to fix its DISPLAY label would
+    // silently change its EXIT CODE (a wrapped FileNotFound would fall through to 1
+    // instead of 2). The label swap is not allowed to have behavioural side effects.
+    let mds_err = err.downcast_ref::<MdsError>().or_else(|| {
+        err.downcast_ref::<crate::output::StdinRelabeledError>()
+            .map(crate::output::StdinRelabeledError::inner)
+    });
+    if let Some(mds_err) = mds_err {
         match mds_err {
             MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
@@ -699,8 +707,11 @@ pub(crate) fn compile_to_content(
         // Stdin: compile from source string using cwd as base_dir.
         // read_stdin enforces MAX_FILE_SIZE (PF-004).
         let (source, cwd) = read_stdin()?;
+        // AD-211-1 / AD-211-5: a string-source compile labels its errors `<source>`
+        // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
+        // boundary that knows the input was stdin.
         mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
-            .map_err(miette::Error::from)?
+            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?
     } else {
         // File path: compile_with_deps_opts routes through the resolver which enforces
         // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
@@ -1160,8 +1171,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             .with_source_map_base(source_map_base);
 
         let (source, cwd) = read_stdin()?;
+        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`.
         let result = mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
-            .map_err(miette::Error::from)?;
+            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &result.warnings {
                 crate::output::eprint_warning(w);

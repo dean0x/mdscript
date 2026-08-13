@@ -1321,39 +1321,426 @@ fn stdin_json_wire_file_key_is_stdin_sentinel() {
             "AC-P1-01: JSON files[].file must be '<stdin>' for stdin input, not '{file_key}'"
         );
     }
+    // AC-P1-01/AC-P1-27, negative half: the internal VFS key must not leak anywhere
+    // in the document, not just in the key this test read.
+    assert!(
+        !stdout.contains("input.mds"),
+        "AC-P1-27: 'input.mds' must not appear anywhere in CLI stdout for a stdin \
+         lint; got: {stdout}"
+    );
 }
 
-// ── AC-P1-14/#202: JSON wire diagnostics sorted by byte offset ───────────────
+// ── AC-P1-08/#202: JSON wire diagnostics sorted by byte offset ───────────────
 //
 // Pins issue #202: within a file group, diagnostics must appear in ascending
-// byte-offset order regardless of the order rules were applied.
+// byte-offset order regardless of the order the rules were applied in.
+
+/// Fixture whose OFFSET order is the reverse of its RULE-EXECUTION order.
+///
+/// `run_rules` (crates/mds-core/src/lint/mod.rs) dispatches `duplicate_export`
+/// fifth and `legacy_interpolation` tenth — so without a sort, `duplicate-export`
+/// (the LATER offset) is emitted first. `{name}` on line 2 is a legacy
+/// single-brace interpolation at a low offset; the repeated `@export greet` at the
+/// end is a duplicate export at a high offset.
+///
+/// A fixture whose diagnostics are already ascending cannot detect the sort being
+/// removed — the assertion would hold either way.
+const OUT_OF_ORDER_FIXTURE: &str =
+    "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+
+fn stdin_json_diagnostics(source: &str) -> Vec<serde_json::Value> {
+    let out = lint_stdin(source, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\n{stdout}"));
+    let files = v["files"].as_array().expect("JSON must have 'files' array");
+    assert_eq!(
+        files.len(),
+        1,
+        "stdin lint must emit exactly one file group"
+    );
+    files[0]["diagnostics"]
+        .as_array()
+        .expect("must have 'diagnostics'")
+        .clone()
+}
 
 #[test]
 fn stdin_json_diagnostics_sorted_by_offset() {
-    // Two diagnostics at different offsets: the one at the lower offset must
-    // come first.  Use a source with two distinct export violations placed at
-    // known positions.
-    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
-    let out = lint_stdin(source, &["--format", "json"]);
+    let diags = stdin_json_diagnostics(OUT_OF_ORDER_FIXTURE);
 
+    let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
+    let offsets: Vec<i64> = diags
+        .iter()
+        .filter_map(|d| d["span"]["offset"].as_i64())
+        .collect();
+
+    // Non-vacuity guard: this assertion is meaningless on a single diagnostic, and
+    // meaningless if the two land on the same offset.
+    assert_eq!(
+        offsets.len(),
+        diags.len(),
+        "every diagnostic in this fixture must carry a span; got: {diags:?}"
+    );
+    assert!(
+        offsets.len() >= 2 && offsets[0] != offsets[offsets.len() - 1],
+        "AC-P1-08 needs at least two diagnostics at DISTINCT offsets to be a real \
+         check; got rules {rules:?} at offsets {offsets:?}"
+    );
+
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        offsets, sorted,
+        "AC-P1-08: diagnostics must be in ascending byte-offset order; \
+         got rules {rules:?} at offsets {offsets:?}"
+    );
+
+    // The positive control: `duplicate_export` runs BEFORE `legacy_interpolation`
+    // in run_rules but fires at the LATER offset, so it must appear LATER in the
+    // array. Delete the sort in LintResultBuilder::build and this flips.
+    let legacy = rules
+        .iter()
+        .position(|r| *r == "legacy-interpolation")
+        .expect("fixture must produce a legacy-interpolation diagnostic");
+    let dup = rules
+        .iter()
+        .position(|r| *r == "duplicate-export")
+        .expect("fixture must produce a duplicate-export diagnostic");
+    assert!(
+        legacy < dup,
+        "AC-P1-08: emitted order must follow byte offset, not rule-dispatch order \
+         (duplicate_export is dispatched first but fires later in the file); \
+         got rules {rules:?} at offsets {offsets:?}"
+    );
+}
+
+/// AC-P1-09: the human renderer must present diagnostics in the same order as the
+/// JSON renderer — proving the sort lives on `LintResult.diagnostics` and not in
+/// one renderer (PF-007: a per-surface assertion could not show this).
+#[test]
+fn stdin_human_and_json_diagnostic_order_match() {
+    let json_rules: Vec<String> = stdin_json_diagnostics(OUT_OF_ORDER_FIXTURE)
+        .iter()
+        .filter_map(|d| d["rule"].as_str().map(str::to_string))
+        .collect();
+    // Non-vacuity guard: two empty sequences compare equal and prove nothing.
+    assert!(
+        json_rules.len() >= 2,
+        "AC-P1-09 needs at least two diagnostics to compare an ORDER; got {json_rules:?}"
+    );
+
+    let out = lint_stdin(OUT_OF_ORDER_FIXTURE, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Rule names appear in the miette `code` line of each rendered diagnostic.
+    let human_rules: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            json_rules
+                .iter()
+                .find(|r| t == format!("mds::lint::{r}") || t == **r)
+                .cloned()
+        })
+        .collect();
+
+    assert_eq!(
+        human_rules, json_rules,
+        "AC-P1-09: human and JSON surfaces must agree on diagnostic order.\n\
+         json: {json_rules:?}\nhuman: {human_rules:?}\nstderr:\n{stderr}"
+    );
+}
+
+/// AC-P1-11: repeated lints of identical input are byte-identical.
+#[test]
+fn stdin_json_output_is_byte_identical_across_runs() {
+    let first = lint_stdin(OUT_OF_ORDER_FIXTURE, &["--format", "json"]).stdout;
+    for run in 2..=5 {
+        let next = lint_stdin(OUT_OF_ORDER_FIXTURE, &["--format", "json"]).stdout;
+        assert_eq!(
+            first,
+            next,
+            "AC-P1-11: run {run} differed from run 1.\nrun1: {}\nrun{run}: {}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&next)
+        );
+    }
+}
+
+// ── AC-P1-07 / AD-211-5: the analysis-failure envelope labels stdin `<stdin>` ──
+
+/// Pull the source identity out of a miette code-frame header, e.g. the
+/// `<stdin>` in `[<stdin>:1:1]`.
+///
+/// Returning `Option` and requiring the caller to unwrap keeps this from passing
+/// vacuously: a rendering that emitted no frame at all yields `None` and fails,
+/// rather than silently satisfying a "does not contain `<source>`" assertion
+/// (PF-013).
+fn frame_source_identity(rendered: &str) -> Option<String> {
+    let start = rendered.find('[')?;
+    let rest = &rendered[start + 1..];
+    let end = rest.find(']')?;
+    let inner = &rest[..end];
+    // `<label>:LINE:COL` — strip the trailing two numeric fields.
+    let mut parts: Vec<&str> = inner.rsplitn(3, ':').collect();
+    parts.reverse();
+    (parts.len() == 3 && parts[1].chars().all(|c| c.is_ascii_digit())).then(|| parts[0].to_string())
+}
+
+#[test]
+fn stdin_analysis_failure_labels_source_as_stdin() {
+    // A source that fails the check gate: `@if` without a condition is a hard
+    // syntax error, so lint_str_with returns Err and takes the
+    // emit_analysis_failure_json_or_stderr path.
+    let source = "@if\nbroken\n";
+
+    // Human channel: the miette frame header must name <stdin>.
+    let human = lint_stdin(source, &[]);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
+        panic!("expected a miette code frame with a `[label:line:col]` header; got:\n{stderr}")
+    });
+    assert_eq!(
+        identity, "<stdin>",
+        "AC-P1-07: the analysis-failure frame must name '<stdin>'; got '{identity}'.\n{stderr}"
+    );
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "an analysis failure must still exit 2; stderr:\n{stderr}"
+    );
+
+    // JSON channel: the error envelope must carry no source identity but the sentinel.
+    let json = lint_stdin(source, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("analysis-failure JSON must parse");
+    assert!(
+        v["error"].is_object(),
+        "JSON analysis failure must use the error envelope; got: {stdout}"
+    );
+    let message = v["error"]["message"]
+        .as_str()
+        .expect("error.message must be a string");
+    assert!(
+        !message.contains("<source>") && !message.contains("input.mds"),
+        "AC-P1-07: error.message must not leak a core source label; got: {message}"
+    );
+    assert!(
+        !stdout.contains("<source>") && !stdout.contains("input.mds"),
+        "AC-P1-27: no core source label may appear in stdout; got: {stdout}"
+    );
+}
+
+/// AC-P1-04: `lint`, `check`, `build` and `fmt` all name a stdin source with the
+/// SAME sentinel. The §0a ruling names all four; a leg that renders `<source>`
+/// makes the uniform-sentinel rule false on day one.
+///
+/// This is the reproduction the plan's step 1a asked for, turned into a pin:
+/// before the relabel landed in `run_check` / `compile_to_content`, `mds check -`
+/// and `mds build -` both rendered `[<source>:1:1]` here.
+#[test]
+fn stdin_source_identity_is_uniform_across_subcommands() {
+    let source = "@if\nbroken\n";
+    for subcommand in ["lint", "check", "build"] {
+        let out = run_mds_stdin(subcommand, source);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
+            panic!("`mds {subcommand} -` must render a code frame; got:\n{stderr}")
+        });
+        assert_eq!(
+            identity, "<stdin>",
+            "AC-P1-04: `mds {subcommand} -` must name the source '<stdin>'; \
+             got '{identity}'.\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("<source>"),
+            "AC-P1-04: `mds {subcommand} -` must not emit '<source>'; got:\n{stderr}"
+        );
+    }
+}
+
+// ── AC-P1-10: `files[]` array ordering is part of the wire contract ──────────
+
+/// Directory mode path-sorts `files[]`; single-file and stdin emit exactly one
+/// entry. Both halves are frozen here because a published contract has to pin the
+/// order of the outer array too, not only the diagnostics inside each entry.
+#[test]
+fn json_files_array_is_path_sorted_in_directory_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    // Written in an order that is neither alphabetical nor reverse-alphabetical,
+    // so passing cannot be an accident of filesystem enumeration order.
+    let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    for rel in ["b.mds", "a.mds", "sub/c.mds"] {
+        fs::write(dir.path().join(rel), dupe).unwrap();
+    }
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    let files: Vec<&str> = v["files"]
+        .as_array()
+        .expect("JSON must have 'files' array")
+        .iter()
+        .filter_map(|f| f["file"].as_str())
+        .collect();
 
-    let files = v["files"].as_array().expect("JSON must have 'files' array");
-    for entry in files {
-        let diags = entry["diagnostics"]
-            .as_array()
-            .expect("must have 'diagnostics'");
-        let offsets: Vec<i64> = diags
-            .iter()
-            .filter_map(|d| d["span"]["offset"].as_i64())
-            .collect();
-        let mut sorted = offsets.clone();
-        sorted.sort_unstable();
-        assert_eq!(
-            offsets, sorted,
-            "AC-P1-14: diagnostics must be in ascending byte-offset order; \
-             got offsets: {offsets:?}"
+    assert_eq!(
+        files.len(),
+        3,
+        "all three files must report findings; got: {files:?}"
+    );
+    let mut sorted = files.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        files, sorted,
+        "AC-P1-10: files[] must be in ascending path order; got: {files:?}"
+    );
+
+    // Single-file mode: exactly one entry.
+    let single = lint_path(&dir.path().join("a.mds"), &["--format", "json"]);
+    let single_stdout = String::from_utf8_lossy(&single.stdout);
+    let sv: serde_json::Value = serde_json::from_str(&single_stdout).unwrap();
+    assert_eq!(
+        sv["files"].as_array().map(Vec::len),
+        Some(1),
+        "AC-P1-10: single-file mode must emit exactly one files[] entry; got: {single_stdout}"
+    );
+}
+
+// ── AC-P1-20: WIRE sanitization of files[].file survives the relabel ─────────
+
+/// POSITIVE CONTROL (PF-013 / ADR-009). This PR rewrites `diag.file` wholesale in
+/// stdin mode, and `files[].file` is the exact key that #176 / CWE-150 escaping
+/// protects. An assertion that merely finds `<stdin>` proves nothing about the
+/// escape contract — `<stdin>` contains no character in the hostile class, so it
+/// is a no-op for it.
+///
+/// So: lint a directory containing a file whose PATH carries a control byte, and
+/// assert the emitted key carries the escaped `\uXXXX` literal and no raw byte.
+/// The control arm runs the SAME extraction over the raw path and shows it does
+/// detect the raw byte when one is present — without it, "no raw byte found"
+/// would be indistinguishable from "the check matched nothing".
+///
+/// The byte is constructed at runtime from a numeric escape and never typed as a
+/// literal into this file (PF-018 — the editing tooling decodes such escapes into
+/// real bytes in tracked source, and the `Source hygiene` CI job rejects them).
+#[cfg(unix)]
+#[test]
+fn directory_json_file_key_escapes_control_bytes_in_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    const BEL: u8 = 0x07;
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = b"be".to_vec();
+    raw.push(BEL);
+    raw.extend_from_slice(b"l.mds");
+    let name = OsString::from_vec(raw.clone());
+    let target = dir.path().join(&name);
+
+    let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    if fs::write(&target, dupe).is_err() {
+        // Some filesystems reject control bytes in names — nothing to assert.
+        return;
+    }
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    /// The extraction under test: does `s` contain a raw C0 control byte?
+    fn has_raw_control(s: &str) -> bool {
+        s.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+    }
+
+    // CONTROL ARM — the same predicate, applied to the unsanitized path, must
+    // return true. If this fails, the assertion below is incapable of failing.
+    let raw_path = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        has_raw_control(&raw_path),
+        "control arm: the predicate must detect the raw byte when it is present, \
+         otherwise the assertion below proves nothing (PF-013)"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    let file_key = v["files"]
+        .as_array()
+        .and_then(|f| f.first())
+        .and_then(|f| f["file"].as_str())
+        .unwrap_or_else(|| panic!("expected one files[] entry; got: {stdout}"));
+
+    assert!(
+        !has_raw_control(file_key),
+        "AC-P1-20: files[].file must not carry a raw control byte; got: {file_key:?}"
+    );
+    assert!(
+        file_key.contains("\\u0007"),
+        "AC-P1-20: files[].file must carry the escaped literal form of the control \
+         byte; got: {file_key:?}"
+    );
+}
+
+/// Run `mds <subcommand> -` with `input` on stdin.
+fn run_mds_stdin(subcommand: &str, input: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .arg(subcommand)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+// ── AC-P1-03: fix-preview status lines use the bracketed sentinel ────────────
+
+/// The bare `stdin` convention (`Would fix: stdin`) is gone: every fix-path
+/// message names the source with the same bracketed sentinel as the diagnostics.
+#[test]
+fn stdin_fix_preview_messages_use_bracketed_sentinel() {
+    // legacy-interpolation is Tier A and auto-fixable on a standalone source.
+    // The interpolation sits inside a `@define` body so `name` is a parameter in
+    // scope — otherwise the fix-safety gate rejects the rewrite ("undefined
+    // variable") and no status line is printed at all.
+    let source = "@define greet(name):\n  Hello {name}!\n@end\n";
+
+    // (a) --fix --check → "Would fix: <stdin>", exit 1.
+    let out = lint_stdin(source, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Would fix: <stdin>"),
+        "AC-P1-03: expected 'Would fix: <stdin>'; got:\n{stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check must exit 1 when a fix would apply; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Would fix: stdin"),
+        "AC-P1-03: the bare `stdin` convention must be gone; got:\n{stderr}"
+    );
+
+    // (b) --fix --diff → the unified-diff header names <stdin>.
+    let out = lint_stdin(source, &["--fix", "--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("<stdin>"),
+        "AC-P1-03: the diff header must reference '<stdin>'; got:\n{stdout}"
+    );
+    // The diff header lines are `--- <name>` / `+++ <name>`; neither may carry the
+    // unbracketed token.
+    for line in stdout
+        .lines()
+        .filter(|l| l.starts_with("---") || l.starts_with("+++"))
+    {
+        assert!(
+            !line.split_whitespace().any(|w| w == "stdin"),
+            "AC-P1-03: diff header must not use bare `stdin`; got: {line}"
         );
     }
 }

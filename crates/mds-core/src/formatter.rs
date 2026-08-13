@@ -873,6 +873,45 @@ mod tests {
         );
     }
 
+    /// AC-P1-18 / AD-203-2: `ImportDirective::Selective::name_offsets` must stay
+    /// OUT of structural equality.
+    ///
+    /// `imports_eq` (lint/rules/structural_eq.rs) destructures `Selective` with
+    /// `..` and compares only `names` and `path`. That exclusion is load-bearing
+    /// here, not merely tidy: this is the formatter's safety gate, and stripping
+    /// trailing whitespace from an EARLIER directive line shifts every later byte
+    /// offset — including the per-name offsets #203 added. If `name_offsets`
+    /// participated, the gate would call a correct reformat "non-equivalent" and
+    /// silently refuse to write it.
+    ///
+    /// The source below is exactly that shape: line 1 carries trailing spaces, so
+    /// formatting shifts the selective import on line 2 three bytes left.
+    #[test]
+    fn structural_equivalent_ignores_shifted_selective_import_name_offsets() {
+        let source = "@import \"./x.mds\" as x   \n@import { a, b } from \"./l.mds\"\nHi\n";
+        let formatted = "@import \"./x.mds\" as x\n@import { a, b } from \"./l.mds\"\nHi\n";
+        let raw: Vec<Range<usize>> = vec![];
+
+        // Non-vacuity guard: the two sources must actually differ, and the shift
+        // must actually reach the selective import's name offsets.
+        assert_ne!(
+            source, formatted,
+            "the fixture must exercise a real reformat"
+        );
+        assert_ne!(
+            source.find("{ a").unwrap(),
+            formatted.find("{ a").unwrap(),
+            "the reformat must shift the selective import's byte offsets, or this \
+             test does not exercise name_offsets at all"
+        );
+
+        assert!(
+            structural_equivalent(source, formatted, &raw),
+            "shifted name_offsets must not make the formatter safety gate reject a \
+             correct reformat — name_offsets is a span annotation, not semantic content"
+        );
+    }
+
     #[test]
     fn structural_equivalent_still_rejects_dropped_meaningful_trailing_text() {
         // A real formatter bug: meaningful trailing text was lost.

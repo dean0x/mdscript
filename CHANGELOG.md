@@ -78,41 +78,70 @@ via struct literals. Use the named constructor or builder listed for each:
   this method instead of assembling sanitized copies itself, keeping the escape logic co-located
   with the struct definition (PF-014).
 
-#### Lint JSON wire contract: diagnostics sorted by byte offset (#202)
+#### Lint JSON wire contract (#202, #203, #211)
 
-Within each `files[].diagnostics` array in `mds lint --format json` output,
-diagnostics are now ordered by ascending byte offset (`span.offset`). Previously
-the order was rule-insertion order (implementation-defined). This is a **wire
-contract change**: consumers that relied on a fixed rule-application order may
-see reordered JSON output.
+> This block is the **single wire-change ledger** for the lint JSON envelope.
+> Later changes to `mds lint --format json` append here rather than opening a
+> parallel section, so a consumer has one place to read.
+
+**Before / after**, for `mds lint - --format json` on a source with one unused
+selective import:
+
+```jsonc
+// before
+{ "version": 1, "truncated": false, "files": [ { "file": "input.mds",
+  "diagnostics": [
+    { "rule": "duplicate-export", "span": { "offset": 59, "length": 7 } },
+    { "rule": "unused-import",    "span": { "offset":  0, "length": 7 } }
+  ] } ] }
+
+// after
+{ "version": 1, "truncated": false, "files": [ { "file": "<stdin>",
+  "diagnostics": [
+    { "rule": "unused-import",    "span": { "offset": 10, "length": 5 } },
+    { "rule": "duplicate-export", "span": { "offset": 59, "length": 7 } }
+  ] } ] }
+```
+
+**A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
+output, matches `<source>` in an `error.message` or rendered frame, relies on
+`diagnostics[]` arriving in rule-execution order, or assumes `unused-import`
+spans have length 7.
+
+**1. Diagnostics are sorted by byte offset (#202).** Within each
+`files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`.
+Previously the order was rule-execution order (implementation-defined).
 
 - Diagnostics without a span sort to the end of their file group.
-- Equal-offset diagnostics preserve the previous rule-insertion order (stable sort).
+- Equal-offset diagnostics preserve rule-execution order (stable sort).
 - File groups themselves remain lexicographically ordered (BTreeMap).
+- Ordering is established on `LintResult.diagnostics` itself, so the CLI human
+  path and the napi / WASM / Python surfaces observe the same order.
+- **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is
+  `true`, the retained diagnostics are still the first `MAX_DIAGNOSTICS` (1,000)
+  in rule-execution order, re-sorted afterwards — not the 1,000 smallest offsets.
 
-#### Lint JSON wire contract: stdin source key is always `"<stdin>"` (#211)
+**2. The stdin source identity is always `<stdin>` (#211).** Every CLI context
+that names a stdin source now uses the single sentinel `<stdin>`:
 
-`mds lint --format json -` now emits `"<stdin>"` in the `files[].file` key.
-Previously this field emitted `"input.mds"` (the internal VFS sentinel), which
-was an implementation detail leaking into the public wire contract.
+- the JSON `files[].file` key (previously `"input.mds"`, the internal VFS key);
+- human diagnostic frames for `mds lint -` (previously `input.mds`);
+- fix-preview status lines and diff headers (previously bare `stdin`);
+- the **analysis-failure envelope** — a stdin source that fails the check gate
+  used to render `<source>:L:C`, the resolver's internal label. `mds check -` and
+  `mds build -` rendered `<source>` on the same path and now render `<stdin>`
+  too, so all four subcommands agree.
 
-Human-readable diagnostic output (stderr) now also consistently shows `<stdin>`
-as the source identity in span headers and status lines (e.g.
-`Would fix: <stdin>`, diff headers).
+`mds::STRING_SOURCE_MAP_LABEL` is **unchanged** and remains `"input.mds"`: it is a
+virtual-FS entry key, not a display label. The napi, WASM and Python lint APIs
+continue to report `"input.mds"` for string-source input. The relabel is applied
+only at the CLI output boundary.
 
-#### `unused-import` diagnostic spans anchor at the unused name (#203)
-
-For selective imports (`@import { name1, name2 } from "path"`), the
-`unused-import` diagnostic span now anchors at the **unused name's first byte**
-rather than at the `@import` keyword. The `span.length` covers only the name
-token.
-
-Before: `{ "offset": 0, "length": 7 }` (always the `@import` keyword)
-After:  `{ "offset": 10, "length": 5 }` (the name, e.g. `greet` in
-         `@import { greet } from ...`)
-
-Alias imports (`@import "path" as alias`) are unchanged — their span still
-covers the `@import` keyword.
+**3. `unused-import` spans anchor at the unused name (#203).** For selective
+imports (`@import { name1, name2 } from "path"`), the span now covers the unused
+name rather than the `@import` keyword, and `span.length` is the name's length
+instead of a constant 7. Alias imports (`@import "path" as alias`) are unchanged —
+their span still covers the `@import` keyword.
 
 #### New `fix_edits` field on `LintDiagnostic`
 
