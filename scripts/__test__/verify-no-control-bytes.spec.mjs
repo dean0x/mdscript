@@ -919,6 +919,65 @@ describe('AC-20: symlinks are skipped and counted, not read', () => {
     } finally { cleanup(dir); }
   });
 
+  test('AC-20: a staged gitlink (mode 160000) is skipped in --staged mode, not reported as an error', () => {
+    // Regression test for the pre-fix bug: without mode-aware skip in getStagedFiles(),
+    // a staged gitlink (submodule) would reach readAllIndexBlobs(), and
+    // `git cat-file --batch` would return 'missing' (gitlinks store a commit SHA,
+    // not a blob), causing exit 2 with the misleading message
+    // "staged path not in index: <submodule-name>".
+    //
+    // Fix (D-CB5a): getStagedFiles() now uses `git diff --cached --raw -z`
+    // to obtain the new-file mode for each staged entry. Entries with new-mode
+    // 160000 (gitlink) are marked skip:true before they reach readAllIndexBlobs(),
+    // consistent with full-tree mode's AC-20 behavior.
+    //
+    // A real commit SHA is required because git validates the SHA format when
+    // updating the index via --cacheinfo. We harvest a SHA from a sibling temp
+    // repo to avoid network access and keep the test hermetic.
+    const { dir, git } = mkTempGitRepo();
+    const innerDir = mkdtempSync(join(tmpdir(), 'mds-inner-'));
+    try {
+      // Create an inner repo and commit one file to get a real commit SHA.
+      execFileSync('git', ['init'], { cwd: innerDir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.email', 'test@test.test'], { cwd: innerDir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.name', 'Test'], { cwd: innerDir, stdio: 'pipe' });
+      writeFileSync(join(innerDir, 'inner.md'), 'inner\n');
+      execFileSync('git', ['add', 'inner.md'], { cwd: innerDir, stdio: 'pipe' });
+      execFileSync('git', ['commit', '-m', 'inner'], { cwd: innerDir, stdio: 'pipe' });
+      const innerSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: innerDir, encoding: 'utf8', stdio: 'pipe',
+      }).trim();
+
+      // Stage a clean regular file alongside a gitlink (mode 160000) in the outer repo.
+      // `git update-index --cacheinfo 160000,<sha>,<path>` injects a gitlink entry
+      // directly into the index without requiring a real .gitmodules or disk presence.
+      writeFileSync(join(dir, 'clean.md'), 'clean content\n');
+      git('add', 'clean.md');
+      execFileSync('git', [
+        'update-index', '--add', '--cacheinfo', `160000,${innerSha},sub`,
+      ], { cwd: dir, stdio: 'pipe' });
+
+      // Confirm the gitlink is actually in the index at mode 160000.
+      const modes = execFileSync('git', ['ls-files', '-s'], { cwd: dir, encoding: 'utf8' });
+      assert.ok(modes.includes('160000'), 'fixture must actually stage a gitlink at mode 160000');
+
+      // --staged mode: the gitlink must be skipped (not cause an error), and the
+      // regular file must be scanned and pass.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        `staged gitlink must be skipped without error; stderr: ${r.stderr}`);
+      // The success output must report the skipped gitlink count.
+      assert.ok(r.stdout.includes('symlink/gitlink skipped'),
+        `output must report the skipped gitlink; got: ${r.stdout}`);
+      // The regular file must be scanned (not silently dropped with the gitlink).
+      assert.ok(/Scanned 1 file\(s\)/.test(r.stdout),
+        `must scan the one regular file; got: ${r.stdout}`);
+    } finally {
+      cleanup(dir);
+      cleanup(innerDir);
+    }
+  });
+
 });
 
 // ---------------------------------------------------------------------------

@@ -27,6 +27,16 @@
  * commits, amend with no content changes) and exits 0 with an explicit
  * message; the full-tree scan is the authoritative non-vacuity gate.
  *
+ * AC-6 AMENDMENT (--staged mode): AC-6 requires exit 1 when the scanned
+ * file set is empty. --staged mode intentionally exits 0 for a legitimately-
+ * empty content-bearing set (deletion-only commits via `git rm`, `git commit
+ * --amend -m`, `git commit --allow-empty`). Exiting 1 there would train
+ * contributors toward `--no-verify`, which disables the gate for ALL commits
+ * — the opposite of the security goal. No bypass exists: any staged file with
+ * hazardous content appears under the ACMRT filter. This amendment is
+ * deliberate, tested (see spec test "D-CB5 --staged carve-out from AC-6"),
+ * and leaves the full-tree CI scan as the authoritative AC-6 gate.
+ *
  * D-CB8: --staged mode reads file content from the git index via a single
  * `git cat-file --batch` subprocess (all staged blobs at once), never from
  * the working tree. Staging a clean file then modifying the working copy
@@ -264,27 +274,36 @@ function getTrackedFiles(cwd) {
 
 /**
  * Get staged file list for --staged mode.
- * Uses `git diff --cached --name-only -z --diff-filter=ACMRT` for paths.
+ * Uses `git diff --cached --raw -z --diff-filter=ACMRT` to obtain both paths
+ * and git mode information so that gitlinks (160000) and symlinks (120000) can
+ * be skipped consistently with full-tree mode's AC-20 behavior.
  * D-CB8: content is fetched later in batch via readAllIndexBlobs().
  *
- * D-CB5a divergence: `git diff --cached --name-only` does not carry git mode
- * information, so every path is assigned mode 0o100644. Symlinks (120000) and
- * gitlinks (160000) are NOT skipped as they are in full-tree mode. This is
- * benign: a staged symlink's blob content is the target path (plain ASCII),
- * which never contains a hazard codepoint, so no false positives arise. The
- * full-tree scan enforces the unconditional AC-20 skip; staged mode is a
- * narrower scope where only newly-committed content is checked.
+ * D-CB5a: mode-aware skip for staged mode. Unlike `git diff --cached
+ * --name-only`, the `--raw` format carries the new-file mode (octal) for each
+ * staged entry. Entries with new-mode 120000 (symlink) or 160000 (gitlink) are
+ * marked skip:true — identical to full-tree mode's AC-20 treatment. This
+ * resolves the pre-fix divergence where gitlinks reaching readAllIndexBlobs()
+ * would trigger a misleading "staged path not in index" error because
+ * `git cat-file --batch` returns 'missing' for a commit-typed index entry.
+ *
+ * D-CB5b: include T (type-change) in the diff-filter so a tracked symlink
+ * (120000) replaced by a regular file (100644) containing a hazard codepoint
+ * is not silently excluded. The raw format carries the new mode, so a T-change
+ * landing on mode 100644 is scanned; one landing on 120000 or 160000 is
+ * skipped. A T-change landing on 160000 would previously have caused a
+ * misleading error — it is now skipped cleanly.
+ *
+ * Raw diff format (git diff --cached --raw -z), per entry:
+ *   :<old-mode> <new-mode> <old-sha> <new-sha> <status>\0<path>\0
+ * Rename/copy (status starts with R or C):
+ *   :<old-mode> <new-mode> <old-sha> <new-sha> Rscore\0<old-path>\0<new-path>\0
  */
 function getStagedFiles(cwd) {
-  // D-CB5b: include T (type-change) so a tracked symlink replaced by a regular
-  // file containing a hazard codepoint is not silently excluded.  A T change
-  // from regular-file → symlink is benign (symlink blob = ASCII target path),
-  // which is already documented in the D-CB5a JSDoc above.
-  const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMRT'], cwd);
+  const r = gitExec(['diff', '--cached', '--raw', '-z', '--diff-filter=ACMRT'], cwd);
   if (r.status !== 0) {
-    // D-CB5: fail closed. `git diff --cached` exits 0 even when nothing is
-    // staged, so a non-zero status is a real tool failure (corrupt index,
-    // unreadable object). Treating it as "no staged files" would let the
+    // D-CB5: fail closed — a non-zero status is a real tool failure (corrupt
+    // index, unreadable object). Treating it as "no staged files" would let the
     // pre-commit hook report success on a scan that never happened.
     console.error(
       `✖ verify-no-control-bytes: git diff --cached failed (status ${r.status}): ` +
@@ -292,8 +311,36 @@ function getStagedFiles(cwd) {
     );
     process.exit(2);
   }
-  const paths = r.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
-  return paths.map(p => ({ path: p, mode: 0o100644, skip: false, staged: true }));
+
+  const parts = r.stdout.toString('utf8').split('\0');
+  const files = [];
+  let i = 0;
+  while (i < parts.length) {
+    const header = parts[i];
+    // Raw diff headers start with ':'. Skip empty parts and non-header tokens.
+    if (!header || !header.startsWith(':')) { i++; continue; }
+    // `:old-mode new-mode old-sha new-sha status`
+    const fields = header.slice(1).split(' ');
+    const newMode = parseInt(fields[1], 8); // new-mode is octal (e.g. "100644")
+    const status = fields[4] || '';
+    i++;
+    // Rename (R) and copy (C) entries have two paths: old-path then new-path.
+    // Advance past old-path and use new-path (the content we care about).
+    if (status.startsWith('R') || status.startsWith('C')) {
+      i++; // skip old-path
+    }
+    const path = parts[i] || '';
+    i++;
+    if (!path) continue;
+    // AC-20: skip symlinks (120000) and gitlinks (160000) — identical to
+    // full-tree mode. A gitlink's cat-file lookup returns 'missing' (commit
+    // object, not a blob) and would otherwise cause a misleading "staged path
+    // not in index" error. Symlink blobs contain only the ASCII target path
+    // and are safe to skip.
+    const skip = newMode === 0o120000 || newMode === 0o160000;
+    files.push({ path, mode: newMode, skip, staged: true });
+  }
+  return files;
 }
 
 /**
@@ -498,8 +545,12 @@ function main() {
       absolutePath: resolve(cwd, p),
     }));
   } else if (isStaged) {
-    // D-CB8: staged mode — read from git index
-    fileEntries = getStagedFiles(cwd).map(e => ({ ...e, absolutePath: null }));
+    // D-CB8: staged mode — read from git index.
+    // getStagedFiles() now provides mode info; skip gitlinks and symlinks
+    // exactly as full-tree mode does (AC-20, D-CB5a).
+    const all = getStagedFiles(cwd);
+    skippedCount = all.filter(e => e.skip).length;
+    fileEntries = all.filter(e => !e.skip).map(e => ({ ...e, absolutePath: null }));
   } else {
     // Default: full tracked tree
     const all = getTrackedFiles(cwd);
