@@ -300,14 +300,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Pre-merge check verifier** (#289): `scripts/verify-pr-checks.mjs` guards
   against PF-017 (a cancelled CI run reads as "not failing" to `gh pr merge
-  --admin`). It evaluates three tiers: Tier A asserts every required
-  branch-protection context is `completed+success`; Tier B fails on any
-  non-required check-run that concluded
+  --admin`). It evaluates four tiers: Tier A asserts every required
+  branch-protection context is `completed+success`; Tier A+ (`EXPECTED_CONTEXTS`)
+  asserts locally-named jobs are present and passing regardless of branch
+  protection — absence is FAIL, not advisory (ADR-009, PF-013); Tier B fails on
+  any non-required check-run that concluded
   `failure/cancelled/timed_out/action_required/stale`; Tier C (legacy commit
   statuses) is advisory. It emits a `gh pr merge --squash --match-head-commit
-  <sha>` command pinned to the verified SHA. Exit 0: Tier A and Tier B pass;
-  exit 1: any Tier A/B failure or zero check-runs found; exit 2:
-  tool/permission errors.
+  <sha>` command pinned to the verified SHA. Exit 0: Tier A, Tier A+, and Tier B
+  pass; exit 1: any Tier A, Tier A+, or Tier B failure, or zero check-runs found;
+  exit 2: tool/permission errors.
 
 
 ### Changed

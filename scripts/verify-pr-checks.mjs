@@ -422,7 +422,7 @@ export function evaluateChecks({
     lines.push(`  Merge command: ${cmd}`);
     return { pass: true, exitCode: 0, lines, mergeCommand: cmd };
   } else {
-    lines.push(`✖ FAIL — ${failures.length} required context(s) not satisfied`);
+    lines.push(`✖ FAIL — ${failures.length} check(s) did not pass`);
     return { pass: false, exitCode: 1, lines };
   }
 }
