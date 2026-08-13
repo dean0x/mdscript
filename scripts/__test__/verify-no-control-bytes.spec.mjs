@@ -240,6 +240,46 @@ describe('AC-7 AC-8 AC-9: positive controls and clean-file checks', () => {
     } finally { cleanup(dir); }
   });
 
+  test('AC-7 PC-6: planted U+FEFF (BOM) at offset 0 → exits 1 naming U+FEFF', () => {
+    // U+FEFF is the most likely codepoint to be special-cased by a future
+    // change to the decoder (BOM-stripping is a common optimization) and must
+    // therefore be exercised end-to-end through the full decode → predicate →
+    // report pipeline, not only via the table-driven isHazardous unit tests.
+    //
+    // UTF-8 encoding of U+FEFF: 0xEF 0xBB 0xBF (3 bytes).
+    // Bytes constructed at runtime from hex — no backslash-u escape (PF-018).
+    const { dir, git } = mkTempGitRepo();
+    try {
+      const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+      writeFileSync(join(dir, 'bom.mjs'), Buffer.concat([bom, Buffer.from('export const x = 1;')]));
+      git('add', 'bom.mjs');
+      const r = runScanner([], { cwd: dir });
+      assert.equal(r.status, 1, 'scanner must exit 1 on U+FEFF (BOM) at offset 0');
+      assert.ok(r.stderr.includes('bom.mjs'), 'error must name the file');
+      assert.ok(r.stderr.includes('U+FEFF'), 'error must include U+FEFF codepoint');
+    } finally { cleanup(dir); }
+  });
+
+  test('AC-7 PC-7: planted U+2028 (Line Separator) mid-file → exits 1 naming U+2028', () => {
+    // U+2028 (LINE SEPARATOR) is the second codepoint most likely to be
+    // special-cased by a future change to scanBuffer (it looks like a line
+    // break and some decoders treat it as whitespace).  Exercise it
+    // end-to-end through the full pipeline.
+    //
+    // UTF-8 encoding of U+2028: 0xE2 0x80 0xA8 (3 bytes).
+    // Bytes constructed at runtime from hex — no backslash-u escape (PF-018).
+    const { dir, git } = mkTempGitRepo();
+    try {
+      const ls = Buffer.from([0xe2, 0x80, 0xa8]);
+      writeFileSync(join(dir, 'ls.md'), Buffer.concat([Buffer.from('before'), ls, Buffer.from('after')]));
+      git('add', 'ls.md');
+      const r = runScanner([], { cwd: dir });
+      assert.equal(r.status, 1, 'scanner must exit 1 on U+2028 (Line Separator) mid-file');
+      assert.ok(r.stderr.includes('ls.md'), 'error must name the file');
+      assert.ok(r.stderr.includes('U+2028'), 'error must include U+2028 codepoint');
+    } finally { cleanup(dir); }
+  });
+
   test('AC-9 NEG-1: clean international text (accented Latin, CJK, emoji) → exits 0', () => {
     const { dir, git } = mkTempGitRepo();
     try {
@@ -321,11 +361,16 @@ describe('AC-11: git ls-files discovery path', () => {
       // Remove from git tracking (but keep on disk as untracked)
       git('rm', '--cached', 'tracked.md');
       const r2 = runScanner([], { cwd: dir });
-      // With zero tracked files, non-vacuity guard fires (exit 1) — which is correct.
-      // The scanner proves it reads the tracked set: the hostile file is on disk but untracked.
-      // If it read the working tree, it would still find the hostile byte even after `git rm --cached`.
-      // Since zero tracked files → non-vacuity exit 1, we know the scanner used git ls-files.
-      // To confirm: add a clean file and verify the scanner passes.
+      // Zero tracked files → non-vacuity guard fires (exit 1), proving the scanner
+      // reads the git-tracked set rather than the working tree directory.
+      // The hostile file is still on disk but is now untracked; a working-tree
+      // scanner would still find it and exit 1 for the wrong reason.
+      assert.equal(r2.status, 1, 'zero tracked files (hostile file on disk but untracked) → non-vacuity guard exits 1');
+      assert.ok(
+        r2.stderr.includes('zero files scanned') || r2.stderr.includes('empty scan'),
+        `non-vacuity message must mention zero files; got: ${r2.stderr}`
+      );
+      // Add a clean tracked file; hostile file is still on disk but untracked.
       writeFileSync(join(dir, 'clean.md'), 'clean content\n');
       git('add', 'clean.md');
       const r3 = runScanner([], { cwd: dir });
