@@ -254,6 +254,14 @@ function getTrackedFiles(cwd) {
  * Get staged file list for --staged mode.
  * Uses `git diff --cached --name-only -z --diff-filter=ACMR` for paths.
  * D-CB8: content is fetched later in batch via readAllIndexBlobs().
+ *
+ * D-CB5a divergence: `git diff --cached --name-only` does not carry git mode
+ * information, so every path is assigned mode 0o100644. Symlinks (120000) and
+ * gitlinks (160000) are NOT skipped as they are in full-tree mode. This is
+ * benign: a staged symlink's blob content is the target path (plain ASCII),
+ * which never contains a hazard codepoint, so no false positives arise. The
+ * full-tree scan enforces the unconditional AC-20 skip; staged mode is a
+ * narrower scope where only newly-committed content is checked.
  */
 function getStagedFiles(cwd) {
   const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR'], cwd);

@@ -456,6 +456,55 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
+  test('AC-6 --staged: amend-message-only (prior commit + nothing newly staged) → exits 0', () => {
+    // Regression for the empirically-confirmed bug: `git commit --amend -m "..."` was
+    // rejected with exit 1 by the pre-commit hook. During a message-only amend the
+    // index is identical to HEAD, so `git diff --cached --diff-filter=ACMR` returns
+    // zero paths. The non-vacuity guard (D-CB5) MUST NOT fire in --staged mode for
+    // this legitimate git state.
+    //
+    // This test uses a repo with a real prior commit (unlike the fresh-repo test above)
+    // to faithfully simulate the amend scenario where HEAD exists.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Establish a prior commit — this is the HEAD that an amend would rewrite.
+      writeFileSync(join(dir, 'initial.md'), 'initial content\n');
+      git('add', 'initial.md');
+      git('commit', '-m', 'initial commit');
+      // Index == HEAD: `git diff --cached` returns nothing. Simulates --amend -m.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        '--staged with index == HEAD must exit 0 (amend -m "..." is a valid workflow)');
+      assert.ok(
+        r.stdout.includes('nothing to scan') || r.stdout.includes('no staged'),
+        `stdout must explain why scanning was skipped; got: ${r.stdout}`
+      );
+    } finally { cleanup(dir); }
+  });
+
+  test('AC-6 --staged: allow-empty commit (nothing staged, prior commit) → exits 0', () => {
+    // Regression for the empirically-confirmed bug: `git commit --allow-empty` was
+    // rejected with exit 1 by the pre-commit hook. An allow-empty commit intentionally
+    // carries no staged content; `git diff --cached --diff-filter=ACMR` returns zero
+    // paths, which is a LEGITIMATE state. The scanner must exit 0 with an explicit
+    // message so the contributor knows the gate ran and found nothing to check.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Establish a prior commit so HEAD exists (matching typical allow-empty usage).
+      writeFileSync(join(dir, 'initial.md'), 'initial content\n');
+      git('add', 'initial.md');
+      git('commit', '-m', 'initial commit');
+      // Nothing staged — simulates `git commit --allow-empty`.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        '--staged with nothing staged must exit 0 (allow-empty is a valid workflow)');
+      assert.ok(
+        r.stdout.includes('nothing to scan') || r.stdout.includes('no staged'),
+        `stdout must explain why scanning was skipped; got: ${r.stdout}`
+      );
+    } finally { cleanup(dir); }
+  });
+
 });
 
 // ---------------------------------------------------------------------------
