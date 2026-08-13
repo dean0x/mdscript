@@ -13,7 +13,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync, execFileSync } from 'node:child_process';
@@ -417,12 +417,13 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6 --staged: no staged content (amend/nothing staged) → exits 0 with explicit message', () => {
-    // D-CB5's non-vacuity guard applies to full-tree mode only. In --staged mode
-    // an empty ACMR-filtered set is a legitimate state — `git commit --amend
-    // --no-edit` and `--allow-empty` produce exactly this. Exiting 1 here blocks
-    // valid commits and trains contributors to reach for --no-verify, which
-    // disables the gate for ALL commits. Fix: exit 0 with an explicit message.
+  test('D-CB5 --staged carve-out from AC-6: no staged content (amend/nothing staged) → exits 0 with explicit message', () => {
+    // AC-6 requires exit 1 when the scanned file set is empty in FULL-TREE mode.
+    // --staged mode has an explicit carve-out: an empty ACMR-filtered set is a
+    // LEGITIMATE state — `git commit --amend --no-edit` and `--allow-empty`
+    // produce exactly this. Exiting 1 here blocks valid commits and trains
+    // contributors to reach for --no-verify, which disables the gate for ALL
+    // commits. Documented exception: exit 0 with an explicit message.
     const { dir } = mkTempGitRepo();
     try {
       // Nothing staged — `git diff --cached` returns empty.
@@ -435,10 +436,12 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6 --staged: deletion-only commit → exits 0 with deletion count', () => {
-    // A commit that removes files only (git rm) yields zero ACMR-filtered paths
-    // because D = deletion is excluded from the ACMR filter. The scanner must
-    // exit 0, not 1. D-CB5 non-vacuity applies to full-tree mode only.
+  test('D-CB5 --staged carve-out from AC-6: deletion-only commit → exits 0 with deletion count', () => {
+    // AC-6 requires exit 1 when the scanned file set is empty in FULL-TREE mode.
+    // --staged mode carve-out: a commit that removes files only (git rm) yields
+    // zero ACMR-filtered paths because D = deletion is excluded from the ACMR
+    // filter. The scanner must exit 0, not 1. D-CB5 non-vacuity applies to
+    // full-tree mode only.
     const { dir, git } = mkTempGitRepo();
     try {
       // Commit a clean file, then stage its deletion
@@ -456,7 +459,7 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6 --staged: amend-message-only (prior commit + nothing newly staged) → exits 0', () => {
+  test('D-CB5 --staged carve-out from AC-6: amend-message-only (prior commit + nothing newly staged) → exits 0', () => {
     // Regression for the empirically-confirmed bug: `git commit --amend -m "..."` was
     // rejected with exit 1 by the pre-commit hook. During a message-only amend the
     // index is identical to HEAD, so `git diff --cached --diff-filter=ACMR` returns
@@ -482,7 +485,7 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6 --staged: allow-empty commit (nothing staged, prior commit) → exits 0', () => {
+  test('D-CB5 --staged carve-out from AC-6: allow-empty commit (nothing staged, prior commit) → exits 0', () => {
     // Regression for the empirically-confirmed bug: `git commit --allow-empty` was
     // rejected with exit 1 by the pre-commit hook. An allow-empty commit intentionally
     // carries no staged content; `git diff --cached --diff-filter=ACMR` returns zero
@@ -634,15 +637,30 @@ describe('AC-15: scanner source is self-clean', () => {
     // The forbidden grep invocation is 'grep' joined with ' -P'; split here so
     // the contiguous substring is absent from this source file.
     const grepPFlag = 'grep' + ' -P';
-    // 0x5C = backslash, then 'u' and 4 hex digits:
+    // 0x5C = backslash. Doubling it (bs + bs) yields two backslash chars as a
+    // string value; the RegExp constructor interprets that pair as an escaped
+    // literal backslash, producing /\\u[0-9a-fA-F]{4}/ — a pattern that matches
+    // an actual backslash followed by 'u' and four hex digits. A single bs would
+    // compile to /\u[0-9a-fA-F]{4}/ where \u is an Annex-B identity escape and
+    // matches bare 'u' — the false-positive trap identified in review finding #4.
     const bs = String.fromCodePoint(0x5c);
-    const bsUPattern = new RegExp(bs + 'u[0-9a-fA-F]{4}');
+    const bsUPattern = new RegExp(bs + bs + 'u[0-9a-fA-F]{4}');
 
+    // Auto-discover all spec files so new files added to scripts/__test__/ are
+    // automatically covered. A hardcoded list silently under-covers when files
+    // are added (the gap that let code-of-conduct.spec.mjs escape — review
+    // findings #1/#2). A minimum-count assertion catches accidental narrowing.
+    const specFiles = readdirSync(join(ROOT, 'scripts/__test__'))
+      .filter(f => f.endsWith('.spec.mjs'))
+      .map(f => `scripts/__test__/${f}`);
+    assert.ok(
+      specFiles.length >= 3,
+      `expected at least 3 spec files in scripts/__test__; got ${specFiles.length}: ${specFiles.join(', ')}`,
+    );
     const fileSet = [
       'scripts/verify-no-control-bytes.mjs',
       'scripts/verify-pr-checks.mjs',
-      'scripts/__test__/verify-no-control-bytes.spec.mjs',
-      'scripts/__test__/verify-pr-checks.spec.mjs',
+      ...specFiles,
       'scripts/hooks/pre-commit',
     ];
 
@@ -663,17 +681,27 @@ describe('AC-15: scanner source is self-clean', () => {
 
 // ---------------------------------------------------------------------------
 // AC-30: hex context stored per hit as a pre-computed string, not as the raw
-//        buffer — one-file-at-a-time memory discipline, verified by code shape.
+//        buffer — hazardHits never retains file buffers; verified by code shape.
 //
 // AC-30 has three clauses:
 //   (a) Wall-clock full-tree scan < 5 s — asserted with Date.now() in the
 //       AC-5 test above (generous CI-safe bound).
-//   (b) --staged mode < 2 s for a 20-file commit — not directly timed here;
-//       the same structural bound holds (git cat-file reads one blob at a time).
-//   (c) MUST NOT hold more than one file's contents in memory at a time —
-//       verified by code shape: at verify-no-control-bytes.mjs:473,
-//       hazardHits.push stores { hexCtx } (a pre-computed string) not { buf }
-//       (the raw buffer), so the buffer is GC-eligible after each iteration.
+//   (b) --staged mode < 2 s for a 20-file commit — not directly timed here.
+//       NOTE: readAllIndexBlobs() (added after the original AC-30 comment was
+//       written) collapses N per-file `git cat-file blob` spawns into ONE
+//       `git cat-file --batch` call. The entire staged set is materialized
+//       into a single r.stdout buffer; out.slice(pos, pos+size) returns Buffer
+//       views that pin that buffer. --staged mode therefore holds all staged
+//       file contents in memory simultaneously, bounded by the 256 MB maxBuffer
+//       cap (r.error -> exit 2). This is a known trade-off (spawn cost vs memory)
+//       that was accepted when readAllIndexBlobs() replaced readIndexBlob().
+//   (c) hazardHits MUST NOT retain file buffers — verified by code shape: at
+//       verify-no-control-bytes.mjs:611, hazardHits.push stores { hexCtx }
+//       (a pre-computed string) not { buf } (the raw buffer). In full-tree mode
+//       buf is GC-eligible after each loop iteration. In --staged mode buf is a
+//       view into the already-pinned blobMap buffer (clause b), so GC-eligibility
+//       at the hazardHits level is academic there — but the key property holds:
+//       hazardHits does NOT additionally retain file buffers.
 //
 // This describe block tests clause (c) indirectly: by proving the correct
 // hexCtx string reaches the output across multiple files, it demonstrates
@@ -685,9 +713,11 @@ describe('AC-30: hex context stored as string per hit, not as file buffer', () =
   test('scanner reports hex context for every hazard across multiple files', () => {
     // Verify that hexCtx is computed and stored correctly for each hit.
     // Memory discipline (clause c) is by code shape: hazardHits stores { hexCtx }
-    // not { buf } (scanner:473), so buf is GC-eligible after each file's iteration.
-    // This test proves the correct context string reaches the output regardless
-    // of how many files are scanned.
+    // not { buf } (scanner:611), so buf is not additionally retained in hazardHits.
+    // In full-tree mode buf is GC-eligible after each iteration; in --staged mode
+    // buf is a view into the blobMap buffer (all blobs held simultaneously per
+    // clause b). This test proves the correct context string reaches the output
+    // regardless of how many files are scanned.
     const { dir, git } = mkTempGitRepo();
     try {
       // Construct two files each with an ESC at a known position
