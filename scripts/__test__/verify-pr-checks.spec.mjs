@@ -23,6 +23,7 @@ import {
   main,
   fetchRequiredContexts,
   fetchStatuses,
+  parseGhStderrHttpStatus,
   EXPECTED_CONTEXTS,
 } from '../verify-pr-checks.mjs';
 
@@ -619,6 +620,11 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     assert.equal(calls.length, 4, `expected 4 API calls (pr, protection, checks, status); got ${calls.length}`);
     const checkCall = calls.find(u => u.includes('/check-runs'));
     assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
+    // D-PR4a parity: combined-status endpoint must request per_page=100 so a context
+    // at position 31+ is not silently absent from the set (low finding fix).
+    const statusCall = calls.find(u => u.includes('/status'));
+    assert.ok(statusCall && statusCall.includes('per_page=100'),
+      `status URL must include per_page=100 (D-PR4a parity); got: ${statusCall}`);
   });
 
   test('check-runs API error → exit 2 (indeterminate), not 1', () => {
@@ -682,6 +688,59 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
       'missing total_count must not cause a false exit 2');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// High finding: parseGhStderrHttpStatus — pin stub contract to production parsing.
+//
+// defaultGhRunner calls parseGhStderrHttpStatus (an exported pure function) to
+// extract the HTTP code from gh's stderr. Testing it here with captured real gh
+// stderr strings ensures the stubs used throughout this file mirror the value the
+// production runner actually produces (applies ADR-009, avoids PF-013: dead
+// branches that only trigger on a value the runner never produces).
+// ---------------------------------------------------------------------------
+describe('high finding: parseGhStderrHttpStatus parses real gh stderr format', () => {
+
+  test('extracts 404 from the real gh Not Found format', () => {
+    // Captured from: gh api /repos/dean0x/mdl/branches/nonexistent-xyz/protection
+    // stderr output: "gh: Not Found (HTTP 404)"
+    assert.equal(parseGhStderrHttpStatus('gh: Not Found (HTTP 404)'), 404,
+      'must extract 404 from real gh stderr format');
+  });
+
+  test('extracts 403 from the real gh Forbidden format', () => {
+    // Captured from: gh api on a branch with insufficient permissions
+    // stderr output: "gh: Forbidden (HTTP 403)"
+    assert.equal(parseGhStderrHttpStatus('gh: Forbidden (HTTP 403)'), 403,
+      'must extract 403 from real gh stderr format');
+  });
+
+  test('returns null for a non-HTTP error (e.g. connection refused)', () => {
+    // Connection errors have no "(HTTP NNN)" suffix — must not crash or return
+    // a wrong code that triggers the 404/403 branch accidentally.
+    assert.equal(parseGhStderrHttpStatus('connection refused'), null);
+  });
+
+  test('returns null for empty string', () => {
+    assert.equal(parseGhStderrHttpStatus(''), null);
+  });
+
+  test('returns null for null/undefined (guard against caller passing undefined stderr)', () => {
+    assert.equal(parseGhStderrHttpStatus(null), null);
+    assert.equal(parseGhStderrHttpStatus(undefined), null);
+  });
+
+  test('stub stubs use the same shape this function produces (contract parity check)', () => {
+    // All stubRunner error objects in this file use `httpStatus: 404` or `httpStatus: 403`
+    // which mirrors what parseGhStderrHttpStatus returns for real gh stderr strings.
+    // This test makes the mapping explicit and prevents future stubs from drifting
+    // back to `status: 404` (the old, broken shape) (avoids PF-013).
+    assert.equal(parseGhStderrHttpStatus('gh: Not Found (HTTP 404)'), 404,
+      'stub must use httpStatus: 404 (not status: 404) to mirror production');
+    assert.equal(parseGhStderrHttpStatus('gh: Forbidden (HTTP 403)'), 403,
+      'stub must use httpStatus: 403 (not status: 403) to mirror production');
   });
 
 });
@@ -837,6 +896,35 @@ describe('Tier B: non-required non-expected check-run states', () => {
     assert.equal(result.exitCode, 0, 'Tier B: neutral is advisory — must not block PASS');
     const allLines = result.lines.join('\n');
     assert.ok(allLines.includes('neutral'), `advisory line must name the conclusion; got: ${allLines}`);
+  });
+
+  // Critical finding (parameterized over all five TIER_B_FAIL conclusions):
+  // The original mutation test replaced TIER_B_FAIL = new Set([]) and all tests
+  // still passed, proving the set was unexercised for the remaining 3 conclusions.
+  // These tests close that gap and make any future removal detectable.
+  test('timed_out (completed) → FAIL (all five TIER_B_FAIL conclusions covered)', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'timed_out' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: completed/timed_out non-required run must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('timed_out'), `must quote conclusion; got: ${allLines}`);
+    assert.ok(allLines.includes('Some background job'), `must name the job; got: ${allLines}`);
+  });
+
+  test('action_required (completed) → FAIL (all five TIER_B_FAIL conclusions covered)', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'action_required' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: completed/action_required non-required run must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('action_required'), `must quote conclusion; got: ${allLines}`);
+  });
+
+  test('stale (completed) → FAIL (all five TIER_B_FAIL conclusions covered)', () => {
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'stale' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: completed/stale non-required run must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('stale'), `must quote conclusion; got: ${allLines}`);
   });
 
 });

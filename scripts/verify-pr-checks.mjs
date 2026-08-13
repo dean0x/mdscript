@@ -111,6 +111,24 @@ export const EXPECTED_CONTEXTS = ['Source hygiene'];
 // ---------------------------------------------------------------------------
 
 /**
+ * Extract the HTTP status code from gh's stderr string.
+ *
+ * gh prints errors in the format "gh: <message> (HTTP NNN)" for API errors.
+ * The process exit code is always 1 regardless of the HTTP status, so `status`
+ * alone cannot distinguish 404 from 403. This pure function is exported so
+ * tests can pin the stub contract to the production parsing contract (avoids
+ * PF-013: dead branches that only trigger on a value the runner never produces).
+ *
+ * @param {string|null|undefined} stderr
+ * @returns {number|null} HTTP status code, or null if not found
+ */
+export function parseGhStderrHttpStatus(stderr) {
+  if (!stderr) return null;
+  const m = stderr.match(/\(HTTP (\d+)\)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/**
  * Default runner: calls `gh api` and returns parsed JSON.
  *
  * On error, returns `{ __error: true, status: <process-exit>, httpStatus: <HTTP-code|null>, stderr }`.
@@ -139,12 +157,9 @@ function defaultGhRunner(args) {
     return { __error: true, status: -1, httpStatus: null, stderr };
   }
   if (r.status !== 0) {
-    // Parse HTTP status from gh's stderr format: "gh: <message> (HTTP NNN)"
-    // The process exit code is always 1 for API errors; only the parsed HTTP
-    // status code reliably distinguishes 404 from 403 (avoids PF-013: dead
-    // branches that only trigger on a value the runner never actually produces).
-    const httpMatch = r.stderr ? r.stderr.match(/\(HTTP (\d+)\)/) : null;
-    const httpStatus = httpMatch ? parseInt(httpMatch[1], 10) : null;
+    // parseGhStderrHttpStatus is tested separately so the stub contract and
+    // the production parsing contract are pinned to each other (avoids PF-013).
+    const httpStatus = parseGhStderrHttpStatus(r.stderr);
     return { __error: true, status: r.status, httpStatus, stderr: r.stderr };
   }
   try {
@@ -501,7 +516,10 @@ export function fetchCheckRuns(headSha, runner) {
  * @returns {{ ok: true, statuses: CommitStatus[] } | { ok: false, exitCode: 2, message: string }}
  */
 export function fetchStatuses(headSha, runner) {
-  const url = `/repos/{owner}/{repo}/commits/${headSha}/status`;
+  // per_page=100 requests the maximum from the combined-status endpoint so that
+  // a context at position 31+ is not silently missed. D-PR4a parity: assert
+  // returned count against total_count and fail closed on any shortfall.
+  const url = `/repos/{owner}/{repo}/commits/${headSha}/status?per_page=100`;
   const data = runner(['api', url]);
   if (data.__error) {
     return { ok: false, exitCode: 2, message: `commit-status API error: ${data.stderr}` };
