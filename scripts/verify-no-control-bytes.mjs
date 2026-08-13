@@ -335,8 +335,10 @@ function getStagedFiles(cwd) {
     // AC-20: skip symlinks (120000) and gitlinks (160000) — identical to
     // full-tree mode. A gitlink's cat-file lookup returns 'missing' (commit
     // object, not a blob) and would otherwise cause a misleading "staged path
-    // not in index" error. Symlink blobs contain only the ASCII target path
-    // and are safe to skip.
+    // not in index" error. Symlink blobs contain the target path; POSIX permits
+    // any byte except NUL and '/' in symlink targets, so control bytes are
+    // theoretically possible and scanning them could produce false-positive gate
+    // failures. Skipping keeps the gate focused on source-file content (avoids PF-015).
     const skip = newMode === 0o120000 || newMode === 0o160000;
     files.push({ path, mode: newMode, skip, staged: true });
   }
