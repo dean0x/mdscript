@@ -1019,24 +1019,20 @@ impl MdsError {
         sanitize_control_chars(&self.to_string()).into_owned()
     }
 
-    /// Return `true` when this error's embedded `NamedSource` carries the stdin
-    /// analysis sentinel `"<source>"` — the name that `resolve_source_intrinsic`
-    /// assigns to `ctx.file_str` for string-source inputs.
+    /// Return the name embedded in this error's `NamedSource`, or `None` when the
+    /// error carries no source (e.g. `MdsError::Io`).
     ///
-    /// The CLI uses this at its output boundary to decide whether to relabel the
-    /// embedded source name as `"<stdin>"`.  Only errors produced by a string-source
-    /// analysis carry that sentinel; errors from imported files carry the real file
-    /// path and must not be relabelled (PF-012 — in-bounds-but-wrong caret class;
-    /// the AD-211-5 ruling only authorised relabelling stdin's OWN source identity).
+    /// This is the primary access point for the source identity associated with an
+    /// `MdsError`.  Callers that need to detect the string-source analysis path should
+    /// compare the returned name against `resolver::SOURCE_LABEL` (`"<source>"`):
+    /// only errors produced by `resolve_source_intrinsic` carry that sentinel; errors
+    /// from imported files carry the real file path (PF-012 / AD-211-5).
     ///
-    /// Returns `false` when the error has no embedded source at all (e.g.
-    /// `MdsError::Io`), because there is nothing to relabel in that case.
+    /// The name is taken directly from the `NamedSource` stored on the variant and is
+    /// not sanitized — use [`MdsError::display_sanitized`] when the name will be
+    /// rendered to a terminal or embedded in an API response.
     #[must_use]
-    pub fn source_label_is_stdin_sentinel(&self) -> bool {
-        // "<source>" is resolver::SOURCE_LABEL — the value assigned to ctx.file_str
-        // by resolve_source_intrinsic.  Defined as a local const so error.rs needs
-        // no coupling to resolver.rs's crate-private symbol.
-        const SOURCE_LABEL: &str = "<source>";
+    pub fn source_name(&self) -> Option<&str> {
         let src = match self {
             MdsError::Syntax { src, .. }
             | MdsError::UndefinedVariable { src, .. }
@@ -1063,7 +1059,7 @@ impl MdsError {
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,
         };
-        src.is_some_and(|ns| ns.name() == SOURCE_LABEL)
+        src.map(|ns| ns.name())
     }
 }
 

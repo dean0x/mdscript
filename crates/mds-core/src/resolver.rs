@@ -196,7 +196,10 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// Used as `ctx.file_str` (shown in diagnostics) and as the cycle-detection key
 /// pushed onto `self.resolving` in `resolve_source`/`resolve_source_intrinsic`.
 /// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
-const SOURCE_LABEL: &str = "<source>";
+///
+/// `pub(crate)` so sibling modules (`error`, `sourcemap`) can reference the single
+/// definition and stay in sync automatically — no per-module copy needed.
+pub(crate) const SOURCE_LABEL: &str = "<source>";
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
 ///

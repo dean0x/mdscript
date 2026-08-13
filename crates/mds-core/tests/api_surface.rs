@@ -207,6 +207,30 @@ fn mds_error_trait_impls() {
     let _ = diagnostic.code();
 }
 
+/// Pin `MdsError::source_name()` — the neutral domain accessor for the embedded
+/// `NamedSource` name (ADR-010; replaces the CLI-vocabulary `source_label_is_stdin_sentinel`).
+#[test]
+fn mds_error_source_name_accessor() {
+    use std::sync::Arc;
+
+    // Errors with an embedded source carry its name.
+    let with_src = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "myfile.mds",
+            "content".to_string(),
+        ))),
+    };
+    assert_eq!(with_src.source_name(), Some("myfile.mds"));
+
+    // Errors without an embedded source return None.
+    let without_src = MdsError::Io {
+        message: "test".to_string(),
+    };
+    assert_eq!(without_src.source_name(), None);
+}
+
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);

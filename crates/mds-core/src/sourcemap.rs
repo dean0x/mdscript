@@ -91,12 +91,11 @@ pub const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
 ///   and `"input.mds"` can never coexist as two distinct `sources[]` entries
 ///   even if S8 or spliced-region paths pass the sentinel separately).
 ///
-/// The literal `"<source>"` is used here rather than `SOURCE_LABEL` from
-/// `resolver.rs` to avoid a cross-module dependency.  If the sentinel ever
-/// changes, update this function first.
+/// References `crate::resolver::SOURCE_LABEL` (now `pub(crate)`) so that a change
+/// to the sentinel value is caught at compile time rather than silently drifting.
 #[inline]
 pub(crate) fn map_source_label(name: &str) -> &str {
-    if name == "<source>" {
+    if name == crate::resolver::SOURCE_LABEL {
         STRING_SOURCE_MAP_LABEL
     } else {
         name

@@ -77,6 +77,12 @@ via struct literals. Use the named constructor or builder listed for each:
   suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
   this method instead of assembling sanitized copies itself, keeping the escape logic co-located
   with the struct definition (PF-014).
+- **`MdsError::source_name() -> Option<&str>`** — a new method that returns the name embedded
+  in the error's `NamedSource`, or `None` for errors without a source (e.g. `MdsError::Io`).
+  This replaces the previously-unreleased `source_label_is_stdin_sentinel()` method, which
+  encoded CLI presentation vocabulary into the domain crate. `source_name()` is domain-neutral:
+  callers that need to detect the string-source analysis path compare the returned name against
+  the sentinel value `"<source>"` themselves.
 
 #### Lint JSON wire contract (#202, #203, #211)
 
@@ -130,7 +136,10 @@ that names a stdin source now uses the single sentinel `<stdin>`:
 - the **analysis-failure envelope** — a stdin source that fails the check gate
   used to render `<source>:L:C`, the resolver's internal label. `mds check -` and
   `mds build -` rendered `<source>` on the same path and now render `<stdin>`
-  too, so all four subcommands agree.
+  too, so all four subcommands agree.  Note: the analysis-failure JSON envelope
+  shape is `{"version":1,"error":{"code","message","help","span"}}` — it carries
+  **no `file` key** (unlike the success envelope which has `files[].file`).  A
+  JSON consumer reading `error` results MUST NOT look for a `file` key there.
 
 `mds::STRING_SOURCE_MAP_LABEL` is **unchanged** and remains `"input.mds"`: it is a
 virtual-FS entry key, not a display label. The napi, WASM and Python lint APIs
@@ -905,6 +914,17 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   messages-mode template was built with a stdout output path (`-o -`) and
   `source_map=true` (from config), two overlapping errors could fire. The
   messages-mode stdout path now emits exactly one warning.
+
+- **`mds lint --fix --format json <file>` no longer emits `"file": "input.mds"`
+  for residual diagnostics.** In single-file mode with both `--fix` and
+  `--format json`, the `files[].file` key in the JSON output for residual
+  (post-fix) diagnostics was the internal VFS label `"input.mds"` instead of the
+  real file basename.  The reverify closure inside `plan_and_apply_fixes` calls
+  `lint_str_with`, which sets `diag.file` to `STRING_SOURCE_MAP_LABEL`; the
+  resulting residual was not relabeled before `emit_result`.  Fixed by calling
+  `set_diag_display_path(&mut residual, filename)` in the `Fixed` and
+  `PartiallyFixed` match arms of `run_lint_file`, mirroring the existing relabel
+  in directory mode (which was already correct).
 
 ## [0.3.0] — 2026-06-28
 
