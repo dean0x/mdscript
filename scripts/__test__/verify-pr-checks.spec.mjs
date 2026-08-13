@@ -543,9 +543,11 @@ describe('AC-1 AC-2: Code of Conduct verification', () => {
   //     release/content/version/2/1/code_of_conduct.md
   //   The upstream file carries a TOML front-matter block (+++ ... +++) that is
   //   site metadata, not part of the document. With it stripped, the body is
-  //   byte-identical to this fixture: 5478 bytes, sha256 369bf730...339b.
-  //   (The plan recorded 977d7813.../5480 bytes for a capture that does not
-  //   reproduce against upstream today; the digest below is measured, not copied.)
+  //   byte-identical to this fixture: 5478 bytes,
+  //   sha256 369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b.
+  //   AC-1 recorded a different capture (977d781349351fd7c1f076e4c7dc7de2a05b40e12c773542c3815dd4ce7f37ba,
+  //   5480 bytes) that does not reproduce against upstream today; the constants
+  //   below reflect the measured value, not the plan's capture.
   const FIXTURE_SHA256 = '369bf7301883368fc19203bd0f1233fed2b83f0378ad19c4d0708bf61925339b';
   const FIXTURE_BYTES = 5478;
 

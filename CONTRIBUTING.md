@@ -70,7 +70,13 @@ automatically in CI (`source-hygiene` job) and can be run locally:
 ```bash
 node scripts/verify-no-control-bytes.mjs          # full tracked-tree scan
 node scripts/verify-no-control-bytes.mjs --staged  # staged-only (pre-commit)
+npm run test:gates                                 # positive-control spec suite
 ```
+
+Exit codes are a contract: `0` no hazards found (prints file and byte counts
+for non-vacuity), `1` hazard found or scan failed closed (zero files scanned,
+unreadable path, stale allowlist entry, git not on PATH), `2` indeterminate
+(a git subcommand failed unexpectedly — never treat `2` as clean).
 
 **Opt-in pre-commit hook** (replaces `.git/hooks` wholesale — document your
 existing local hooks before enabling):
@@ -81,9 +87,9 @@ git config core.hooksPath scripts/hooks
 
 **Hazard class**: C0 (0x00-0x1F) excluding TAB and LF, DEL (0x7F), C1
 (0x80-0x9F at codepoint level — catches UTF-8-encoded NEL 0xC2 0x85), the
-twelve Unicode `Bidi_Control=Yes` codepoints (Trojan Source, CVE-2021-42574)
-including U+061C, U+2028 (LS), U+2029 (PS), and U+FEFF (BOM). CR (U+000D) is
-permitted only as the first byte of CRLF.
+twelve Unicode `Bidi_Control=Yes` codepoints including U+061C (Trojan Source,
+CVE-2021-42574), plus U+2028 (LS), U+2029 (PS), and U+FEFF (BOM). CR (U+000D)
+is permitted only as the first byte of CRLF.
 
 **BSD grep trap**: macOS ships BSD grep, which has no `-P` flag and exits 2
 with empty output. That empty output is indistinguishable from a clean scan.
@@ -121,15 +127,27 @@ every context is `status=completed` AND `conclusion=success`, and on pass
 emits a `gh pr merge --squash --match-head-commit <sha>` command pinned to
 the verified SHA (closes the TOCTOU window).
 
-Exit codes are a contract: `0` verified, `1` a required context is missing or
-not successful, `2` the tool could not tell (protection unreadable, no required
-contexts configured, `gh` older than 2.31, incomplete pagination). **Only `0`
-means verified** — never read `2` as a pass.
+Exit codes are a contract: `0` all Tier A and Tier B checks passed, `1` any
+Tier A failure (required context missing or non-success), any Tier B failure
+(non-required check-run concluded failure/cancelled/timed_out/action_required/
+stale), or zero check-runs found, `2` the tool could not tell (protection
+unreadable, no required contexts configured, `gh` older than 2.31, incomplete
+pagination). **Only `0` means verified** — never read `2` as a pass.
+
+Tier B is load-bearing: `source-hygiene` is not among `main`'s required
+branch-protection contexts, so Tier B is the sole mechanism that makes a
+failing `source-hygiene` run block an `--admin` merge.
 
 Scope, stated so it is not assumed: the verifier checks the checks *on one
 commit*. It does **not** assert that the head is up to date with the base
 branch, so a stale-but-green head can still be merged under `--admin` even
-after the verifier passes. Keep the branch rebased.
+after the verifier passes. Keep the branch rebased. It does **not** assert that
+`source-hygiene` is a required context — `--admin` bypasses required-status
+enforcement outright for non-required checks, and Tier B is the binding
+mechanism. Tier B skips non-required check-runs still `queued` or `in_progress`:
+a verifier pass issued while `source-hygiene` is still running has verified
+nothing about source hygiene. Ensure all jobs have completed before running the
+verifier.
 
 If the base branch is unprotected (e.g. a wave branch), supply `--required-from`:
 

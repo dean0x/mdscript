@@ -641,11 +641,14 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
 
 - **Pre-merge check verifier** (#289): `scripts/verify-pr-checks.mjs` guards
   against PF-017 (a cancelled CI run reads as "not failing" to `gh pr merge
-  --admin`). It reads required contexts from live branch protection, asserts each
-  is `status=completed` AND `conclusion=success`, and emits a `gh pr merge
-  --squash --match-head-commit <sha>` command pinned to the verified SHA. On
-  success, exit 0; on any required context missing or non-success, exit 1; on
-  tool/permission errors, exit 2.
+  --admin`). It evaluates three tiers: Tier A asserts every required
+  branch-protection context is `completed+success`; Tier B fails on any
+  non-required check-run that concluded
+  `failure/cancelled/timed_out/action_required/stale`; Tier C (legacy commit
+  statuses) is advisory. It emits a `gh pr merge --squash --match-head-commit
+  <sha>` command pinned to the verified SHA. Exit 0: Tier A and Tier B pass;
+  exit 1: any Tier A/B failure or zero check-runs found; exit 2:
+  tool/permission errors.
 
 ### Changed
 

@@ -146,15 +146,20 @@ describe('AC-12 AC-13: hazard class golden set', () => {
     assert.equal(isHazardous(0x0a, null), false, 'LF must NOT be hazardous');
   });
 
-  test('mutation check: removing C1 range (U+0085) would fail the test above', () => {
-    // D-CB1a: Prove the golden-set test is non-vacuous.
-    // This test verifies that U+0085 (C1 NEL, the case the baseline missed) IS detected.
-    // The case that triggered PF-018 three times in this repo.
-    const nel = 0x85; // U+0085 — C1 NEL; written as hex, not \u escape (D-CB2)
+  test('C1 range covers U+0080-U+009F including NEL (U+0085), and stops at U+00A0', () => {
+    // AC-12: The C1 range { from: 0x80, to: 0x9f } must cover all codepoints in
+    // that band, including U+0085 (C1 NEL) — the exact byte PF-018 injected into
+    // tracked source three times in this repo.
+    //
+    // The genuine non-vacuity guard for D-CB1a is the golden-count test at line 67
+    // (exactly 21 entries) and the bidirectional membership assertions above (lines
+    // 104-124); those tests catch both removal and narrowing. This test documents
+    // the boundary behaviour of the C1 range specifically.
+    const nel = 0x85; // U+0085 — C1 NEL; written as hex, not backslash-u (D-CB2)
     assert.equal(isHazardous(nel, null), true,
       'U+0085 (C1 NEL) must be detected — this is the exact byte PF-018 injected into tracked source');
 
-    // Also verify U+0080 (C1 low end) and U+009F (C1 high end) are caught
+    // Verify U+0080 (C1 low end) and U+009F (C1 high end) are caught
     assert.equal(isHazardous(0x80, null), true, 'U+0080 (C1 boundary) must be hazardous');
     assert.equal(isHazardous(0x9f, null), true, 'U+009F (C1 boundary) must be hazardous');
     // Confirm U+00A0 is NOT hazardous (just outside C1 range)
@@ -337,9 +342,15 @@ describe('AC-11: git ls-files discovery path', () => {
 // ---------------------------------------------------------------------------
 describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
 
-  test('AC-5: scanner exits 0 on real repo tree with >= 500 files and >= 4MB', () => {
+  test('AC-5 AC-30: scanner exits 0 on real repo tree with >= 500 files and >= 4MB in under 5 s', () => {
+    // AC-30 (clause a): full tracked-tree scan must complete in under 5 seconds wall-clock.
+    // A generous CI-safe bound of 5 s is used; local runs are typically < 1 s.
+    const start = Date.now();
     const r = runScanner([], { cwd: ROOT });
+    const elapsed = Date.now() - start;
     assert.equal(r.status, 0, `scanner must exit 0 on clean repo tree; stderr: ${r.stderr}`);
+    assert.ok(elapsed < 5000,
+      `full-tree scan must complete in < 5 s wall-clock (AC-30); took ${elapsed}ms`);
     // Parse scanned file count and byte count from success output
     const m = r.stdout.match(/Scanned (\d+) file\(s\), (\d+) byte\(s\)/);
     assert.ok(m, `success output must include "Scanned N file(s), M byte(s)"; got: ${r.stdout}`);
@@ -502,16 +513,32 @@ describe('AC-15: scanner source is self-clean', () => {
 });
 
 // ---------------------------------------------------------------------------
-// AC-30: hex context is pre-computed — file buffer not retained beyond each
-//        individual file scan (avoids accumulating all file contents in memory)
+// AC-30: hex context stored per hit as a pre-computed string, not as the raw
+//        buffer — one-file-at-a-time memory discipline, verified by code shape.
+//
+// AC-30 has three clauses:
+//   (a) Wall-clock full-tree scan < 5 s — asserted with Date.now() in the
+//       AC-5 test above (generous CI-safe bound).
+//   (b) --staged mode < 2 s for a 20-file commit — not directly timed here;
+//       the same structural bound holds (git cat-file reads one blob at a time).
+//   (c) MUST NOT hold more than one file's contents in memory at a time —
+//       verified by code shape: at verify-no-control-bytes.mjs:473,
+//       hazardHits.push stores { hexCtx } (a pre-computed string) not { buf }
+//       (the raw buffer), so the buffer is GC-eligible after each iteration.
+//
+// This describe block tests clause (c) indirectly: by proving the correct
+// hexCtx string reaches the output across multiple files, it demonstrates
+// that hexCtx was computed and stored before buf went out of scope — which
+// is only possible if buf was NOT retained in hazardHits.
 // ---------------------------------------------------------------------------
-describe('AC-30: hex context pre-computation', () => {
+describe('AC-30: hex context stored as string per hit, not as file buffer', () => {
 
   test('scanner reports hex context for every hazard across multiple files', () => {
     // Verify that hexCtx is computed and stored correctly for each hit.
-    // When this works, buf is NOT retained in hazardHits — the fix is structural
-    // (hazardHits stores { hexCtx } not { buf }) and this test proves the
-    // correct string reaches the output regardless of how many files are scanned.
+    // Memory discipline (clause c) is by code shape: hazardHits stores { hexCtx }
+    // not { buf } (scanner:473), so buf is GC-eligible after each file's iteration.
+    // This test proves the correct context string reaches the output regardless
+    // of how many files are scanned.
     const { dir, git } = mkTempGitRepo();
     try {
       // Construct two files each with an ESC at a known position
