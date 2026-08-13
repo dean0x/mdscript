@@ -39,9 +39,7 @@ jobs:
       - name: "Assert no hazardous codepoints in tracked source"
         run: node scripts/verify-no-control-bytes.mjs
       - name: "Run positive-control and class-completeness suite"
-        run: |
-          shopt -s failglob
-          node --test scripts/__test__/*.spec.mjs
+        run: npm run test:gates
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
