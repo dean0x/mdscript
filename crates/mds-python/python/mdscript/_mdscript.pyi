@@ -165,8 +165,12 @@ class LintFileReport:
 class LintResult:
     """The result of :func:`lint`, :func:`lint_file`, or :func:`lint_virtual`.
 
-    Canonical JSON shape: ``{"files":[...],"truncated":false,"version":1}``.
-    Keys are in BTreeMap (alphabetical) order — byte-identical across all surfaces.
+    Core JSON shape: ``{"files":[...],"truncated":false,"version":1}``.
+    When non-fatal warnings occur (e.g. unknown rule names),
+    ``"lint_warnings"`` also appears in alphabetical key order between
+    ``"files"`` and ``"truncated"``. Keys are in BTreeMap (alphabetical)
+    order. The CLI surface writes warnings to stderr rather than including
+    them in its JSON stdout.
 
     ``files`` is a list of typed :class:`LintFileReport` objects. Each report
     exposes ``.file`` (str) and ``.diagnostics`` (list[:class:`LintDiagnostic`]).

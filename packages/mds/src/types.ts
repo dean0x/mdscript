@@ -221,9 +221,12 @@ export interface LintFileReport {
 }
 
 /**
- * Canonical lint result returned by all lint surfaces (CLI `--format json`,
- * napi, WASM, Python). All surfaces produce byte-identical JSON for the same
- * input and rules configuration.
+ * Lint result returned by the napi, WASM, and Python binding surfaces, and
+ * by the CLI `--format json` surface. The `files`, `truncated`, and `version`
+ * fields are present on every surface. The optional `lint_warnings` field is
+ * included in the binding-surface JSON when non-fatal warnings occurred; the
+ * CLI writes those warnings to stderr so its JSON stdout remains parseable
+ * without modification.
  */
 export interface LintResult {
   /** Schema version; always 1 in this release. */
