@@ -1534,7 +1534,10 @@ fn lint(
             obj.insert(
                 "lint_warnings".to_string(),
                 serde_json::Value::Array(
-                    lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    lint_warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }
@@ -1564,7 +1567,10 @@ fn lint_file(
             obj.insert(
                 "lint_warnings".to_string(),
                 serde_json::Value::Array(
-                    lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    lint_warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }
@@ -1598,7 +1604,10 @@ fn lint_virtual(
             obj.insert(
                 "lint_warnings".to_string(),
                 serde_json::Value::Array(
-                    lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    lint_warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }

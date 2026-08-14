@@ -80,9 +80,7 @@ impl UnknownRuleNames {
 /// assert_eq!(u.names(), &["no-such-rule".to_string()]);
 /// assert_eq!(KNOWN_LINT_RULES.len(), 10);
 /// ```
-pub fn find_unknown_rule_names(
-    rules: &HashMap<String, Severity>,
-) -> Option<UnknownRuleNames> {
+pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<UnknownRuleNames> {
     let unknowns: Vec<String> = rules
         .keys()
         .filter(|k| !KNOWN_LINT_RULES.contains(&k.as_str()))
@@ -115,7 +113,10 @@ pub fn format_unknown_rule_names_warning(names: &[String]) -> String {
     // Structural precondition: names must be non-empty.
     // UnknownRuleNames guarantees this, but callers passing &[String] directly
     // should ensure the same.
-    assert!(!names.is_empty(), "format_unknown_rule_names_warning called with empty names");
+    assert!(
+        !names.is_empty(),
+        "format_unknown_rule_names_warning called with empty names"
+    );
     let recognised = KNOWN_LINT_RULES.join(", ");
     if names.len() == 1 {
         format!(

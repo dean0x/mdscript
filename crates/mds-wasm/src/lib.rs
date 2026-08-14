@@ -861,7 +861,11 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
                 obj.insert(
                     "lint_warnings".to_string(),
                     serde_json::Value::Array(
-                        lint_opts.lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                        lint_opts
+                            .lint_warnings
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
                     ),
                 );
             }
@@ -932,7 +936,11 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
                 obj.insert(
                     "lint_warnings".to_string(),
                     serde_json::Value::Array(
-                        lint_opts.lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                        lint_opts
+                            .lint_warnings
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
                     ),
                 );
             }

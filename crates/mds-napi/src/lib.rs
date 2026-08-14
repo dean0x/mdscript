@@ -984,7 +984,10 @@ pub fn lint(env: Env, source: String, opts: Option<Object>) -> napi::Result<serd
             obj.insert(
                 "lint_warnings".to_string(),
                 serde_json::Value::Array(
-                    lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    lint_warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }
@@ -1024,7 +1027,10 @@ pub fn lint_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<s
             obj.insert(
                 "lint_warnings".to_string(),
                 serde_json::Value::Array(
-                    lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    lint_warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }
@@ -1123,7 +1129,10 @@ pub fn lint_virtual(
             obj.insert(
                 "lint_warnings".to_string(),
                 serde_json::Value::Array(
-                    lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    lint_warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
                 ),
             );
         }

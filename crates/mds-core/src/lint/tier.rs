@@ -113,8 +113,8 @@ mod tests {
     /// for valid registered rules.
     #[test]
     fn registry_and_tier_table_are_bidirectionally_consistent() {
-        use super::super::rules::ALL_RULE_NAMES;
         use super::super::config::KNOWN_LINT_RULES;
+        use super::super::rules::ALL_RULE_NAMES;
 
         /// Canonical expected-tier table: (rule_name, expected_FixTier).
         /// Must be updated whenever a rule is added, removed, or re-tiered.
@@ -137,15 +137,18 @@ mod tests {
 
         // Length pin: bump this when a new rule ships.
         assert_eq!(
-            EXPECTED.len(), 10,
+            EXPECTED.len(),
+            10,
             "EXPECTED table length must equal the number of registered rules (10)"
         );
         assert_eq!(
-            ALL_RULE_NAMES.len(), 10,
+            ALL_RULE_NAMES.len(),
+            10,
             "ALL_RULE_NAMES length must equal the number of registered rules (10)"
         );
         assert_eq!(
-            KNOWN_LINT_RULES.len(), 10,
+            KNOWN_LINT_RULES.len(),
+            10,
             "KNOWN_LINT_RULES length must equal the number of registered rules (10)"
         );
 
@@ -154,7 +157,9 @@ mod tests {
             let got = rule_tier(name);
             let entry = EXPECTED.iter().find(|(n, _)| *n == name);
             let expected_tier = entry
-                .unwrap_or_else(|| panic!("rule {name:?} is in the registry but missing from EXPECTED"))
+                .unwrap_or_else(|| {
+                    panic!("rule {name:?} is in the registry but missing from EXPECTED")
+                })
                 .1
                 .clone();
             assert_eq!(

@@ -3454,7 +3454,10 @@ fn unknown_rule_one_warning_per_invocation_not_per_file() {
     );
 
     // AC-224-19: the warning must appear at most once (one per invocation, not per file).
-    let warning_count = stderr.lines().filter(|l| l.contains("unknown lint rule")).count();
+    let warning_count = stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .count();
     assert_eq!(
         warning_count, 1,
         "AC-224-19: warning must appear exactly once per invocation, not once per file \

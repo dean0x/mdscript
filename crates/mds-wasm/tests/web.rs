@@ -1190,7 +1190,10 @@ fn wasm_lint_unknown_rule_name_returns_lint_warnings() {
         warnings_arr.length() > 0,
         "W-WARN-1: lint_warnings must be non-empty for an unknown rule name"
     );
-    let w0 = warnings_arr.get(0).as_string().expect("W-WARN-1: lint_warnings[0] must be a string");
+    let w0 = warnings_arr
+        .get(0)
+        .as_string()
+        .expect("W-WARN-1: lint_warnings[0] must be a string");
     assert!(
         w0.contains("no-such-rule-xyzzy"),
         "W-WARN-1: lint_warnings[0] must name the unknown rule; got: {w0}"
@@ -1235,7 +1238,10 @@ fn wasm_lint_virtual_unknown_rule_name_returns_lint_warnings() {
         warnings_arr.length() > 0,
         "W-WARN-3: lint_warnings must be non-empty for an unknown rule name"
     );
-    let w0 = warnings_arr.get(0).as_string().expect("W-WARN-3: lint_warnings[0] must be a string");
+    let w0 = warnings_arr
+        .get(0)
+        .as_string()
+        .expect("W-WARN-3: lint_warnings[0] must be a string");
     assert!(
         w0.contains("no-such-rule-xyzzy"),
         "W-WARN-3: lint_warnings[0] must name the unknown rule; got: {w0}"
@@ -1256,17 +1262,18 @@ fn wasm_lint_continues_with_unknown_rule_name() {
     let _ = files_arr.length(); // just confirm it's array-like; no panic = ok
 
     // truncated must be present and false.
-    let truncated = get_prop(&result, "truncated")
-        .as_bool()
-        .unwrap_or(true);
-    assert!(!truncated, "W-WARN-4: truncated must be false for a clean source");
+    let truncated = get_prop(&result, "truncated").as_bool().unwrap_or(true);
+    assert!(
+        !truncated,
+        "W-WARN-4: truncated must be false for a clean source"
+    );
 }
 
 #[wasm_bindgen_test]
 fn wasm_lint_unknown_rule_no_lint_warnings_absent_on_clean() {
     // W-WARN-2b (AC-224-1/D8): no options → no lint_warnings field at all.
-    let result = mds_wasm::lint("Hello!\n", JsValue::NULL)
-        .expect("W-WARN-2b: lint(NULL) must succeed");
+    let result =
+        mds_wasm::lint("Hello!\n", JsValue::NULL).expect("W-WARN-2b: lint(NULL) must succeed");
     let lint_warnings = get_prop(&result, "lint_warnings");
     assert!(
         lint_warnings.is_undefined(),

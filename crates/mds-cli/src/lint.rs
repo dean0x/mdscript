@@ -204,11 +204,7 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             if !quiet {
                 if let Some(ref unknown) = mds::find_unknown_rule_names(&mds_config.lint.rules) {
                     // Escape each name via safe_inline (WIRE per-field rule, spec §7.5).
-                    let escaped: Vec<String> = unknown
-                        .names()
-                        .iter()
-                        .map(safe_inline)
-                        .collect();
+                    let escaped: Vec<String> = unknown.names().iter().map(safe_inline).collect();
                     // AC-224-2: include all recognised rule names (KNOWN_LINT_RULES is
                     // sorted alphabetically — AC-224-3 determinism guaranteed).
                     let recognised = mds::KNOWN_LINT_RULES.join(", ");

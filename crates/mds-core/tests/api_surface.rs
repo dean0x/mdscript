@@ -1145,7 +1145,11 @@ fn known_lint_rules_and_unknown_detection() {
     use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
 
     // AC-224-7: exactly 10 rules.
-    assert_eq!(KNOWN_LINT_RULES.len(), 10, "KNOWN_LINT_RULES must have exactly 10 entries");
+    assert_eq!(
+        KNOWN_LINT_RULES.len(),
+        10,
+        "KNOWN_LINT_RULES must have exactly 10 entries"
+    );
 
     // AC-224-7: exact sorted contents.
     let expected = [
@@ -1160,7 +1164,10 @@ fn known_lint_rules_and_unknown_detection() {
         "unused-import",
         "unused-variable",
     ];
-    assert_eq!(KNOWN_LINT_RULES, &expected, "KNOWN_LINT_RULES must match the expected sorted list");
+    assert_eq!(
+        KNOWN_LINT_RULES, &expected,
+        "KNOWN_LINT_RULES must match the expected sorted list"
+    );
 
     // AC-224-8: every known rule is accepted by from_rules without unknowns.
     let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
@@ -1189,15 +1196,17 @@ fn known_lint_rules_and_unknown_detection() {
     let unknown = find_unknown_rule_names(&mixed).expect("should detect two unknown rules");
     // Accessor returns names; struct literal construction is impossible (#[non_exhaustive]).
     let names = unknown.names();
-    assert_eq!(names, &["another-bad".to_string(), "no-such-rule".to_string()],
-        "names must be sorted lexicographically");
+    assert_eq!(
+        names,
+        &["another-bad".to_string(), "no-such-rule".to_string()],
+        "names must be sorted lexicographically"
+    );
     assert_eq!(names.len(), 2);
 
     // Positive control (PF-013 / ADR-009): find_unknown_rule_names does NOT return None
     // for a single-unknown map.
-    let one_bad: HashMap<String, Severity> = HashMap::from([
-        ("no-such-rule".to_string(), Severity::Warn),
-    ]);
+    let one_bad: HashMap<String, Severity> =
+        HashMap::from([("no-such-rule".to_string(), Severity::Warn)]);
     assert!(
         find_unknown_rule_names(&one_bad).is_some(),
         "single-unknown map must produce Some"
