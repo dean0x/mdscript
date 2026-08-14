@@ -80,9 +80,15 @@ via struct literals. Use the named constructor or builder listed for each:
 - **`MdsError::source_name() -> Option<&str>`** — a new method that returns the name embedded
   in the error's `NamedSource`, or `None` for errors without a source (e.g. `MdsError::Io`).
   This replaces the previously-unreleased `source_label_is_stdin_sentinel()` method, which
-  encoded CLI presentation vocabulary into the domain crate. `source_name()` is domain-neutral:
-  callers that need to detect the string-source analysis path compare the returned name against
-  the sentinel value `"<source>"` themselves.
+  encoded CLI presentation vocabulary into the domain crate. `source_name()` is domain-neutral;
+  callers that need to detect the string-source analysis path should use
+  `MdsError::is_string_source()` rather than comparing the returned name against the sentinel
+  value themselves — the internal sentinel is `pub(crate)` and is not reachable from downstream
+  crates.
+- **`MdsError::is_string_source() -> bool`** — a new predicate that returns `true` when the
+  error was produced by the string-source analysis path (`resolve_source_intrinsic`). Use this
+  instead of comparing `source_name()` against a bare string literal: the internal sentinel
+  (`SOURCE_LABEL`) is `pub(crate)` and is not accessible from downstream crates.
 
 #### Lint JSON wire contract (#202, #203, #211)
 
@@ -111,10 +117,14 @@ selective import:
 **A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
 output, matches `<source>` in an `error.message` or rendered frame, relies on
 `diagnostics[]` arriving in rule-execution order, assumes `unused-import`
-spans have length 7, or relies on the `mds lint <dir>` file-group order being
-component-wise (`Path::Ord`). File groups are now ordered by the byte-wise string
+spans have length 7, relies on the `mds lint <dir>` file-group order being
+component-wise (`Path::Ord`), or on Windows assumes `files[].file` values use
+the native backslash separator. File groups are now ordered by the byte-wise string
 of the relative display path (e.g. `api-utils.mds` sorts before `api/x.mds`
-because `'-'` (0x2D) < `'/'` (0x2F)).
+because `'-'` (0x2D) < `'/'` (0x2F)). On Windows, `relative_display` normalises
+path separators to forward slashes, so a nested path that previously appeared as
+`sub\c.mds` in the JSON now appears as `sub/c.mds`; a consumer that string-matches
+or splits on `\` in `files[].file` values will silently fail to match.
 
 **1. Diagnostics are sorted by byte offset (#202).** Within each
 `files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`

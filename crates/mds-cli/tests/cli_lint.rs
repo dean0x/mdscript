@@ -1613,11 +1613,30 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
     // (`serde_json::from_str` → `v["error"]["message"].as_str()` → `.contains()`)
     // to a SYNTHETIC JSON document that embeds each forbidden value.
     //
+    // **Why synthetic rather than a binary built at 113f472?**  Spawning a
+    // historical CLI binary inside a cargo test is impractical — it requires
+    // a pre-built artifact committed to the repo or a build-time download,
+    // neither of which is feasible here.  A synthetic envelope is the
+    // next-best option: it validates that the serde path (`v["error"]["message"]
+    // .as_str()`) can detect the forbidden values when they ARE present,
+    // which is exactly the failure mode a regression would introduce (the key
+    // moves or the value is `null`).  The tradeoff is that the control cannot
+    // prove the live CLI would emit the forbidden value if the fix regressed.
+    //
+    // **Near-vacuous JSON-channel absence assertions:** analysis (2026-08-14)
+    // shows that no `MdsError` Display template interpolates `ctx.file_str` (the
+    // resolved file path) into the rendered message, so `"<source>"` structurally
+    // cannot reach `error.message` through any current code path.  The absence
+    // checks are therefore largely structural rather than behavioral; the
+    // non-vacuous coverage rests on the human-channel `frame_source_identity`
+    // assertion below, which is genuinely sound because it exercises the miette
+    // rendering path end-to-end.
+    //
     // A tautology over a string literal — e.g. `"<source>".contains("<source>")` —
     // proves only that `str::contains` is implemented; it never exercises the serde
     // deserialization step, so it would still pass even if `v["error"]["message"]`
     // silently returned `None` (e.g. because `MdsError::serialize` moved the value
-    // to a different key).  These controls catch that regression.
+    // to a different key).  These controls catch that narrower regression.
     {
         let ctrl_stdout = r#"{"version":1,"error":{"code":"parse_error","message":"<source>:1:1","help":null,"span":null}}"#;
         let ctrl_v: serde_json::Value = serde_json::from_str(ctrl_stdout).unwrap();
@@ -1783,8 +1802,8 @@ fn stdin_source_identity_is_uniform_across_subcommands() {
 
 /// Pins the conditional guard inside `relabel_stdin_error` (output.rs).
 ///
-/// The guard — `e.source_name().is_some_and(|n| n == "<source>")` — prevents
-/// relabelling errors whose embedded source belongs to an IMPORTED file.  When
+/// The guard — `e.is_string_source()` — prevents relabelling errors whose
+/// embedded source belongs to an IMPORTED file.  When
 /// stdin imports a file that fails to parse (broken lib.mds), the `MdsError`
 /// carries the imported file's real path as its source name.  Because that path
 /// is not the sentinel `"<source>"`, the guard is false and `StdinRelabeledError`
@@ -1962,16 +1981,18 @@ fn directory_json_file_key_escapes_control_bytes_in_paths() {
 
     let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
     if fs::write(&target, dupe).is_err() {
-        // Some filesystems reject control bytes in names.  Emit an explicit skip
-        // notice so the omission is visible in test output rather than a silent
-        // early return.  Windows has no `OsStringExt` analogue, so there is no
-        // #[cfg(windows)] sibling test; the Windows coverage gap is tracked
-        // alongside the other open Windows CI items at #147/#148.
-        eprintln!(
-            "SKIP directory_json_file_key_escapes_control_bytes_in_paths: \
-             control-byte filename rejected by filesystem (PF-013 / ADR-009)"
+        // Both CI filesystems (ext4 / APFS) accept 0x07 in filenames, so
+        // this branch is unreachable in CI.  Panic rather than silently
+        // returning — cargo nextest captures stdout/stderr and only surfaces
+        // them on failure, so an eprintln!/return here would be invisible
+        // and would never reveal a genuine skip.  Windows has no
+        // `OsStringExt` analogue, so there is no #[cfg(windows)] sibling
+        // test; the Windows coverage gap is tracked at #147/#148.
+        panic!(
+            "directory_json_file_key_escapes_control_bytes_in_paths: \
+             control-byte filename rejected by filesystem — unexpected on this platform \
+             (PF-013 / ADR-009)"
         );
-        return;
     }
 
     let out = lint_path(dir.path(), &["--format", "json"]);
