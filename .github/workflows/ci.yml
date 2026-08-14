@@ -109,7 +109,7 @@ jobs:
             #   signature help pushed optimized binary to ~808K locally (wasm-opt v117
             #   bundled + release profile); +headroom for CI toolchain variance (CI uses
             #   Binaryen v129 which may differ).
-            #   PR #294 (2026-08-14, feat/lint-json-wire-contract): sort + stdin-label +
+            #   PR #294 (2026-08-14, ticket/pr1-lint-json-wire-contract): sort + stdin-label +
             #   name-span-anchor added +11,840 bytes; wave/v0.4.0-wave1 baseline 821,662,
             #   post-change 833,502 (wasm-pack 0.15.0 bundled wasm-opt, measured at HEAD
             #   after removing redundant to_canonical_json re-sort in 56424f7).
