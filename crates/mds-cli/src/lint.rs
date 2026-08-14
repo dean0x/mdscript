@@ -219,28 +219,10 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             // formats. Per-surface goldens (PF-007) each lock in their own value;
             // no differential test claims cross-surface byte-parity.
             //
-            // AD-224-3: `safe_inline` WIRE-escapes each name BEFORE it enters the
-            // warning text, because `eprint_warning` is HUMAN mode (`\n` survives).
-            // A JSON object key is never legitimately multi-line; routing through
-            // `safe_inline` closes CWE-117 on the newline + forged-line vector.
-            // Both arms escape names individually (`safe_inline(n)` per name),
-            // matching the core formatter's per-name shape.  In the plural arm the
-            // outer `safe_inline(&listed)` call is idempotent (the \uXXXX sequences
-            // produced by the inner calls are ASCII and are not re-escaped) but is
-            // required to keep the print-discipline guard satisfied (AC-224-6).
-            //
-            // AC-224-6: every value interpolated inside `eprint_warning`'s `format!`
-            // must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that
-            // `print_discipline.rs`'s trace accepts without an allowlist entry.
-            // Do NOT hoist the FINAL warning string out of `format!` into a local:
-            // the trace cannot follow an `if`/`else` initialiser, and the escape
-            // would silently stop being machine-checked (PF-004 drift).
-            // Building intermediate locals (`listed`, `recognised`) is acceptable
-            // as long as the safe_inline call on each appears as a whole-expression
-            // directly inside `format!`, as both arms below do.
-            // `mds::KNOWN_LINT_RULES` is a slice of compile-time literals and needs no
-            // escaping — it is passed through `safe_inline` anyway so the guard can see
-            // the whole `format!` is clean without an exemption.
+            // The safe_inline / print-discipline contract (AD-224-3, AC-224-6) and
+            // the --quiet gate (AD-224-5, AC-224-22) are documented at
+            // `emit_unknown_rule_warning` — the single point of definition for the
+            // emitter, shared with LintDirCtx::config_for (PF-009).
             //
             // into_core_config uses LintConfig::from_rules_checked internally,
             // which returns (config, Option<UnknownRuleNames>) in one step. The
@@ -248,44 +230,67 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             // rather than relying on a separate find_unknown_rule_names call — the
             // fix for the review finding at config.rs:104 (detection is structural,
             // not advisory).
-            //
-            // AC-224-22: suppress under --quiet (coordination point with PR4 D4).
             let (lint_config, unknown) = mds_config.lint.into_core_config();
-            if !quiet {
-                if let Some(unknown) = unknown {
-                    // AC-224-2/AC-224-3: names() is sorted; KNOWN_LINT_RULES is sorted.
-                    let names = unknown.names();
-                    let recognised = mds::KNOWN_LINT_RULES.join(", ");
-                    if let [only] = names {
-                        eprint_warning(&format!(
-                            "warning: unknown lint rule '{}' in mds.json; \
-                             recognised rules are: {}; ignoring",
-                            safe_inline(only),
-                            safe_inline(&recognised)
-                        ));
-                    } else {
-                        // AD-224-3: escape each name individually before assembly,
-                        // matching the core formatter's per-name shape. The outer
-                        // safe_inline on the assembled string is idempotent (the
-                        // \uXXXX escape sequences from the inner calls are ASCII
-                        // and are not re-escaped) but keeps the print-discipline
-                        // guard satisfied (AC-224-6: whole-expression sanitizer call).
-                        let listed = names
-                            .iter()
-                            .map(|n| format!("'{}'", safe_inline(n)))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        eprint_warning(&format!(
-                            "warning: unknown lint rules: {} in mds.json; \
-                             recognised rules are: {}; ignoring",
-                            safe_inline(&listed),
-                            safe_inline(&recognised)
-                        ));
-                    }
-                }
+            if let Some(unknown) = unknown {
+                emit_unknown_rule_warning(&unknown, quiet);
             }
             Ok(lint_config)
         }
+    }
+}
+
+/// Emit the unknown-rule warning for one config load, suppressed under `--quiet`.
+///
+/// Both `load_lint_config` (stdin/single-file path) and `LintDirCtx::config_for`
+/// (directory path) call this function. One definition prevents the duplication
+/// that already drifted once inside this PR on the CWE-117 escape path (PF-009:
+/// the same work set represented twice drifts; ADR-008: the escape contract is
+/// per-file, so every call site is equally security-relevant).
+///
+/// AD-224-3 (AC-224-6): every value interpolated inside `eprint_warning`'s
+/// `format!` must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that
+/// `print_discipline.rs`'s trace accepts without an allowlist entry. Keeping the
+/// `eprint_warning` calls here (in a named function inside `crates/mds-cli/src/`)
+/// preserves that machine-checked coverage: the scanner enumerates every `.rs`
+/// file under `src/` and checks every `eprint_warning(…)` call site it finds.
+///
+/// Intermediate locals (`listed`, `recognised`) are fine; the constraint is on
+/// the FINAL `eprint_warning` argument — it must be a whole-expression inside the
+/// enclosing `format!`, not hoisted into an `if`/`else` initialiser.
+///
+/// AD-224-5 (AC-224-22): no-op when `quiet` is true.
+fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, quiet: bool) {
+    if quiet {
+        return;
+    }
+    // AC-224-2/AC-224-3: names() is sorted; KNOWN_LINT_RULES is sorted.
+    let names = unknown.names();
+    let recognised = mds::KNOWN_LINT_RULES.join(", ");
+    if let [only] = names {
+        eprint_warning(&format!(
+            "warning: unknown lint rule '{}' in mds.json; \
+             recognised rules are: {}; ignoring",
+            safe_inline(only),
+            safe_inline(&recognised)
+        ));
+    } else {
+        // AD-224-3: escape each name individually before assembly,
+        // matching the core formatter's per-name shape. The outer
+        // safe_inline on the assembled string is idempotent (the
+        // \uXXXX escape sequences from the inner calls are ASCII
+        // and are not re-escaped) but keeps the print-discipline
+        // guard satisfied (AC-224-6: whole-expression sanitizer call).
+        let listed = names
+            .iter()
+            .map(|n| format!("'{}'", safe_inline(n)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprint_warning(&format!(
+            "warning: unknown lint rules: {} in mds.json; \
+             recognised rules are: {}; ignoring",
+            safe_inline(&listed),
+            safe_inline(&recognised)
+        ));
     }
 }
 
@@ -1055,42 +1060,51 @@ fn run_lint_file(
 /// (issue #6 / zero-warnings policy). Pattern mirrors `FileCompileCtx` / `DirWatchCtx`
 /// in watch.rs.
 ///
-/// `config_cache` maps a directory path to the resolved `LintConfig` for that directory.
+/// Two caches serve two independent fast paths into the config resolution logic.
+/// They are kept SEPARATE so the key namespaces never collide: a directory that
+/// happens to contain an `mds.json` would appear as a `base_dir` key in one run
+/// and as a `config_dir` key in another, and a single map would conflate them.
 ///
-/// Each entry is stored under TWO keys: the file's parent directory (`base_dir`) and
-/// the RESOLVED config directory (`config_dir`, the directory that contains the
-/// governing `mds.json`). Storing under both enables two independent fast paths:
+/// - **Fast path 1** (`base_dir_cache`): if a file's parent directory has already
+///   been resolved, return the cached config without re-walking the ancestor chain.
+/// - **Fast path 2** (`config_dir_cache`): if a DIFFERENT `base_dir` resolves to
+///   the SAME `mds.json`, return the cached config and skip emitting a duplicate
+///   warning (AC-224-19: "at most once per distinct config directory").
 ///
-/// - **Fast path 1** (`base_dir → config`): subsequent files in the SAME directory
-///   hit the cache without walking the ancestor chain.
-/// - **Fast path 2** (`config_dir → config`): a file in a DIFFERENT directory that
-///   resolves to the SAME `mds.json` finds the already-loaded config. Without this
-///   key, subdirectories that share a single root `mds.json` would each re-read it
-///   and emit a duplicate warning, violating AC-224-19 ("at most once per distinct
-///   config directory").
+/// NOTE: `load_config(base_dir)` is called BEFORE consulting `config_dir_cache`,
+/// so the file I/O and ancestor walk still happen for each new `base_dir` — fast
+/// path 2 prevents the DUPLICATE WARNING, not the re-parse. For a tree of N files
+/// under one directory, fast path 1 amortises the cost to a single read (the common
+/// case). The AC-224-19 threshold (200 files, one directory) is met by fast path 1.
 ///
 /// The `RefCell` provides interior mutability so per-file helpers can populate the
-/// cache through a shared `&LintDirCtx` reference.
+/// caches through a shared `&LintDirCtx` reference.
 struct LintDirCtx<'a> {
     lint_root: &'a Path,
     flags: LintFlags,
     runtime_vars: &'a Option<HashMap<String, mds::Value>>,
-    config_cache: RefCell<HashMap<PathBuf, Rc<mds::LintConfig>>>,
+    /// Fast-path-1 cache: `base_dir → config`. Every directory whose files have
+    /// been linted at least once is recorded here; a second file in the same
+    /// directory returns immediately without calling `load_config`.
+    base_dir_cache: RefCell<HashMap<PathBuf, Rc<mds::LintConfig>>>,
+    /// Fast-path-2 cache: `config_dir → config`. Keyed by the RESOLVED directory
+    /// that contains `mds.json`, not the file's parent. Prevents a duplicate
+    /// unknown-rule warning when multiple `base_dir`s share one root `mds.json`.
+    config_dir_cache: RefCell<HashMap<PathBuf, Rc<mds::LintConfig>>>,
 }
 
 impl<'a> LintDirCtx<'a> {
     /// Return the `LintConfig` for the directory `base_dir`.
     ///
-    /// The cache is keyed by both `base_dir` and the resolved config directory
-    /// (the directory containing the governing `mds.json`); see `config_cache` for
-    /// the two-key design and the AC-224-19 rationale. On config-load failure,
-    /// returns `Err(MdsError::Io{..})` so the caller can record a per-file error
-    /// and continue linting the rest of the tree.
+    /// Consults `base_dir_cache` (fast path 1) and `config_dir_cache` (fast path 2)
+    /// before loading from disk; see the struct doc for the two-cache design and the
+    /// AC-224-19 rationale. On config-load failure returns `Err(MdsError::Io{..})` so
+    /// the caller can record a per-file error and continue linting the rest of the tree.
     fn config_for(&self, base_dir: &Path) -> Result<Rc<mds::LintConfig>, MdsError> {
         // Fast path 1: base_dir was already resolved in a previous call (common case
         // for multiple files in the same directory — avoids the ancestor walk).
         {
-            let cache = self.config_cache.borrow();
+            let cache = self.base_dir_cache.borrow();
             if let Some(cfg) = cache.get(base_dir) {
                 return Ok(Rc::clone(cfg));
             }
@@ -1109,7 +1123,7 @@ impl<'a> LintDirCtx<'a> {
             None => {
                 // No mds.json found: use the default config, keyed by base_dir only.
                 let rc = Rc::new(mds::LintConfig::default());
-                self.config_cache
+                self.base_dir_cache
                     .borrow_mut()
                     .insert(base_dir.to_path_buf(), Rc::clone(&rc));
                 Ok(rc)
@@ -1118,77 +1132,42 @@ impl<'a> LintDirCtx<'a> {
                 // Fast path 2: a different base_dir already resolved to this same
                 // config directory (e.g. a/file.mds and b/file.mds both governed by
                 // root/mds.json). Return the cached config without emitting a
-                // duplicate warning (AC-224-19).
+                // duplicate warning (AC-224-19). Note: load_config above still ran
+                // — fast path 2 suppresses the duplicate WARNING, not the re-parse.
                 let maybe_cached = {
-                    let cache = self.config_cache.borrow();
+                    let cache = self.config_dir_cache.borrow();
                     cache.get(&config_dir).map(Rc::clone)
                 };
                 if let Some(rc) = maybe_cached {
                     // Alias base_dir → cached config so fast path 1 fires on the
                     // next call for a file in this same directory.
-                    self.config_cache
+                    self.base_dir_cache
                         .borrow_mut()
                         .insert(base_dir.to_path_buf(), Rc::clone(&rc));
                     return Ok(rc);
                 }
 
                 // First load for this config_dir: build the config and emit the warning.
-                //
-                // The constraints from load_lint_config's warn block apply here:
-                //
-                // AC-224-3 residual: warning text diverges from napi/WASM/Python by
-                // design (CLI adds "in mds.json" context and singular/plural forms) so
-                // the print_discipline guard can machine-check the safe_inline sites.
-                // AD-224-3: safe_inline WIRE-escapes each name before it enters the
-                // eprint_warning argument (HUMAN mode preserves \n, so routing through
-                // safe_inline closes the forged-status-line vector).  Both arms escape
-                // names individually; the outer safe_inline in the plural arm is
-                // idempotent but required for print_discipline coverage (AC-224-6).
-                // AC-224-6: every value interpolated inside eprint_warning's format!
-                // must be a WHOLE-EXPRESSION safe_inline call.  Do NOT hoist the FINAL
-                // warning string into a local — the trace cannot follow if/else
-                // initialisers and the escape would silently stop being machine-checked.
-                // Building intermediate locals (listed, recognised) is fine as long as
-                // each safe_inline call appears whole-expression inside format!.
-                // AC-224-22: suppressed under --quiet.
+                // The safe_inline / print-discipline contract (AD-224-3, AC-224-6),
+                // the --quiet gate (AD-224-5, AC-224-22), and the AC-224-3 residual
+                // (full warning text diverges from napi/WASM/Python by design) are
+                // all documented at `emit_unknown_rule_warning` — the single emitter
+                // shared with load_lint_config (PF-009, avoids drift on the CWE-117
+                // mitigation path).
                 let (lint_config, unknown) = mds_config.lint.into_core_config();
-                if !self.flags.quiet {
-                    if let Some(unknown) = unknown {
-                        // AC-224-2/AC-224-3: names() is sorted; KNOWN_LINT_RULES is sorted.
-                        let names = unknown.names();
-                        let recognised = mds::KNOWN_LINT_RULES.join(", ");
-                        if let [only] = names {
-                            eprint_warning(&format!(
-                                "warning: unknown lint rule '{}' in mds.json; \
-                                 recognised rules are: {}; ignoring",
-                                safe_inline(only),
-                                safe_inline(&recognised)
-                            ));
-                        } else {
-                            let listed = names
-                                .iter()
-                                .map(|n| format!("'{}'", safe_inline(n)))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            eprint_warning(&format!(
-                                "warning: unknown lint rules: {} in mds.json; \
-                                 recognised rules are: {}; ignoring",
-                                safe_inline(&listed),
-                                safe_inline(&recognised)
-                            ));
-                        }
-                    }
+                if let Some(unknown) = unknown {
+                    emit_unknown_rule_warning(&unknown, self.flags.quiet);
                 }
 
-                // Cache under BOTH the resolved config directory AND the file's base
-                // directory.  The config_dir key enables fast path 2 for future
-                // base_dirs that resolve to this same mds.json; the base_dir key
+                // Populate BOTH caches. `config_dir_cache` enables fast path 2 for
+                // future base_dirs that resolve to this same mds.json; `base_dir_cache`
                 // enables fast path 1 for future files in this same directory.
                 let rc = Rc::new(lint_config);
                 {
-                    let mut cache = self.config_cache.borrow_mut();
-                    cache.insert(config_dir, Rc::clone(&rc));
-                    cache.insert(base_dir.to_path_buf(), Rc::clone(&rc));
+                    let mut bd = self.base_dir_cache.borrow_mut();
+                    let mut cd = self.config_dir_cache.borrow_mut();
+                    bd.insert(base_dir.to_path_buf(), Rc::clone(&rc));
+                    cd.insert(config_dir, Rc::clone(&rc));
                 }
                 Ok(rc)
             }
@@ -1232,8 +1211,9 @@ fn run_lint_directory(
     let LintFlags { quiet, format, .. } = flags;
 
     // A6/D20: config is now discovered per-file (each file walks up to its nearest
-    // mds.json). The single root config load is removed; config_cache in LintDirCtx
-    // amortises repeated loads for files in the same directory.
+    // mds.json). The single root config load is removed; base_dir_cache and
+    // config_dir_cache in LintDirCtx amortise repeated loads for files in the same
+    // directory and across subdirectories sharing one root mds.json.
 
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
@@ -1300,7 +1280,8 @@ fn run_lint_directory(
         lint_root: dir,
         flags,
         runtime_vars: &runtime_vars,
-        config_cache: RefCell::new(HashMap::new()),
+        base_dir_cache: RefCell::new(HashMap::new()),
+        config_dir_cache: RefCell::new(HashMap::new()),
     };
 
     for file in &files {
