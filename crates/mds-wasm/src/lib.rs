@@ -450,17 +450,17 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
 /// D8 (AC-224-1): the WASM binding surfaces unknown-rule warnings by adding a
 /// `lint_warnings: string[]` field to the returned JSON object. This helper
 /// consolidates that logic across `lint` and `lintVirtual`.
-fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> serde_json::Value {
-    if !warnings.is_empty() {
+fn inject_lint_warnings(mut json: serde_json::Value, warning: Option<String>) -> serde_json::Value {
+    // `Option<String>`, not `Vec<String>`: there is exactly one warning message today
+    // (unknown rule names are reported as a single sentence), so a vector would be
+    // over-general plumbing. The JSON shape is still `string[]` — the array is built
+    // here — so adding a second warning kind later is a change to this function, not to
+    // the wire contract.
+    if let Some(w) = warning {
         if let Some(obj) = json.as_object_mut() {
             obj.insert(
                 "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
+                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
             );
         }
     }
@@ -478,8 +478,8 @@ struct ParsedLintOptions {
     opts: ParsedOptions,
     /// Per-rule severity overrides parsed from `options.rules`.
     lint_config: mds::LintConfig,
-    /// Warning messages for unknown rule names (AC-224-1 D8 channel).
-    lint_warnings: Vec<String>,
+    /// Warning message for unknown rule names, if any (AC-224-1 D8 channel).
+    lint_warnings: Option<String>,
 }
 
 /// Extract and validate the `rules` field from a lint options object.
@@ -491,10 +491,10 @@ struct ParsedLintOptions {
 ///
 /// D8 (AC-224-1): unknown rule NAMES are detected and returned as warning strings.
 /// Callers surface them via `lint_warnings` in the returned JSON object.
-fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Vec<String>), JsValue> {
+fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String>), JsValue> {
     let val = get_prop_js(obj, "rules");
     if val.is_undefined() || val.is_null() {
-        return Ok((mds::LintConfig::default(), vec![]));
+        return Ok((mds::LintConfig::default(), None));
     }
     // Deserialize the rules sub-object via serde_wasm_bindgen.
     let rules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
@@ -524,9 +524,8 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Vec<String>),
         rules.insert(key, severity);
     }
     // D8: detect unknown rule names and format warning strings.
-    let lint_warnings: Vec<String> = mds::find_unknown_rule_names(&rules)
-        .map(|u| vec![mds::format_unknown_rule_names_warning(u.names())])
-        .unwrap_or_default();
+    let lint_warnings =
+        mds::find_unknown_rule_names(&rules).map(|u| mds::format_unknown_rule_names_warning(&u));
     Ok((mds::LintConfig::from_rules(rules), lint_warnings))
 }
 
@@ -541,7 +540,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
         return Ok(ParsedLintOptions {
             opts: ParsedOptions::default(),
             lint_config: mds::LintConfig::default(),
-            lint_warnings: vec![],
+            lint_warnings: None,
         });
     }
 
@@ -619,7 +618,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
         return Ok(ParsedLintOptions {
             opts: ParsedOptions::default(),
             lint_config: mds::LintConfig::default(),
-            lint_warnings: vec![],
+            lint_warnings: None,
         });
     }
 

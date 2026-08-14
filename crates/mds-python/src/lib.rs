@@ -1269,17 +1269,17 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
 /// D8 (AC-224-1): the Python binding surfaces unknown-rule warnings by adding a
 /// `lint_warnings` field to the `LintResult` JSON. This helper consolidates that
 /// logic across `lint`, `lint_file`, and `lint_virtual`.
-fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> serde_json::Value {
-    if !warnings.is_empty() {
+fn inject_lint_warnings(mut json: serde_json::Value, warning: Option<String>) -> serde_json::Value {
+    // `Option<String>`, not `Vec<String>`: there is exactly one warning message today
+    // (unknown rule names are reported as a single sentence), so a vector would be
+    // over-general plumbing. The JSON shape is still `string[]` — the array is built
+    // here — so adding a second warning kind later is a change to this function, not to
+    // the wire contract.
+    if let Some(w) = warning {
         if let Some(obj) = json.as_object_mut() {
             obj.insert(
                 "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
+                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
             );
         }
     }
@@ -1298,12 +1298,12 @@ fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> s
 fn extract_rules(
     py: Python<'_>,
     rules: Option<&Bound<'_, PyAny>>,
-) -> PyResult<(mds::LintConfig, Vec<String>)> {
+) -> PyResult<(mds::LintConfig, Option<String>)> {
     let Some(obj) = rules else {
-        return Ok((mds::LintConfig::default(), vec![]));
+        return Ok((mds::LintConfig::default(), None));
     };
     if obj.is_none() {
-        return Ok((mds::LintConfig::default(), vec![]));
+        return Ok((mds::LintConfig::default(), None));
     }
     let json: serde_json::Value =
         depythonize(obj).map_err(|e| options_error(py, &format!("invalid rules: {e}")))?;
@@ -1340,9 +1340,8 @@ fn extract_rules(
         rules_map.insert(key, severity);
     }
     // D8: detect unknown rule names and format warning strings.
-    let lint_warnings: Vec<String> = mds::find_unknown_rule_names(&rules_map)
-        .map(|u| vec![mds::format_unknown_rule_names_warning(u.names())])
-        .unwrap_or_default();
+    let lint_warnings = mds::find_unknown_rule_names(&rules_map)
+        .map(|u| mds::format_unknown_rule_names_warning(&u));
     Ok((mds::LintConfig::from_rules(rules_map), lint_warnings))
 }
 

@@ -43,7 +43,11 @@ pub struct UnknownRuleNames {
 
 impl UnknownRuleNames {
     fn new(mut names: Vec<String>) -> Self {
-        names.sort();
+        // `sort_unstable` rather than `sort`: the names come from `HashMap` keys and are
+        // therefore distinct, so stability is unobservable — and the stable merge sort
+        // monomorphised for `String` is measurably larger in the WASM binary, which runs
+        // against a hard size guard (AC-224-18).
+        names.sort_unstable();
         UnknownRuleNames { names }
     }
 
@@ -93,44 +97,68 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
     }
 }
 
-/// Format the warning message for one or more unknown lint rule names.
+/// Format the warning message for the unknown lint rule names in `unknown`.
 ///
 /// AD-224-4: both the offending-name list and the recognised-rules list are
-/// sorted lexicographically in the output, ensuring deterministic output across
-/// runs and surfaces regardless of HashMap iteration order. The structural
-/// precondition (at least one unknown name) is guaranteed by the `UnknownRuleNames`
-/// type — only constructible with a non-empty list.
+/// sorted lexicographically in the output, so the message is byte-identical
+/// across runs and surfaces regardless of `HashMap` iteration order.
 ///
-/// Called by the bindings (napi/WASM/Python) to produce their `lint_warnings` strings.
-/// The CLI does not call this function — it applies `safe_inline` to each name and
-/// uses a context-specific format (adding "in mds.json") before passing to `eprint_warning`.
+/// The empty-input precondition is **structural, not asserted**: the only way to
+/// obtain an [`UnknownRuleNames`] is [`find_unknown_rule_names`], which returns
+/// `None` rather than an empty report. This function therefore cannot panic and
+/// has no failure mode (PF-005 — a `debug_assert!` here would be a no-op in
+/// release, and a release `assert!` would be a panic in a library).
+///
+/// Each name is WIRE-escaped with [`sanitize_control_chars_wire`] before it is
+/// interpolated (spec §7.5 per-field rule: a rule name is a single-line
+/// identifier, never prose). A rule name is an arbitrary caller-supplied map key
+/// and JSON `\uXXXX` escapes decode to real control bytes, so the escape is what
+/// makes the returned string safe for a consumer to render (applies ADR-008,
+/// avoids PF-014 — the input is sanitized, not the rendered output). The
+/// recognised-rules list needs no escaping: it is a slice of compile-time string
+/// literals.
+///
+/// Called by the bindings (napi/WASM/Python) to build their `lint_warnings`
+/// strings. The CLI does **not** call it — it applies `safe_inline` per name and
+/// uses a context-specific wording (`… in mds.json`) so the print-discipline
+/// guard can machine-check the escape at the call site.
 ///
 /// Produces one of:
 /// - `"unknown lint rule 'NAME'; recognised rules are: ...; ignoring"`
 /// - `"unknown lint rules: 'A', 'B'; recognised rules are: ...; ignoring"`
 #[must_use]
-pub fn format_unknown_rule_names_warning(names: &[String]) -> String {
-    // Structural precondition: names must be non-empty.
-    // UnknownRuleNames guarantees this, but callers passing &[String] directly
-    // should ensure the same.
-    assert!(
-        !names.is_empty(),
-        "format_unknown_rule_names_warning called with empty names"
-    );
-    let recognised = KNOWN_LINT_RULES.join(", ");
-    if names.len() == 1 {
-        format!(
-            "unknown lint rule '{}'; recognised rules are: {}; ignoring",
-            names[0], recognised
-        )
+pub fn format_unknown_rule_names_warning(unknown: &UnknownRuleNames) -> String {
+    // Assembled with `push_str` rather than `format!` + `join`. This function is
+    // reachable from the WASM binary, which runs against a hard 850,000-byte guard
+    // (AC-224-18); `[&str]::join` and `Vec<String>::join` each monomorphise into
+    // kilobytes there, and nothing else in the WASM surface pulls them in. The output
+    // is byte-identical to the `format!` form.
+    let names = unknown.names();
+    let mut out = String::with_capacity(256);
+    if let [only] = names {
+        out.push_str("unknown lint rule '");
+        out.push_str(&super::sanitize_control_chars_wire(only));
+        out.push('\'');
     } else {
-        let quoted: Vec<String> = names.iter().map(|n| format!("'{n}'")).collect();
-        format!(
-            "unknown lint rules: {}; recognised rules are: {}; ignoring",
-            quoted.join(", "),
-            recognised
-        )
+        out.push_str("unknown lint rules: ");
+        for (i, name) in names.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push('\'');
+            out.push_str(&super::sanitize_control_chars_wire(name));
+            out.push('\'');
+        }
     }
+    out.push_str("; recognised rules are: ");
+    for (i, rule) in KNOWN_LINT_RULES.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(rule);
+    }
+    out.push_str("; ignoring");
+    out
 }
 
 /// Per-rule severity override configuration.
@@ -197,5 +225,77 @@ impl LintConfig {
     /// back to the rule's built-in default severity.
     pub fn severity_for(&self, rule: &str) -> Option<&Severity> {
         self.rules.get(rule)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unknowns(names: &[&str]) -> UnknownRuleNames {
+        let map: HashMap<String, Severity> = names
+            .iter()
+            .map(|n| ((*n).to_string(), Severity::Warn))
+            .collect();
+        find_unknown_rule_names(&map).expect("names must be unknown")
+    }
+
+    /// AC-224-2 / AC-224-3: singular form names the rule and every recognised rule.
+    #[test]
+    fn warning_singular_names_rule_and_full_registry() {
+        let msg = format_unknown_rule_names_warning(&unknowns(&["no-such-rule"]));
+        assert_eq!(
+            msg,
+            format!(
+                "unknown lint rule 'no-such-rule'; recognised rules are: {}; ignoring",
+                KNOWN_LINT_RULES.join(", ")
+            )
+        );
+        for rule in KNOWN_LINT_RULES {
+            assert!(msg.contains(rule), "message must list {rule}; got: {msg}");
+        }
+    }
+
+    /// AC-224-3: multiple offenders are listed in sorted order, not map order.
+    #[test]
+    fn warning_plural_sorts_offenders() {
+        // Inserted zzz-first; the output must still be aaa-first.
+        let msg = format_unknown_rule_names_warning(&unknowns(&["zzz-bad", "aaa-bad", "mmm-bad"]));
+        assert!(
+            msg.starts_with("unknown lint rules: 'aaa-bad', 'mmm-bad', 'zzz-bad'; "),
+            "offenders must be sorted lexicographically; got: {msg}"
+        );
+    }
+
+    /// AC-224-4 / ADR-008: a hostile rule name is WIRE-escaped by the formatter, so
+    /// the string handed to a binding consumer carries no raw control byte.
+    ///
+    /// PF-018: the hostile characters are built from Rust `\u{..}` escapes at
+    /// runtime — never authored as literal bytes in this file.
+    #[test]
+    fn warning_wire_escapes_hostile_rule_name() {
+        let hostile = format!(
+            "{}[31mEVIL{}X\nClean: totally-real.mds",
+            '\u{1b}', '\u{202e}'
+        );
+        let msg = format_unknown_rule_names_warning(&unknowns(&[&hostile]));
+
+        // Negative: no raw control byte survives.
+        assert!(
+            !msg.chars().any(|c| c.is_control()),
+            "no raw control character may survive escaping; got: {msg:?}"
+        );
+        // Positive control (PF-013): the escaped literals are actually present, so the
+        // negative assertion above cannot pass because the name never reached the message.
+        for escaped in ["\\u001B", "\\u202E", "\\u000A"] {
+            assert!(
+                msg.contains(escaped),
+                "{escaped} must appear in the escaped warning; got: {msg}"
+            );
+        }
+        assert!(
+            msg.contains("EVIL"),
+            "non-vacuity: the rule name must reach the message; got: {msg}"
+        );
     }
 }

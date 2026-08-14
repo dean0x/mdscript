@@ -1256,10 +1256,20 @@ fn wasm_lint_continues_with_unknown_rule_name() {
     }));
     let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-4: lint must succeed");
 
-    // files[] must be present and be an array.
+    // files[] must be present and be a genuine JS array. `js_sys::Array::from` coerces
+    // almost anything, so asserting on its length would pass vacuously — check
+    // `Array::is_array` on the raw value instead.
     let files = get_prop(&result, "files");
-    let files_arr = js_sys::Array::from(&files);
-    let _ = files_arr.length(); // just confirm it's array-like; no panic = ok
+    assert!(
+        js_sys::Array::is_array(&files),
+        "W-WARN-4: files must be a JS array even when the rule name is unknown"
+    );
+    assert_eq!(
+        js_sys::Array::from(&files).length(),
+        0,
+        "W-WARN-4: a clean source yields no file entries; the unknown rule name must not \
+         add one"
+    );
 
     // truncated must be present and false.
     let truncated = get_prop(&result, "truncated").as_bool().unwrap_or(true);

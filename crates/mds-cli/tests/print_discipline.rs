@@ -385,22 +385,6 @@ const ALLOWED_UNTRACED_HELPER_ARGS: &[(&str, &str, &str)] = &[
          guard checks it. Two entries — this one and `build.rs`'s — cover all five live \
          bare-`w` sites, because the list is keyed by (file, expression).",
     ),
-    (
-        "lint.rs",
-        "&warning",
-        "The `warning` variable is pre-assembled in `load_lint_config` using \
-         `safe_inline(name)` on every unknown rule name (WIRE per-field escaping of \
-         hostile characters from `mds.json`) and `mds::KNOWN_LINT_RULES.join(\", \")` \
-         on compile-time-constant string literals from the registry. No user-controlled \
-         content enters `warning` unescaped. The lexical guard cannot trace across the \
-         `format!` call that assembles `warning` from those pre-escaped pieces, so this \
-         entry is the human review anchor for WIRE-safety-at-construction. End-to-end \
-         verified by T-ESC-RULE-1 in `security.rs`, which proves that a hostile \
-         `mds.json` rule name (C0, bidi, and embedded newlines) reaches stderr with all \
-         control bytes WIRE-escaped and no forged status line possible. The recognised-rules \
-         list (`mds::KNOWN_LINT_RULES`) is a `&[&'static str]` slice of compiler-constant \
-         literals with no user-derived content — no escaping is needed or applied there.",
-    ),
 ];
 
 // ── The guard ─────────────────────────────────────────────────────────────────

@@ -295,7 +295,12 @@ export function getBackend(): BackendType {
   return assertReady().getBackend();
 }
 
-export { isMdsError } from './types.js';
+// `LINT_RULE_NAMES` is exported here, not only from `index.ts`: the package
+// `exports` map resolves `@mdscript/mds` to `dist/node.js` (Node) or
+// `dist/browser.js`, and never to `dist/index.js` — a value re-exported only
+// from `index.ts` is unreachable for consumers. The browser entry gains it with
+// the browser lint surface; today it has no lint API to configure.
+export { isMdsError, LINT_RULE_NAMES } from './types.js';
 export type {
   BackendType,
   CheckOptions,
@@ -309,6 +314,7 @@ export type {
   LintFileReport,
   LintOptions,
   LintResult,
+  LintRuleName,
   LintSpan,
   RuleSeverity,
   MarkdownResult,

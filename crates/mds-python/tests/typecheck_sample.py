@@ -96,6 +96,10 @@ def lint_source(source: str) -> int:
 def lint_typed_access(source: str) -> list[str]:
     """Demonstrate fully-typed attribute access on lint results (B6/F10)."""
     result: LintResult = mdscript.lint(source)
+    # AC-224-1 / D8: the unknown-rule warning channel is typed as list[str], so a
+    # consumer can read it without a cast or a `type: ignore`.
+    lint_warnings: list[str] = result.lint_warnings
+    _ = lint_warnings
     rules: list[str] = []
     report: LintFileReport
     for report in result.files:

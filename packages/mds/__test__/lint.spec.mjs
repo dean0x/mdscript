@@ -15,7 +15,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { lint, lintFile, lintVirtual, isMdsError, init } from '../dist/node.js';
+import { lint, lintFile, lintVirtual, isMdsError, init, LINT_RULE_NAMES } from '../dist/node.js';
 import { assertResultShape } from '../dist/backend/contract.js';
 import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 
@@ -615,6 +615,132 @@ describe('lint canonical JSON goldens', () => {
       JSON.stringify(result),
       CLEAN_GOLDEN,
       `lintVirtual silenced golden mismatch: got ${JSON.stringify(result)}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-224-1 / AC-224-8 (D8): unknown lint rule names on the universal surface.
+//
+// The universal package is the fifth surface AC-224-1 enumerates, and PF-007 says
+// a per-surface assertion elsewhere proves nothing here: napi's spec proves napi,
+// web.rs proves WASM. These tests assert the contract as `@mdscript/mds` exposes
+// it, on the default backend AND on a directly-constructed WASM backend, so the
+// claim is not silently limited to whichever backend init() happens to pick.
+//
+// Contract: an unknown rule name never throws. It surfaces in
+// `result.lint_warnings`, and the field is ABSENT when every name is recognised.
+// ---------------------------------------------------------------------------
+
+describe('unknown lint rule names (AC-224-1 / D8)', () => {
+  before(() => init());
+
+  /** Assert one lint result carries a warning naming `ruleName`. */
+  function assertWarnsAbout(result, ruleName, label) {
+    assert.equal(result.version, 1, `${label}: version must be 1`);
+    assert.ok(
+      Array.isArray(result.lint_warnings),
+      `${label}: lint_warnings must be an array; got ${JSON.stringify(result.lint_warnings)}`,
+    );
+    assert.ok(result.lint_warnings.length > 0, `${label}: lint_warnings must be non-empty`);
+    const joined = result.lint_warnings.join(' ');
+    assert.ok(
+      joined.includes(ruleName),
+      `${label}: lint_warnings must name ${ruleName}; got: ${joined}`,
+    );
+    assert.ok(
+      joined.includes('recognised rules are'),
+      `${label}: lint_warnings must list the recognised rules; got: ${joined}`,
+    );
+  }
+
+  test('U-L-WARN-1: lint() warns and continues on an unknown rule name', () => {
+    const result = lint(UNUSED_SOURCE, { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assertWarnsAbout(result, 'no-such-rule-xyzzy', 'U-L-WARN-1');
+    // Lint CONTINUES: the real finding is still reported, unchanged.
+    assert.doesNotThrow(() => assertResultShape(result, 'lint'));
+    const rules = result.files.flatMap((f) => f.diagnostics).map((d) => d.rule);
+    assert.ok(
+      rules.includes('unused-variable'),
+      `U-L-WARN-1: linting must continue and still report findings; got: ${JSON.stringify(rules)}`,
+    );
+  });
+
+  test('U-L-WARN-2: lintVirtual() warns on an unknown rule name', () => {
+    const result = lintVirtual(
+      { 'main.mds': CLEAN_SOURCE },
+      'main.mds',
+      { rules: { 'no-such-rule-xyzzy': 'error' } },
+    );
+    assertWarnsAbout(result, 'no-such-rule-xyzzy', 'U-L-WARN-2');
+  });
+
+  test('U-L-WARN-3: lintFile() warns on an unknown rule name', async () => {
+    const result = await lintFile(LINT_WARN_MDS, { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assertWarnsAbout(result, 'no-such-rule-xyzzy', 'U-L-WARN-3');
+  });
+
+  // Paired negative arm (PF-013 / ADR-009): the positive arms above only prove the
+  // field can appear. Without this, an implementation that always populated
+  // lint_warnings would pass every assertion above.
+  test('U-L-WARN-4: every recognised rule name is accepted with no lint_warnings', () => {
+    assert.equal(LINT_RULE_NAMES.length, 10, 'LINT_RULE_NAMES must have exactly 10 entries');
+    for (const name of LINT_RULE_NAMES) {
+      const result = lint(CLEAN_SOURCE, { rules: { [name]: 'off' } });
+      assert.equal(
+        result.lint_warnings,
+        undefined,
+        `U-L-WARN-4: ${name} is a recognised rule — lint_warnings must be absent; ` +
+          `got: ${JSON.stringify(result.lint_warnings)}`,
+      );
+    }
+    // Empty and absent rules maps behave identically to a recognised-only map.
+    assert.equal(lint(CLEAN_SOURCE, { rules: {} }).lint_warnings, undefined);
+    assert.equal(lint(CLEAN_SOURCE).lint_warnings, undefined);
+  });
+
+  test('U-L-WARN-5: an unknown rule name never throws (contrast: unknown severity does)', () => {
+    assert.doesNotThrow(
+      () => lint(CLEAN_SOURCE, { rules: { 'no-such-rule-xyzzy': 'warn' } }),
+      'U-L-WARN-5: an unknown rule NAME must not throw',
+    );
+    // The asymmetry is deliberate and must stay: unknown severity VALUES still throw.
+    assert.throws(
+      () => lint(CLEAN_SOURCE, { rules: { 'unused-variable': 'verbose' } }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected MdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options', `got code: ${err.code}`);
+        return true;
+      },
+      'U-L-WARN-5: an unknown severity VALUE must still throw mds::invalid_options',
+    );
+  });
+
+  // PF-007: init() prefers native wherever the napi addon resolves, so every test
+  // above may have exercised only one backend. Force the WASM backend directly so
+  // the universal contract is proven on both, mirroring U-L12's approach.
+  test('U-L-WARN-6: the same contract holds on a directly-constructed WASM backend', async () => {
+    let wasmBackend;
+    try {
+      const wasmMod = await initWasmNode();
+      wasmBackend = createWasmBackend(wasmMod);
+    } catch (initErr) {
+      if (process.env.CI) {
+        throw new Error(
+          'U-L-WARN-6: WASM backend is required in CI for AC-224-1 universal/WASM coverage. ' +
+            `Caused by: ${initErr.message}`,
+        );
+      }
+      console.warn('U-L-WARN-6: skipping WASM surface -- mds-wasm module not built');
+      return;
+    }
+    const warned = wasmBackend.lint(CLEAN_SOURCE, { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assertWarnsAbout(warned, 'no-such-rule-xyzzy', 'U-L-WARN-6');
+    const clean = wasmBackend.lint(CLEAN_SOURCE, { rules: { 'unused-variable': 'off' } });
+    assert.equal(
+      clean.lint_warnings,
+      undefined,
+      `U-L-WARN-6: recognised rules must produce no lint_warnings; got: ${JSON.stringify(clean.lint_warnings)}`,
     );
   });
 });

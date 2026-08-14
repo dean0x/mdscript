@@ -1215,7 +1215,7 @@ Place `mds.json` in the project root (or any ancestor directory). The compiler w
 | Field | Type | Description |
 |-------|------|-------------|
 | `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
-| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. Unknown rule names are warn-and-ignored (forward compat). |
+| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). On the CLI the warning goes to stderr and is suppressed by `--quiet`; on the `lint` API surfaces it is returned in `lint_warnings`. |
 
 Maximum config file size: 1 MB.
 

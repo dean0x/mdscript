@@ -788,17 +788,17 @@ pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<
 /// D8 (AC-224-1): the napi binding surfaces unknown-rule warnings by adding a
 /// `lint_warnings: string[]` field to the returned JSON object. This helper
 /// consolidates that logic across `lint`, `lintFile`, and `lintVirtual`.
-fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> serde_json::Value {
-    if !warnings.is_empty() {
+fn inject_lint_warnings(mut json: serde_json::Value, warning: Option<String>) -> serde_json::Value {
+    // `Option<String>`, not `Vec<String>`: there is exactly one warning message today
+    // (unknown rule names are reported as a single sentence), so a vector would be
+    // over-general plumbing. The JSON shape is still `string[]` — the array is built
+    // here — so adding a second warning kind later is a change to this function, not to
+    // the wire contract.
+    if let Some(w) = warning {
         if let Some(obj) = json.as_object_mut() {
             obj.insert(
                 "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
+                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
             );
         }
     }
@@ -814,14 +814,17 @@ fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> s
 /// so callers can surface them in the `lint_warnings` field of the returned JSON object.
 /// This is the binding warning channel: napi `lint`/`lintFile`/`lintVirtual` add
 /// `lint_warnings: string[]` to their return value when unknown rule names are present.
-fn extract_rules_direct(env: &Env, obj: &Object) -> napi::Result<(mds::LintConfig, Vec<String>)> {
+fn extract_rules_direct(
+    env: &Env,
+    obj: &Object,
+) -> napi::Result<(mds::LintConfig, Option<String>)> {
     if !obj.has_named_property("rules")? {
-        return Ok((mds::LintConfig::default(), vec![]));
+        return Ok((mds::LintConfig::default(), None));
     }
     let val: Unknown = obj.get_named_property_unchecked("rules")?;
     let vt = val.get_type()?;
     match vt {
-        ValueType::Undefined | ValueType::Null => Ok((mds::LintConfig::default(), vec![])),
+        ValueType::Undefined | ValueType::Null => Ok((mds::LintConfig::default(), None)),
         ValueType::Object => {
             // Deserialize the rules sub-object; js arrays also satisfy Object so
             // we guard against that in the JSON shape check below.
@@ -860,9 +863,8 @@ fn extract_rules_direct(env: &Env, obj: &Object) -> napi::Result<(mds::LintConfi
                 rules.insert(key, severity);
             }
             // D8: detect unknown rule names before consuming the HashMap.
-            let lint_warnings: Vec<String> = mds::find_unknown_rule_names(&rules)
-                .map(|u| vec![mds::format_unknown_rule_names_warning(u.names())])
-                .unwrap_or_default();
+            let lint_warnings = mds::find_unknown_rule_names(&rules)
+                .map(|u| mds::format_unknown_rule_names_warning(&u));
             Ok((mds::LintConfig::from_rules(rules), lint_warnings))
         }
         other => Err(throw_options_error(
@@ -886,12 +888,12 @@ type LintOpts = (
     Option<PathBuf>,
     Option<HashMap<String, Value>>,
     mds::LintConfig,
-    Vec<String>,
+    Option<String>,
 );
 
 fn parse_lint_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintOpts> {
     let Some(opts_obj) = opts else {
-        return Ok((None, None, mds::LintConfig::default(), vec![]));
+        return Ok((None, None, mds::LintConfig::default(), None));
     };
 
     reject_unknown_napi_keys(env, &opts_obj, &["basePath", "vars", "rules"])?;
@@ -906,11 +908,15 @@ fn parse_lint_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintOpts> {
 ///
 /// Valid keys: `vars`, `rules`. `basePath` is not accepted (derived from file path).
 /// Returns `(vars, lint_config, lint_warnings)`.
-type LintFileOpts = (Option<HashMap<String, Value>>, mds::LintConfig, Vec<String>);
+type LintFileOpts = (
+    Option<HashMap<String, Value>>,
+    mds::LintConfig,
+    Option<String>,
+);
 
 fn parse_lint_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFileOpts> {
     let Some(opts_obj) = opts else {
-        return Ok((None, mds::LintConfig::default(), vec![]));
+        return Ok((None, mds::LintConfig::default(), None));
     };
 
     if opts_obj.has_named_property("basePath")? {
@@ -935,7 +941,7 @@ fn parse_lint_file_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFil
 /// against the module map, not the filesystem.
 fn parse_lint_virtual_opts(env: &Env, opts: Option<Object>) -> napi::Result<LintFileOpts> {
     let Some(opts_obj) = opts else {
-        return Ok((None, mds::LintConfig::default(), vec![]));
+        return Ok((None, mds::LintConfig::default(), None));
     };
 
     if opts_obj.has_named_property("basePath")? {

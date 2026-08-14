@@ -197,34 +197,43 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             // warning text, because `eprint_warning` is HUMAN mode (`\n` survives).
             // A JSON object key is never legitimately multi-line; routing through
             // `safe_inline` closes CWE-117 on the newline + forged-line vector.
-            // This keeps the value inside `eprint_warning`'s arguments, which
-            // `print_discipline.rs:27-60` already machine-checks (AC-224-6).
+            //
+            // AC-224-6: every interpolation below is a WHOLE-EXPRESSION `safe_inline`
+            // call sitting directly inside `eprint_warning`'s `format!`, which is the
+            // one shape `print_discipline.rs`'s trace accepts without an allowlist
+            // entry. Do not hoist the assembled message into a local: the trace cannot
+            // follow an `if`/`else` initialiser, and the escape would silently stop
+            // being machine-checked (that is the PF-004 drift this guard exists for).
+            // `mds::KNOWN_LINT_RULES` is a slice of compile-time literals and needs no
+            // escaping — it is passed through `safe_inline` anyway so the guard can see
+            // the whole `format!` is clean without an exemption.
             //
             // AC-224-22: suppress under --quiet (coordination point with PR4 D4).
             if !quiet {
-                if let Some(ref unknown) = mds::find_unknown_rule_names(&mds_config.lint.rules) {
-                    // Escape each name via safe_inline (WIRE per-field rule, spec §7.5).
-                    let escaped: Vec<String> = unknown.names().iter().map(safe_inline).collect();
-                    // AC-224-2: include all recognised rule names (KNOWN_LINT_RULES is
-                    // sorted alphabetically — AC-224-3 determinism guaranteed).
+                if let Some(unknown) = mds::find_unknown_rule_names(&mds_config.lint.rules) {
+                    // AC-224-2/AC-224-3: names() is sorted; KNOWN_LINT_RULES is sorted.
+                    let names = unknown.names();
                     let recognised = mds::KNOWN_LINT_RULES.join(", ");
-                    let warning = if escaped.len() == 1 {
-                        format!(
+                    if let [only] = names {
+                        eprint_warning(&format!(
                             "warning: unknown lint rule '{}' in mds.json; \
                              recognised rules are: {}; ignoring",
-                            escaped[0], recognised
-                        )
+                            safe_inline(only),
+                            safe_inline(&recognised)
+                        ));
                     } else {
-                        let quoted: Vec<String> =
-                            escaped.iter().map(|n| format!("'{n}'")).collect();
-                        format!(
+                        let listed = names
+                            .iter()
+                            .map(|n| format!("'{n}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        eprint_warning(&format!(
                             "warning: unknown lint rules in mds.json: {}; \
                              recognised rules are: {}; ignoring",
-                            quoted.join(", "),
-                            recognised
-                        )
-                    };
-                    eprint_warning(&warning);
+                            safe_inline(&listed),
+                            safe_inline(&recognised)
+                        ));
+                    }
                 }
             }
             Ok(mds_config.lint.into_core_config())

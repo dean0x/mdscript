@@ -181,49 +181,6 @@ name rather than the `@import` keyword, and `span.length` is the name's length
 instead of a constant 7. Alias imports (`@import "path" as alias`) are unchanged —
 their span still covers the `@import` keyword.
 
-#### Unknown lint rule names now emit a warning instead of being silently ignored (#224)
-
-Previously, an unrecognised rule name in `mds.json`'s `lint.rules` object (or the
-`rules` option on the binding surfaces) was silently accepted — the rule had no effect
-and there was no signal that a key was misconfigured.
-
-**New behaviour:** an unknown rule name emits a warning and lint continues
-(exit codes are unchanged). This surfaces typos and forward-compat configs without
-hard-failing on rule names added in a newer binary.
-
-- **CLI**: the warning goes to **stderr** (never stdout), so `--format json` output
-  remains valid parseable JSON. `--quiet` suppresses the warning.
-- **napi / WASM / Python binding surfaces**: the warning is returned in
-  `lint_warnings: string[]` (absent when empty) on the returned lint result object.
-
-Exact format: `warning: unknown lint rule 'NAME' in mds.json; recognised rules are: …; ignoring`
-
-Unknown **severity values** (not rule names) continue to hard-fail with
-`mds::invalid_options` — the asymmetry is intentional (severities are a closed set;
-rule names grow with each release).
-
-#### New exports: `LINT_RULE_NAMES`, `LintRuleName` (TypeScript / `@mdscript/mds`)
-
-The canonical list of recognised lint rule names is now exported as:
-- `LINT_RULE_NAMES: readonly LintRuleName[]` — the alphabetically sorted array
-- `LintRuleName` — a string union type of all 10 rule name literals
-
-`LintResult.lint_warnings?: string[]` is added to the TypeScript interface.
-
-#### New core API: `KNOWN_LINT_RULES`, `find_unknown_rule_names`, `UnknownRuleNames`, `format_unknown_rule_names_warning`
-
-`mds-core` now exports:
-- `KNOWN_LINT_RULES: &[&str]` — the canonical slice of rule names
-- `find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<UnknownRuleNames>` —
-  returns `None` when all names are known, `Some` with a sorted `UnknownRuleNames` when not
-- `format_unknown_rule_names_warning(names: &[String]) -> String` — formats the warning string
-- `UnknownRuleNames` — a `#[non_exhaustive]` struct with a `names() -> &[String]` accessor
-
-#### New `LintResult.lint_warnings` getter on Python `LintResult`
-
-`mds-python`'s `LintResult` gains a `.lint_warnings` property returning `list[str]`
-(empty when no warnings occurred). Existing callers are not affected.
-
 #### New `fix_edits` field on `LintDiagnostic`
 
 `LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;
@@ -572,6 +529,22 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
 
 ### Added
 
+- **Lint rule-name registry, exposed on every surface (#224).** The recognised rule
+  names now have one source of truth, derived from each rule module's own name constant.
+  - `mds-core`: `KNOWN_LINT_RULES: &[&str]` (the canonical slice),
+    `find_unknown_rule_names(&HashMap<String, Severity>) -> Option<UnknownRuleNames>`
+    (`None` when every name is recognised), `UnknownRuleNames` (a `#[non_exhaustive]`
+    report with a `names() -> &[String]` accessor, always non-empty and sorted), and
+    `format_unknown_rule_names_warning(&UnknownRuleNames) -> String`. The formatter takes
+    the report type rather than a slice so its non-empty precondition is structural — it
+    has no panic path — and it WIRE-escapes each name before interpolating it.
+  - `@mdscript/mds` (Node entry point): `LINT_RULE_NAMES: readonly LintRuleName[]` and
+    the `LintRuleName` string-union type. The browser entry point does not export them
+    yet — it has no lint API to configure.
+  - TypeScript `LintResult` gains `lint_warnings?: string[]`.
+  - Python `LintResult` gains a `.lint_warnings` property returning `list[str]` (empty
+    when there is nothing to report); the type stub is updated to match.
+
 - **`--set-string KEY=VALUE`** CLI flag for `mds build`, `mds check`, and `mds watch`.
   Sets a variable as a string without type coercion — useful when a value is
   numeric-looking but must stay a string (e.g. `mds build t.mds --set-string id=007`).
@@ -797,6 +770,25 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   tool/permission errors.
 
 ### Changed
+
+- **Unknown lint rule names now emit a warning instead of being silently ignored
+  (#224).** Previously an unrecognised rule name in `mds.json`'s `lint.rules` object
+  (or in the `rules` option on a binding surface) was silently accepted: the rule had
+  no effect and nothing signalled that the key was misconfigured. Now the unknown name
+  is reported and linting continues — **exit codes are unchanged**, the JSON envelope on
+  stdout is unchanged, and the rule is still not enforced (it does not exist). This
+  surfaces typos without hard-failing a config that names a rule added in a newer
+  release.
+  - **CLI**: the warning goes to **stderr**, never stdout, so `mds lint --format json`
+    still writes a single valid JSON document. `--quiet` suppresses it. Format:
+    `warning: unknown lint rule 'NAME' in mds.json; recognised rules are: …; ignoring`.
+  - **napi / WASM / Python**: the warning is returned as `lint_warnings: string[]` on
+    the lint result, a key that is absent when there is nothing to report.
+  - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`, `check`,
+    `fmt` and `watch` load the same `mds.json` and are byte-unchanged — an accepted
+    asymmetry, not an oversight.
+  - Unknown **severity values** continue to hard-fail with `mds::invalid_options`. The
+    asymmetry is deliberate: severities are a closed set, rule names grow every release.
 
 - **napi and Python `compileFile` / `compile_file` now emit root-relative
   `sources[]`** in Source Map v3 output. Previously these surfaces emitted the

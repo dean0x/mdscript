@@ -171,7 +171,7 @@ export type RuleSeverity = 'error' | 'warn' | 'info' | 'off';
  *
  * Passing a key outside this set in `LintOptions.rules` emits a warning (see
  * {@link LintResult.lint_warnings}) and lint continues — unknown names are
- * silently ignored by the engine after the warning is surfaced to the caller.
+ * not enforced by the engine (the rule does not exist), but the caller is told.
  */
 export type LintRuleName =
   | 'duplicate-export'
@@ -245,7 +245,7 @@ export interface LintOptions {
    *
    * Keys should be {@link LintRuleName} values. An unrecognised key emits a
    * warning in {@link LintResult.lint_warnings} and lint continues — the
-   * unknown rule is silently ignored by the engine. `Record<string, …>` is
+   * unknown rule is not enforced by the engine. `Record<string, …>` is
    * accepted for forward compatibility with future rule names.
    */
   rules?: Record<string, RuleSeverity>;
@@ -266,7 +266,7 @@ export interface LintFileOptions {
    *
    * Keys should be {@link LintRuleName} values. An unrecognised key emits a
    * warning in {@link LintResult.lint_warnings} and lint continues — the
-   * unknown rule is silently ignored by the engine. `Record<string, …>` is
+   * unknown rule is not enforced by the engine. `Record<string, …>` is
    * accepted for forward compatibility with future rule names.
    */
   rules?: Record<string, RuleSeverity>;
