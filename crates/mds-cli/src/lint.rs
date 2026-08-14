@@ -197,39 +197,17 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     match config_opt {
         None => Ok(mds::LintConfig::default()),
         Some((mds_config, _config_dir)) => {
-            // AC-224-3 residual (R6/PF-007): the full warning text DIVERGES between
-            // the CLI and binding surfaces by design.
+            // AC-224-3 residual (PF-007): the CLI warning text diverges from the binding
+            // surfaces by design — it adds "warning:" prefix and "in mds.json" context;
+            // the bindings use `mds::format_unknown_rule_names_warning`. The recognised-rules
+            // list and its sort order are shared via `mds::KNOWN_LINT_RULES` (AC-224-3
+            // guarantee). The safe_inline / print-discipline contract (AD-224-3, AC-224-6)
+            // and the --quiet gate (AD-224-5, AC-224-22) are documented at
+            // `emit_unknown_rule_warning`.
             //
-            // Binding surfaces (napi/WASM/Python) call
-            // `mds::format_unknown_rule_names_warning`, which produces:
-            //   "unknown lint rule 'X'; recognised rules are: …; ignoring"
-            //   "unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring"
-            // The CLI adds a "warning:" prefix (matching its other eprint_warning
-            // call sites) and an "in mds.json" source context (so the origin of
-            // the config anomaly is visible to a terminal user).  Both CLI forms
-            // place the names BEFORE the source context, parallel with each other
-            // and structurally parallel with the core formatter (names first, then
-            // the rest of the message):
-            //   "warning: unknown lint rule 'X' in mds.json; recognised rules are: …; ignoring"
-            //   "warning: unknown lint rules: 'A', 'B' in mds.json; recognised rules are: …; ignoring"
-            //
-            // AC-224-3 shared-constant guarantee: the recognised-rules LIST and its
-            // sort order are shared via `mds::KNOWN_LINT_RULES` across all surfaces.
-            // The full message text is NOT byte-identical; CHANGELOG documents both
-            // formats. Per-surface goldens (PF-007) each lock in their own value;
-            // no differential test claims cross-surface byte-parity.
-            //
-            // The safe_inline / print-discipline contract (AD-224-3, AC-224-6) and
-            // the --quiet gate (AD-224-5, AC-224-22) are documented at
-            // `emit_unknown_rule_warning` — the single point of definition for the
-            // emitter, shared with LintDirCtx::config_for (PF-009).
-            //
-            // into_core_config uses LintConfig::from_rules_checked internally,
-            // which returns (config, Option<UnknownRuleNames>) in one step. The
-            // return type structurally forces us to handle the unknowns report here
-            // rather than relying on a separate find_unknown_rule_names call — the
-            // fix for the review finding at config.rs:104 (detection is structural,
-            // not advisory).
+            // into_core_config returns (config, Option<UnknownRuleNames>) in one step —
+            // structurally forcing the caller to handle the unknowns report so detection
+            // cannot be accidentally skipped (review finding at config.rs:104).
             let (lint_config, unknown) = mds_config.lint.into_core_config();
             if let Some(unknown) = unknown {
                 emit_unknown_rule_warning(&unknown, quiet);
@@ -1134,11 +1112,11 @@ impl<'a> LintDirCtx<'a> {
                 // root/mds.json). Return the cached config without emitting a
                 // duplicate warning (AC-224-19). Note: load_config above still ran
                 // — fast path 2 suppresses the duplicate WARNING, not the re-parse.
-                let maybe_cached = {
-                    let cache = self.config_dir_cache.borrow();
-                    cache.get(&config_dir).map(Rc::clone)
-                };
-                if let Some(rc) = maybe_cached {
+                //
+                // `config_dir_cache` and `base_dir_cache` are different RefCells, so
+                // holding the shared borrow on `config_dir_cache` through the body is
+                // safe — the body only mutably borrows `base_dir_cache`.
+                if let Some(rc) = self.config_dir_cache.borrow().get(&config_dir).map(Rc::clone) {
                     // Alias base_dir → cached config so fast path 1 fires on the
                     // next call for a file in this same directory.
                     self.base_dir_cache
@@ -1148,12 +1126,9 @@ impl<'a> LintDirCtx<'a> {
                 }
 
                 // First load for this config_dir: build the config and emit the warning.
-                // The safe_inline / print-discipline contract (AD-224-3, AC-224-6),
-                // the --quiet gate (AD-224-5, AC-224-22), and the AC-224-3 residual
-                // (full warning text diverges from napi/WASM/Python by design) are
-                // all documented at `emit_unknown_rule_warning` — the single emitter
-                // shared with load_lint_config (PF-009, avoids drift on the CWE-117
-                // mitigation path).
+                // Contract documentation (safe_inline, --quiet, AC-224-3 residual) lives
+                // at `emit_unknown_rule_warning` — the single emitter shared with
+                // load_lint_config (PF-009).
                 let (lint_config, unknown) = mds_config.lint.into_core_config();
                 if let Some(unknown) = unknown {
                     emit_unknown_rule_warning(&unknown, self.flags.quiet);
@@ -1163,12 +1138,12 @@ impl<'a> LintDirCtx<'a> {
                 // future base_dirs that resolve to this same mds.json; `base_dir_cache`
                 // enables fast path 1 for future files in this same directory.
                 let rc = Rc::new(lint_config);
-                {
-                    let mut bd = self.base_dir_cache.borrow_mut();
-                    let mut cd = self.config_dir_cache.borrow_mut();
-                    bd.insert(base_dir.to_path_buf(), Rc::clone(&rc));
-                    cd.insert(config_dir, Rc::clone(&rc));
-                }
+                self.base_dir_cache
+                    .borrow_mut()
+                    .insert(base_dir.to_path_buf(), Rc::clone(&rc));
+                self.config_dir_cache
+                    .borrow_mut()
+                    .insert(config_dir, Rc::clone(&rc));
                 Ok(rc)
             }
         }
