@@ -804,17 +804,20 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     are shared with the CLI via `mds::KNOWN_LINT_RULES`. Per-surface parity (PF-007):
     each surface's format is asserted by its own tests; no cross-surface byte-identity
     is claimed.
-  - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`, `check`,
-    `fmt` and `watch` load the same `mds.json` and are byte-unchanged — an accepted
-    D2(a) asymmetry, not an oversight. This invariant is held in CI by the
-    `build_unknown_lint_rule_in_mds_json_emits_no_warning`,
-    `check_unknown_lint_rule_in_mds_json_emits_no_warning`, and
-    `fmt_unknown_lint_rule_in_mds_json_emits_no_warning` tests in `cli_build.rs`. Those
-    same tests mechanically hold the AC-224-14 watch-path invariant: `watch.rs:822`
-    calls `load_config(...).unwrap_or(None)`; because `build` and `fmt` share the same
-    `load_config` implementation, a passing build or fmt proves `load_config` returns
-    `Ok` for configs with unknown rule names, so the `unwrap_or(None)` cannot collapse
-    `output_dir` to `None` on account of an unknown lint rule name.
+  - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`,
+    `mds fmt <DIR>`, and `watch` read `mds.json` via `load_config` but deserialize
+    the `lint` field without calling `load_lint_config` — an accepted D2(a)
+    asymmetry, not an oversight (see build.rs:49-51). `mds check` and `mds fmt
+    <FILE>` do not call `load_config` at all. The D2(a) invariant is held in CI by
+    the `build_unknown_lint_rule_in_mds_json_emits_no_warning` and
+    `fmt_unknown_lint_rule_in_mds_json_emits_no_warning` tests in `cli_build.rs`,
+    each with a positive-control arm (unknown severity causes non-zero exit, proving
+    `load_config` was reached). Those tests mechanically hold the AC-224-14
+    watch-path invariant: `watch.rs:822` calls `load_config(...).unwrap_or(None)`;
+    because `build` and `mds fmt <DIR>` share the same `load_config` implementation,
+    a passing build or dir-fmt proves `load_config` returns `Ok` for configs with
+    unknown rule names, so `unwrap_or(None)` cannot collapse `output_dir` to `None`
+    on account of an unknown lint rule name alone.
   - Unknown **severity values** continue to hard-fail with `mds::invalid_options`. The
     asymmetry is deliberate: severities are a closed set, rule names grow every release.
 
