@@ -413,10 +413,12 @@ impl CompileResult {
 /// A single lint finding within a [`LintFileReport`].
 ///
 /// Maps to the canonical wire-format diagnostic object
-/// `{ rule, severity, message, help?, fixable, span? }`.
-/// `help` is `None` when the rule emits no hint; `span` is `None` for rules
-/// that do not attach a source offset. Both fields are always set as Python
-/// attributes (never missing), so callers need not use `getattr` defaults.
+/// `{ rule, severity, message, help, fixable, span, fix_edits }`.
+/// `help`, `span`, and `fix_edits` are always present as Python attributes
+/// (never missing — no `getattr` default needed); their value is `None` when
+/// the rule emits no hint, produces no source span, or carries no fix edits
+/// respectively.  In the JSON wire format all three are JSON `null` (not
+/// absent keys) when `None`.
 #[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct LintDiagnostic {

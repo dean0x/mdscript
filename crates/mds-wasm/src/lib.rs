@@ -796,7 +796,11 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// ## Returns
 ///
 /// On success, the canonical lint JSON object:
-/// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
+/// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span, fix_edits},...]},...], truncated: bool }`
+///
+/// `help`, `span`, and `fix_edits` are always present JSON keys; their value
+/// is JSON `null` when the rule emits no hint, produces no source span, or
+/// carries no fix edits respectively.  (`span` is `null`, not an absent key.)
 ///
 /// On failure (parse or validation error), throws a JS `Error` with the same
 /// structure as [`compile`].
