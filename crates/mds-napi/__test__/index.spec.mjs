@@ -26,8 +26,8 @@ const { compile, compileFile, check, checkFile } = addon;
 // Resolution order: MDS_CLI_BIN env var > freshest release/debug build > null.
 // ---------------------------------------------------------------------------
 
-/** Absolute path to the repository root (two levels above this test file). */
-const REPO_ROOT = path.resolve(__dirname, '../..');
+/** Absolute path to the repository root (three levels above this test file). */
+const REPO_ROOT = path.resolve(__dirname, '../../..');
 
 /** Return the absolute path to the `mds` CLI binary, or null if none can be found. */
 function findMdsCli() {
