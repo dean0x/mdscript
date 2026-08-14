@@ -576,9 +576,11 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   Cross-platform wheel matrix and PyPI publishing are a tracked follow-up (#132) —
   for now, install from source: `pip install ./crates/mds-python`. (#59)
 
-- **`mds lint`** — 9-rule static analyzer for `.mds` templates (#61). Available
-  across all surfaces (CLI, Rust, napi, WASM, Python) with byte-identical canonical
-  JSON output.
+- **`mds lint`** — 10-rule static analyzer for `.mds` templates (#61). Available
+  across all surfaces (CLI, Rust, napi, WASM, Python). The per-file and
+  per-diagnostic canonical JSON payload is byte-identical across all surfaces;
+  binding surfaces (napi, WASM, Python) additionally expose a `lint_warnings`
+  channel absent from the CLI surface (see #224 in this block).
 
   **Rules** (individually configurable via `mds.json` `lint.rules` or the
   `rules` API option; severities differ per rule):
