@@ -240,6 +240,21 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
     }
 }
 
+/// Returns the path of `path` relative to `root`, normalised to forward-slash
+/// separators regardless of the host platform.
+///
+/// The same computation is used for both the directory-mode sort key and the
+/// JSON `files[].file` value so that sort order and emitted key are
+/// byte-identical on every platform.  Forward slashes (`/`, 0x2F) are used
+/// instead of the native separator so that byte-wise ordering matches the
+/// documented example (`api-utils.mds` before `api/x.mds`) on Unix and
+/// Windows alike.  On Unix this is a no-op (paths never contain `\`); on
+/// Windows `Path::to_string_lossy()` uses `\`, which is replaced here.
+fn relative_display(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.to_string_lossy().replace('\\', "/")
+}
+
 // ── Read source file ──────────────────────────────────────────────────────────
 
 /// Read raw source of `path`: symlink-checked and size-capped (mirrors fmt.rs).
@@ -1040,12 +1055,12 @@ fn run_lint_directory(
     // byte-wise string order ('-' = 0x2D < '/' = 0x2F).  Sorting on the relative
     // display string keeps the CLI wire contract consistent with the BTreeMap
     // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
-    files.sort_by_cached_key(|p| {
-        let rel = p.strip_prefix(dir).unwrap_or(p);
-        let display = rel.to_string_lossy().into_owned();
-        let raw = rel.as_os_str().to_owned();
-        (display, raw)
-    });
+    // `relative_display` normalises to forward slashes so byte-wise order is
+    // identical on Unix and Windows (finding 4).  Its return value is the same
+    // String used as the JSON `files[].file` key, keeping sort and emission
+    // byte-identical by construction (finding 2).  `sort_by_cached_key` computes
+    // each key once — O(n) allocations, not O(n log n) (AC-P1-22).
+    files.sort_by_cached_key(|p| relative_display(p, dir));
 
     let mut max_tally = FileTally::Clean;
     let mut json_files: Vec<serde_json::Value> = Vec::new();
@@ -1122,11 +1137,9 @@ fn lint_one_file_accumulating(
 
     // Compute a display path relative to the lint root so JSON `file` keys
     // are navigable and unique across the whole directory tree (not just basenames).
-    let display_path = file
-        .strip_prefix(ctx.lint_root)
-        .unwrap_or(file)
-        .display()
-        .to_string();
+    // `relative_display` normalises to forward slashes, keeping the emitted key
+    // byte-identical to the sort key used by `run_lint_directory` (finding 2).
+    let display_path = relative_display(file, ctx.lint_root);
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
@@ -1301,11 +1314,9 @@ fn lint_one_file_human(
     } = ctx.flags;
 
     // Compute a display path relative to the lint root for human rendering.
-    let display_path = file
-        .strip_prefix(ctx.lint_root)
-        .unwrap_or(file)
-        .display()
-        .to_string();
+    // `relative_display` normalises to forward slashes, byte-identical to the
+    // sort key and the JSON emitted key (finding 2).
+    let display_path = relative_display(file, ctx.lint_root);
 
     let source = match read_source_file(file) {
         Ok(s) => s,
