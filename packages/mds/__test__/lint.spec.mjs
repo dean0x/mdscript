@@ -17,6 +17,7 @@ import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { lint, lintFile, lintVirtual, isMdsError, init } from '../dist/node.js';
 import { assertResultShape } from '../dist/backend/contract.js';
+import { initWasmNode, createWasmBackend } from '../dist/backend/wasm.js';
 
 // ---------------------------------------------------------------------------
 // CLI helper for AC-P1-24 cross-surface differential (U-L11).
@@ -300,6 +301,135 @@ describe('lint', () => {
       cliResult.files[0].file,
       '<stdin>',
       'U-L11: CLI stdin file key must be "<stdin>"',
+    );
+  });
+
+  // AC-P1-24 cross-surface differential (WASM surface): init() always selects
+  // native where the napi addon resolves, so U-L11 exercises napi only and the
+  // WASM branch of its "napi or WASM" comment is dead (PF-007). This test forces
+  // the WASM backend directly via initWasmNode() + createWasmBackend(), making
+  // the WASM surface the one under test.
+  //
+  // Three assertions are combined here:
+  //   (a) getBackend() === 'wasm' -- proves the right surface ran; a silent
+  //       backend switch would be immediately detected (avoids PF-007).
+  //   (b) files[].file === 'input.mds' -- AC-P1-28(c): WASM string-source lint
+  //       MUST keep the shared constant as its virtual-FS key.
+  //   (c) WASM diagnostics[] equal CLI diagnostics[] when the file key is
+  //       excluded -- the actual cross-surface parity differential (PF-007).
+  //
+  // In CI the WASM module is built before npm test; the assertion is hard.
+  // Locally, if the WASM module is not yet built, the test warns and skips.
+  // The CLI differential leg (c) additionally skips if no CLI binary is found.
+  test('U-L12: AC-P1-24 cross-surface -- WASM backend lint matches CLI diagnostics[] (file key excluded, AC-P1-28(c))', async () => {
+    // -- Force WASM backend directly, bypassing init()'s native preference --
+    let wasmBackend;
+    try {
+      const wasmMod = await initWasmNode();
+      wasmBackend = createWasmBackend(wasmMod);
+    } catch (initErr) {
+      if (process.env.CI) {
+        throw new Error(
+          'U-L12: WASM backend is required in CI for AC-P1-24 WASM surface coverage. ' +
+            'Build it with: wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg. ' +
+            `Caused by: ${initErr.message}`,
+        );
+      }
+      // Local dev without a built WASM module: warn and skip (not a hard failure).
+      console.warn(
+        'U-L12: skipping WASM surface -- mds-wasm module not found ' +
+          '(run `wasm-pack build crates/mds-wasm --target nodejs --out-dir pkg` to enable)',
+      );
+      return;
+    }
+
+    // (a) Prove the right surface ran (avoids PF-007 silent-backend-switch).
+    assert.equal(
+      wasmBackend.getBackend(),
+      'wasm',
+      'U-L12: wasmBackend.getBackend() must return "wasm"',
+    );
+
+    // Same fixture as U-L10/U-L11: {name} triggers legacy-interpolation at a
+    // low byte offset; duplicate @export greet triggers duplicate-export at a
+    // higher offset. Rule-execution order is the REVERSE of offset order --
+    // without the offset sort both surfaces would diverge from the CLI.
+    const source =
+      '@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n';
+
+    const wasmResult = wasmBackend.lint(source);
+    assert.ok(
+      wasmResult.files.length > 0,
+      'U-L12: fixture must produce at least one file entry from the WASM surface',
+    );
+
+    // (b) AC-P1-28(c): WASM string-source lint MUST emit files[].file == 'input.mds'.
+    // STRING_SOURCE_MAP_LABEL is the shared constant that both the WASM virtual-FS
+    // default filename and the core lint entry point use -- it must not be remapped
+    // to '<stdin>' on the WASM surface (the remap belongs at the CLI output boundary).
+    for (const f of wasmResult.files) {
+      assert.equal(
+        f.file,
+        'input.mds',
+        `U-L12: AC-P1-28(c): WASM string-source file key must be 'input.mds'; got '${f.file}'`,
+      );
+    }
+
+    // (c) Cross-surface differential against the CLI (if a binary is available).
+    const mdsCli = findMdsCli();
+    if (mdsCli == null) {
+      if (process.env.CI) {
+        throw new Error(
+          'U-L12: mds CLI binary is required in CI for the WASM vs CLI differential. ' +
+            'Set MDS_CLI_BIN or run `cargo build -p mds-cli`.',
+        );
+      }
+      console.warn(
+        'U-L12: WASM vs CLI differential skipped -- mds CLI binary not found ' +
+          '(run `cargo build -p mds-cli` to enable the full cross-surface check)',
+      );
+      return;
+    }
+
+    const cliProc = spawnSync(mdsCli, ['lint', '-', '--format', 'json'], {
+      input: source,
+      encoding: 'utf-8',
+    });
+    // exit 0 = clean, exit 1 = warn-only, exit 2 = at least one error-severity finding.
+    assert.ok(
+      cliProc.status === 0 || cliProc.status === 1 || cliProc.status === 2,
+      `U-L12: CLI lint exited unexpected status ${cliProc.status}: ${cliProc.stderr}`,
+    );
+    const cliResult = JSON.parse(cliProc.stdout);
+    assert.ok(
+      cliResult.files.length > 0,
+      'U-L12: fixture must produce at least one file entry from the CLI surface',
+    );
+
+    // Normalize: strip the file key (deliberately differs per surface) so the
+    // comparison covers diagnostics[], spans, rule, severity, fixable only.
+    function normalizeFiles(result) {
+      return result.files.map(({ file: _file, ...rest }) => rest);
+    }
+    const wasmNorm = normalizeFiles(wasmResult);
+    const cliNorm = normalizeFiles(cliResult);
+
+    // Non-vacuity guard: two empty arrays compare equal and prove nothing (PF-013).
+    const totalDiags = wasmNorm.reduce((n, f) => n + (f.diagnostics?.length ?? 0), 0);
+    assert.ok(
+      totalDiags >= 2,
+      `U-L12: AC-P1-24 needs at least two diagnostics for a meaningful cross-surface ` +
+        `differential; got ${totalDiags}`,
+    );
+
+    // Primary parity assertion: WASM and CLI diagnostics[] are identical when
+    // the file key is excluded (the cross-surface differential, avoids PF-007).
+    assert.deepEqual(
+      wasmNorm,
+      cliNorm,
+      'U-L12: AC-P1-24: WASM and CLI diagnostics[] must be identical when file key is excluded.\n' +
+        `  WASM: ${JSON.stringify(wasmNorm)}\n` +
+        `  CLI:  ${JSON.stringify(cliNorm)}`,
     );
   });
 });
