@@ -1287,3 +1287,140 @@ fn build_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         &out.stderr[..out.stderr.len().min(512)]
     );
 }
+
+// ── AC-224-14 / D2(a): build, check, and fmt do not emit unknown-rule warnings ──
+//
+// Only `mds lint` reads `lint.rules` and emits an unknown-rule warning.  The other
+// commands (`build`, `check`, `fmt`, and `watch`) load the same `mds.json` through
+// `into_core_config` but do not call `load_lint_config`, so they never warn — an
+// accepted D2(a) asymmetry documented in CHANGELOG.md.
+//
+// These tests also mechanically hold the AC-224-14 watch-path invariant.  The
+// `watch.rs:822` hot-path calls `load_config(...).unwrap_or(None)`.  Because
+// `build` and `fmt` share the same `load_config` implementation as `watch`, a
+// passing build or fmt proves `load_config` returns `Ok` for a config with unknown
+// rule names — so the `unwrap_or(None)` can never collapse `output_dir` to `None`
+// on account of an unknown lint rule name alone (avoids PF-013 vacuous absence).
+
+/// AC-224-14 / D2(a): `mds build` must NOT emit an unknown-rule warning even
+/// when `mds.json` names a lint rule that does not exist.
+///
+/// Non-vacuity (ADR-009): the test asserts the build SUCCEEDS (so the file was
+/// read and `load_config` returned `Ok`), which is the strongest possible proof
+/// that the warning-path was reached and declined, not simply never reached.
+#[test]
+fn build_unknown_lint_rule_in_mds_json_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("tpl.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"warn"}}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "D2(a): mds build must succeed even with an unknown lint rule in mds.json; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule"),
+        "D2(a): mds build must NOT emit an unknown-rule warning; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-rule-xyzzy"),
+        "D2(a): mds build must NOT name the unknown rule in stderr; stderr: {stderr}"
+    );
+}
+
+/// AC-224-14 / D2(a): `mds check` must NOT emit an unknown-rule warning even
+/// when `mds.json` names a lint rule that does not exist.
+#[test]
+fn check_unknown_lint_rule_in_mds_json_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("tpl.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"warn"}}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("check")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "D2(a): mds check must succeed even with an unknown lint rule in mds.json; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule"),
+        "D2(a): mds check must NOT emit an unknown-rule warning; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-rule-xyzzy"),
+        "D2(a): mds check must NOT name the unknown rule in stderr; stderr: {stderr}"
+    );
+}
+
+/// AC-224-14 / D2(a): `mds fmt` must NOT emit an unknown-rule warning even
+/// when `mds.json` names a lint rule that does not exist.
+///
+/// `mds fmt` calls `load_config` (fmt.rs:308) and thus follows the same code
+/// path as `mds build` and `watch.rs:822`.  A passing test proves `load_config`
+/// returns `Ok` for this input, which is the root guarantee the AC-224-14 watch
+/// invariant relies on.
+#[test]
+fn fmt_unknown_lint_rule_in_mds_json_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("tpl.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"warn"}}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("fmt")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "D2(a): mds fmt must succeed even with an unknown lint rule in mds.json; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule"),
+        "D2(a): mds fmt must NOT emit an unknown-rule warning; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-rule-xyzzy"),
+        "D2(a): mds fmt must NOT name the unknown rule in stderr; stderr: {stderr}"
+    );
+}

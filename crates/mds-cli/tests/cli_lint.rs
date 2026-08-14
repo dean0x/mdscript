@@ -24,6 +24,7 @@
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
 //! - AC-224-10: unknown rule name → JSON wire shape unchanged (lint continues)
 //! - AC-224-11: unknown rule warning goes to stderr, not stdout
+//! - AC-224-14: D2(a) asymmetry — build/check/fmt do NOT warn (see cli_build.rs)
 //! - AC-224-19: directory with N files emits exactly ONE unknown-rule warning
 //! - AC-224-21: stdout JSON remains valid when unknown rule name is present
 //! - AC-224-22: --quiet suppresses the unknown-rule warning

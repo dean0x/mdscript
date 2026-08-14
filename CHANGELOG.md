@@ -789,15 +789,29 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     key is absent (not `null`, not `[]`) when no warnings occurred. On the Python
     live-object surface, `LintResult.lint_warnings` is a property that always exists
     and returns an empty list when no warnings occurred. The message format differs from
-    the CLI (no `"warning:"` prefix, no `"in mds.json"` source context):
-    - `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
-    - `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
-    The recognised-rules list and sort order are shared with the CLI via
-    `mds::KNOWN_LINT_RULES`. Per-surface parity (PF-007): each surface's format is
-    asserted by its own tests; no cross-surface byte-identity is claimed.
+    the CLI — **accepted residual** (AC-224-3 requires byte-identity across all five
+    surfaces; the binding format is a knowing deviation, held by per-surface goldens
+    per PF-007). The three structural differences: no `"warning:"` prefix, no `"in
+    mds.json"` source context, and a different colon position in the plural form:
+    - Singular: `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
+    - Plural:   `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
+    Compare the CLI plural `warning: unknown lint rules in mds.json: 'A', 'B'; …`
+    — the binding form omits both the prefix and the `in mds.json` clause, placing
+    the colon directly after `lint rules`. The recognised-rules list and sort order
+    are shared with the CLI via `mds::KNOWN_LINT_RULES`. Per-surface parity (PF-007):
+    each surface's format is asserted by its own tests; no cross-surface byte-identity
+    is claimed.
   - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`, `check`,
     `fmt` and `watch` load the same `mds.json` and are byte-unchanged — an accepted
-    asymmetry, not an oversight.
+    D2(a) asymmetry, not an oversight. This invariant is held in CI by the
+    `build_unknown_lint_rule_in_mds_json_emits_no_warning`,
+    `check_unknown_lint_rule_in_mds_json_emits_no_warning`, and
+    `fmt_unknown_lint_rule_in_mds_json_emits_no_warning` tests in `cli_build.rs`. Those
+    same tests mechanically hold the AC-224-14 watch-path invariant: `watch.rs:822`
+    calls `load_config(...).unwrap_or(None)`; because `build` and `fmt` share the same
+    `load_config` implementation, a passing build or fmt proves `load_config` returns
+    `Ok` for configs with unknown rule names, so the `unwrap_or(None)` cannot collapse
+    `output_dir` to `None` on account of an unknown lint rule name.
   - Unknown **severity values** continue to hard-fail with `mds::invalid_options`. The
     asymmetry is deliberate: severities are a closed set, rule names grow every release.
 
