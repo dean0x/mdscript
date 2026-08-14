@@ -598,7 +598,7 @@ impl LintDiagnostic {
         let span_val = self.span.as_ref().map(|sp| {
             // Span keys in alphabetical order: column (conditional), length,
             // line (conditional), offset.  line and column are omitted (key absent,
-            // not null) when not set, matching to_canonical_json (diagnostic.rs:780-785).
+            // not null) when not set, matching to_canonical_json (diagnostic.rs:776-781).
             let mut span_map = serde_json::Map::new();
             if let Some(col) = sp.column {
                 span_map.insert(
