@@ -32,7 +32,8 @@ pub(crate) struct MdsConfig {
     /// Per-rule severity overrides for `mds lint` (AC-F-17).
     ///
     /// Unknown severity VALUES fail config loading loudly (closed enum).
-    /// Unknown rule NAMES are preserved for forward compat (CLI warns and ignores).
+    /// Unknown rule NAMES produce a warning and lint continues (forward-compat: a config
+    /// naming a rule from a newer mds version warns but does not break on an older binary).
     #[serde(default)]
     pub(crate) lint: LintCliConfig,
 }
@@ -44,7 +45,7 @@ pub(crate) struct MdsConfig {
 ///
 /// Unknown severity VALUES (e.g. `"banana"`) cause a hard parse error (exit 2)
 /// because `Severity` is a closed enum with no sensible fallback. Unknown rule
-/// NAMES are warn-and-ignored at the CLI layer (forward compat).
+/// NAMES produce a warning on every surface and lint continues (forward-compat).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct LintCliConfig {
     #[serde(default)]

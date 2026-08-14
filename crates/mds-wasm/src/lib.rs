@@ -448,11 +448,16 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
 /// Parsed options for the `lint` and `lint_virtual` functions.
 ///
 /// Extends the standard options with a `rules` field — absent in `compile`/`check`.
+///
+/// `lint_warnings` is populated (non-empty) when unknown rule names are found;
+/// callers add it to the returned JSON as `lint_warnings: string[]` (D8 binding channel).
 struct ParsedLintOptions {
     /// Standard options (filename, extra_modules, vars).
     opts: ParsedOptions,
     /// Per-rule severity overrides parsed from `options.rules`.
     lint_config: mds::LintConfig,
+    /// Warning messages for unknown rule names (AC-224-1 D8 channel).
+    lint_warnings: Vec<String>,
 }
 
 /// Extract and validate the `rules` field from a lint options object.
@@ -461,10 +466,13 @@ struct ParsedLintOptions {
 /// names and values are severity strings (`"off"` | `"info"` | `"warn"` | `"error"`).
 /// An absent or null/undefined `rules` key returns the default config (all rules at
 /// built-in defaults). An unknown severity VALUE is a hard error (closed enum).
-fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
+///
+/// D8 (AC-224-1): unknown rule NAMES are detected and returned as warning strings.
+/// Callers surface them via `lint_warnings` in the returned JSON object.
+fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Vec<String>), JsValue> {
     let val = get_prop_js(obj, "rules");
     if val.is_undefined() || val.is_null() {
-        return Ok(mds::LintConfig::default());
+        return Ok((mds::LintConfig::default(), vec![]));
     }
     // Deserialize the rules sub-object via serde_wasm_bindgen.
     let rules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
@@ -493,7 +501,11 @@ fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
         })?;
         rules.insert(key, severity);
     }
-    Ok(mds::LintConfig::from_rules(rules))
+    // D8: detect unknown rule names and format warning strings.
+    let lint_warnings: Vec<String> = mds::find_unknown_rule_names(&rules)
+        .map(|u| vec![mds::format_unknown_rule_names_warning(u.names())])
+        .unwrap_or_default();
+    Ok((mds::LintConfig::from_rules(rules), lint_warnings))
 }
 
 /// Parse the JS options for `lint` and `lint_virtual`.
@@ -507,6 +519,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
         return Ok(ParsedLintOptions {
             opts: ParsedOptions::default(),
             lint_config: mds::LintConfig::default(),
+            lint_warnings: vec![],
         });
     }
 
@@ -523,7 +536,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
     let filename = extract_filename(&obj)?;
     let extra_modules = extract_modules(&obj)?;
     let vars = extract_vars(&obj)?;
-    let lint_config = extract_rules(&obj)?;
+    let (lint_config, lint_warnings) = extract_rules(&obj)?;
 
     Ok(ParsedLintOptions {
         opts: ParsedOptions {
@@ -534,6 +547,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
             include_sources_content: false,
         },
         lint_config,
+        lint_warnings,
     })
 }
 
@@ -583,6 +597,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
         return Ok(ParsedLintOptions {
             opts: ParsedOptions::default(),
             lint_config: mds::LintConfig::default(),
+            lint_warnings: vec![],
         });
     }
 
@@ -596,7 +611,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
     reject_unknown_wasm_keys(&obj, &["vars", "rules"])?;
 
     let vars = extract_vars(&obj)?;
-    let lint_config = extract_rules(&obj)?;
+    let (lint_config, lint_warnings) = extract_rules(&obj)?;
 
     Ok(ParsedLintOptions {
         opts: ParsedOptions {
@@ -607,6 +622,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
             include_sources_content: false,
         },
         lint_config,
+        lint_warnings,
     })
 }
 
@@ -838,7 +854,19 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         )
         .map_err(mds_error_to_js)?;
 
-        to_js(&result.to_canonical_json())
+        // D8 (AC-224-1): surface unknown-rule warnings on the WASM binding channel.
+        let mut json = result.to_canonical_json();
+        if !lint_opts.lint_warnings.is_empty() {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "lint_warnings".to_string(),
+                    serde_json::Value::Array(
+                        lint_opts.lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+        }
+        to_js(&json)
     }))
 }
 
@@ -897,7 +925,19 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
         )
         .map_err(mds_error_to_js)?;
 
-        to_js(&result.to_canonical_json())
+        // D8 (AC-224-1): surface unknown-rule warnings on the WASM binding channel.
+        let mut json = result.to_canonical_json();
+        if !lint_opts.lint_warnings.is_empty() {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "lint_warnings".to_string(),
+                    serde_json::Value::Array(
+                        lint_opts.lint_warnings.into_iter().map(serde_json::Value::String).collect(),
+                    ),
+                );
+            }
+        }
+        to_js(&json)
     }))
 }
 

@@ -1160,3 +1160,116 @@ fn wasm_lint_virtual_newline_in_frontmatter_key_is_escaped_on_the_wire() {
         "T-15/F6-NL: message body must be preserved verbatim; got: {all_messages:?}"
     );
 }
+
+// ── AC-224 D8: unknown rule name warning channel on WASM ─────────────────────
+//
+// An unknown rule name in the `rules` option produces a `lint_warnings` array
+// in the result rather than hard-failing (D8 / AC-224-1). Known rule names
+// produce no `lint_warnings` field (common-case cleanliness).
+
+#[wasm_bindgen_test]
+fn wasm_lint_unknown_rule_name_returns_lint_warnings() {
+    // W-WARN-1 (AC-224-1/D8): lint() with an unknown rule name returns lint_warnings.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "no-such-rule-xyzzy": "warn" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-1: lint must succeed");
+
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("W-WARN-1: version must be a number") as u32;
+    assert_eq!(version, 1, "W-WARN-1: version must be 1");
+
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        !lint_warnings.is_undefined() && !lint_warnings.is_null(),
+        "W-WARN-1: lint_warnings must be present for an unknown rule name"
+    );
+    let warnings_arr = js_sys::Array::from(&lint_warnings);
+    assert!(
+        warnings_arr.length() > 0,
+        "W-WARN-1: lint_warnings must be non-empty for an unknown rule name"
+    );
+    let w0 = warnings_arr.get(0).as_string().expect("W-WARN-1: lint_warnings[0] must be a string");
+    assert!(
+        w0.contains("no-such-rule-xyzzy"),
+        "W-WARN-1: lint_warnings[0] must name the unknown rule; got: {w0}"
+    );
+    assert!(
+        w0.contains("recognised rules are") || w0.contains("recognized rules are"),
+        "W-WARN-1: lint_warnings[0] must list recognised rules; got: {w0}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_known_rule_names_no_lint_warnings() {
+    // W-WARN-2 (AC-224-1/D8): lint() with only known rule names has no lint_warnings.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "unused-variable": "off" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-2: lint must succeed");
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        lint_warnings.is_undefined(),
+        "W-WARN-2: lint_warnings must be absent for known rule names; got: {lint_warnings:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_unknown_rule_name_returns_lint_warnings() {
+    // W-WARN-3 (AC-224-1/D8): lintVirtual() with an unknown rule name returns lint_warnings.
+    let modules_val = to_js_object(&serde_json::json!({ "main.mds": "Hello!\n" }));
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "no-such-rule-xyzzy": "error" }
+    }));
+    let result = mds_wasm::lint_virtual(modules_val, "main.mds", opts)
+        .expect("W-WARN-3: lintVirtual must succeed");
+
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        !lint_warnings.is_undefined() && !lint_warnings.is_null(),
+        "W-WARN-3: lint_warnings must be present for an unknown rule name"
+    );
+    let warnings_arr = js_sys::Array::from(&lint_warnings);
+    assert!(
+        warnings_arr.length() > 0,
+        "W-WARN-3: lint_warnings must be non-empty for an unknown rule name"
+    );
+    let w0 = warnings_arr.get(0).as_string().expect("W-WARN-3: lint_warnings[0] must be a string");
+    assert!(
+        w0.contains("no-such-rule-xyzzy"),
+        "W-WARN-3: lint_warnings[0] must name the unknown rule; got: {w0}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_continues_with_unknown_rule_name() {
+    // W-WARN-4 (AC-224-1/D8): lint continues — files[] and truncated are present.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "no-such-rule-xyzzy": "warn" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-4: lint must succeed");
+
+    // files[] must be present and be an array.
+    let files = get_prop(&result, "files");
+    let files_arr = js_sys::Array::from(&files);
+    let _ = files_arr.length(); // just confirm it's array-like; no panic = ok
+
+    // truncated must be present and false.
+    let truncated = get_prop(&result, "truncated")
+        .as_bool()
+        .unwrap_or(true);
+    assert!(!truncated, "W-WARN-4: truncated must be false for a clean source");
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_unknown_rule_no_lint_warnings_absent_on_clean() {
+    // W-WARN-2b (AC-224-1/D8): no options → no lint_warnings field at all.
+    let result = mds_wasm::lint("Hello!\n", JsValue::NULL)
+        .expect("W-WARN-2b: lint(NULL) must succeed");
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        lint_warnings.is_undefined(),
+        "W-WARN-2b: lint_warnings must be absent when no rules are passed; got: {lint_warnings:?}"
+    );
+}

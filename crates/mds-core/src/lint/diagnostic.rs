@@ -193,8 +193,8 @@ use crate::limits::MAX_DIAGNOSTICS;
 /// `Error` renders as an error; produces exit code 2.
 ///
 /// Serialization: `"off"` / `"info"` / `"warn"` / `"error"` (closed enum — unknown
-/// severity VALUE strings fail loudly via serde deserialization error, not
-/// warn-and-ignore; only unknown rule NAMES get the lenient treatment).
+/// severity VALUE strings fail loudly via serde deserialization error. Unknown rule
+/// NAMES emit a warning and lint continues; see `find_unknown_rule_names`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {

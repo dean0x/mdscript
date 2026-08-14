@@ -1130,6 +1130,80 @@ fn lint_types_exist() {
     assert!(!result.truncated);
 }
 
+/// AC-224-7 / AC-224-8: KNOWN_LINT_RULES and UnknownRuleNames honour ADR-010.
+///
+/// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
+/// - It contains exactly the ten registered rule names.
+/// - Every entry in the registry is accepted by `LintConfig::from_rules` without
+///   error or warning.
+/// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
+///   maps containing unknown names.
+/// - `UnknownRuleNames` exposes names via accessor, not a public field, and is
+///   only constructible through the library.
+#[test]
+fn known_lint_rules_and_unknown_detection() {
+    use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
+
+    // AC-224-7: exactly 10 rules.
+    assert_eq!(KNOWN_LINT_RULES.len(), 10, "KNOWN_LINT_RULES must have exactly 10 entries");
+
+    // AC-224-7: exact sorted contents.
+    let expected = [
+        "duplicate-export",
+        "duplicate-import",
+        "empty-block",
+        "legacy-interpolation",
+        "redundant-else",
+        "shadow-variable",
+        "unreachable-branch",
+        "unused-function",
+        "unused-import",
+        "unused-variable",
+    ];
+    assert_eq!(KNOWN_LINT_RULES, &expected, "KNOWN_LINT_RULES must match the expected sorted list");
+
+    // AC-224-8: every known rule is accepted by from_rules without unknowns.
+    let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
+        .iter()
+        .map(|&n| (n.to_string(), Severity::Warn))
+        .collect();
+    let _config = LintConfig::from_rules(all_known.clone());
+    assert!(
+        find_unknown_rule_names(&all_known).is_none(),
+        "all-known rules map must produce no unknowns"
+    );
+
+    // AC-224-8: empty rules map produces no unknowns.
+    let empty: HashMap<String, Severity> = HashMap::new();
+    assert!(
+        find_unknown_rule_names(&empty).is_none(),
+        "empty rules map must produce no unknowns"
+    );
+
+    // AC-224-7: UnknownRuleNames is only obtainable via the library API.
+    let mixed: HashMap<String, Severity> = HashMap::from([
+        ("unused-variable".to_string(), Severity::Off),
+        ("no-such-rule".to_string(), Severity::Warn),
+        ("another-bad".to_string(), Severity::Error),
+    ]);
+    let unknown = find_unknown_rule_names(&mixed).expect("should detect two unknown rules");
+    // Accessor returns names; struct literal construction is impossible (#[non_exhaustive]).
+    let names = unknown.names();
+    assert_eq!(names, &["another-bad".to_string(), "no-such-rule".to_string()],
+        "names must be sorted lexicographically");
+    assert_eq!(names.len(), 2);
+
+    // Positive control (PF-013 / ADR-009): find_unknown_rule_names does NOT return None
+    // for a single-unknown map.
+    let one_bad: HashMap<String, Severity> = HashMap::from([
+        ("no-such-rule".to_string(), Severity::Warn),
+    ]);
+    assert!(
+        find_unknown_rule_names(&one_bad).is_some(),
+        "single-unknown map must produce Some"
+    );
+}
+
 /// L-API-4: MdsError enum is unchanged — lint findings are LintDiagnostic, not MdsError variants.
 #[test]
 fn mds_error_variants_unchanged_by_lint() {

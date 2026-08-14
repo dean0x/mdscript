@@ -166,6 +166,45 @@ export interface LintDiagnostic {
  */
 export type RuleSeverity = 'error' | 'warn' | 'info' | 'off';
 
+/**
+ * Union of all recognised lint rule names.
+ *
+ * Passing a key outside this set in `LintOptions.rules` emits a warning (see
+ * {@link LintResult.lint_warnings}) and lint continues — unknown names are
+ * silently ignored by the engine after the warning is surfaced to the caller.
+ */
+export type LintRuleName =
+  | 'duplicate-export'
+  | 'duplicate-import'
+  | 'empty-block'
+  | 'legacy-interpolation'
+  | 'redundant-else'
+  | 'shadow-variable'
+  | 'unreachable-branch'
+  | 'unused-function'
+  | 'unused-import'
+  | 'unused-variable';
+
+/**
+ * All recognised lint rule names, sorted alphabetically.
+ *
+ * This array is the canonical registry used on all surfaces. `rules` keys not
+ * found here emit a warning (see {@link LintResult.lint_warnings}) and lint
+ * continues — unknown names are ignored by the engine after the warning.
+ */
+export const LINT_RULE_NAMES: readonly LintRuleName[] = [
+  'duplicate-export',
+  'duplicate-import',
+  'empty-block',
+  'legacy-interpolation',
+  'redundant-else',
+  'shadow-variable',
+  'unreachable-branch',
+  'unused-function',
+  'unused-import',
+  'unused-variable',
+] as const;
+
 /** All diagnostics for a single file in a lint result. */
 export interface LintFileReport {
   /** Path or name of the linted file. */
@@ -189,13 +228,26 @@ export interface LintResult {
    * earlier diagnostics were dropped. Re-run after fixing to surface the rest.
    */
   truncated: boolean;
+  /**
+   * Non-fatal warnings produced during linting — for example, unknown rule
+   * names passed in the `rules` option. Absent (not `[]`) when no warnings
+   * occurred. On the CLI surface, these warnings go to stderr instead.
+   */
+  lint_warnings?: string[];
 }
 
 /** Options for source-string lint operations. */
 export interface LintOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
-  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  /**
+   * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
+   *
+   * Keys should be {@link LintRuleName} values. An unrecognised key emits a
+   * warning in {@link LintResult.lint_warnings} and lint continues — the
+   * unknown rule is silently ignored by the engine. `Record<string, …>` is
+   * accepted for forward compatibility with future rule names.
+   */
   rules?: Record<string, RuleSeverity>;
   /**
    * Base directory for resolving `@import` directives in the source string.
@@ -209,7 +261,14 @@ export interface LintOptions {
 export interface LintFileOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
-  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  /**
+   * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
+   *
+   * Keys should be {@link LintRuleName} values. An unrecognised key emits a
+   * warning in {@link LintResult.lint_warnings} and lint continues — the
+   * unknown rule is silently ignored by the engine. `Record<string, …>` is
+   * accepted for forward compatibility with future rule names.
+   */
   rules?: Record<string, RuleSeverity>;
 }
 

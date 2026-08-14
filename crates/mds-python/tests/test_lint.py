@@ -357,3 +357,94 @@ def test_compile_to_dict_sourcemap_present_when_requested() -> None:
     d = r.to_dict()
     assert "sourceMap" in d
     assert isinstance(d["sourceMap"], dict), "sourceMap must be a dict when generated"
+
+
+# ── AC-224 D8: unknown rule name warning channel (Python) ────────────────────
+#
+# An unknown rule name in the `rules` kwarg produces `lint_warnings` in the
+# LintResult (D8 / AC-224-1). Known rule names produce no lint_warnings.
+# Python surface: lint_warnings() is a property getter that returns list[str].
+
+
+def test_py_warn_l1_unknown_rule_name_returns_lint_warnings() -> None:
+    """lint() with unknown rule name → lint_warnings non-empty (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"no-such-rule-xyzzy": "warn"})
+    assert r.version == 1
+    warnings = r.lint_warnings
+    assert isinstance(warnings, list), f"lint_warnings must be a list; got: {type(warnings)}"
+    assert len(warnings) > 0, "lint_warnings must be non-empty for an unknown rule name"
+    assert "no-such-rule-xyzzy" in warnings[0], (
+        f"lint_warnings[0] must name the unknown rule; got: {warnings[0]}"
+    )
+    assert "recognised rules are" in warnings[0] or "recognized rules are" in warnings[0], (
+        f"lint_warnings[0] must list recognised rules; got: {warnings[0]}"
+    )
+
+
+def test_py_warn_l2_known_rule_names_no_lint_warnings() -> None:
+    """lint() with only known rule names → lint_warnings empty (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"unused-variable": "off"})
+    assert r.version == 1
+    assert r.lint_warnings == [], (
+        f"lint_warnings must be empty for known rule names; got: {r.lint_warnings}"
+    )
+
+
+def test_py_warn_lf1_lint_file_unknown_rule_returns_warnings(fixtures: pathlib.Path) -> None:
+    """lint_file() with unknown rule name → lint_warnings non-empty (AC-224-1/D8)."""
+    r = m.lint_file(fixtures / "simple.mds", rules={"no-such-rule-xyzzy": "error"})
+    assert r.version == 1
+    warnings = r.lint_warnings
+    assert len(warnings) > 0, "lint_warnings must be non-empty for an unknown rule name"
+    assert "no-such-rule-xyzzy" in warnings[0], (
+        f"lint_warnings[0] must name the unknown rule; got: {warnings[0]}"
+    )
+
+
+def test_py_warn_lv1_lint_virtual_unknown_rule_returns_warnings() -> None:
+    """lint_virtual() with unknown rule name → lint_warnings non-empty (AC-224-1/D8)."""
+    modules = {"main.mds": CLEAN_SOURCE}
+    r = m.lint_virtual(modules, "main.mds", rules={"no-such-rule-xyzzy": "warn"})
+    assert r.version == 1
+    warnings = r.lint_warnings
+    assert len(warnings) > 0, "lint_warnings must be non-empty for an unknown rule name"
+    assert "no-such-rule-xyzzy" in warnings[0], (
+        f"lint_warnings[0] must name the unknown rule; got: {warnings[0]}"
+    )
+
+
+def test_py_warn_l3_lint_continues_with_unknown_rule() -> None:
+    """lint() with unknown rule name still returns files[] and truncated (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"no-such-rule-xyzzy": "warn"})
+    d = r.to_dict()
+    assert "files" in d, "files key must be present even when unknown rule name is given"
+    assert "truncated" in d, "truncated key must be present even when unknown rule name is given"
+    assert d["truncated"] is False
+
+
+def test_py_warn_l4_to_dict_includes_lint_warnings() -> None:
+    """lint() with unknown rule name → to_dict() includes 'lint_warnings' key (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"no-such-rule-xyzzy": "warn"})
+    d = r.to_dict()
+    assert "lint_warnings" in d, (
+        f"to_dict() must include 'lint_warnings' when unknown rule names are present; got: {d}"
+    )
+    assert isinstance(d["lint_warnings"], list)
+    assert len(d["lint_warnings"]) > 0
+
+
+def test_py_warn_l5_multiple_unknown_rules() -> None:
+    """lint() with multiple unknown rule names → all appear in lint_warnings (AC-224-1/D8)."""
+    r = m.lint(
+        CLEAN_SOURCE,
+        rules={"no-such-rule-a": "warn", "no-such-rule-b": "error"},
+    )
+    warnings = r.lint_warnings
+    assert len(warnings) > 0, "lint_warnings must be non-empty"
+    combined = " ".join(warnings)
+    assert "no-such-rule-a" in combined, (
+        f"all unknown rule names must appear in lint_warnings; got: {warnings}"
+    )
+    assert "no-such-rule-b" in combined, (
+        f"all unknown rule names must appear in lint_warnings; got: {warnings}"
+    )

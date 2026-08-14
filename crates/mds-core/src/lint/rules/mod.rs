@@ -30,3 +30,23 @@ pub(crate) mod unused_import;
 pub(crate) mod unused_variable;
 
 pub(crate) mod structural_eq;
+
+/// All registered lint rule names, sorted lexicographically.
+///
+/// AD-224-2: composed from each rule module's own `RULE` const so the string
+/// is the single source of truth. This does NOT close the *omission* risk — a
+/// new module whose `RULE` is never listed here compiles fine. The mechanical
+/// closure is the bidirectional tier table in `tier.rs` plus an explicit
+/// `ALL_RULE_NAMES.len() == 10` pin in that table's test.
+pub(crate) const ALL_RULE_NAMES: &[&str] = &[
+    duplicate_export::RULE,
+    duplicate_import::RULE,
+    empty_block::RULE,
+    legacy_interpolation::RULE,
+    redundant_else::RULE,
+    shadow_variable::RULE,
+    unreachable_branch::RULE,
+    unused_function::RULE,
+    unused_import::RULE,
+    unused_variable::RULE,
+];

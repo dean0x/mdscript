@@ -43,19 +43,10 @@ use crate::output::{
     STDIN_DISPLAY_LABEL,
 };
 
-/// Known lint rule names — used to warn about unknown names in mds.json config.
-const KNOWN_RULES: &[&str] = &[
-    "unused-variable",
-    "unused-import",
-    "unused-function",
-    "shadow-variable",
-    "empty-block",
-    "redundant-else",
-    "unreachable-branch",
-    "duplicate-import",
-    "duplicate-export",
-    "legacy-interpolation",
-];
+// AC-224-15: No local rule-name list. The single source of truth is
+// mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
+// A repo-wide search for "unused-variable" under crates/mds-cli/src/ must
+// return zero hits.
 
 pub(crate) struct LintArgs {
     pub(crate) input: Option<PathBuf>,
@@ -187,30 +178,57 @@ fn do_lint(args: LintArgs) -> Result<()> {
 // ── Config helpers ────────────────────────────────────────────────────────────
 
 /// Load mds.json and extract the core `LintConfig`, warning about unknown rule names.
-fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
+///
+/// AD-224-1 (2026-08-12 ruling): an unknown rule name WARNS and lint CONTINUES.
+/// The domain is asymmetric — severities are a closed set but rule names grow
+/// every release — so hard-failing would break configs naming rules from a newer
+/// mds when run with an older binary.
+///
+/// AD-224-5 (AC-224-21, AC-224-22): the warning goes to STDERR only (never
+/// stdout — `--format json` stdout must remain valid parseable JSON), and is
+/// SUPPRESSED under `--quiet` (this signal precedes a normal exit, not an error;
+/// see `crates/mds-cli/src/main.rs:30`'s documented contract).
+fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     let config_opt = load_config(dir)?;
     match config_opt {
         None => Ok(mds::LintConfig::default()),
         Some((mds_config, _config_dir)) => {
-            // Warn on unknown rule names — unknown NAMES are ignored for forward compat.
+            // AD-224-3: `safe_inline` WIRE-escapes each name before it enters the
+            // warning text, because `eprint_warning` is HUMAN mode (`\n` survives).
+            // A JSON object key is never legitimately multi-line; routing through
+            // `safe_inline` closes CWE-117 on the newline + forged-line vector.
+            // This keeps the value inside `eprint_warning`'s arguments, which
+            // `print_discipline.rs:27-60` already machine-checks (AC-224-6).
             //
-            // `name` is an arbitrary attacker-supplied JSON object key: `mds.json` is
-            // read from the working tree, and JSON `\uXXXX` escapes decode to real
-            // control bytes.
-            //
-            // Two escapes, deliberately different (spec §7.5 per-field rule): the warning
-            // PROSE goes through `eprint_warning` (HUMAN — it is the message body), while
-            // the rule NAME goes through `safe_inline` (WIRE). Routing the whole line
-            // through `eprint_warning` alone was NOT sufficient: HUMAN mode preserves
-            // `\n`, so a rule name of `x\nClean: totally-real.mds\n0 problems found\n`
-            // still emitted three standalone lines byte-identical to genuine status
-            // output (CWE-117). A JSON object key is never legitimately multi-line.
-            for name in mds_config.lint.rules.keys() {
-                if !KNOWN_RULES.contains(&name.as_str()) {
-                    eprint_warning(&format!(
-                        "warning: unknown lint rule '{}' in mds.json; ignoring",
-                        safe_inline(name)
-                    ));
+            // AC-224-22: suppress under --quiet (coordination point with PR4 D4).
+            if !quiet {
+                if let Some(ref unknown) = mds::find_unknown_rule_names(&mds_config.lint.rules) {
+                    // Escape each name via safe_inline (WIRE per-field rule, spec §7.5).
+                    let escaped: Vec<String> = unknown
+                        .names()
+                        .iter()
+                        .map(safe_inline)
+                        .collect();
+                    // AC-224-2: include all recognised rule names (KNOWN_LINT_RULES is
+                    // sorted alphabetically — AC-224-3 determinism guaranteed).
+                    let recognised = mds::KNOWN_LINT_RULES.join(", ");
+                    let warning = if escaped.len() == 1 {
+                        format!(
+                            "warning: unknown lint rule '{}' in mds.json; \
+                             recognised rules are: {}; ignoring",
+                            escaped[0], recognised
+                        )
+                    } else {
+                        let quoted: Vec<String> =
+                            escaped.iter().map(|n| format!("'{n}'")).collect();
+                        format!(
+                            "warning: unknown lint rules in mds.json: {}; \
+                             recognised rules are: {}; ignoring",
+                            quoted.join(", "),
+                            recognised
+                        )
+                    };
+                    eprint_warning(&warning);
                 }
             }
             Ok(mds_config.lint.into_core_config())
@@ -686,7 +704,7 @@ fn run_lint_stdin(
 
     let (source, cwd) = read_stdin()?;
     // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(&cwd) {
+    let config = match load_lint_config(&cwd, quiet) {
         Ok(c) => c,
         Err(e) => {
             let mds_err = MdsError::Io {
@@ -831,7 +849,7 @@ fn run_lint_file(
     // effective_parent maps "" (bare filename) to "." — avoids PF-006.
     let base_dir = effective_parent(path);
     // mds.json load/parse failure → JSON envelope in --format json mode (AC-F-14).
-    let config = match load_lint_config(base_dir) {
+    let config = match load_lint_config(base_dir, quiet) {
         Ok(c) => c,
         Err(e) => {
             let mds_err = MdsError::Io {
@@ -1011,7 +1029,7 @@ impl<'a> LintDirCtx<'a> {
                 return Ok(Rc::clone(cfg));
             }
         }
-        let config = load_lint_config(base_dir).map_err(|e| MdsError::Io {
+        let config = load_lint_config(base_dir, self.flags.quiet).map_err(|e| MdsError::Io {
             message: format!("{e}"),
         })?;
         let rc = Rc::new(config);

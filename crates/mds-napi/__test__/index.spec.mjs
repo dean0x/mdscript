@@ -1585,3 +1585,70 @@ describe('ESC-injection hardening (issue #176 / CWE-150)', () => {
     );
   });
 });
+
+// ── AC-224 D8: unknown rule name warning channel on napi ─────────────────────
+//
+// An unknown rule name in the `rules` option produces a `lint_warnings` array
+// in the result rather than hard-failing (D8 / AC-224-1). Known rule names
+// produce no `lint_warnings` field (common-case cleanliness).
+
+describe('unknown rule name warning (AC-224 D8)', () => {
+  // L-N-WARN-1: lint() with unknown rule name returns lint_warnings array
+  test('L-N-WARN-1: lint with unknown rule name returns lint_warnings', () => {
+    const result = lint('Hello!\n', { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assert.equal(result.version, 1, 'version must be 1');
+    assert.ok(Array.isArray(result.lint_warnings), 'lint_warnings must be an array');
+    assert.ok(result.lint_warnings.length > 0, 'lint_warnings must be non-empty');
+    assert.ok(
+      result.lint_warnings[0].includes('no-such-rule-xyzzy'),
+      `lint_warnings[0] must name the unknown rule; got: ${result.lint_warnings[0]}`,
+    );
+    assert.ok(
+      result.lint_warnings[0].includes('recognised rules are') ||
+        result.lint_warnings[0].includes('recognized rules are'),
+      `lint_warnings[0] must list recognised rules; got: ${result.lint_warnings[0]}`,
+    );
+  });
+
+  // L-N-WARN-2: lint() with only known rules has no lint_warnings
+  test('L-N-WARN-2: lint with only known rules has no lint_warnings', () => {
+    const result = lint('Hello!\n', { rules: { 'unused-variable': 'off' } });
+    assert.equal(result.version, 1);
+    assert.ok(
+      result.lint_warnings === undefined || result.lint_warnings.length === 0,
+      `lint_warnings must be absent or empty for known rules; got: ${JSON.stringify(result.lint_warnings)}`,
+    );
+  });
+
+  // L-N-WARN-3: lintFile() with unknown rule name returns lint_warnings
+  test('L-N-WARN-3: lintFile with unknown rule name returns lint_warnings', () => {
+    const result = lintFile(SIMPLE_MDS, { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assert.equal(result.version, 1);
+    assert.ok(Array.isArray(result.lint_warnings), 'lint_warnings must be an array');
+    assert.ok(result.lint_warnings.length > 0, 'lint_warnings must be non-empty');
+    assert.ok(
+      result.lint_warnings[0].includes('no-such-rule-xyzzy'),
+      `lint_warnings[0] must name the unknown rule; got: ${result.lint_warnings[0]}`,
+    );
+  });
+
+  // L-N-WARN-4: lintVirtual() with unknown rule name returns lint_warnings
+  test('L-N-WARN-4: lintVirtual with unknown rule name returns lint_warnings', () => {
+    const modules = { 'main.mds': 'Hello!\n' };
+    const result = lintVirtual(modules, 'main.mds', { rules: { 'no-such-rule-xyzzy': 'error' } });
+    assert.equal(result.version, 1);
+    assert.ok(Array.isArray(result.lint_warnings), 'lint_warnings must be an array');
+    assert.ok(result.lint_warnings.length > 0, 'lint_warnings must be non-empty');
+    assert.ok(
+      result.lint_warnings[0].includes('no-such-rule-xyzzy'),
+      `lint_warnings[0] must name the unknown rule; got: ${result.lint_warnings[0]}`,
+    );
+  });
+
+  // L-N-WARN-5: lint continues — files[] is still present and correctly shaped
+  test('L-N-WARN-5: lint continues when rule name is unknown (files[] present)', () => {
+    const result = lint('Hello!\n', { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assert.ok(Array.isArray(result.files), 'files must be an array');
+    assert.strictEqual(result.truncated, false, 'truncated must be false');
+  });
+});

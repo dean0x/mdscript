@@ -65,6 +65,10 @@ pub use lint::{
     sanitize_control_chars_wire, FixLineSpan, LintConfig, LintDiagnostic, LintResult, Severity,
     TextEdit,
 };
+pub use lint::config::{
+    find_unknown_rule_names, format_unknown_rule_names_warning, UnknownRuleNames,
+    KNOWN_LINT_RULES,
+};
 pub use options::{
     format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
 };

@@ -97,48 +97,79 @@ pub(crate) fn first_occurrence<K: std::hash::Hash + Eq>(
 mod tests {
     use super::*;
 
-    /// ARC-3: Every registered rule name must map to its documented FixTier.
+    /// AC-224-9: Every registered rule name must map to its documented FixTier,
+    /// and the expected-tier table must agree with the registry in BOTH directions.
     ///
-    /// Enumerating all 10 rules explicitly means that a newly-added rule which
-    /// falls silently into the `_ => FixTier::C` catch-all arm will cause this
-    /// test to fail (once its expected tier is added here), preventing silent
-    /// misclassification in the JSON `fixable` field and the fix planner.
+    /// AD-224-2 (amended): `ALL_RULE_NAMES` removes string duplication but not
+    /// omission risk — an 11th rule module forgotten here compiles fine. The
+    /// mechanical closure requires:
+    /// 1. A separate `EXPECTED` table with explicit (name, tier) pairs.
+    /// 2. `assert_eq!(EXPECTED.len(), ALL_RULE_NAMES.len())` — length pin.
+    /// 3. Every registry entry appears in `EXPECTED` (registry → table).
+    /// 4. Every `EXPECTED` entry appears in the registry (table → registry).
     ///
-    /// Tier A: duplicate-import, duplicate-export, unreachable-branch, empty-block,
-    ///         legacy-interpolation
-    /// Tier B: unused-import, unused-function
-    /// Tier C: unused-variable, redundant-else, shadow-variable
+    /// A rule present in the registry but absent from `EXPECTED`, or vice versa,
+    /// fails this test. The `_ => FixTier::C` catch-all arm is now unreachable
+    /// for valid registered rules.
     #[test]
-    fn all_ten_rules_map_to_expected_tier() {
-        // Tier A — auto-fixable with reverify gate
+    fn registry_and_tier_table_are_bidirectionally_consistent() {
+        use super::super::rules::ALL_RULE_NAMES;
+        use super::super::config::KNOWN_LINT_RULES;
+
+        /// Canonical expected-tier table: (rule_name, expected_FixTier).
+        /// Must be updated whenever a rule is added, removed, or re-tiered.
+        /// Pin: len must equal ALL_RULE_NAMES.len() (10 as of this release).
+        const EXPECTED: &[(&str, FixTier)] = &[
+            // Tier A — auto-fixable with reverify gate
+            ("duplicate-export", FixTier::A),
+            ("duplicate-import", FixTier::A),
+            ("empty-block", FixTier::A),
+            ("legacy-interpolation", FixTier::A),
+            ("unreachable-branch", FixTier::A),
+            // Tier B — standalone-only fixable
+            ("unused-function", FixTier::B),
+            ("unused-import", FixTier::B),
+            // Tier C — report-only, never fixed
+            ("redundant-else", FixTier::C),
+            ("shadow-variable", FixTier::C),
+            ("unused-variable", FixTier::C),
+        ];
+
+        // Length pin: bump this when a new rule ships.
         assert_eq!(
-            rule_tier("duplicate-import"),
-            FixTier::A,
-            "duplicate-import"
+            EXPECTED.len(), 10,
+            "EXPECTED table length must equal the number of registered rules (10)"
         );
         assert_eq!(
-            rule_tier("duplicate-export"),
-            FixTier::A,
-            "duplicate-export"
+            ALL_RULE_NAMES.len(), 10,
+            "ALL_RULE_NAMES length must equal the number of registered rules (10)"
         );
         assert_eq!(
-            rule_tier("unreachable-branch"),
-            FixTier::A,
-            "unreachable-branch"
+            KNOWN_LINT_RULES.len(), 10,
+            "KNOWN_LINT_RULES length must equal the number of registered rules (10)"
         );
-        assert_eq!(rule_tier("empty-block"), FixTier::A, "empty-block");
-        assert_eq!(
-            rule_tier("legacy-interpolation"),
-            FixTier::A,
-            "legacy-interpolation"
-        );
-        // Tier B — standalone-only fixable
-        assert_eq!(rule_tier("unused-import"), FixTier::B, "unused-import");
-        assert_eq!(rule_tier("unused-function"), FixTier::B, "unused-function");
-        // Tier C — report-only, never fixed
-        assert_eq!(rule_tier("unused-variable"), FixTier::C, "unused-variable");
-        assert_eq!(rule_tier("redundant-else"), FixTier::C, "redundant-else");
-        assert_eq!(rule_tier("shadow-variable"), FixTier::C, "shadow-variable");
+
+        // Direction 1: every registry entry has a correct entry in EXPECTED.
+        for &name in ALL_RULE_NAMES {
+            let got = rule_tier(name);
+            let entry = EXPECTED.iter().find(|(n, _)| *n == name);
+            let expected_tier = entry
+                .unwrap_or_else(|| panic!("rule {name:?} is in the registry but missing from EXPECTED"))
+                .1
+                .clone();
+            assert_eq!(
+                got, expected_tier,
+                "rule_tier({name:?}) should be {expected_tier:?} per EXPECTED"
+            );
+        }
+
+        // Direction 2: every EXPECTED entry exists in the registry.
+        for &(name, ref _tier) in EXPECTED {
+            assert!(
+                ALL_RULE_NAMES.contains(&name),
+                "rule {name:?} is in EXPECTED but missing from ALL_RULE_NAMES (registry)"
+            );
+        }
     }
 
     /// is_output_neutral: legacy-interpolation is NOT output-neutral; all other

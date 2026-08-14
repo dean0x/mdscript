@@ -147,8 +147,11 @@ and `lintVirtual`.
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
 
-**Lint `rules` map:** unknown rule names are silently accepted (a typo has no effect);
-unknown severity values throw `mds::invalid_options`.
+**Lint `rules` map:** unknown rule names emit a warning and lint continues — the unknown
+name has no effect but `result.lint_warnings` (a `string[]` field, absent when empty)
+is populated so callers can surface the issue. Unknown severity values throw
+`mds::invalid_options`. On the CLI surface the warning goes to stderr; in binding
+surfaces it appears in `lint_warnings`.
 
 **Lint result shape:**
 ```ts
