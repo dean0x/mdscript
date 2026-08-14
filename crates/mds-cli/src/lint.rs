@@ -433,6 +433,13 @@ enum FixFileOutcome {
 ///
 /// `base_dir` is the file's parent (for reverify recompile).
 ///
+/// `display_label` is the caller-supplied display path (relative, forward-slash-normalised)
+/// written into every `diag.file` in residual results via `set_diag_display_path`; it
+/// becomes the `files[].file` wire key after `to_canonical_json` applies
+/// `sanitize_control_chars_wire`.  This is the value that appears in the JSON wire output
+/// and must be pre-sanitized by the caller for error-envelope entries that bypass
+/// `to_canonical_json`.
+///
 /// ## Reverify gate (AC-F-20)
 ///
 /// The reverify closure checks three conditions:
@@ -861,11 +868,12 @@ fn run_lint_file(
     };
     // Remap the basename-only `file` label that mds::lint() sets → the display
     // filename so all four FixFileOutcome arms carry a consistent label.
-    // Matches the explicit relabel in lint_one_file_accumulating (:1194) and
-    // lint_one_file_human (:1374); without this call the Rejected and NothingToFix
+    // Matches the explicit relabel in lint_one_file_accumulating and
+    // lint_one_file_human; without this call the Rejected and NothingToFix
     // arms rely on mds::lint independently deriving the same basename — correct
     // today, but a silent coupling that would break if the two derivations ever
-    // diverged (finding 3).
+    // diverged.  Centralising the relabel here is the explicit invariant:
+    // every FixFileOutcome carries `filename` as its display path.
     set_diag_display_path(&mut result, filename);
 
     if result.truncated && fix {
@@ -1093,7 +1101,9 @@ fn run_lint_directory(
     // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
     //
     // `relative_display` normalises to forward slashes so byte-wise order is
-    // identical on Unix and Windows (finding 4).  `sanitize_control_chars_wire` is
+    // identical on Unix and Windows — the sort key and the emitted JSON `file`
+    // key are the same String by construction, so array position matches key
+    // order on both platforms.  `sanitize_control_chars_wire` is
     // then applied so the sort key matches the emitted key produced by
     // `to_canonical_json`: POSIX filenames may legally contain control bytes
     // (e.g. 0x01), and sorting on the raw (unsanitized) string would place a
@@ -1190,8 +1200,15 @@ fn lint_one_file_accumulating(
     // sanitizes the key via `sanitize_control_chars_wire`; `run_lint_directory`
     // sorts on that same sanitized string, so emitted array order and emitted file
     // key order are consistent for all inputs including control-byte filenames
-    // (AC-P1-10, finding 2).
+    // (AC-P1-10).
     let display_path = relative_display(file, ctx.lint_root);
+    // Error-only entries (`{"file": …, "error": …}`) bypass `to_canonical_json`
+    // and therefore bypass its `sanitize_control_chars_wire` pass.  Pre-sanitize
+    // here so the `file` key in error entries is treated identically to the `file`
+    // key in diagnostic entries — hostile filenames cannot inject control, bidi,
+    // or separator characters into either entry type (spec.md §lint-json `file`
+    // contract; ADR-008).
+    let file_key = mds::sanitize_control_chars_wire(&display_path).into_owned();
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
@@ -1205,7 +1222,7 @@ fn lint_one_file_accumulating(
         Ok(c) => c,
         Err(ref e) => {
             json_files.push(serde_json::json!({
-                "file": display_path,
+                "file": file_key,
                 "error": e.serialize()
             }));
             return FileTally::Error;
@@ -1216,7 +1233,7 @@ fn lint_one_file_accumulating(
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
-                "file": display_path,
+                "file": file_key,
                 "error": e.serialize()
             }));
             return if matches!(e, MdsError::ResourceLimit { .. }) {
@@ -1250,7 +1267,7 @@ fn lint_one_file_accumulating(
             Err(e) => {
                 // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
                 json_files.push(serde_json::json!({
-                    "file": display_path,
+                    "file": file_key,
                     "error": e.serialize()
                 }));
                 return FileTally::Error;
@@ -1316,7 +1333,7 @@ fn lint_one_file_accumulating(
             Ok(s) => s,
             Err(e) => {
                 json_files.push(serde_json::json!({
-                    "file": display_path,
+                    "file": file_key,
                     "error": e.serialize()
                 }));
                 return FileTally::Error;
@@ -1367,7 +1384,7 @@ fn lint_one_file_human(
 
     // Compute a display path relative to the lint root for human rendering.
     // `relative_display` normalises to forward slashes, matching the unsanitized
-    // base used by `run_lint_directory`'s sort (finding 2).  Human rendering
+    // base used by `run_lint_directory`'s sort (AC-P1-10).  Human rendering
     // shows the real filename bytes rather than sanitized `\uXXXX` escapes.
     let display_path = relative_display(file, ctx.lint_root);
 
