@@ -94,6 +94,7 @@ via struct literals. Use the named constructor or builder listed for each:
 selective import:
 
 ```jsonc
+// abbreviated — see spec.md for the full schema
 // before
 { "files": [ { "diagnostics": [
     { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } },
