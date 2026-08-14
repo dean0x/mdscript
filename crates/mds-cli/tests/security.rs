@@ -571,11 +571,10 @@ fn build_cli_authored_error_message_escapes_control_bytes() {
 /// forgery still worked. A rule name is a JSON object key: never legitimately
 /// multi-line, so it is WIRE per the spec §7.5 per-field rule.
 ///
-/// **AC-224-4 width claim**: `eprint_warning` is a bare `eprintln!` that never
-/// consults terminal width. Under piped stdio the tty ioctl is absent, so miette's
-/// width detection is inoperative — COLUMNS is not read by the binary in this mode
-/// and all column values produce byte-identical output. The single-pass assertions
-/// below establish the escape property; the width invariant holds by construction.
+/// **AC-224-4**: run across multiple terminal widths to prove the warning never wraps
+/// (eprint_warning → bare eprintln!, independent of COLUMNS). The multi-width loop
+/// produces byte-identical output at all seven column values and empirically confirms
+/// the single-line invariant, consistent with the sibling T-ESC-RULE-2 test.
 #[test]
 fn lint_unknown_rule_name_escapes_control_bytes() {
     let dir = tempfile::tempdir().unwrap();
@@ -597,89 +596,89 @@ fn lint_unknown_rule_name_escapes_control_bytes() {
     )
     .unwrap();
 
-    // AC-224-4: run once. Width is irrelevant by construction: `eprint_warning` is a
-    // bare `eprintln!` that never consults terminal width. Under piped stdio the tty
-    // ioctl is absent, so miette's width detection is inoperative — COLUMNS is not
-    // read by the binary in this mode and every column value produces byte-identical
-    // output. A COLUMNS loop that the binary cannot observe adds no discriminating
-    // power; the structural guarantee is more authoritative than empirical enumeration.
-    let out = mds_bin()
-        .arg("lint")
-        .arg(dir.path())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
+    // AC-224-4: run across multiple terminal widths to prove the singular warning
+    // never wraps (eprint_warning → bare eprintln!, independent of COLUMNS).
+    for columns in [40u32, 60, 80, 100, 120, 160, 200] {
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .env("COLUMNS", columns.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // ── Non-vacuity: the warning fired, naming the rule and the recognised list ──
-    assert!(
-        stderr.contains("unknown lint rule"),
-        "non-vacuity: the unknown-rule warning must be rendered; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("EVIL"),
-        "non-vacuity: the rule name itself must be printed; got: {stderr}"
-    );
-    assert!(
-        stderr.contains("recognised rules are"),
-        "non-vacuity: the recognised-rules list must appear; got: {stderr}"
-    );
-
-    // ── Negative: no raw hostile byte survives ───────────────────────────────
-    assert!(
-        !out.stderr.contains(&0x1Bu8),
-        "raw ESC byte (0x1B) must not reach stderr from an mds.json rule name; got: {stderr}"
-    );
-    assert_no_control_chars(&stderr, "mds lint unknown-rule warning");
-
-    // ── Negative: neither forged line appears on a line of its own ───────────
-    //
-    // `assert_no_control_chars` deliberately permits `\n` so it can be used on HUMAN-mode
-    // prose, so it cannot see this. Mirrors T-ESC-FNAME-1's standalone-line assertion.
-    for forged in ["Clean: totally-real.mds", "OK: all-fine.mds"] {
+        // ── Non-vacuity: the warning fired, naming the rule and the recognised list ──
         assert!(
-            !stderr.lines().any(|l| l.trim() == forged),
-            "an mds.json rule name must not be able to forge the standalone status line \
-             {forged:?}; got: {stderr}"
+            stderr.contains("unknown lint rule"),
+            "COLUMNS={columns}: the unknown-rule warning must be rendered; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("EVIL"),
+            "COLUMNS={columns}: the rule name itself must be printed; got: {stderr}"
+        );
+        assert!(
+            stderr.contains("recognised rules are"),
+            "COLUMNS={columns}: the recognised-rules list must appear; got: {stderr}"
+        );
+
+        // ── Negative: no raw hostile byte survives ───────────────────────────────
+        assert!(
+            !out.stderr.contains(&0x1Bu8),
+            "COLUMNS={columns}: raw ESC byte (0x1B) must not reach stderr from an mds.json rule name; got: {stderr}"
+        );
+        assert_no_control_chars(&stderr, "mds lint unknown-rule warning");
+
+        // ── Negative: neither forged line appears on a line of its own ───────────
+        //
+        // `assert_no_control_chars` deliberately permits `\n` so it can be used on HUMAN-mode
+        // prose, so it cannot see this. Mirrors T-ESC-FNAME-1's standalone-line assertion.
+        // The rule name carries TWO newlines so "Clean: totally-real.mds" lands as a
+        // middle segment that would appear standalone if safe_inline were removed — live.
+        for forged in ["Clean: totally-real.mds", "OK: all-fine.mds"] {
+            assert!(
+                !stderr.lines().any(|l| l.trim() == forged),
+                "COLUMNS={columns}: an mds.json rule name must not be able to forge the standalone \
+                 status line {forged:?}; got: {stderr}"
+            );
+        }
+
+        // ── Positive: the escaped literals are present ───────────────────────────
+        for escaped in ["\\u001B", "\\u202E", "\\u061C"] {
+            assert!(
+                stderr.contains(escaped),
+                "COLUMNS={columns}: {escaped} must appear in the unknown-rule warning; got: {stderr}"
+            );
+        }
+        assert_eq!(
+            stderr.matches("\\u000A").count(),
+            2,
+            "COLUMNS={columns}: both embedded newlines must be escaped to their WIRE literal; got: {stderr}"
+        );
+
+        // ── Non-vacuity: the whole rule name landed on ONE line ──────────────────
+        //
+        // AC-224-4: the multi-width loop proves the warning occupies exactly one line
+        // at every terminal width — eprint_warning never wraps.
+        let warning_lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("unknown lint rule"))
+            .collect();
+        assert_eq!(
+            warning_lines.len(),
+            1,
+            "COLUMNS={columns}: the warning must occupy exactly one line; got: {stderr}"
+        );
+        assert!(
+            warning_lines[0].contains("EVIL")
+                && warning_lines[0].contains("recognised rules are")
+                && warning_lines[0].ends_with("; ignoring"),
+            "COLUMNS={columns}: the single warning line must carry the rule name, the \
+             recognised-rules list, and the trailing '; ignoring'; got: {stderr}"
         );
     }
-
-    // ── Positive: the escaped literals are present ───────────────────────────
-    for escaped in ["\\u001B", "\\u202E", "\\u061C"] {
-        assert!(
-            stderr.contains(escaped),
-            "{escaped} must appear in the unknown-rule warning; got: {stderr}"
-        );
-    }
-    assert_eq!(
-        stderr.matches("\\u000A").count(),
-        2,
-        "both embedded newlines must be escaped to their WIRE literal; got: {stderr}"
-    );
-
-    // ── Non-vacuity: the whole rule name landed on ONE line ──────────────────
-    //
-    // AC-224-4: eprint_warning is a bare eprintln! that never wraps. Under piped
-    // stdio the tty ioctl is absent and COLUMNS is not read, so the single-line
-    // invariant holds by construction — width cannot influence the output.
-    let warning_lines: Vec<&str> = stderr
-        .lines()
-        .filter(|l| l.contains("unknown lint rule"))
-        .collect();
-    assert_eq!(
-        warning_lines.len(),
-        1,
-        "the warning must occupy exactly one line; got: {stderr}"
-    );
-    assert!(
-        warning_lines[0].contains("EVIL")
-            && warning_lines[0].contains("recognised rules are")
-            && warning_lines[0].ends_with("; ignoring"),
-        "the single warning line must carry the rule name, the recognised-rules list, \
-         and the trailing '; ignoring'; got: {stderr}"
-    );
 }
 
 /// T-ESC-RULE-2 [security-11-plural / CWE-150 / PF-004 / PF-013 / AC-224-4 / AC-224-5]:
@@ -702,7 +701,12 @@ fn lint_plural_unknown_rule_names_escape_control_bytes() {
     // Two distinct hostile rule names — ESC + colour code in the first,
     // RTL-override + Arabic-letter-mark in the second — plus embedded newlines
     // carrying forged status lines in each.
-    let rule_a = format!("{}[31mAAA{}RULE\nClean: real-a.mds", '\u{1b}', '\u{202e}');
+    // Two newlines in rule_a: "Clean: real-a.mds" is the middle segment that would
+    // land standalone if safe_inline were removed — makes the forged-line assertion live.
+    let rule_a = format!(
+        "{}[31mAAA{}RULE\nClean: real-a.mds\nOK: fake-a.mds",
+        '\u{1b}', '\u{202e}'
+    );
     let rule_b = format!("BBB{}RULE\nOK: real-b.mds", '\u{061c}');
     let mut rules = serde_json::Map::new();
     rules.insert(rule_a, serde_json::Value::String("warn".to_string()));
@@ -776,6 +780,13 @@ fn lint_plural_unknown_rule_names_escape_control_bytes() {
             stderr.contains("\\u061C"),
             "COLUMNS={columns}: Arabic-letter-mark in second name must be escaped to \
              \\u061C; got: {stderr}"
+        );
+        // Three embedded newlines total: two from rule_a, one from rule_b.
+        assert_eq!(
+            stderr.matches("\\u000A").count(),
+            3,
+            "COLUMNS={columns}: all embedded newlines (2 from first name, 1 from second) \
+             must be escaped to \\u000A; got: {stderr}"
         );
 
         // ── Non-vacuity: the plural warning occupies exactly ONE line ────────
