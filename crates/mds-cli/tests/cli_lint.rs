@@ -3427,18 +3427,29 @@ fn unknown_rule_warning_suppressed_by_quiet() {
     );
 }
 
-/// AC-224-19: a directory with many files emits exactly ONE unknown-rule warning,
-/// not one per file.
+/// AC-224-19: a directory tree whose files span multiple subdirectories emits exactly
+/// ONE unknown-rule warning, not one per file or one per subdirectory.
 ///
-/// The implementation detects unknowns once at config-load time, not per-file
-/// invocation. This test creates 5 files in the same directory to ensure the
-/// warning count does not scale with the number of linted files.
+/// A flat-directory test (all files in one dir) would be vacuous because the
+/// base_dir cache already coalesces them — the caching claim under review is about
+/// SUBDIRECTORIES that all resolve to the same root `mds.json`. This test uses a
+/// nested tree (root + subdirs a/, b/, c/d/) so that each unique base_dir produces a
+/// distinct cache lookup. Without the config_dir-keyed deduplication in
+/// `LintDirCtx::config_for`, each distinct base_dir would re-load the config and
+/// re-emit the warning, yielding N warnings for N subdirs (the AC-224-19 bug).
 #[test]
 fn unknown_rule_one_warning_per_invocation_not_per_file() {
     let dir = tempfile::tempdir().unwrap();
-    for i in 0..5u32 {
-        std::fs::write(dir.path().join(format!("file{i}.mds")), "Hello!\n").unwrap();
+    // Files in different subdirectories — each has a distinct base_dir. All are
+    // governed by the single root mds.json, exercising the config_dir deduplication.
+    for subdir in ["a", "b", "c", "c/d"] {
+        let sub = dir.path().join(subdir);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("file.mds"), "Hello!\n").unwrap();
     }
+    // One file at the root level so the base_dir == config_dir case is also covered.
+    std::fs::write(dir.path().join("root.mds"), "Hello!\n").unwrap();
+    // Single mds.json at the root governs every file in the tree.
     write_unknown_rule_config(dir.path());
 
     let out = mds_bin()
@@ -3451,21 +3462,25 @@ fn unknown_rule_one_warning_per_invocation_not_per_file() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    // AC-224-19: the warning must appear at least once (non-vacuity).
+    // AC-224-19: the warning must appear at least once (positive control, PF-013).
     assert!(
-        stderr.contains("unknown lint rule") || stderr.contains("no-such-rule-xyzzy"),
-        "AC-224-19: warning must appear; got stderr: {stderr}"
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-19: warning must appear on stderr; got stderr: {stderr}"
     );
 
-    // AC-224-19: the warning must appear at most once (one per invocation, not per file).
+    // AC-224-19: exactly one warning per invocation, regardless of how many
+    // subdirectories contributed distinct base_dir lookups. A warning_count > 1 here
+    // means config_for is keying on base_dir rather than config_dir and emitting a
+    // duplicate for each subdir that resolves to the same root mds.json.
     let warning_count = stderr
         .lines()
         .filter(|l| l.contains("unknown lint rule"))
         .count();
     assert_eq!(
         warning_count, 1,
-        "AC-224-19: warning must appear exactly once per invocation, not once per file \
-         (got {warning_count}); got stderr: {stderr}"
+        "AC-224-19: warning must appear exactly once per distinct config directory \
+         (got {warning_count} — one per subdir instead of one per config); \
+         got stderr:\n{stderr}"
     );
 }
 
@@ -3725,6 +3740,104 @@ fn unknown_rule_json_stdout_contains_no_warning_text() {
     }
     serde_json::from_str::<serde_json::Value>(stdout.trim())
         .expect("AC-224-21: stdout must parse as a single JSON document");
+}
+
+/// AC-224-21 (single-file target): `--format json` stdout is clean when the unknown-
+/// rule warning fires.
+///
+/// `run_lint_file` is a separate emitter from `run_lint_directory`; this test covers
+/// it independently (AC-224-21 gap identified in the code review). Paired positive
+/// control (PF-013 / ADR-009): the warning IS on stderr, so a clean-stdout assertion
+/// cannot pass vacuously on a run where the warning never fired.
+#[test]
+fn unknown_rule_json_stdout_clean_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("clean.mds");
+    std::fs::write(&file, "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control: warning fired on stderr.
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-21 (file): warning must fire on stderr; got: {stderr}"
+    );
+
+    // AC-224-21: stdout must be valid JSON and contain no warning text.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "AC-224-21 (file): stdout must be valid JSON; error: {e}; got: {stdout}"
+        )
+    });
+    for needle in ["no-such-rule-xyzzy", "recognised rules are", "warning", "ignoring"] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21 (file): stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+}
+
+/// AC-224-21 (stdin target): `--format json` stdout is clean when the unknown-rule
+/// warning fires.
+///
+/// `run_lint_stdin` is a separate emitter from `run_lint_directory` and
+/// `run_lint_file`; this test covers it independently (AC-224-21 gap). `current_dir`
+/// is set to a tempdir containing `mds.json` so `run_lint_stdin` picks up the unknown
+/// rule. Paired positive control (PF-013 / ADR-009).
+#[test]
+fn unknown_rule_json_stdout_clean_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let mut child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .arg("--format")
+        .arg("json")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe — child may exit before reading all of stdin.
+    let _ = child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control: warning fired on stderr.
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-21 (stdin): warning must fire on stderr; got: {stderr}"
+    );
+
+    // AC-224-21: stdout must be valid JSON and contain no warning text.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "AC-224-21 (stdin): stdout must be valid JSON; error: {e}; got: {stdout}"
+        )
+    });
+    for needle in ["no-such-rule-xyzzy", "recognised rules are", "warning", "ignoring"] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21 (stdin): stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
 }
 
 /// AC-224-22: the pre-subcommand global form `mds --quiet lint <dir>` suppresses the
