@@ -1651,4 +1651,46 @@ describe('unknown rule name warning (AC-224 D8)', () => {
     assert.ok(Array.isArray(result.files), 'files must be an array');
     assert.strictEqual(result.truncated, false, 'truncated must be false');
   });
+
+  // L-N-WARN-ESC: ADR-008 per-surface — lint_warnings must not deliver raw control bytes.
+  //
+  // The mds-core unit test `warning_wire_escapes_hostile_rule_name` proves the formatter
+  // escapes hostile bytes before building the string. This test proves the string that
+  // actually reaches a JS consumer through the napi binding carries no raw control byte
+  // (negative) and DOES carry the sanitized \\u001B literal (positive control, PF-013).
+  //
+  // PF-018: the ESC byte is constructed at runtime — never authored as a literal.
+  test('L-N-WARN-ESC: hostile rule name (ESC byte) — lint_warnings delivers escaped literal, not raw byte', () => {
+    const esc = String.fromCharCode(0x1b); // U+001B — runtime construction only (PF-018)
+    const hostileRule = esc + '[31mhostile-rule' + esc + '[0m';
+    const result = lint('Hello!\n', { rules: { [hostileRule]: 'warn' } });
+
+    // The call must succeed and expose the warning through lint_warnings (D8 / AC-224-1).
+    assert.ok(Array.isArray(result.lint_warnings), 'L-N-WARN-ESC: lint_warnings must be an array');
+    assert.ok(result.lint_warnings.length > 0, 'L-N-WARN-ESC: lint_warnings must be non-empty');
+
+    const w0 = result.lint_warnings[0];
+    assert.equal(typeof w0, 'string', 'L-N-WARN-ESC: lint_warnings[0] must be a string');
+
+    // Negative: no raw C0 (excl. \\t \\n), DEL, or C1 byte may survive (ADR-008).
+    for (let i = 0; i < w0.length; i++) {
+      const code = w0.charCodeAt(i);
+      const isC0 = code < 0x20 && code !== 0x09 && code !== 0x0a;
+      const isDel = code === 0x7f;
+      const isC1 = code >= 0x80 && code <= 0x9f;
+      assert.ok(
+        !isC0 && !isDel && !isC1,
+        'L-N-WARN-ESC: raw hostile char U+' + code.toString(16).toUpperCase().padStart(4, '0') +
+        ' at index ' + i + ' must not appear in lint_warnings[0]; got: ' + JSON.stringify(w0),
+      );
+    }
+
+    // Positive control (PF-013/ADR-009): the sanitized literal must be present so
+    // the negative above cannot pass merely because the name never reached the message.
+    assert.ok(
+      w0.includes('\\u001B'),
+      'L-N-WARN-ESC: sanitized \\u001B literal must appear in lint_warnings[0]; got: ' +
+        JSON.stringify(w0),
+    );
+  });
 });

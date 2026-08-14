@@ -514,3 +514,45 @@ def test_py_warn_canonical_sanitizes_lint_warnings() -> None:
     assert expected_escape in warnings[0], (
         f"ESC must appear as the escaped literal \\u001B; got: {warnings[0]!r}"
     )
+
+
+def test_py_warn_live_lint_escapes_hostile_rule_name() -> None:
+    """live lint() path: a hostile rule name (ESC byte) must not reach lint_warnings raw.
+
+    ADR-008 per-surface: the mds-core unit test warning_wire_escapes_hostile_rule_name
+    proves the formatter escapes before building the string. This test proves the string
+    that actually reaches Python through the PyO3 binding carries no raw control byte
+    (negative) and DOES carry the sanitized literal (positive control, PF-013/ADR-009).
+
+    PF-018: the ESC byte is constructed at runtime via chr() — never authored as a literal.
+    """
+    esc = chr(0x1B)  # U+001B — runtime construction only (PF-018)
+    hostile_rule = esc + "[31mhostile-rule" + esc + "[0m"
+    r = m.lint(CLEAN_SOURCE, rules={hostile_rule: "warn"})
+
+    # The call must succeed and expose the warning through lint_warnings (D8 / AC-224-1).
+    warnings = r.lint_warnings
+    assert isinstance(warnings, list), f"lint_warnings must be a list; got: {type(warnings)}"
+    assert len(warnings) > 0, "lint_warnings must be non-empty for a hostile unknown rule name"
+
+    w0 = warnings[0]
+    assert isinstance(w0, str), f"lint_warnings[0] must be a str; got: {type(w0)}"
+
+    # Negative: no raw C0 (excl. \t \n), DEL, or C1 byte may survive (ADR-008).
+    for i, ch in enumerate(w0):
+        code = ord(ch)
+        is_c0 = code < 0x20 and code not in (0x09, 0x0A)
+        is_del = code == 0x7F
+        is_c1 = 0x80 <= code <= 0x9F
+        assert not (is_c0 or is_del or is_c1), (
+            f"raw hostile char U+{code:04X} at index {i} must not appear in "
+            f"lint_warnings[0]; got: {w0!r}"
+        )
+
+    # Positive control (PF-013/ADR-009): the sanitized literal must be present so
+    # the negative above cannot pass merely because the name never reached the message.
+    # Construct the expected 6-char string at runtime (PF-018).
+    expected_escape = "\\u001B"  # backslash + u + 0 + 0 + 1 + B
+    assert expected_escape in w0, (
+        f"sanitized \\u001B literal must appear in lint_warnings[0]; got: {w0!r}"
+    )

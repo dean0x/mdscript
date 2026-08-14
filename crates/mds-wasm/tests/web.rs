@@ -1296,6 +1296,64 @@ fn wasm_lint_unknown_rule_no_lint_warnings_absent_on_clean() {
     );
 }
 
+/// W-WARN-ESC (ADR-008 per-surface): a hostile rule name containing U+001B must not
+/// deliver a raw control byte through `lint_warnings` to the JS consumer.
+///
+/// The mds-core unit test `warning_wire_escapes_hostile_rule_name` proves the
+/// formatter escapes before building the string. This test proves the string that
+/// actually crosses the WASM FFI boundary carries no raw control byte (negative) and
+/// DOES carry the six-character ASCII sequence backslash-u-0-0-1-B (positive control,
+/// PF-013/ADR-009).
+///
+/// PF-018: hostile bytes are built from Rust `\u{..}` escapes — never authored as
+/// literal bytes in this source file.
+#[wasm_bindgen_test]
+fn wasm_lint_hostile_rule_name_escapes_control_bytes_in_lint_warnings() {
+    // Construct the hostile rule name at runtime using Rust char escapes (PF-018).
+    let hostile_rule = format!("\u{1b}[31mhostile-rule\u{1b}[0m");
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { hostile_rule: "warn" }
+    }));
+    let result =
+        mds_wasm::lint("Hello!\n", opts).expect("W-WARN-ESC: lint must succeed with hostile rule name");
+
+    // The warning must be present (D8 / AC-224-1) — call succeeds, lint_warnings is non-empty.
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        !lint_warnings.is_undefined() && !lint_warnings.is_null(),
+        "W-WARN-ESC: lint_warnings must be present for a hostile unknown rule name"
+    );
+    let warnings_arr = js_sys::Array::from(&lint_warnings);
+    assert!(
+        warnings_arr.length() > 0,
+        "W-WARN-ESC: lint_warnings must be non-empty"
+    );
+    let w0 = warnings_arr
+        .get(0)
+        .as_string()
+        .expect("W-WARN-ESC: lint_warnings[0] must be a string");
+
+    // Negative: no raw control byte (C0 excl. \t \n, DEL, C1) may survive (ADR-008).
+    for (i, ch) in w0.char_indices() {
+        let code = ch as u32;
+        let is_c0 = code < 0x20 && code != 0x09 && code != 0x0a;
+        let is_del = code == 0x7f;
+        let is_c1 = (0x80..=0x9f).contains(&code);
+        assert!(
+            !is_c0 && !is_del && !is_c1,
+            "W-WARN-ESC: raw hostile char U+{code:04X} at byte {i} must not appear \
+             in lint_warnings[0]; got: {w0:?}"
+        );
+    }
+
+    // Positive control (PF-013/ADR-009): the sanitized literal must be present so
+    // the negative above cannot pass merely because the name never reached the message.
+    assert!(
+        w0.contains("\\u001B"),
+        "W-WARN-ESC: sanitized \\u001B literal must appear in lint_warnings[0]; got: {w0:?}"
+    );
+}
+
 #[wasm_bindgen_test]
 fn wasm_lint_unknown_severity_value_throws_invalid_options() {
     // W-SEVER-1 (AC-224-1 — paired throw arm, lint path): unknown severity
