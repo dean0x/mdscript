@@ -2,7 +2,7 @@
 //!
 //! The engine runs AFTER the check gate (resolve+validate) passes, confirming the
 //! template compiles correctly. It then independently tokenizes and parses the entry
-//! source for a single-pass facts walk, applies the 9 lint rules as plain
+//! source for a single-pass facts walk, applies the 10 lint rules as plain
 //! functions, and returns a `LintResult`.
 //!
 //! ## Pipeline (per file)
