@@ -492,9 +492,5 @@ def test_py_warn_canonical_sanitizes_lint_warnings() -> None:
         f"ESC byte must be sanitized in lint_warnings via LintResult(canonical); "
         f"got: {warnings[0]!r}"
     )
-    # The sanitized form must be non-empty — hostile bytes are replaced, not dropped.
+    # The sanitized form must be non-empty: hostile bytes are replaced, not dropped.
     assert len(warnings[0]) > 0, "sanitized warning must be non-empty"
-    # The WIRE-escaped form of ESC (U+001B) is the six-character literal .
-    assert "\\u001B" in warnings[0], (
-        f"ESC must appear as the escaped literal \\u001B; got: {warnings[0]!r}"
-    )

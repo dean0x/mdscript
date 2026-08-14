@@ -940,7 +940,7 @@ fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>,
 /// parallel-path gap (PF-004).
 ///
 /// The live lint path is safe because `format_unknown_rule_names_warning`
-/// WIRE-escapes each string before [`inject_lint_warnings`] injects it.  The
+/// WIRE-escapes each string before `mds::attach_lint_warnings` injects it.  The
 /// `LintResult(canonical)` / pickle path must also sanitize `lint_warnings` because
 /// callers may supply untrusted canonical data containing hostile control bytes.
 ///
@@ -971,7 +971,10 @@ fn sanitize_lint_value(value: &mut serde_json::Value) {
     // Sanitize lint_warnings strings (PF-004: the live path escapes via
     // format_unknown_rule_names_warning before injection, but LintResult(canonical) /
     // pickle callers may supply untrusted data directly).
-    if let Some(arr) = value.get_mut("lint_warnings").and_then(|v| v.as_array_mut()) {
+    if let Some(arr) = value
+        .get_mut("lint_warnings")
+        .and_then(|v| v.as_array_mut())
+    {
         for item in arr.iter_mut() {
             if let serde_json::Value::String(s) = item {
                 if let std::borrow::Cow::Owned(sanitized) = mds::sanitize_control_chars_wire(s) {
