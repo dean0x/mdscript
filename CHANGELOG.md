@@ -794,26 +794,20 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   - **CLI**: the warning goes to **stderr**, never stdout, so `mds lint --format json`
     still writes a single valid JSON document. `--quiet` suppresses it. Singular and
     plural formats (offenders sorted lexicographically):
-    - `warning: unknown lint rule 'NAME' in mds.json; recognised rules are: …; ignoring`
-    - `warning: unknown lint rules: 'A', 'B' in mds.json; recognised rules are: …; ignoring`
+    - `warning: in mds.json: unknown lint rule 'NAME'; recognised rules are: …; ignoring`
+    - `warning: in mds.json: unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
   - **napi / WASM / Python**: the warning is surfaced as `lint_warnings: string[]` on
     the lint result. In the JSON wire form and in `to_dict()` / `to_json()` output, the
     key is absent (not `null`, not `[]`) when no warnings occurred. On the Python
     live-object surface, `LintResult.lint_warnings` is a property that always exists
-    and returns an empty list when no warnings occurred. The message format differs from
-    the CLI — **accepted residual** (AC-224-3 requires byte-identity across all five
-    surfaces; the binding format is a knowing deviation, held by per-surface goldens
-    per PF-007). The two structural differences: no `"warning:"` prefix and no `"in
-    mds.json"` source context (both CLI forms place the rule names before the source
-    context; the colon placement in the plural form is the same as the binding form):
+    and returns an empty list when no warnings occurred. The message body is shared with
+    the CLI via `mds::format_unknown_rule_names_warning` (AC-224-3 met); the only
+    per-surface difference is that the CLI prefixes `"warning: in mds.json: "` to carry
+    the source-file provenance on stderr, while the bindings use the body as-is:
     - Singular: `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
     - Plural:   `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
-    Compare the CLI plural `warning: unknown lint rules: 'A', 'B' in mds.json; …`
-    — the binding form omits both the prefix and the `in mds.json` clause but the
-    colon placement (`lint rules: 'A', 'B'`) is shared. The recognised-rules list and sort order
-    are shared with the CLI via `mds::KNOWN_LINT_RULES`. Per-surface parity (PF-007):
-    each surface's format is asserted by its own tests; no cross-surface byte-identity
-    is claimed.
+    The recognised-rules list, sort order, and name wire-escaping are all shared.
+    Per-surface parity (PF-007): each surface's format is asserted by its own tests.
   - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`,
     `mds fmt <DIR>`, and `watch` read `mds.json` via `load_config` but deserialize
     the `lint` field without calling `load_lint_config` — an accepted D2(a)

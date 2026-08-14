@@ -197,17 +197,11 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     match config_opt {
         None => Ok(mds::LintConfig::default()),
         Some((mds_config, _config_dir)) => {
-            // AC-224-3 residual (PF-007): the CLI warning text diverges from the binding
-            // surfaces by design — it adds "warning:" prefix and "in mds.json" context;
-            // the bindings use `mds::format_unknown_rule_names_warning`. The recognised-rules
-            // list and its sort order are shared via `mds::KNOWN_LINT_RULES` (AC-224-3
-            // guarantee). The safe_inline / print-discipline contract (AD-224-3, AC-224-6)
-            // and the --quiet gate (AD-224-5, AC-224-22) are documented at
-            // `emit_unknown_rule_warning`.
-            //
             // into_core_config returns (config, Option<UnknownRuleNames>) in one step —
             // structurally forcing the caller to handle the unknowns report so detection
             // cannot be accidentally skipped (review finding at config.rs:104).
+            // The safe_inline / print-discipline contract (AD-224-3, AC-224-6) and the
+            // --quiet gate (AD-224-5, AC-224-22) are documented at `emit_unknown_rule_warning`.
             let (lint_config, unknown) = mds_config.lint.into_core_config();
             if let Some(unknown) = unknown {
                 emit_unknown_rule_warning(&unknown, quiet);
@@ -225,51 +219,28 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
 /// the same work set represented twice drifts; ADR-008: the escape contract is
 /// per-file, so every call site is equally security-relevant).
 ///
+/// AC-224-3: delegates the message body to [`mds::format_unknown_rule_names_warning`]
+/// so the CLI and all binding surfaces share one canonical phrasing. The CLI adds
+/// `"warning: in mds.json: "` as a prefix to carry the source-file provenance —
+/// the ONLY structural difference from the binding surface format.
+///
 /// AD-224-3 (AC-224-6): every value interpolated inside `eprint_warning`'s
 /// `format!` must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that
 /// `print_discipline.rs`'s trace accepts without an allowlist entry. Keeping the
-/// `eprint_warning` calls here (in a named function inside `crates/mds-cli/src/`)
+/// `eprint_warning` call here (in a named function inside `crates/mds-cli/src/`)
 /// preserves that machine-checked coverage: the scanner enumerates every `.rs`
 /// file under `src/` and checks every `eprint_warning(…)` call site it finds.
-///
-/// Intermediate locals (`listed`, `recognised`) are fine; the constraint is on
-/// the FINAL `eprint_warning` argument — it must be a whole-expression inside the
-/// enclosing `format!`, not hoisted into an `if`/`else` initialiser.
+/// `safe_inline(&core_msg)` satisfies that constraint; the call is idempotent
+/// because names are already wire-escaped inside `format_unknown_rule_names_warning`.
 ///
 /// AD-224-5 (AC-224-22): no-op when `quiet` is true.
 fn emit_unknown_rule_warning(unknown: &mds::UnknownRuleNames, quiet: bool) {
     if quiet {
         return;
     }
-    // AC-224-2/AC-224-3: names() is sorted; KNOWN_LINT_RULES is sorted.
-    let names = unknown.names();
-    let recognised = mds::KNOWN_LINT_RULES.join(", ");
-    if let [only] = names {
-        eprint_warning(&format!(
-            "warning: unknown lint rule '{}' in mds.json; \
-             recognised rules are: {}; ignoring",
-            safe_inline(only),
-            safe_inline(&recognised)
-        ));
-    } else {
-        // AD-224-3: escape each name individually before assembly,
-        // matching the core formatter's per-name shape. The outer
-        // safe_inline on the assembled string is idempotent (the
-        // \uXXXX escape sequences from the inner calls are ASCII
-        // and are not re-escaped) but keeps the print-discipline
-        // guard satisfied (AC-224-6: whole-expression sanitizer call).
-        let listed = names
-            .iter()
-            .map(|n| format!("'{}'", safe_inline(n)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprint_warning(&format!(
-            "warning: unknown lint rules: {} in mds.json; \
-             recognised rules are: {}; ignoring",
-            safe_inline(&listed),
-            safe_inline(&recognised)
-        ));
-    }
+    // AC-224-3: shared message body; "in mds.json:" prefix carries source provenance.
+    let core_msg = mds::format_unknown_rule_names_warning(unknown);
+    eprint_warning(&format!("warning: in mds.json: {}", safe_inline(&core_msg)));
 }
 
 // ── Display-path remap ────────────────────────────────────────────────────────
@@ -1131,8 +1102,8 @@ impl<'a> LintDirCtx<'a> {
                 }
 
                 // First load for this config_dir: build the config and emit the warning.
-                // Contract documentation (safe_inline, --quiet, AC-224-3 residual) lives
-                // at `emit_unknown_rule_warning` — the single emitter shared with
+                // Contract documentation (safe_inline, --quiet, AC-224-3) lives at
+                // `emit_unknown_rule_warning` — the single emitter shared with
                 // load_lint_config (PF-009).
                 let (lint_config, unknown) = mds_config.lint.into_core_config();
                 if let Some(unknown) = unknown {

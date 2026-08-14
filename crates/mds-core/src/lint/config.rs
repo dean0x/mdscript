@@ -125,15 +125,14 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 /// recognised-rules list needs no escaping: it is a slice of compile-time string
 /// literals.
 ///
-/// Called by the bindings (napi/WASM/Python) to build their `lint_warnings`
-/// strings. The CLI does **not** call it — the CLI uses context-specific wording
-/// (`… in mds.json`) as a deliberate surface preference, not a guard constraint.
-/// Both paths apply the same WIRE-escape per name (`safe_inline` in the CLI is
-/// `sanitize_control_chars_wire` by another name); the print-discipline guard is
-/// satisfied on both surfaces by a whole-expression sanitizer call inside
-/// `eprint_warning`'s `format!`. The divergence is wording only (CHANGELOG
-/// AC-224-3 documents the CLI format as a knowing deviation from byte-identical
-/// cross-surface messages).
+/// Called by the CLI and by the bindings (napi/WASM/Python) to build their
+/// warning strings. The CLI wraps the returned string with a `"warning: in
+/// mds.json: "` prefix so the source-file provenance appears on stderr; the
+/// bindings use the returned string as-is for the `lint_warnings` field.
+/// The print-discipline guard is satisfied on the CLI surface by passing the
+/// return value through `safe_inline` inside `eprint_warning`'s `format!`
+/// (`safe_inline` is `sanitize_control_chars_wire` by another name; the call
+/// is idempotent because names are already wire-escaped here).
 ///
 /// Produces one of:
 /// - `"unknown lint rule 'NAME'; recognised rules are: ...; ignoring"`

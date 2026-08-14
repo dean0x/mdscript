@@ -3608,7 +3608,7 @@ fn unknown_rule_cli_exact_golden() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_singular = format!(
-            "warning: unknown lint rule 'no-such-rule-xyzzy' in mds.json; \
+            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
              recognised rules are: {recognised}; ignoring"
         );
         let warning_line = stderr
@@ -3645,7 +3645,7 @@ fn unknown_rule_cli_exact_golden() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_plural = format!(
-            "warning: unknown lint rules: 'aaa-bad', 'zzz-bad' in mds.json; \
+            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
              recognised rules are: {recognised}; ignoring"
         );
         let warning_line = stderr
@@ -3699,7 +3699,7 @@ fn unknown_rule_cli_exact_golden_single_file() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_singular = format!(
-            "warning: unknown lint rule 'no-such-rule-xyzzy' in mds.json; \
+            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
              recognised rules are: {recognised}; ignoring"
         );
         let warning_line = stderr
@@ -3738,7 +3738,7 @@ fn unknown_rule_cli_exact_golden_single_file() {
 
         let stderr = String::from_utf8_lossy(&out.stderr);
         let expected_plural = format!(
-            "warning: unknown lint rules: 'aaa-bad', 'zzz-bad' in mds.json; \
+            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
              recognised rules are: {recognised}; ignoring"
         );
         let warning_line = stderr
