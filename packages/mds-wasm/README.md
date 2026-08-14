@@ -47,7 +47,8 @@ const checked = check(source, { vars: { name: 'World' } });
 // lint(source, options)
 // Accepted keys: filename, modules, vars, rules.
 // options.rules — { [ruleName: string]: 'off' | 'info' | 'warn' | 'error' }
-//   Unknown rule names emit a warning and lint continues; unknown severity values throw.
+//   Unknown rule names emit a warning and lint continues — the unknown name has no effect
+//   (the rule is not enforced); unknown severity values throw.
 //   When unknown rule names are present, lintResult.lint_warnings is a non-empty string[].
 const lintResult = lint(source, { rules: { 'shadow-variable': 'warn' } });
 // lintResult: { version: 1, files: [...], truncated: boolean, lint_warnings?: string[] }
