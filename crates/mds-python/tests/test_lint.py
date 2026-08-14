@@ -434,19 +434,32 @@ def test_py_warn_l4_to_dict_includes_lint_warnings() -> None:
 
 
 def test_py_warn_l5_multiple_unknown_rules() -> None:
-    """lint() with multiple unknown rule names → all appear in lint_warnings (AC-224-1/D8)."""
+    """lint() with multiple unknown rule names → both appear sorted lexicographically (AC-224-3).
+
+    Names are deliberately supplied in reverse lexicographic order ('zzz-bad' before
+    'aaa-bad') to verify that UnknownRuleNames::new sorts the offender list rather
+    than emitting it in HashMap iteration order (AC-224-3).
+    """
     r = m.lint(
         CLEAN_SOURCE,
-        rules={"no-such-rule-a": "warn", "no-such-rule-b": "error"},
+        rules={"zzz-bad": "warn", "aaa-bad": "error"},
     )
     warnings = r.lint_warnings
     assert len(warnings) > 0, "lint_warnings must be non-empty"
     combined = " ".join(warnings)
-    assert "no-such-rule-a" in combined, (
+    assert "zzz-bad" in combined, (
         f"all unknown rule names must appear in lint_warnings; got: {warnings}"
     )
-    assert "no-such-rule-b" in combined, (
+    assert "aaa-bad" in combined, (
         f"all unknown rule names must appear in lint_warnings; got: {warnings}"
+    )
+    # AC-224-3: offenders MUST be sorted lexicographically (not HashMap iteration order).
+    # 'aaa-bad' < 'zzz-bad', so 'aaa-bad' must appear first in the combined warning text.
+    idx_aaa = combined.index("aaa-bad")
+    idx_zzz = combined.index("zzz-bad")
+    assert idx_aaa < idx_zzz, (
+        f"offenders must be sorted lexicographically: 'aaa-bad' must precede 'zzz-bad' "
+        f"(AC-224-3); got: {warnings}"
     )
 
 
