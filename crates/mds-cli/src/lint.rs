@@ -45,8 +45,7 @@ use crate::output::{
 
 // AC-224-15: No local rule-name list. The single source of truth is
 // mds::KNOWN_LINT_RULES (composed from each rule module's own RULE const).
-// A repo-wide search for "unused-variable" under crates/mds-cli/src/ must
-// return zero hits.
+// No rule-name string literals from the registry appear in this directory.
 
 pub(crate) struct LintArgs {
     pub(crate) input: Option<PathBuf>,
@@ -193,6 +192,16 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     match config_opt {
         None => Ok(mds::LintConfig::default()),
         Some((mds_config, _config_dir)) => {
+            // AC-224-3 residual: the warning text produced here ("unknown lint rule
+            // '...' in mds.json; ...") differs from the text produced by
+            // `mds::format_unknown_rule_names_warning` used by napi/WASM/Python
+            // ("unknown lint rules: '...'; ...") by design: the CLI adds the
+            // source context "in mds.json" and uses singular/plural forms so the
+            // print-discipline guard can machine-check the safe_inline call sites
+            // directly. This divergence is intentional and recorded here as a named
+            // residual (applies AD-224-3, R6/PF-007 — per-surface goldens, not a
+            // differential test).
+            //
             // AD-224-3: `safe_inline` WIRE-escapes each name before it enters the
             // warning text, because `eprint_warning` is HUMAN mode (`\n` survives).
             // A JSON object key is never legitimately multi-line; routing through

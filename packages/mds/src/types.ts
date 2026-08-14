@@ -169,9 +169,12 @@ export type RuleSeverity = 'error' | 'warn' | 'info' | 'off';
 /**
  * Union of all recognised lint rule names.
  *
- * Passing a key outside this set in `LintOptions.rules` emits a warning (see
- * {@link LintResult.lint_warnings}) and lint continues — unknown names are
- * not enforced by the engine (the rule does not exist), but the caller is told.
+ * D-224-1 (2026-08-12 ruling): passing a key outside this set is NOT an error.
+ * The engine emits a warning (see {@link LintResult.lint_warnings}) and lint
+ * continues — the unknown rule is not enforced, but the caller is told. The
+ * asymmetry with unknown severity values (which are hard errors) is deliberate:
+ * severity is a closed set, but rule names grow every release, so hard-failing
+ * would break configs that name a rule added in a newer binary.
  */
 export type LintRuleName =
   | 'duplicate-export'
@@ -188,9 +191,13 @@ export type LintRuleName =
 /**
  * All recognised lint rule names, sorted alphabetically.
  *
- * This array is the canonical registry used on all surfaces. `rules` keys not
- * found here emit a warning (see {@link LintResult.lint_warnings}) and lint
- * continues — unknown names are ignored by the engine after the warning.
+ * D-224-2: this array is a manual mirror of the Rust `KNOWN_LINT_RULES`
+ * registry (composed from each rule module's own `RULE` const). The TS mirror
+ * is guarded in one direction only — a new rule must be added here manually
+ * after landing in `mds-core`. Drift is a named residual (avoids PF-015).
+ *
+ * `rules` keys not found here emit a warning (see {@link LintResult.lint_warnings})
+ * and lint continues — unknown names are ignored by the engine after the warning.
  */
 export const LINT_RULE_NAMES: readonly LintRuleName[] = [
   'duplicate-export',
