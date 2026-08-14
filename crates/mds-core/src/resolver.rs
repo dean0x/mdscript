@@ -197,8 +197,14 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// pushed onto `self.resolving` in `resolve_source`/`resolve_source_intrinsic`.
 /// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
 ///
-/// `pub(crate)` so sibling modules (`error`, `sourcemap`) can reference the single
-/// definition and stay in sync automatically — no per-module copy needed.
+/// `pub(crate)` so sibling modules can reference the single definition and stay in
+/// sync automatically — no per-module copy needed.  Two consumers inside `mds-core`:
+///
+/// - `sourcemap::map_source_label` — compares against this constant directly.
+/// - `error::MdsError::is_string_source` — wraps the comparison in a public
+///   predicate; downstream crates (`mds-cli`) call that method rather than
+///   hardcoding `"<source>"`, which would have no compile-time link to this
+///   definition.  CLI callers MUST use `is_string_source()`, not this constant.
 pub(crate) const SOURCE_LABEL: &str = "<source>";
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
