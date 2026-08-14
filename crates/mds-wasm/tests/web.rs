@@ -1310,7 +1310,7 @@ fn wasm_lint_unknown_rule_no_lint_warnings_absent_on_clean() {
 #[wasm_bindgen_test]
 fn wasm_lint_hostile_rule_name_escapes_control_bytes_in_lint_warnings() {
     // Construct the hostile rule name at runtime using Rust char escapes (PF-018).
-    let hostile_rule = format!("\u{1b}[31mhostile-rule\u{1b}[0m");
+    let hostile_rule = "\u{1b}[31mhostile-rule\u{1b}[0m".to_string();
     let opts = to_js_object(&serde_json::json!({
         "rules": { hostile_rule: "warn" }
     }));
