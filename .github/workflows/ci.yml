@@ -115,6 +115,14 @@ jobs:
             #   after removing redundant to_canonical_json re-sort in 56424f7).
             #   Guard NOT raised: 16,498 bytes (1.94%) headroom. CI uses
             #   Binaryen v129 (distinct toolchain from local). (AC-P1-23)
+            #   ticket/pr2-unknown-rule-names (2026-08-14, #224): unknown-rule-name warning
+            #   (find_unknown_rule_names + format_unknown_rule_names_warning + five binding
+            #   sites) added +9,449 bytes; PR1 baseline 833,502, post-change 842,951 (wasm-pack
+            #   0.15.0 bundled wasm-opt, measured locally). Delta is under the +10,000 R2-fallback
+            #   trigger; config.rs used sort_unstable (not sort) and push_str (not join) to
+            #   keep the delta minimal — join monomorphises into kilobytes in WASM.
+            #   Guard NOT raised: 7,049 bytes (0.83%) headroom. CI uses Binaryen v129
+            #   (distinct toolchain from local). Three more wave PRs still to land. (AC-224-18)
             # Follow-up: pin the wasm build toolchain to make the size deterministic
             # and re-tighten this guard.
             if [ "$raw" -gt 850000 ]; then
