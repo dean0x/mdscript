@@ -2314,4 +2314,55 @@ mod tests {
             "the retained set must be in non-decreasing offset order"
         );
     }
+
+    /// AD-202-1b regression: `LintResult::new` preserves caller-supplied order on
+    /// ALL surfaces, including `to_canonical_json`.
+    ///
+    /// The contract is documented in `LintResult::new`'s `# Ordering` section:
+    /// the constructor does NOT sort, and `sort_diagnostics` is the single ordering
+    /// choke point called only from `LintResultBuilder::build`.  Adding a
+    /// "defensive re-sort" inside `to_canonical_json` would silently contradict
+    /// CHANGELOG.md §1, the `to_canonical_json` rustdoc, and this test.
+    ///
+    /// Scenario: a downstream Rust consumer builds `LintResult::new` with
+    /// `diag_offset_50` first and `diag_offset_10` second (deliberate priority
+    /// order).  `to_canonical_json` must emit them in the same order.
+    #[test]
+    fn lint_result_new_preserves_caller_order_through_to_canonical_json() {
+        // Two diagnostics in a deliberately REVERSE offset order (50 before 10).
+        let diag_offset_50 = make_span_diag(Some("a.mds"), Some(50), "r-50");
+        let diag_offset_10 = make_span_diag(Some("a.mds"), Some(10), "r-10");
+
+        // Build via the public constructor — does NOT sort (AD-202-1b).
+        let result = LintResult::new(vec![diag_offset_50, diag_offset_10]);
+
+        let json = result.to_canonical_json();
+        let diags = json["files"][0]["diagnostics"].as_array().unwrap();
+
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected exactly two diagnostics in the JSON output"
+        );
+
+        // Caller supplied offset-50 first; it must remain first in the JSON.
+        let first_rule = diags[0]["rule"].as_str().unwrap();
+        let second_rule = diags[1]["rule"].as_str().unwrap();
+        assert_eq!(
+            first_rule, "r-50",
+            "to_canonical_json must preserve caller-supplied order for LintResult::new; \
+             expected 'r-50' first (offset 50) but got: {:?}",
+            first_rule
+        );
+        assert_eq!(
+            second_rule, "r-10",
+            "to_canonical_json must preserve caller-supplied order for LintResult::new; \
+             expected 'r-10' second (offset 10) but got: {:?}",
+            second_rule
+        );
+
+        // Spot-check the offsets to make the ordering claim self-documenting.
+        assert_eq!(diags[0]["span"]["offset"], 50_u64);
+        assert_eq!(diags[1]["span"]["offset"], 10_u64);
+    }
 }
