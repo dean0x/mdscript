@@ -993,7 +993,7 @@ mode, which uses a single config located from the directory argument.
 }
 ```
 
-Keys are in alphabetical order (BTreeMap serialization). Within each `files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`; span-less diagnostics sort last; equal-offset ties preserve rule-execution order (stable sort). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is absent for diagnostics that lack a source location. When linting from stdin (`mds lint -`), `files[].file` is `"<stdin>"`.
+Keys are in alphabetical order (BTreeMap serialization). Within each `files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`; span-less diagnostics sort last; equal-offset ties preserve rule-execution order (stable sort). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is JSON `null` for diagnostics that lack a source location. When linting from stdin (`mds lint -`), `files[].file` is `"<stdin>"`.
 
 #### Sanitization invariant (v1)
 
