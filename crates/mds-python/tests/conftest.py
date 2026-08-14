@@ -58,16 +58,27 @@ def _find_cli() -> Path | None:
 
 @pytest.fixture(scope="session")
 def mds_cli() -> Path:
-    """Path to the `mds` CLI, or skip if it is not available.
+    """Path to the `mds` CLI, or skip/fail if it is not available.
 
     The CLI is a *separate* code path (Rust binary → mds-core) from the Python
     FFI binding, so using it to produce golden output keeps parity checks
-    non-circular. It is optional: the suite's hard-coded goldens cover parity on
-    their own, and this fixture only enables the extra live cross-check.
+    non-circular. It is optional in local development, but required in CI.
+
+    In CI (``CI`` environment variable is set and non-empty) a missing binary
+    calls :func:`pytest.fail` so the cross-surface parity tests cannot silently
+    not run — mirroring the hard-fail policy in the JS cross-surface tests
+    (P-L-4 in ``crates/mds-napi/__test__/index.spec.mjs`` and U-L11/U-L12 in
+    ``packages/mds/__test__/lint.spec.mjs``).  Outside CI a missing binary
+    triggers :func:`pytest.skip`.
     """
     cli = _find_cli()
     if cli is None:
-        pytest.skip("mds CLI binary not found (set MDS_CLI_BIN or build mds-cli)")
+        msg = "mds CLI binary not found (set MDS_CLI_BIN or build mds-cli)"
+        if os.environ.get("CI"):
+            pytest.fail(
+                f"{msg}; in CI the CLI is required for cross-surface parity"
+            )
+        pytest.skip(msg)
     return cli
 
 
