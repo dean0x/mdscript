@@ -1166,6 +1166,11 @@ fn wasm_lint_virtual_newline_in_frontmatter_key_is_escaped_on_the_wire() {
 // An unknown rule name in the `rules` option produces a `lint_warnings` array
 // in the result rather than hard-failing (D8 / AC-224-1). Known rule names
 // produce no `lint_warnings` field (common-case cleanliness).
+//
+// The deliberate asymmetry: unknown severity VALUES remain a hard error
+// (`mds::invalid_options`). Severities are a closed enum; rule names grow every
+// release. Both arms are pinned here so the asymmetry is asserted on the surface
+// this PR touches (PF-007 — per-surface goldens prove nothing cross-surface).
 
 #[wasm_bindgen_test]
 fn wasm_lint_unknown_rule_name_returns_lint_warnings() {
@@ -1288,5 +1293,41 @@ fn wasm_lint_unknown_rule_no_lint_warnings_absent_on_clean() {
     assert!(
         lint_warnings.is_undefined(),
         "W-WARN-2b: lint_warnings must be absent when no rules are passed; got: {lint_warnings:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_unknown_severity_value_throws_invalid_options() {
+    // W-SEVER-1 (AC-224-1 — paired throw arm, lint path): unknown severity
+    // VALUES remain a hard error on the WASM surface. napi pins this in L-N-6;
+    // Python in test_l5_lint_rules_unknown_severity_raises. Per PF-007 those
+    // prove nothing about WASM — this test pins the throw arm here.
+    //
+    // Severities are a closed enum; "verbose" is not a valid severity string.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "unused-variable": "verbose" }
+    }));
+    let err = mds_wasm::lint("Hello!\n", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::invalid_options",
+        "W-SEVER-1: unknown severity value must throw mds::invalid_options; got: {code}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_unknown_severity_value_throws_invalid_options() {
+    // W-SEVER-2 (AC-224-1 — paired throw arm, lint_virtual path): mirrors
+    // W-SEVER-1 for lintVirtual(). Both entry points route through
+    // extract_rules(), so both paths are pinned (PF-007).
+    let modules_val = to_js_object(&serde_json::json!({ "main.mds": "Hello!\n" }));
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "unused-variable": "verbose" }
+    }));
+    let err = mds_wasm::lint_virtual(modules_val, "main.mds", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::invalid_options",
+        "W-SEVER-2: lint_virtual unknown severity value must throw mds::invalid_options; got: {code}"
     );
 }
