@@ -416,6 +416,7 @@ fn plan_and_apply_fixes(
     base_dir: &Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
+    display_label: &str,
 ) -> FixFileOutcome {
     let is_standalone = result.is_standalone;
     let plan = mds::fix::plan_fixes_with_options(&result, source, is_standalone);
@@ -491,21 +492,24 @@ fn plan_and_apply_fixes(
     match outcome {
         mds::fix::FixOutcome::Fixed {
             source: new_source,
-            residual,
-        } => FixFileOutcome::Fixed {
-            new_source,
-            residual,
-        },
+            mut residual,
+        } => {
+            set_diag_display_path(&mut residual, display_label);
+            FixFileOutcome::Fixed { new_source, residual }
+        }
         mds::fix::FixOutcome::PartiallyFixed {
             source: new_source,
-            residual,
+            mut residual,
             rejected,
-        } => FixFileOutcome::PartiallyFixed {
-            new_source,
-            residual,
-            applied_count: total_edits - rejected.len(),
-            total_count: total_edits,
-        },
+        } => {
+            set_diag_display_path(&mut residual, display_label);
+            FixFileOutcome::PartiallyFixed {
+                new_source,
+                residual,
+                applied_count: total_edits - rejected.len(),
+                total_count: total_edits,
+            }
+        }
         mds::fix::FixOutcome::Rejected { source: _, reason } => FixFileOutcome::Rejected {
             reason,
             original: result,
@@ -715,8 +719,15 @@ fn run_lint_stdin(
         }
 
         // ── Write path: apply fixes, emit fixed source to stdout ─────────────────
-        let fix_outcome = plan_and_apply_fixes(result, &source, &cwd, runtime_vars, &config);
-        let (output_src, mut diag_result) = match fix_outcome {
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            &cwd,
+            runtime_vars,
+            &config,
+            STDIN_DISPLAY_LABEL,
+        );
+        let (output_src, diag_result) = match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
                 residual,
@@ -742,18 +753,6 @@ fn run_lint_stdin(
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
-        // AD-211-4 (write-path residual): for Fixed/PartiallyFixed the residual comes
-        // from the reverify lint_str_with call and therefore carries diag.file ==
-        // STRING_SOURCE_MAP_LABEL ("input.mds").  Relabel here so every emission path
-        // is symmetric with directory mode (`lint_one_file_accumulating` /
-        // `lint_one_file_human`) and with the report-only/preview relabel above.
-        // For Rejected/NothingToFix the original was already relabeled above — a
-        // second call is a harmless no-op.
-        // Note: --fix --format json + stdin is a hard usage error at lint.rs:141-147
-        // (AC-F-22b), so this relabel is not currently reachable via the JSON path;
-        // it is applied here as defence-in-depth so that lifting AC-F-22b in a future
-        // PR does not break AC-P1-27 silently.
-        set_diag_display_path(&mut diag_result, STDIN_DISPLAY_LABEL);
         // Stdin diagnostics: pass source text for span context rendering.
         // AD-211-1: use STDIN_DISPLAY_LABEL so source frame header reads "<stdin>".
         let named_source = (STDIN_DISPLAY_LABEL, output_src.as_str());
@@ -837,19 +836,13 @@ fn run_lint_file(
 
     // ── Write path: --fix without preview ────────────────────────────────────
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config);
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config, filename);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                mut residual,
+                residual,
             } => {
-                // The reverify closure in plan_and_apply_fixes calls lint_str_with,
-                // which sets diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").
-                // Relabel to the file's basename so the JSON wire output uses the
-                // real filename rather than the internal VFS key.  Mirrors the
-                // set_diag_display_path calls in `lint_one_file_accumulating` and
-                // `lint_one_file_human`.
-                set_diag_display_path(&mut residual, filename);
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source)?;
                 if !quiet {
@@ -859,7 +852,7 @@ fn run_lint_file(
             }
             FixFileOutcome::PartiallyFixed {
                 new_source,
-                mut residual,
+                residual,
                 applied_count,
                 total_count,
             } => {
@@ -869,8 +862,6 @@ fn run_lint_file(
                         safe_path(path)
                     );
                 }
-                // Same reverify relabel as the Fixed arm — see comment above.
-                set_diag_display_path(&mut residual, filename);
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source)?;
                 exit_by_severity(&residual);
@@ -1049,11 +1040,11 @@ fn run_lint_directory(
     // byte-wise string order ('-' = 0x2D < '/' = 0x2F).  Sorting on the relative
     // display string keeps the CLI wire contract consistent with the BTreeMap
     // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
-    files.sort_by_key(|p| {
-        p.strip_prefix(dir)
-            .unwrap_or(p)
-            .to_string_lossy()
-            .into_owned()
+    files.sort_by_cached_key(|p| {
+        let rel = p.strip_prefix(dir).unwrap_or(p);
+        let display = rel.to_string_lossy().into_owned();
+        let raw = rel.as_os_str().to_owned();
+        (display, raw)
     });
 
     let mut max_tally = FileTally::Clean;
@@ -1200,14 +1191,19 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            &config,
+            &display_path,
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                mut residual,
+                residual,
             } => {
-                set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1217,7 +1213,7 @@ fn lint_one_file_accumulating(
             }
             FixFileOutcome::PartiallyFixed {
                 new_source,
-                mut residual,
+                residual,
                 applied_count,
                 total_count,
             } => {
@@ -1228,7 +1224,6 @@ fn lint_one_file_accumulating(
                         safe_path(file)
                     );
                 }
-                set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1364,14 +1359,19 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            &config,
+            &display_path,
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                mut residual,
+                residual,
             } => {
-                set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1384,7 +1384,7 @@ fn lint_one_file_human(
             }
             FixFileOutcome::PartiallyFixed {
                 new_source,
-                mut residual,
+                residual,
                 applied_count,
                 total_count,
             } => {
@@ -1395,7 +1395,6 @@ fn lint_one_file_human(
                         safe_path(file)
                     );
                 }
-                set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));

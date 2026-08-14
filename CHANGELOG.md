@@ -109,8 +109,11 @@ selective import:
 
 **A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
 output, matches `<source>` in an `error.message` or rendered frame, relies on
-`diagnostics[]` arriving in rule-execution order, or assumes `unused-import`
-spans have length 7.
+`diagnostics[]` arriving in rule-execution order, assumes `unused-import`
+spans have length 7, or relies on the `mds lint <dir>` file-group order being
+component-wise (`Path::Ord`). File groups are now ordered by the byte-wise string
+of the relative display path (e.g. `api-utils.mds` sorts before `api/x.mds`
+because `'-'` (0x2D) < `'/'` (0x2F)).
 
 **1. Diagnostics are sorted by byte offset (#202).** Within each
 `files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`
