@@ -79,12 +79,10 @@ via struct literals. Use the named constructor or builder listed for each:
   with the struct definition (PF-014).
 - **`MdsError::source_name() -> Option<&str>`** — a new method that returns the name embedded
   in the error's `NamedSource`, or `None` for errors without a source (e.g. `MdsError::Io`).
-  This replaces the previously-unreleased `source_label_is_stdin_sentinel()` method, which
-  encoded CLI presentation vocabulary into the domain crate. `source_name()` is domain-neutral;
-  callers that need to detect the string-source analysis path should use
-  `MdsError::is_string_source()` rather than comparing the returned name against the sentinel
-  value themselves — the internal sentinel is `pub(crate)` and is not reachable from downstream
-  crates.
+  `source_name()` is domain-neutral; callers that need to detect the string-source analysis
+  path should use `MdsError::is_string_source()` rather than comparing the returned name
+  against the sentinel value themselves — the internal sentinel is `pub(crate)` and is not
+  reachable from downstream crates.
 - **`MdsError::is_string_source() -> bool`** — a new predicate that returns `true` when the
   error was produced by the string-source analysis path (`resolve_source_intrinsic`). Use this
   instead of comparing `source_name()` against a bare string literal: the internal sentinel
@@ -136,12 +134,12 @@ Previously the order was rule-execution order (implementation-defined).
 
 - Diagnostics without a span sort to the end of their file group.
 - Equal-offset diagnostics preserve rule-execution order (stable sort).
-- File groups have a defined order: `mds lint <dir>` sorts by the byte-wise
-  (lexicographic) string representation of the relative display path, matching
-  the `BTreeMap` key ordering that `to_canonical_json` uses on the binding
-  surfaces (napi / WASM / Python). Both order by byte-wise string on the file
-  key — e.g. `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) <
-  `'/'` (0x2F).
+- File groups have a defined order: `mds lint <dir>` sorts `files[]` by the
+  byte-wise (lexicographic) string comparison of the relative display path — e.g.
+  `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'` (0x2F).
+  This is a CLI directory-mode contract only: the binding surfaces (napi / WASM /
+  Python) lint a single entry source, so their `files[]` array never carries more
+  than one entry.
 - Ordering is established on `LintResult.diagnostics` itself, so the CLI human
   path and the napi / WASM / Python surfaces observe the same order.
 - **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is

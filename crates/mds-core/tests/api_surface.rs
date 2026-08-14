@@ -208,7 +208,7 @@ fn mds_error_trait_impls() {
 }
 
 /// Pin `MdsError::source_name()` — the neutral domain accessor for the embedded
-/// `NamedSource` name (ADR-010; replaces the CLI-vocabulary `source_label_is_stdin_sentinel`).
+/// `NamedSource` name (ADR-010).
 #[test]
 fn mds_error_source_name_accessor() {
     use std::sync::Arc;

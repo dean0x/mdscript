@@ -738,12 +738,16 @@ impl LintResult {
     /// ordered by ascending byte offset (`span.offset`).  Diagnostics without a span
     /// sort to the end of the group. The sort is stable so equal-offset diagnostics
     /// preserve rule-insertion order.  Within this function, file groups are ordered
-    /// lexicographically by file key (BTreeMap / byte-wise string order on the
-    /// `diag.file` value).  This applies to a single `LintResult` whose diagnostics
-    /// span multiple files.  The CLI directory mode instead processes one file per
-    /// `LintResult` and sorts the outer `files[]` array by the byte-wise string of
-    /// the relative display path (matching this function's key ordering so the two
-    /// surfaces agree — PF-007 notwithstanding).
+    /// lexicographically by the **raw** `diag.file` value (BTreeMap / byte-wise
+    /// string order), while the emitted `"file"` string is the WIRE-sanitized form
+    /// of that key — the two differ only for a file name carrying a control, bidi or
+    /// separator character, and only an external caller can reach that case, because
+    /// every engine entry point (`lint`, `lint_str`, `lint_source`, `lint_virtual`)
+    /// passes exactly one filename, so an engine-produced `LintResult` always has
+    /// exactly one file group.  The CLI directory mode processes one file per
+    /// `LintResult` and sorts the outer `files[]` array itself, on the **sanitized**
+    /// relative display path, so there its array position always matches its emitted
+    /// key order (AC-P1-10).
     /// A `LintResult` assembled by an external caller via [`LintResult::new`] is
     /// emitted in the order that caller supplied — see that constructor's
     /// `# Ordering` note.
