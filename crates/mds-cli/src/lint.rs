@@ -253,9 +253,13 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 /// providing a directory-traversal vector (CWE-22/CWE-41).
 ///
 /// The directory-mode sort applies `sanitize_control_chars_wire` on top of
-/// this function's output so that sort position and the emitted `files[].file`
-/// key are byte-identical for every input, including filenames that contain
-/// control bytes (AC-P1-10).  Forward slashes (`/`, 0x2F) are used instead of
+/// this function's output so that the sort key matches the sanitized
+/// `files[].file` value emitted by `to_canonical_json` for diagnostic entries,
+/// keeping array position consistent with the emitted key order (AC-P1-10).
+/// Error-only entries (`{"file": …, "error": …}`) push the raw display path
+/// without a second sanitization pass — a pre-existing asymmetry; their array
+/// position is still determined by the sanitized sort key.
+/// Forward slashes (`/`, 0x2F) are used instead of
 /// the native backslash separator (`\`, 0x5C) because bytes in the range
 /// 0x30–0x5B (digits `0`–`9`, uppercase letters `A`–`Z`, and `[`) sort between
 /// `/` and `\`; on Windows a flat file like `sub[abc.mds` would sort BEFORE a
@@ -1074,9 +1078,12 @@ fn run_lint_directory(
         return Ok(());
     }
 
-    // F1: sort by the byte-wise (lexicographic) string of the SANITIZED relative
-    // display path so that sort position and the emitted `files[].file` key are
-    // byte-identical for every input (AC-P1-10).
+    // F1: sort by (sanitized_display_key, raw_os_path) so that:
+    // 1. Array position is consistent with the sanitized `files[].file` key
+    //    emitted by `to_canonical_json` for diagnostic entries (AC-P1-10).
+    // 2. An OsString secondary key breaks any ties when two different non-UTF-8
+    //    filenames produce the same `to_string_lossy` string — rare in practice,
+    //    but ensures deterministic order regardless of readdir enumeration order.
     //
     // `Path::Ord` (component-wise) diverges from byte-order when a path-separator
     // character appears WITHIN a filename component — e.g. `api-utils.mds` sorts
@@ -1098,7 +1105,10 @@ fn run_lint_directory(
     // `sort_by_cached_key` computes each key once — O(n) allocations, not O(n log n)
     // (AC-P1-22).
     files.sort_by_cached_key(|p| {
-        mds::sanitize_control_chars_wire(&relative_display(p, dir)).into_owned()
+        (
+            mds::sanitize_control_chars_wire(&relative_display(p, dir)).into_owned(),
+            p.as_os_str().to_os_string(),
+        )
     });
 
     let mut max_tally = FileTally::Clean;
@@ -1704,8 +1714,9 @@ mod tests {
     }
 
     /// Regression: the directory-mode sort key must be the SANITIZED display path
-    /// so that sort position and the emitted `files[].file` key are byte-identical
-    /// for every input, including filenames that contain control bytes (AC-P1-10).
+    /// so that sort position matches the sanitized `files[].file` key emitted by
+    /// `to_canonical_json` for diagnostic entries, including control-byte filenames
+    /// (AC-P1-10).
     ///
     /// Without sanitization: a file whose name begins with 0x01 (a C0 control byte)
     /// sorts BEFORE "P.mds" in the raw byte order (0x01 < 0x50), but its sanitized
@@ -1747,10 +1758,8 @@ mod tests {
 
         // Sanitized sort keys: byte 0x01 becomes a JSON escape starting with '\' (0x5C).
         // 0x5C > 'P' (0x50), so P.mds sorts first — matching the emitted key order.
-        let ctrl_sort_key =
-            mds::sanitize_control_chars_wire(&ctrl_raw).into_owned();
-        let normal_sort_key =
-            mds::sanitize_control_chars_wire(&normal_raw).into_owned();
+        let ctrl_sort_key = mds::sanitize_control_chars_wire(&ctrl_raw).into_owned();
+        let normal_sort_key = mds::sanitize_control_chars_wire(&normal_raw).into_owned();
 
         assert!(
             normal_sort_key < ctrl_sort_key,
