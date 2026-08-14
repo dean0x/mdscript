@@ -115,7 +115,9 @@ selective import:
 ```
 
 **A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
-output, matches `<source>` in an `error.message` or rendered frame, relies on
+output, matches `<source>` in a rendered diagnostic frame (stderr only — the JSON
+`error.message` field cannot carry source identity; no `MdsError` Display template
+interpolates `ctx.file_str`, per AD-211-5), relies on
 `diagnostics[]` arriving in rule-execution order, assumes `unused-import`
 spans have length 7, relies on the `mds lint <dir>` file-group order being
 component-wise (`Path::Ord`), or on Windows assumes `files[].file` values use
