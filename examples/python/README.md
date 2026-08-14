@@ -73,6 +73,7 @@ for report in lr.files:          # list[LintFileReport]
         diag.rule, diag.severity, diag.message
         diag.help                # str | None
         diag.fixable             # bool
+        diag.fix_edits           # list[dict] | None
         diag.span                # Span | None
 ```
 

@@ -243,6 +243,7 @@ fn run_check(
     quiet: bool,
 ) -> Result<()> {
     use build::read_stdin;
+    use output::STDIN_DISPLAY_LABEL;
     let runtime_vars = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
@@ -272,13 +273,17 @@ fn run_check(
     // Single-file / stdin path.
     if input == std::path::Path::new("-") {
         let (source, cwd) = read_stdin()?;
+        // AD-211-1 / AD-211-5: a string-source check labels its errors `<source>`
+        // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
+        // boundary that knows the input was stdin.
         let ((), warnings) = mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-            .map_err(miette::Error::from)?;
+            .map_err(|e| output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &warnings {
                 output::eprint_warning(w);
             }
-            eprintln!("OK: <stdin>");
+            // AD-211-3: one definition of the sentinel, shared with lint/build/fmt.
+            eprintln!("OK: {STDIN_DISPLAY_LABEL}");
         }
     } else {
         let ((), warnings) =

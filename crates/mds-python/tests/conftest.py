@@ -58,23 +58,37 @@ def _find_cli() -> Path | None:
 
 @pytest.fixture(scope="session")
 def mds_cli() -> Path:
-    """Path to the `mds` CLI, or skip if it is not available.
+    """Path to the `mds` CLI, or skip/fail if it is not available.
 
     The CLI is a *separate* code path (Rust binary → mds-core) from the Python
     FFI binding, so using it to produce golden output keeps parity checks
-    non-circular. It is optional: the suite's hard-coded goldens cover parity on
-    their own, and this fixture only enables the extra live cross-check.
+    non-circular. It is optional in local development, but required in CI.
+
+    In CI (``CI`` environment variable is set and non-empty) a missing binary
+    calls :func:`pytest.fail` so the cross-surface parity tests cannot silently
+    not run — mirroring the hard-fail policy in the JS cross-surface tests
+    (P-L-4 in ``crates/mds-napi/__test__/index.spec.mjs`` and U-L11/U-L12 in
+    ``packages/mds/__test__/lint.spec.mjs``).  Outside CI a missing binary
+    triggers :func:`pytest.skip`.
     """
     cli = _find_cli()
     if cli is None:
-        pytest.skip("mds CLI binary not found (set MDS_CLI_BIN or build mds-cli)")
+        msg = "mds CLI binary not found (set MDS_CLI_BIN or build mds-cli)"
+        if os.environ.get("CI"):
+            pytest.fail(
+                f"{msg}; in CI the CLI is required for cross-surface parity"
+            )
+        pytest.skip(msg)
     return cli
 
 
 def cli_build(cli: Path, source: str, tmp_path: Path, *sets: str) -> str:
     """Compile `source` through the CLI and return its raw stdout (the payload)."""
     src = tmp_path / "parity.mds"
-    src.write_text(source, encoding="utf-8")
+    # write_bytes: force LF bytes so the CLI processes the same content as the
+    # in-memory string. write_text(newline=None) translates \n to os.linesep on
+    # Windows (CRLF), which would desynchronize byte offsets between surfaces.
+    src.write_bytes(source.encode("utf-8"))
     cmd = [str(cli), "build", str(src), "-o", "-", *sets]
     out = subprocess.run(
         cmd, capture_output=True, text=True, check=True, encoding="utf-8"

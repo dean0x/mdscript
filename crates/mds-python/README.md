@@ -74,7 +74,7 @@ keyword-only; `scan_imports` takes its argument positionally.
   `LintResult` exposes `.version`, `.truncated`, `.to_dict()`, `.to_json()`, and `.files`
   — a `list[LintFileReport]`. Each `LintFileReport` has `.file` (`str`) and `.diagnostics`
   (`list[LintDiagnostic]`). `LintDiagnostic` carries `.rule`, `.severity`, `.message`,
-  `.help` (`str | None`), `.fixable` (`bool`), and `.span` (`Span | None`).
+  `.help` (`str | None`), `.fixable` (`bool`), `.fix_edits` (`list[dict] | None`), and `.span` (`Span | None`).
   `LintFileReport` and `LintDiagnostic` are frozen, picklable, and comparable by value.
 
 ### Result objects

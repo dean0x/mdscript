@@ -257,6 +257,61 @@ mod tests {
         assert!(!is_literal(&Expr::Var("x".to_string())));
     }
 
+    /// AC-P1-18 / AD-203-2: `name_offsets` MUST NOT participate in `imports_eq`.
+    ///
+    /// `ImportDirective::Selective` carries `name_offsets: Vec<usize>` as a span
+    /// annotation (byte positions within the source file for each imported name).
+    /// Structural equality compares only `names` and `path` — `name_offsets`
+    /// (and `offset`) are excluded via the `..` pattern at line 175/180.
+    ///
+    /// This is load-bearing: the `duplicate-import` rule uses `imports_eq` to
+    /// detect two directives that import the same names from the same path,
+    /// regardless of how they were written (interior whitespace, trailing spaces,
+    /// or any other formatting difference shifts `name_offsets`).  If `name_offsets`
+    /// leaked into the comparison, two semantically-identical imports at different
+    /// source positions would never be flagged as duplicates.
+    ///
+    /// The positive control below asserts that the same helper DOES return `false`
+    /// when `names` differ — proving the test is capable of distinguishing unequal
+    /// pairs and is not vacuously true (PF-013 / ADR-009).
+    #[test]
+    fn selective_name_offsets_excluded_from_imports_eq() {
+        // Two Selective imports: same `names` and `path`, but different `name_offsets`
+        // (as would happen when the imports are written with different interior
+        // whitespace, or when a preceding directive shifts byte positions).
+        let a = ImportDirective::Selective {
+            names: vec!["foo".to_string(), "bar".to_string()],
+            path: "./lib.mds".to_string(),
+            offset: 0,
+            name_offsets: vec![10, 15], // positions in one source
+        };
+        let b = ImportDirective::Selective {
+            names: vec!["foo".to_string(), "bar".to_string()],
+            path: "./lib.mds".to_string(),
+            offset: 42,                 // different import-keyword offset too
+            name_offsets: vec![53, 58], // shifted positions in another source
+        };
+        assert!(
+            imports_eq(&a, &b),
+            "AC-P1-18: imports_eq must return true for Selective imports that differ \
+             only in name_offsets / offset — those are span annotations, not semantic content"
+        );
+
+        // Positive control: imports with DIFFERENT names are NOT equal.
+        // This proves the assertion above is not vacuously true — the same
+        // `imports_eq` call CAN return false when the logical content differs.
+        let c = ImportDirective::Selective {
+            names: vec!["foo".to_string(), "baz".to_string()], // "baz" != "bar"
+            path: "./lib.mds".to_string(),
+            offset: 0,
+            name_offsets: vec![10, 15],
+        };
+        assert!(
+            !imports_eq(&a, &c),
+            "positive control: imports with different names must NOT be structurally equal"
+        );
+    }
+
     /// ElseifBranch.offset is intentionally excluded from structural equality.
     ///
     /// Two IfBlock nodes that are logically identical (same condition, same bodies)

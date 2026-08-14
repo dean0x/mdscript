@@ -976,6 +976,7 @@ mode, which uses a single config located from the directory argument.
     {
       "diagnostics": [
         {
+          "fix_edits": null,
           "fixable": false,
           "help": "Remove the frontmatter key or reference it in the template body.",
           "message": "Variable 'foo' is defined in frontmatter but never referenced in the body.",
@@ -992,7 +993,9 @@ mode, which uses a single config located from the directory argument.
 }
 ```
 
-Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is absent for diagnostics that lack a source location.
+Keys are in alphabetical order (BTreeMap serialization). Within each `files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`; span-less diagnostics sort last; equal-offset ties preserve rule-execution order (stable sort). (The CLI and binding surfaces always produce results through `LintResultBuilder`; a `LintResult` assembled directly via `LintResult::new` preserves caller-supplied order instead.) In directory mode, `files[].file` is the forward-slash-separated path relative to the lint root (e.g. `src/template.mds`), and the `files[]` array is ordered by the byte-wise string comparison of that relative display path (e.g. `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'` (0x2F)). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is JSON `null` for diagnostics that lack a source location. When linting from stdin (`mds lint -`), `files[].file` is `"<stdin>"`.
+
+A file that produces a per-file analysis failure in directory mode (malformed config, I/O error) emits a `{"file":"…","error":{"code":"…","message":"…","help":"…","span":…}}` entry without a `"diagnostics"` key and contributes to exit code 2. When a stdin source fails the check gate before linting begins, the CLI emits an analysis-failure envelope to stdout: `{"version":1,"error":{"code":"…","message":"…","help":"…","span":…}}`. This envelope carries no `"files"` or `"truncated"` key, and no `"file"` key (unlike the success envelope above). A JSON consumer MUST handle both the success envelope and the analysis-failure envelope and MUST NOT assume a `"file"` key is present in error results.
 
 #### Sanitization invariant (v1)
 
@@ -1025,7 +1028,7 @@ escaped, in either mode.
 This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
-All four surfaces emit byte-identical values.
+All four surfaces emit byte-identical values, with one exception: the `"file"` key when the source is piped via stdin. `mds lint -` (CLI) relabels the internal virtual-FS key `"input.mds"` to `"<stdin>"` at the output boundary; the binding surfaces (`lintVirtual` / `lint` on napi, WASM, and Python) retain `"input.mds"`. All other fields — `message`, `help`, `rule`, `severity`, `span`, `fix_edits` — are byte-identical across all four surfaces.
 
 ##### Mode is chosen per field, not per surface
 

@@ -77,6 +77,109 @@ via struct literals. Use the named constructor or builder listed for each:
   suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
   this method instead of assembling sanitized copies itself, keeping the escape logic co-located
   with the struct definition (PF-014).
+- **`MdsError::source_name() -> Option<&str>`** — a new method that returns the name embedded
+  in the error's `NamedSource`, or `None` for errors without a source (e.g. `MdsError::Io`).
+  `source_name()` is domain-neutral; callers that need to detect the string-source analysis
+  path should use `MdsError::is_string_source()` rather than comparing the returned name
+  against the sentinel value themselves — the internal sentinel is `pub(crate)` and is not
+  reachable from downstream crates.
+- **`MdsError::is_string_source() -> bool`** — a new predicate that returns `true` when the
+  error was produced by the string-source analysis path (`resolve_source_intrinsic`). Use this
+  instead of comparing `source_name()` against a bare string literal: the internal sentinel
+  (`SOURCE_LABEL`) is `pub(crate)` and is not accessible from downstream crates.
+
+#### Lint JSON wire contract (#202, #203, #211)
+
+> This block is the **single wire-change ledger** for the lint JSON envelope.
+> Later changes to `mds lint --format json` append here rather than opening a
+> parallel section, so a consumer has one place to read.
+
+**Before / after**, for `mds lint - --format json` on a source with one unused
+selective import:
+
+```jsonc
+// abbreviated — see spec.md for the full schema
+// before
+{ "files": [ { "diagnostics": [
+    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } },
+    { "rule": "unused-import",    "span": { "length": 7, "offset":  0 } }
+  ], "file": "input.mds" } ], "truncated": false, "version": 1 }
+
+// after
+{ "files": [ { "diagnostics": [
+    { "rule": "unused-import",    "span": { "length": 5, "offset": 10 } },
+    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } }
+  ], "file": "<stdin>" } ], "truncated": false, "version": 1 }
+```
+
+**A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
+output, matches `<source>` in a rendered diagnostic frame (stderr only — the JSON
+`error.message` field cannot carry source identity; no `MdsError` Display template
+interpolates `ctx.file_str`, per AD-211-5), relies on
+`diagnostics[]` arriving in rule-execution order, assumes `unused-import`
+spans have length 7, relies on the `mds lint <dir>` file-group order being
+component-wise (`Path::Ord`), or on Windows assumes `files[].file` values use
+the native backslash separator. File groups are now ordered by the byte-wise string
+of the relative display path (e.g. `api-utils.mds` sorts before `api/x.mds`
+because `'-'` (0x2D) < `'/'` (0x2F)). On Windows, `relative_display` normalises
+path separators to forward slashes, so a nested path that previously appeared as
+`sub\c.mds` in the JSON now appears as `sub/c.mds`; a consumer that string-matches
+or splits on `\` in `files[].file` values will silently fail to match.
+
+**1. Diagnostics are sorted by byte offset (#202).** Within each
+`files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`
+for results produced by the lint engine; a `LintResult` assembled directly via
+`LintResult::new` is emitted in the order the caller supplied.
+Previously the order was rule-execution order (implementation-defined).
+
+- Diagnostics without a span sort to the end of their file group.
+- Equal-offset diagnostics preserve rule-execution order (stable sort).
+- File groups have a defined order: `mds lint <dir>` sorts `files[]` by the
+  byte-wise (lexicographic) string comparison of the relative display path — e.g.
+  `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'` (0x2F).
+  This is a CLI directory-mode contract only: the binding surfaces (napi / WASM /
+  Python) lint a single entry source, so their `files[]` array never carries more
+  than one entry.
+- Ordering is established on `LintResult.diagnostics` itself, so the CLI human
+  path and the napi / WASM / Python surfaces observe the same order.
+- **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is
+  `true`, the retained diagnostics are still the first `MAX_DIAGNOSTICS` (1,000)
+  in rule-execution order, re-sorted afterwards — not the 1,000 smallest offsets.
+- **Sort cost (AC-P1-22):** The sort key is a borrowed tuple `(bool, &str, bool,
+  usize)` — zero per-comparison heap allocations. The sort runs at most once per
+  `LintResultBuilder::build` call over n <= `MAX_DIAGNOSTICS` (1,000) items.
+
+**2. The stdin source identity is always `<stdin>` (#211).** Every CLI context
+that names a stdin source now uses the single sentinel `<stdin>`:
+
+- the JSON `files[].file` key (previously `"input.mds"`, the internal VFS key);
+- human diagnostic frames for `mds lint -` (previously `input.mds`);
+- fix-preview status lines and diff headers (previously bare `stdin`);
+- the **analysis-failure envelope** — a stdin source that fails the check gate
+  used to render `<source>:L:C`, the resolver's internal label. `mds check -` and
+  `mds build -` rendered `<source>` on the same path and now render `<stdin>`
+  too, so all four subcommands agree.  Note: the analysis-failure JSON envelope
+  shape is `{"version":1,"error":{"code","message","help","span"}}` — it carries
+  **no `file` key** (unlike the success envelope which has `files[].file`).  A
+  JSON consumer reading `error` results MUST NOT look for a `file` key there.
+
+`mds::STRING_SOURCE_MAP_LABEL` is **unchanged** and remains `"input.mds"`: it is a
+virtual-FS entry key, not a display label. The napi, WASM and Python lint APIs
+continue to report `"input.mds"` for string-source input. The relabel is applied
+only at the CLI output boundary.
+
+**Zero-diagnostic behaviour:** when stdin lint completes with no findings, the
+JSON is `{"files":[],"truncated":false,"version":1}` — no file entry. The
+`<stdin>` sentinel appears in `files[0].file` only when at least one diagnostic is
+emitted. This matches non-stdin zero-diagnostic behaviour and keeps the JSON
+identical across the CLI and binding surfaces (napi, WASM, Python) for the clean
+case.
+
+**3. `unused-import` spans anchor at the unused name (#203).** For selective
+imports (`@import { name1, name2 } from "path"`), the span now covers the unused
+name rather than the `@import` keyword, and `span.length` is the name's length
+instead of a constant 7. Alias imports (`@import "path" as alias`) are unchanged —
+their span still covers the `@import` keyword.
 
 #### New `fix_edits` field on `LintDiagnostic`
 
@@ -833,6 +936,17 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   messages-mode template was built with a stdout output path (`-o -`) and
   `source_map=true` (from config), two overlapping errors could fire. The
   messages-mode stdout path now emits exactly one warning.
+
+- **`mds lint --fix --format json <file>` no longer emits `"file": "input.mds"`
+  for residual diagnostics.** In single-file mode with both `--fix` and
+  `--format json`, the `files[].file` key in the JSON output for residual
+  (post-fix) diagnostics was the internal VFS label `"input.mds"` instead of the
+  real file basename.  The reverify closure inside `plan_and_apply_fixes` calls
+  `lint_str_with`, which sets `diag.file` to `STRING_SOURCE_MAP_LABEL`; the
+  resulting residual was not relabeled before `emit_result`.  Fixed by calling
+  `set_diag_display_path(&mut residual, filename)` in the `Fixed` and
+  `PartiallyFixed` match arms of `run_lint_file`, mirroring the existing relabel
+  in directory mode (which was already correct).
 
 ## [0.3.0] — 2026-06-28
 

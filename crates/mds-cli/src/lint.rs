@@ -39,7 +39,8 @@ use crate::build::{
 };
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
-    render_unified_diff, safe_file_display, safe_inline, safe_path,
+    relabel_stdin_error, render_unified_diff, safe_file_display, safe_inline, safe_path,
+    STDIN_DISPLAY_LABEL,
 };
 
 /// Known lint rule names — used to warn about unknown names in mds.json config.
@@ -165,7 +166,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
                     input.display()
                 ),
             };
-            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            emit_analysis_failure_json_or_stderr(&mds_err, format, None);
             std::process::exit(2);
         }
         return run_lint_directory(&input, flags, runtime_vars);
@@ -177,7 +178,7 @@ fn do_lint(args: LintArgs) -> Result<()> {
     // Route through emit_analysis_failure_json_or_stderr so --format json produces the
     // correct error envelope (L-CLI-JSON4 / AC-F-14). Do NOT use `?` here.
     if let Err(mds_err) = ensure_existing_mds_file(&input) {
-        emit_analysis_failure_json_or_stderr(&mds_err, format);
+        emit_analysis_failure_json_or_stderr(&mds_err, format, None);
         std::process::exit(mds_error_exit_code(&mds_err));
     }
     run_lint_file(&input, flags, runtime_vars)
@@ -227,11 +228,51 @@ fn load_lint_config(dir: &Path) -> Result<mds::LintConfig> {
 /// This function replaces the field with the caller-supplied relative path so
 /// the JSON output uses distinct, navigable paths.
 ///
-/// Call this immediately after every `mds::lint` that runs in directory mode.
+/// **AD-211-4 (stdin relabel):** also used for stdin mode — called with
+/// `STDIN_DISPLAY_LABEL` immediately after every `mds::lint_str_with` call so
+/// that `diag.file` in the JSON wire output reads `"<stdin>"` rather than the
+/// internal VFS key `"input.mds"` (`STRING_SOURCE_MAP_LABEL`).
+///
+/// Call this immediately after every `mds::lint` / `mds::lint_str_with` call.
 fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
     for diag in &mut result.diagnostics {
         diag.file = Some(display.to_string());
     }
+}
+
+/// Returns the path of `path` relative to `root`, normalised to forward-slash
+/// separators by joining path components with `/`.
+///
+/// Using `Path::components()` is the correct platform-aware join: on Windows a
+/// backslash is a path separator, so each component is a directory or filename
+/// segment; on Unix a backslash is an ordinary filename byte (POSIX forbids
+/// only `/` and NUL), so a single component carries the whole
+/// `\`-containing filename intact.  The naive `.replace('\\', "/")` alternative
+/// would manufacture a path separator from an ordinary filename byte on Unix,
+/// turning `sub/..\..\etc\evil.mds` into `sub/../../../etc/evil.mds` and
+/// providing a directory-traversal vector (CWE-22/CWE-41).
+///
+/// The directory-mode sort applies `sanitize_control_chars_wire` on top of
+/// this function's output so that the sort key matches the sanitized
+/// `files[].file` value emitted by `to_canonical_json` for diagnostic entries,
+/// keeping array position consistent with the emitted key order (AC-P1-10).
+/// Error-only entries (`{"file": …, "error": …}`) push the raw display path
+/// without a second sanitization pass — a pre-existing asymmetry; their array
+/// position is still determined by the sanitized sort key.
+///
+/// Forward slashes (`/`, 0x2F) are used instead of
+/// the native backslash separator (`\`, 0x5C) because bytes in the range
+/// 0x30–0x5B (digits `0`–`9`, uppercase letters `A`–`Z`, and `[`) sort between
+/// `/` and `\`; on Windows a flat file like `sub[abc.mds` would sort BEFORE a
+/// nested path `sub\d.mds` using the native separator (0x5B < 0x5C), but AFTER
+/// it with the emitted forward slash (0x5B > 0x2F), reversing the array order
+/// relative to the emitted key order.
+fn relative_display(path: &Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ── Read source file ──────────────────────────────────────────────────────────
@@ -393,6 +434,13 @@ enum FixFileOutcome {
 ///
 /// `base_dir` is the file's parent (for reverify recompile).
 ///
+/// `display_label` is the caller-supplied display path (relative, forward-slash-normalised)
+/// written into every `diag.file` in residual results via `set_diag_display_path`; it
+/// becomes the `files[].file` wire key after `to_canonical_json` applies
+/// `sanitize_control_chars_wire`.  This is the value that appears in the JSON wire output
+/// and must be pre-sanitized by the caller for error-envelope entries that bypass
+/// `to_canonical_json`.
+///
 /// ## Reverify gate (AC-F-20)
 ///
 /// The reverify closure checks three conditions:
@@ -410,6 +458,7 @@ fn plan_and_apply_fixes(
     base_dir: &Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
+    display_label: &str,
 ) -> FixFileOutcome {
     let is_standalone = result.is_standalone;
     let plan = mds::fix::plan_fixes_with_options(&result, source, is_standalone);
@@ -485,21 +534,27 @@ fn plan_and_apply_fixes(
     match outcome {
         mds::fix::FixOutcome::Fixed {
             source: new_source,
-            residual,
-        } => FixFileOutcome::Fixed {
-            new_source,
-            residual,
-        },
+            mut residual,
+        } => {
+            set_diag_display_path(&mut residual, display_label);
+            FixFileOutcome::Fixed {
+                new_source,
+                residual,
+            }
+        }
         mds::fix::FixOutcome::PartiallyFixed {
             source: new_source,
-            residual,
+            mut residual,
             rejected,
-        } => FixFileOutcome::PartiallyFixed {
-            new_source,
-            residual,
-            applied_count: total_edits - rejected.len(),
-            total_count: total_edits,
-        },
+        } => {
+            set_diag_display_path(&mut residual, display_label);
+            FixFileOutcome::PartiallyFixed {
+                new_source,
+                residual,
+                applied_count: total_edits - rejected.len(),
+                total_count: total_edits,
+            }
+        }
         mds::fix::FixOutcome::Rejected { source: _, reason } => FixFileOutcome::Rejected {
             reason,
             original: result,
@@ -637,18 +692,32 @@ fn run_lint_stdin(
             let mds_err = MdsError::Io {
                 message: format!("{e}"),
             };
-            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            // AD-211-5: config errors (MdsError::Io) carry no embedded NamedSource,
+            // so the relabel is a no-op here. Passed anyway so the envelope rule holds
+            // for EVERY stdin failure path — a future error variant routed here that
+            // does carry a source inherits the sentinel instead of needing a new call.
+            emit_analysis_failure_json_or_stderr(&mds_err, format, Some(&source));
             std::process::exit(2);
         }
     };
 
-    let result = match mds::lint_str_with(&source, Some(&cwd), runtime_vars.clone(), &config) {
+    let mut result = match mds::lint_str_with(&source, Some(&cwd), runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(e) => {
-            emit_analysis_failure_json_or_stderr(&e, format);
+            // AD-211-5: relabel <source> → <stdin> in the rendered failure envelope.
+            emit_analysis_failure_json_or_stderr(&e, format, Some(&source));
             std::process::exit(mds_error_exit_code(&e));
         }
     };
+
+    // AD-211-4 / AD-211-1: relabel diag.file from STRING_SOURCE_MAP_LABEL →
+    // STDIN_DISPLAY_LABEL at the CLI output boundary.  fix.rs never reads diag.file
+    // (verified: zero reads in fix.rs), so this relabel is safe upstream of both
+    // preview_fixes and plan_and_apply_fixes.  This single call ensures
+    // "files[].file" emits "<stdin>" across all code paths (AC-P1-01); for the
+    // write path, plan_and_apply_fixes relabels its internally produced residual
+    // before returning.
+    set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
 
     if fix {
         // ── Preview path: --fix --check and/or --fix --diff (never writes source) ───
@@ -659,12 +728,12 @@ fn run_lint_stdin(
             match preview {
                 PreviewOutcome::WouldFix(ref fixed) => {
                     if diff {
-                        let diff_str = render_unified_diff(&source, fixed, "stdin");
+                        let diff_str = render_unified_diff(&source, fixed, STDIN_DISPLAY_LABEL);
                         let _ = write_stdout(&diff_str);
                     }
                     if check {
                         if !quiet {
-                            eprintln!("Would fix: stdin");
+                            eprintln!("Would fix: {STDIN_DISPLAY_LABEL}");
                         }
                         std::process::exit(1);
                     }
@@ -678,8 +747,10 @@ fn run_lint_stdin(
             }
             // After diff-only preview, or when nothing would change / fix rejected:
             // render diagnostics of the original result and exit by severity.
+            // AD-211-1: pass STDIN_DISPLAY_LABEL so span context renders "<stdin>", not
+            // the internal STRING_SOURCE_MAP_LABEL ("input.mds").
             let named_source = if format == LintFormat::Human {
-                Some((mds::STRING_SOURCE_MAP_LABEL, source.as_str()))
+                Some((STDIN_DISPLAY_LABEL, source.as_str()))
             } else {
                 None
             };
@@ -689,7 +760,14 @@ fn run_lint_stdin(
         }
 
         // ── Write path: apply fixes, emit fixed source to stdout ─────────────────
-        let fix_outcome = plan_and_apply_fixes(result, &source, &cwd, runtime_vars, &config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            &cwd,
+            runtime_vars,
+            &config,
+            STDIN_DISPLAY_LABEL,
+        );
         let (output_src, diag_result) = match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -703,7 +781,7 @@ fn run_lint_stdin(
             } => {
                 if !quiet {
                     eprintln!(
-                        "Partially fixed: stdin ({applied_count} of {total_count} fixes applied)"
+                        "Partially fixed: {STDIN_DISPLAY_LABEL} ({applied_count} of {total_count} fixes applied)"
                     );
                 }
                 (new_source, residual)
@@ -715,7 +793,8 @@ fn run_lint_stdin(
             FixFileOutcome::NothingToFix { original } => (source, original),
         };
         // Stdin diagnostics: pass source text for span context rendering.
-        let named_source = (mds::STRING_SOURCE_MAP_LABEL, output_src.as_str());
+        // AD-211-1: use STDIN_DISPLAY_LABEL so source frame header reads "<stdin>".
+        let named_source = (STDIN_DISPLAY_LABEL, output_src.as_str());
         render_result_human(&diag_result, quiet, named_source);
         let _ = write_stdout(&output_src);
         exit_by_severity(&diag_result);
@@ -723,8 +802,9 @@ fn run_lint_stdin(
     }
 
     // Report-only mode: pass stdin source for span context rendering.
+    // AD-211-1: use STDIN_DISPLAY_LABEL so span source frame reads "<stdin>".
     let named_source = if format == LintFormat::Human {
-        Some((mds::STRING_SOURCE_MAP_LABEL, source.as_str()))
+        Some((STDIN_DISPLAY_LABEL, source.as_str()))
     } else {
         None
     };
@@ -757,7 +837,7 @@ fn run_lint_file(
             let mds_err = MdsError::Io {
                 message: format!("{e}"),
             };
-            emit_analysis_failure_json_or_stderr(&mds_err, format);
+            emit_analysis_failure_json_or_stderr(&mds_err, format, None);
             std::process::exit(2);
         }
     };
@@ -765,7 +845,7 @@ fn run_lint_file(
     let source = match read_source_file(path) {
         Ok(s) => s,
         Err(e) => {
-            emit_analysis_failure_json_or_stderr(&e, format);
+            emit_analysis_failure_json_or_stderr(&e, format, None);
             std::process::exit(mds_error_exit_code(&e));
         }
     };
@@ -774,13 +854,22 @@ fn run_lint_file(
         .and_then(|n| n.to_str())
         .unwrap_or("<file>");
 
-    let result = match mds::lint(path, runtime_vars.clone(), &config) {
+    let mut result = match mds::lint(path, runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(e) => {
-            emit_analysis_failure_json_or_stderr(&e, format);
+            emit_analysis_failure_json_or_stderr(&e, format, None);
             std::process::exit(mds_error_exit_code(&e));
         }
     };
+    // Remap the basename-only `file` label that mds::lint() sets → the display
+    // filename so all four FixFileOutcome arms carry a consistent label.
+    // Matches the explicit relabel in lint_one_file_accumulating and
+    // lint_one_file_human; without this call the Rejected and NothingToFix
+    // arms rely on mds::lint independently deriving the same basename — correct
+    // today, but a silent coupling that would break if the two derivations ever
+    // diverged.  Centralising the relabel here is the explicit invariant:
+    // every FixFileOutcome carries `filename` as its display path.
+    set_diag_display_path(&mut result, filename);
 
     if result.truncated && fix {
         eprintln!(
@@ -795,7 +884,8 @@ fn run_lint_file(
 
     // ── Write path: --fix without preview ────────────────────────────────────
     if fix && !check && !diff {
-        let fix_outcome = plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config);
+        let fix_outcome =
+            plan_and_apply_fixes(result, &source, base_dir, runtime_vars, &config, filename);
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
@@ -991,8 +1081,40 @@ fn run_lint_directory(
         return Ok(());
     }
 
-    // F1: path-sort explicitly — collect_mds_files does NOT guarantee order.
-    files.sort();
+    // F1: sort by (sanitized_display_key, raw_os_path) so that:
+    // 1. Array position is consistent with the sanitized `files[].file` key
+    //    emitted by `to_canonical_json` for diagnostic entries (AC-P1-10).
+    // 2. An OsString secondary key breaks any ties when two different non-UTF-8
+    //    filenames produce the same `to_string_lossy` string — rare in practice,
+    //    but ensures deterministic order regardless of readdir enumeration order.
+    //
+    // `Path::Ord` (component-wise) diverges from byte-order when a path-separator
+    // character appears WITHIN a filename component — e.g. `api-utils.mds` sorts
+    // AFTER `api/x.mds` under Path::Ord ("api" < "api-utils"), but BEFORE under
+    // byte-wise string order ('-' = 0x2D < '/' = 0x2F).  Sorting on the relative
+    // display string keeps the CLI wire contract consistent with the BTreeMap
+    // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
+    //
+    // `relative_display` normalises to forward slashes so byte-wise order is
+    // identical on Unix and Windows — the sort key and the emitted JSON `file`
+    // key are the same String by construction, so array position matches key
+    // order on both platforms.  `sanitize_control_chars_wire` is
+    // then applied so the sort key matches the emitted key produced by
+    // `to_canonical_json`: POSIX filenames may legally contain control bytes
+    // (e.g. 0x01), and sorting on the raw (unsanitized) string would place a
+    // control-byte filename at a position inconsistent with its `\uXXXX`-escaped
+    // emitted key, violating AC-P1-10.  For the vast majority of paths (no control
+    // bytes), `sanitize_control_chars_wire` returns `Cow::Borrowed` — no extra
+    // heap allocation beyond the String conversion.
+    //
+    // `sort_by_cached_key` computes each key once — O(n) allocations, not O(n log n)
+    // (AC-P1-22).
+    files.sort_by_cached_key(|p| {
+        (
+            mds::sanitize_control_chars_wire(&relative_display(p, dir)).into_owned(),
+            p.as_os_str().to_os_string(),
+        )
+    });
 
     let mut max_tally = FileTally::Clean;
     let mut json_files: Vec<serde_json::Value> = Vec::new();
@@ -1069,11 +1191,19 @@ fn lint_one_file_accumulating(
 
     // Compute a display path relative to the lint root so JSON `file` keys
     // are navigable and unique across the whole directory tree (not just basenames).
-    let display_path = file
-        .strip_prefix(ctx.lint_root)
-        .unwrap_or(file)
-        .display()
-        .to_string();
+    // `relative_display` normalises to forward slashes.  `to_canonical_json` then
+    // sanitizes the key via `sanitize_control_chars_wire`; `run_lint_directory`
+    // sorts on that same sanitized string, so emitted array order and emitted file
+    // key order are consistent for all inputs including control-byte filenames
+    // (AC-P1-10).
+    let display_path = relative_display(file, ctx.lint_root);
+    // Error-only entries (`{"file": …, "error": …}`) bypass `to_canonical_json`
+    // and therefore bypass its `sanitize_control_chars_wire` pass.  Pre-sanitize
+    // here so the `file` key in error entries is treated identically to the `file`
+    // key in diagnostic entries — hostile filenames cannot inject control, bidi,
+    // or separator characters into either entry type (spec.md §lint-json `file`
+    // contract; ADR-008).
+    let file_key = mds::sanitize_control_chars_wire(&display_path).into_owned();
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
     // path does not need it — mds::lint() reads the file independently (I-06).
@@ -1087,7 +1217,7 @@ fn lint_one_file_accumulating(
         Ok(c) => c,
         Err(ref e) => {
             json_files.push(serde_json::json!({
-                "file": display_path,
+                "file": file_key,
                 "error": e.serialize()
             }));
             return FileTally::Error;
@@ -1098,7 +1228,7 @@ fn lint_one_file_accumulating(
         Ok(r) => r,
         Err(ref e) => {
             json_files.push(serde_json::json!({
-                "file": display_path,
+                "file": file_key,
                 "error": e.serialize()
             }));
             return if matches!(e, MdsError::ResourceLimit { .. }) {
@@ -1132,20 +1262,25 @@ fn lint_one_file_accumulating(
             Err(e) => {
                 // Per-file I/O failure in directory mode: accumulate structured error (AC-F-14).
                 json_files.push(serde_json::json!({
-                    "file": display_path,
+                    "file": file_key,
                     "error": e.serialize()
                 }));
                 return FileTally::Error;
             }
         };
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            &config,
+            &display_path,
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                mut residual,
+                residual,
             } => {
-                set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1155,7 +1290,7 @@ fn lint_one_file_accumulating(
             }
             FixFileOutcome::PartiallyFixed {
                 new_source,
-                mut residual,
+                residual,
                 applied_count,
                 total_count,
             } => {
@@ -1166,7 +1301,6 @@ fn lint_one_file_accumulating(
                         safe_path(file)
                     );
                 }
-                set_diag_display_path(&mut residual, &display_path);
                 accumulate_result_json(&residual, json_files);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1194,7 +1328,7 @@ fn lint_one_file_accumulating(
             Ok(s) => s,
             Err(e) => {
                 json_files.push(serde_json::json!({
-                    "file": display_path,
+                    "file": file_key,
                     "error": e.serialize()
                 }));
                 return FileTally::Error;
@@ -1244,11 +1378,10 @@ fn lint_one_file_human(
     } = ctx.flags;
 
     // Compute a display path relative to the lint root for human rendering.
-    let display_path = file
-        .strip_prefix(ctx.lint_root)
-        .unwrap_or(file)
-        .display()
-        .to_string();
+    // `relative_display` normalises to forward slashes, matching the unsanitized
+    // base used by `run_lint_directory`'s sort (AC-P1-10).  Human rendering
+    // shows the real filename bytes rather than sanitized `\uXXXX` escapes.
+    let display_path = relative_display(file, ctx.lint_root);
 
     let source = match read_source_file(file) {
         Ok(s) => s,
@@ -1302,14 +1435,19 @@ fn lint_one_file_human(
     }
 
     if fix && !check && !diff {
-        let fix_outcome =
-            plan_and_apply_fixes(result, &source, base_dir, ctx.runtime_vars.clone(), &config);
+        let fix_outcome = plan_and_apply_fixes(
+            result,
+            &source,
+            base_dir,
+            ctx.runtime_vars.clone(),
+            &config,
+            &display_path,
+        );
         match fix_outcome {
             FixFileOutcome::Fixed {
                 new_source,
-                mut residual,
+                residual,
             } => {
-                set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1322,7 +1460,7 @@ fn lint_one_file_human(
             }
             FixFileOutcome::PartiallyFixed {
                 new_source,
-                mut residual,
+                residual,
                 applied_count,
                 total_count,
             } => {
@@ -1333,7 +1471,6 @@ fn lint_one_file_human(
                         safe_path(file)
                     );
                 }
-                set_diag_display_path(&mut residual, &display_path);
                 render_result_human(&residual, quiet, named_source);
                 if let Err(e) = atomic_write_file(file, &new_source) {
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
@@ -1416,9 +1553,34 @@ fn emit_result(
     }
 }
 
-/// Emit an `MdsError` analysis failure.
+/// AD-211-5 (2026-08-12 ruling): this envelope is the single CLI choke-point for
+/// **lint's** analysis failures (config load, IO, resolution, parse).  When
+/// `stdin_source` is `Some(source_text)` the embedded source identity in the rendered
+/// output is replaced with [`STDIN_DISPLAY_LABEL`], so every CLI diagnostic context
+/// for stdin input uses the uniform sentinel instead of the core's internal
+/// `SOURCE_LABEL` (`"<source>"`) that `resolve_source_intrinsic` embeds in `MdsError`
+/// spans.
+///
+/// **State it as a rule about this envelope, not about stdin:** every
+/// `MdsError` reaching this function for a stdin run labels its source `<stdin>`.
+/// Any error later routed here — a config rejection, a new IO failure — inherits
+/// that label instead of inventing a second convention.
+///
+/// The JSON leg needs no relabel and takes none: `MdsError::serialize()` emits
+/// `code` / `message` / `help` / `span`, and no `MdsError` `Display` template
+/// interpolates `ctx.file_str`, so the source identity never reaches
+/// `error.message`.  `cli_lint.rs::stdin_analysis_failure_labels_source_as_stdin`
+/// pins that on both channels rather than leaving it as an assumption.
+///
+/// For errors from a file source, pass `stdin_source: None`; the error's embedded
+/// `NamedSource` (which already carries the correct filename) is used as-is.
+///
 /// JSON format → stdout envelope; human → stderr via miette.
-fn emit_analysis_failure_json_or_stderr(e: &MdsError, format: LintFormat) {
+fn emit_analysis_failure_json_or_stderr(
+    e: &MdsError,
+    format: LintFormat,
+    stdin_source: Option<&str>,
+) {
     if format == LintFormat::Json {
         let envelope = serde_json::json!({
             "version": 1,
@@ -1431,7 +1593,11 @@ fn emit_analysis_failure_json_or_stderr(e: &MdsError, format: LintFormat) {
     } else {
         // Route through the single render choke point (avoids PF-004 /
         // architecture-6: hand-rolled sanitize_control_chars bypass).
-        eprint_error(miette::Report::from(e.clone()));
+        let report = match stdin_source {
+            Some(src) => relabel_stdin_error(e, src),
+            None => miette::Report::from(e.clone()),
+        };
+        eprint_error(report);
     }
 }
 
@@ -1505,6 +1671,113 @@ mod tests {
             matches!(outcome, PreviewOutcome::Rejected(_)),
             "preview_fixes must return Rejected for an overlap_rejected plan, \
              not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
+        );
+    }
+
+    /// Regression: `relative_display` must NOT treat a literal backslash in a
+    /// Unix filename as a path separator.
+    ///
+    /// On Unix, POSIX forbids only `/` and NUL in filenames; `\` is an ordinary
+    /// byte.  The old `to_string_lossy().replace('\\', "/")` implementation
+    /// turned `sub/..\..\etc\evil.mds` into `sub/../../../etc/evil.mds`,
+    /// providing a directory-traversal vector (CWE-22/CWE-41) and causing key
+    /// collisions on the published lint JSON wire surface when two distinct files
+    /// (e.g. `a/b.mds` and `a\b.mds`) were linted together.
+    ///
+    /// The new `Path::components()` join preserves `\` as a literal filename
+    /// byte on Unix and normalises it to a separator on Windows, which is the
+    /// correct platform-aware behaviour.
+    ///
+    /// Path construction uses Rust string literals containing a backslash byte
+    /// (0x5C) — not a control byte, so the Source hygiene gate does not flag it.
+    #[cfg(unix)]
+    #[test]
+    fn relative_display_preserves_literal_backslash_on_unix() {
+        use super::relative_display;
+        use std::path::Path;
+
+        let root = Path::new("/lint-root");
+
+        // A real subdirectory: /lint-root/a/b.mds  (two path components under root)
+        let real_subdir = Path::new("/lint-root/a/b.mds");
+
+        // A top-level file whose NAME contains a literal backslash: /lint-root/a\b.mds
+        // On Unix the backslash is just a filename byte; Path treats this as ONE
+        // component under root (not two).  The string "a\\b.mds" in Rust source
+        // is the byte sequence a, 0x5C, b, ., m, d, s — no control bytes.
+        let backslash_name = Path::new("/lint-root/a\\b.mds");
+
+        let display_subdir = relative_display(real_subdir, root);
+        let display_backslash = relative_display(backslash_name, root);
+
+        assert_eq!(
+            display_subdir, "a/b.mds",
+            "real subdirectory path should emit forward-slash-separated key"
+        );
+        assert_eq!(
+            display_backslash, "a\\b.mds",
+            "a literal backslash filename byte must be preserved in the emitted key on Unix"
+        );
+        assert_ne!(
+            display_subdir, display_backslash,
+            "a literal-backslash filename must not collide with the same letters \
+             separated by a real slash (was broken by the old .replace() approach)"
+        );
+    }
+
+    /// Regression: the directory-mode sort key must be the SANITIZED display path
+    /// so that sort position matches the sanitized `files[].file` key emitted by
+    /// `to_canonical_json` for diagnostic entries, including control-byte filenames
+    /// (AC-P1-10).
+    ///
+    /// Without sanitization: a file whose name begins with 0x01 (a C0 control byte)
+    /// sorts BEFORE "P.mds" in the raw byte order (0x01 < 0x50), but its sanitized
+    /// emitted key starts with `\` (0x5C, the JSON-escape prefix for byte 0x01),
+    /// placing it AFTER "P.mds" in emitted-key order — violating AC-P1-10.
+    ///
+    /// With the sanitized sort key the two orderings agree: "P.mds" (emitted "P.mds")
+    /// sorts before the control-byte file (whose JSON-emitted key starts with `\`) in both
+    /// the array position and the emitted key comparison.
+    ///
+    /// The control byte is constructed at runtime via char::from(1u8) so that no
+    /// literal control byte or \uXXXX escape appears in the source file (PF-018 /
+    /// Source hygiene gate).
+    #[cfg(unix)]
+    #[test]
+    fn sort_key_sanitizes_control_byte_filenames() {
+        use super::relative_display;
+        use std::path::Path;
+
+        let root = Path::new("/lint-root");
+
+        // Build a filename starting with byte 0x01 at runtime — not as a literal
+        // control byte in source (PF-018).
+        let ctrl_char = char::from(1u8); // U+0001, a C0 control character
+        let ctrl_filename = format!("{ctrl_char}a.mds");
+        let ctrl_path_buf = root.join(&ctrl_filename);
+        let ctrl_path: &Path = &ctrl_path_buf;
+        let normal_path = Path::new("/lint-root/P.mds");
+
+        let ctrl_raw = relative_display(ctrl_path, root);
+        let normal_raw = relative_display(normal_path, root);
+
+        // Raw (unsanitized) order: 0x01 < 'P' (0x50) → control-byte file sorts first.
+        assert!(
+            ctrl_raw < normal_raw,
+            "raw display: control-byte path ({ctrl_raw:?}) must sort before P.mds by \
+             unsanitized byte order (confirms old sort would have been wrong)"
+        );
+
+        // Sanitized sort keys: byte 0x01 becomes a JSON escape starting with '\' (0x5C).
+        // 0x5C > 'P' (0x50), so P.mds sorts first — matching the emitted key order.
+        let ctrl_sort_key = mds::sanitize_control_chars_wire(&ctrl_raw).into_owned();
+        let normal_sort_key = mds::sanitize_control_chars_wire(&normal_raw).into_owned();
+
+        assert!(
+            normal_sort_key < ctrl_sort_key,
+            "sanitized sort key: P.mds ({normal_sort_key:?}) must sort before \
+             control-byte file ({ctrl_sort_key:?}) — matching the emitted key order \
+             (AC-P1-10)"
         );
     }
 }

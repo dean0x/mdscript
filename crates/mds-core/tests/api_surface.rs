@@ -207,6 +207,82 @@ fn mds_error_trait_impls() {
     let _ = diagnostic.code();
 }
 
+/// Pin `MdsError::source_name()` — the neutral domain accessor for the embedded
+/// `NamedSource` name (ADR-010).
+#[test]
+fn mds_error_source_name_accessor() {
+    use std::sync::Arc;
+
+    // Errors with an embedded source carry its name.
+    let with_src = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "myfile.mds",
+            "content".to_string(),
+        ))),
+    };
+    assert_eq!(with_src.source_name(), Some("myfile.mds"));
+
+    // Errors without an embedded source return None.
+    let without_src = MdsError::Io {
+        message: "test".to_string(),
+    };
+    assert_eq!(without_src.source_name(), None);
+}
+
+/// Pin `MdsError::is_string_source()` — the compile-time-coupled sentinel predicate
+/// (ADR-010).  This predicate keeps the `pub(crate)` sentinel comparison inside
+/// `mds-core`; downstream crates (e.g. `mds-cli`) use it instead of hardcoding the
+/// literal `"<source>"`, which would have no compile-time link to the definition.
+///
+/// Positive control: an error whose embedded source name is the internal sentinel
+/// `"<source>"` must return `true`.
+/// Negative controls: a non-sentinel source name and a source-less error must return
+/// `false`.  (PF-013: absence alone proves nothing; positive control is mandatory.)
+#[test]
+fn mds_error_is_string_source() {
+    use std::sync::Arc;
+
+    // Positive control: the internal sentinel value "<source>" — as set by
+    // `resolve_source_intrinsic`.
+    let sentinel_err = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "<source>",
+            "content".to_string(),
+        ))),
+    };
+    assert!(
+        sentinel_err.is_string_source(),
+        "is_string_source() must return true for the internal sentinel"
+    );
+
+    // Negative control: a real file path must not match.
+    let file_err = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "real_file.mds",
+            "content".to_string(),
+        ))),
+    };
+    assert!(
+        !file_err.is_string_source(),
+        "is_string_source() must return false for a real file path"
+    );
+
+    // Negative control: an error without an embedded source.
+    let no_src_err = MdsError::Io {
+        message: "test".to_string(),
+    };
+    assert!(
+        !no_src_err.is_string_source(),
+        "is_string_source() must return false when there is no embedded source"
+    );
+}
+
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
@@ -1431,6 +1507,44 @@ fn string_source_map_label_is_in_public_api() {
         "STRING_SOURCE_MAP_LABEL must equal \"input.mds\"; changing it requires \
          updating every surface that uses it"
     );
+}
+
+/// AC-P1-27 positive control (PF-013 / ADR-009): the core library still uses
+/// `STRING_SOURCE_MAP_LABEL` ("input.mds") as the `file` key for string-source
+/// lint results.
+///
+/// This test confirms that the CLI's output-boundary relabel (`set_diag_display_path`
+/// in `mds-cli/src/lint.rs`) is doing real work and is not dead code — without the
+/// relabel, `"input.mds"` would appear in the `files[].file` key of the CLI JSON
+/// output.  The 113f472 baseline would fail AC-P1-01 on this exact property: the
+/// core has always used `STRING_SOURCE_MAP_LABEL` and the PR's relabel is the only
+/// thing that makes the CLI emit `"<stdin>"` instead.
+#[test]
+fn lint_str_uses_string_source_map_label_as_file_key() {
+    // Source that triggers `duplicate-export` — no imports needed, so lint_str
+    // succeeds without a filesystem base directory.
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    let result = mds::lint_str(source).expect("lint_str must succeed for this source");
+    // AC-P1-27: every diagnostic must carry STRING_SOURCE_MAP_LABEL as the file key.
+    // The CLI relabels this at the output boundary; the core must not.
+    let all_files: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.file.as_deref())
+        .collect();
+    assert!(
+        !all_files.is_empty(),
+        "AC-P1-27: duplicate-export must fire and produce at least one diagnostic"
+    );
+    for file_key in &all_files {
+        assert_eq!(
+            *file_key,
+            mds::STRING_SOURCE_MAP_LABEL,
+            "AC-P1-27: core must use STRING_SOURCE_MAP_LABEL ('input.mds') as the \
+             file key for string-source lint — got '{file_key}' instead; \
+             the CLI relabel happens at the output boundary, not in core"
+        );
+    }
 }
 
 /// F-API-2: TextEdit is publicly nameable and LintDiagnostic::with_fix_edits wires through.

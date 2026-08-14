@@ -259,7 +259,10 @@ def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib
     """
     src = "Hello World!\n"
     mds_file = tmp_path / "main.mds"
-    mds_file.write_text(src, encoding="utf-8")
+    # write_bytes: force LF bytes so the CLI lints the same bytes the Python surface
+    # processes in-memory. write_text(newline=None) translates \n to os.linesep on
+    # Windows (CRLF), causing byte-offset divergence between surfaces.
+    mds_file.write_bytes(src.encode("utf-8"))
     out = subprocess.run(
         [str(mds_cli), "lint", "--format", "json", str(mds_file)],
         capture_output=True,
@@ -274,4 +277,244 @@ def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib
         "CLI lint --format json must match Python lint_virtual byte-for-byte:\n"
         f"  CLI: {cli_json}\n"
         f"  py:  {py_json}"
+    )
+
+
+def test_ac_p1_24_cross_surface_diagnostic_order_parity(
+    mds_cli: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """AC-P1-24 (PF-007): CLI and Python surfaces must agree on diagnostics[] order.
+
+    Per-surface goldens each lock in their OWN ordering value and therefore cannot
+    detect a cross-surface divergence (PF-007).  This test compares surfaces to each
+    other — a differential, not a golden — using a multi-diagnostic fixture so that
+    ordering divergence IS detectable.
+
+    The fixture uses rules NOT touched by #203 (legacy-interpolation and
+    duplicate-export), placed so the RULE-EXECUTION order differs from the OFFSET
+    order.  After the AD-202-1 sort both surfaces must report the same ascending
+    order.  Both surfaces sort via LintResultBuilder::build; a per-renderer
+    deviation would be caught here but not by test_par4 (single-diagnostic goldens)
+    or test_par5 (zero-diagnostic clean source).
+    """
+    # Source whose rule-execution order is the REVERSE of its offset order:
+    # - legacy-interpolation (single-brace {name}) fires at a LOW offset (line 2).
+    # - duplicate-export fires at a HIGH offset (end of file).
+    # run_rules dispatches duplicate_export (5th) BEFORE legacy_interpolation (10th),
+    # so without the sort the order is duplicate-export first — opposite of offsets.
+    src = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
+    entry_key = "parity.mds"
+    mds_file = tmp_path / entry_key
+    # write_bytes: force LF bytes so the CLI lints the same bytes the Python surface
+    # processes in-memory. write_text(newline=None) translates \n to os.linesep on
+    # Windows (CRLF), causing byte-offset divergence between surfaces (root cause of
+    # the AC-P1-24 Windows CI failure).
+    mds_file.write_bytes(src.encode("utf-8"))
+
+    # CLI surface: lint the file in JSON mode.
+    cli_out = subprocess.run(
+        [str(mds_cli), "lint", "--format", "json", str(mds_file)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    # Exit 1 (warning-severity findings) or 2 (error-severity findings) are both
+    # valid: legacy-interpolation is a warning, duplicate-export is an error.
+    assert cli_out.returncode in (0, 1, 2), (
+        f"CLI lint exited unexpectedly with {cli_out.returncode}: {cli_out.stderr}"
+    )
+    cli_result = json.loads(cli_out.stdout)
+
+    # Python surface: lint_virtual with the same entry key so the "file" value matches.
+    py_result = json.loads(m.lint_virtual({entry_key: src}, entry_key).to_json())
+
+    # Non-vacuity guard: both surfaces must produce findings; an empty files[] would
+    # make the ordering comparison vacuously pass (PF-013 analog).
+    assert cli_result.get("files"), (
+        f"CLI must produce findings for the ordering fixture; got: {cli_out.stdout}"
+    )
+    assert py_result.get("files"), "Python must produce findings for the ordering fixture"
+    cli_diags = cli_result["files"][0].get("diagnostics", [])
+    py_diags = py_result["files"][0].get("diagnostics", [])
+    assert len(cli_diags) >= 2, (
+        f"CLI must produce at least 2 diagnostics to test ordering; got {len(cli_diags)}"
+    )
+    assert len(py_diags) >= 2, (
+        f"Python must produce at least 2 diagnostics to test ordering; got {len(py_diags)}"
+    )
+
+    # Normalize: strip the "file" key from each files[] entry so the comparison
+    # is not skewed by per-surface file-key conventions (AC-P1-06 allows CLI and
+    # bindings to differ on "file" for stdin mode; in file mode they match here).
+    def drop_file_key(result: dict) -> list:  # type: ignore[type-arg]
+        return [
+            {k: v for k, v in f.items() if k != "file"}
+            for f in result.get("files", [])
+        ]
+
+    cli_norm = drop_file_key(cli_result)
+    py_norm = drop_file_key(py_result)
+
+    assert cli_norm == py_norm, (
+        "AC-P1-24 (PF-007): CLI and Python surfaces disagree on diagnostics[] content "
+        "when the 'file' key is excluded.\n"
+        "This indicates a per-surface ordering or shape divergence; the common choke "
+        "point LintResultBuilder::build must establish the order both surfaces inherit.\n"
+        f"  CLI    (file excluded): {json.dumps(cli_norm)}\n"
+        f"  python (file excluded): {json.dumps(py_norm)}"
+    )
+
+    # Separately verify each surface's file key (they match in file mode).
+    cli_files = [f.get("file") for f in cli_result.get("files", [])]
+    py_files = [f.get("file") for f in py_result.get("files", [])]
+    assert all(f == entry_key for f in cli_files), (
+        f"AC-P1-24: CLI file keys must all be '{entry_key}'; got: {cli_files}"
+    )
+    assert all(f == entry_key for f in py_files), (
+        f"AC-P1-24: Python file keys must all be '{entry_key}'; got: {py_files}"
+    )
+
+
+def test_par5b_live_cli_lint_differential_with_findings(mds_cli: pathlib.Path) -> None:
+    """AC-P1-24: CLI stdin and Python lint() produce identical diagnostics[] (file key excluded).
+
+    test_par5 proves byte-identity for a clean source, where the ``{"files":[]}`` result
+    avoids the file-key divergence entirely.  This test covers the case WITH findings,
+    where the file key differs by design — CLI stdin emits ``"<stdin>"``, Python
+    ``lint()`` emits ``"input.mds"`` — and asserts cross-surface parity only on the
+    fields that are *supposed* to match: ``diagnostics[]``, spans, rule, severity,
+    fixable.
+
+    Avoids PF-007: surfaces are compared to *each other* (with the file key stripped),
+    not each to its own golden.  Per-surface goldens cannot catch a divergence in
+    diagnostic content, span offsets, or sort order across surfaces.
+
+    Fixture: ``{name}`` triggers ``legacy-interpolation`` at a low byte offset;
+    duplicate ``@export greet`` triggers ``duplicate-export`` at a higher offset.
+    ``run_rules`` dispatches ``duplicate-export`` before ``legacy-interpolation``,
+    so without the offset sort the array order would be reversed.  Using this fixture
+    confirms the sort ran while keeping the rule-set isolated from the #203
+    span-anchoring changes.
+    """
+    # Source: two diagnostics whose rule-execution order is the REVERSE of offset order.
+    src = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
+
+    # -- CLI surface: stdin lint in JSON mode; file key = "<stdin>" --
+    # Pass bytes directly to stdin: text=True + input=str would translate \n to
+    # os.linesep on Windows (CRLF), making the CLI lint different bytes than the
+    # in-memory string the Python surface processes, causing byte-offset divergence.
+    out = subprocess.run(
+        [str(mds_cli), "lint", "-", "--format", "json"],
+        input=src.encode("utf-8"),
+        capture_output=True,
+    )
+    # exit 0 = clean, exit 1 = warn-only findings, exit 2 = at least one error-severity
+    # finding.  The fixture's duplicate-export rule fires at "error" severity, so exit 2
+    # is the expected normal outcome (not a CLI failure).
+    assert out.returncode in (0, 1, 2), (
+        f"AC-P1-24: CLI lint exited unexpected status {out.returncode} "
+        f"(expected 0/1/2 for a lint result):\n{out.stderr.decode('utf-8', errors='replace')}"
+    )
+    assert out.returncode != 0, (
+        "AC-P1-24: fixture must produce at least one finding (exit non-zero); got clean exit"
+    )
+    cli_result = json.loads(out.stdout.decode("utf-8").strip())
+
+    # -- Python surface: string-source lint; file key = "input.mds" --
+    py_result = json.loads(m.lint(src).to_json())
+
+    # Normalize: strip the file key from each files[] entry (it differs by design).
+    # Compare the remaining structure — diagnostics[], spans, rule, severity, fixable.
+    def strip_file_key(result: dict) -> list:
+        return [{k: v for k, v in entry.items() if k != "file"} for entry in result["files"]]
+
+    cli_norm = strip_file_key(cli_result)
+    py_norm = strip_file_key(py_result)
+
+    # Non-vacuity guard: empty arrays compare equal and prove nothing (PF-013).
+    total_diags = sum(len(entry.get("diagnostics", [])) for entry in cli_norm)
+    assert total_diags >= 2, (
+        f"AC-P1-24: fixture must produce at least two diagnostics for a meaningful "
+        f"cross-surface differential; got {total_diags} from CLI"
+    )
+
+    # Cross-surface assertion: diagnostics[], spans, rule, severity, fixable must be
+    # identical across surfaces when the file key is excluded (avoids PF-007).
+    assert cli_norm == py_norm, (
+        "AC-P1-24: CLI stdin and Python lint() diagnostics[] must be identical "
+        "when the file key is excluded.\n"
+        f"  CLI: {json.dumps(cli_norm)}\n"
+        f"  py:  {json.dumps(py_norm)}"
+    )
+
+    # Separately assert the per-surface file key values (AC-P1-24 / AC-P1-01 / AC-P1-06).
+    assert cli_result["files"][0]["file"] == "<stdin>", (
+        f"AC-P1-24: CLI stdin file key must be '<stdin>'; "
+        f"got '{cli_result['files'][0]['file']}'"
+    )
+    assert py_result["files"][0]["file"] == "input.mds", (
+        f"AC-P1-24: Python string-source file key must be 'input.mds'; "
+        f"got '{py_result['files'][0]['file']}'"
+    )
+
+
+def test_crlf_input_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """Deliberate CRLF-input contract: both surfaces must AGREE on offsets for CRLF bytes.
+
+    This is a regression contract for the AC-P1-24 Windows CI failure.  The root cause
+    was CRLF translation in the test harness (write_text / text=True stdin) causing the
+    CLI and Python surfaces to receive DIFFERENT bytes, making offset values diverge.
+
+    When BOTH surfaces receive identical CRLF bytes the correct behaviour is that they
+    AGREE — this test verifies that contract explicitly rather than relying on it being
+    implied by LF-only fixtures.
+
+    Fixture: the same source as test_ac_p1_24 / test_par5b, with \n replaced by \r\n.
+    write_bytes is used so no os.linesep translation occurs — the CLI receives genuine
+    CRLF bytes, matching the CRLF string passed to lint_virtual().
+    """
+    src_lf = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
+    src_crlf_str = src_lf.replace("\n", "\r\n")
+    src_crlf_bytes = src_crlf_str.encode("utf-8")
+
+    entry_key = "crlf_parity.mds"
+    mds_file = tmp_path / entry_key
+    # write_bytes: no os.linesep translation — CLI receives the exact CRLF bytes we
+    # intend.  This mirrors the fix that was applied to all other write_text sites in
+    # this file (see AC-P1-24 Windows failure post-mortem).
+    mds_file.write_bytes(src_crlf_bytes)
+
+    cli_out = subprocess.run(
+        [str(mds_cli), "lint", "--format", "json", str(mds_file)],
+        capture_output=True,
+    )
+    assert cli_out.returncode in (0, 1, 2), (
+        f"CLI lint exited unexpectedly with {cli_out.returncode}: "
+        f"{cli_out.stderr.decode('utf-8', errors='replace')}"
+    )
+
+    cli_result = json.loads(cli_out.stdout.decode("utf-8"))
+
+    # Python surface: lint_virtual receives the CRLF string — same bytes when encoded.
+    py_result = json.loads(m.lint_virtual({entry_key: src_crlf_str}, entry_key).to_json())
+
+    # Non-vacuity guard: both surfaces must produce findings (PF-013).
+    assert cli_result.get("files"), "CLI must produce findings for CRLF fixture"
+    assert py_result.get("files"), "Python must produce findings for CRLF fixture"
+
+    def drop_file_key(result: dict) -> list:  # type: ignore[type-arg]
+        return [
+            {k: v for k, v in f.items() if k != "file"}
+            for f in result.get("files", [])
+        ]
+
+    cli_norm = drop_file_key(cli_result)
+    py_norm = drop_file_key(py_result)
+
+    assert cli_norm == py_norm, (
+        "CRLF parity: CLI and Python must agree on diagnostics[] when both receive\n"
+        "identical CRLF bytes. A divergence here means the surfaces handle CRLF\n"
+        "byte-counting differently in the shared core.\n"
+        f"  CLI: {json.dumps(cli_norm)}\n"
+        f"  py:  {json.dumps(py_norm)}"
     )
