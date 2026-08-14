@@ -155,6 +155,6 @@ surfaces it appears in `lint_warnings`.
 
 **Lint result shape:**
 ```ts
-{ version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean }
+{ version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean, lint_warnings?: string[] }
 // LintDiagnostic: { rule, severity, message, help?, fixable, fix_edits, span? }
 ```
