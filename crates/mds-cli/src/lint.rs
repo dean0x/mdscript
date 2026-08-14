@@ -252,11 +252,16 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 /// turning `sub/..\..\etc\evil.mds` into `sub/../../../etc/evil.mds` and
 /// providing a directory-traversal vector (CWE-22/CWE-41).
 ///
-/// The same computation is used for both the directory-mode sort key and the
-/// JSON `files[].file` value so that sort order and emitted key are
-/// byte-identical on every platform.  Forward slashes (`/`, 0x2F) are used
-/// instead of the native separator so that byte-wise ordering matches the
-/// documented example (`api-utils.mds` before `api/x.mds`) on all platforms.
+/// The directory-mode sort applies `sanitize_control_chars_wire` on top of
+/// this function's output so that sort position and the emitted `files[].file`
+/// key are byte-identical for every input, including filenames that contain
+/// control bytes (AC-P1-10).  Forward slashes (`/`, 0x2F) are used instead of
+/// the native backslash separator (`\`, 0x5C) because bytes in the range
+/// 0x30–0x5B (digits `0`–`9`, uppercase letters `A`–`Z`, and `[`) sort between
+/// `/` and `\`; on Windows a flat file like `sub[abc.mds` would sort BEFORE a
+/// nested path `sub\d.mds` using the native separator (0x5B < 0x5C), but AFTER
+/// it with the emitted forward slash (0x5B > 0x2F), reversing the array order
+/// relative to the emitted key order.
 fn relative_display(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     rel.components()
@@ -843,13 +848,21 @@ fn run_lint_file(
         .and_then(|n| n.to_str())
         .unwrap_or("<file>");
 
-    let result = match mds::lint(path, runtime_vars.clone(), &config) {
+    let mut result = match mds::lint(path, runtime_vars.clone(), &config) {
         Ok(r) => r,
         Err(e) => {
             emit_analysis_failure_json_or_stderr(&e, format, None);
             std::process::exit(mds_error_exit_code(&e));
         }
     };
+    // Remap the basename-only `file` label that mds::lint() sets → the display
+    // filename so all four FixFileOutcome arms carry a consistent label.
+    // Matches the explicit relabel in lint_one_file_accumulating (:1194) and
+    // lint_one_file_human (:1374); without this call the Rejected and NothingToFix
+    // arms rely on mds::lint independently deriving the same basename — correct
+    // today, but a silent coupling that would break if the two derivations ever
+    // diverged (finding 3).
+    set_diag_display_path(&mut result, filename);
 
     if result.truncated && fix {
         eprintln!(
@@ -1061,22 +1074,32 @@ fn run_lint_directory(
         return Ok(());
     }
 
-    // F1: sort by the byte-wise (lexicographic) string of the relative display path.
+    // F1: sort by the byte-wise (lexicographic) string of the SANITIZED relative
+    // display path so that sort position and the emitted `files[].file` key are
+    // byte-identical for every input (AC-P1-10).
+    //
     // `Path::Ord` (component-wise) diverges from byte-order when a path-separator
     // character appears WITHIN a filename component — e.g. `api-utils.mds` sorts
     // AFTER `api/x.mds` under Path::Ord ("api" < "api-utils"), but BEFORE under
     // byte-wise string order ('-' = 0x2D < '/' = 0x2F).  Sorting on the relative
     // display string keeps the CLI wire contract consistent with the BTreeMap
     // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
+    //
     // `relative_display` normalises to forward slashes so byte-wise order is
-    // identical on Unix and Windows (finding 4).  Its return value is also used as
-    // the JSON `files[].file` key; sort key and emitted key are byte-identical for
-    // normal paths.  For paths containing control bytes, `to_canonical_json` applies
-    // `sanitize_control_chars_wire` after sorting, so the emitted key may differ from
-    // the sort key for that narrow class of filenames (AC-P1-20).
+    // identical on Unix and Windows (finding 4).  `sanitize_control_chars_wire` is
+    // then applied so the sort key matches the emitted key produced by
+    // `to_canonical_json`: POSIX filenames may legally contain control bytes
+    // (e.g. 0x01), and sorting on the raw (unsanitized) string would place a
+    // control-byte filename at a position inconsistent with its `\uXXXX`-escaped
+    // emitted key, violating AC-P1-10.  For the vast majority of paths (no control
+    // bytes), `sanitize_control_chars_wire` returns `Cow::Borrowed` — no extra
+    // heap allocation beyond the String conversion.
+    //
     // `sort_by_cached_key` computes each key once — O(n) allocations, not O(n log n)
     // (AC-P1-22).
-    files.sort_by_cached_key(|p| relative_display(p, dir));
+    files.sort_by_cached_key(|p| {
+        mds::sanitize_control_chars_wire(&relative_display(p, dir)).into_owned()
+    });
 
     let mut max_tally = FileTally::Clean;
     let mut json_files: Vec<serde_json::Value> = Vec::new();
@@ -1153,8 +1176,11 @@ fn lint_one_file_accumulating(
 
     // Compute a display path relative to the lint root so JSON `file` keys
     // are navigable and unique across the whole directory tree (not just basenames).
-    // `relative_display` normalises to forward slashes, keeping the emitted key
-    // byte-identical to the sort key used by `run_lint_directory` (finding 2).
+    // `relative_display` normalises to forward slashes.  `to_canonical_json` then
+    // sanitizes the key via `sanitize_control_chars_wire`; `run_lint_directory`
+    // sorts on that same sanitized string, so emitted array order and emitted file
+    // key order are consistent for all inputs including control-byte filenames
+    // (AC-P1-10, finding 2).
     let display_path = relative_display(file, ctx.lint_root);
 
     // `source` is only consumed in the fix branch (below); the report-only/JSON
@@ -1330,8 +1356,9 @@ fn lint_one_file_human(
     } = ctx.flags;
 
     // Compute a display path relative to the lint root for human rendering.
-    // `relative_display` normalises to forward slashes, byte-identical to the
-    // sort key and the JSON emitted key (finding 2).
+    // `relative_display` normalises to forward slashes, matching the unsanitized
+    // base used by `run_lint_directory`'s sort (finding 2).  Human rendering
+    // shows the real filename bytes rather than sanitized `\uXXXX` escapes.
     let display_path = relative_display(file, ctx.lint_root);
 
     let source = match read_source_file(file) {
@@ -1673,6 +1700,63 @@ mod tests {
             display_subdir, display_backslash,
             "a literal-backslash filename must not collide with the same letters \
              separated by a real slash (was broken by the old .replace() approach)"
+        );
+    }
+
+    /// Regression: the directory-mode sort key must be the SANITIZED display path
+    /// so that sort position and the emitted `files[].file` key are byte-identical
+    /// for every input, including filenames that contain control bytes (AC-P1-10).
+    ///
+    /// Without sanitization: a file whose name begins with 0x01 (a C0 control byte)
+    /// sorts BEFORE "P.mds" in the raw byte order (0x01 < 0x50), but its sanitized
+    /// emitted key starts with `\` (0x5C, the JSON-escape prefix for byte 0x01),
+    /// placing it AFTER "P.mds" in emitted-key order — violating AC-P1-10.
+    ///
+    /// With the sanitized sort key the two orderings agree: "P.mds" (emitted "P.mds")
+    /// sorts before the control-byte file (whose JSON-emitted key starts with `\`) in both
+    /// the array position and the emitted key comparison.
+    ///
+    /// The control byte is constructed at runtime via char::from(1u8) so that no
+    /// literal control byte or \uXXXX escape appears in the source file (PF-018 /
+    /// Source hygiene gate).
+    #[cfg(unix)]
+    #[test]
+    fn sort_key_sanitizes_control_byte_filenames() {
+        use super::relative_display;
+        use std::path::Path;
+
+        let root = Path::new("/lint-root");
+
+        // Build a filename starting with byte 0x01 at runtime — not as a literal
+        // control byte in source (PF-018).
+        let ctrl_char = char::from(1u8); // U+0001, a C0 control character
+        let ctrl_filename = format!("{ctrl_char}a.mds");
+        let ctrl_path_buf = root.join(&ctrl_filename);
+        let ctrl_path: &Path = &ctrl_path_buf;
+        let normal_path = Path::new("/lint-root/P.mds");
+
+        let ctrl_raw = relative_display(ctrl_path, root);
+        let normal_raw = relative_display(normal_path, root);
+
+        // Raw (unsanitized) order: 0x01 < 'P' (0x50) → control-byte file sorts first.
+        assert!(
+            ctrl_raw < normal_raw,
+            "raw display: control-byte path ({ctrl_raw:?}) must sort before P.mds by \
+             unsanitized byte order (confirms old sort would have been wrong)"
+        );
+
+        // Sanitized sort keys: byte 0x01 becomes a JSON escape starting with '\' (0x5C).
+        // 0x5C > 'P' (0x50), so P.mds sorts first — matching the emitted key order.
+        let ctrl_sort_key =
+            mds::sanitize_control_chars_wire(&ctrl_raw).into_owned();
+        let normal_sort_key =
+            mds::sanitize_control_chars_wire(&normal_raw).into_owned();
+
+        assert!(
+            normal_sort_key < ctrl_sort_key,
+            "sanitized sort key: P.mds ({normal_sort_key:?}) must sort before \
+             control-byte file ({ctrl_sort_key:?}) — matching the emitted key order \
+             (AC-P1-10)"
         );
     }
 }
