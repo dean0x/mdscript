@@ -80,7 +80,7 @@ mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
 mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
-mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (9 rules; --fix, --format json)
+mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (10 rules; --fix, --format json)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
