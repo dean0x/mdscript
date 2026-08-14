@@ -445,6 +445,28 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
 
 // ── Lint options ──────────────────────────────────────────────────────────────
 
+/// Inject `lint_warnings` into a canonical JSON result when warnings are present.
+///
+/// D8 (AC-224-1): the WASM binding surfaces unknown-rule warnings by adding a
+/// `lint_warnings: string[]` field to the returned JSON object. This helper
+/// consolidates that logic across `lint` and `lintVirtual`.
+fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> serde_json::Value {
+    if !warnings.is_empty() {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "lint_warnings".to_string(),
+                serde_json::Value::Array(
+                    warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    json
+}
+
 /// Parsed options for the `lint` and `lint_virtual` functions.
 ///
 /// Extends the standard options with a `rules` field — absent in `compile`/`check`.
@@ -854,22 +876,7 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         )
         .map_err(mds_error_to_js)?;
 
-        // D8 (AC-224-1): surface unknown-rule warnings on the WASM binding channel.
-        let mut json = result.to_canonical_json();
-        if !lint_opts.lint_warnings.is_empty() {
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "lint_warnings".to_string(),
-                    serde_json::Value::Array(
-                        lint_opts
-                            .lint_warnings
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            }
-        }
+        let json = inject_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
         to_js(&json)
     }))
 }
@@ -929,22 +936,7 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
         )
         .map_err(mds_error_to_js)?;
 
-        // D8 (AC-224-1): surface unknown-rule warnings on the WASM binding channel.
-        let mut json = result.to_canonical_json();
-        if !lint_opts.lint_warnings.is_empty() {
-            if let Some(obj) = json.as_object_mut() {
-                obj.insert(
-                    "lint_warnings".to_string(),
-                    serde_json::Value::Array(
-                        lint_opts
-                            .lint_warnings
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            }
-        }
+        let json = inject_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
         to_js(&json)
     }))
 }

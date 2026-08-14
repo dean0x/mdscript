@@ -1264,6 +1264,28 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     Ok(result)
 }
 
+/// Inject `lint_warnings` into a canonical JSON result when warnings are present.
+///
+/// D8 (AC-224-1): the Python binding surfaces unknown-rule warnings by adding a
+/// `lint_warnings` field to the `LintResult` JSON. This helper consolidates that
+/// logic across `lint`, `lint_file`, and `lint_virtual`.
+fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> serde_json::Value {
+    if !warnings.is_empty() {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "lint_warnings".to_string(),
+                serde_json::Value::Array(
+                    warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    json
+}
+
 /// Parse and validate the `rules` keyword argument into a [`mds::LintConfig`] and warning list.
 ///
 /// `None`/absent → default config (no per-rule overrides). A non-mapping value →
@@ -1527,22 +1549,9 @@ fn lint(
     let result = run_catching(py, move || {
         mds::lint_str_with(&source, base_path.as_deref(), vars, &lint_config)
     })?;
-    let mut value = result.to_canonical_json();
-    // D8: inject lint_warnings into the JSON when unknown rule names were detected.
-    if !lint_warnings.is_empty() {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    lint_warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Ok(LintResult { value })
+    Ok(LintResult {
+        value: inject_lint_warnings(result.to_canonical_json(), lint_warnings),
+    })
 }
 
 /// Lint an MDS template file (`path` is a str or `os.PathLike`).
@@ -1560,22 +1569,9 @@ fn lint_file(
     let vars = extract_vars(py, vars.as_ref())?;
     let (lint_config, lint_warnings) = extract_rules(py, rules.as_ref())?;
     let result = run_catching(py, move || mds::lint(&path, vars, &lint_config))?;
-    let mut value = result.to_canonical_json();
-    // D8: inject lint_warnings into the JSON when unknown rule names were detected.
-    if !lint_warnings.is_empty() {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    lint_warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Ok(LintResult { value })
+    Ok(LintResult {
+        value: inject_lint_warnings(result.to_canonical_json(), lint_warnings),
+    })
 }
 
 /// Lint a module from an in-memory virtual filesystem.
@@ -1597,22 +1593,9 @@ fn lint_virtual(
     let result = run_catching(py, move || {
         mds::lint_virtual(modules, &entry, vars, &lint_config)
     })?;
-    let mut value = result.to_canonical_json();
-    // D8: inject lint_warnings into the JSON when unknown rule names were detected.
-    if !lint_warnings.is_empty() {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    lint_warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Ok(LintResult { value })
+    Ok(LintResult {
+        value: inject_lint_warnings(result.to_canonical_json(), lint_warnings),
+    })
 }
 
 // ── Module ──────────────────────────────────────────────────────────────────────

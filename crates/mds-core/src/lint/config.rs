@@ -101,9 +101,9 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 /// precondition (at least one unknown name) is guaranteed by the `UnknownRuleNames`
 /// type — only constructible with a non-empty list.
 ///
-/// **CLI note:** the CLI applies `safe_inline` to each name BEFORE passing it here,
-/// so the output of this function contains WIRE-escaped control bytes. The bindings
-/// pass raw names (JSON encoding handles escaping for their output channel).
+/// Called by the bindings (napi/WASM/Python) to produce their `lint_warnings` strings.
+/// The CLI does not call this function — it applies `safe_inline` to each name and
+/// uses a context-specific format (adding "in mds.json") before passing to `eprint_warning`.
 ///
 /// Produces one of:
 /// - `"unknown lint rule 'NAME'; recognised rules are: ...; ignoring"`

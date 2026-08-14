@@ -783,6 +783,28 @@ pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<
 
 // ── Lint options parsing ──────────────────────────────────────────────────────
 
+/// Inject `lint_warnings` into a canonical JSON result when warnings are present.
+///
+/// D8 (AC-224-1): the napi binding surfaces unknown-rule warnings by adding a
+/// `lint_warnings: string[]` field to the returned JSON object. This helper
+/// consolidates that logic across `lint`, `lintFile`, and `lintVirtual`.
+fn inject_lint_warnings(mut json: serde_json::Value, warnings: Vec<String>) -> serde_json::Value {
+    if !warnings.is_empty() {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "lint_warnings".to_string(),
+                serde_json::Value::Array(
+                    warnings
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    json
+}
+
 /// Extract and validate the `rules` option: `Record<string, string>` → `(mds::LintConfig, Vec<String>)`.
 ///
 /// Returns the default config (all rules at built-in defaults) when `rules` is absent,
@@ -976,23 +998,10 @@ pub fn lint(env: Env, source: String, opts: Option<Object>) -> napi::Result<serd
         }),
     )?;
 
-    // D8 (AC-224-1): surface unknown-rule warnings on the napi binding channel.
-    // lint_warnings is non-empty only when unknown rule names were present in opts.rules.
-    let mut json = result.to_canonical_json();
-    if !lint_warnings.is_empty() {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    lint_warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Ok(json)
+    Ok(inject_lint_warnings(
+        result.to_canonical_json(),
+        lint_warnings,
+    ))
 }
 
 /// Lint an MDS template file for static analysis findings.
@@ -1020,22 +1029,10 @@ pub fn lint_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<s
         AssertUnwindSafe(move || mds::lint(&path_buf, vars, &lint_config)),
     )?;
 
-    // D8: surface unknown-rule warnings on the napi binding channel.
-    let mut json = result.to_canonical_json();
-    if !lint_warnings.is_empty() {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    lint_warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Ok(json)
+    Ok(inject_lint_warnings(
+        result.to_canonical_json(),
+        lint_warnings,
+    ))
 }
 
 /// Lint a multi-module virtual filesystem for static analysis findings.
@@ -1122,20 +1119,8 @@ pub fn lint_virtual(
         AssertUnwindSafe(move || mds::lint_virtual(mods, &entry, vars, &lint_config)),
     )?;
 
-    // D8: surface unknown-rule warnings on the napi binding channel.
-    let mut json = result.to_canonical_json();
-    if !lint_warnings.is_empty() {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(
-                    lint_warnings
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Ok(json)
+    Ok(inject_lint_warnings(
+        result.to_canonical_json(),
+        lint_warnings,
+    ))
 }
