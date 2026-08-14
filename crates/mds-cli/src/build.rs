@@ -65,9 +65,7 @@ impl LintCliConfig {
     /// (even `let (config, _) = …` is an explicit decision). This closes the
     /// gap identified in the review finding for config.rs:104 — a fifth consumer
     /// of this helper could not previously skip detection silently.
-    pub(crate) fn into_core_config(
-        self,
-    ) -> (mds::LintConfig, Option<mds::UnknownRuleNames>) {
+    pub(crate) fn into_core_config(self) -> (mds::LintConfig, Option<mds::UnknownRuleNames>) {
         mds::LintConfig::from_rules_checked(self.rules)
     }
 }

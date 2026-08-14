@@ -274,7 +274,9 @@ impl LintConfig {
     /// assert!(config2.severity_for("no-such-rule").is_some());
     /// ```
     #[must_use]
-    pub fn from_rules_checked(rules: HashMap<String, Severity>) -> (Self, Option<UnknownRuleNames>) {
+    pub fn from_rules_checked(
+        rules: HashMap<String, Severity>,
+    ) -> (Self, Option<UnknownRuleNames>) {
         let unknown = find_unknown_rule_names(&rules);
         (LintConfig { rules }, unknown)
     }
@@ -404,9 +406,14 @@ mod tests {
     fn attach_lint_warnings_injects_field_when_warning_present() {
         let json = serde_json::json!({ "version": 1 });
         let result = attach_lint_warnings(json, Some("unknown lint rule 'foo'; ignoring".into()));
-        let arr = result["lint_warnings"].as_array().expect("lint_warnings must be an array");
+        let arr = result["lint_warnings"]
+            .as_array()
+            .expect("lint_warnings must be an array");
         assert_eq!(arr.len(), 1, "exactly one element");
-        assert_eq!(arr[0].as_str().unwrap(), "unknown lint rule 'foo'; ignoring");
+        assert_eq!(
+            arr[0].as_str().unwrap(),
+            "unknown lint rule 'foo'; ignoring"
+        );
     }
 
     /// D8: no `lint_warnings` key is added when warning is absent (absent-when-empty semantics).

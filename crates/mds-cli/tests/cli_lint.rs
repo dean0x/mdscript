@@ -3336,10 +3336,14 @@ fn unknown_rule_warning_to_stderr_not_stdout_in_json_mode() {
         "AC-224-21: 'unknown' warning text must not appear in stdout JSON; got: {stdout}"
     );
 
-    // AC-224-11: the warning must appear on stderr.
+    // AC-224-11: the warning must appear on stderr and name the rule.
+    // Both substrings required (&&, not ||) so neither half alone can satisfy the
+    // positive control — aligns with the stronger form in
+    // `unknown_rule_json_stdout_contains_no_warning_text` (avoids PF-013 asymmetry).
     assert!(
-        stderr.contains("unknown lint rule") || stderr.contains("no-such-rule-xyzzy"),
-        "AC-224-11: the unknown-rule warning must go to stderr; got stderr: {stderr}"
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-11: the unknown-rule warning must go to stderr and name the rule; \
+         got stderr: {stderr}"
     );
 }
 
@@ -3515,8 +3519,12 @@ fn unknown_rule_plural_sorted_warning() {
         "AC-224-2: plural form must be used for two unknown names; got stderr: {stderr}"
     );
     // AC-224-2: aaa-bad sorts before zzz-bad.
-    let aaa_pos = stderr.find("aaa-bad").expect("aaa-bad must appear in stderr");
-    let zzz_pos = stderr.find("zzz-bad").expect("zzz-bad must appear in stderr");
+    let aaa_pos = stderr
+        .find("aaa-bad")
+        .expect("aaa-bad must appear in stderr");
+    let zzz_pos = stderr
+        .find("zzz-bad")
+        .expect("zzz-bad must appear in stderr");
     assert!(
         aaa_pos < zzz_pos,
         "AC-224-2: 'aaa-bad' must appear before 'zzz-bad' (lexicographic order); \

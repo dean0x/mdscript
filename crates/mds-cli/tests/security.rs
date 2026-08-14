@@ -702,14 +702,8 @@ fn lint_plural_unknown_rule_names_escape_control_bytes() {
     // Two distinct hostile rule names — ESC + colour code in the first,
     // RTL-override + Arabic-letter-mark in the second — plus embedded newlines
     // carrying forged status lines in each.
-    let rule_a = format!(
-        "{}[31mAAA{}RULE\nClean: real-a.mds",
-        '\u{1b}', '\u{202e}'
-    );
-    let rule_b = format!(
-        "BBB{}RULE\nOK: real-b.mds",
-        '\u{061c}'
-    );
+    let rule_a = format!("{}[31mAAA{}RULE\nClean: real-a.mds", '\u{1b}', '\u{202e}');
+    let rule_b = format!("BBB{}RULE\nOK: real-b.mds", '\u{061c}');
     let mut rules = serde_json::Map::new();
     rules.insert(rule_a, serde_json::Value::String("warn".to_string()));
     rules.insert(rule_b, serde_json::Value::String("warn".to_string()));
