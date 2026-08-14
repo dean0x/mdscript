@@ -1290,10 +1290,11 @@ fn build_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
 
 // ── AC-224-14 / D2(a): build, check, and fmt do not emit unknown-rule warnings ──
 //
-// Only `mds lint` reads `lint.rules` and emits an unknown-rule warning.  The other
+// Only `mds lint` reads `lint.rules` and emits an unknown-rule warning — single-file
+// mode via `load_lint_config`, directory mode via `LintDirCtx::config_for`.  The other
 // commands (`build`, `check`, `fmt`, and `watch`) load the same `mds.json` through
-// `into_core_config` but do not call `load_lint_config`, so they never warn — an
-// accepted D2(a) asymmetry documented in CHANGELOG.md.
+// `into_core_config` but do not emit the warning — an accepted D2(a) asymmetry
+// documented in CHANGELOG.md.
 //
 // These tests also mechanically hold the AC-224-14 watch-path invariant.  The
 // `watch.rs:822` hot-path calls `load_config(...).unwrap_or(None)`.  Because
