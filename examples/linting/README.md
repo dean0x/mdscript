@@ -188,7 +188,7 @@ surfaces `shadow-variable` as **info** (☞) and `unused-variable` as an **error
 Config errors are strict: an unknown severity value or malformed JSON fails the run
 with exit `2`. An unknown *rule name* is handled more leniently: a
 `warning: unknown lint rule …` is printed to stderr, the config still loads, lint
-continues, and the unknown rule is not enforced — it is silently skipped
+continues, and the unknown rule is not enforced — it is skipped
 (forward-compatible: a config naming a rule from a newer release warns instead of
 failing on an older binary).
 
