@@ -110,9 +110,10 @@ jobs:
             #   bundled + release profile); +headroom for CI toolchain variance (CI uses
             #   Binaryen v129 which may differ).
             #   PR #294 (2026-08-14, feat/lint-json-wire-contract): sort + stdin-label +
-            #   name-span-anchor added +23,481 bytes; wave/v0.4.0-wave1 baseline 821,662,
-            #   post-change 845,143 (local wasm-pack bundled wasm-opt, independently
-            #   verified). Guard NOT raised: 4,857 bytes (0.57%) headroom. CI uses
+            #   name-span-anchor added +11,840 bytes; wave/v0.4.0-wave1 baseline 821,662,
+            #   post-change 833,502 (wasm-pack 0.15.0 bundled wasm-opt, measured at HEAD
+            #   after removing redundant to_canonical_json re-sort in 56424f7).
+            #   Guard NOT raised: 16,498 bytes (1.94%) headroom. CI uses
             #   Binaryen v129 (distinct toolchain from local). (AC-P1-23)
             # Follow-up: pin the wasm build toolchain to make the size deterministic
             # and re-tighten this guard.
