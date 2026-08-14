@@ -259,7 +259,10 @@ def test_par5_live_cli_lint_json_parity(mds_cli: pathlib.Path, tmp_path: pathlib
     """
     src = "Hello World!\n"
     mds_file = tmp_path / "main.mds"
-    mds_file.write_text(src, encoding="utf-8")
+    # write_bytes: force LF bytes so the CLI lints the same bytes the Python surface
+    # processes in-memory. write_text(newline=None) translates \n to os.linesep on
+    # Windows (CRLF), causing byte-offset divergence between surfaces.
+    mds_file.write_bytes(src.encode("utf-8"))
     out = subprocess.run(
         [str(mds_cli), "lint", "--format", "json", str(mds_file)],
         capture_output=True,
@@ -302,7 +305,11 @@ def test_ac_p1_24_cross_surface_diagnostic_order_parity(
     src = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
     entry_key = "parity.mds"
     mds_file = tmp_path / entry_key
-    mds_file.write_text(src, encoding="utf-8")
+    # write_bytes: force LF bytes so the CLI lints the same bytes the Python surface
+    # processes in-memory. write_text(newline=None) translates \n to os.linesep on
+    # Windows (CRLF), causing byte-offset divergence between surfaces (root cause of
+    # the AC-P1-24 Windows CI failure).
+    mds_file.write_bytes(src.encode("utf-8"))
 
     # CLI surface: lint the file in JSON mode.
     cli_out = subprocess.run(
@@ -393,24 +400,25 @@ def test_par5b_live_cli_lint_differential_with_findings(mds_cli: pathlib.Path) -
     src = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
 
     # -- CLI surface: stdin lint in JSON mode; file key = "<stdin>" --
+    # Pass bytes directly to stdin: text=True + input=str would translate \n to
+    # os.linesep on Windows (CRLF), making the CLI lint different bytes than the
+    # in-memory string the Python surface processes, causing byte-offset divergence.
     out = subprocess.run(
         [str(mds_cli), "lint", "-", "--format", "json"],
-        input=src,
+        input=src.encode("utf-8"),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
     )
     # exit 0 = clean, exit 1 = warn-only findings, exit 2 = at least one error-severity
     # finding.  The fixture's duplicate-export rule fires at "error" severity, so exit 2
     # is the expected normal outcome (not a CLI failure).
     assert out.returncode in (0, 1, 2), (
         f"AC-P1-24: CLI lint exited unexpected status {out.returncode} "
-        f"(expected 0/1/2 for a lint result):\n{out.stderr}"
+        f"(expected 0/1/2 for a lint result):\n{out.stderr.decode('utf-8', errors='replace')}"
     )
     assert out.returncode != 0, (
         "AC-P1-24: fixture must produce at least one finding (exit non-zero); got clean exit"
     )
-    cli_result = json.loads(out.stdout.strip())
+    cli_result = json.loads(out.stdout.decode("utf-8").strip())
 
     # -- Python surface: string-source lint; file key = "input.mds" --
     py_result = json.loads(m.lint(src).to_json())
@@ -447,4 +455,66 @@ def test_par5b_live_cli_lint_differential_with_findings(mds_cli: pathlib.Path) -
     assert py_result["files"][0]["file"] == "input.mds", (
         f"AC-P1-24: Python string-source file key must be 'input.mds'; "
         f"got '{py_result['files'][0]['file']}'"
+    )
+
+
+def test_crlf_input_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> None:
+    """Deliberate CRLF-input contract: both surfaces must AGREE on offsets for CRLF bytes.
+
+    This is a regression contract for the AC-P1-24 Windows CI failure.  The root cause
+    was CRLF translation in the test harness (write_text / text=True stdin) causing the
+    CLI and Python surfaces to receive DIFFERENT bytes, making offset values diverge.
+
+    When BOTH surfaces receive identical CRLF bytes the correct behaviour is that they
+    AGREE — this test verifies that contract explicitly rather than relying on it being
+    implied by LF-only fixtures.
+
+    Fixture: the same source as test_ac_p1_24 / test_par5b, with \n replaced by \r\n.
+    write_bytes is used so no os.linesep translation occurs — the CLI receives genuine
+    CRLF bytes, matching the CRLF string passed to lint_virtual().
+    """
+    src_lf = "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n"
+    src_crlf_str = src_lf.replace("\n", "\r\n")
+    src_crlf_bytes = src_crlf_str.encode("utf-8")
+
+    entry_key = "crlf_parity.mds"
+    mds_file = tmp_path / entry_key
+    # write_bytes: no os.linesep translation — CLI receives the exact CRLF bytes we
+    # intend.  This mirrors the fix that was applied to all other write_text sites in
+    # this file (see AC-P1-24 Windows failure post-mortem).
+    mds_file.write_bytes(src_crlf_bytes)
+
+    cli_out = subprocess.run(
+        [str(mds_cli), "lint", "--format", "json", str(mds_file)],
+        capture_output=True,
+    )
+    assert cli_out.returncode in (0, 1, 2), (
+        f"CLI lint exited unexpectedly with {cli_out.returncode}: "
+        f"{cli_out.stderr.decode('utf-8', errors='replace')}"
+    )
+
+    cli_result = json.loads(cli_out.stdout.decode("utf-8"))
+
+    # Python surface: lint_virtual receives the CRLF string — same bytes when encoded.
+    py_result = json.loads(m.lint_virtual({entry_key: src_crlf_str}, entry_key).to_json())
+
+    # Non-vacuity guard: both surfaces must produce findings (PF-013).
+    assert cli_result.get("files"), "CLI must produce findings for CRLF fixture"
+    assert py_result.get("files"), "Python must produce findings for CRLF fixture"
+
+    def drop_file_key(result: dict) -> list:  # type: ignore[type-arg]
+        return [
+            {k: v for k, v in f.items() if k != "file"}
+            for f in result.get("files", [])
+        ]
+
+    cli_norm = drop_file_key(cli_result)
+    py_norm = drop_file_key(py_result)
+
+    assert cli_norm == py_norm, (
+        "CRLF parity: CLI and Python must agree on diagnostics[] when both receive\n"
+        "identical CRLF bytes. A divergence here means the surfaces handle CRLF\n"
+        "byte-counting differently in the shared core.\n"
+        f"  CLI: {json.dumps(cli_norm)}\n"
+        f"  py:  {json.dumps(py_norm)}"
     )

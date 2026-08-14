@@ -85,7 +85,10 @@ def mds_cli() -> Path:
 def cli_build(cli: Path, source: str, tmp_path: Path, *sets: str) -> str:
     """Compile `source` through the CLI and return its raw stdout (the payload)."""
     src = tmp_path / "parity.mds"
-    src.write_text(source, encoding="utf-8")
+    # write_bytes: force LF bytes so the CLI processes the same content as the
+    # in-memory string. write_text(newline=None) translates \n to os.linesep on
+    # Windows (CRLF), which would desynchronize byte offsets between surfaces.
+    src.write_bytes(source.encode("utf-8"))
     cmd = [str(cli), "build", str(src), "-o", "-", *sets]
     out = subprocess.run(
         cmd, capture_output=True, text=True, check=True, encoding="utf-8"
