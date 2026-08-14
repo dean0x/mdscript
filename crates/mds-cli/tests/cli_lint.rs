@@ -1609,20 +1609,49 @@ fn stdin_analysis_failure_labels_source_as_stdin() {
         "AC-P1-07: error.message must not be empty"
     );
 
-    // ADR-009 / PF-013 positive controls: these fabricated strings WOULD trigger
-    // the assertions below to FAIL, proving the detection logic is sound.
-    // `MdsError::serialize()` emits `code`/`message`/`help`/`span` only; no
-    // `MdsError` Display template interpolates `ctx.file_str`, so the source
-    // identity structurally cannot reach `error.message` (AD-211-5 rustdoc).
-    // A future Display change that adds a file reference would be caught here.
-    assert!(
-        "<source>:1:1 — parse error".contains("<source>"),
-        "control: '<source>' is detectable by .contains() (ADR-009 non-vacuity)"
-    );
-    assert!(
-        "failed to read input.mds".contains("input.mds"),
-        "control: 'input.mds' is detectable by .contains() (ADR-009 non-vacuity)"
-    );
+    // ADR-009 / PF-013 positive controls: apply the SAME extraction pipeline
+    // (`serde_json::from_str` → `v["error"]["message"].as_str()` → `.contains()`)
+    // to a SYNTHETIC JSON document that embeds each forbidden value.
+    //
+    // A tautology over a string literal — e.g. `"<source>".contains("<source>")` —
+    // proves only that `str::contains` is implemented; it never exercises the serde
+    // deserialization step, so it would still pass even if `v["error"]["message"]`
+    // silently returned `None` (e.g. because `MdsError::serialize` moved the value
+    // to a different key).  These controls catch that regression.
+    {
+        let ctrl_stdout = r#"{"version":1,"error":{"code":"parse_error","message":"<source>:1:1","help":null,"span":null}}"#;
+        let ctrl_v: serde_json::Value = serde_json::from_str(ctrl_stdout).unwrap();
+        let ctrl_msg = ctrl_v["error"]["message"]
+            .as_str()
+            .expect("control: synthetic envelope must yield a message string");
+        assert!(
+            ctrl_msg.contains("<source>"),
+            "control (ADR-009/PF-013): extraction path v[\"error\"][\"message\"].as_str() \
+             detects '<source>' in error.message — if this fails the real check below is broken"
+        );
+        assert!(
+            ctrl_stdout.contains("<source>"),
+            "control (ADR-009/PF-013): raw stdout scan detects '<source>' — \
+             if this fails the stdout scan below is broken"
+        );
+    }
+    {
+        let ctrl_stdout = r#"{"version":1,"error":{"code":"io_error","message":"failed to read input.mds","help":null,"span":null}}"#;
+        let ctrl_v: serde_json::Value = serde_json::from_str(ctrl_stdout).unwrap();
+        let ctrl_msg = ctrl_v["error"]["message"]
+            .as_str()
+            .expect("control: synthetic envelope must yield a message string");
+        assert!(
+            ctrl_msg.contains("input.mds"),
+            "control (ADR-009/PF-013): extraction path v[\"error\"][\"message\"].as_str() \
+             detects 'input.mds' in error.message — if this fails the real check below is broken"
+        );
+        assert!(
+            ctrl_stdout.contains("input.mds"),
+            "control (ADR-009/PF-013): raw stdout scan detects 'input.mds' — \
+             if this fails the stdout scan below is broken"
+        );
+    }
 
     assert!(
         !message.contains("<source>"),
@@ -1933,7 +1962,15 @@ fn directory_json_file_key_escapes_control_bytes_in_paths() {
 
     let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
     if fs::write(&target, dupe).is_err() {
-        // Some filesystems reject control bytes in names — nothing to assert.
+        // Some filesystems reject control bytes in names.  Emit an explicit skip
+        // notice so the omission is visible in test output rather than a silent
+        // early return.  Windows has no `OsStringExt` analogue, so there is no
+        // #[cfg(windows)] sibling test; the Windows coverage gap is tracked
+        // alongside the other open Windows CI items at #147/#148.
+        eprintln!(
+            "SKIP directory_json_file_key_escapes_control_bytes_in_paths: \
+             control-byte filename rejected by filesystem (PF-013 / ADR-009)"
+        );
         return;
     }
 
