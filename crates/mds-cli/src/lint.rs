@@ -241,18 +241,28 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 }
 
 /// Returns the path of `path` relative to `root`, normalised to forward-slash
-/// separators regardless of the host platform.
+/// separators by joining path components with `/`.
+///
+/// Using `Path::components()` is the correct platform-aware join: on Windows a
+/// backslash is a path separator, so each component is a directory or filename
+/// segment; on Unix a backslash is an ordinary filename byte (POSIX forbids
+/// only `/` and NUL), so a single component carries the whole
+/// `\`-containing filename intact.  The naive `.replace('\\', "/")` alternative
+/// would manufacture a path separator from an ordinary filename byte on Unix,
+/// turning `sub/..\..\etc\evil.mds` into `sub/../../../etc/evil.mds` and
+/// providing a directory-traversal vector (CWE-22/CWE-41).
 ///
 /// The same computation is used for both the directory-mode sort key and the
 /// JSON `files[].file` value so that sort order and emitted key are
 /// byte-identical on every platform.  Forward slashes (`/`, 0x2F) are used
 /// instead of the native separator so that byte-wise ordering matches the
-/// documented example (`api-utils.mds` before `api/x.mds`) on Unix and
-/// Windows alike.  On Unix this is a no-op (paths never contain `\`); on
-/// Windows `Path::to_string_lossy()` uses `\`, which is replaced here.
+/// documented example (`api-utils.mds` before `api/x.mds`) on all platforms.
 fn relative_display(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // ── Read source file ──────────────────────────────────────────────────────────
@@ -510,7 +520,10 @@ fn plan_and_apply_fixes(
             mut residual,
         } => {
             set_diag_display_path(&mut residual, display_label);
-            FixFileOutcome::Fixed { new_source, residual }
+            FixFileOutcome::Fixed {
+                new_source,
+                residual,
+            }
         }
         mds::fix::FixOutcome::PartiallyFixed {
             source: new_source,
@@ -683,10 +696,10 @@ fn run_lint_stdin(
     // AD-211-4 / AD-211-1: relabel diag.file from STRING_SOURCE_MAP_LABEL →
     // STDIN_DISPLAY_LABEL at the CLI output boundary.  fix.rs never reads diag.file
     // (verified: zero reads in fix.rs), so this relabel is safe upstream of both
-    // preview_fixes and plan_and_apply_fixes.  For the report-only and preview branches
-    // this single call ensures "files[].file" emits "<stdin>" (AC-P1-01).  The write
-    // path's residual is a fresh LintResult from the reverify lint_str_with call; it
-    // is relabeled separately after the fix_outcome match below.
+    // preview_fixes and plan_and_apply_fixes.  This single call ensures
+    // "files[].file" emits "<stdin>" across all code paths (AC-P1-01); for the
+    // write path, plan_and_apply_fixes relabels its internally produced residual
+    // before returning.
     set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
 
     if fix {
@@ -1056,10 +1069,13 @@ fn run_lint_directory(
     // display string keeps the CLI wire contract consistent with the BTreeMap
     // ordering that `to_canonical_json` applies on the binding surfaces (PF-007).
     // `relative_display` normalises to forward slashes so byte-wise order is
-    // identical on Unix and Windows (finding 4).  Its return value is the same
-    // String used as the JSON `files[].file` key, keeping sort and emission
-    // byte-identical by construction (finding 2).  `sort_by_cached_key` computes
-    // each key once — O(n) allocations, not O(n log n) (AC-P1-22).
+    // identical on Unix and Windows (finding 4).  Its return value is also used as
+    // the JSON `files[].file` key; sort key and emitted key are byte-identical for
+    // normal paths.  For paths containing control bytes, `to_canonical_json` applies
+    // `sanitize_control_chars_wire` after sorting, so the emitted key may differ from
+    // the sort key for that narrow class of filenames (AC-P1-20).
+    // `sort_by_cached_key` computes each key once — O(n) allocations, not O(n log n)
+    // (AC-P1-22).
     files.sort_by_cached_key(|p| relative_display(p, dir));
 
     let mut max_tally = FileTally::Clean;
@@ -1606,6 +1622,57 @@ mod tests {
             matches!(outcome, PreviewOutcome::Rejected(_)),
             "preview_fixes must return Rejected for an overlap_rejected plan, \
              not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
+        );
+    }
+
+    /// Regression: `relative_display` must NOT treat a literal backslash in a
+    /// Unix filename as a path separator.
+    ///
+    /// On Unix, POSIX forbids only `/` and NUL in filenames; `\` is an ordinary
+    /// byte.  The old `to_string_lossy().replace('\\', "/")` implementation
+    /// turned `sub/..\..\etc\evil.mds` into `sub/../../../etc/evil.mds`,
+    /// providing a directory-traversal vector (CWE-22/CWE-41) and causing key
+    /// collisions on the published lint JSON wire surface when two distinct files
+    /// (e.g. `a/b.mds` and `a\b.mds`) were linted together.
+    ///
+    /// The new `Path::components()` join preserves `\` as a literal filename
+    /// byte on Unix and normalises it to a separator on Windows, which is the
+    /// correct platform-aware behaviour.
+    ///
+    /// Path construction uses Rust string literals containing a backslash byte
+    /// (0x5C) — not a control byte, so the Source hygiene gate does not flag it.
+    #[cfg(unix)]
+    #[test]
+    fn relative_display_preserves_literal_backslash_on_unix() {
+        use super::relative_display;
+        use std::path::Path;
+
+        let root = Path::new("/lint-root");
+
+        // A real subdirectory: /lint-root/a/b.mds  (two path components under root)
+        let real_subdir = Path::new("/lint-root/a/b.mds");
+
+        // A top-level file whose NAME contains a literal backslash: /lint-root/a\b.mds
+        // On Unix the backslash is just a filename byte; Path treats this as ONE
+        // component under root (not two).  The string "a\\b.mds" in Rust source
+        // is the byte sequence a, 0x5C, b, ., m, d, s — no control bytes.
+        let backslash_name = Path::new("/lint-root/a\\b.mds");
+
+        let display_subdir = relative_display(real_subdir, root);
+        let display_backslash = relative_display(backslash_name, root);
+
+        assert_eq!(
+            display_subdir, "a/b.mds",
+            "real subdirectory path should emit forward-slash-separated key"
+        );
+        assert_eq!(
+            display_backslash, "a\\b.mds",
+            "a literal backslash filename byte must be preserved in the emitted key on Unix"
+        );
+        assert_ne!(
+            display_subdir, display_backslash,
+            "a literal-backslash filename must not collide with the same letters \
+             separated by a real slash (was broken by the old .replace() approach)"
         );
     }
 }
