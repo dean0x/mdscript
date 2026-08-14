@@ -1339,6 +1339,14 @@ fn stdin_lint_diagnostic_includes_code_frame() {
         "stdin mode must show '<stdin>' in the code frame; got: {stderr}"
     );
 
+    // PF-013 negative half: the internal VFS key must NOT appear in the human output.
+    // Symmetric with the JSON sibling (stdin_json_wire_file_key_is_stdin_sentinel) which
+    // also asserts absence of "input.mds" alongside the presence assertion for "<stdin>".
+    assert!(
+        !stderr.contains("input.mds"),
+        "stdin human output must not expose the internal VFS key 'input.mds'; got: {stderr}"
+    );
+
     // At least one token from the source must appear in the code frame context.
     // miette renders the offending line; "@export greet" is on that line.
     assert!(

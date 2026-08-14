@@ -246,7 +246,7 @@ I checked whether inheritance could feed the linter a MERGED module, putting par
 
 ## 5. Implementation sequence
 
-0. **Baseline WASM raw bytes** — `npm run build -w @mdscript/mds-wasm`. Budget 850,000 (`ci.yml`); main at 820,305 (3.5% headroom). **`[CR]` Run in the PRIMARY CHECKOUT — `pkg/` is generated and gitignored, so an isolated worktree has nothing to measure and the check passes vacuously (PF-016).**
+0. **Baseline WASM raw bytes** — `npm run build -w @mdscript/mds-wasm`. Budget 850,000 (`ci.yml`); wave/v0.4.0-wave1 CI baseline 821,662 (~3.3% headroom; local build measured 820,305 at the same commit — CI uses Binaryen v129, local uses an older toolchain). **`[CR]` Run in the PRIMARY CHECKOUT — `pkg/` is generated and gitignored, so an isolated worktree has nothing to measure and the check passes vacuously (PF-016).**
 1. **#211**: `STDIN_DISPLAY_LABEL`; swap 5 literals **including the hardcoded `"<stdin>"` at `build.rs:993`**; `set_diag_display_path` in `run_lint_stdin`; fix :662/:667/:706; repoint :682/:718/:727; **apply the AD-211-5 ruling** (`<source>` → `<stdin>` at `emit_analysis_failure_json_or_stderr`, written as an envelope-wide rule). Update `cli_lint.rs:1266-1280`. **Do NOT edit `crates/mds-core/src/sourcemap.rs:79`.** Gate.
 
    **1a. LOCATE the live build/check `<source>` emission site — an explicit task, not an assumption.** The ruling's `crates/mds-cli/src/formatter.rs:120` citation is **retracted** (§0a); that file does not exist and no replacement line number has been established. **Do not guess one.** Before writing any code for this leg:
