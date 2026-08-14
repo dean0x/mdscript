@@ -1086,6 +1086,7 @@ fn lint_api_signatures_exist() {
 /// L-API-2: pub types LintDiagnostic, Severity, LintConfig, LintResult are accessible
 /// and have the expected fields/variants.
 #[test]
+#[allow(deprecated)] // exercises LintConfig::from_rules for surface coverage
 fn lint_types_exist() {
     // Severity has four variants with lowercase serde names.
     let _off = Severity::Off;
@@ -1135,12 +1136,13 @@ fn lint_types_exist() {
 /// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
 /// - It contains exactly the ten registered rule names.
 /// - Every entry in the registry is accepted by `LintConfig::from_rules` without
-///   error or warning.
+///   error or warning (exercises the deprecated constructor for surface coverage).
 /// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
 ///   maps containing unknown names.
 /// - `UnknownRuleNames` exposes names via accessor, not a public field, and is
 ///   only constructible through the library.
 #[test]
+#[allow(deprecated)] // exercises LintConfig::from_rules for surface coverage
 fn known_lint_rules_and_unknown_detection() {
     use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
 

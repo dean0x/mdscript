@@ -4,13 +4,16 @@
 //! `lint.rules` section into it, and all `lint_*` entry points accept a `&LintConfig`.
 //!
 //! **Unknown rule NAMEs** do not cause construction failures — the rule simply has no
-//! effect and lint continues. Detection is opt-in: callers must call
-//! [`find_unknown_rule_names`] and surface any unknowns themselves. mds-core itself
-//! emits no warning. The CLI's `mds lint` warns on stderr; napi/WASM/Python return
-//! `lint_warnings`; `mds build`, `check`, `fmt`, and `watch` do not warn — an accepted
-//! asymmetry, not an oversight. This is deliberate forward-compatibility: severities are
-//! a closed set, but rule names grow every release; hard-failing an unknown name would
-//! break a config naming a newer rule when run with an older binary.
+//! effect and lint continues. The preferred construction path for surfaces that must
+//! surface unknowns is [`LintConfig::from_rules_checked`]: it returns the config and
+//! an unknowns report in one atomic call, making it structurally impossible to miss
+//! the detection step. [`find_unknown_rule_names`] remains available for callers that
+//! perform detection separately. mds-core itself emits no warning. The CLI's
+//! `mds lint` warns on stderr; napi/WASM/Python return `lint_warnings`; `mds build`,
+//! `check`, `fmt`, and `watch` do not warn — an accepted asymmetry, not an oversight.
+//! This is deliberate forward-compatibility: severities are a closed set, but rule
+//! names grow every release; hard-failing an unknown name would break a config naming
+//! a newer rule when run with an older binary.
 //! **Unknown severity VALUES** fail loudly via serde deserialization error (closed enum).
 
 use std::collections::HashMap;
@@ -123,9 +126,14 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 /// literals.
 ///
 /// Called by the bindings (napi/WASM/Python) to build their `lint_warnings`
-/// strings. The CLI does **not** call it — it applies `safe_inline` per name and
-/// uses a context-specific wording (`… in mds.json`) so the print-discipline
-/// guard can machine-check the escape at the call site.
+/// strings. The CLI does **not** call it — the CLI uses context-specific wording
+/// (`… in mds.json`) as a deliberate surface preference, not a guard constraint.
+/// Both paths apply the same WIRE-escape per name (`safe_inline` in the CLI is
+/// `sanitize_control_chars_wire` by another name); the print-discipline guard is
+/// satisfied on both surfaces by a whole-expression sanitizer call inside
+/// `eprint_warning`'s `format!`. The divergence is wording only (CHANGELOG
+/// AC-224-3 documents the CLI format as a knowing deviation from byte-identical
+/// cross-surface messages).
 ///
 /// Produces one of:
 /// - `"unknown lint rule 'NAME'; recognised rules are: ...; ignoring"`
@@ -165,39 +173,6 @@ pub fn format_unknown_rule_names_warning(unknown: &UnknownRuleNames) -> String {
     out
 }
 
-/// Inject `lint_warnings` into a canonical JSON result when a warning is present.
-///
-/// D8 (AC-224-1): the napi, WASM, and Python bindings surface unknown-rule warnings
-/// by adding a `lint_warnings: string[]` field to the returned JSON object. This
-/// function is the single implementation of that D8 wire contract — the key name
-/// `"lint_warnings"`, the array-of-one shape, and the absent-when-empty semantics
-/// — so the contract cannot diverge across surfaces.
-///
-/// `Option<String>` rather than `Vec<String>`: there is exactly one warning message
-/// today (unknown rule names are reported as a single sentence), so a vector would be
-/// over-general plumbing. The JSON shape is still `string[]` — the array is built
-/// here — so adding a second warning kind later is a change to this function, not to
-/// the wire contract.
-///
-/// Deliberately kept out of [`LintResult::to_canonical_json`] so the CLI serializer
-/// path (`--format json`) remains byte-frozen: the CLI writes the warning to stderr
-/// via `eprint_warning` and never touches the JSON.
-#[must_use]
-pub fn attach_lint_warnings(
-    mut json: serde_json::Value,
-    warning: Option<String>,
-) -> serde_json::Value {
-    if let Some(w) = warning {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
-            );
-        }
-    }
-    json
-}
-
 /// Per-rule severity override configuration.
 ///
 /// Loaded from the `lint.rules` section of `mds.json`:
@@ -217,11 +192,9 @@ pub fn attach_lint_warnings(
 /// because the closed enum has no sensible fallback.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
-/// Use `LintConfig::default()` for a config with all rules at engine defaults,
+/// Use `LintConfig::default()` for a config with all rules at engine defaults, or
 /// [`LintConfig::from_rules_checked`] (preferred) to supply per-rule overrides and
-/// receive an unknowns report in a single step, or [`LintConfig::from_rules`] when
-/// the unknowns check has already been performed externally; do not construct via
-/// struct literal.
+/// receive an unknowns report in a single step. Do not construct via struct literal.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct LintConfig {
@@ -264,14 +237,17 @@ impl LintConfig {
     /// assert!(unknown.is_none());
     /// assert_eq!(config.severity_for("unused-variable"), Some(&Severity::Off));
     ///
-    /// // Map with an unknown name: report is Some, config still loads.
+    /// // Map with an unknown name alongside a known one: report fires, config loads.
     /// let (config2, unknown2) = LintConfig::from_rules_checked(HashMap::from([
     ///     ("no-such-rule".to_string(), Severity::Warn),
+    ///     ("unused-variable".to_string(), Severity::Error),
     /// ]));
     /// let u = unknown2.expect("should detect unknown");
     /// assert_eq!(u.names(), &["no-such-rule".to_string()]);
-    /// // The config still loads — lint continues with no effect for the unknown rule.
-    /// assert!(config2.severity_for("no-such-rule").is_some());
+    /// // The config still loads — the known sibling is queryable at its configured severity.
+    /// // The unknown name is stored verbatim in the map, but the lint engine never queries
+    /// // it (no rule implementation matches "no-such-rule"), so it has no effect on linting.
+    /// assert_eq!(config2.severity_for("unused-variable"), Some(&Severity::Error));
     /// ```
     #[must_use]
     pub fn from_rules_checked(
@@ -290,11 +266,10 @@ impl LintConfig {
     /// or `with_*` only when taking `self`. This function does not take `self`,
     /// so it is named `from_rules`.
     ///
-    /// **Prefer [`LintConfig::from_rules_checked`]** when your surface must warn about
-    /// unknown rule names. It returns the unknowns report in a single call, making it
-    /// structurally impossible to miss the detection step. Use `from_rules` only when
-    /// the unknowns check has already been performed externally (e.g. a config built
-    /// entirely from compile-time literals, or detection delegated to a separate call).
+    /// **Prefer [`LintConfig::from_rules_checked`]** — it returns the unknowns report
+    /// in a single call, making it structurally impossible to miss the detection step.
+    /// `from_rules` remains available for external crates that have already performed
+    /// the unknowns check separately; it will not be removed without a major-version bump.
     ///
     /// Unknown rule names in the map do not cause this constructor to fail — the rule
     /// simply has no effect, and lint continues. mds-core itself emits no warning;
@@ -305,12 +280,19 @@ impl LintConfig {
     ///
     /// ```
     /// use std::collections::HashMap;
+    /// #[allow(deprecated)]
     /// use mds::{LintConfig, Severity};
+    /// #[allow(deprecated)]
     /// let config = LintConfig::from_rules(HashMap::from([
     ///     ("unused-variable".to_string(), Severity::Off),
     /// ]));
     /// assert_eq!(config.severity_for("unused-variable"), Some(&Severity::Off));
     /// ```
+    #[deprecated(
+        since = "0.4.0",
+        note = "prefer `LintConfig::from_rules_checked`, which returns the unknowns report \
+                in one atomic call — all built-in callers have migrated"
+    )]
     #[must_use]
     pub fn from_rules(rules: HashMap<String, Severity>) -> Self {
         LintConfig { rules }
@@ -396,34 +378,4 @@ mod tests {
         );
     }
 
-    // ── attach_lint_warnings ─────────────────────────────────────────────────
-
-    /// D8: a present warning is injected as `lint_warnings: [string]`.
-    ///
-    /// PF-013 / ADR-009: both directions are tested — present warning inserts
-    /// the field; absent warning leaves the object unchanged.
-    #[test]
-    fn attach_lint_warnings_injects_field_when_warning_present() {
-        let json = serde_json::json!({ "version": 1 });
-        let result = attach_lint_warnings(json, Some("unknown lint rule 'foo'; ignoring".into()));
-        let arr = result["lint_warnings"]
-            .as_array()
-            .expect("lint_warnings must be an array");
-        assert_eq!(arr.len(), 1, "exactly one element");
-        assert_eq!(
-            arr[0].as_str().unwrap(),
-            "unknown lint rule 'foo'; ignoring"
-        );
-    }
-
-    /// D8: no `lint_warnings` key is added when warning is absent (absent-when-empty semantics).
-    #[test]
-    fn attach_lint_warnings_leaves_object_unchanged_when_no_warning() {
-        let json = serde_json::json!({ "version": 1 });
-        let result = attach_lint_warnings(json, None);
-        assert!(
-            result.get("lint_warnings").is_none(),
-            "lint_warnings must be absent when no warning; got: {result:?}"
-        );
-    }
 }
