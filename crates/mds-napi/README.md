@@ -66,7 +66,7 @@ Static analysis. Returns the canonical lint JSON:
 `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, fix_edits, span?},...]},...], truncated: bool, lint_warnings?: string[] }`
 
 Options: `basePath` (lint only — lintFile derives the base from the file path; lintVirtual resolves against the module map), `vars`, `rules` (`Record<string, "off"|"info"|"warn"|"error">`).
-Unknown rule names in `rules` emit a warning and lint continues — the unknown name has no effect but `result.lint_warnings` (a `string[]` field) is populated so callers can surface the issue; unknown severity values throw `mds::invalid_options`.
+Unknown rule names in `rules` emit a warning and lint continues — the unknown name has no effect but `result.lint_warnings` (a `string[]` field, absent when empty) is populated so callers can surface the issue; unknown severity values throw `mds::invalid_options`.
 
 See `index.d.ts` for the full typed surface.
 
