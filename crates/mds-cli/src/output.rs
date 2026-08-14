@@ -164,14 +164,13 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.
 pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Report {
     // Only replace the embedded source when the inner error's source name is the
-    // stdin sentinel "<source>" set by `resolve_source_intrinsic`.  Errors from
-    // imported files carry the real file path; replacing them would render the
-    // caret against stdin text at the wrong location (PF-012 / AD-211-5 scope).
-    // Compare the embedded source name against the resolver sentinel "<source>".
-    // Only string-source analysis errors carry that name; imported-file errors carry
-    // the real path and must not be relabelled (PF-012 / AD-211-5).
+    // stdin sentinel set by `resolve_source_intrinsic`.  Errors from imported files
+    // carry the real file path; replacing them would render the caret against stdin
+    // text at the wrong location (PF-012 / AD-211-5 scope).
+    // `is_string_source()` encapsulates the sentinel comparison inside mds-core,
+    // where it has compile-time coupling to the `pub(crate)` constant definition.
     miette::Report::new(StdinRelabeledError {
-        source: if e.source_name().is_some_and(|n| n == "<source>") {
+        source: if e.is_string_source() {
             miette::Diagnostic::source_code(e)
                 .map(|_| mds::named_source_for_render(STDIN_DISPLAY_LABEL, source))
         } else {

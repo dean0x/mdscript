@@ -1024,13 +1024,17 @@ impl MdsError {
     ///
     /// This is the primary access point for the source identity associated with an
     /// `MdsError`.  Callers that need to detect the string-source analysis path should
-    /// compare the returned name against `resolver::SOURCE_LABEL` (`"<source>"`):
-    /// only errors produced by `resolve_source_intrinsic` carry that sentinel; errors
-    /// from imported files carry the real file path (PF-012 / AD-211-5).
+    /// use [`MdsError::is_string_source`] rather than comparing the returned string
+    /// against a literal — the internal sentinel is a `pub(crate)` implementation
+    /// detail of `mds-core` and is not reachable from downstream crates.
     ///
     /// The name is taken directly from the `NamedSource` stored on the variant and is
-    /// not sanitized — use [`MdsError::display_sanitized`] when the name will be
-    /// rendered to a terminal or embedded in an API response.
+    /// not sanitized.  To sanitize it before rendering to a terminal, pass it to
+    /// [`sanitize_control_chars`][crate::sanitize_control_chars]; for a wire context
+    /// (JSON or API response) use
+    /// [`sanitize_control_chars_wire`][crate::sanitize_control_chars_wire].
+    /// [`MdsError::display_sanitized`] sanitizes the **Display message**, not the
+    /// source name.
     #[must_use]
     pub fn source_name(&self) -> Option<&str> {
         let src = match self {
@@ -1060,6 +1064,23 @@ impl MdsError {
             | MdsError::FormatterInvariant { .. } => None,
         };
         src.map(|ns| ns.name())
+    }
+
+    /// Return `true` when this error was produced by the string-source analysis
+    /// path (`resolve_source_intrinsic`) — identifiable because that path embeds
+    /// the `pub(crate)` sentinel `SOURCE_LABEL` (`"<source>"`) as the
+    /// `NamedSource` name.
+    ///
+    /// Use this predicate instead of comparing [`source_name`][MdsError::source_name]
+    /// against a bare string literal.  The sentinel value is a `pub(crate)` constant
+    /// in `crates/mds-core`; comparing against it in a downstream crate would require
+    /// duplicating the value with no compile-time coupling to the definition.
+    ///
+    /// Errors from imported files carry the real file path and return `false`
+    /// (see PF-012 / AD-211-5).
+    #[must_use]
+    pub fn is_string_source(&self) -> bool {
+        self.source_name() == Some(crate::resolver::SOURCE_LABEL)
     }
 }
 

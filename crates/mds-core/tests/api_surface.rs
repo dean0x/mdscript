@@ -231,6 +231,58 @@ fn mds_error_source_name_accessor() {
     assert_eq!(without_src.source_name(), None);
 }
 
+/// Pin `MdsError::is_string_source()` — the compile-time-coupled sentinel predicate
+/// (ADR-010).  This predicate keeps the `pub(crate)` sentinel comparison inside
+/// `mds-core`; downstream crates (e.g. `mds-cli`) use it instead of hardcoding the
+/// literal `"<source>"`, which would have no compile-time link to the definition.
+///
+/// Positive control: an error whose embedded source name is the internal sentinel
+/// `"<source>"` must return `true`.
+/// Negative controls: a non-sentinel source name and a source-less error must return
+/// `false`.  (PF-013: absence alone proves nothing; positive control is mandatory.)
+#[test]
+fn mds_error_is_string_source() {
+    use std::sync::Arc;
+
+    // Positive control: the internal sentinel value "<source>" — as set by
+    // `resolve_source_intrinsic`.
+    let sentinel_err = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "<source>",
+            "content".to_string(),
+        ))),
+    };
+    assert!(
+        sentinel_err.is_string_source(),
+        "is_string_source() must return true for the internal sentinel"
+    );
+
+    // Negative control: a real file path must not match.
+    let file_err = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "real_file.mds",
+            "content".to_string(),
+        ))),
+    };
+    assert!(
+        !file_err.is_string_source(),
+        "is_string_source() must return false for a real file path"
+    );
+
+    // Negative control: an error without an embedded source.
+    let no_src_err = MdsError::Io {
+        message: "test".to_string(),
+    };
+    assert!(
+        !no_src_err.is_string_source(),
+        "is_string_source() must return false when there is no embedded source"
+    );
+}
+
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
