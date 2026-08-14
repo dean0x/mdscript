@@ -849,6 +849,15 @@ impl LintResult {
     ///
     /// Returns an empty list when no warnings occurred (the common case).
     /// Each element is a human-readable warning string.
+    ///
+    /// **Absent-when-empty convention:** the backing JSON key `lint_warnings` is
+    /// omitted when no warnings occurred.  As a result `"lint_warnings" not in
+    /// r.to_dict()` and `r.lint_warnings == []` both describe the same "no warnings"
+    /// state — the Python attribute returns `[]` (idiomatic Python empty default)
+    /// while `to_dict()` omits the key entirely.  This is consistent with the
+    /// TypeScript surface (`lint_warnings?: string[]`) and intentionally asymmetric
+    /// with per-diagnostic optional fields (`help`, `span`, `fix_edits`) which follow
+    /// the always-present-key-with-JSON-null convention inside each diagnostic object.
     #[getter]
     fn lint_warnings(&self) -> Vec<String> {
         self.value
@@ -921,8 +930,8 @@ fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>,
     }
 }
 
-/// Sanitize all message, help, and file string fields in a canonical lint result value
-/// in-place.
+/// Sanitize all string fields in a canonical lint result value in-place: per-file
+/// `file`, per-diagnostic `message` and `help`, and every string in `lint_warnings`.
 ///
 /// Called in [`LintResult::new`] so any data arriving through the
 /// `LintResult(canonical)` / pickle path is sanitized before the typed getters or
@@ -930,28 +939,45 @@ fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>,
 /// `LintResult::to_canonical_json()` does on the live lint path, closing the
 /// parallel-path gap (PF-004).
 ///
+/// The live lint path is safe because `format_unknown_rule_names_warning`
+/// WIRE-escapes each string before [`inject_lint_warnings`] injects it.  The
+/// `LintResult(canonical)` / pickle path must also sanitize `lint_warnings` because
+/// callers may supply untrusted canonical data containing hostile control bytes.
+///
 /// **No re-sort (AD-202-1b):** `to_canonical_json()` preserves caller-supplied
 /// order for `LintResult::new` callers; `sort_diagnostics` is the single ordering
 /// choke point, called only from `LintResultBuilder::build`.  This function
 /// intentionally mirrors that contract — it sanitizes but does not reorder.
 fn sanitize_lint_value(value: &mut serde_json::Value) {
-    let Some(files) = value.get_mut("files").and_then(|v| v.as_array_mut()) else {
-        return;
-    };
-    for file_val in files.iter_mut() {
-        let Some(obj) = file_val.as_object_mut() else {
-            continue;
-        };
-        sanitize_json_str_field(obj, "file");
-        let Some(diags) = obj.get_mut("diagnostics").and_then(|v| v.as_array_mut()) else {
-            continue;
-        };
-        for d in diags.iter_mut() {
-            let Some(d_obj) = d.as_object_mut() else {
+    // Sanitize per-file string fields.
+    if let Some(files) = value.get_mut("files").and_then(|v| v.as_array_mut()) {
+        for file_val in files.iter_mut() {
+            let Some(obj) = file_val.as_object_mut() else {
                 continue;
             };
-            sanitize_json_str_field(d_obj, "message");
-            sanitize_json_str_field(d_obj, "help");
+            sanitize_json_str_field(obj, "file");
+            let Some(diags) = obj.get_mut("diagnostics").and_then(|v| v.as_array_mut()) else {
+                continue;
+            };
+            for d in diags.iter_mut() {
+                let Some(d_obj) = d.as_object_mut() else {
+                    continue;
+                };
+                sanitize_json_str_field(d_obj, "message");
+                sanitize_json_str_field(d_obj, "help");
+            }
+        }
+    }
+    // Sanitize lint_warnings strings (PF-004: the live path escapes via
+    // format_unknown_rule_names_warning before injection, but LintResult(canonical) /
+    // pickle callers may supply untrusted data directly).
+    if let Some(arr) = value.get_mut("lint_warnings").and_then(|v| v.as_array_mut()) {
+        for item in arr.iter_mut() {
+            if let serde_json::Value::String(s) = item {
+                if let std::borrow::Cow::Owned(sanitized) = mds::sanitize_control_chars_wire(s) {
+                    *s = sanitized;
+                }
+            }
         }
     }
 }
@@ -1264,28 +1290,6 @@ fn parse_modules(py: Python<'_>, modules: &Bound<'_, PyAny>) -> PyResult<HashMap
     Ok(result)
 }
 
-/// Inject `lint_warnings` into a canonical JSON result when warnings are present.
-///
-/// D8 (AC-224-1): the Python binding surfaces unknown-rule warnings by adding a
-/// `lint_warnings` field to the `LintResult` JSON. This helper consolidates that
-/// logic across `lint`, `lint_file`, and `lint_virtual`.
-fn inject_lint_warnings(mut json: serde_json::Value, warning: Option<String>) -> serde_json::Value {
-    // `Option<String>`, not `Vec<String>`: there is exactly one warning message today
-    // (unknown rule names are reported as a single sentence), so a vector would be
-    // over-general plumbing. The JSON shape is still `string[]` — the array is built
-    // here — so adding a second warning kind later is a change to this function, not to
-    // the wire contract.
-    if let Some(w) = warning {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
-            );
-        }
-    }
-    json
-}
-
 /// Parse and validate the `rules` keyword argument into a [`mds::LintConfig`] and warning list.
 ///
 /// `None`/absent → default config (no per-rule overrides). A non-mapping value →
@@ -1339,10 +1343,13 @@ fn extract_rules(
             })?;
         rules_map.insert(key, severity);
     }
-    // D8: detect unknown rule names and format warning strings.
-    let lint_warnings = mds::find_unknown_rule_names(&rules_map)
-        .map(|u| mds::format_unknown_rule_names_warning(&u));
-    Ok((mds::LintConfig::from_rules(rules_map), lint_warnings))
+    // D8: detect unknown rule names and build config in one step via
+    // from_rules_checked. The return type structurally forces the caller
+    // to handle the unknowns report — a fifth caller cannot accidentally
+    // omit the detection step (review finding: config.rs:104).
+    let (lint_config, unknown) = mds::LintConfig::from_rules_checked(rules_map);
+    let lint_warnings = unknown.map(|u| mds::format_unknown_rule_names_warning(&u));
+    Ok((lint_config, lint_warnings))
 }
 
 /// Build a [`mds::CompileOptions`] from the `source_map` and `sources_content`
@@ -1549,7 +1556,7 @@ fn lint(
         mds::lint_str_with(&source, base_path.as_deref(), vars, &lint_config)
     })?;
     Ok(LintResult {
-        value: inject_lint_warnings(result.to_canonical_json(), lint_warnings),
+        value: mds::attach_lint_warnings(result.to_canonical_json(), lint_warnings),
     })
 }
 
@@ -1569,7 +1576,7 @@ fn lint_file(
     let (lint_config, lint_warnings) = extract_rules(py, rules.as_ref())?;
     let result = run_catching(py, move || mds::lint(&path, vars, &lint_config))?;
     Ok(LintResult {
-        value: inject_lint_warnings(result.to_canonical_json(), lint_warnings),
+        value: mds::attach_lint_warnings(result.to_canonical_json(), lint_warnings),
     })
 }
 
@@ -1593,7 +1600,7 @@ fn lint_virtual(
         mds::lint_virtual(modules, &entry, vars, &lint_config)
     })?;
     Ok(LintResult {
-        value: inject_lint_warnings(result.to_canonical_json(), lint_warnings),
+        value: mds::attach_lint_warnings(result.to_canonical_json(), lint_warnings),
     })
 }
 

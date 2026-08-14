@@ -448,3 +448,53 @@ def test_py_warn_l5_multiple_unknown_rules() -> None:
     assert "no-such-rule-b" in combined, (
         f"all unknown rule names must appear in lint_warnings; got: {warnings}"
     )
+
+
+def test_py_warn_l2b_known_rule_to_dict_omits_lint_warnings_key() -> None:
+    """lint() with only known rules → to_dict() omits 'lint_warnings' key entirely.
+
+    Pins the absent-when-empty convention: r.lint_warnings == [] and
+    'lint_warnings' not in r.to_dict() both describe the same "no warnings" state.
+    Positive control: test_py_warn_l4 asserts the key IS present when warnings fired,
+    so this absence assertion is not vacuous (ADR-009 / PF-013).
+    """
+    r = m.lint(CLEAN_SOURCE, rules={"unused-variable": "off"})
+    assert r.lint_warnings == [], "lint_warnings attribute must be empty for known rules"
+    d = r.to_dict()
+    assert "lint_warnings" not in d, (
+        "to_dict() must omit 'lint_warnings' when no warnings occurred "
+        f"(absent-when-empty convention); got keys: {list(d.keys())}"
+    )
+
+
+def test_py_warn_canonical_sanitizes_lint_warnings() -> None:
+    """LintResult(canonical) sanitizes hostile control bytes in lint_warnings (PF-004).
+
+    The live lint path is safe because format_unknown_rule_names_warning WIRE-escapes
+    strings before injection. The LintResult(canonical) / pickle path must also sanitize
+    lint_warnings because callers may supply untrusted canonical data.
+
+    Positive control: construct an ESC byte at runtime (not as a literal, per PF-018)
+    and confirm the getter does NOT return the raw byte after construction.
+    """
+    esc = chr(0x1B)  # ESC — constructed at runtime, not written as a literal (PF-018)
+    raw_warning = f"unknown rule {esc}[31mhostile{esc}[0m"
+    canonical = {
+        "version": 1,
+        "files": [],
+        "truncated": False,
+        "lint_warnings": [raw_warning],
+    }
+    result = m.LintResult(canonical)
+    warnings = result.lint_warnings
+    assert len(warnings) == 1, f"expected one warning entry; got: {warnings}"
+    assert esc not in warnings[0], (
+        f"ESC byte must be sanitized in lint_warnings via LintResult(canonical); "
+        f"got: {warnings[0]!r}"
+    )
+    # The sanitized form must be non-empty — hostile bytes are replaced, not dropped.
+    assert len(warnings[0]) > 0, "sanitized warning must be non-empty"
+    # The WIRE-escaped form of ESC (U+001B) is the six-character literal .
+    assert "\\u001B" in warnings[0], (
+        f"ESC must appear as the escaped literal \\u001B; got: {warnings[0]!r}"
+    )

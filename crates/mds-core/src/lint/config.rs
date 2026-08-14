@@ -3,10 +3,14 @@
 //! `LintConfig` is public (lives in mds-core) — the CLI converts the `mds.json`
 //! `lint.rules` section into it, and all `lint_*` entry points accept a `&LintConfig`.
 //!
-//! **Unknown rule NAMEs** emit a warning and lint continues — the unknown rule simply
-//! has no effect. This is deliberate forward-compatibility: severities are a closed set,
-//! but rule names grow every release; hard-failing an unknown name would break a config
-//! naming a newer rule when run with an older binary.
+//! **Unknown rule NAMEs** do not cause construction failures — the rule simply has no
+//! effect and lint continues. Detection is opt-in: callers must call
+//! [`find_unknown_rule_names`] and surface any unknowns themselves. mds-core itself
+//! emits no warning. The CLI's `mds lint` warns on stderr; napi/WASM/Python return
+//! `lint_warnings`; `mds build`, `check`, `fmt`, and `watch` do not warn — an accepted
+//! asymmetry, not an oversight. This is deliberate forward-compatibility: severities are
+//! a closed set, but rule names grow every release; hard-failing an unknown name would
+//! break a config naming a newer rule when run with an older binary.
 //! **Unknown severity VALUES** fail loudly via serde deserialization error (closed enum).
 
 use std::collections::HashMap;
@@ -161,6 +165,39 @@ pub fn format_unknown_rule_names_warning(unknown: &UnknownRuleNames) -> String {
     out
 }
 
+/// Inject `lint_warnings` into a canonical JSON result when a warning is present.
+///
+/// D8 (AC-224-1): the napi, WASM, and Python bindings surface unknown-rule warnings
+/// by adding a `lint_warnings: string[]` field to the returned JSON object. This
+/// function is the single implementation of that D8 wire contract — the key name
+/// `"lint_warnings"`, the array-of-one shape, and the absent-when-empty semantics
+/// — so the contract cannot diverge across surfaces.
+///
+/// `Option<String>` rather than `Vec<String>`: there is exactly one warning message
+/// today (unknown rule names are reported as a single sentence), so a vector would be
+/// over-general plumbing. The JSON shape is still `string[]` — the array is built
+/// here — so adding a second warning kind later is a change to this function, not to
+/// the wire contract.
+///
+/// Deliberately kept out of [`LintResult::to_canonical_json`] so the CLI serializer
+/// path (`--format json`) remains byte-frozen: the CLI writes the warning to stderr
+/// via `eprint_warning` and never touches the JSON.
+#[must_use]
+pub fn attach_lint_warnings(
+    mut json: serde_json::Value,
+    warning: Option<String>,
+) -> serde_json::Value {
+    if let Some(w) = warning {
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert(
+                "lint_warnings".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
+            );
+        }
+    }
+    json
+}
+
 /// Per-rule severity override configuration.
 ///
 /// Loaded from the `lint.rules` section of `mds.json`:
@@ -169,17 +206,21 @@ pub fn format_unknown_rule_names_warning(unknown: &UnknownRuleNames) -> String {
 /// ```
 ///
 /// Absent rules default to the engine's built-in severity (defined per rule in the
-/// rule catalog). Unknown rule names in the map produce a warning on every surface
-/// (the rule simply has no effect, and lint continues). This is deliberate
-/// forward-compatibility: a config naming a rule from a newer mds version warns
-/// but does not break when run with an older binary.
+/// rule catalog). Unknown rule names in the map do not cause construction to fail
+/// — the rule simply has no effect, and lint continues. Detection is opt-in via
+/// [`find_unknown_rule_names`]: mds-core itself emits no warning; callers are
+/// responsible for surfacing unknowns. This is deliberate forward-compatibility:
+/// a config naming a rule from a newer mds version does not break when run with
+/// an older binary.
 ///
 /// Unknown severity *values* (e.g. `"verbose"`) cause a hard parse error (`exit 2`)
 /// because the closed enum has no sensible fallback.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
-/// Use `LintConfig::default()` for a config with all rules at engine defaults, or
-/// [`LintConfig::from_rules`] to supply per-rule overrides; do not construct via
+/// Use `LintConfig::default()` for a config with all rules at engine defaults,
+/// [`LintConfig::from_rules_checked`] (preferred) to supply per-rule overrides and
+/// receive an unknowns report in a single step, or [`LintConfig::from_rules`] when
+/// the unknowns check has already been performed externally; do not construct via
 /// struct literal.
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
@@ -190,6 +231,54 @@ pub struct LintConfig {
 }
 
 impl LintConfig {
+    /// Construct a `LintConfig` with the given per-rule overrides AND detect any
+    /// unknown rule names in one atomic step.
+    ///
+    /// This is the **preferred construction path** for any surface that must warn
+    /// about unknown rule names (the 2026-08-12 ruling: unknown names warn and lint
+    /// continues — the silence is the only thing that changes). The return type
+    /// carries the unknowns report alongside the config so the caller cannot
+    /// accidentally omit the detection step — compare with [`LintConfig::from_rules`],
+    /// where forgetting a follow-up [`find_unknown_rule_names`] call silently reverts
+    /// to the pre-warning behaviour on that surface (R12 in the PR plan).
+    ///
+    /// Marked `#[must_use]` — the compiler emits a warning if the return value is
+    /// discarded entirely, making it structurally harder to drop the unknowns report.
+    /// Callers that deliberately do not need the report should write:
+    /// `let (config, _) = LintConfig::from_rules_checked(map);`
+    ///
+    /// The asymmetry with unknown severities is deliberate and unchanged: severity
+    /// values are a closed enum and hard-fail at the serde layer; rule names grow
+    /// every release, so they warn rather than fail (AD-224-1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mds::{LintConfig, Severity};
+    ///
+    /// // All-known map: unknowns report is None.
+    /// let (config, unknown) = LintConfig::from_rules_checked(HashMap::from([
+    ///     ("unused-variable".to_string(), Severity::Off),
+    /// ]));
+    /// assert!(unknown.is_none());
+    /// assert_eq!(config.severity_for("unused-variable"), Some(&Severity::Off));
+    ///
+    /// // Map with an unknown name: report is Some, config still loads.
+    /// let (config2, unknown2) = LintConfig::from_rules_checked(HashMap::from([
+    ///     ("no-such-rule".to_string(), Severity::Warn),
+    /// ]));
+    /// let u = unknown2.expect("should detect unknown");
+    /// assert_eq!(u.names(), &["no-such-rule".to_string()]);
+    /// // The config still loads — lint continues with no effect for the unknown rule.
+    /// assert!(config2.severity_for("no-such-rule").is_some());
+    /// ```
+    #[must_use]
+    pub fn from_rules_checked(rules: HashMap<String, Severity>) -> (Self, Option<UnknownRuleNames>) {
+        let unknown = find_unknown_rule_names(&rules);
+        (LintConfig { rules }, unknown)
+    }
+
     /// Construct a `LintConfig` with the given per-rule severity overrides.
     ///
     /// This is the supported construction path for external crates — struct literals
@@ -199,10 +288,16 @@ impl LintConfig {
     /// or `with_*` only when taking `self`. This function does not take `self`,
     /// so it is named `from_rules`.
     ///
-    /// Unknown rule names in the map produce a warning via [`find_unknown_rule_names`]
-    /// on every API surface; they do not cause this constructor to fail. Call
-    /// [`find_unknown_rule_names`] before or after construction if you need to inspect
-    /// or surface those names.
+    /// **Prefer [`LintConfig::from_rules_checked`]** when your surface must warn about
+    /// unknown rule names. It returns the unknowns report in a single call, making it
+    /// structurally impossible to miss the detection step. Use `from_rules` only when
+    /// the unknowns check has already been performed externally (e.g. a config built
+    /// entirely from compile-time literals, or detection delegated to a separate call).
+    ///
+    /// Unknown rule names in the map do not cause this constructor to fail — the rule
+    /// simply has no effect, and lint continues. mds-core itself emits no warning;
+    /// call [`find_unknown_rule_names`] on the same map before passing it here if you
+    /// need to inspect or surface those names.
     ///
     /// # Examples
     ///
@@ -296,6 +391,32 @@ mod tests {
         assert!(
             msg.contains("EVIL"),
             "non-vacuity: the rule name must reach the message; got: {msg}"
+        );
+    }
+
+    // ── attach_lint_warnings ─────────────────────────────────────────────────
+
+    /// D8: a present warning is injected as `lint_warnings: [string]`.
+    ///
+    /// PF-013 / ADR-009: both directions are tested — present warning inserts
+    /// the field; absent warning leaves the object unchanged.
+    #[test]
+    fn attach_lint_warnings_injects_field_when_warning_present() {
+        let json = serde_json::json!({ "version": 1 });
+        let result = attach_lint_warnings(json, Some("unknown lint rule 'foo'; ignoring".into()));
+        let arr = result["lint_warnings"].as_array().expect("lint_warnings must be an array");
+        assert_eq!(arr.len(), 1, "exactly one element");
+        assert_eq!(arr[0].as_str().unwrap(), "unknown lint rule 'foo'; ignoring");
+    }
+
+    /// D8: no `lint_warnings` key is added when warning is absent (absent-when-empty semantics).
+    #[test]
+    fn attach_lint_warnings_leaves_object_unchanged_when_no_warning() {
+        let json = serde_json::json!({ "version": 1 });
+        let result = attach_lint_warnings(json, None);
+        assert!(
+            result.get("lint_warnings").is_none(),
+            "lint_warnings must be absent when no warning; got: {result:?}"
         );
     }
 }

@@ -445,28 +445,6 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
 
 // ── Lint options ──────────────────────────────────────────────────────────────
 
-/// Inject `lint_warnings` into a canonical JSON result when warnings are present.
-///
-/// D8 (AC-224-1): the WASM binding surfaces unknown-rule warnings by adding a
-/// `lint_warnings: string[]` field to the returned JSON object. This helper
-/// consolidates that logic across `lint` and `lintVirtual`.
-fn inject_lint_warnings(mut json: serde_json::Value, warning: Option<String>) -> serde_json::Value {
-    // `Option<String>`, not `Vec<String>`: there is exactly one warning message today
-    // (unknown rule names are reported as a single sentence), so a vector would be
-    // over-general plumbing. The JSON shape is still `string[]` — the array is built
-    // here — so adding a second warning kind later is a change to this function, not to
-    // the wire contract.
-    if let Some(w) = warning {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
-            );
-        }
-    }
-    json
-}
-
 /// Parsed options for the `lint` and `lint_virtual` functions.
 ///
 /// Extends the standard options with a `rules` field — absent in `compile`/`check`.
@@ -523,10 +501,13 @@ fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String
         })?;
         rules.insert(key, severity);
     }
-    // D8: detect unknown rule names and format warning strings.
-    let lint_warnings =
-        mds::find_unknown_rule_names(&rules).map(|u| mds::format_unknown_rule_names_warning(&u));
-    Ok((mds::LintConfig::from_rules(rules), lint_warnings))
+    // D8: detect unknown rule names and build config in one step via
+    // from_rules_checked. The return type structurally forces the caller
+    // to handle the unknowns report — a fifth caller cannot accidentally
+    // omit the detection step (review finding: config.rs:104).
+    let (lint_config, unknown) = mds::LintConfig::from_rules_checked(rules);
+    let lint_warnings = unknown.map(|u| mds::format_unknown_rule_names_warning(&u));
+    Ok((lint_config, lint_warnings))
 }
 
 /// Parse the JS options for `lint` and `lint_virtual`.
@@ -875,7 +856,7 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         )
         .map_err(mds_error_to_js)?;
 
-        let json = inject_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
+        let json = mds::attach_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
         to_js(&json)
     }))
 }
@@ -935,7 +916,7 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
         )
         .map_err(mds_error_to_js)?;
 
-        let json = inject_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
+        let json = mds::attach_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
         to_js(&json)
     }))
 }

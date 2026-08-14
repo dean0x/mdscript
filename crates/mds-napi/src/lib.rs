@@ -783,28 +783,6 @@ pub fn check_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<
 
 // ── Lint options parsing ──────────────────────────────────────────────────────
 
-/// Inject `lint_warnings` into a canonical JSON result when warnings are present.
-///
-/// D8 (AC-224-1): the napi binding surfaces unknown-rule warnings by adding a
-/// `lint_warnings: string[]` field to the returned JSON object. This helper
-/// consolidates that logic across `lint`, `lintFile`, and `lintVirtual`.
-fn inject_lint_warnings(mut json: serde_json::Value, warning: Option<String>) -> serde_json::Value {
-    // `Option<String>`, not `Vec<String>`: there is exactly one warning message today
-    // (unknown rule names are reported as a single sentence), so a vector would be
-    // over-general plumbing. The JSON shape is still `string[]` — the array is built
-    // here — so adding a second warning kind later is a change to this function, not to
-    // the wire contract.
-    if let Some(w) = warning {
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert(
-                "lint_warnings".to_string(),
-                serde_json::Value::Array(vec![serde_json::Value::String(w)]),
-            );
-        }
-    }
-    json
-}
-
 /// Extract and validate the `rules` option: `Record<string, string>` → `(mds::LintConfig, Vec<String>)`.
 ///
 /// Returns the default config (all rules at built-in defaults) when `rules` is absent,
@@ -862,10 +840,13 @@ fn extract_rules_direct(
                     })?;
                 rules.insert(key, severity);
             }
-            // D8: detect unknown rule names before consuming the HashMap.
-            let lint_warnings = mds::find_unknown_rule_names(&rules)
-                .map(|u| mds::format_unknown_rule_names_warning(&u));
-            Ok((mds::LintConfig::from_rules(rules), lint_warnings))
+            // D8: detect unknown rule names and build config in one step via
+            // from_rules_checked. The return type structurally forces the caller
+            // to handle the unknowns report — a fifth caller cannot accidentally
+            // omit the detection step (review finding: config.rs:104).
+            let (lint_config, unknown) = mds::LintConfig::from_rules_checked(rules);
+            let lint_warnings = unknown.map(|u| mds::format_unknown_rule_names_warning(&u));
+            Ok((lint_config, lint_warnings))
         }
         other => Err(throw_options_error(
             env,
@@ -1004,7 +985,7 @@ pub fn lint(env: Env, source: String, opts: Option<Object>) -> napi::Result<serd
         }),
     )?;
 
-    Ok(inject_lint_warnings(
+    Ok(mds::attach_lint_warnings(
         result.to_canonical_json(),
         lint_warnings,
     ))
@@ -1035,7 +1016,7 @@ pub fn lint_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<s
         AssertUnwindSafe(move || mds::lint(&path_buf, vars, &lint_config)),
     )?;
 
-    Ok(inject_lint_warnings(
+    Ok(mds::attach_lint_warnings(
         result.to_canonical_json(),
         lint_warnings,
     ))
@@ -1125,7 +1106,7 @@ pub fn lint_virtual(
         AssertUnwindSafe(move || mds::lint_virtual(mods, &entry, vars, &lint_config)),
     )?;
 
-    Ok(inject_lint_warnings(
+    Ok(mds::attach_lint_warnings(
         result.to_canonical_json(),
         lint_warnings,
     ))

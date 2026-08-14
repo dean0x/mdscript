@@ -217,9 +217,17 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             // escaping — it is passed through `safe_inline` anyway so the guard can see
             // the whole `format!` is clean without an exemption.
             //
+            // into_core_config uses LintConfig::from_rules_checked internally,
+            // which returns (config, Option<UnknownRuleNames>) in one step. The
+            // return type structurally forces us to handle the unknowns report here
+            // rather than relying on a separate find_unknown_rule_names call — the
+            // fix for the review finding at config.rs:104 (detection is structural,
+            // not advisory).
+            //
             // AC-224-22: suppress under --quiet (coordination point with PR4 D4).
+            let (lint_config, unknown) = mds_config.lint.into_core_config();
             if !quiet {
-                if let Some(unknown) = mds::find_unknown_rule_names(&mds_config.lint.rules) {
+                if let Some(unknown) = unknown {
                     // AC-224-2/AC-224-3: names() is sorted; KNOWN_LINT_RULES is sorted.
                     let names = unknown.names();
                     let recognised = mds::KNOWN_LINT_RULES.join(", ");
@@ -245,7 +253,7 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
                     }
                 }
             }
-            Ok(mds_config.lint.into_core_config())
+            Ok(lint_config)
         }
     }
 }
