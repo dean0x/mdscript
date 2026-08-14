@@ -745,9 +745,10 @@ fn run_lint_stdin(
         // AD-211-4 (write-path residual): for Fixed/PartiallyFixed the residual comes
         // from the reverify lint_str_with call and therefore carries diag.file ==
         // STRING_SOURCE_MAP_LABEL ("input.mds").  Relabel here so every emission path
-        // is symmetric with directory mode (lint.rs:1176/1197/1340/1364) and with the
-        // report-only/preview relabel above.  For Rejected/NothingToFix the original
-        // was already relabeled above — a second call is a harmless no-op.
+        // is symmetric with directory mode (`lint_one_file_accumulating` /
+        // `lint_one_file_human`) and with the report-only/preview relabel above.
+        // For Rejected/NothingToFix the original was already relabeled above — a
+        // second call is a harmless no-op.
         // Note: --fix --format json + stdin is a hard usage error at lint.rs:141-147
         // (AC-F-22b), so this relabel is not currently reachable via the JSON path;
         // it is applied here as defence-in-depth so that lifting AC-F-22b in a future
@@ -846,7 +847,8 @@ fn run_lint_file(
                 // which sets diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").
                 // Relabel to the file's basename so the JSON wire output uses the
                 // real filename rather than the internal VFS key.  Mirrors the
-                // set_diag_display_path call in directory mode (lint.rs:1176/1340).
+                // set_diag_display_path calls in `lint_one_file_accumulating` and
+                // `lint_one_file_human`.
                 set_diag_display_path(&mut residual, filename);
                 emit_result(format, &residual, quiet, named_source);
                 atomic_write_file(path, &new_source)?;

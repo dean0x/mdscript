@@ -154,21 +154,20 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// and the replacement is ignored.
 ///
 /// Call sites (verified line numbers, §5 step 1a of the implementation plan):
-/// - `mds check -`: `crates/mds-cli/src/main.rs:279`
+/// - `mds check -`: `crates/mds-cli/src/main.rs:280`
 /// - `mds build -` (single-file path): `crates/mds-cli/src/build.rs:714`
 /// - `mds build -` (directory stdin path): `crates/mds-cli/src/build.rs:1176`
-/// - `mds lint -`: `crates/mds-cli/src/lint.rs:1509` (via
+/// - `mds lint -`: `crates/mds-cli/src/lint.rs:1520` (via
 ///   `emit_analysis_failure_json_or_stderr`)
 ///
 /// Any new CLI boundary that renders a stdin analysis failure must call this
 /// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.
 pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Report {
     // Only replace the embedded source when the inner error's source name is the
-    // stdin sentinel set by `resolve_source_intrinsic`.  Errors from imported files
-    // carry the real file path; replacing them would render the caret against stdin
-    // text at the wrong location (PF-012 / AD-211-5 scope).
-    // `is_string_source()` encapsulates the sentinel comparison inside mds-core,
-    // where it has compile-time coupling to the `pub(crate)` constant definition.
+    // stdin sentinel set by `resolve_source_intrinsic` — checked via
+    // `e.is_string_source()`, which keeps the sentinel comparison inside mds-core.
+    // Errors from imported files carry the real file path; replacing them would
+    // render the caret against stdin text at the wrong location (PF-012 / AD-211-5 scope).
     miette::Report::new(StdinRelabeledError {
         source: if e.is_string_source() {
             miette::Diagnostic::source_code(e)
