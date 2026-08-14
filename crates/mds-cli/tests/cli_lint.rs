@@ -3660,6 +3660,104 @@ fn unknown_rule_cli_exact_golden() {
     }
 }
 
+/// AC-224-2 / AC-224-3 golden for the SINGLE-FILE target path.
+///
+/// `unknown_rule_cli_exact_golden` exercises `mds lint <dir>`, which goes through
+/// `LintDirCtx::config_for`. This test exercises `mds lint <file>`, which goes
+/// through `load_lint_config` — a distinct code path. By pinning the EXACT warning
+/// string for both paths we ensure that a future edit to either emitter fails
+/// loudly here rather than diverging silently (the duplication that existed before
+/// the `emit_unknown_rule_warning` extraction was introduced in this PR).
+///
+/// PF-007: covers the CLI single-file surface only.
+#[test]
+fn unknown_rule_cli_exact_golden_single_file() {
+    #[rustfmt::skip]
+    let recognised = concat!(
+        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
+        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
+        "unused-import, unused-variable"
+    );
+
+    // ── Singular golden (single-file path) ────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_singular = format!(
+            "warning: unknown lint rule 'no-such-rule-xyzzy' in mds.json; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rule"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC-224-2/AC-224-3 single-file: no singular unknown-rule warning; \
+                     got stderr: {stderr}"
+                )
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_singular,
+            "AC-224-2/AC-224-3 single-file singular golden mismatch"
+        );
+    }
+
+    // ── Plural golden (single-file path) ──────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "zzz-bad": "warn", "aaa-bad": "error" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_plural = format!(
+            "warning: unknown lint rules: 'aaa-bad', 'zzz-bad' in mds.json; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rules"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC-224-2/AC-224-3 single-file: no plural unknown-rule warning; \
+                     got stderr: {stderr}"
+                )
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_plural,
+            "AC-224-2/AC-224-3 single-file plural golden mismatch"
+        );
+    }
+}
+
 /// Populate `dir` with a fixed three-file tree — one clean, two with real findings —
 /// so the JSON envelope under test carries actual `files[]` entries rather than an
 /// empty array (an all-clean tree would make the comparison below near-vacuous).
@@ -3989,6 +4087,122 @@ fn unknown_rule_warning_suppressed_by_global_quiet_form() {
             args.join(" ")
         );
     }
+}
+
+/// AC-224-22 (single-file target): `--quiet` suppresses the unknown-rule warning when
+/// targeting a single file.
+///
+/// `load_lint_config` (the `run_lint_file` / `run_lint_stdin` code path) has a quiet gate
+/// inside `emit_unknown_rule_warning`; this test covers the single-file path independently
+/// from the directory target covered by `unknown_rule_warning_suppressed_by_quiet`, which
+/// exercises the `config_for` emitter instead.
+///
+/// Paired positive control (PF-013 / ADR-009): the same invocation WITHOUT `--quiet` DOES
+/// emit the warning, so the absence assertion cannot pass vacuously.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("clean.mds");
+    std::fs::write(&file, "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    // Positive control: without --quiet the warning fires on the single-file path.
+    let loud = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: single-file mode without --quiet must warn; got: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // AC-224-22: --quiet must suppress the warning.
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .arg("--quiet")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22 (single-file): --quiet must suppress the unknown-rule warning; got: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        loud.status.code(),
+        "AC-224-22 (single-file): --quiet must not move the exit code; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-22 (stdin target): `--quiet` suppresses the unknown-rule warning when reading
+/// from stdin.
+///
+/// `load_lint_config` (the `run_lint_stdin` code path) has a quiet gate inside
+/// `emit_unknown_rule_warning`; this test covers the stdin path independently from the
+/// directory target covered by `unknown_rule_warning_suppressed_by_quiet`, which exercises
+/// the `config_for` emitter instead.
+///
+/// `current_dir` is set to a tempdir containing `mds.json` so `run_lint_stdin` picks up
+/// the unknown rule.  Paired positive control (PF-013 / ADR-009): the same invocation
+/// WITHOUT `--quiet` DOES emit the warning.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    write_unknown_rule_config(dir.path());
+
+    // Positive control: without --quiet the warning fires on the stdin path.
+    let mut loud_child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe -- child may exit before reading all of stdin.
+    let _ = loud_child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let loud = loud_child.wait_with_output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: stdin mode without --quiet must warn; got: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // AC-224-22: --quiet must suppress the warning on the stdin path.
+    let mut child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .arg("--quiet")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe -- child may exit before reading all of stdin.
+    let _ = child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let out = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22 (stdin): --quiet must suppress the unknown-rule warning; got: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        loud.status.code(),
+        "AC-224-22 (stdin): --quiet must not move the exit code; got stderr: {stderr}"
+    );
 }
 
 /// AC-224-12 (NEGATIVE / fix behaviour unchanged): an unknown rule name changes nothing
