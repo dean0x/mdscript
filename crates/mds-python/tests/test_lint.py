@@ -494,3 +494,10 @@ def test_py_warn_canonical_sanitizes_lint_warnings() -> None:
     )
     # The sanitized form must be non-empty: hostile bytes are replaced, not dropped.
     assert len(warnings[0]) > 0, "sanitized warning must be non-empty"
+    # WIRE-escaping must replace raw ESC with its JSON escape sequence (6 ASCII chars).
+    # Construct the expected string at runtime to avoid authoring a literal control byte
+    # inside a string constant (PF-018: the tooling decodes backslash-u + 4 hex to real bytes).
+    expected_escape = "\\u001B"  # backslash + u + 0 + 0 + 1 + B — six ASCII characters
+    assert expected_escape in warnings[0], (
+        f"ESC must appear as the escaped literal \\u001B; got: {warnings[0]!r}"
+    )

@@ -3465,6 +3465,84 @@ fn unknown_rule_one_warning_per_invocation_not_per_file() {
     );
 }
 
+/// AC-224-2 (plural branch): when two or more rule names are unknown the plural form
+/// of the warning is emitted and the names appear in lexicographic sorted order.
+///
+/// Test-plan entry 2: CLI config `{"zzz-bad":"warn","aaa-bad":"error"}` yields
+/// exactly one warning line naming both unknown rules with `aaa-bad` before `zzz-bad`.
+///
+/// Non-vacuity (PF-013/ADR-009): the test also confirms the positive control —
+/// `recognised rules are` appears — and the negative control — a known rule in the
+/// same config does NOT trigger the plural path for itself.
+#[test]
+fn unknown_rule_plural_sorted_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    // zzz-bad and aaa-bad are both unknown; unused-variable is real so it does NOT
+    // count toward the unknown list.  The inserted order is zzz first to confirm
+    // lexicographic sorting, not insertion order.
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({
+            "zzz-bad":        "warn",
+            "aaa-bad":        "error",
+            "unused-variable": "off"
+        }),
+    );
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-2: both unknown names are reported.
+    assert!(
+        stderr.contains("aaa-bad"),
+        "AC-224-2: 'aaa-bad' must appear in the plural warning; got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("zzz-bad"),
+        "AC-224-2: 'zzz-bad' must appear in the plural warning; got stderr: {stderr}"
+    );
+    // AC-224-2: plural form is used (not singular).
+    assert!(
+        stderr.contains("unknown lint rules"),
+        "AC-224-2: plural form must be used for two unknown names; got stderr: {stderr}"
+    );
+    // AC-224-2: aaa-bad sorts before zzz-bad.
+    let aaa_pos = stderr.find("aaa-bad").expect("aaa-bad must appear in stderr");
+    let zzz_pos = stderr.find("zzz-bad").expect("zzz-bad must appear in stderr");
+    assert!(
+        aaa_pos < zzz_pos,
+        "AC-224-2: 'aaa-bad' must appear before 'zzz-bad' (lexicographic order); \
+         got stderr: {stderr}"
+    );
+    // Positive control: recognised-rules list is present (AC-224-2 completeness).
+    assert!(
+        stderr.contains("recognised rules are"),
+        "recognised-rules list must be included in the plural warning; got stderr: {stderr}"
+    );
+    // Negative control: unused-variable is a known rule and must NOT appear
+    // QUOTED (as an unknown name) in the warning — it does appear unquoted in
+    // the "recognised rules are: …" part, which is expected.  The unknown-names
+    // list uses single-quote delimiters ('NAME'), so checking for the quoted
+    // form distinguishes the two positions.
+    let warning_line = stderr
+        .lines()
+        .find(|l| l.contains("unknown lint rules"))
+        .unwrap_or_else(|| panic!("no plural unknown-rule warning line; got stderr: {stderr}"));
+    assert!(
+        !warning_line.contains("'unused-variable'"),
+        "a recognised rule name must not appear quoted in the unknown-names list; \
+         got warning line: {warning_line}"
+    );
+}
+
 /// Populate `dir` with a fixed three-file tree — one clean, two with real findings —
 /// so the JSON envelope under test carries actual `files[]` entries rather than an
 /// empty array (an all-clean tree would make the comparison below near-vacuous).

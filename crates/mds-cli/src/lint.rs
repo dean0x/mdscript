@@ -185,27 +185,45 @@ fn do_lint(args: LintArgs) -> Result<()> {
 ///
 /// AD-224-5 (AC-224-21, AC-224-22): the warning goes to STDERR only (never
 /// stdout — `--format json` stdout must remain valid parseable JSON), and is
-/// SUPPRESSED under `--quiet` (this signal precedes a normal exit, not an error;
-/// see `crates/mds-cli/src/main.rs:30`'s documented contract).
+/// SUPPRESSED under `--quiet` (AC-224-22, coordination point with PR4 D4): the
+/// unknown-rule warning is never the causal reason for a non-zero exit — an
+/// unknown rule has no enforcement and does not affect `result_exit_code`, which
+/// counts actual lint findings, not config anomalies. A `--quiet` consumer who
+/// receives a non-zero exit will always have a visible, causal lint finding.
+/// `crates/mds-cli/src/main.rs:30` documents `--quiet` as suppressing
+/// *"status and diagnostic output"*; this warning is status, not an error.
 fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
     let config_opt = load_config(dir)?;
     match config_opt {
         None => Ok(mds::LintConfig::default()),
         Some((mds_config, _config_dir)) => {
-            // AC-224-3 residual: the warning text produced here ("unknown lint rule
-            // '...' in mds.json; ...") differs from the text produced by
-            // `mds::format_unknown_rule_names_warning` used by napi/WASM/Python
-            // ("unknown lint rules: '...'; ...") by design: the CLI adds the
-            // source context "in mds.json" and uses singular/plural forms so the
-            // print-discipline guard can machine-check the safe_inline call sites
-            // directly. This divergence is intentional and recorded here as a named
-            // residual (applies AD-224-3, R6/PF-007 — per-surface goldens, not a
-            // differential test).
+            // AC-224-3 residual (R6/PF-007): the full warning text DIVERGES between
+            // the CLI and binding surfaces by design.
             //
-            // AD-224-3: `safe_inline` WIRE-escapes each name before it enters the
+            // Binding surfaces (napi/WASM/Python) call
+            // `mds::format_unknown_rule_names_warning`, which produces:
+            //   "unknown lint rule 'X'; recognised rules are: …; ignoring"
+            //   "unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring"
+            // The CLI adds a "warning:" prefix (matching its other eprint_warning
+            // call sites) and an "in mds.json" source context (so the origin of
+            // the config anomaly is visible to a terminal user):
+            //   "warning: unknown lint rule 'X' in mds.json; recognised rules are: …; ignoring"
+            //   "warning: unknown lint rules in mds.json: 'A', 'B'; recognised rules are: …; ignoring"
+            //
+            // AC-224-3 shared-constant guarantee: the recognised-rules LIST and its
+            // sort order are shared via `mds::KNOWN_LINT_RULES` across all surfaces.
+            // The full message text is NOT byte-identical; CHANGELOG documents both
+            // formats. Per-surface goldens (PF-007) each lock in their own value;
+            // no differential test claims cross-surface byte-parity.
+            //
+            // AD-224-3: `safe_inline` WIRE-escapes each name BEFORE it enters the
             // warning text, because `eprint_warning` is HUMAN mode (`\n` survives).
             // A JSON object key is never legitimately multi-line; routing through
             // `safe_inline` closes CWE-117 on the newline + forged-line vector.
+            // In the plural branch each name is escaped individually before assembly,
+            // matching the core formatter's shape (AD-224-3); the outer `safe_inline`
+            // on the assembled string is idempotent but satisfies the print-discipline
+            // guard's whole-expression requirement (AC-224-6).
             //
             // AC-224-6: every interpolation below is a WHOLE-EXPRESSION `safe_inline`
             // call sitting directly inside `eprint_warning`'s `format!`, which is the
@@ -239,9 +257,15 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
                             safe_inline(&recognised)
                         ));
                     } else {
+                        // AD-224-3: escape each name individually before assembly,
+                        // matching the core formatter's per-name shape. The outer
+                        // safe_inline on the assembled string is idempotent (the
+                        // \uXXXX escape sequences from the inner calls are ASCII
+                        // and are not re-escaped) but keeps the print-discipline
+                        // guard satisfied (AC-224-6: whole-expression sanitizer call).
                         let listed = names
                             .iter()
-                            .map(|n| format!("'{n}'"))
+                            .map(|n| format!("'{}'", safe_inline(n)))
                             .collect::<Vec<_>>()
                             .join(", ");
                         eprint_warning(&format!(
