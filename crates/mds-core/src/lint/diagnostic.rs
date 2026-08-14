@@ -732,7 +732,7 @@ impl LintResult {
     /// `"length"` are always present; `"line"` and `"column"` are **omitted** (the
     /// key is absent, not `null`) when not set.  No current lint rule sets `line`
     /// or `column`, so live output contains only `"offset"` and `"length"`.  The
-    /// `mds-python` binding unconditionally emits only `"offset"` and `"length"`.
+    /// `mds-python` binding also conditionally emits `"line"` and `"column"` when set.
     ///
     /// **AD-202-1 (ordering guarantee):** within each file group, diagnostics are
     /// ordered by ascending byte offset (`span.offset`).  Diagnostics without a span
@@ -2218,7 +2218,7 @@ mod tests {
     }
 
     /// AC-P1-08 (no-span): diagnostics without a span sort to the end of their
-    /// file group.
+    /// file group and serialize as `"span": null` on the canonical-JSON wire path.
     #[test]
     fn build_no_span_sorts_to_end() {
         let mut builder = LintResultBuilder::new();
@@ -2234,6 +2234,34 @@ mod tests {
             result.diagnostics[1].rule, "no-span",
             "no-span diagnostic must sort to the end; got: {:?}",
             result.diagnostics
+        );
+
+        // AC-P1-08 (span:None, JSON wire): the no-span diagnostic must
+        // serialize as `"span": null` on the canonical-JSON wire path — key
+        // present, value null, not an absent key.
+        //
+        // Serde_json trap: `v["span"].is_null()` returns `true` for an
+        // ABSENT key too, because `Value::index` returns `Value::Null` for
+        // missing keys rather than panicking.  Always verify key presence via
+        // `as_object().contains_key` first, then check the value separately.
+        let json = result.to_canonical_json();
+        let diags = json["files"][0]["diagnostics"]
+            .as_array()
+            .expect("diagnostics must be a JSON array");
+        // diags[1] is the no-span entry — order verified above via .diagnostics.
+        let no_span_obj = diags[1]
+            .as_object()
+            .expect("diagnostic must be a JSON object");
+        assert!(
+            no_span_obj.contains_key("span"),
+            "no-span diagnostic must carry `\"span\": null` on the wire \
+             (key present, value null) — not an absent key; \
+             got object: {no_span_obj:?}"
+        );
+        assert!(
+            no_span_obj.get("span").unwrap().is_null(),
+            "no-span diagnostic's `\"span\"` value must be JSON null; got: {:?}",
+            no_span_obj.get("span").unwrap()
         );
     }
 

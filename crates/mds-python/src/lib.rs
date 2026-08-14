@@ -596,12 +596,26 @@ impl LintDiagnostic {
         );
         // Emit span unconditionally (null when None) to match to_canonical_json exactly.
         let span_val = self.span.as_ref().map(|sp| {
-            // Span keys: length, offset (alphabetical per wire format).
+            // Span keys in alphabetical order: column (conditional), length,
+            // line (conditional), offset.  line and column are omitted (key absent,
+            // not null) when not set, matching to_canonical_json (diagnostic.rs:780-785).
             let mut span_map = serde_json::Map::new();
+            if let Some(col) = sp.column {
+                span_map.insert(
+                    "column".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(col)),
+                );
+            }
             span_map.insert(
                 "length".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(sp.length)),
             );
+            if let Some(line) = sp.line {
+                span_map.insert(
+                    "line".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(line)),
+                );
+            }
             span_map.insert(
                 "offset".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(sp.offset)),
@@ -770,8 +784,16 @@ impl LintResult {
                                     Some(Span {
                                         offset: s.get("offset")?.as_u64()? as usize,
                                         length: s.get("length")?.as_u64()? as usize,
-                                        line: None,
-                                        column: None,
+                                        // line and column are omitted (key absent, not null)
+                                        // when not set; map absent / null to None.
+                                        line: s
+                                            .get("line")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .map(|v| v as usize),
+                                        column: s
+                                            .get("column")
+                                            .and_then(serde_json::Value::as_u64)
+                                            .map(|v| v as usize),
                                     })
                                 });
                                 let fix_edits = d
@@ -886,6 +908,11 @@ fn sanitize_json_str_field(obj: &mut serde_json::Map<String, serde_json::Value>,
 /// `to_dict()` read from the backing store. Mirrors what
 /// `LintResult::to_canonical_json()` does on the live lint path, closing the
 /// parallel-path gap (PF-004).
+///
+/// **No re-sort (AD-202-1b):** `to_canonical_json()` preserves caller-supplied
+/// order for `LintResult::new` callers; `sort_diagnostics` is the single ordering
+/// choke point, called only from `LintResultBuilder::build`.  This function
+/// intentionally mirrors that contract — it sanitizes but does not reorder.
 fn sanitize_lint_value(value: &mut serde_json::Value) {
     let Some(files) = value.get_mut("files").and_then(|v| v.as_array_mut()) else {
         return;
