@@ -1314,8 +1314,8 @@ fn wasm_lint_hostile_rule_name_escapes_control_bytes_in_lint_warnings() {
     let opts = to_js_object(&serde_json::json!({
         "rules": { hostile_rule: "warn" }
     }));
-    let result =
-        mds_wasm::lint("Hello!\n", opts).expect("W-WARN-ESC: lint must succeed with hostile rule name");
+    let result = mds_wasm::lint("Hello!\n", opts)
+        .expect("W-WARN-ESC: lint must succeed with hostile rule name");
 
     // The warning must be present (D8 / AC-224-1) — call succeeds, lint_warnings is non-empty.
     let lint_warnings = get_prop(&result, "lint_warnings");

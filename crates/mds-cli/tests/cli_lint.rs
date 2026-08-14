@@ -3567,6 +3567,99 @@ fn unknown_rule_plural_sorted_warning() {
     );
 }
 
+/// AC-224-2 / AC-224-3 golden (singular and plural): pins the EXACT rendered warning
+/// text for both the one-offender and two-offender paths on the CLI.
+///
+/// Test-plan entries 2 and 3 require exact rendering, not just `contains` checks, so
+/// that future edits to the message format fail loudly here rather than silently
+/// diverging from the CHANGELOG and spec.md documentation.
+///
+/// PF-007: these goldens cover the CLI surface only; the binding surfaces are pinned
+/// by their own per-surface tests.
+#[test]
+fn unknown_rule_cli_exact_golden() {
+    // We cannot import mds:: directly from an integration test; hard-code the
+    // current ten names in alphabetical order (the same value KNOWN_LINT_RULES
+    // holds, verified by AC-224-7).  If the registry grows this golden must be
+    // updated alongside the registry — the test will fail loudly.
+    #[rustfmt::skip]
+    let recognised = concat!(
+        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
+        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
+        "unused-import, unused-variable"
+    );
+
+    // ── Singular golden ────────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_singular = format!(
+            "warning: unknown lint rule 'no-such-rule-xyzzy' in mds.json; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rule"))
+            .unwrap_or_else(|| {
+                panic!("no singular unknown-rule warning line; got stderr: {stderr}")
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_singular,
+            "AC-224-2/AC-224-3 singular golden mismatch"
+        );
+    }
+
+    // ── Plural golden ──────────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+        // Insert zzz-bad before aaa-bad to confirm lexicographic sorting, not
+        // insertion order.
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "zzz-bad": "warn", "aaa-bad": "error" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_plural = format!(
+            "warning: unknown lint rules: 'aaa-bad', 'zzz-bad' in mds.json; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rules"))
+            .unwrap_or_else(|| panic!("no plural unknown-rule warning line; got stderr: {stderr}"));
+        assert_eq!(
+            warning_line.trim(),
+            expected_plural,
+            "AC-224-2/AC-224-3 plural golden mismatch"
+        );
+    }
+}
+
 /// Populate `dir` with a fixed three-file tree — one clean, two with real findings —
 /// so the JSON envelope under test carries actual `files[]` entries rather than an
 /// empty array (an all-clean tree would make the comparison below near-vacuous).
@@ -3778,11 +3871,14 @@ fn unknown_rule_json_stdout_clean_single_file() {
 
     // AC-224-21: stdout must be valid JSON and contain no warning text.
     serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "AC-224-21 (file): stdout must be valid JSON; error: {e}; got: {stdout}"
-        )
+        panic!("AC-224-21 (file): stdout must be valid JSON; error: {e}; got: {stdout}")
     });
-    for needle in ["no-such-rule-xyzzy", "recognised rules are", "warning", "ignoring"] {
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
         assert!(
             !stdout.contains(needle),
             "AC-224-21 (file): stdout must not contain {needle:?}; got: {stdout}"
@@ -3829,11 +3925,14 @@ fn unknown_rule_json_stdout_clean_stdin() {
 
     // AC-224-21: stdout must be valid JSON and contain no warning text.
     serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
-        panic!(
-            "AC-224-21 (stdin): stdout must be valid JSON; error: {e}; got: {stdout}"
-        )
+        panic!("AC-224-21 (stdin): stdout must be valid JSON; error: {e}; got: {stdout}")
     });
-    for needle in ["no-such-rule-xyzzy", "recognised rules are", "warning", "ignoring"] {
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
         assert!(
             !stdout.contains(needle),
             "AC-224-21 (stdin): stdout must not contain {needle:?}; got: {stdout}"

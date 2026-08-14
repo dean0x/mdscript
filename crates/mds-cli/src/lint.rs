@@ -206,9 +206,12 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             //   "unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring"
             // The CLI adds a "warning:" prefix (matching its other eprint_warning
             // call sites) and an "in mds.json" source context (so the origin of
-            // the config anomaly is visible to a terminal user):
+            // the config anomaly is visible to a terminal user).  Both CLI forms
+            // place the names BEFORE the source context, parallel with each other
+            // and structurally parallel with the core formatter (names first, then
+            // the rest of the message):
             //   "warning: unknown lint rule 'X' in mds.json; recognised rules are: …; ignoring"
-            //   "warning: unknown lint rules in mds.json: 'A', 'B'; recognised rules are: …; ignoring"
+            //   "warning: unknown lint rules: 'A', 'B' in mds.json; recognised rules are: …; ignoring"
             //
             // AC-224-3 shared-constant guarantee: the recognised-rules LIST and its
             // sort order are shared via `mds::KNOWN_LINT_RULES` across all surfaces.
@@ -220,17 +223,21 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
             // warning text, because `eprint_warning` is HUMAN mode (`\n` survives).
             // A JSON object key is never legitimately multi-line; routing through
             // `safe_inline` closes CWE-117 on the newline + forged-line vector.
-            // In the plural branch each name is escaped individually before assembly,
-            // matching the core formatter's shape (AD-224-3); the outer `safe_inline`
-            // on the assembled string is idempotent but satisfies the print-discipline
-            // guard's whole-expression requirement (AC-224-6).
+            // Both arms escape names individually (`safe_inline(n)` per name),
+            // matching the core formatter's per-name shape.  In the plural arm the
+            // outer `safe_inline(&listed)` call is idempotent (the \uXXXX sequences
+            // produced by the inner calls are ASCII and are not re-escaped) but is
+            // required to keep the print-discipline guard satisfied (AC-224-6).
             //
-            // AC-224-6: every interpolation below is a WHOLE-EXPRESSION `safe_inline`
-            // call sitting directly inside `eprint_warning`'s `format!`, which is the
-            // one shape `print_discipline.rs`'s trace accepts without an allowlist
-            // entry. Do not hoist the assembled message into a local: the trace cannot
-            // follow an `if`/`else` initialiser, and the escape would silently stop
-            // being machine-checked (that is the PF-004 drift this guard exists for).
+            // AC-224-6: every value interpolated inside `eprint_warning`'s `format!`
+            // must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that
+            // `print_discipline.rs`'s trace accepts without an allowlist entry.
+            // Do NOT hoist the FINAL warning string out of `format!` into a local:
+            // the trace cannot follow an `if`/`else` initialiser, and the escape
+            // would silently stop being machine-checked (PF-004 drift).
+            // Building intermediate locals (`listed`, `recognised`) is acceptable
+            // as long as the safe_inline call on each appears as a whole-expression
+            // directly inside `format!`, as both arms below do.
             // `mds::KNOWN_LINT_RULES` is a slice of compile-time literals and needs no
             // escaping — it is passed through `safe_inline` anyway so the guard can see
             // the whole `format!` is clean without an exemption.
@@ -269,7 +276,7 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
                             .collect::<Vec<_>>()
                             .join(", ");
                         eprint_warning(&format!(
-                            "warning: unknown lint rules in mds.json: {}; \
+                            "warning: unknown lint rules: {} in mds.json; \
                              recognised rules are: {}; ignoring",
                             safe_inline(&listed),
                             safe_inline(&recognised)
@@ -1134,11 +1141,15 @@ impl<'a> LintDirCtx<'a> {
                 // the print_discipline guard can machine-check the safe_inline sites.
                 // AD-224-3: safe_inline WIRE-escapes each name before it enters the
                 // eprint_warning argument (HUMAN mode preserves \n, so routing through
-                // safe_inline closes the forged-status-line vector).
-                // AC-224-6: every interpolation is a WHOLE-EXPRESSION safe_inline call
-                // directly inside the format! — do NOT hoist to a local; the
-                // print_discipline trace cannot follow if/else initialisers and the
-                // escape would silently stop being machine-checked.
+                // safe_inline closes the forged-status-line vector).  Both arms escape
+                // names individually; the outer safe_inline in the plural arm is
+                // idempotent but required for print_discipline coverage (AC-224-6).
+                // AC-224-6: every value interpolated inside eprint_warning's format!
+                // must be a WHOLE-EXPRESSION safe_inline call.  Do NOT hoist the FINAL
+                // warning string into a local — the trace cannot follow if/else
+                // initialisers and the escape would silently stop being machine-checked.
+                // Building intermediate locals (listed, recognised) is fine as long as
+                // each safe_inline call appears whole-expression inside format!.
                 // AC-224-22: suppressed under --quiet.
                 let (lint_config, unknown) = mds_config.lint.into_core_config();
                 if !self.flags.quiet {
@@ -1156,11 +1167,11 @@ impl<'a> LintDirCtx<'a> {
                         } else {
                             let listed = names
                                 .iter()
-                                .map(|n| format!("'{n}'"))
+                                .map(|n| format!("'{}'", safe_inline(n)))
                                 .collect::<Vec<_>>()
                                 .join(", ");
                             eprint_warning(&format!(
-                                "warning: unknown lint rules in mds.json: {}; \
+                                "warning: unknown lint rules: {} in mds.json; \
                                  recognised rules are: {}; ignoring",
                                 safe_inline(&listed),
                                 safe_inline(&recognised)

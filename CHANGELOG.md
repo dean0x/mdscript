@@ -783,7 +783,7 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     still writes a single valid JSON document. `--quiet` suppresses it. Singular and
     plural formats (offenders sorted lexicographically):
     - `warning: unknown lint rule 'NAME' in mds.json; recognised rules are: …; ignoring`
-    - `warning: unknown lint rules in mds.json: 'A', 'B'; recognised rules are: …; ignoring`
+    - `warning: unknown lint rules: 'A', 'B' in mds.json; recognised rules are: …; ignoring`
   - **napi / WASM / Python**: the warning is surfaced as `lint_warnings: string[]` on
     the lint result. In the JSON wire form and in `to_dict()` / `to_json()` output, the
     key is absent (not `null`, not `[]`) when no warnings occurred. On the Python
@@ -791,13 +791,14 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     and returns an empty list when no warnings occurred. The message format differs from
     the CLI — **accepted residual** (AC-224-3 requires byte-identity across all five
     surfaces; the binding format is a knowing deviation, held by per-surface goldens
-    per PF-007). The three structural differences: no `"warning:"` prefix, no `"in
-    mds.json"` source context, and a different colon position in the plural form:
+    per PF-007). The two structural differences: no `"warning:"` prefix and no `"in
+    mds.json"` source context (both CLI forms place the rule names before the source
+    context; the colon placement in the plural form is the same as the binding form):
     - Singular: `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
     - Plural:   `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
-    Compare the CLI plural `warning: unknown lint rules in mds.json: 'A', 'B'; …`
-    — the binding form omits both the prefix and the `in mds.json` clause, placing
-    the colon directly after `lint rules`. The recognised-rules list and sort order
+    Compare the CLI plural `warning: unknown lint rules: 'A', 'B' in mds.json; …`
+    — the binding form omits both the prefix and the `in mds.json` clause but the
+    colon placement (`lint rules: 'A', 'B'`) is shared. The recognised-rules list and sort order
     are shared with the CLI via `mds::KNOWN_LINT_RULES`. Per-surface parity (PF-007):
     each surface's format is asserted by its own tests; no cross-surface byte-identity
     is claimed.
