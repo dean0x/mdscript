@@ -311,8 +311,9 @@ describe('lint', () => {
   // the WASM surface the one under test.
   //
   // Three assertions are combined here:
-  //   (a) getBackend() === 'wasm' -- proves the right surface ran; a silent
-  //       backend switch would be immediately detected (avoids PF-007).
+  //   (a) getBackend() === 'wasm' -- shape check on the backend descriptor string.
+  //       NOTE: this assertion cannot detect a silent backend switch because
+  //       createWasmBackend() hardcodes 'wasm'; it is NOT a PF-007 guard.
   //   (b) files[].file === 'input.mds' -- AC-P1-28(c): WASM string-source lint
   //       MUST keep the shared constant as its virtual-FS key.
   //   (c) WASM diagnostics[] equal CLI diagnostics[] when the file key is
@@ -343,7 +344,10 @@ describe('lint', () => {
       return;
     }
 
-    // (a) Prove the right surface ran (avoids PF-007 silent-backend-switch).
+    // (a) Shape check: the backend descriptor must be the literal string 'wasm'.
+    // This verifies the API contract of createWasmBackend(), not surface routing --
+    // the test constructs the backend directly so no code path can return a different
+    // backend here (cannot detect a silent backend switch; not a PF-007 guard).
     assert.equal(
       wasmBackend.getBackend(),
       'wasm',
@@ -352,8 +356,10 @@ describe('lint', () => {
 
     // Same fixture as U-L10/U-L11: {name} triggers legacy-interpolation at a
     // low byte offset; duplicate @export greet triggers duplicate-export at a
-    // higher offset. Rule-execution order is the REVERSE of offset order --
-    // without the offset sort both surfaces would diverge from the CLI.
+    // higher offset. sort_diagnostics in LintResultBuilder::build is called by
+    // both the WASM surface and the CLI, so both emit diagnostics in offset order
+    // regardless of run_rules dispatch order. The rule-position pinning assertion
+    // below verifies the sort actually reordered from dispatch order.
     const source =
       '@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n';
 
@@ -422,9 +428,30 @@ describe('lint', () => {
         `differential; got ${totalDiags}`,
     );
 
+    // Rule-position pinning: both rules must have fired, and legacy-interpolation
+    // must appear BEFORE duplicate-export (proves the AD-202-1 sort reordered
+    // against run_rules dispatch order). Delete the sort in LintResultBuilder::build
+    // and this fails.
+    const rules = wasmNorm.flatMap((f) => (f.diagnostics ?? []).map((d) => d.rule));
+    const legacyIdx = rules.indexOf('legacy-interpolation');
+    const dupIdx = rules.indexOf('duplicate-export');
+    assert.ok(
+      legacyIdx !== -1,
+      `U-L12: fixture must produce a legacy-interpolation diagnostic; got rules: ${JSON.stringify(rules)}`,
+    );
+    assert.ok(
+      dupIdx !== -1,
+      `U-L12: fixture must produce a duplicate-export diagnostic; got rules: ${JSON.stringify(rules)}`,
+    );
+    assert.ok(
+      legacyIdx < dupIdx,
+      `U-L12: legacy-interpolation (lower offset) must appear before duplicate-export ` +
+        `(higher offset); got indices legacy=${legacyIdx} dup=${dupIdx}`,
+    );
+
     // Primary parity assertion: WASM and CLI diagnostics[] are identical when
     // the file key is excluded (the cross-surface differential, avoids PF-007).
-    assert.deepEqual(
+    assert.deepStrictEqual(
       wasmNorm,
       cliNorm,
       'U-L12: AC-P1-24: WASM and CLI diagnostics[] must be identical when file key is excluded.\n' +
