@@ -538,6 +538,16 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     `format_unknown_rule_names_warning(&UnknownRuleNames) -> String`. The formatter takes
     the report type rather than a slice so its non-empty precondition is structural — it
     has no panic path — and it WIRE-escapes each name before interpolating it.
+  - `mds-core`: `LintConfig::from_rules_checked(HashMap<String, Severity>) -> (LintConfig,
+    Option<UnknownRuleNames>)` — the preferred constructor. It returns the config and the
+    unknowns report in one `#[must_use]` call so a caller cannot silently skip detection.
+    `LintConfig::from_rules` is retained but **deprecated since 0.4.0** in its favour; it
+    still behaves exactly as before (it never fails on an unknown name) and is not removed.
+  - `mds-core`: `attach_lint_warnings(&mut serde_json::Map<String, Value>, Option<String>)`
+    — the single definition of the `lint_warnings` wire contract (key name, `string[]`
+    shape, absent-when-empty) shared by the napi, WASM, and Python bindings. It takes a
+    `&mut Map` rather than a `&mut Value` so the "target is a JSON object" precondition is
+    structural rather than a silent no-op on a non-object.
   - `@mdscript/mds` (Node entry point): `LINT_RULE_NAMES: readonly LintRuleName[]` and
     the `LintRuleName` string-union type. The browser entry point does not export them
     yet — it has no lint API to configure.

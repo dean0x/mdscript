@@ -1116,7 +1116,12 @@ impl<'a> LintDirCtx<'a> {
                 // `config_dir_cache` and `base_dir_cache` are different RefCells, so
                 // holding the shared borrow on `config_dir_cache` through the body is
                 // safe — the body only mutably borrows `base_dir_cache`.
-                if let Some(rc) = self.config_dir_cache.borrow().get(&config_dir).map(Rc::clone) {
+                if let Some(rc) = self
+                    .config_dir_cache
+                    .borrow()
+                    .get(&config_dir)
+                    .map(Rc::clone)
+                {
                     // Alias base_dir → cached config so fast path 1 fires on the
                     // next call for a file in this same directory.
                     self.base_dir_cache

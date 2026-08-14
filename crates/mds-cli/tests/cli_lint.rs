@@ -4315,3 +4315,206 @@ fn unknown_rule_does_not_change_fix_behaviour() {
         }
     }
 }
+
+/// AC-224-11 (HUMAN format): stdout stays empty, and the warning is the ONLY delta on
+/// stderr — every file is still linted and reported exactly as it was.
+///
+/// The JSON arm is pinned by `unknown_rule_json_stdout_is_byte_identical_to_run_without_it`.
+/// Human format routes diagnostics through a completely different renderer
+/// (`render_result_human` → `eprint_error` → miette, on stderr) and writes nothing to
+/// stdout, so a JSON-only assertion proves nothing here — this arm has to be asserted
+/// separately (PF-007 reasoning applied within one surface: two output formats are two
+/// renderers).
+///
+/// The SAME tempdir is reused for both runs, with only `mds.json` rewritten between
+/// them, so the display paths are byte-identical and the stderr comparison is about
+/// content rather than tempdir naming.
+///
+/// Non-vacuity (PF-013 / ADR-009): the run asserts the warning IS present in the first
+/// run and ABSENT in the second, and that the control run's stderr actually carries
+/// per-file diagnostics — comparing two empty buffers would prove nothing.
+#[test]
+fn unknown_rule_human_stdout_empty_and_per_file_output_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+
+    let run = || {
+        mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    // Run 1: config names an unknown rule alongside a valid one.
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+    let with = run();
+    // Run 2: identical tree and identical paths, unknown entry deleted.
+    write_rules_config(dir.path(), serde_json::json!({ "unused-variable": "warn" }));
+    let without = run();
+
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+    let without_stderr = String::from_utf8_lossy(&without.stderr);
+
+    // Positive control: the warning fired in run 1 and not in run 2.
+    assert!(
+        with_stderr.contains("unknown lint rule") && with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the unknown-rule warning must fire on stderr in human mode; \
+         got: {with_stderr}"
+    );
+    assert!(
+        !without_stderr.contains("unknown lint rule"),
+        "control run must not warn; got: {without_stderr}"
+    );
+    // Non-vacuity: the control run really does carry per-file lint output, so the
+    // equality assertion below is comparing real diagnostics, not two empty buffers.
+    assert!(
+        without_stderr.contains("unused-variable"),
+        "non-vacuity: the fixture tree must produce per-file diagnostics on stderr; \
+         got: {without_stderr}"
+    );
+
+    // AC-224-11: human format writes NOTHING to stdout, with or without the unknown rule.
+    assert!(
+        with.stdout.is_empty(),
+        "AC-224-11: human-format stdout must be empty on the unknown-rule path; got: {}",
+        String::from_utf8_lossy(&with.stdout)
+    );
+    assert!(
+        without.stdout.is_empty(),
+        "AC-224-11: human-format stdout must be empty in the control run; got: {}",
+        String::from_utf8_lossy(&without.stdout)
+    );
+
+    // AC-224-11: the added warning line is the ONLY difference on stderr — no file is
+    // skipped and no per-file result changes.
+    let with_minus_warning: String = with_stderr
+        .lines()
+        .filter(|l| !l.contains("unknown lint rule"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let without_normalized: String = without_stderr.lines().map(|l| format!("{l}\n")).collect();
+    assert_eq!(
+        with_minus_warning, without_normalized,
+        "AC-224-11: apart from the added warning line, human-mode stderr must be \
+         identical with and without the unknown rule name;\nwith:\n{with_stderr}\n\
+         without:\n{without_stderr}"
+    );
+
+    // AC-224-13: the exit code does not move because of the unknown rule name.
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13: the exit code must not move because of an unknown rule name in human mode"
+    );
+}
+
+/// AC-224-10 / AC-224-19 (nested config): the `mds.json` lives in a SUBDIRECTORY and the
+/// lint root itself has none.
+///
+/// This is a distinct `LintDirCtx::config_for` branch from the other unknown-rule tests:
+/// the root's `base_dir` resolves to `None` (default config, cached under `base_dir` only)
+/// while the subdirectory resolves to `Some((config, config_dir))`. Both branches are
+/// exercised in one invocation, so a regression that emitted the warning from the `None`
+/// arm, or that failed to reach the `Some` arm at all, is caught here.
+///
+/// Non-vacuity (PF-013 / ADR-009): the run asserts the warning fires exactly once AND
+/// that both files were actually linted (the root file is reported too), so neither the
+/// count nor the JSON comparison can pass because nothing ran.
+#[test]
+fn unknown_rule_nested_config_warns_once_and_envelope_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Root file: governed by NO config (the lint root has no mds.json).
+    std::fs::write(
+        dir.path().join("root.mds"),
+        "---\nroot_unused: v\n---\nHi!\n",
+    )
+    .unwrap();
+    // Subdirectory file: governed by sub/mds.json, which names the unknown rule.
+    std::fs::write(sub.join("nested.mds"), "---\nsub_unused: v\n---\nHo!\n").unwrap();
+
+    let run = || {
+        mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .arg("--format")
+            .arg("json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    write_rules_config(
+        &sub,
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+    let with = run();
+    write_rules_config(&sub, serde_json::json!({ "unused-variable": "warn" }));
+    let without = run();
+
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+
+    // AC-224-19: exactly one warning, emitted from the subdirectory's config only.
+    let warning_count = with_stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .count();
+    assert_eq!(
+        warning_count, 1,
+        "AC-224-19 (nested): the subdirectory config must warn exactly once; got stderr:\n\
+         {with_stderr}"
+    );
+    assert!(
+        with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the warning must name the unknown rule; got: {with_stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&without.stderr).contains("unknown lint rule"),
+        "control run must not warn; got: {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+
+    // AC-224-10: the stdout envelope is byte-identical across the two runs.
+    assert_eq!(
+        with.stdout,
+        without.stdout,
+        "AC-224-10 (nested): stdout must be byte-identical with and without the unknown \
+         rule name;\nwith:    {}\nwithout: {}",
+        String::from_utf8_lossy(&with.stdout),
+        String::from_utf8_lossy(&without.stdout)
+    );
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13 (nested): the exit code must not move"
+    );
+
+    // Non-vacuity: BOTH files were linted — the root file (default config, no warning)
+    // and the nested file (subdir config). A byte-identical comparison of two envelopes
+    // that never reached the nested directory would prove nothing.
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&with.stdout).trim())
+            .expect("stdout must be valid JSON");
+    let files: Vec<String> = parsed["files"]
+        .as_array()
+        .expect("files must be an array")
+        .iter()
+        .map(|f| f["file"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        files.iter().any(|f| f == "root.mds"),
+        "non-vacuity: the root file must still be linted; got files: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f == "sub/nested.mds"),
+        "non-vacuity: the nested file must still be linted; got files: {files:?}"
+    );
+}
