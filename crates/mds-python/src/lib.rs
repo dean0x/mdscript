@@ -1558,9 +1558,14 @@ fn lint(
     let result = run_catching(py, move || {
         mds::lint_str_with(&source, base_path.as_deref(), vars, &lint_config)
     })?;
-    Ok(LintResult {
-        value: mds::attach_lint_warnings(result.to_canonical_json(), lint_warnings),
-    })
+    let mut json = result.to_canonical_json();
+    // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+    mds::attach_lint_warnings(
+        json.as_object_mut()
+            .expect("LintResult::to_canonical_json always returns a JSON object"),
+        lint_warnings,
+    );
+    Ok(LintResult { value: json })
 }
 
 /// Lint an MDS template file (`path` is a str or `os.PathLike`).
@@ -1578,9 +1583,14 @@ fn lint_file(
     let vars = extract_vars(py, vars.as_ref())?;
     let (lint_config, lint_warnings) = extract_rules(py, rules.as_ref())?;
     let result = run_catching(py, move || mds::lint(&path, vars, &lint_config))?;
-    Ok(LintResult {
-        value: mds::attach_lint_warnings(result.to_canonical_json(), lint_warnings),
-    })
+    let mut json = result.to_canonical_json();
+    // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+    mds::attach_lint_warnings(
+        json.as_object_mut()
+            .expect("LintResult::to_canonical_json always returns a JSON object"),
+        lint_warnings,
+    );
+    Ok(LintResult { value: json })
 }
 
 /// Lint a module from an in-memory virtual filesystem.
@@ -1602,9 +1612,14 @@ fn lint_virtual(
     let result = run_catching(py, move || {
         mds::lint_virtual(modules, &entry, vars, &lint_config)
     })?;
-    Ok(LintResult {
-        value: mds::attach_lint_warnings(result.to_canonical_json(), lint_warnings),
-    })
+    let mut json = result.to_canonical_json();
+    // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+    mds::attach_lint_warnings(
+        json.as_object_mut()
+            .expect("LintResult::to_canonical_json always returns a JSON object"),
+        lint_warnings,
+    );
+    Ok(LintResult { value: json })
 }
 
 // ── Module ──────────────────────────────────────────────────────────────────────

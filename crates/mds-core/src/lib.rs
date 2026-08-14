@@ -61,13 +61,13 @@ pub(crate) mod value;
 pub use formatter::{format_str, format_str_named, format_str_with};
 pub use fs::{effective_parent, FileSystem, NativeFs, VirtualFs};
 pub use lint::{
-    attach_lint_warnings, find_unknown_rule_names, fix, format_unknown_rule_names_warning,
-    named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
-    sanitize_control_chars_wire, FixLineSpan, LintConfig, LintDiagnostic, LintResult, Severity,
-    TextEdit, UnknownRuleNames, KNOWN_LINT_RULES,
+    find_unknown_rule_names, fix, format_unknown_rule_names_warning, named_source_for_render,
+    neutralize_source_for_render, sanitize_control_chars, sanitize_control_chars_wire, FixLineSpan,
+    LintConfig, LintDiagnostic, LintResult, Severity, TextEdit, UnknownRuleNames, KNOWN_LINT_RULES,
 };
 pub use options::{
-    format_unknown_keys_error, json_type_name, parse_json_vars, reject_unknown_json_keys, VarsError,
+    attach_lint_warnings, format_unknown_keys_error, json_type_name, parse_json_vars,
+    reject_unknown_json_keys, VarsError,
 };
 pub use resolver::ModuleCache;
 pub use source_path::relativize_source;

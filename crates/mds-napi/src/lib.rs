@@ -985,10 +985,14 @@ pub fn lint(env: Env, source: String, opts: Option<Object>) -> napi::Result<serd
         }),
     )?;
 
-    Ok(mds::attach_lint_warnings(
-        result.to_canonical_json(),
+    let mut json = result.to_canonical_json();
+    // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+    mds::attach_lint_warnings(
+        json.as_object_mut()
+            .expect("LintResult::to_canonical_json always returns a JSON object"),
         lint_warnings,
-    ))
+    );
+    Ok(json)
 }
 
 /// Lint an MDS template file for static analysis findings.
@@ -1016,10 +1020,14 @@ pub fn lint_file(env: Env, path: String, opts: Option<Object>) -> napi::Result<s
         AssertUnwindSafe(move || mds::lint(&path_buf, vars, &lint_config)),
     )?;
 
-    Ok(mds::attach_lint_warnings(
-        result.to_canonical_json(),
+    let mut json = result.to_canonical_json();
+    // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+    mds::attach_lint_warnings(
+        json.as_object_mut()
+            .expect("LintResult::to_canonical_json always returns a JSON object"),
         lint_warnings,
-    ))
+    );
+    Ok(json)
 }
 
 /// Lint a multi-module virtual filesystem for static analysis findings.
@@ -1106,8 +1114,12 @@ pub fn lint_virtual(
         AssertUnwindSafe(move || mds::lint_virtual(mods, &entry, vars, &lint_config)),
     )?;
 
-    Ok(mds::attach_lint_warnings(
-        result.to_canonical_json(),
+    let mut json = result.to_canonical_json();
+    // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+    mds::attach_lint_warnings(
+        json.as_object_mut()
+            .expect("LintResult::to_canonical_json always returns a JSON object"),
         lint_warnings,
-    ))
+    );
+    Ok(json)
 }

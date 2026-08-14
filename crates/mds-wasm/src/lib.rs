@@ -856,7 +856,13 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         )
         .map_err(mds_error_to_js)?;
 
-        let json = mds::attach_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
+        let mut json = result.to_canonical_json();
+        // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+        mds::attach_lint_warnings(
+            json.as_object_mut()
+                .expect("LintResult::to_canonical_json always returns a JSON object"),
+            lint_opts.lint_warnings,
+        );
         to_js(&json)
     }))
 }
@@ -916,7 +922,13 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
         )
         .map_err(mds_error_to_js)?;
 
-        let json = mds::attach_lint_warnings(result.to_canonical_json(), lint_opts.lint_warnings);
+        let mut json = result.to_canonical_json();
+        // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+        mds::attach_lint_warnings(
+            json.as_object_mut()
+                .expect("LintResult::to_canonical_json always returns a JSON object"),
+            lint_opts.lint_warnings,
+        );
         to_js(&json)
     }))
 }

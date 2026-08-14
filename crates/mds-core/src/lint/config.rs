@@ -377,5 +377,4 @@ mod tests {
             "non-vacuity: the rule name must reach the message; got: {msg}"
         );
     }
-
 }

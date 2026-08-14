@@ -33,8 +33,8 @@ pub(crate) mod rules;
 pub(crate) mod tier;
 
 pub use config::{
-    attach_lint_warnings, find_unknown_rule_names, format_unknown_rule_names_warning, LintConfig,
-    UnknownRuleNames, KNOWN_LINT_RULES,
+    find_unknown_rule_names, format_unknown_rule_names_warning, LintConfig, UnknownRuleNames,
+    KNOWN_LINT_RULES,
 };
 pub use diagnostic::{
     named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
