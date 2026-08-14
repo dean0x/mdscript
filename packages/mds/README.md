@@ -153,5 +153,5 @@ unknown severity values throw `mds::invalid_options`.
 **Lint result shape:**
 ```ts
 { version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean }
-// LintDiagnostic: { rule, severity, message, help?, fixable, fix_edits?, span? }
+// LintDiagnostic: { rule, severity, message, help?, fixable, fix_edits, span? }
 ```
