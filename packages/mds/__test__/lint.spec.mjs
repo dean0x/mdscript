@@ -617,6 +617,35 @@ describe('lint canonical JSON goldens', () => {
       `lintVirtual silenced golden mismatch: got ${JSON.stringify(result)}`,
     );
   });
+
+  // spec.md normative claim: in alphabetical key order `lint_warnings` sorts between
+  // `files` and `truncated`. This test pins that position in the actual JSON output.
+  // (ADR-009 / PF-013: verifying key ORDER requires a result that actually contains the
+  // key; clean-source goldens above cannot exercise this.)
+  test('U-LG4: lint_warnings key sorts between files and truncated in the JSON wire form', () => {
+    const result = lintVirtual(
+      { 'main.mds': CLEAN_SOURCE },
+      'main.mds',
+      { rules: { 'no-such-rule-xyzzy': 'warn' } },
+    );
+    assert.ok(
+      Array.isArray(result.lint_warnings) && result.lint_warnings.length > 0,
+      `U-LG4: lint_warnings must be a non-empty array; got ${JSON.stringify(result.lint_warnings)}`,
+    );
+    const json = JSON.stringify(result);
+    const filesIdx = json.indexOf('"files"');
+    const warnIdx = json.indexOf('"lint_warnings"');
+    const truncIdx = json.indexOf('"truncated"');
+    assert.ok(
+      filesIdx !== -1 && warnIdx !== -1 && truncIdx !== -1,
+      `U-LG4: expected files, lint_warnings, and truncated keys in serialized result; got: ${json}`,
+    );
+    assert.ok(
+      filesIdx < warnIdx && warnIdx < truncIdx,
+      `U-LG4: lint_warnings must sort between files and truncated (alphabetical BTreeMap order); ` +
+        `filesIdx=${filesIdx} warnIdx=${warnIdx} truncIdx=${truncIdx} in: ${json}`,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------

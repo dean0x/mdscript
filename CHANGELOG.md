@@ -780,10 +780,21 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   surfaces typos without hard-failing a config that names a rule added in a newer
   release.
   - **CLI**: the warning goes to **stderr**, never stdout, so `mds lint --format json`
-    still writes a single valid JSON document. `--quiet` suppresses it. Format:
-    `warning: unknown lint rule 'NAME' in mds.json; recognised rules are: …; ignoring`.
-  - **napi / WASM / Python**: the warning is returned as `lint_warnings: string[]` on
-    the lint result, a key that is absent when there is nothing to report.
+    still writes a single valid JSON document. `--quiet` suppresses it. Singular and
+    plural formats (offenders sorted lexicographically):
+    - `warning: unknown lint rule 'NAME' in mds.json; recognised rules are: …; ignoring`
+    - `warning: unknown lint rules in mds.json: 'A', 'B'; recognised rules are: …; ignoring`
+  - **napi / WASM / Python**: the warning is surfaced as `lint_warnings: string[]` on
+    the lint result. In the JSON wire form and in `to_dict()` / `to_json()` output, the
+    key is absent (not `null`, not `[]`) when no warnings occurred. On the Python
+    live-object surface, `LintResult.lint_warnings` is a property that always exists
+    and returns an empty list when no warnings occurred. The message format differs from
+    the CLI (no `"warning:"` prefix, no `"in mds.json"` source context):
+    - `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
+    - `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
+    The recognised-rules list and sort order are shared with the CLI via
+    `mds::KNOWN_LINT_RULES`. Per-surface parity (PF-007): each surface's format is
+    asserted by its own tests; no cross-surface byte-identity is claimed.
   - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`, `check`,
     `fmt` and `watch` load the same `mds.json` and are byte-unchanged — an accepted
     asymmetry, not an oversight.
