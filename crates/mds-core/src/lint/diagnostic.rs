@@ -654,8 +654,9 @@ impl LintResult {
     /// which is a semantic change to a published API.  The internal builder
     /// (`LintResultBuilder::build`) sorts after truncation, so results produced
     /// by `lint`/`lint_source` always carry the canonical offset order.
-    /// [`to_canonical_json`] re-sorts defensively at the serialization boundary,
-    /// so the emitted JSON is always in canonical order.
+    /// A `LintResult` built via this constructor preserves caller order on all
+    /// surfaces — [`to_canonical_json`] included — because `sort_diagnostics`
+    /// is the single ordering choke point (AD-202-1) and it is not called here.
     ///
     /// # Examples
     ///
@@ -758,19 +759,14 @@ impl LintResult {
     pub fn to_canonical_json(&self) -> serde_json::Value {
         use std::collections::BTreeMap;
 
-        // Defensive sort: enforce canonical (file, offset) order at the serialization
-        // boundary.  LintResultBuilder::build establishes this order on the internal
-        // path; this pass makes the guarantee self-enforcing for LintResult::new callers
-        // too.  Cost is bounded at MAX_DIAGNOSTICS items (idempotent when already sorted).
-        // LintDiagnostic is not Clone, so we sort a vec of references.
-        let mut sorted: Vec<&LintDiagnostic> = self.diagnostics.iter().collect();
-        sorted.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
-
         // Group diagnostics by file, preserving insertion order within each group.
         // BTreeMap gives deterministic (sorted) file ordering in the output.
+        // AD-202-1: order is established by LintResultBuilder::build (for engine
+        // results) or preserved as caller-supplied (for LintResult::new callers).
+        // sort_diagnostics is the single ordering choke point; no re-sort here.
         let mut by_file: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
 
-        for diag in &sorted {
+        for diag in &self.diagnostics {
             let key = diag.file.clone().unwrap_or_else(|| "<unknown>".to_string());
             let span_json = diag.span.as_ref().map(|s| {
                 let mut obj = serde_json::json!({

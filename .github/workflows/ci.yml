@@ -87,8 +87,8 @@ jobs:
         run: |
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
-              echo "::warning::WASM file missing: $f"
-              continue
+              echo "::error::WASM file missing: $f"
+              exit 1
             fi
             raw=$(wc -c < "$f" | tr -d ' ')
             gz=$(gzip -c "$f" | wc -c | tr -d ' ')
