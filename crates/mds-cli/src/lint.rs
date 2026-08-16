@@ -1213,8 +1213,10 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
 ///
 /// **Channel discipline (AD-216-8):** the summary is emitted in BOTH human and JSON
 /// format modes — format governs where machine-readable output goes (stdout), not
-/// whether status output (stderr) appears.  JSON consumers who filter on `--quiet`
-/// continue to receive valid parseable JSON on stdout regardless of stderr content.
+/// whether status output (stderr) appears.  JSON consumers using `--format json`
+/// (without `--fix --diff`) continue to receive valid parseable JSON on stdout
+/// regardless of stderr content; `--fix --diff` writes unified diffs to stdout
+/// before the JSON envelope and is incompatible with JSON-consumer pipelines.
 fn run_lint_directory(
     dir: &Path,
     flags: LintFlags,
