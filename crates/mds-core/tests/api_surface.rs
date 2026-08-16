@@ -1650,7 +1650,7 @@ fn fix_api_incremental_exists() {
 }
 
 /// F-API-3: `apply_fixes` remains reachable on the public API surface and behaviorally
-/// unchanged while deprecated.
+/// unchanged while deprecated. Remove at v0.5.0 with the function (AD-209-1).
 ///
 /// AD-209-2: `#[expect(deprecated)]` was chosen over a `trybuild` compile-fail fixture
 /// because: (a) trybuild only asserts that the deprecation warning fires; it does not
@@ -1663,8 +1663,6 @@ fn fix_api_incremental_exists() {
 /// a separate test-driver crate.
 ///
 /// All values constructed via named constructors, never struct literals (applies ADR-010).
-// AD-209-1: apply_fixes is deprecated; this pin is the F-API-3 compile-and-runtime
-// guard for the deprecated public path. Remove at v0.5.0 with the function.
 #[expect(
     deprecated,
     reason = "AD-209-2: F-API-3 pins the deprecated apply_fixes public API surface; see fix.rs rustdoc"

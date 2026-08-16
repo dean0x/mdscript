@@ -592,7 +592,7 @@ fn regressed_rules(
 /// `apply_plan_unchecked` is provided for the `--fix --diff` / `--fix --check`
 /// diff-preview path (which computes the delta without writing it) and for unit
 /// tests. Calling it on a write path without a subsequent reverify is an
-/// anti-pattern -- the reverify gate is the only guard against a fix that
+/// anti-pattern — the reverify gate is the only guard against a fix that
 /// accidentally changes compiled semantics.
 ///
 /// The caller must pass `plan` with `overlap_rejected == false`; if true,
@@ -698,12 +698,12 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 /// tests must be ported or explicitly tracked before removal at v0.5.0
 /// (see issue #209):
 ///
-/// - `a4_partial_overlap_still_rejected_after_dedup` (fix.rs:1392) -- A4
-/// - `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (fix.rs:1681) -- A5
-/// - `reverify_preexisting_untargeted_survives_and_fix_applies` (fix.rs:1869) -- AC-F-23
-/// - `reverify_new_untargeted_diagnostic_is_rejected` (fix.rs:1890)
-/// - `tier_b_unused_function_standalone_apply_succeeds` (fix.rs:1957) -- I-13
-/// - `l_fix_rev1_output_delta_causes_rejection` (fix.rs:2024) -- L-FIX-REV1
+/// - `a4_partial_overlap_still_rejected_after_dedup` (fix.rs:1444) -- A4
+/// - `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (fix.rs:1741) -- A5
+/// - `reverify_preexisting_untargeted_survives_and_fix_applies` (fix.rs:1941) -- AC-F-23
+/// - `reverify_new_untargeted_diagnostic_is_rejected` (fix.rs:1966)
+/// - `tier_b_unused_function_standalone_apply_succeeds` (fix.rs:2037) -- I-13
+/// - `l_fix_rev1_output_delta_causes_rejection` (fix.rs:2108) -- L-FIX-REV1
 ///
 /// Apply a `FixPlan` with a reverify callback.
 ///
