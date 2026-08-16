@@ -56,6 +56,11 @@ npm run build -w @mdscript/mds-wasm
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
 node scripts/verify-versions.mjs
+# Verify #[deprecated(since = ...)] attributes match the release version.
+# bump-version.mjs rewrites manifests and CHANGELOG only -- never .rs files.
+# Two live sites: crates/mds-core/src/lint/config.rs and crates/mds-core/src/lint/fix.rs.
+# Every hit's quoted version string MUST equal X.Y.Z before you tag.
+grep -rn 'since = ' crates/ --include='*.rs'
 
 # Source hygiene and pre-merge check gates
 node scripts/verify-no-control-bytes.mjs
