@@ -3146,7 +3146,7 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
 /// the human-mode check above for the `lint_one_file_human` code path.
 ///
 /// Code ordering is correct: `lint_one_file_accumulating` returns `FileTally::Error`
-/// at lint.rs:1535 before reaching the `eprintln!("Fixed: …")` at lint.rs:1539.
+/// at lint.rs:1537 before reaching the `eprintln!("Fixed: …")` at lint.rs:1541.
 /// This test provides the coverage that the code ordering is verified.
 ///
 /// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
@@ -4693,28 +4693,20 @@ fn lint_directory_summary_counts_each_severity_bucket() {
 /// Parse [clean, warn, error, limit] from a directory summary line.
 /// Returns [0,0,0,0] on parse failure (test will then fail on the equality check).
 fn parse_summary_counts(stderr: &str) -> [usize; 4] {
+    fn leading_usize(s: &str) -> Option<usize> {
+        s.split_whitespace().next()?.parse().ok()
+    }
     // Pattern: "N clean, N with warnings, N with errors, N resource-limited"
     for line in stderr.lines() {
         if let Some(rest) = line.strip_suffix(" resource-limited") {
             let parts: Vec<&str> = rest.split(", ").collect();
             if parts.len() == 4 {
-                let clean = parts[0]
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok());
-                let warn = parts[1]
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok());
-                let error = parts[2]
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok());
-                let limit = parts[3]
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok());
-                if let (Some(c), Some(w), Some(e), Some(l)) = (clean, warn, error, limit) {
+                if let (Some(c), Some(w), Some(e), Some(l)) = (
+                    leading_usize(parts[0]),
+                    leading_usize(parts[1]),
+                    leading_usize(parts[2]),
+                    leading_usize(parts[3]),
+                ) {
                     return [c, w, e, l];
                 }
             }

@@ -1733,7 +1733,7 @@ fn lint_one_file_human(
                 applied_count,
                 total_count,
             } => {
-                // Unified message format (issue #43 / #173).
+                // Unified message + quiet guard (#173).
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
