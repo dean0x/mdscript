@@ -125,6 +125,11 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 /// recognised-rules list needs no escaping: it is a slice of compile-time string
 /// literals.
 ///
+/// AC-224-3 (amended criterion, repo-owner ruling 2026-08-16): the criterion
+/// requires a shared message body, a shared recognised-rules list, and a shared
+/// sort order across all five surfaces. The CLI prefix described below is permitted
+/// by the amended criterion; it is not a residual or a self-waiver.
+///
 /// Called by the CLI and by the bindings (napi/WASM/Python) to build their
 /// warning strings. The CLI wraps the returned string with a `"warning: in
 /// mds.json: "` prefix so the source-file provenance appears on stderr; the

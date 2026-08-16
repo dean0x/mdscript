@@ -219,10 +219,13 @@ fn load_lint_config(dir: &Path, quiet: bool) -> Result<mds::LintConfig> {
 /// the same work set represented twice drifts; ADR-008: the escape contract is
 /// per-file, so every call site is equally security-relevant).
 ///
-/// AC-224-3: delegates the message body to [`mds::format_unknown_rule_names_warning`]
-/// so the CLI and all binding surfaces share one canonical phrasing. The CLI adds
-/// `"warning: in mds.json: "` as a prefix to carry the source-file provenance —
-/// the ONLY structural difference from the binding surface format.
+/// AC-224-3 (amended criterion, repo-owner ruling 2026-08-16): the criterion requires
+/// a shared message body, a shared recognised-rules list, and a shared sort order
+/// across all five surfaces. The CLI prefix `"warning: in mds.json: "` is permitted
+/// by the amended criterion; it carries source-file provenance that the bindings
+/// cannot provide because their rules arrive in the caller's options object, not a
+/// config file. One formatter ([`mds::format_unknown_rule_names_warning`]) produces
+/// the shared body; the CLI adds the provenance prefix before emitting on stderr.
 ///
 /// AD-224-3 (AC-224-6): every value interpolated inside `eprint_warning`'s
 /// `format!` must be a WHOLE-EXPRESSION `safe_inline` call — the one shape that

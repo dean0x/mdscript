@@ -801,9 +801,11 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     key is absent (not `null`, not `[]`) when no warnings occurred. On the Python
     live-object surface, `LintResult.lint_warnings` is a property that always exists
     and returns an empty list when no warnings occurred. The message body is shared with
-    the CLI via `mds::format_unknown_rule_names_warning` (AC-224-3 met); the only
-    per-surface difference is that the CLI prefixes `"warning: in mds.json: "` to carry
-    the source-file provenance on stderr, while the bindings use the body as-is:
+    the CLI via `mds::format_unknown_rule_names_warning` (AC-224-3 met under amended
+    criterion, repo-owner ruling 2026-08-16: shared body, shared recognised-rules list,
+    shared sort order; the CLI adds a `"warning: in mds.json: "` provenance prefix that
+    the bindings cannot provide because their rules arrive in the caller's options
+    object, not a config file). The bindings use the body as-is:
     - Singular: `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
     - Plural:   `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
     The recognised-rules list, sort order, and name wire-escaping are all shared.
