@@ -728,11 +728,12 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 ///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
-#[must_use = "a dropped FixOutcome silently discards the fix result"]
 #[deprecated(
     since = "0.4.0",
-    note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must be `Fn`, not `FnOnce`. Removed in v0.5.0; see the item docs."
+    note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must \
+            be `Fn`, not `FnOnce`. Removed in v0.5.0; see the item docs."
 )]
+#[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
 where
     F: FnOnce(&str) -> Result<LintResult, MdsError>,
