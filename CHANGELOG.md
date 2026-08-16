@@ -543,9 +543,13 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   --quiet` printed it to stderr under directory, single-file, and stdin input alike. The
   preview-path copy (under `--fix --check` or without `--fix`) was already `--quiet`-gated in
   most modes but remained ungated in `--format json` directory mode. The `diagnostic cap (N)
-  reached` notice was ungated in single-file and both directory modes. Scripts that grep stderr
-  for `fix rejected` must drop `--quiet`. Exit codes are unaffected, and error-severity
-  diagnostics still print under `--quiet` as always.
+  reached` notice was ungated in single-file and both directory modes; in stdin mode it is newly
+  added by this release (stdin previously had no cap notice at all — see Added below).
+  Additionally, `Fixed: <path>` and `Would fix: <path>` confirmation lines are newly added to
+  `--format json` directory mode — previously these lines appeared only in `--format human`;
+  all three new emitters are `--quiet`-gated from the start. Scripts that grep stderr for
+  `fix rejected` must drop `--quiet`. Exit codes are unaffected, and error-severity diagnostics
+  still print under `--quiet` as always.
 
 ### Added
 
@@ -558,6 +562,24 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   note that this summary line is now always printed on a clean run (to suppress it, pass
   `--quiet`). The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
   — no `"summary"` key is added, so existing consumers of `--format json` are unaffected.
+  Exception (D1-a): `mds lint --fix --check --quiet <dir>` exits 1 with zero stderr bytes when
+  pending fixes exist but no file has errors or hits a resource limit — the exit code is
+  unexplained on the surface but is intentional and documented in `--help`.
+
+- **`mds lint --fix` adds stderr parity across all three input modes (#216).** Three status
+  messages that previously appeared in some modes but not others are now present in all three
+  input modes, each suppressed under `--quiet`:
+  - **Stdin diagnostic-cap notice**: `mds lint --fix -` on inputs that exceed the diagnostic cap
+    now prints `diagnostic cap (N) reached; further findings were suppressed — re-run --fix to
+    continue` to stderr. This line did not exist in stdin mode before this release. stdout (the
+    fixed source) is unaffected.
+  - **`Fixed: <path>` in `--format json` directory mode**: previously emitted only by
+    `--format human`; now also printed per fixed file in `--format json`. The JSON document on
+    stdout is unchanged.
+  - **`Would fix: <path>` in `--format json` directory mode**: same — previously human-only, now
+    also printed in JSON mode under `--fix --check`.
+  Scripts or tests that assert zero stderr from `mds lint --fix -` or
+  `mds lint --fix --format json <dir>` on non-quiet runs should note these additions.
 
 - **Lint rule-name registry, exposed on every surface (#224).** The recognised rule
   names now have one source of truth, derived from each rule module's own name constant.
