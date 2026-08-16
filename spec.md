@@ -858,7 +858,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - Output extension per file is intrinsic (`.md` or `.json`).
 - With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source.
 - `-o` is rejected for a directory input.
-- Continue-on-error: all compilable files are attempted; a summary and non-zero exit are produced if any file failed.
+- Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
 - When the directory contains no `.mds` files, exits 0 with a "no files found" message.
 - **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
 - stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
@@ -872,7 +872,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
-| `-q, --quiet` | Suppress status messages and warnings on stderr. |
+| `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
 
 **Output path resolution** (precedence order, highest first):
 
@@ -915,6 +915,7 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 |--------|-------------|
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
+| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors the same rule for `mds lint --fix --check`). (Two notices bypass `--quiet`: the directory-depth warning and the all-files-excluded diagnostic.) |
 
 ### 7.5 `mds lint`
 
@@ -934,6 +935,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 **Channel discipline:**
 - Human-readable diagnostics → **stderr** (via miette).
 - `--format json` output → **stdout** (single JSON object, one trailing newline).
+- Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode, except under `--fix --diff` which also writes the unified diff to stdout).
 - `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
 
 **Options:**
@@ -947,7 +949,42 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
 | `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
-| `-q, --quiet` | Suppress warning/info human diagnostics; errors still print. |
+| `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. (The directory-depth warning — fires on trees deeper than MAX_DEPTH=64 — is emitted regardless of `--quiet`.) |
+
+**Directory mode** (`mds lint <dir>`):
+
+- Lints every `.mds` file recursively (including `_`-prefixed partials).
+- Accumulate-and-continue: per-file errors do not abort the run.
+- After processing all files, emits one summary line to stderr:
+  `N clean, N with warnings, N with errors, N resource-limited`
+  Each file falls in exactly one bucket, so the four counts always sum to the number of
+  `.mds` files the walker collected.
+  - "Clean" — no findings.
+  - "With warnings" — warning-severity findings only.
+  - "With errors" — error-severity lint findings **or** a per-file analysis failure
+    (source read, config load, or lint call failure). These two populations are
+    deliberately merged, matching the way `mds build`'s "failed" count merges them.
+  - "Resource-limited" — files where `mds::lint` returned `MdsError::ResourceLimit`
+    (for example, exceeding `MAX_BLOCKS_PER_MODULE`). These are counted here, never
+    under "with errors".
+- Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
+  (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
+  bucket, the summary is always emitted so the non-zero exit is never unexplained.
+  **Exception:** `mds lint --fix --check --quiet <dir>` exits 1 with zero
+  stderr bytes when pending fixes exist but no file is in the error or
+  resource-limited bucket — the `--fix --check` pending-fix signal is treated as
+  status output and is suppressed by `--quiet` alongside the summary line.
+- The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
+  regardless of `--quiet` or directory mode — no `"summary"` key is added.
+
+**`--quiet` and `--fix` status messages:** `fix rejected: <reason>`, `Partially fixed:`,
+`Would fix:`, and the `diagnostic cap (N) reached` notice are status output gated by
+`--quiet` in **all three input modes** (directory, single file, stdin). `Fixed: <path>` is
+gated by `--quiet` in single-file and directory modes (both `--format human` and `--format
+json`); stdin writes fixed source to stdout rather than writing back to a file, so no
+path-bearing `Fixed:` line appears there. All of these status messages go to **stderr**
+regardless of `--format`; the JSON stdout envelope is unaffected. Error-severity diagnostics
+and the exit code are unaffected by `--quiet`.
 
 **Exit codes** (lint-specific; differ from `mds build`/`mds check`):
 

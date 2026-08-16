@@ -1418,8 +1418,22 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// (AC-PERF-02: peak RSS ≈ O(largest single file), not O(total)).
 ///
 /// Continue-on-error: a per-file compile error does NOT abort the run.
-/// All valid files are written; a summary is printed; non-zero exit when any failed
-/// (AC-FUNC-18).
+/// All valid files are written; a summary is printed (unless `--quiet` and the run
+/// succeeded); non-zero exit when any failed (AC-FUNC-18).
+///
+/// **Summary / quiet contract (AD-216-1):** the summary line is suppressed under
+/// `--quiet` on a fully-successful run (`fail_count == 0`).  When any file fails,
+/// the summary is always emitted so the non-zero exit is never unexplained.
+/// This mirrors the gate used by `mds check` (`main.rs`) and `mds fmt` (`fmt.rs`).
+///
+/// **Documented limitation (AC-Q05):** two warning writers reachable from this
+/// function do not accept a `quiet` parameter — `output.rs::collect_mds_files_inner`
+/// (depth-limit warning, fires on trees deeper than MAX_DEPTH=64) and
+/// `output.rs::probe_and_remove_stale` (stale-unlink failure warning).  Both emit
+/// to stderr regardless of `--quiet`.  The normative documentation (spec.md §7.2
+/// and README) uses the form "no output on a successful build" rather than "no output
+/// under any condition" (PF-015); the global `--quiet` flag description at `main.rs:30`
+/// uses a briefer phrasing that does not enumerate this limitation explicitly.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
@@ -1624,7 +1638,13 @@ fn run_build_directory(
         }
     }
 
-    eprintln!("{ok_count} built, {fail_count} failed");
+    // AD-216-1: mirror the gate used by `mds check` (main.rs) and `mds fmt` (fmt.rs):
+    // suppress the summary under --quiet when every file succeeded, so a quiet CI job
+    // produces no output on a clean run.  AD-216-2: exit codes are untouched — a
+    // --quiet build with failures still exits 1 with the summary explaining why.
+    if !quiet || fail_count > 0 {
+        eprintln!("{ok_count} built, {fail_count} failed");
+    }
 
     if fail_count > 0 {
         std::process::exit(1);

@@ -14,6 +14,28 @@
 //! - `--format json` output → **stdout** only (single JSON object, trailing newline).
 //! - `--quiet` suppresses warning+info human diagnostics and summaries, NOT errors.
 //!
+//! # `--quiet` status-message contract (#216, decision D4)
+//!
+//! Every *status* message on stderr is gated on `!quiet` wherever it is emitted.
+//! Per-mode scope (PF-015: scoped claim rather than vacuously-true absolute).
+//! Directory mode has two separate emitters (`lint_one_file_human` for --format
+//! human and `lint_one_file_accumulating` for --format json), giving four emitter
+//! sites in total. `Partially fixed:`, `Would fix:`, `fix rejected:`, and the
+//! diagnostic-cap notice are gated at all four sites (single-file, directory-human,
+//! directory-JSON, stdin). `Fixed:` is emitted in single-file and both directory
+//! modes (both human and JSON); stdin emits `Partially fixed:` but no `Fixed:` —
+//! the fixed source on stdout is the signal. `Clean:` is single-file mode only;
+//! the directory summary is directory mode only.
+//! PF-004: these are separate emitters; a gate on one is not inherited by the others
+//! (the #43/#173 divergence class).
+//!
+//! Two messages deliberately bypass `--quiet` because they signal a silent-CI-green-pass
+//! hazard rather than status: the all-excluded diagnostic in [`run_lint_directory`] and
+//! the directory summary when any file is in the error or resource-limited bucket.
+//! A third emitter also bypasses `--quiet`: `output::collect_mds_files_inner`'s
+//! depth-limit warning (fires on trees deeper than MAX_DEPTH=64) accepts no quiet
+//! parameter — documented limitation per AC-Q05/PF-015, mirroring `build.rs`.
+//!
 //! # Exit codes (via direct `std::process::exit`, NEVER via `exit_code()`)
 //!
 //! - 0: clean (no Warn/Error findings)
@@ -747,6 +769,17 @@ fn run_lint_stdin(
     // before returning.
     set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
 
+    // D4 (AD-216-11): status message, not an error — suppress under --quiet.
+    // PF-004: stdin is a separate emitter from file/directory mode; the cap notice
+    // must reach this path too (avoids the #43/#173 divergence class).
+    if result.truncated && fix && !quiet {
+        eprintln!(
+            "diagnostic cap ({}) reached; further findings were suppressed — \
+             re-run --fix to continue",
+            mds::MAX_DIAGNOSTICS
+        );
+    }
+
     if fix {
         // ── Preview path: --fix --check and/or --fix --diff (never writes source) ───
         // Mirrors run_lint_file's preview path so stdin honours --check / --diff the
@@ -815,7 +848,17 @@ fn run_lint_stdin(
                 (new_source, residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("fix rejected: {}", safe_inline(&reason));
+                // D4 (AD-216-11): "fix rejected" is a status message — the safety
+                // gate fired and the original diagnostics are unmodified.  Suppress under
+                // --quiet, matching this function's own `PreviewOutcome::Rejected` arm and
+                // the directory-mode emitters in `lint_one_file_accumulating` /
+                // `lint_one_file_human`.  PF-004: stdin is a separate emitter from
+                // directory mode and must not bypass the gate (the #43/#173 divergence
+                // class).  Exit code is unaffected; error-severity residual diagnostics
+                // still print through `render_result_human`.
+                if !quiet {
+                    eprintln!("fix rejected: {}", safe_inline(&reason));
+                }
                 (source, original)
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
@@ -899,7 +942,11 @@ fn run_lint_file(
     // every FixFileOutcome carries `filename` as its display path.
     set_diag_display_path(&mut result, filename);
 
-    if result.truncated && fix {
+    // D4 (AD-216-11): status message, not an error — suppress under --quiet
+    // (the global `--quiet` help text: "Suppress status and diagnostic output; errors
+    // always print").  PF-004: single-file mode is a separate emitter from directory
+    // mode; gating only the directory copy would re-create the #43/#173 divergence.
+    if result.truncated && fix && !quiet {
         eprintln!(
             "diagnostic cap ({}) reached; further findings were suppressed — \
              re-run --fix to continue",
@@ -943,7 +990,13 @@ fn run_lint_file(
                 exit_by_severity(&residual);
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("fix rejected: {}", safe_inline(&reason));
+                // D4 (AD-216-11): status message — suppress under --quiet,
+                // matching this function's own `PreviewOutcome::Rejected` arm and the
+                // directory-mode emitters.  PF-004: single-file mode is a separate
+                // emitter and must honour the same gate.
+                if !quiet {
+                    eprintln!("fix rejected: {}", safe_inline(&reason));
+                }
                 emit_result(format, &original, quiet, named_source);
                 exit_by_severity(&original);
             }
@@ -1156,6 +1209,37 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
 ///
 /// Accumulate-and-continue past per-file failures. Exit = max severity across files.
 /// Output is path-sorted (F1 — `collect_mds_files` does NOT sort).
+///
+/// **Directory summary (AD-216-3):** after processing all files, emits one summary
+/// line to stderr in the form
+/// `{clean} clean, {warn} with warnings, {error} with errors, {limit} resource-limited`.
+/// "With errors" covers both error-severity lint findings AND per-file analysis failures
+/// (read error, config error, lint call failure) — the same conflation `mds build`'s
+/// "failed" bucket makes (D3-a).  "Resource-limited" counts files where `mds::lint`
+/// returned `MdsError::ResourceLimit` — distinct from lint findings.
+///
+/// **Summary / quiet contract (AD-216-6):** the summary is suppressed under `--quiet`
+/// unless at least one file is in the `error` or `resource-limited` bucket.  Warn-only
+/// runs are silent under `--quiet` (mirrors `mds fmt`, which does not force its summary
+/// on a `changed_count`-only run).  Exit codes are unaffected (AD-216-2).
+///
+/// **D1 decision (AC-Q14):** `mds lint --quiet <dir>` on a warn-only tree exits 1 with
+/// no output.  `mds lint --fix --check --quiet <dir>` with pending fixes exits 1 with
+/// no output.  Both are intentional: warnings are status output, which `main.rs:30`
+/// says `--quiet` suppresses.
+///
+/// **D2 decision (AC-Q16):** the JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`)
+/// is unchanged — no `"summary"` key is added.  The summary is emitted to stderr only,
+/// keeping stdout a single clean JSON document in all non-`--diff` modes.  (`--fix --diff`
+/// is a legal invocation that writes the unified diff to stdout ahead of the envelope,
+/// so `--fix --diff --format json` produces non-JSON-parseable stdout by design.)
+///
+/// **Channel discipline (AD-216-8):** the summary is emitted in BOTH human and JSON
+/// format modes — format governs where machine-readable output goes (stdout), not
+/// whether status output (stderr) appears.  JSON consumers using `--format json`
+/// (without `--fix --diff`) continue to receive valid parseable JSON on stdout
+/// regardless of stderr content; `--fix --diff` writes unified diffs to stdout
+/// before the JSON envelope and is incompatible with JSON-consumer pipelines.
 fn run_lint_directory(
     dir: &Path,
     flags: LintFlags,
@@ -1172,6 +1256,11 @@ fn run_lint_directory(
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
 
+    // AD-216-9: empty-dir early return emits no summary — the per-file loop never
+    // runs, so all four counters stay at zero and there is nothing meaningful to
+    // print.  The all-excluded diagnostic (below) bypasses --quiet and exits 2:
+    // parity with `build`/`check`/`fmt` (a silent non-zero exit here would be a
+    // bug, not a feature).
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
@@ -1230,6 +1319,15 @@ fn run_lint_directory(
 
     let mut any_would_fix = false;
 
+    // AD-216-3/5: four counters for the directory summary, one per FileTally variant.
+    // Names are file-unique (print_discipline.rs limit 2, :106-110): `clean_count`,
+    // `warn_file_count`, `error_file_count`, `limit_file_count` — none reuse an already-
+    // exempted name from another summary line in this file.
+    let mut clean_count: usize = 0;
+    let mut warn_file_count: usize = 0;
+    let mut error_file_count: usize = 0;
+    let mut limit_file_count: usize = 0;
+
     let ctx = LintDirCtx {
         lint_root: dir,
         flags,
@@ -1250,10 +1348,28 @@ fn run_lint_directory(
         } else {
             lint_one_file_human(file, &ctx, &mut any_truncated, &mut any_would_fix)
         };
+        // AD-216-5: exhaustive match — a future FileTally variant becomes a compile
+        // error here rather than being silently uncounted in the summary.
+        match tally {
+            FileTally::Clean => clean_count += 1,
+            FileTally::WarnOnly => warn_file_count += 1,
+            FileTally::Error => error_file_count += 1,
+            FileTally::ResourceLimit => limit_file_count += 1,
+        }
         if tally > max_tally {
             max_tally = tally;
         }
     }
+    // AD-216-5: assert the four-counter partition invariant in production code
+    // (per project reliability rule: "Assert preconditions and invariants in
+    // production code — not just tests").  Zero release-build cost: debug_assert!
+    // compiles away in release mode.  Catches a future early continue inserted
+    // into the per-file loop body that would silently undercount the summary.
+    debug_assert_eq!(
+        clean_count + warn_file_count + error_file_count + limit_file_count,
+        files.len(),
+        "AD-216-5: FileTally partition invariant violated"
+    );
 
     // Emit JSON envelope BEFORE any early exit so consumers always receive parseable
     // output regardless of exit code (AC-F-14 / issue #36).
@@ -1267,6 +1383,29 @@ fn run_lint_directory(
             "{}\n",
             serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
         ));
+    }
+
+    // AD-216-7: emit the summary AFTER the JSON envelope (so consumers always get a
+    // parseable JSON object on stdout) and BEFORE the --fix --check exit (so a
+    // --fix --check run that would exit 1 still prints the summary on the way out).
+    //
+    // AD-216-6: suppress under --quiet unless error- or resource-limited files are
+    // present.  Warn-only runs are silent under --quiet (D1-a — mirrors fmt.rs:342:
+    // `changed_count` does not force the summary under --quiet).
+    //
+    // AD-216-8: emitted in both human and JSON format modes.  --format governs the
+    // machine-readable channel (stdout); the summary is status output (stderr) and is
+    // governed only by --quiet.
+    //
+    // AD-216-4: format — `{clean} clean, {warn} with warnings, {error} with errors,
+    // {limit} resource-limited`.  Fixed arity, comma-separated; matches the sibling
+    // shape used by `build`/`check`/`fmt` and keeps the line greppable across all
+    // summary-emitting subcommands.
+    if !quiet || error_file_count > 0 || limit_file_count > 0 {
+        eprintln!(
+            "{clean_count} clean, {warn_file_count} with warnings, \
+             {error_file_count} with errors, {limit_file_count} resource-limited"
+        );
     }
 
     // --fix --check: exit 1 if any file would have been modified (accumulate-and-continue,
@@ -1352,7 +1491,9 @@ fn lint_one_file_accumulating(
 
     if result.truncated {
         *any_truncated = true;
-        if fix {
+        // D4 (AD-216-11): this is a status message, not an error — suppress
+        // under --quiet (main.rs:30 "Suppress status and diagnostic output").
+        if fix && !quiet {
             eprintln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
@@ -1395,6 +1536,10 @@ fn lint_one_file_accumulating(
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
+                // PF-004: parity with lint_one_file_human — same quiet gate, same text.
+                if !quiet {
+                    eprintln!("Fixed: {}", safe_path(file));
+                }
                 tally_from_result(&residual)
             }
             FixFileOutcome::PartiallyFixed {
@@ -1403,7 +1548,7 @@ fn lint_one_file_accumulating(
                 applied_count,
                 total_count,
             } => {
-                // Unified message + quiet guard (issue #43 / #173).
+                // Unified message + quiet guard (#173).
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
@@ -1418,11 +1563,17 @@ fn lint_one_file_accumulating(
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!(
-                    "{}: fix rejected: {}",
-                    safe_path(file),
-                    safe_inline(&reason)
-                );
+                // D4 (AD-216-11): "fix rejected" is a status message — the safety
+                // gate fired, the original diagnostics remain unmodified.  Suppress under
+                // --quiet (main.rs:30).  The residual lint findings (and the exit code)
+                // are unaffected: this message describes the --fix attempt, not the findings.
+                if !quiet {
+                    eprintln!(
+                        "{}: fix rejected: {}",
+                        safe_path(file),
+                        safe_inline(&reason)
+                    );
+                }
                 accumulate_result_json(&original, json_files);
                 tally_from_result(&original)
             }
@@ -1457,9 +1608,16 @@ fn lint_one_file_accumulating(
                     let diff_str = render_unified_diff(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
+                // PF-004: parity with lint_one_file_human — same quiet gate, same text.
+                if check && !quiet {
+                    eprintln!("Would fix: {}", safe_path(file));
+                }
             }
             PreviewOutcome::Rejected(ref reason) => {
-                eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
+                // D4 (AD-216-11): status message — suppress under --quiet.
+                if !quiet {
+                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
+                }
             }
             PreviewOutcome::NothingToFix => {}
         }
@@ -1533,7 +1691,9 @@ fn lint_one_file_human(
 
     if result.truncated {
         *any_truncated = true;
-        if fix {
+        // D4 (AD-216-11): this is a status message, not an error — suppress
+        // under --quiet (main.rs:30 "Suppress status and diagnostic output").
+        if fix && !quiet {
             eprintln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
@@ -1573,7 +1733,7 @@ fn lint_one_file_human(
                 applied_count,
                 total_count,
             } => {
-                // Unified message format (issue #43 / #173).
+                // Unified message + quiet guard (#173).
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
@@ -1588,11 +1748,16 @@ fn lint_one_file_human(
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!(
-                    "{}: fix rejected: {}",
-                    safe_path(file),
-                    safe_inline(&reason)
-                );
+                // D4 (AD-216-11): "fix rejected" is a status message — the safety
+                // gate fired, the original diagnostics remain unmodified.  Suppress under
+                // --quiet (main.rs:30).
+                if !quiet {
+                    eprintln!(
+                        "{}: fix rejected: {}",
+                        safe_path(file),
+                        safe_inline(&reason)
+                    );
+                }
                 render_result_human(&original, quiet, named_source);
                 tally_from_result(&original)
             }
