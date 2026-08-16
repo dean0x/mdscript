@@ -1667,10 +1667,11 @@ fn fix_api_incremental_exists() {
 /// giving a stronger pin than a compile-fail fixture alone; and
 /// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` when the
 /// `#[deprecated]` attribute is removed from `apply_fixes`. The mutation control
-/// requires two commands (applies ADR-009): `cargo clippy --workspace --all-targets
-/// -- -D warnings` reports 10 expectations (all in fix.rs) and aborts before the
-/// api_surface integration-test target is compiled; `cargo clippy -p mds-core
-/// --test api_surface -- -D warnings` reports this pin individually.
+/// (applies ADR-009): removing the attribute leaves the lib rlib compiling clean, so
+/// both the lib-test (fix.rs `#[cfg(test)]`) and integration-test (api_surface) targets
+/// become ready simultaneously; `cargo clippy --workspace --all-targets -- -D warnings`
+/// schedules them concurrently and reports exactly 11 unfulfilled_lint_expectations:
+/// 10 in fix.rs and 1 in this file.
 ///
 /// All values constructed via named constructors, never struct literals (applies ADR-010).
 #[expect(
