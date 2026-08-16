@@ -586,7 +586,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 ## v0.5.0 Removal Tracker: apply_fixes
 
 `mds::fix::apply_fixes` is deprecated as of v0.4.0 and scheduled for removal at v0.5.0.
-The removal is tracked in GitHub issue #304. Before the v0.5.0 tag, the following six
+The removal is tracked in GitHub issue #304. Before the v0.5.0 tag, at least the following
 ADR-004 reverify-gate behaviors must gain equivalent coverage on the
 `apply_fixes_incremental` path or be explicitly retired in #304.
 
