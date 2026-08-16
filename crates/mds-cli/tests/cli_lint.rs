@@ -51,6 +51,10 @@
 //!   single-file, and stdin mode — four separate emitters, each with its own positive control
 //! - D4 (#216, PF-004): diagnostic-cap notice honours --quiet in all three input modes
 //!   (directory, single-file, stdin) with paired positive controls (ADR-009/PF-013)
+//! - D3-a (#216): config-load failure is counted in the "with errors" bucket (not "clean")
+//! - D3-a (#216): config-load failure forces the summary under --quiet (positive control)
+//! - D3-a (#216, unix): chmod-000 source-read failure counted in the "with errors" bucket
+//! - D3-a (#216, unix): chmod-000 source-read failure forces summary under --quiet
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -5646,5 +5650,210 @@ fn lint_directory_quiet_works_in_pre_subcommand_position() {
         String::from_utf8_lossy(&control.stderr).trim(),
         "2 clean, 0 with warnings, 0 with errors, 0 resource-limited",
         "positive control: the same tree without --quiet must print the summary"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// D3-a: per-file analysis failures are counted in the "with errors" bucket
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// spec.md §7.5 "With errors" bullet (lines 963-965): "error-severity lint findings
+// OR a per-file analysis failure (source read, config load, or lint call failure)".
+// Every prior #216 test populates the error bucket via lint findings (lint_error.mds).
+// The tests below exercise the analysis-failure half, which has separate code paths
+// in lint.rs (config-discovery error arms, source-read IO error arms) and must be
+// covered independently (D3-a bucket-membership claim).
+
+// ── D3-a: config-load failure counted in "with errors" (not "clean") ──────────
+
+/// Config-load failure must land in the "with errors" bucket of the directory summary,
+/// not the "clean" bucket.  A malformed `mds.json` in a subdirectory triggers a
+/// config-load error for files in that subtree; the test verifies bucket membership
+/// and that the four counters partition the full file set (AC-Q08).
+#[test]
+fn lint_directory_config_failure_counted_in_error_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // One clean file at root — no mds.json present, defaults apply.
+    fs::copy(fixture("lint_clean.mds"), root.join("clean.mds")).unwrap();
+
+    // Subdirectory with an unparseable mds.json; the file inside it triggers a
+    // config-load failure (not a lint finding — different code path in lint.rs).
+    let bad = root.join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
+    fs::copy(fixture("lint_clean.mds"), bad.join("bad.mds")).unwrap();
+
+    let out = lint_path(root, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "config-load failure must cause exit 2; stderr: {stderr}"
+    );
+    // D3-a: the file whose config load failed must be counted in "with errors".
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 1 with errors, 0 resource-limited"),
+        "D3-a: config-load failure must be counted as 'with errors' in the summary; \
+         got: {stderr:?}"
+    );
+    // AC-Q08: the four counters must partition the 2-file tree with no drops.
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts,
+        [1, 0, 1, 0],
+        "D3-a/AC-Q08: 1 clean + 0 warn + 1 error + 0 limit must sum to 2 files; \
+         got counts: {counts:?}"
+    );
+}
+
+// ── D3-a: config-load failure forces summary under --quiet ────────────────────
+//
+// The quiet gate is: !quiet || error_file_count > 0 || limit_file_count > 0.
+// A config-load failure increments error_file_count, so the summary must be
+// forced even under --quiet.
+//
+// PF-013 / ADR-009: the positive control (non-quiet run) confirms that "with errors"
+// appears on the same tree, making the with-quiet assertion non-vacuous.
+
+#[test]
+fn lint_directory_config_failure_forces_summary_under_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::copy(fixture("lint_clean.mds"), root.join("clean.mds")).unwrap();
+    let bad = root.join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
+    fs::copy(fixture("lint_clean.mds"), bad.join("bad.mds")).unwrap();
+
+    let quiet = lint_path(root, &["--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(2),
+        "config-load failure under --quiet must still exit 2; stderr: {quiet_stderr:?}"
+    );
+    // D3-a: error_file_count > 0 forces the summary even under --quiet.
+    assert!(
+        quiet_stderr.contains("with errors"),
+        "D3-a: config-load failure must force the summary under --quiet \
+         (error_file_count > 0 gate); got: {quiet_stderr:?}"
+    );
+
+    // PF-013 / ADR-009 — paired positive control on the same tree.
+    let control = lint_path(root, &[]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        control_stderr.contains("with errors"),
+        "positive control: non-quiet run with config-load failure must also emit the \
+         summary with 'with errors', proving the --quiet assertion is non-vacuous; \
+         got: {control_stderr:?}"
+    );
+}
+
+// ── D3-a: chmod-000 source-read failure counted in "with errors" (unix only) ──
+//
+// A chmod-000 file causes a source-read IO error in the lint engine, which must be
+// counted as FileTally::Error (not FileTally::Clean).  This is the source-read
+// population of the "with errors" disjunction (spec.md §7.5 lines 963-965).
+//
+// Not run on Windows where permission enforcement uses ACLs, not Unix mode bits.
+// Running as root bypasses Unix permission checks; the test is vacuous as root,
+// but CI does not run as root.
+
+#[cfg(unix)]
+#[test]
+fn lint_directory_unreadable_file_counted_in_error_bucket() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // One clean, readable file.
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+
+    // One file made unreadable via chmod 000.
+    let unreadable = dir.path().join("unreadable.mds");
+    fs::copy(fixture("lint_clean.mds"), &unreadable).unwrap();
+    fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+
+    // Restore permissions before any assertion so a test-failure panic cannot
+    // leave a 000-mode file that confuses temporary-directory cleanup.
+    let _ = fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "chmod-000 file must cause exit 2; stderr: {stderr}"
+    );
+    // D3-a: the source-read failure must land in "with errors", not "clean".
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 1 with errors, 0 resource-limited"),
+        "D3-a: source-read failure must be counted as 'with errors' in the summary; \
+         got: {stderr:?}"
+    );
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts,
+        [1, 0, 1, 0],
+        "D3-a/AC-Q08: 1 clean + 0 warn + 1 error + 0 limit must sum to 2 files; \
+         got counts: {counts:?}"
+    );
+}
+
+// ── D3-a: chmod-000 source-read failure forces summary under --quiet (unix only)
+//
+// PF-013 / ADR-009: both the --quiet run and the positive control are captured
+// while the file is still unreadable, then permissions are restored before
+// asserting, so a panic during assertion cannot leave a bad-permission file.
+
+#[cfg(unix)]
+#[test]
+fn lint_directory_unreadable_file_forces_summary_under_quiet() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+
+    let unreadable = dir.path().join("unreadable.mds");
+    fs::copy(fixture("lint_clean.mds"), &unreadable).unwrap();
+    fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Capture both runs while the file is still unreadable (positive control must
+    // see the same tree state as the --quiet run).
+    let quiet = lint_path(dir.path(), &["--quiet"]);
+    let control = lint_path(dir.path(), &[]);
+
+    // Restore permissions before any assertion.
+    let _ = fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644));
+
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(2),
+        "chmod-000 file under --quiet must still exit 2; stderr: {quiet_stderr:?}"
+    );
+    // D3-a: error_file_count > 0 forces the summary even under --quiet.
+    assert!(
+        quiet_stderr.contains("with errors"),
+        "D3-a: source-read failure must force the summary under --quiet; \
+         got: {quiet_stderr:?}"
+    );
+
+    // PF-013 / ADR-009 — paired positive control on the same (unreadable) tree.
+    assert!(
+        control_stderr.contains("with errors"),
+        "positive control: non-quiet run with unreadable file must also show 'with errors', \
+         proving the --quiet assertion is non-vacuous; got: {control_stderr:?}"
     );
 }

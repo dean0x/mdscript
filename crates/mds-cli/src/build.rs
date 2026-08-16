@@ -1430,9 +1430,10 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// function do not accept a `quiet` parameter — `output.rs::collect_mds_files_inner`
 /// (depth-limit warning, fires on trees deeper than MAX_DEPTH=64) and
 /// `output.rs::probe_and_remove_stale` (stale-unlink failure warning).  Both emit
-/// to stderr regardless of `--quiet`.  All documentation about this function's
-/// `--quiet` behaviour says "no output on a successful build" rather than "no output
-/// under any condition" (PF-015).
+/// to stderr regardless of `--quiet`.  The normative documentation (spec.md §7.2
+/// and README) uses the form "no output on a successful build" rather than "no output
+/// under any condition" (PF-015); the global `--quiet` flag description at `main.rs:30`
+/// uses a briefer phrasing that does not enumerate this limitation explicitly.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
