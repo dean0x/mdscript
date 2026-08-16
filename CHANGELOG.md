@@ -539,9 +539,12 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   `fix rejected: <reason>` notice (emitted when the three-tier safety gate refuses a fix and
   leaves the file unchanged) and the `diagnostic cap (N) reached` notice are now suppressed
   under `--quiet` in **all three input modes** — directory, single file, and stdin. Previously
-  each was gated in some modes and not others, so `mds lint --fix --quiet` wrote to stderr for
-  a single file or stdin but stayed silent for a directory. Scripts that grep stderr for
-  `fix rejected` must drop `--quiet`. Exit codes are unaffected, and error-severity
+  the apply-path `fix rejected:` notice was ungated in all three modes, so `mds lint --fix
+  --quiet` printed it to stderr under directory, single-file, and stdin input alike. The
+  preview-path copy (under `--fix --check` or without `--fix`) was already `--quiet`-gated in
+  most modes but remained ungated in `--format json` directory mode. The `diagnostic cap (N)
+  reached` notice was ungated in single-file and both directory modes. Scripts that grep stderr
+  for `fix rejected` must drop `--quiet`. Exit codes are unaffected, and error-severity
   diagnostics still print under `--quiet` as always.
 
 ### Added
@@ -551,8 +554,10 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   `N clean, N with warnings, N with errors, N resource-limited`
   Under `--quiet`, the summary is suppressed when the worst outcome is warnings only (mirrors
   `mds fmt`); it is always emitted when any file is in the error or resource-limited bucket.
-  The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged — no
-  `"summary"` key is added, so existing consumers of `--format json` are unaffected.
+  Scripts or tests that relied on `mds lint <dir>` producing no stderr on a clean tree should
+  note that this summary line is now always printed on a clean run (to suppress it, pass
+  `--quiet`). The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
+  — no `"summary"` key is added, so existing consumers of `--format json` are unaffected.
 
 - **Lint rule-name registry, exposed on every surface (#224).** The recognised rule
   names now have one source of truth, derived from each rule module's own name constant.
