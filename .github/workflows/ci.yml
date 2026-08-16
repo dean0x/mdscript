@@ -38,6 +38,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # Intra-doc link gate (AC-209-11 / OD-209-G): broken intra-doc links in
+      # mds-core degrade silently to literal text without this check.
+      # --no-deps excludes dependency crates; -p mds-core scopes the check to mds-core.
+      - name: Rustdoc (warnings are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps
 
   msrv:
     name: MSRV (Rust 1.88)

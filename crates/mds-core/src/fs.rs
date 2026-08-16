@@ -71,7 +71,7 @@ pub trait FileSystem: Send + Sync {
     /// - the resolved path escapes the established project root ([`NativeFs`] only)
     ///
     /// Returns [`MdsError::ResourceLimit`] when the resolved path exceeds
-    /// [`MAX_PATH_SEGMENTS`] segments.
+    /// `MAX_PATH_SEGMENTS` segments.
     fn normalize_in_dir(&self, dir: &str, relative: &str) -> Result<String, MdsError>;
 
     /// Return the directory portion of a normalized file key.

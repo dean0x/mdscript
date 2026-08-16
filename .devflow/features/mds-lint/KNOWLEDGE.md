@@ -464,7 +464,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 - **Resting a security invariant on `debug_assert!`** (PF-005): `debug_assert!` is compiled out of release. The old `SanitizedReport` returned `None` for `source()`/`related()` behind a `debug_assert!` that no CLI error populates the aux graph — real in tests, absent in the shipped binary. Enforce invariants with data transformation, not assertions.
 
-- **Calling `apply_plan_unchecked()` on a production write path**: Production code that writes back to disk MUST use `apply_fixes()` or `apply_fixes_incremental()`. The `_unchecked` suffix makes the bypass explicit at every call site.
+- **Calling `apply_plan_unchecked()` on a production write path**: Production code that writes back to disk MUST use `apply_fixes_incremental()`. The `_unchecked` suffix makes the bypass explicit at every call site.
 
 - **Adding a ModuleCache "optimization"**: Per-file fresh resolve is intentional. A shared cache would be unsafe because runtime vars are per-call.
 
@@ -574,7 +574,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - **PF-007** (cross-surface goldens can't catch divergence): `fix_edits` is emitted unconditionally (null when None) across all surfaces; differential tests cover cross-surface parity.
 - **PF-013** (vacuous negative security tests): Every ESC-injection test now pairs a NEGATIVE assertion (raw byte absent) with a POSITIVE one (escaped form present) and a non-vacuity guard (diagnostics non-empty, expected rule matched). T-9 was rewritten from a vacuous YAML-rejection vector to a reachable duplicate-import + U+0085 NEL vector.
 - **PF-014** (sanitize inputs, not rendered artifacts): The `SanitizedReport` design — pre-sanitize message/help/labels before miette renders — is the PF-014-correct boundary. Post-processing the rendered frame corrupts miette's own ANSI SGR codes; CI uses `NO_COLOR=1` and pipes stderr so the failure would stay green. T-ESC-6 pins this on the colour path.
-- **ADR-001** (span-guided rewrite + compile-equivalence gate): All `--fix` edits are span-guided byte rewrites. `TextEdit` ranges are validated fail-closed. `apply_plan_unchecked` is explicitly named to make ADR-001 bypass visible.
+- **ADR-001** (span-guided rewrite + compile-equivalence gate): All `--fix` edits are span-guided byte rewrites. `TextEdit` ranges are validated fail-closed. `apply_plan_unchecked` is explicitly named to make ADR-004 reverify-gate bypass visible.
 - **ADR-004** (three-tier --fix safety model, reverify gate): `apply_fixes_incremental`'s batch-first strategy with bounded per-edit fallback is the AC-F-20 implementation.
 - **ADR-002** (v0.4.0 whitespace contract, interior-verbatim): The `empty-block` rule's "whitespace-only-Text body" definition is directly downstream of this contract.
 - **ADR-003** (@extends FM emission): The `unused-variable` rule is suppressed on `@extends` children.
@@ -582,3 +582,22 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/tests/api_surface.rs` — pins the public lint API signatures.
 - `.devflow/features/mds-fmt/KNOWLEDGE.md` — `mds fmt` knowledge base; `atomic_write_file` is shared between both subcommands via `output.rs`.
 - `.devflow/features/source-map-security/KNOWLEDGE.md` — source map path-containment choke-point.
+
+## v0.5.0 Removal Tracker: apply_fixes
+
+`mds::fix::apply_fixes` is deprecated as of v0.4.0. The six ADR-004 reverify-gate
+tests that must be ported or retired before removal are enumerated below by name —
+**test names are the durable key; line numbers drift as `fix.rs` evolves**. GitHub
+issue #304 carries behavioral context (which ADR-004 behavior each test pins); its
+line numbers predate the `#[expect(...)]` insertions made by PR #303 (issue #209) and
+have since drifted.
+
+Six tests to port or retire (use `grep -n 'fn <name>' crates/mds-core/src/lint/fix.rs`
+to locate current lines — test names are the durable key):
+
+- `a4_partial_overlap_still_rejected_after_dedup`
+- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix`
+- `reverify_preexisting_untargeted_survives_and_fix_applies`
+- `reverify_new_untargeted_diagnostic_is_rejected`
+- `tier_b_unused_function_standalone_apply_succeeds`
+- `l_fix_rev1_output_delta_causes_rejection`

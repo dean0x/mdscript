@@ -60,7 +60,7 @@
 //!
 //! ## Containment deduplication (AC-F-26)
 //!
-//! Before overlap detection, [`dedup_contained_or_identical`] removes any edit
+//! Before overlap detection, `dedup_contained_or_identical` removes any edit
 //! whose byte range is fully contained within an earlier retained edit. This handles
 //! the common case where two rules fire on the same block (e.g. `unreachable-branch`
 //! and `empty-block` both targeting the same `@if`): the wider edit subsumes the
@@ -235,9 +235,9 @@ fn reverify_failure_reason(err: &MdsError) -> String {
 /// A plan of fix edits for a single file's source.
 ///
 /// Obtain via [`plan_fixes`] or [`plan_fixes_with_options`], then pass to
-/// [`apply_fixes`] or [`apply_fixes_incremental`]. External crates that need an
-/// empty plan can use `FixPlan::default()`; its fields are `pub`, so they remain
-/// directly readable and writable.
+/// [`apply_fixes_incremental`]. External crates that need an empty plan can
+/// use `FixPlan::default()`; its fields are `pub`, so they remain directly
+/// readable and writable.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases;
 /// do not use a struct literal in external crates.
@@ -582,22 +582,22 @@ fn regressed_rules(
 /// single pass, so earlier edits' offsets remain valid after later edits are
 /// applied.
 ///
-/// # `_unchecked` suffix — ADR-001
+/// # `_unchecked` suffix — ADR-004
 ///
-/// This function bypasses the ADR-001 reverify gate (compile-equivalence
-/// check) — it applies edits without recompiling or verifying that the fixed
-/// source produces identical compiled output. Production code that writes back
-/// to disk **must** use [`apply_fixes`] instead, which gates on the reverify
-/// callback before returning `FixOutcome::Fixed`. `apply_plan_unchecked` is
-/// provided for the `--fix --diff` / `--fix --check` diff-preview path (which
-/// computes the delta without writing it) and for unit tests. Calling it on a
-/// write path without a subsequent reverify is an anti-pattern — the reverify
-/// gate is the only guard against a fix that accidentally changes compiled
-/// semantics.
+/// This function bypasses the ADR-004 reverify gate — it applies edits without
+/// recompiling or verifying that the fixed source produces identical compiled
+/// output. Production code that writes back to disk **must** use
+/// [`apply_fixes_incremental`] instead, which gates on the reverify callback
+/// before returning `FixOutcome::Fixed` or `FixOutcome::PartiallyFixed`.
+/// `apply_plan_unchecked` is provided for the `--fix --diff` / `--fix --check`
+/// diff-preview path (which computes the delta without writing it) and for unit
+/// tests. Calling it on a write path without a subsequent reverify is an
+/// anti-pattern — the reverify gate is the only guard against a fix that
+/// accidentally changes compiled semantics.
 ///
 /// The caller must pass `plan` with `overlap_rejected == false`; if true,
-/// calling this function is a logic error (use [`apply_fixes`] which checks
-/// this).
+/// calling this function is a logic error (use [`apply_fixes_incremental`] which
+/// checks this).
 ///
 /// # Panics
 ///
@@ -662,6 +662,47 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 
 /// Apply a `FixPlan` with a reverify callback.
 ///
+/// # Deprecated (AD-209-1)
+///
+/// Use [`apply_fixes_incremental`] instead. (applies ADR-004)
+///
+/// `apply_fixes` implements the ADR-004 three-tier reverify gate as a single
+/// all-or-nothing call: `reverify` runs once and either the whole batch is
+/// accepted or the whole batch is refused. `apply_fixes_incremental` provides
+/// the same safety contract with a batch-first attempt plus a bounded per-edit
+/// fallback (capped at `FALLBACK_MAX_EDITS = 50`), which salvages the safe
+/// subset rather than refusing wholesale. That is why the deprecation is
+/// correct rather than arbitrary (applies ADR-004).
+///
+/// ## Migration deltas (not a drop-in replacement)
+///
+/// 1. **Closure bound change**: `apply_fixes` takes `F: FnOnce`;
+///    `apply_fixes_incremental` requires `F: Fn` because `reverify` may be
+///    called more than once. A move-once closure cannot migrate mechanically.
+///
+/// 2. **New reachable outcome**: `apply_fixes_incremental` can return
+///    `FixOutcome::PartiallyFixed` (some edits accepted, some refused).
+///    `apply_fixes` never returns `PartiallyFixed`. `FixOutcome` is
+///    `#[non_exhaustive]`, so existing wildcard arms still compile, but a
+///    wildcard that swallows `PartiallyFixed` silently discards partial
+///    results.
+///
+/// 3. **Reverify call count**: `apply_fixes` calls `reverify` exactly once;
+///    `apply_fixes_incremental` calls it up to `plan.edits.len() + 1` times.
+///
+/// ## Why the body was not deleted
+///
+/// `crates/mds-core/src/lint/fix.rs` does not exist at tag `v0.3.0` (the
+/// newest published tag at this commit), so `apply_fixes` has never been
+/// published to crates.io. However, deleting it would silently drop coverage
+/// of six ADR-004 reverify-gate behaviors that are pinned only through this
+/// function, with no equivalent on the `apply_fixes_incremental` path. These
+/// tests must be ported or retired before removal at v0.5.0. The enumerated
+/// list (test names, line numbers, and the behavior each pins) lives in GitHub
+/// issue #304 (v0.5.0 removal tracker for `apply_fixes`).
+///
+/// # Behavior
+///
 /// The `reverify` callback is called with the fixed source and must return:
 /// - `Ok(LintResult)`: the lint result of the fixed source (may be empty).
 /// - `Err(MdsError)`: the fixed source failed the check gate.
@@ -687,6 +728,11 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 ///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
+#[deprecated(
+    since = "0.4.0",
+    note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must \
+            be `Fn`, not `FnOnce`. To be removed in v0.5.0; see the item docs."
+)]
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
 where
@@ -1388,6 +1434,10 @@ mod tests {
     /// `dedup_contained_or_identical`: B.end=18 > max_end(12) → B is not contained,
     /// both edits are retained.
     /// `has_overlapping_edits`: A.end=12 > B.start=6 → partial overlap → rejected.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn a4_partial_overlap_still_rejected_after_dedup() {
         let source = "line0\nline1\nline2\n";
@@ -1650,6 +1700,10 @@ mod tests {
 
     // ── L-FIX-REV1: Reverify gate ────────────────────────────────────────────
 
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn l_fix_rev1_reverify_failure_rejects_fix() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1677,6 +1731,10 @@ mod tests {
     ///
     /// The embedded `{err}` is asserted non-empty, confirming that a real error
     /// was propagated rather than a blank placeholder.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1735,6 +1793,10 @@ mod tests {
 
     /// T-REASON-1 [security-11 / CWE-117 / PF-013 / #176]: the reverify failure reason
     /// produced by `apply_fixes` escapes the embedded `MdsError` Display.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn apply_fixes_rejection_reason_escapes_embedded_error_display() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1829,6 +1891,10 @@ mod tests {
     /// The source has the second `@import` starting at byte 23
     /// (`"@import \"./a.mds\" as a\n"` = 23 bytes), which is a valid char
     /// boundary, so `diag_to_edit` succeeds and the plan is non-empty.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn reverify_success_returns_fixed() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1865,6 +1931,10 @@ mod tests {
     /// `unused-variable` that coexists with a fixable `duplicate-import`) survives the
     /// reverify but must NOT cause the fix to be refused — residual findings are
     /// expected to remain and determine the exit code.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn reverify_preexisting_untargeted_survives_and_fix_applies() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1886,6 +1956,10 @@ mod tests {
 
     /// A genuinely NEW untargeted diagnostic introduced by the edit IS a regression
     /// and must refuse the fix.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn reverify_new_untargeted_diagnostic_is_rejected() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1953,6 +2027,10 @@ mod tests {
     /// so `unused-import` cannot fire on a standalone file. `unused-function` fires
     /// when `has_explicit_exports && !exported && !called` — achieved here with an
     /// explicit `@export greet` plus an unexported, uncalled `@define dead():`.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn tier_b_unused_function_standalone_apply_succeeds() {
         // Standalone source: no @import, no @extends, has explicit @export.
@@ -2020,6 +2098,10 @@ mod tests {
     ///
     /// This verifies the mechanism the CLI relies on: when the reverify closure
     /// returns `Err` due to an output delta, the entire fix batch is refused.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn l_fix_rev1_output_delta_causes_rejection() {
         let source = "Hello World!\n";
@@ -2367,6 +2449,10 @@ mod tests {
 
     /// PF-005 regression: `apply_fixes` with unsorted edits must return
     /// `FixOutcome::Rejected`, NOT silently corrupt the source.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn pf005_unsorted_edits_rejected_in_apply_fixes() {
         let source = "LineA\nLineB\n";

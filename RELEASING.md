@@ -56,6 +56,13 @@ npm run build -w @mdscript/mds-wasm
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
 node scripts/verify-versions.mjs
+# Verify #[deprecated(since = ...)] attributes match the release version.
+# bump-version.mjs rewrites manifests and CHANGELOG only -- never .rs files.
+# Every hit's version must be <= X.Y.Z. A deprecation introduced in THIS release
+# must equal X.Y.Z; pre-existing ones keep their original version.
+# ADR-009: if the grep returns no hits, plant a temporary `since = "x.y.z"` in any
+# .rs file, confirm the grep finds it, then remove it before proceeding.
+grep -rn 'since = ' crates/ --include='*.rs'
 
 # Source hygiene and pre-merge check gates
 node scripts/verify-no-control-bytes.mjs

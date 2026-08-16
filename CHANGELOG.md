@@ -46,6 +46,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only re-exported from `index.ts`, which the package `exports` map does not resolve —
   so consumers could receive the value but not name its type. Purely additive.
 
+### Deprecated
+
+- **`mds::fix::apply_fixes` is deprecated in favor of `apply_fixes_incremental` (#209).**
+  The replacement applies the same ADR-004 three-tier reverify-gate safety contract with a
+  batch-first attempt plus a bounded per-edit fallback, salvaging the safe subset of fixes
+  when some edits fail the reverify gate rather than refusing the whole batch.
+
+  Two behavioral differences require manual migration:
+
+  - **Closure bound**: `apply_fixes` takes `F: FnOnce`; `apply_fixes_incremental` requires
+    `F: Fn` because the reverify closure may be called more than once. A move-once closure
+    cannot be migrated mechanically.
+  - **New reachable outcome**: `apply_fixes_incremental` can return
+    `FixOutcome::PartiallyFixed` when some edits are accepted and some are refused.
+    `apply_fixes` never returns `PartiallyFixed`. Because `FixOutcome` is
+    `#[non_exhaustive]`, existing wildcard arms compile unchanged, but a wildcard that
+    swallows `PartiallyFixed` silently discards partial results.
+
+  Scheduled for removal in v0.5.0; tracked in GitHub issue #304. The six ADR-004
+  regression tests pinned only against `apply_fixes` must be ported or retired before
+  the v0.5.0 tag (see #304 for the enumerated list with line numbers and the behavior
+  each test pins).
+
+- **`mds::LintConfig::from_rules` is deprecated in favor of `LintConfig::from_rules_checked` (#224).**
+  The replacement returns both the config and an unknowns report in a single `#[must_use]`
+  call, making it structurally impossible to silently skip unknown-rule detection.
+  `from_rules` still accepts any rule name without error; unknown names have no effect.
+
+  Migration: change `LintConfig::from_rules(map)` to `LintConfig::from_rules_checked(map)`
+  and handle the `Option<UnknownRuleNames>` second return value. No removal is scheduled
+  before v1.0.0; this function will remain available throughout the v0.x series (contrast
+  `apply_fixes` above, which is scheduled for removal at v0.5.0).
+
 ### **BREAKING** — File-method `basePath` rejection, TypeScript option types, and WASM `basePath` rejection (#180, #213)
 
 #### `compileFile` and `checkFile` now reject `basePath` (#180)
@@ -194,7 +227,7 @@ via struct literals. Use the named constructor or builder listed for each:
 - **`RejectedEdit`** — use `RejectedEdit::new(edit, reason)`.
 - **`FixPlan`** — use `FixPlan::default()` for an empty plan; its fields are `pub`, so they
   remain directly readable and writable from external crates.
-- **`LintConfig`** — use `LintConfig::from_rules(rules)` or `LintConfig::default()` for no overrides.
+- **`LintConfig`** — use `LintConfig::from_rules_checked(rules)` or `LintConfig::default()` for no overrides.
 - **`LintDiagnostic::sanitized_for_render()`** — a new method that returns a sanitized clone
   suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
   this method instead of assembling sanitized copies itself, keeping the escape logic co-located
