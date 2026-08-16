@@ -32,7 +32,10 @@ pub(crate) struct MdsConfig {
     /// Per-rule severity overrides for `mds lint` (AC-F-17).
     ///
     /// Unknown severity VALUES fail config loading loudly (closed enum).
-    /// Unknown rule NAMES are preserved for forward compat (CLI warns and ignores).
+    /// Unknown rule NAMES: only `mds lint` warns on stderr and continues — single-file
+    /// mode via `load_lint_config`, directory mode via `LintDirCtx::config_for`.
+    /// `mds build`, `check`, `fmt`, and `watch` load this field but do not emit the
+    /// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
     #[serde(default)]
     pub(crate) lint: LintCliConfig,
 }
@@ -44,7 +47,10 @@ pub(crate) struct MdsConfig {
 ///
 /// Unknown severity VALUES (e.g. `"banana"`) cause a hard parse error (exit 2)
 /// because `Severity` is a closed enum with no sensible fallback. Unknown rule
-/// NAMES are warn-and-ignored at the CLI layer (forward compat).
+/// NAMES: only `mds lint` warns on stderr and continues — single-file mode via
+/// `load_lint_config`, directory mode via `LintDirCtx::config_for`. `mds build`,
+/// `check`, `fmt`, and `watch` deserialize this struct but do not emit the
+/// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct LintCliConfig {
     #[serde(default)]
@@ -52,9 +58,21 @@ pub(crate) struct LintCliConfig {
 }
 
 impl LintCliConfig {
-    /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions.
-    pub(crate) fn into_core_config(self) -> mds::LintConfig {
-        mds::LintConfig::from_rules(self.rules)
+    /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions,
+    /// returning any unknown rule names alongside it.
+    ///
+    /// Uses [`mds::LintConfig::from_rules_checked`] so the caller receives both
+    /// the config and the unknowns report in one step, rather than building the
+    /// config and optionally invoking a separate check. This closes the gap
+    /// identified in the review finding for config.rs:104 — a consumer could
+    /// previously skip detection silently by not invoking the separate check.
+    /// Note: `#[must_use]` on `from_rules_checked` fires only when the entire
+    /// return value is dropped; `let (config, _) = …` silently discards the
+    /// `Option<mds::UnknownRuleNames>` and is the caller's own choice (as
+    /// config.rs:249 states: the `#[must_use]` only warns "if the return value
+    /// is discarded entirely").
+    pub(crate) fn into_core_config(self) -> (mds::LintConfig, Option<mds::UnknownRuleNames>) {
+        mds::LintConfig::from_rules_checked(self.rules)
     }
 }
 

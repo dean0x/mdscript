@@ -1287,3 +1287,233 @@ fn build_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         &out.stderr[..out.stderr.len().min(512)]
     );
 }
+
+// ── AC-224-14 / D2(a): build and fmt (dir) do not emit unknown-rule warnings ──
+//
+// Only `mds lint` reads `lint.rules` and emits an unknown-rule warning — single-file
+// mode via `load_lint_config`, directory mode via `LintDirCtx::config_for`.
+// `mds build` and `mds fmt <DIR>` read `mds.json` via `load_config` but deserialize
+// the `lint` field without calling `load_lint_config`, so they never warn — an
+// accepted D2(a) asymmetry (see build.rs:49-51 and CHANGELOG).  `mds check` and
+// `mds fmt <FILE>` do not call `load_config` at all and never reach any lint-config
+// path; their absence assertions are structural, not D2(a).
+//
+// The build and fmt (dir) tests mechanically hold the AC-224-14 watch-path invariant:
+// `watch.rs:822` calls `load_config(...).unwrap_or(None)`.  Because `build` and
+// `mds fmt <DIR>` share the same `load_config` implementation, a passing build or
+// dir-fmt proves `load_config` returns `Ok` for configs with unknown rule names —
+// so `unwrap_or(None)` cannot collapse `output_dir` to `None` on account of an
+// unknown lint rule name alone.  Non-vacuity is secured by the positive-control
+// arms in each test (ADR-009 / PF-013).
+
+/// AC-224-14 / D2(a): `mds build` must NOT emit an unknown-rule warning even
+/// when `mds.json` names a lint rule that does not exist.
+///
+/// Non-vacuity (ADR-009 / PF-013): a paired positive-control arm runs the same
+/// config with an unknown SEVERITY value — `mds build` exits non-zero on that
+/// config, proving `load_config` was reached and the JSON was parsed.  The main
+/// assertion (unknown rule name → exits 0, no warning) is therefore non-vacuous:
+/// `load_config` was called; only the warning was declined.  The complementary
+/// positive control showing the warning IS emitted lives in `cli_lint.rs`.
+#[test]
+fn build_unknown_lint_rule_in_mds_json_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("tpl.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"warn"}}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "D2(a): mds build must succeed even with an unknown lint rule in mds.json; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule"),
+        "D2(a): mds build must NOT emit an unknown-rule warning; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-rule-xyzzy"),
+        "D2(a): mds build must NOT name the unknown rule in stderr; stderr: {stderr}"
+    );
+
+    // Positive-control arm (ADR-009 / PF-013): an unknown SEVERITY value is a hard
+    // serde parse error in load_config (Severity is a closed enum; "banana" is not a
+    // recognised variant).  build must exit non-zero, proving load_config was called
+    // and the JSON was actually parsed in the no-warning arm above.  If build ever
+    // stops reading mds.json this arm will fail, surfacing the regression.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"banana"}}}"#,
+    )
+    .unwrap();
+    let out_bad = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !out_bad.status.success(),
+        "D2(a) positive-control: mds build must exit non-zero on an unknown severity \
+         value ('banana') in mds.json — this proves load_config was reached in the \
+         no-warning arm; stderr: {}",
+        String::from_utf8_lossy(&out_bad.stderr)
+    );
+}
+
+/// AC-224-14: `mds check` must NOT emit an unknown-rule warning even
+/// when `mds.json` names a lint rule that does not exist.
+///
+/// `mds check <FILE>` does not call `load_config` at all (see main.rs:288-290);
+/// it never reads `mds.json`.  The absence is structural, not a D2(a) choice.
+/// Non-vacuity (ADR-009 / PF-013): a positive-control arm confirms that even an
+/// unknown SEVERITY value in `mds.json` leaves `mds check`'s exit code unchanged,
+/// proving the file is not read rather than merely that a warning was declined.
+#[test]
+fn check_unknown_lint_rule_in_mds_json_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("tpl.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"warn"}}}"#,
+    )
+    .unwrap();
+
+    let out = mds_bin()
+        .arg("check")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "AC-224-14: mds check must succeed even with an unknown lint rule in mds.json; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule"),
+        "AC-224-14: mds check must NOT emit an unknown-rule warning; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-14: mds check must NOT name the unknown rule in stderr; stderr: {stderr}"
+    );
+
+    // Positive-control arm (ADR-009 / PF-013): write mds.json with an unknown
+    // SEVERITY value ("banana" is not a recognised Severity variant) — a config
+    // that would cause `mds build` to exit non-zero (hard serde parse error).
+    // `mds check <FILE>` must still exit 0, proving that check never reads
+    // mds.json at all.  If check ever starts reading the config, this arm will
+    // fail, surfacing the regression.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"banana"}}}"#,
+    )
+    .unwrap();
+    let out_bad = mds_bin()
+        .arg("check")
+        .arg(&src)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        out_bad.status.success(),
+        "AC-224-14 positive-control: mds check must still exit 0 with an unknown \
+         severity in mds.json — check does not read the config; \
+         stderr: {}",
+        String::from_utf8_lossy(&out_bad.stderr)
+    );
+}
+
+/// AC-224-14 / D2(a): `mds fmt <DIR>` must NOT emit an unknown-rule warning even
+/// when `mds.json` names a lint rule that does not exist.
+///
+/// `mds fmt <DIR>` calls `load_config` (fmt.rs:308) and thus follows the same
+/// code path as `mds build` and `watch.rs:822`.  A passing test proves
+/// `load_config` returns `Ok` for configs with unknown rule names.
+/// Note: `mds fmt <FILE>` does NOT call `load_config`; only the directory target
+/// exercises this code path.
+/// Non-vacuity (ADR-009 / PF-013): a positive-control arm confirms that an
+/// unknown SEVERITY value causes `mds fmt <DIR>` to exit non-zero, proving
+/// `load_config` was reached and the JSON was parsed in the no-warning arm.
+#[test]
+fn fmt_unknown_lint_rule_in_mds_json_emits_no_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("tpl.mds");
+    std::fs::write(&src, "Hello!\n").unwrap();
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"warn"}}}"#,
+    )
+    .unwrap();
+
+    // Target the DIRECTORY so load_config (fmt.rs:308) is actually called.
+    // Targeting a single file bypasses load_config entirely.
+    let out = mds_bin()
+        .arg("fmt")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "D2(a): mds fmt must succeed even with an unknown lint rule in mds.json; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule"),
+        "D2(a): mds fmt must NOT emit an unknown-rule warning; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-rule-xyzzy"),
+        "D2(a): mds fmt must NOT name the unknown rule in stderr; stderr: {stderr}"
+    );
+
+    // Positive-control arm (ADR-009 / PF-013): an unknown SEVERITY value is a hard
+    // serde parse error in load_config (Severity is a closed enum).  mds fmt <DIR>
+    // must exit non-zero, proving load_config was called in the no-warning arm above.
+    std::fs::write(
+        dir.path().join("mds.json"),
+        r#"{"lint":{"rules":{"no-such-rule-xyzzy":"banana"}}}"#,
+    )
+    .unwrap();
+    let out_bad = mds_bin()
+        .arg("fmt")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        !out_bad.status.success(),
+        "D2(a) positive-control: mds fmt <DIR> must exit non-zero on an unknown \
+         severity value ('banana') in mds.json — this proves load_config was reached \
+         in the no-warning arm; stderr: {}",
+        String::from_utf8_lossy(&out_bad.stderr)
+    );
+}

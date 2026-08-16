@@ -2,7 +2,7 @@
 //!
 //! The engine runs AFTER the check gate (resolve+validate) passes, confirming the
 //! template compiles correctly. It then independently tokenizes and parses the entry
-//! source for a single-pass facts walk, applies the 9 lint rules as plain
+//! source for a single-pass facts walk, applies the 10 lint rules as plain
 //! functions, and returns a `LintResult`.
 //!
 //! ## Pipeline (per file)
@@ -32,7 +32,10 @@ pub mod fix;
 pub(crate) mod rules;
 pub(crate) mod tier;
 
-pub use config::LintConfig;
+pub use config::{
+    find_unknown_rule_names, format_unknown_rule_names_warning, LintConfig, UnknownRuleNames,
+    KNOWN_LINT_RULES,
+};
 pub use diagnostic::{
     named_source_for_render, neutralize_source_for_render, sanitize_control_chars,
     sanitize_control_chars_wire, FixLineSpan, LintDiagnostic, LintResult, Severity, TextEdit,

@@ -80,7 +80,7 @@ mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
 mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
-mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (9 rules; --fix, --format json)
+mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (10 rules; --fix, --format json)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
@@ -212,7 +212,7 @@ any formatting behavior yet; frontmatter key sorting is deferred to a future ver
 
 ### Static analysis with `mds lint`
 
-A 9-rule static analyzer that catches common template authoring issues:
+A 10-rule static analyzer that catches common template authoring issues:
 
 ```bash
 mds lint template.mds           # lint a single file
@@ -231,6 +231,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
 | `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
+| `legacy-interpolation` | warn | Single-brace `{x}` syntax from MDS v0.x; migrates to `{{x}}` automatically (auto-fixable) |
 | `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
 | `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |

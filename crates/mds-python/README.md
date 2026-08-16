@@ -70,8 +70,9 @@ keyword-only; `scan_imports` takes its argument positionally.
   ⚠ Privacy: `sources_content=True` embeds the full template source in the map.
 - `rules` is a mapping of rule name → severity string (`"off"`, `"info"`, `"warn"`, `"error"`).
   Unknown severity values raise `MdsError(code="mds::invalid_options")`; unknown rule names
-  are silently accepted (the name simply has no effect — a typo will not configure the rule).
-  `LintResult` exposes `.version`, `.truncated`, `.to_dict()`, `.to_json()`, and `.files`
+  emit a warning and lint continues — the unknown name has no effect, but a non-empty
+  `result.lint_warnings` list signals the problem so callers can surface it.
+  `LintResult` exposes `.version`, `.truncated`, `.lint_warnings`, `.to_dict()`, `.to_json()`, and `.files`
   — a `list[LintFileReport]`. Each `LintFileReport` has `.file` (`str`) and `.diagnostics`
   (`list[LintDiagnostic]`). `LintDiagnostic` carries `.rule`, `.severity`, `.message`,
   `.help` (`str | None`), `.fixable` (`bool`), `.fix_edits` (`list[dict] | None`), and `.span` (`Span | None`).

@@ -107,7 +107,12 @@ The `fixable` flag in the canonical JSON output is computed as `(fix_removals.is
 { "lint": { "rules": { "unused-variable": "off", "shadow-variable": "warn" } } }
 ```
 
-**Unknown rule NAMEs** → warn-and-ignore at CLI (forward compat).  
+**Unknown rule NAMEs** → warned about on every surface, then ignored; the config still
+loads and lint continues, and the exit code does not move (forward compat: a config naming
+a rule from a newer release must not break an older binary). The CLI writes the warning to
+stderr (suppressed by `--quiet`); napi/WASM/Python return it in `lint_warnings`.
+The registry is `mds::KNOWN_LINT_RULES`, derived from each rule module's own `RULE` const;
+detection is `mds::find_unknown_rule_names`. (#224)  
 **Unknown severity VALUES** → hard parse error → exit 2 (closed enum, no sensible fallback).
 
 `LintConfig` lives in `mds-core` (not mds-cli). The CLI `LintCliConfig` from `build.rs` converts to it via `into_core_config()`.
@@ -497,7 +502,9 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **shadow-variable is info AND default-off**: Only fires when explicitly configured. `Info` findings never contribute to the exit code.
 
-**Unknown rule NAMES vs unknown severity VALUES behave differently**: An unknown rule name in `mds.json` is warned about and ignored. An unknown severity value fails loudly with a serde deserialization error (exits 2).
+**Unknown rule NAMES vs unknown severity VALUES behave differently**: An unknown rule name is warned about and then ignored — on every surface, not just the CLI — and the run continues with an unchanged exit code and an unchanged JSON envelope. An unknown severity value fails loudly with a serde deserialization error (exits 2). The asymmetry is deliberate: severities are a closed set, rule names grow every release.
+
+**`.devflow/features/*/KNOWLEDGE.md` is TRACKED, not gitignored**: `.gitignore` ignores `.devflow/*` but re-includes `!.devflow/features/*/KNOWLEDGE.md` (lines 64-70). A doc sweep that excludes `.devflow` wholesale will miss this file, and the source-hygiene gate does scan it.
 
 **D2 mechanical ripple in resolver.rs**: The `..` in the three `ExportDirective` match arms in `resolver.rs` is intentional — it acknowledges the new `offset` field without reading it.
 
@@ -546,7 +553,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/src/lint/config.rs` — `LintConfig` (lives in mds-core; CLI converts to it)
 - `crates/mds-core/src/ast.rs` — `ElseifBranch { offset }`, `IfBlock { else_offset, end_offset }`, `ForBlock/DefineBlock { end_offset }`
 - `crates/mds-core/src/lint/rules/` — 10 rule modules + `structural_eq.rs`
-- `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`, `KNOWN_RULES`
+- `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`; the rule-name list lives in `mds::KNOWN_LINT_RULES`, not in this crate (#224)
 - `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` / `safe_inline` (all WIRE, new); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
 - `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field
 - `crates/mds-cli/src/watch.rs` — all 11 error prints route through `eprint_error`; lifecycle status lines route through `safe_path` / `safe_inline` / `eprint_warning`

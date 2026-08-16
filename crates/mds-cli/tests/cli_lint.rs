@@ -22,6 +22,12 @@
 //! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
 //! - I-24: unreachable-branch (always-true @if) --fix applied; file changed, exit 0
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
+//! - AC-224-10: unknown rule name → JSON wire shape unchanged (lint continues)
+//! - AC-224-11: unknown rule warning goes to stderr, not stdout
+//! - AC-224-14: D2(a) asymmetry — build/check/fmt do NOT warn (see cli_build.rs)
+//! - AC-224-19: directory with N files emits exactly ONE unknown-rule warning
+//! - AC-224-21: stdout JSON remains valid when unknown rule name is present
+//! - AC-224-22: --quiet suppresses the unknown-rule warning
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -3263,5 +3269,1252 @@ fn lint_dir_nested_malformed_config_per_file_error() {
     assert!(
         combined.contains("mds.json") || combined.contains("config") || combined.contains("bad"),
         "output must reference the malformed config source; got: {combined}"
+    );
+}
+
+// ── AC-224-10/11/21/22/19: unknown rule-name warn-and-continue ───────────────
+//
+// An unknown rule name in `mds.json` must:
+//   AC-224-10: not alter the JSON wire shape on stdout (lint continues as normal)
+//   AC-224-11: emit the warning on stderr (never stdout)
+//   AC-224-21: preserve valid JSON on stdout in --format json mode
+//   AC-224-22: be suppressed by --quiet
+//   AC-224-19: emit exactly ONE warning per mds lint invocation, not one per file
+
+/// Write a `mds.json` with an unknown rule name into `dir`.
+fn write_unknown_rule_config(dir: &std::path::Path) {
+    let config = serde_json::json!({
+        "lint": {
+            "rules": {
+                "no-such-rule-xyzzy": "warn"
+            }
+        }
+    });
+    std::fs::write(
+        dir.join("mds.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+}
+
+/// AC-224-21 / AC-224-11: warning goes to stderr; stdout JSON is unaffected.
+///
+/// In `--format json` mode the stdout JSON must be valid and not contain the
+/// warning text; the warning must appear on stderr instead.
+#[test]
+fn unknown_rule_warning_to_stderr_not_stdout_in_json_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("clean.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-21: stdout must still be valid JSON (the warning must NOT land there).
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "AC-224-21: stdout must be valid JSON even when unknown rules are present; \
+             parse error: {e}; stdout: {stdout}"
+        )
+    });
+    assert_eq!(
+        parsed["version"].as_u64(),
+        Some(1),
+        "AC-224-21: JSON must have version:1; got: {parsed}"
+    );
+    assert!(
+        !stdout.contains("unknown"),
+        "AC-224-21: 'unknown' warning text must not appear in stdout JSON; got: {stdout}"
+    );
+
+    // AC-224-11: the warning must appear on stderr and name the rule.
+    // Both substrings required (&&, not ||) so neither half alone can satisfy the
+    // positive control — aligns with the stronger form in
+    // `unknown_rule_json_stdout_contains_no_warning_text` (avoids PF-013 asymmetry).
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-11: the unknown-rule warning must go to stderr and name the rule; \
+         got stderr: {stderr}"
+    );
+}
+
+/// AC-224-10: the JSON wire shape is unchanged when lint continues past an unknown rule.
+///
+/// The `files` array and `truncated` / `version` fields must be present with their
+/// normal shape. No extra top-level error key must appear.
+#[test]
+fn unknown_rule_json_wire_shape_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+
+    // AC-224-10: standard fields are present; no error envelope.
+    assert!(
+        parsed.get("files").is_some(),
+        "AC-224-10: 'files' key must be present in the JSON output; got: {parsed}"
+    );
+    assert!(
+        parsed.get("truncated").is_some(),
+        "AC-224-10: 'truncated' key must be present in the JSON output; got: {parsed}"
+    );
+    assert!(
+        parsed.get("error").is_none(),
+        "AC-224-10: no 'error' key must appear for a lint-continues result; got: {parsed}"
+    );
+
+    // Exit code must be 0 (clean file, no real diagnostics).
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "AC-224-10: exit code must be 0 when the only unknown element is a rule name; \
+         got stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// AC-224-22: `--quiet` suppresses the unknown-rule warning on stderr.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--quiet")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-22: --quiet must suppress the unknown-rule warning.
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22: --quiet must suppress the unknown-rule warning; got stderr: {stderr}"
+    );
+
+    // Exit code is still 0 (clean file).
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "AC-224-22: exit code must be 0; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-19: a directory tree whose files span multiple subdirectories emits exactly
+/// ONE unknown-rule warning, not one per file or one per subdirectory.
+///
+/// A flat-directory test (all files in one dir) would be vacuous because the
+/// base_dir cache already coalesces them — the caching claim under review is about
+/// SUBDIRECTORIES that all resolve to the same root `mds.json`. This test uses a
+/// nested tree (root + subdirs a/, b/, c/d/) so that each unique base_dir produces a
+/// distinct cache lookup. Without the config_dir-keyed deduplication in
+/// `LintDirCtx::config_for`, each distinct base_dir would re-load the config and
+/// re-emit the warning, yielding N warnings for N subdirs (the AC-224-19 bug).
+#[test]
+fn unknown_rule_one_warning_per_invocation_not_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // Files in different subdirectories — each has a distinct base_dir. All are
+    // governed by the single root mds.json, exercising the config_dir deduplication.
+    for subdir in ["a", "b", "c", "c/d"] {
+        let sub = dir.path().join(subdir);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("file.mds"), "Hello!\n").unwrap();
+    }
+    // One file at the root level so the base_dir == config_dir case is also covered.
+    std::fs::write(dir.path().join("root.mds"), "Hello!\n").unwrap();
+    // Single mds.json at the root governs every file in the tree.
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-19: the warning must appear at least once (positive control, PF-013).
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-19: warning must appear on stderr; got stderr: {stderr}"
+    );
+
+    // AC-224-19: exactly one warning per invocation, regardless of how many
+    // subdirectories contributed distinct base_dir lookups. A warning_count > 1 here
+    // means config_for is keying on base_dir rather than config_dir and emitting a
+    // duplicate for each subdir that resolves to the same root mds.json.
+    let warning_count = stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .count();
+    assert_eq!(
+        warning_count, 1,
+        "AC-224-19: warning must appear exactly once per distinct config directory \
+         (got {warning_count} — one per subdir instead of one per config); \
+         got stderr:\n{stderr}"
+    );
+}
+
+/// AC-224-2 (plural branch): when two or more rule names are unknown the plural form
+/// of the warning is emitted and the names appear in lexicographic sorted order.
+///
+/// Test-plan entry 2: CLI config `{"zzz-bad":"warn","aaa-bad":"error"}` yields
+/// exactly one warning line naming both unknown rules with `aaa-bad` before `zzz-bad`.
+///
+/// Non-vacuity (PF-013/ADR-009): the test also confirms the positive control —
+/// `recognised rules are` appears — and the negative control — a known rule in the
+/// same config does NOT trigger the plural path for itself.
+#[test]
+fn unknown_rule_plural_sorted_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    // zzz-bad and aaa-bad are both unknown; unused-variable is real so it does NOT
+    // count toward the unknown list.  The inserted order is zzz first to confirm
+    // lexicographic sorting, not insertion order.
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({
+            "zzz-bad":        "warn",
+            "aaa-bad":        "error",
+            "unused-variable": "off"
+        }),
+    );
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-2: both unknown names are reported.
+    assert!(
+        stderr.contains("aaa-bad"),
+        "AC-224-2: 'aaa-bad' must appear in the plural warning; got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("zzz-bad"),
+        "AC-224-2: 'zzz-bad' must appear in the plural warning; got stderr: {stderr}"
+    );
+    // AC-224-2: plural form is used (not singular).
+    assert!(
+        stderr.contains("unknown lint rules"),
+        "AC-224-2: plural form must be used for two unknown names; got stderr: {stderr}"
+    );
+    // AC-224-2: aaa-bad sorts before zzz-bad.
+    let aaa_pos = stderr
+        .find("aaa-bad")
+        .expect("aaa-bad must appear in stderr");
+    let zzz_pos = stderr
+        .find("zzz-bad")
+        .expect("zzz-bad must appear in stderr");
+    assert!(
+        aaa_pos < zzz_pos,
+        "AC-224-2: 'aaa-bad' must appear before 'zzz-bad' (lexicographic order); \
+         got stderr: {stderr}"
+    );
+    // Positive control: recognised-rules list is present (AC-224-2 completeness).
+    assert!(
+        stderr.contains("recognised rules are"),
+        "recognised-rules list must be included in the plural warning; got stderr: {stderr}"
+    );
+    // Negative control: unused-variable is a known rule and must NOT appear
+    // QUOTED (as an unknown name) in the warning — it does appear unquoted in
+    // the "recognised rules are: …" part, which is expected.  The unknown-names
+    // list uses single-quote delimiters ('NAME'), so checking for the quoted
+    // form distinguishes the two positions.
+    let warning_line = stderr
+        .lines()
+        .find(|l| l.contains("unknown lint rules"))
+        .unwrap_or_else(|| panic!("no plural unknown-rule warning line; got stderr: {stderr}"));
+    assert!(
+        !warning_line.contains("'unused-variable'"),
+        "a recognised rule name must not appear quoted in the unknown-names list; \
+         got warning line: {warning_line}"
+    );
+}
+
+/// AC-224-2 / AC-224-3 golden (singular and plural): pins the EXACT rendered warning
+/// text for both the one-offender and two-offender paths on the CLI.
+///
+/// Test-plan entries 2 and 3 require exact rendering, not just `contains` checks, so
+/// that future edits to the message format fail loudly here rather than silently
+/// diverging from the CHANGELOG and spec.md documentation.
+///
+/// PF-007: these goldens cover the CLI surface only; the binding surfaces are pinned
+/// by their own per-surface tests.
+#[test]
+fn unknown_rule_cli_exact_golden() {
+    // We cannot import mds:: directly from an integration test; hard-code the
+    // current ten names in alphabetical order (the same value KNOWN_LINT_RULES
+    // holds, verified by AC-224-7).  If the registry grows this golden must be
+    // updated alongside the registry — the test will fail loudly.
+    #[rustfmt::skip]
+    let recognised = concat!(
+        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
+        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
+        "unused-import, unused-variable"
+    );
+
+    // ── Singular golden ────────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_singular = format!(
+            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rule"))
+            .unwrap_or_else(|| {
+                panic!("no singular unknown-rule warning line; got stderr: {stderr}")
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_singular,
+            "AC-224-2/AC-224-3 singular golden mismatch"
+        );
+    }
+
+    // ── Plural golden ──────────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+        // Insert zzz-bad before aaa-bad to confirm lexicographic sorting, not
+        // insertion order.
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "zzz-bad": "warn", "aaa-bad": "error" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_plural = format!(
+            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rules"))
+            .unwrap_or_else(|| panic!("no plural unknown-rule warning line; got stderr: {stderr}"));
+        assert_eq!(
+            warning_line.trim(),
+            expected_plural,
+            "AC-224-2/AC-224-3 plural golden mismatch"
+        );
+    }
+}
+
+/// AC-224-2 / AC-224-3 golden for the SINGLE-FILE target path.
+///
+/// `unknown_rule_cli_exact_golden` exercises `mds lint <dir>`, which goes through
+/// `LintDirCtx::config_for`. This test exercises `mds lint <file>`, which goes
+/// through `load_lint_config` — a distinct code path. By pinning the EXACT warning
+/// string for both paths we ensure that a future edit to either emitter fails
+/// loudly here rather than diverging silently (the duplication that existed before
+/// the `emit_unknown_rule_warning` extraction was introduced in this PR).
+///
+/// PF-007: covers the CLI single-file surface only.
+#[test]
+fn unknown_rule_cli_exact_golden_single_file() {
+    #[rustfmt::skip]
+    let recognised = concat!(
+        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
+        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
+        "unused-import, unused-variable"
+    );
+
+    // ── Singular golden (single-file path) ────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_singular = format!(
+            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rule"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC-224-2/AC-224-3 single-file: no singular unknown-rule warning; \
+                     got stderr: {stderr}"
+                )
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_singular,
+            "AC-224-2/AC-224-3 single-file singular golden mismatch"
+        );
+    }
+
+    // ── Plural golden (single-file path) ──────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "zzz-bad": "warn", "aaa-bad": "error" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_plural = format!(
+            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rules"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC-224-2/AC-224-3 single-file: no plural unknown-rule warning; \
+                     got stderr: {stderr}"
+                )
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_plural,
+            "AC-224-2/AC-224-3 single-file plural golden mismatch"
+        );
+    }
+}
+
+/// Populate `dir` with a fixed three-file tree — one clean, two with real findings —
+/// so the JSON envelope under test carries actual `files[]` entries rather than an
+/// empty array (an all-clean tree would make the comparison below near-vacuous).
+fn write_mixed_lint_tree(dir: &std::path::Path) {
+    std::fs::write(dir.join("clean.mds"), "Hello!\n").unwrap();
+    std::fs::write(
+        dir.join("unused.mds"),
+        "---\nunused_key: value\n---\nHello!\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("dup.mds"),
+        "---\nanother_unused: v\n---\nHi there!\n",
+    )
+    .unwrap();
+}
+
+/// Write an `mds.json` naming `rules` verbatim.
+fn write_rules_config(dir: &std::path::Path, rules: serde_json::Value) {
+    let config = serde_json::json!({ "lint": { "rules": rules } });
+    std::fs::write(
+        dir.join("mds.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+}
+
+/// AC-224-10 (NEGATIVE, envelope frozen): an unknown rule name changes the `--format json`
+/// stdout by **zero bytes**.
+///
+/// The two runs differ only by the presence of `no-such-rule-xyzzy` in `mds.json`. Their
+/// stdout buffers are compared byte-for-byte, and the top-level key set is compared as an
+/// EXACT set (not `contains`), so a new top-level key or a `files[]` entry lacking
+/// `diagnostics` fails. Exit codes must match too.
+///
+/// Non-vacuity (PF-013 / ADR-009): the same run asserts the warning IS on stderr and that
+/// the envelope actually carries `files[]` entries — a byte-identical comparison of two
+/// empty or two error envelopes would prove nothing.
+#[test]
+fn unknown_rule_json_stdout_is_byte_identical_to_run_without_it() {
+    let with_dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(with_dir.path());
+    write_rules_config(
+        with_dir.path(),
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+
+    let without_dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(without_dir.path());
+    write_rules_config(
+        without_dir.path(),
+        serde_json::json!({ "unused-variable": "warn" }),
+    );
+
+    let run = |dir: &std::path::Path| {
+        mds_bin()
+            .arg("lint")
+            .arg(dir)
+            .arg("--format")
+            .arg("json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    let with = run(with_dir.path());
+    let without = run(without_dir.path());
+
+    // Non-vacuity: the warning fired in the first run and not in the second.
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+    assert!(
+        with_stderr.contains("unknown lint rule") && with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the unknown-rule warning must fire on stderr; got: {with_stderr}"
+    );
+    let without_stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(
+        !without_stderr.contains("unknown lint rule"),
+        "control run must not warn; got: {without_stderr}"
+    );
+
+    // AC-224-10: stdout is byte-identical, and the exit code does not move.
+    assert_eq!(
+        with.stdout,
+        without.stdout,
+        "AC-224-10: stdout must be byte-identical with and without the unknown rule name;\n\
+         with:    {}\nwithout: {}",
+        String::from_utf8_lossy(&with.stdout),
+        String::from_utf8_lossy(&without.stdout)
+    );
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13: the exit code must not move because of an unknown rule name"
+    );
+
+    // AC-224-10: exact top-level key set — not `contains`.
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&with.stdout).trim())
+            .expect("stdout must be valid JSON");
+    let obj = parsed.as_object().expect("envelope must be a JSON object");
+    let mut top_keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    top_keys.sort_unstable();
+    assert_eq!(
+        top_keys,
+        ["files", "truncated", "version"],
+        "AC-224-10: the top-level key set must be exactly {{files, truncated, version}}; \
+         got: {parsed}"
+    );
+    assert_eq!(parsed["version"].as_u64(), Some(1));
+
+    // Non-vacuity: the envelope really does carry file entries, and each has the
+    // `diagnostics` key with no `error` key.
+    let files = parsed["files"].as_array().expect("files must be an array");
+    assert!(
+        !files.is_empty(),
+        "non-vacuity: the fixture tree must produce at least one files[] entry; got: {parsed}"
+    );
+    for entry in files {
+        let e = entry.as_object().expect("files[] entry must be an object");
+        assert!(
+            e.contains_key("diagnostics"),
+            "AC-224-10: every files[] entry must carry a diagnostics key; got: {entry}"
+        );
+        assert!(
+            !e.contains_key("error"),
+            "AC-224-10: no files[] entry may carry an error key; got: {entry}"
+        );
+    }
+}
+
+/// AC-224-21: `--format json` stdout carries no warning text at all — including the
+/// literal substring `warning`, which the bare `!stdout.contains("unknown")` check above
+/// would not catch. Paired positive control: the warning IS on stderr in the same run.
+#[test]
+fn unknown_rule_json_stdout_contains_no_warning_text() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+    );
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control first: without this, every negative below is vacuous.
+    assert!(
+        stderr.contains("no-such-rule-xyzzy") && stderr.contains("recognised rules are"),
+        "positive control: the warning must be on stderr; got: {stderr}"
+    );
+
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21: stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .expect("AC-224-21: stdout must parse as a single JSON document");
+}
+
+/// AC-224-21 (single-file target): `--format json` stdout is clean when the unknown-
+/// rule warning fires.
+///
+/// `run_lint_file` is a separate emitter from `run_lint_directory`; this test covers
+/// it independently (AC-224-21 gap identified in the code review). Paired positive
+/// control (PF-013 / ADR-009): the warning IS on stderr, so a clean-stdout assertion
+/// cannot pass vacuously on a run where the warning never fired.
+#[test]
+fn unknown_rule_json_stdout_clean_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("clean.mds");
+    std::fs::write(&file, "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control: warning fired on stderr.
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-21 (file): warning must fire on stderr; got: {stderr}"
+    );
+
+    // AC-224-21: stdout must be valid JSON and contain no warning text.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC-224-21 (file): stdout must be valid JSON; error: {e}; got: {stdout}")
+    });
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21 (file): stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+}
+
+/// AC-224-21 (stdin target): `--format json` stdout is clean when the unknown-rule
+/// warning fires.
+///
+/// `run_lint_stdin` is a separate emitter from `run_lint_directory` and
+/// `run_lint_file`; this test covers it independently (AC-224-21 gap). `current_dir`
+/// is set to a tempdir containing `mds.json` so `run_lint_stdin` picks up the unknown
+/// rule. Paired positive control (PF-013 / ADR-009).
+#[test]
+fn unknown_rule_json_stdout_clean_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let mut child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .arg("--format")
+        .arg("json")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe — child may exit before reading all of stdin.
+    let _ = child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control: warning fired on stderr.
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-21 (stdin): warning must fire on stderr; got: {stderr}"
+    );
+
+    // AC-224-21: stdout must be valid JSON and contain no warning text.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC-224-21 (stdin): stdout must be valid JSON; error: {e}; got: {stdout}")
+    });
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21 (stdin): stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+}
+
+/// AC-224-22: the pre-subcommand global form `mds --quiet lint <dir>` suppresses the
+/// warning exactly like `mds lint --quiet <dir>`, and neither moves the exit code.
+///
+/// Paired positive control (PF-013): the same tree without `--quiet` DOES warn.
+#[test]
+fn unknown_rule_warning_suppressed_by_global_quiet_form() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+    );
+
+    let loud = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: the non-quiet run must warn"
+    );
+
+    for args in [vec!["lint", "--quiet"], vec!["--quiet", "lint"]] {
+        let mut cmd = mds_bin();
+        for a in &args {
+            cmd.arg(a);
+        }
+        let out = cmd
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+            "AC-224-22: `mds {}` must suppress the unknown-rule warning; got: {stderr}",
+            args.join(" ")
+        );
+        assert_eq!(
+            out.status.code(),
+            loud.status.code(),
+            "AC-224-22: --quiet must not move the exit code (form: {})",
+            args.join(" ")
+        );
+    }
+}
+
+/// AC-224-22 (single-file target): `--quiet` suppresses the unknown-rule warning when
+/// targeting a single file.
+///
+/// `load_lint_config` (the `run_lint_file` / `run_lint_stdin` code path) has a quiet gate
+/// inside `emit_unknown_rule_warning`; this test covers the single-file path independently
+/// from the directory target covered by `unknown_rule_warning_suppressed_by_quiet`, which
+/// exercises the `config_for` emitter instead.
+///
+/// Paired positive control (PF-013 / ADR-009): the same invocation WITHOUT `--quiet` DOES
+/// emit the warning, so the absence assertion cannot pass vacuously.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("clean.mds");
+    std::fs::write(&file, "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    // Positive control: without --quiet the warning fires on the single-file path.
+    let loud = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: single-file mode without --quiet must warn; got: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // AC-224-22: --quiet must suppress the warning.
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .arg("--quiet")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22 (single-file): --quiet must suppress the unknown-rule warning; got: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        loud.status.code(),
+        "AC-224-22 (single-file): --quiet must not move the exit code; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-22 (stdin target): `--quiet` suppresses the unknown-rule warning when reading
+/// from stdin.
+///
+/// `load_lint_config` (the `run_lint_stdin` code path) has a quiet gate inside
+/// `emit_unknown_rule_warning`; this test covers the stdin path independently from the
+/// directory target covered by `unknown_rule_warning_suppressed_by_quiet`, which exercises
+/// the `config_for` emitter instead.
+///
+/// `current_dir` is set to a tempdir containing `mds.json` so `run_lint_stdin` picks up
+/// the unknown rule.  Paired positive control (PF-013 / ADR-009): the same invocation
+/// WITHOUT `--quiet` DOES emit the warning.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    write_unknown_rule_config(dir.path());
+
+    // Positive control: without --quiet the warning fires on the stdin path.
+    let mut loud_child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe -- child may exit before reading all of stdin.
+    let _ = loud_child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let loud = loud_child.wait_with_output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: stdin mode without --quiet must warn; got: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // AC-224-22: --quiet must suppress the warning on the stdin path.
+    let mut child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .arg("--quiet")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe -- child may exit before reading all of stdin.
+    let _ = child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let out = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22 (stdin): --quiet must suppress the unknown-rule warning; got: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        loud.status.code(),
+        "AC-224-22 (stdin): --quiet must not move the exit code; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-12 (NEGATIVE / fix behaviour unchanged): an unknown rule name changes nothing
+/// about `--fix`, `--fix --check` or `--fix --diff`.
+///
+/// Two identical trees are built; only one names `no-such-rule-xyzzy` alongside the same
+/// valid rules. For each of the three invocations the exit code, the post-run file bytes
+/// and the stdout are compared between the trees.
+///
+/// Non-vacuity (PF-013): the run asserts a fix was ACTUALLY applied (the file bytes moved)
+/// and that the warning fired in the unknown-rule tree — a parity assertion between two
+/// trees where nothing happened would prove nothing.
+#[test]
+fn unknown_rule_does_not_change_fix_behaviour() {
+    /// Build a tree with one auto-fixable (Tier A) duplicate-export violation.
+    fn build_tree(rules: serde_json::Value) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lint_error.mds");
+        fs::copy(fixture("lint_error.mds"), &target).unwrap();
+        write_rules_config(dir.path(), rules);
+        (dir, target)
+    }
+
+    let valid_rules = serde_json::json!({ "duplicate-export": "error" });
+    let mut with_rules = valid_rules.clone();
+    with_rules["no-such-rule-xyzzy"] = serde_json::json!("warn");
+
+    // ── --fix --check: must not write, must report pending fixes ────────────
+    let (with_dir, with_target) = build_tree(with_rules.clone());
+    let (without_dir, without_target) = build_tree(valid_rules.clone());
+    let with_before = fs::read(&with_target).unwrap();
+
+    let with_check = lint_path(with_dir.path(), &["--fix", "--check"]);
+    let without_check = lint_path(without_dir.path(), &["--fix", "--check"]);
+    assert!(
+        String::from_utf8_lossy(&with_check.stderr).contains("unknown lint rule"),
+        "non-vacuity: the unknown-rule tree must warn"
+    );
+    assert_eq!(
+        with_check.status.code(),
+        without_check.status.code(),
+        "AC-224-12: --fix --check exit code must not move"
+    );
+    assert_eq!(
+        fs::read(&with_target).unwrap(),
+        with_before,
+        "AC-224-12: --fix --check must not write"
+    );
+
+    // ── --fix --diff: identical diff output, still no write ─────────────────
+    //
+    // The `---`/`+++` headers name the absolute file path, which necessarily differs
+    // between the two tempdirs. Normalise each tree's own root to a placeholder so the
+    // comparison is about the diff CONTENT — the only thing an unknown rule name could
+    // plausibly change — rather than about tempdir naming.
+    let with_diff = lint_path(with_dir.path(), &["--fix", "--diff"]);
+    let without_diff = lint_path(without_dir.path(), &["--fix", "--diff"]);
+    let normalize = |bytes: &[u8], root: &std::path::Path| {
+        String::from_utf8_lossy(bytes).replace(root.to_string_lossy().as_ref(), "<DIR>")
+    };
+    let with_diff_text = normalize(&with_diff.stdout, with_dir.path());
+    let without_diff_text = normalize(&without_diff.stdout, without_dir.path());
+    assert!(
+        with_diff_text.contains("@export greet"),
+        "non-vacuity: --fix --diff must actually render a hunk; got: {with_diff_text}"
+    );
+    assert_eq!(
+        with_diff_text, without_diff_text,
+        "AC-224-12: --fix --diff output must be identical once the tempdir root is normalised"
+    );
+    assert_eq!(
+        with_diff.status.code(),
+        without_diff.status.code(),
+        "AC-224-12: --fix --diff exit code must not move"
+    );
+    assert_eq!(
+        fs::read(&with_target).unwrap(),
+        with_before,
+        "AC-224-12: --fix --diff must not write"
+    );
+
+    // ── --fix: identical result bytes and exit code, and a fix really happened ──
+    let with_fix = lint_path(with_dir.path(), &["--fix"]);
+    let without_fix = lint_path(without_dir.path(), &["--fix"]);
+    assert_eq!(
+        with_fix.status.code(),
+        without_fix.status.code(),
+        "AC-224-12: --fix exit code must not move"
+    );
+    let with_after = fs::read(&with_target).unwrap();
+    let without_after = fs::read(&without_target).unwrap();
+    assert_eq!(
+        with_after, without_after,
+        "AC-224-12: the fixed file bytes must be identical with and without the unknown rule"
+    );
+    assert_ne!(
+        with_after, with_before,
+        "non-vacuity: a fix must actually have been applied, or the parity above is empty"
+    );
+
+    // No stray artefacts left behind in either tree.
+    for dir in [with_dir.path(), without_dir.path()] {
+        for entry in fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                name == "lint_error.mds" || name == "mds.json",
+                "AC-224-12: --fix must leave no temp or backup artefact; found {name}"
+            );
+        }
+    }
+}
+
+/// AC-224-11 (HUMAN format): stdout stays empty, and the warning is the ONLY delta on
+/// stderr — every file is still linted and reported exactly as it was.
+///
+/// The JSON arm is pinned by `unknown_rule_json_stdout_is_byte_identical_to_run_without_it`.
+/// Human format routes diagnostics through a completely different renderer
+/// (`render_result_human` → `eprint_error` → miette, on stderr) and writes nothing to
+/// stdout, so a JSON-only assertion proves nothing here — this arm has to be asserted
+/// separately (PF-007 reasoning applied within one surface: two output formats are two
+/// renderers).
+///
+/// The SAME tempdir is reused for both runs, with only `mds.json` rewritten between
+/// them, so the display paths are byte-identical and the stderr comparison is about
+/// content rather than tempdir naming.
+///
+/// Non-vacuity (PF-013 / ADR-009): the run asserts the warning IS present in the first
+/// run and ABSENT in the second, and that the control run's stderr actually carries
+/// per-file diagnostics — comparing two empty buffers would prove nothing.
+#[test]
+fn unknown_rule_human_stdout_empty_and_per_file_output_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+
+    let run = || {
+        mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    // Run 1: config names an unknown rule alongside a valid one.
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+    let with = run();
+    // Run 2: identical tree and identical paths, unknown entry deleted.
+    write_rules_config(dir.path(), serde_json::json!({ "unused-variable": "warn" }));
+    let without = run();
+
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+    let without_stderr = String::from_utf8_lossy(&without.stderr);
+
+    // Positive control: the warning fired in run 1 and not in run 2.
+    assert!(
+        with_stderr.contains("unknown lint rule") && with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the unknown-rule warning must fire on stderr in human mode; \
+         got: {with_stderr}"
+    );
+    assert!(
+        !without_stderr.contains("unknown lint rule"),
+        "control run must not warn; got: {without_stderr}"
+    );
+    // Non-vacuity: the control run really does carry per-file lint output, so the
+    // equality assertion below is comparing real diagnostics, not two empty buffers.
+    assert!(
+        without_stderr.contains("unused-variable"),
+        "non-vacuity: the fixture tree must produce per-file diagnostics on stderr; \
+         got: {without_stderr}"
+    );
+
+    // AC-224-11: human format writes NOTHING to stdout, with or without the unknown rule.
+    assert!(
+        with.stdout.is_empty(),
+        "AC-224-11: human-format stdout must be empty on the unknown-rule path; got: {}",
+        String::from_utf8_lossy(&with.stdout)
+    );
+    assert!(
+        without.stdout.is_empty(),
+        "AC-224-11: human-format stdout must be empty in the control run; got: {}",
+        String::from_utf8_lossy(&without.stdout)
+    );
+
+    // AC-224-11: the added warning line is the ONLY difference on stderr — no file is
+    // skipped and no per-file result changes.
+    let with_minus_warning: String = with_stderr
+        .lines()
+        .filter(|l| !l.contains("unknown lint rule"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let without_normalized: String = without_stderr.lines().map(|l| format!("{l}\n")).collect();
+    assert_eq!(
+        with_minus_warning, without_normalized,
+        "AC-224-11: apart from the added warning line, human-mode stderr must be \
+         identical with and without the unknown rule name;\nwith:\n{with_stderr}\n\
+         without:\n{without_stderr}"
+    );
+
+    // AC-224-13: the exit code does not move because of the unknown rule name.
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13: the exit code must not move because of an unknown rule name in human mode"
+    );
+}
+
+/// AC-224-10 / AC-224-19 (nested config): the `mds.json` lives in a SUBDIRECTORY and the
+/// lint root itself has none.
+///
+/// This is a distinct `LintDirCtx::config_for` branch from the other unknown-rule tests:
+/// the root's `base_dir` resolves to `None` (default config, cached under `base_dir` only)
+/// while the subdirectory resolves to `Some((config, config_dir))`. Both branches are
+/// exercised in one invocation, so a regression that emitted the warning from the `None`
+/// arm, or that failed to reach the `Some` arm at all, is caught here.
+///
+/// Non-vacuity (PF-013 / ADR-009): the run asserts the warning fires exactly once AND
+/// that both files were actually linted (the root file is reported too), so neither the
+/// count nor the JSON comparison can pass because nothing ran.
+#[test]
+fn unknown_rule_nested_config_warns_once_and_envelope_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Root file: governed by NO config (the lint root has no mds.json).
+    std::fs::write(
+        dir.path().join("root.mds"),
+        "---\nroot_unused: v\n---\nHi!\n",
+    )
+    .unwrap();
+    // Subdirectory file: governed by sub/mds.json, which names the unknown rule.
+    std::fs::write(sub.join("nested.mds"), "---\nsub_unused: v\n---\nHo!\n").unwrap();
+
+    let run = || {
+        mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .arg("--format")
+            .arg("json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    write_rules_config(
+        &sub,
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+    let with = run();
+    write_rules_config(&sub, serde_json::json!({ "unused-variable": "warn" }));
+    let without = run();
+
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+
+    // AC-224-19: exactly one warning, emitted from the subdirectory's config only.
+    let warning_count = with_stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .count();
+    assert_eq!(
+        warning_count, 1,
+        "AC-224-19 (nested): the subdirectory config must warn exactly once; got stderr:\n\
+         {with_stderr}"
+    );
+    assert!(
+        with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the warning must name the unknown rule; got: {with_stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&without.stderr).contains("unknown lint rule"),
+        "control run must not warn; got: {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+
+    // AC-224-10: the stdout envelope is byte-identical across the two runs.
+    assert_eq!(
+        with.stdout,
+        without.stdout,
+        "AC-224-10 (nested): stdout must be byte-identical with and without the unknown \
+         rule name;\nwith:    {}\nwithout: {}",
+        String::from_utf8_lossy(&with.stdout),
+        String::from_utf8_lossy(&without.stdout)
+    );
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13 (nested): the exit code must not move"
+    );
+
+    // Non-vacuity: BOTH files were linted — the root file (default config, no warning)
+    // and the nested file (subdir config). A byte-identical comparison of two envelopes
+    // that never reached the nested directory would prove nothing.
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&with.stdout).trim())
+            .expect("stdout must be valid JSON");
+    let files: Vec<String> = parsed["files"]
+        .as_array()
+        .expect("files must be an array")
+        .iter()
+        .map(|f| f["file"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        files.iter().any(|f| f == "root.mds"),
+        "non-vacuity: the root file must still be linted; got files: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f == "sub/nested.mds"),
+        "non-vacuity: the nested file must still be linted; got files: {files:?}"
     );
 }

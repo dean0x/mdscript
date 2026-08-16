@@ -1,12 +1,15 @@
-//! Shared options-parsing utilities for WASM and napi binding layers.
+//! Shared options-parsing and wire-format utilities for WASM and napi binding layers.
 //!
 //! Both binding layers accept a user-supplied `vars` object and need to:
 //! 1. Determine the runtime type-name of an arbitrary JSON value.
 //! 2. Validate and convert a JSON vars object into a `HashMap<String, Value>`.
 //! 3. Reject unknown option keys with a uniform error message.
+//! 4. Inject `lint_warnings` into the canonical-JSON result for unknown rule names.
 //!
-//! Centralising these three functions here eliminates identical copies that
-//! previously lived in `mds-wasm/src/lib.rs` and `mds-napi/src/lib.rs`.
+//! Centralising these functions here eliminates identical copies that previously
+//! lived in `mds-wasm/src/lib.rs` and `mds-napi/src/lib.rs`, and ensures the
+//! D8 wire contract (`lint_warnings` key name, shape, absent-when-empty semantics)
+//! has a single authoritative definition.
 
 use std::collections::HashMap;
 
@@ -193,6 +196,47 @@ pub fn reject_unknown_json_keys(
     Err(format_unknown_keys_error(&unknowns, known))
 }
 
+// ── attach_lint_warnings ──────────────────────────────────────────────────────
+
+/// Inject `lint_warnings` into a canonical JSON result object when a warning is present.
+///
+/// D8 (AC-224-1): the napi, WASM, and Python bindings surface unknown-rule warnings
+/// by adding a `lint_warnings: string[]` field to the returned JSON object. This
+/// function is the single implementation of that D8 wire contract — the key name
+/// `"lint_warnings"`, the array-of-one shape, and the absent-when-empty semantics
+/// — so the contract cannot diverge across surfaces.
+///
+/// `Option<String>` rather than `Vec<String>`: there is exactly one warning message
+/// today (unknown rule names are reported as a single sentence), so a vector would be
+/// over-general plumbing. The JSON shape is still `string[]` — the array is built
+/// here — so adding a second warning kind later is a change to this function, not to
+/// the wire contract.
+///
+/// Deliberately kept out of `LintResult::to_canonical_json` so the CLI serializer
+/// path (`--format json`) remains byte-frozen: the CLI writes the warning to stderr
+/// via `eprint_warning` and never touches the JSON.
+///
+/// The precondition (the target value is a JSON object produced by
+/// `LintResult::to_canonical_json`) is **structural**: the argument type
+/// `&mut serde_json::Map<String, serde_json::Value>` is unrepresentable for non-object
+/// values, so the caller must extract the map explicitly before calling. This eliminates
+/// the silent-discard failure mode that would exist with a `serde_json::Value` parameter
+/// (PF-005: make preconditions structural rather than asserted at runtime). Callers
+/// obtain a map reference via `value.as_object_mut().expect(…)` — the `expect` is the
+/// correct tool because `LintResult::to_canonical_json` is contractually guaranteed to
+/// return a JSON object.
+pub fn attach_lint_warnings(
+    json: &mut serde_json::Map<String, serde_json::Value>,
+    warning: Option<String>,
+) {
+    if let Some(w) = warning {
+        json.insert(
+            "lint_warnings".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(w)]),
+        );
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -371,6 +415,39 @@ mod tests {
         assert!(
             conversion.source().is_some(),
             "Conversion should have a source"
+        );
+    }
+
+    // ── attach_lint_warnings ──────────────────────────────────────────────────
+
+    /// D8: a present warning is injected as `lint_warnings: [string]`.
+    ///
+    /// PF-013 / ADR-009: both directions are tested — present warning inserts
+    /// the field; absent warning leaves the object unchanged.
+    #[test]
+    fn attach_lint_warnings_injects_field_when_warning_present() {
+        let mut json = json!({ "version": 1 });
+        let obj = json.as_object_mut().expect("json! produces an object");
+        attach_lint_warnings(obj, Some("unknown lint rule 'foo'; ignoring".into()));
+        let arr = json["lint_warnings"]
+            .as_array()
+            .expect("lint_warnings must be an array");
+        assert_eq!(arr.len(), 1, "exactly one element");
+        assert_eq!(
+            arr[0].as_str().unwrap(),
+            "unknown lint rule 'foo'; ignoring"
+        );
+    }
+
+    /// D8: no `lint_warnings` key is added when warning is absent (absent-when-empty semantics).
+    #[test]
+    fn attach_lint_warnings_leaves_object_unchanged_when_no_warning() {
+        let mut json = json!({ "version": 1 });
+        let obj = json.as_object_mut().expect("json! produces an object");
+        attach_lint_warnings(obj, None);
+        assert!(
+            json.get("lint_warnings").is_none(),
+            "lint_warnings must be absent when no warning; got: {json:?}"
         );
     }
 }

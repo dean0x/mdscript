@@ -166,6 +166,52 @@ export interface LintDiagnostic {
  */
 export type RuleSeverity = 'error' | 'warn' | 'info' | 'off';
 
+/**
+ * Union of all recognised lint rule names.
+ *
+ * D-224-1 (2026-08-12 ruling): passing a key outside this set is NOT an error.
+ * The engine emits a warning (see {@link LintResult.lint_warnings}) and lint
+ * continues — the unknown rule is not enforced, but the caller is told. The
+ * asymmetry with unknown severity values (which are hard errors) is deliberate:
+ * severity is a closed set, but rule names grow every release, so hard-failing
+ * would break configs that name a rule added in a newer binary.
+ */
+export type LintRuleName =
+  | 'duplicate-export'
+  | 'duplicate-import'
+  | 'empty-block'
+  | 'legacy-interpolation'
+  | 'redundant-else'
+  | 'shadow-variable'
+  | 'unreachable-branch'
+  | 'unused-function'
+  | 'unused-import'
+  | 'unused-variable';
+
+/**
+ * All recognised lint rule names, sorted alphabetically.
+ *
+ * D-224-2: this array is a manual mirror of the Rust `KNOWN_LINT_RULES`
+ * registry (composed from each rule module's own `RULE` const). The TS mirror
+ * is guarded in one direction only — a new rule must be added here manually
+ * after landing in `mds-core`. Drift is a named residual (avoids PF-015).
+ *
+ * `rules` keys not found here emit a warning (see {@link LintResult.lint_warnings})
+ * and lint continues — unknown names are ignored by the engine after the warning.
+ */
+export const LINT_RULE_NAMES: readonly LintRuleName[] = [
+  'duplicate-export',
+  'duplicate-import',
+  'empty-block',
+  'legacy-interpolation',
+  'redundant-else',
+  'shadow-variable',
+  'unreachable-branch',
+  'unused-function',
+  'unused-import',
+  'unused-variable',
+] as const;
+
 /** All diagnostics for a single file in a lint result. */
 export interface LintFileReport {
   /** Path or name of the linted file. */
@@ -175,9 +221,12 @@ export interface LintFileReport {
 }
 
 /**
- * Canonical lint result returned by all lint surfaces (CLI `--format json`,
- * napi, WASM, Python). All surfaces produce byte-identical JSON for the same
- * input and rules configuration.
+ * Lint result returned by the napi, WASM, and Python binding surfaces, and
+ * by the CLI `--format json` surface. The `files`, `truncated`, and `version`
+ * fields are present on every surface. The optional `lint_warnings` field is
+ * included in the binding-surface JSON when non-fatal warnings occurred; the
+ * CLI writes those warnings to stderr so its JSON stdout remains parseable
+ * without modification.
  */
 export interface LintResult {
   /** Schema version; always 1 in this release. */
@@ -189,13 +238,26 @@ export interface LintResult {
    * earlier diagnostics were dropped. Re-run after fixing to surface the rest.
    */
   truncated: boolean;
+  /**
+   * Non-fatal warnings produced during linting — for example, unknown rule
+   * names passed in the `rules` option. Absent (not `[]`) when no warnings
+   * occurred. On the CLI surface, these warnings go to stderr instead.
+   */
+  lint_warnings?: string[];
 }
 
 /** Options for source-string lint operations. */
 export interface LintOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
-  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  /**
+   * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
+   *
+   * Keys should be {@link LintRuleName} values. An unrecognised key emits a
+   * warning in {@link LintResult.lint_warnings} and lint continues — the
+   * unknown rule is not enforced by the engine. `Record<string, …>` is
+   * accepted for forward compatibility with future rule names.
+   */
   rules?: Record<string, RuleSeverity>;
   /**
    * Base directory for resolving `@import` directives in the source string.
@@ -209,7 +271,14 @@ export interface LintOptions {
 export interface LintFileOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
-  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  /**
+   * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
+   *
+   * Keys should be {@link LintRuleName} values. An unrecognised key emits a
+   * warning in {@link LintResult.lint_warnings} and lint continues — the
+   * unknown rule is not enforced by the engine. `Record<string, …>` is
+   * accepted for forward compatibility with future rule names.
+   */
   rules?: Record<string, RuleSeverity>;
 }
 

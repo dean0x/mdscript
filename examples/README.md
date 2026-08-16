@@ -15,7 +15,7 @@ Four capabilities shipped with v0.4.0 — each has a dedicated example:
 # Safety-gated formatter — rewrites directive lines only, never body text
 mds fmt --check examples/
 
-# Static analysis — 9 rules, human and JSON output, --fix --diff preview
+# Static analysis — 10 rules, human and JSON output, --fix --diff preview
 mds lint examples/linting/
 
 # Source Map v3 — sidecar .map file, --inline data-URI, or --embed-sources

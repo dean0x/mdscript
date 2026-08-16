@@ -1086,6 +1086,7 @@ fn lint_api_signatures_exist() {
 /// L-API-2: pub types LintDiagnostic, Severity, LintConfig, LintResult are accessible
 /// and have the expected fields/variants.
 #[test]
+#[allow(deprecated)] // exercises LintConfig::from_rules for surface coverage
 fn lint_types_exist() {
     // Severity has four variants with lowercase serde names.
     let _off = Severity::Off;
@@ -1128,6 +1129,161 @@ fn lint_types_exist() {
     let result = LintResult::new(vec![diag]);
     assert_eq!(result.diagnostics.len(), 1);
     assert!(!result.truncated);
+}
+
+/// AC-224-7 / AC-224-8: KNOWN_LINT_RULES and UnknownRuleNames honour ADR-010.
+///
+/// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
+/// - It contains exactly the ten registered rule names.
+/// - Every entry in the registry is accepted by `LintConfig::from_rules` without
+///   error or warning (exercises the deprecated constructor for surface coverage).
+/// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
+///   maps containing unknown names.
+/// - `UnknownRuleNames` exposes names via accessor, not a public field, and is
+///   only constructible through the library.
+#[test]
+#[allow(deprecated)] // exercises LintConfig::from_rules for surface coverage
+fn known_lint_rules_and_unknown_detection() {
+    use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
+
+    // AC-224-7: exactly 10 rules.
+    assert_eq!(
+        KNOWN_LINT_RULES.len(),
+        10,
+        "KNOWN_LINT_RULES must have exactly 10 entries"
+    );
+
+    // AC-224-7: exact sorted contents.
+    let expected = [
+        "duplicate-export",
+        "duplicate-import",
+        "empty-block",
+        "legacy-interpolation",
+        "redundant-else",
+        "shadow-variable",
+        "unreachable-branch",
+        "unused-function",
+        "unused-import",
+        "unused-variable",
+    ];
+    assert_eq!(
+        KNOWN_LINT_RULES, &expected,
+        "KNOWN_LINT_RULES must match the expected sorted list"
+    );
+
+    // AC-224-8: every known rule is accepted by from_rules without unknowns.
+    let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
+        .iter()
+        .map(|&n| (n.to_string(), Severity::Warn))
+        .collect();
+    let _config = LintConfig::from_rules(all_known.clone());
+    assert!(
+        find_unknown_rule_names(&all_known).is_none(),
+        "all-known rules map must produce no unknowns"
+    );
+
+    // AC-224-8: empty rules map produces no unknowns.
+    let empty: HashMap<String, Severity> = HashMap::new();
+    assert!(
+        find_unknown_rule_names(&empty).is_none(),
+        "empty rules map must produce no unknowns"
+    );
+
+    // AC-224-7: UnknownRuleNames is only obtainable via the library API.
+    let mixed: HashMap<String, Severity> = HashMap::from([
+        ("unused-variable".to_string(), Severity::Off),
+        ("no-such-rule".to_string(), Severity::Warn),
+        ("another-bad".to_string(), Severity::Error),
+    ]);
+    let unknown = find_unknown_rule_names(&mixed).expect("should detect two unknown rules");
+    // Accessor returns names; struct literal construction is impossible (#[non_exhaustive]).
+    let names = unknown.names();
+    assert_eq!(
+        names,
+        &["another-bad".to_string(), "no-such-rule".to_string()],
+        "names must be sorted lexicographically"
+    );
+    assert_eq!(names.len(), 2);
+
+    // Positive control (PF-013 / ADR-009): find_unknown_rule_names does NOT return None
+    // for a single-unknown map.
+    let one_bad: HashMap<String, Severity> =
+        HashMap::from([("no-such-rule".to_string(), Severity::Warn)]);
+    assert!(
+        find_unknown_rule_names(&one_bad).is_some(),
+        "single-unknown map must produce Some"
+    );
+}
+
+/// Review finding (config.rs:104) — `from_rules_checked` is the structurally-safe
+/// construction path.
+///
+/// - An all-known map returns `(config, None)`.
+/// - A map with unknowns returns `(config, Some(UnknownRuleNames))`.
+/// - Both arms return a usable `LintConfig` (lint always continues).
+/// - `from_rules_checked` is `#[must_use]`: the compiler warns if the caller
+///   discards the return value entirely, making it structurally harder to miss
+///   the detection step compared with calling `from_rules` and `find_unknown_rule_names`
+///   separately.
+#[test]
+fn from_rules_checked_structurally_returns_unknowns() {
+    use mds::{LintConfig, KNOWN_LINT_RULES};
+
+    // All-known map: config is usable, unknowns is None.
+    let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
+        .iter()
+        .map(|&n| (n.to_string(), Severity::Warn))
+        .collect();
+    let (config, unknown) = LintConfig::from_rules_checked(all_known);
+    assert!(
+        unknown.is_none(),
+        "all-known map must return None for unknowns"
+    );
+    assert_eq!(
+        config.severity_for("unused-variable"),
+        Some(&Severity::Warn),
+        "config must still be usable after from_rules_checked"
+    );
+
+    // Empty map: config is usable, unknowns is None.
+    let (empty_config, empty_unknown) = LintConfig::from_rules_checked(HashMap::new());
+    assert!(
+        empty_unknown.is_none(),
+        "empty map must return None for unknowns"
+    );
+    assert!(
+        empty_config.severity_for("unused-variable").is_none(),
+        "empty config must have no overrides"
+    );
+
+    // Map with unknown names: config still loads, unknowns is Some.
+    let mixed: HashMap<String, Severity> = HashMap::from([
+        ("unused-variable".to_string(), Severity::Off),
+        ("no-such-rule".to_string(), Severity::Warn),
+        ("another-bad".to_string(), Severity::Error),
+    ]);
+    let (config2, unknown2) = LintConfig::from_rules_checked(mixed);
+    let u = unknown2.expect("from_rules_checked must detect two unknown rules");
+    // Accessor returns sorted names.
+    assert_eq!(
+        u.names(),
+        &["another-bad".to_string(), "no-such-rule".to_string()],
+        "names must be sorted lexicographically"
+    );
+    // The config still loads — the unknown rules have no effect but the valid one does.
+    assert_eq!(
+        config2.severity_for("unused-variable"),
+        Some(&Severity::Off),
+        "valid rule must still be present in config after detection"
+    );
+
+    // Positive control (PF-013): a single-unknown map produces Some, not None.
+    let (_, one_bad_unknown) =
+        LintConfig::from_rules_checked(HashMap::from([("bad-rule".to_string(), Severity::Warn)]));
+    assert!(
+        one_bad_unknown.is_some(),
+        "single-unknown map must produce Some from from_rules_checked"
+    );
 }
 
 /// L-API-4: MdsError enum is unchanged — lint findings are LintDiagnostic, not MdsError variants.

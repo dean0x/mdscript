@@ -186,8 +186,13 @@ surfaces `shadow-variable` as **info** (☞) and `unused-variable` as an **error
 > Files outside `config-demo/` find no `mds.json` and use built-in defaults.
 
 Config errors are strict: an unknown severity value or malformed JSON fails the run
-with exit `2`; an unknown *rule name* prints a `warning: unknown lint rule …` and is
-ignored (forward-compatible).
+with exit `2`. An unknown *rule name* is handled more leniently by `mds lint`: a
+`warning: unknown lint rule …` is printed to stderr, the config still loads, lint
+continues, and the unknown rule is not enforced — it is skipped
+(forward-compatible: a config naming a rule from a newer release warns instead of
+failing on an older binary). Pass `--quiet` to suppress it. Other commands
+(`mds build`, `mds check`, `mds fmt`, `mds watch`) also read `mds.json` but do
+not emit the unknown-rule warning.
 
 ## Exit codes
 

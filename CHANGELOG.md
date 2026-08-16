@@ -529,6 +529,32 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
 
 ### Added
 
+- **Lint rule-name registry, exposed on every surface (#224).** The recognised rule
+  names now have one source of truth, derived from each rule module's own name constant.
+  - `mds-core`: `KNOWN_LINT_RULES: &[&str]` (the canonical slice),
+    `find_unknown_rule_names(&HashMap<String, Severity>) -> Option<UnknownRuleNames>`
+    (`None` when every name is recognised), `UnknownRuleNames` (a `#[non_exhaustive]`
+    report with a `names() -> &[String]` accessor, always non-empty and sorted), and
+    `format_unknown_rule_names_warning(&UnknownRuleNames) -> String`. The formatter takes
+    the report type rather than a slice so its non-empty precondition is structural — it
+    has no panic path — and it WIRE-escapes each name before interpolating it.
+  - `mds-core`: `LintConfig::from_rules_checked(HashMap<String, Severity>) -> (LintConfig,
+    Option<UnknownRuleNames>)` — the preferred constructor. It returns the config and the
+    unknowns report in one `#[must_use]` call so a caller cannot silently skip detection.
+    `LintConfig::from_rules` is retained but **deprecated since 0.4.0** in its favour; it
+    still behaves exactly as before (it never fails on an unknown name) and is not removed.
+  - `mds-core`: `attach_lint_warnings(&mut serde_json::Map<String, Value>, Option<String>)`
+    — the single definition of the `lint_warnings` wire contract (key name, `string[]`
+    shape, absent-when-empty) shared by the napi, WASM, and Python bindings. It takes a
+    `&mut Map` rather than a `&mut Value` so the "target is a JSON object" precondition is
+    structural rather than a silent no-op on a non-object.
+  - `@mdscript/mds` (Node entry point): `LINT_RULE_NAMES: readonly LintRuleName[]` and
+    the `LintRuleName` string-union type. The browser entry point does not export them
+    yet — it has no lint API to configure.
+  - TypeScript `LintResult` gains `lint_warnings?: string[]`.
+  - Python `LintResult` gains a `.lint_warnings` property returning `list[str]` (empty
+    when there is nothing to report); the type stub is updated to match.
+
 - **`--set-string KEY=VALUE`** CLI flag for `mds build`, `mds check`, and `mds watch`.
   Sets a variable as a string without type coercion — useful when a value is
   numeric-looking but must stay a string (e.g. `mds build t.mds --set-string id=007`).
@@ -560,9 +586,11 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   Cross-platform wheel matrix and PyPI publishing are a tracked follow-up (#132) —
   for now, install from source: `pip install ./crates/mds-python`. (#59)
 
-- **`mds lint`** — 9-rule static analyzer for `.mds` templates (#61). Available
-  across all surfaces (CLI, Rust, napi, WASM, Python) with byte-identical canonical
-  JSON output.
+- **`mds lint`** — 10-rule static analyzer for `.mds` templates (#61). Available
+  across all surfaces (CLI, Rust, napi, WASM, Python). The per-file and
+  per-diagnostic canonical JSON payload is byte-identical across all surfaces;
+  binding surfaces (napi, WASM, Python) additionally expose a `lint_warnings`
+  channel absent from the CLI surface (see #224 in this block).
 
   **Rules** (individually configurable via `mds.json` `lint.rules` or the
   `rules` API option; severities differ per rule):
@@ -754,6 +782,50 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   tool/permission errors.
 
 ### Changed
+
+- **Unknown lint rule names now emit a warning instead of being silently ignored
+  (#224).** Previously an unrecognised rule name in `mds.json`'s `lint.rules` object
+  (or in the `rules` option on a binding surface) was silently accepted: the rule had
+  no effect and nothing signalled that the key was misconfigured. Now the unknown name
+  is reported and linting continues — **exit codes are unchanged**, the JSON envelope on
+  stdout is unchanged, and the rule is still not enforced (it does not exist). This
+  surfaces typos without hard-failing a config that names a rule added in a newer
+  release.
+  - **CLI**: the warning goes to **stderr**, never stdout, so `mds lint --format json`
+    still writes a single valid JSON document. `--quiet` suppresses it. Singular and
+    plural formats (offenders sorted lexicographically):
+    - `warning: in mds.json: unknown lint rule 'NAME'; recognised rules are: …; ignoring`
+    - `warning: in mds.json: unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
+  - **napi / WASM / Python**: the warning is surfaced as `lint_warnings: string[]` on
+    the lint result. In the JSON wire form and in `to_dict()` / `to_json()` output, the
+    key is absent (not `null`, not `[]`) when no warnings occurred. On the Python
+    live-object surface, `LintResult.lint_warnings` is a property that always exists
+    and returns an empty list when no warnings occurred. The message body is shared with
+    the CLI via `mds::format_unknown_rule_names_warning` (AC-224-3 met under amended
+    criterion, repo-owner ruling 2026-08-16: shared body, shared recognised-rules list,
+    shared sort order; the CLI adds a `"warning: in mds.json: "` provenance prefix that
+    the bindings cannot provide because their rules arrive in the caller's options
+    object, not a config file). The bindings use the body as-is:
+    - Singular: `unknown lint rule 'NAME'; recognised rules are: …; ignoring`
+    - Plural:   `unknown lint rules: 'A', 'B'; recognised rules are: …; ignoring`
+    The recognised-rules list, sort order, and name wire-escaping are all shared.
+    Per-surface parity (PF-007): each surface's format is asserted by its own tests.
+  - Only `mds lint` reads `lint.rules`, so only `mds lint` warns. `mds build`,
+    `mds fmt <DIR>`, and `watch` read `mds.json` via `load_config` but deserialize
+    the `lint` field without calling `load_lint_config` — an accepted D2(a)
+    asymmetry, not an oversight (see build.rs:49-51). `mds check` and `mds fmt
+    <FILE>` do not call `load_config` at all. The D2(a) invariant is held in CI by
+    the `build_unknown_lint_rule_in_mds_json_emits_no_warning` and
+    `fmt_unknown_lint_rule_in_mds_json_emits_no_warning` tests in `cli_build.rs`,
+    each with a positive-control arm (unknown severity causes non-zero exit, proving
+    `load_config` was reached). Those tests mechanically hold the AC-224-14
+    watch-path invariant: `watch.rs:822` calls `load_config(...).unwrap_or(None)`;
+    because `build` and `mds fmt <DIR>` share the same `load_config` implementation,
+    a passing build or dir-fmt proves `load_config` returns `Ok` for configs with
+    unknown rule names, so `unwrap_or(None)` cannot collapse `output_dir` to `None`
+    on account of an unknown lint rule name alone.
+  - Unknown **severity values** continue to hard-fail with `mds::invalid_options`. The
+    asymmetry is deliberate: severities are a closed set, rule names grow every release.
 
 - **napi and Python `compileFile` / `compile_file` now emit root-relative
   `sources[]`** in Source Map v3 output. Previously these surfaces emitted the
