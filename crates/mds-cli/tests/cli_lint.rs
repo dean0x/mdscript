@@ -49,14 +49,16 @@
 //! - AC-Q30 (#216): --quiet works in both argument positions for lint
 //! - D4 (#216, PF-004): `fix rejected:` honours --quiet in directory (human + JSON),
 //!   single-file, and stdin mode — four separate emitters, each with its own positive control
-//! - D4 (#216, PF-004): diagnostic-cap notice honours --quiet in all three input modes
-//!   (directory, single-file, stdin) with paired positive controls (ADR-009/PF-013)
+//! - D4 (#216, PF-004): diagnostic-cap notice honours --quiet in all four input modes
+//!   (directory-human, directory-JSON, single-file, stdin) with paired positive controls
+//!   (ADR-009/PF-013)
 //! - D3-a (#216): config-load failure is counted in the "with errors" bucket (not "clean")
 //! - D3-a (#216): config-load failure forces the summary under --quiet (positive control)
 //! - D3-a (#216, unix): chmod-000 source-read failure counted in the "with errors" bucket
 //! - D3-a (#216, unix): chmod-000 source-read failure forces summary under --quiet
 //! - D4 (#216, PF-004): `Fixed:` honours --quiet in dir-mode JSON emitter (positive + negative)
 //! - D4 (#216, PF-004): `Would fix:` honours --quiet in dir-mode JSON emitter (positive + negative)
+//! - D4 (#216, PF-004, unix): write failure in dir-JSON mode must not print `Fixed:` (positive + negative)
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -3137,6 +3139,69 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     );
 }
 
+/// Regression gate (directory JSON mode): when `atomic_write_file` fails in
+/// `lint_one_file_accumulating`, stderr must NOT contain "Fixed: <file>" — mirrors
+/// the human-mode check above for the `lint_one_file_human` code path.
+///
+/// Code ordering is correct: `lint_one_file_accumulating` returns `FileTally::Error`
+/// at lint.rs:1535 before reaching the `eprintln!("Fixed: …")` at lint.rs:1539.
+/// This test provides the coverage that the code ordering is verified.
+///
+/// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
+/// DOES appear so the absence assertion below cannot be vacuous.
+#[cfg(unix)]
+#[test]
+fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // ── Positive control (PF-013): in a writable directory, "Fixed:" must appear ──
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Fixed:"),
+            "positive control: dir --fix --format json must emit 'Fixed:' when the write \
+             succeeds (otherwise the absence assertion below is vacuous; ADR-009); \
+             got stderr: {stderr:?}"
+        );
+        // PR1 contract: stdout carries ONLY the JSON document.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "stdout must be valid JSON in dir --fix --format json; err: {e}; stdout: {stdout}"
+            )
+        });
+    }
+
+    // ── Negative (failure gate): in a read-only directory, "Fixed:" must be absent ──
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("files");
+    fs::create_dir(&inner).unwrap();
+
+    let target = inner.join("no_fixed_label_json.mds");
+    fs::copy(fixture("lint_error.mds"), &target).unwrap();
+
+    // Make the inner directory read-only so temp-file creation fails on write.
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Run lint --fix --format json on the directory (routes through lint_one_file_accumulating).
+    let out = lint_path(&inner, &["--fix", "--format", "json"]);
+
+    let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // "Fixed:" must NOT appear — the early return at lint.rs:1535 must prevent it.
+    assert!(
+        !stderr.contains("Fixed:"),
+        "stderr must not contain 'Fixed:' when the JSON-dir write failed \
+         (lint_one_file_accumulating, lint.rs:1535 guard); got: {stderr:?}"
+    );
+}
+
 /// Regression gate: `mds lint <dir>` (directory mode) must not emit raw ESC bytes to
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
@@ -5072,10 +5137,10 @@ fn lint_stdin_prints_no_directory_summary() {
 // has TWO separate emitters (lint_one_file_human for --format human, and
 // lint_one_file_accumulating for --format json), plus single-file mode and stdin mode.
 // That is eight `fix rejected:` call sites in lint.rs total:
-//   :783 :839 (stdin --fix --check / --fix)
-//   :977 :1016 (single-file --fix / --fix --check)
-//   :1533 :1576 (JSON dir --fix / --fix --check  — lint_one_file_accumulating)
-//   :1713 :1748 (human dir --fix / --fix --check — lint_one_file_human)
+//   :802 :858 (stdin --fix --check / --fix)
+//   :996 :1035 (single-file --fix / --fix --check)
+//   :1569 :1617 (JSON dir --fix / --fix --check  — lint_one_file_accumulating)
+//   :1753 :1789 (human dir --fix / --fix --check — lint_one_file_human)
 // This test covers all four modes, each with its own paired positive control, so no
 // assertion can pass because the fix was never attempted rather than suppressed.
 
@@ -5091,7 +5156,7 @@ const FIX_REJECTED_SOURCE: &str = "\
 ";
 
 #[test]
-fn fix_rejected_message_honours_quiet_in_all_three_modes() {
+fn fix_rejected_message_honours_quiet_in_all_four_modes() {
     let needle = "fix rejected";
 
     // ── Mode 1: single file ──────────────────────────────────────────────────
@@ -5164,10 +5229,10 @@ fn fix_rejected_message_honours_quiet_in_all_three_modes() {
     // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
     // PF-004: --format json routes directory files through lint_one_file_accumulating,
     // a separate emitter from lint_one_file_human (Mode 3).  This covers the two
-    // newly-gated sites in that emitter: lint.rs:1533 (--fix Rejected arm) and
-    // lint.rs:1576 (--fix --check Rejected arm).
+    // gated sites in that emitter: lint.rs:1569 (--fix Rejected arm) and
+    // lint.rs:1617 (--fix --check Rejected arm).
 
-    // Apply path (lint.rs:1533): --fix --format json.
+    // Apply path (lint.rs:1569): --fix --format json.
     let loud_json = lint_path(dir.path(), &["--fix", "--format", "json"]);
     let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
     assert!(
@@ -5180,7 +5245,7 @@ fn fix_rejected_message_honours_quiet_in_all_three_modes() {
     let quiet_json_stderr = String::from_utf8_lossy(&quiet_json.stderr);
     assert!(
         !quiet_json_stderr.contains(needle),
-        "dir --fix --format json --quiet must suppress 'fix rejected:' (D4/PF-004 lint.rs:1533); \
+        "dir --fix --format json --quiet must suppress 'fix rejected:' (D4/PF-004 lint.rs:1569); \
          got: {quiet_json_stderr:?}"
     );
     assert_eq!(
@@ -5189,7 +5254,7 @@ fn fix_rejected_message_honours_quiet_in_all_three_modes() {
         "dir --format json --fix: --quiet must not move the exit code"
     );
 
-    // Preview path (lint.rs:1576): --fix --check --format json.
+    // Preview path (lint.rs:1617): --fix --check --format json.
     let loud_json_check = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
     let loud_json_check_stderr = String::from_utf8_lossy(&loud_json_check.stderr);
     assert!(
@@ -5204,7 +5269,7 @@ fn fix_rejected_message_honours_quiet_in_all_three_modes() {
     assert!(
         !quiet_json_check_stderr.contains(needle),
         "dir --fix --check --format json --quiet must suppress 'fix rejected:' (D4/PF-004 \
-         lint.rs:1576); got: {quiet_json_check_stderr:?}"
+         lint.rs:1617); got: {quiet_json_check_stderr:?}"
     );
     assert_eq!(
         quiet_json_check.status.code(),
@@ -5220,11 +5285,14 @@ fn fix_rejected_message_honours_quiet_in_all_three_modes() {
     );
 }
 
-// ── D4 cross-mode parity: diagnostic-cap notice honours --quiet in all three modes ──
+// ── D4 cross-mode parity: diagnostic-cap notice honours --quiet in all four modes ──
 //
-// PF-004: the cap notice is emitted from three separate call sites in lint.rs
-// (run_lint_file, lint_one_file_accumulating, lint_one_file_human) and one in
-// run_lint_stdin (added per this fix).  Each mode must gate on !quiet.
+// PF-004: the cap notice is emitted from four separate call sites:
+//   run_lint_stdin          (stdin mode)
+//   run_lint_file           (single-file mode)
+//   lint_one_file_human     (directory --format human, the default)
+//   lint_one_file_accumulating (directory --format json)
+// Each mode must gate on !quiet independently — PF-004 (avoids #43/#173 divergence class).
 // PF-013 / ADR-009: each mode carries a paired positive control so the quiet
 // assertion cannot pass vacuously on an uncovered path.
 //
@@ -5241,13 +5309,14 @@ fn make_cap_source() -> String {
         .join("\n")
 }
 
-/// The diagnostic-cap notice is suppressed by `--quiet` in all three input modes.
+/// The diagnostic-cap notice is suppressed by `--quiet` in all four input modes.
 ///
 /// D4 (AD-216-11): the cap notice is a *status* message — gated on `!quiet`
-/// at every emitter.  PF-004: directory, single-file, and stdin are SEPARATE emitters;
-/// a gate on one is not inherited by the others (the #43/#173 divergence class).
+/// at every emitter.  PF-004: directory-human, directory-JSON, single-file, and stdin
+/// are SEPARATE emitters; a gate on one is not inherited by the others
+/// (the #43/#173 divergence class).
 #[test]
-fn cap_notice_honours_quiet_in_all_three_modes() {
+fn cap_notice_honours_quiet_in_all_four_modes() {
     let needle = "diagnostic cap";
     let source = make_cap_source();
 
@@ -5320,6 +5389,38 @@ fn cap_notice_honours_quiet_in_all_three_modes() {
         quiet_dir.status.code(),
         loud_dir.status.code(),
         "directory: --quiet must not move the exit code"
+    );
+
+    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
+    // PF-004: --format json routes directory files through lint_one_file_accumulating,
+    // a SEPARATE emitter from lint_one_file_human (Mode 3).  The cap-notice gate at
+    // lint.rs:1492 (`if fix && !quiet`) must also be tested; a regression that
+    // unguarded lint_one_file_accumulating would pass Modes 1–3 and escape CI.
+    // The same temp `dir` / `cap.mds` file is reused (not modified by --fix --check).
+
+    // Positive control: without --quiet the cap notice MUST appear.
+    let loud_json = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+    let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
+    assert!(
+        loud_json_stderr.contains(needle),
+        "positive control (dir --format json): without --quiet the cap notice MUST be reported \
+         (otherwise the quiet assertion is vacuous; ADR-009); got: {loud_json_stderr:?}"
+    );
+
+    let quiet_json = lint_path(
+        dir.path(),
+        &["--fix", "--check", "--format", "json", "--quiet"],
+    );
+    let quiet_json_stderr = String::from_utf8_lossy(&quiet_json.stderr);
+    assert!(
+        !quiet_json_stderr.contains(needle),
+        "directory --fix --check --format json --quiet must suppress the cap notice \
+         (D4/PF-004 lint.rs:1492); got: {quiet_json_stderr:?}"
+    );
+    assert_eq!(
+        quiet_json.status.code(),
+        loud_json.status.code(),
+        "dir --format json: --quiet must not move the exit code"
     );
 }
 
