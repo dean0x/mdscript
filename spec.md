@@ -915,7 +915,7 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 |--------|-------------|
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
-| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors `mds lint`'s D1-a). (Two notices bypass `--quiet`: the directory-depth warning and the all-files-excluded diagnostic.) |
+| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors the same rule for `mds lint --fix --check`). (Two notices bypass `--quiet`: the directory-depth warning and the all-files-excluded diagnostic.) |
 
 ### 7.5 `mds lint`
 
@@ -970,12 +970,12 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 - Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
   (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
   bucket, the summary is always emitted so the non-zero exit is never unexplained.
-  **Exception (D1-a):** `mds lint --fix --check --quiet <dir>` exits 1 with zero
+  **Exception:** `mds lint --fix --check --quiet <dir>` exits 1 with zero
   stderr bytes when pending fixes exist but no file is in the error or
   resource-limited bucket — the `--fix --check` pending-fix signal is treated as
   status output and is suppressed by `--quiet` alongside the summary line.
 - The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
-  regardless of `--quiet` or directory mode — no `"summary"` key is added (D2-B).
+  regardless of `--quiet` or directory mode — no `"summary"` key is added.
 
 **`--quiet` and `--fix` status messages:** `fix rejected: <reason>`, `Partially fixed:`,
 `Would fix:`, and the `diagnostic cap (N) reached` notice are status output gated by

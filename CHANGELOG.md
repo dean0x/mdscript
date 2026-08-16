@@ -562,7 +562,7 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   note that this summary line is now always printed on a clean run (to suppress it, pass
   `--quiet`). The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
   — no `"summary"` key is added, so existing consumers of `--format json` are unaffected.
-  Exception (D1-a): `mds lint --fix --check --quiet <dir>` exits 1 with zero stderr bytes when
+  Exception: `mds lint --fix --check --quiet <dir>` exits 1 with zero stderr bytes when
   pending fixes exist but no file has errors or hits a resource limit — the exit code is
   unexplained on the surface but is intentional and documented in `--help`.
 

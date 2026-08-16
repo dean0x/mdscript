@@ -228,13 +228,12 @@ prints one summary line to stderr after processing all files:
 `N clean, N with warnings, N with errors, N resource-limited`.
 Under `--quiet`, the summary is suppressed when the worst outcome is warnings or clean; it is
 always printed when any file has errors or hits a resource limit, so the non-zero exit is never
-unexplained in those cases. Exception (D1-a): a warn-only run (`mds lint --quiet <dir>`) exits 1
-with no diagnostics or summary on stderr (the depth-limit warning for directory trees deeper than
-64 levels is not suppressed by `--quiet` — documented limitation per AC-Q05); `mds lint --fix
---check --quiet <dir>` with pending fixes exits 1 with zero stderr bytes — both are intentional;
-the `--fix --check --quiet` case is documented verbatim in `--help` as "Exception (D1-a)", while
-the warn-only exit-1 behaviour is derivable from the quiet-suppression rules described there. The
-JSON stdout envelope is unchanged in directory mode (no `"summary"` key added).
+unexplained in those cases. Two exits are deliberately left unexplained under `--quiet`, because
+in both the signal is status output rather than an error: a warn-only run (`mds lint --quiet
+<dir>`) exits 1 with no diagnostics or summary on stderr, and `mds lint --fix --check --quiet
+<dir>` with pending fixes exits 1 with zero stderr bytes. One known limitation: the depth-limit
+warning for directory trees deeper than 64 levels is emitted regardless of `--quiet`. The JSON
+stdout envelope is unchanged in directory mode (no `"summary"` key added).
 
 Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 

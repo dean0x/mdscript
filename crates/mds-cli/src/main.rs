@@ -136,7 +136,7 @@ enum Commands {
     /// Under --quiet the summary is suppressed on a warn-only or clean run, but is
     /// always printed when error- or resource-limited files are present so the non-zero
     /// exit is never unexplained. --quiet also suppresses the `fix rejected:` and
-    /// `diagnostic cap reached` notices in every input mode. Exception (D1-a):
+    /// `diagnostic cap reached` notices in every input mode. Exception:
     /// --fix --check --quiet exits 1 with zero stderr bytes when pending fixes exist
     /// but no error-severity findings are present — the pending-fix signal is status
     /// output and is suppressed by --quiet.
