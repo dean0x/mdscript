@@ -5138,11 +5138,16 @@ fn lint_stdin_prints_no_directory_summary() {
 // PF-004 — an alternate output path can silently bypass a guard. Directory mode
 // has TWO separate emitters (lint_one_file_human for --format human, and
 // lint_one_file_accumulating for --format json), plus single-file mode and stdin mode.
-// That is eight `fix rejected:` call sites in lint.rs total:
-//   :802 :858 (stdin --fix --check / --fix)
-//   :996 :1035 (single-file --fix / --fix --check)
-//   :1569 :1617 (JSON dir --fix / --fix --check  — lint_one_file_accumulating)
-//   :1753 :1789 (human dir --fix / --fix --check — lint_one_file_human)
+// That is eight `fix rejected:` call sites in lint.rs (cited by function + match arm
+// so the reference survives future line-number shifts):
+//   run_lint_stdin             apply  — FixFileOutcome::Rejected arm
+//   run_lint_stdin             preview — PreviewOutcome::Rejected arm
+//   run_lint_file              apply  — FixFileOutcome::Rejected arm
+//   run_lint_file              preview — PreviewOutcome::Rejected arm
+//   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm
+//   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm
+//   lint_one_file_human        apply  — FixFileOutcome::Rejected arm
+//   lint_one_file_human        preview — PreviewOutcome::Rejected arm
 // This test covers all four modes, each with its own paired positive control, so no
 // assertion can pass because the fix was never attempted rather than suppressed.
 
@@ -5231,10 +5236,11 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
     // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
     // PF-004: --format json routes directory files through lint_one_file_accumulating,
     // a separate emitter from lint_one_file_human (Mode 3).  This covers the two
-    // gated sites in that emitter: lint.rs:1569 (--fix Rejected arm) and
-    // lint.rs:1617 (--fix --check Rejected arm).
+    // gated sites in that emitter:
+    //   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm  (--fix)
+    //   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm (--fix --check)
 
-    // Apply path (lint.rs:1569): --fix --format json.
+    // Apply path (lint_one_file_accumulating, FixFileOutcome::Rejected): --fix --format json.
     let loud_json = lint_path(dir.path(), &["--fix", "--format", "json"]);
     let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
     assert!(
@@ -5247,7 +5253,8 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
     let quiet_json_stderr = String::from_utf8_lossy(&quiet_json.stderr);
     assert!(
         !quiet_json_stderr.contains(needle),
-        "dir --fix --format json --quiet must suppress 'fix rejected:' (D4/PF-004 lint.rs:1569); \
+        "dir --fix --format json --quiet must suppress 'fix rejected:' \
+         (D4/PF-004 lint_one_file_accumulating FixFileOutcome::Rejected); \
          got: {quiet_json_stderr:?}"
     );
     assert_eq!(
@@ -5256,7 +5263,7 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
         "dir --format json --fix: --quiet must not move the exit code"
     );
 
-    // Preview path (lint.rs:1617): --fix --check --format json.
+    // Preview path (lint_one_file_accumulating, PreviewOutcome::Rejected): --fix --check --format json.
     let loud_json_check = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
     let loud_json_check_stderr = String::from_utf8_lossy(&loud_json_check.stderr);
     assert!(
@@ -5270,8 +5277,9 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
     let quiet_json_check_stderr = String::from_utf8_lossy(&quiet_json_check.stderr);
     assert!(
         !quiet_json_check_stderr.contains(needle),
-        "dir --fix --check --format json --quiet must suppress 'fix rejected:' (D4/PF-004 \
-         lint.rs:1617); got: {quiet_json_check_stderr:?}"
+        "dir --fix --check --format json --quiet must suppress 'fix rejected:' \
+         (D4/PF-004 lint_one_file_accumulating PreviewOutcome::Rejected); \
+         got: {quiet_json_check_stderr:?}"
     );
     assert_eq!(
         quiet_json_check.status.code(),
@@ -5395,9 +5403,9 @@ fn cap_notice_honours_quiet_in_all_four_modes() {
 
     // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
     // PF-004: --format json routes directory files through lint_one_file_accumulating,
-    // a SEPARATE emitter from lint_one_file_human (Mode 3).  The cap-notice gate at
-    // lint.rs:1492 (`if fix && !quiet`) must also be tested; a regression that
-    // unguarded lint_one_file_accumulating would pass Modes 1–3 and escape CI.
+    // a SEPARATE emitter from lint_one_file_human (Mode 3).  The cap-notice gate
+    // (`if fix && !quiet`) inside lint_one_file_accumulating must also be tested;
+    // a regression that leaves it unguarded would pass Modes 1–3 and escape CI.
     // The same temp `dir` / `cap.mds` file is reused (not modified by --fix --check).
 
     // Positive control: without --quiet the cap notice MUST appear.
@@ -5417,7 +5425,7 @@ fn cap_notice_honours_quiet_in_all_four_modes() {
     assert!(
         !quiet_json_stderr.contains(needle),
         "directory --fix --check --format json --quiet must suppress the cap notice \
-         (D4/PF-004 lint.rs:1492); got: {quiet_json_stderr:?}"
+         (D4/PF-004 lint_one_file_accumulating cap-notice gate); got: {quiet_json_stderr:?}"
     );
     assert_eq!(
         quiet_json.status.code(),
@@ -5762,7 +5770,7 @@ fn lint_directory_quiet_works_in_pre_subcommand_position() {
 // D3-a: per-file analysis failures are counted in the "with errors" bucket
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// spec.md §7.5 "With errors" bullet (lines 963-965): "error-severity lint findings
+// spec.md §7.5 "With errors" bullet (lines 964-966): "error-severity lint findings
 // OR a per-file analysis failure (source read, config load, or lint call failure)".
 // Every prior #216 test populates the error bucket via lint findings (lint_error.mds).
 // The tests below exercise the analysis-failure half, which has separate code paths
@@ -5864,7 +5872,7 @@ fn lint_directory_config_failure_forces_summary_under_quiet() {
 //
 // A chmod-000 file causes a source-read IO error in the lint engine, which must be
 // counted as FileTally::Error (not FileTally::Clean).  This is the source-read
-// population of the "with errors" disjunction (spec.md §7.5 lines 963-965).
+// population of the "with errors" disjunction (spec.md §7.5 lines 964-966).
 //
 // Not run on Windows where permission enforcement uses ACLs, not Unix mode bits.
 // Running as root bypasses Unix permission checks: the chmod-000 file is readable,
