@@ -5108,7 +5108,7 @@ fn lint_directory_summary_is_not_forgeable() {
 
     // Use error-severity content so the file is lint-processed and its path
     // appears in the output (duplicate-export from lint_error.mds content).
-    let error_content = fs::read(&fixture("lint_error.mds")).unwrap();
+    let error_content = fs::read(fixture("lint_error.mds")).unwrap();
     fs::write(&hostile_path, &error_content).unwrap();
 
     let out = lint_path(dir.path(), &[]);
