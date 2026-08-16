@@ -16,11 +16,14 @@
 //!
 //! # `--quiet` status-message contract (#216, decision D4)
 //!
-//! Every *status* message on stderr is gated on `!quiet` in **all three input modes**
-//! (directory, single file, stdin) — `Fixed:`, `Partially fixed:`, `Would fix:`,
-//! `Clean:`, `fix rejected:`, the diagnostic-cap notice, and the directory summary.
+//! Every *status* message on stderr is gated on `!quiet` wherever it is emitted:
+//! `Fixed:`, `Partially fixed:`, `Would fix:`, `fix rejected:`, the diagnostic-cap
+//! notice, and the directory summary appear (and are gated) across all three input
+//! modes; `Clean:` is single-file/stdin only — directory mode emits no per-file
+//! clean message (PF-015: scoped claim rather than vacuously-true absolute).
 //! PF-004: these are separate emitters per mode, so a gate added to one must be added
-//! to all; issue #43/#173 was exactly this divergence for `Partially fixed:`.
+//! to all; issue #173 is the dispatch-spine refactor that addressed this divergence
+//! class for `Partially fixed:`.
 //!
 //! Two messages deliberately bypass `--quiet` because they signal a silent-CI-green-pass
 //! hazard rather than status: the all-excluded diagnostic in [`run_lint_directory`] and
@@ -1353,6 +1356,16 @@ fn run_lint_directory(
             max_tally = tally;
         }
     }
+    // AD-216-5: assert the four-counter partition invariant in production code
+    // (per project reliability rule: "Assert preconditions and invariants in
+    // production code — not just tests").  Zero release-build cost: debug_assert!
+    // compiles away in release mode.  Catches a future early continue/return inserted
+    // into the per-file loop body that would silently undercount the summary.
+    debug_assert_eq!(
+        clean_count + warn_file_count + error_file_count + limit_file_count,
+        files.len(),
+        "AD-216-5: FileTally partition invariant violated"
+    );
 
     // Emit JSON envelope BEFORE any early exit so consumers always receive parseable
     // output regardless of exit code (AC-F-14 / issue #36).
@@ -1519,6 +1532,10 @@ fn lint_one_file_accumulating(
                     eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
                     return FileTally::Error;
                 }
+                // PF-004: parity with lint_one_file_human — same quiet gate, same text.
+                if !quiet {
+                    eprintln!("Fixed: {}", safe_path(file));
+                }
                 tally_from_result(&residual)
             }
             FixFileOutcome::PartiallyFixed {
@@ -1527,7 +1544,7 @@ fn lint_one_file_accumulating(
                 applied_count,
                 total_count,
             } => {
-                // Unified message + quiet guard (issue #43 / #173).
+                // Unified message + quiet guard (#173).
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
@@ -1586,6 +1603,10 @@ fn lint_one_file_accumulating(
                     let label = safe_path(file);
                     let diff_str = render_unified_diff(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
+                }
+                // PF-004: parity with lint_one_file_human — same quiet gate, same text.
+                if check && !quiet {
+                    eprintln!("Would fix: {}", safe_path(file));
                 }
             }
             PreviewOutcome::Rejected(ref reason) => {

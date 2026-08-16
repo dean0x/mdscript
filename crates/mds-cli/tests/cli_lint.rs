@@ -55,6 +55,8 @@
 //! - D3-a (#216): config-load failure forces the summary under --quiet (positive control)
 //! - D3-a (#216, unix): chmod-000 source-read failure counted in the "with errors" bucket
 //! - D3-a (#216, unix): chmod-000 source-read failure forces summary under --quiet
+//! - D4 (#216, PF-004): `Fixed:` honours --quiet in dir-mode JSON emitter (positive + negative)
+//! - D4 (#216, PF-004): `Would fix:` honours --quiet in dir-mode JSON emitter (positive + negative)
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -5856,4 +5858,98 @@ fn lint_directory_unreadable_file_forces_summary_under_quiet() {
         "positive control: non-quiet run with unreadable file must also show 'with errors', \
          proving the --quiet assertion is non-vacuous; got: {control_stderr:?}"
     );
+}
+
+// ── D4 (PF-004): Fixed: and Would fix: honour --quiet in dir-mode JSON emitter ─
+//
+// Finding: lint_one_file_accumulating (JSON) was missing Fixed: and Would fix:
+// messages, creating a divergence from lint_one_file_human (PF-004 class).
+// These tests verify: (a) the messages appear without --quiet (positive control per
+// PF-013/ADR-009), and (b) --quiet suppresses them.
+
+/// D4/PF-004: dir-mode `--fix --format json` emits `Fixed:` to stderr (positive),
+/// and `--quiet` suppresses it (negative).  Both arms per PF-013.
+#[test]
+fn dir_json_fix_emits_fixed_and_quiet_suppresses_it() {
+    // Case A (positive control — ADR-009/PF-013): Fixed: must appear without --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix --format json must emit 'Fixed:' without --quiet; \
+             got stderr: {stderr}"
+        );
+        // Stdout must remain parseable JSON (PR1 contract: stdout carries ONLY the JSON).
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}")
+        });
+    }
+
+    // Case B (quiet gate): Fixed: must be suppressed by --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix --format json --quiet must suppress 'Fixed:'; \
+             got stderr: {stderr}"
+        );
+        // Stdout must still be parseable JSON even under --quiet.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("stdout must remain valid JSON under --quiet; err: {e}; stdout: {stdout}")
+        });
+    }
+}
+
+/// D4/PF-004: dir-mode `--fix --check --format json` emits `Would fix:` to stderr
+/// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013.
+#[test]
+fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
+    // Case A (positive control — ADR-009/PF-013): Would fix: must appear without --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        // Use a fresh copy so any prior --fix write in this run doesn't affect us.
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Would fix:"),
+            "D4/PF-004: dir --fix --check --format json must emit 'Would fix:' without \
+             --quiet; got stderr: {stderr}"
+        );
+        // Stdout must remain parseable JSON (PR1 contract).
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}")
+        });
+    }
+
+    // Case B (quiet gate): Would fix: must be suppressed by --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--check", "--format", "json", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Would fix:"),
+            "D4/PF-004: dir --fix --check --format json --quiet must suppress 'Would fix:'; \
+             got stderr: {stderr}"
+        );
+        // Stdout must still be parseable JSON.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("stdout must remain valid JSON under --quiet; err: {e}; stdout: {stdout}")
+        });
+    }
 }
