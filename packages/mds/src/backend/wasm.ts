@@ -375,12 +375,16 @@ function compileOpts(
 function checkOpts(
   options?: CheckOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
-  // D-TS-06: forward only the checkFile-surface keys (vars only) via METHOD_KEYS.checkFile,
-  // mirroring compileOpts (which uses 'compileFile'). basePath is excluded from
-  // METHOD_KEYS.checkFile and the caller guards against it before reaching here;
-  // forwardOpts cannot include it. This makes METHOD_KEYS the single source of truth
-  // for what is forwarded from CheckOptions to the WASM module (avoids PF-004).
-  const extra = forwardOpts(options, 'checkFile');
+  // D-TS-06: forward only the check-surface keys via METHOD_KEYS.check, which is
+  // derived from CheckOptions — the same interface as this function's parameter.
+  // METHOD_KEYS.check includes basePath, but forwardOpts only forwards keys whose
+  // value is != null; the caller already threw when basePath was non-null, so
+  // basePath is never included in the forwarded object. Using 'check' (not
+  // 'checkFile') keeps the key list tied to CheckOptions so a future key added to
+  // that interface automatically propagates here — eliminating the PF-004 / #180
+  // topology where METHOD_KEYS.check gained a key but this call forwarded via a
+  // different surface's list and silently dropped it.
+  const extra = forwardOpts(options, 'check');
   return extra != null
     ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, ...extra }
     : DEFAULT_COMPILE_OPTS;
