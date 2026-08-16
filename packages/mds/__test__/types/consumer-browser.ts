@@ -21,6 +21,7 @@ import type {
   LintRuleName,
   LintSpan,
   RuleSeverity,
+  SourceMapV3,
 } from '../../dist/browser.js';
 
 // ── Positive: basePath accepted on string-surface types ───────────────────────
@@ -40,5 +41,10 @@ const _result: LintResult = { version: 1, files: [_report], truncated: false };
 const _severity: RuleSeverity = 'error';
 const _ruleName: LintRuleName = 'empty-block';
 
+// SourceMapV3 must also be nameable from the browser entry — compile({sourceMap:true})
+// is supported there, so consumers need the result type.
+const _sourceMap: SourceMapV3 = { version: 3, sources: ['input.mds'], names: [], mappings: '' };
+
 void _compileOpts; void _checkOpts; void _lintOpts; void _lintFileOpts;
 void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;
+void _sourceMap;

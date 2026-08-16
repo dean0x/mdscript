@@ -15,6 +15,7 @@
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import {
   compile,
   check,
@@ -369,7 +370,14 @@ describe('options-validation', () => {
     return require('@mdscript/mds-napi');
   }
 
-  const FIXTURES = path.join(new URL('.', import.meta.url).pathname, 'fixtures');
+  // fileURLToPath, NOT URL.pathname: on Windows `new URL('.', import.meta.url).pathname`
+  // yields "/C:/..." (leading slash, drive letter) and percent-encodes spaces, so
+  // path.join produces a path that cannot be resolved. windows-latest is in the JS CI
+  // matrix (ci.yml `js` job), and every other spec in this package already uses
+  // fileURLToPath — matching that pattern here (avoids the PF-003 Windows-path class).
+  const TEST_DIR = fileURLToPath(new URL('.', import.meta.url));
+  const PKG_DIR = fileURLToPath(new URL('..', import.meta.url));
+  const FIXTURES = path.join(TEST_DIR, 'fixtures');
   const IMPORT_SRC = '@import { greet } from "./import_provider.mds"\n\n{{greet("World")}}\n';
 
   test('U-OV-21: native compile honors basePath for import resolution (AC-P3-01)', () => {
@@ -515,8 +523,8 @@ describe('options-validation', () => {
 
   // ── cross-backend message equality for file basePath (AC-P3-06 / U-OV-27) ─
 
-  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical on native and WASM (AC-P3-06, avoids PF-007)', async () => {
-    requireNativeAddon(); // hard-fail without addon
+  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical to napi and backend-independent (AC-P3-06, avoids PF-007)', async () => {
+    const addon = requireNativeAddon(); // hard-fail without addon
 
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-'));
     const file = path.join(tmp, 'ok.mds');
@@ -529,13 +537,26 @@ describe('options-validation', () => {
 
     try {
       for (const method of ['compileFile', 'checkFile']) {
-        // Native path: comes through the napi addon.
-        const nativeMsg = await captureMsg(
+        // The wrapper's public file methods short-circuit basePath in node.ts
+        // (fileBasePathError) BEFORE backend dispatch — verified below by the
+        // backend-independence leg. That makes the wrapper message the operative
+        // one on every backend, so the authoritative parity assertion is
+        // wrapper-vs-napi, NOT wrapper-vs-wrapper.
+        const wrapperMsg = await captureMsg(
           () => (method === 'compileFile' ? compileFile : checkFile)(file, { basePath: '.' }),
         );
-        // WASM path: set MDS_BACKEND=wasm via env then run in subprocess — or
-        // drive the WASM path directly via wrapWithFileOps. We use a subprocess
-        // for full isolation (no shared module singleton).
+
+        // LEG 1 (the real drift guard): compare against the RAW napi addon, which
+        // owns the canonical message (parse_file_opts / parse_check_file_opts in
+        // crates/mds-napi/src/lib.rs). Nothing else in the suite pins these two
+        // together; without this leg, editing either string silently diverges the
+        // surfaces because the wrapper never calls napi for this input.
+        const napiMsg = await captureMsg(
+          () => (method === 'compileFile' ? addon.compileFile : addon.checkFile)(file, { basePath: '.' }),
+        );
+
+        // LEG 2: the same public call under MDS_BACKEND=wasm must produce the same
+        // message. Subprocess for full isolation (no shared module singleton).
         const { execFileSync } = await import('node:child_process');
         const wasmMsg = await captureMsg(() => {
           const script = `
@@ -547,19 +568,28 @@ ${method}(${JSON.stringify(file)}, { basePath: '.' }).catch(e => {
 `;
           const out = execFileSync(process.execPath, ['--input-type=module'], {
             input: script,
-            cwd: new URL('..', import.meta.url).pathname,
+            cwd: PKG_DIR,
             env: { ...process.env, MDS_BACKEND: 'wasm' },
             timeout: 15000,
           });
           throw new Error(out.toString().trim() || 'WASM subprocess produced no output');
         });
 
-        assert.ok(nativeMsg.length > 0, `native ${method} must throw for basePath`);
-        assert.ok(wasmMsg.length > 0, `WASM ${method} must throw for basePath`);
+        // Positive controls: every leg must have actually produced an error. A
+        // silently-empty message would make the equality assertions vacuous.
+        assert.ok(wrapperMsg.length > 0, `wrapper ${method} must throw for basePath`);
+        assert.ok(napiMsg.length > 0, `napi ${method} must throw for basePath`);
+        assert.ok(wasmMsg.length > 0, `WASM-backend ${method} must throw for basePath`);
+
         assert.strictEqual(
-          nativeMsg,
+          wrapperMsg,
+          napiMsg,
+          `wrapper must match napi byte-for-byte for ${method} — wrapper: "${wrapperMsg}" | napi: "${napiMsg}"`,
+        );
+        assert.strictEqual(
+          wrapperMsg,
           wasmMsg,
-          `byte-identical messages required for ${method} — native: "${nativeMsg}" | wasm: "${wasmMsg}"`,
+          `message must be backend-independent for ${method} — native-default: "${wrapperMsg}" | MDS_BACKEND=wasm: "${wasmMsg}"`,
         );
       }
     } finally {
@@ -569,41 +599,63 @@ ${method}(${JSON.stringify(file)}, { basePath: '.' }).catch(e => {
 
   // ── {basePath: undefined} cross-backend parity (AC-P3-08 / U-OV-29) ────────
 
-  test('U-OV-29: {basePath: undefined} has consistent throw/no-throw on both backends for compile/check (AC-P3-08)', async () => {
+  test('U-OV-29: {basePath: undefined} has consistent throw/no-throw on both backends for compile/check/compileFile/checkFile (AC-P3-08)', async () => {
     requireNativeAddon(); // hard-fail without addon
 
     // Semantic: basePath: undefined is treated as absent ("value is intent") on the
     // wrapper side. The WASM guard checks != null so undefined passes through.
-    // On native, napi sees the property but its value is undefined/null and does not
-    // trigger basePath handling. Both backends must agree.
+    // On native, the per-surface builders drop the undefined value entirely, so napi's
+    // has_named_property("basePath") gate never sees the key. Both backends must agree.
+    //
+    // AC-P3-08 requires all FOUR methods: the file surfaces are the interesting half,
+    // because napi keys off property PRESENCE — if a builder ever forwarded
+    // `basePath: undefined` verbatim, native would throw while WASM would not.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-undef-'));
+    const file = path.join(tmp, 'ok.mds');
+    fs.writeFileSync(file, 'Hello\n', 'utf8');
+
     const methods = [
-      { name: 'compile', fn: (opts) => compile('Hello\n', opts) },
-      { name: 'check',   fn: (opts) => check('Hello\n', opts) },
+      { name: 'compile',     call: 'compile(SRC, OPTS)',        fn: (opts) => compile('Hello\n', opts) },
+      { name: 'check',       call: 'check(SRC, OPTS)',          fn: (opts) => check('Hello\n', opts) },
+      { name: 'compileFile', call: 'await compileFile(F, OPTS)', fn: (opts) => compileFile(file, opts) },
+      { name: 'checkFile',   call: 'await checkFile(F, OPTS)',   fn: (opts) => checkFile(file, opts) },
     ];
 
-    for (const { name, fn } of methods) {
-      let nativeThrew = false;
-      try { fn({ basePath: undefined }); } catch { nativeThrew = true; }
+    try {
+      for (const { name, call, fn } of methods) {
+        let nativeThrew = false;
+        try { await fn({ basePath: undefined }); } catch { nativeThrew = true; }
 
-      // WASM path via subprocess. init() must be awaited before compile/check.
-      const { execFileSync } = await import('node:child_process');
-      let wasmThrew = false;
-      try {
-        execFileSync(process.execPath, ['--input-type=module'], {
-          input: `import { init, ${name} } from './dist/node.js'; await init(); try { ${name}('Hello\\n', { basePath: undefined }); process.exit(0); } catch { process.exit(1); }`,
-          cwd: new URL('..', import.meta.url).pathname,
-          env: { ...process.env, MDS_BACKEND: 'wasm' },
-          timeout: 15000,
-        });
-      } catch {
-        wasmThrew = true;
+        // WASM path via subprocess. init() must be awaited before any method.
+        const { execFileSync } = await import('node:child_process');
+        let wasmThrew = false;
+        try {
+          const script = [
+            `import { init, ${name} } from './dist/node.js';`,
+            `const SRC = 'Hello\\n';`,
+            `const F = ${JSON.stringify(file)};`,
+            `const OPTS = { basePath: undefined };`,
+            `await init();`,
+            `try { ${call}; process.exit(0); } catch { process.exit(1); }`,
+          ].join('\n');
+          execFileSync(process.execPath, ['--input-type=module'], {
+            input: script,
+            cwd: PKG_DIR,
+            env: { ...process.env, MDS_BACKEND: 'wasm' },
+            timeout: 15000,
+          });
+        } catch {
+          wasmThrew = true;
+        }
+
+        assert.strictEqual(
+          nativeThrew,
+          wasmThrew,
+          `${name}: native (threw=${nativeThrew}) and WASM (threw=${wasmThrew}) must agree on {basePath: undefined}`,
+        );
       }
-
-      assert.strictEqual(
-        nativeThrew,
-        wasmThrew,
-        `${name}: native (threw=${nativeThrew}) and WASM (threw=${wasmThrew}) must agree on {basePath: undefined}`,
-      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
 

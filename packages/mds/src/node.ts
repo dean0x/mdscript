@@ -63,8 +63,12 @@ export function _resetForTesting(): void {
  * other errors while making basePath a proper promise rejection) can share one
  * message string, satisfying U-OV-27's byte-identical requirement (avoids PF-007).
  *
- * Message is byte-identical to napi parse_file_opts (lib.rs) so that U-OV-27
- * can assert runtime equality across both backends.
+ * Message is byte-identical to napi `parse_file_opts` / `parse_check_file_opts`
+ * (crates/mds-napi/src/lib.rs). Because this guard short-circuits BEFORE backend
+ * dispatch, napi never actually produces the message for a public `compileFile` /
+ * `checkFile` call — so nothing enforces the two strings staying in sync except
+ * U-OV-27, which compares this message against the raw addon's at runtime. Keep
+ * the two in lockstep; editing either alone fails that test.
  */
 function fileBasePathError(): Error & { code: string } {
   const err = new Error(
@@ -382,4 +386,5 @@ export type {
   MessagesResult,
   MdsError,
   MdsErrorSpan,
+  SourceMapV3,
 } from './types.js';

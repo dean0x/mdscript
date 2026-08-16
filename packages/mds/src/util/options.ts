@@ -85,6 +85,15 @@ const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
  * interception (issue #74). The backend emits a purpose-built actionable error
  * for these methods ("not valid for compileFile/checkFile; the base directory is
  * derived from the file path") rather than the generic "unknown option key" format.
+ *
+ * KNOWN RESIDUAL (OD-5): napi also has purpose-built `basePath` messages for
+ * `lintFile` ("not valid for lintFile; …") and `lintVirtual`, but those two methods
+ * are deliberately NOT in this set. The wrapper intercepts them first and emits the
+ * generic `unknown option key "basePath"; recognised keys are: vars, rules` form, so
+ * the wrapper and napi messages diverge for that one input. This is intentional and
+ * locked in by U-OV-7 and U-OV-13; the generic message still names the offending key
+ * and is a hard error either way. Widening this set would change those two messages
+ * and is deferred rather than bundled into #180/#215/#213.
  */
 const BASEPATH_PASSTHROUGH: ReadonlySet<MethodName> = new Set<MethodName>([
   'compileFile',

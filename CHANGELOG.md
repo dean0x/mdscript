@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LINT_RULE_NAMES` constant are now exported from both the Node.js and browser entry
   points.
 
+- **`SourceMapV3` is now exported from the Node.js and browser entry points.**
+  `MarkdownResult.sourceMap` has always been typed as `SourceMapV3`, but the type was
+  only re-exported from `index.ts`, which the package `exports` map does not resolve —
+  so consumers could receive the value but not name its type. Purely additive.
+
 ### **BREAKING** — TypeScript option types and WASM `basePath` rejection (#213, #180)
 
 #### `FileOptions` no longer extends `CompileOptions` (#213)

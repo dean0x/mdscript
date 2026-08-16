@@ -176,9 +176,24 @@ describe('browser entry — post-init', () => {
     assert.equal(result.version, 1);
     assert.ok(Array.isArray(result.files));
     assert.equal(result.truncated, false);
-    // files contains reports keyed by entry name or dep name.
+    // The entry key must appear in the report, and it must carry a real finding
+    // (the unused frontmatter variable). `files.length >= 0` would be a tautology —
+    // it holds for an empty array and so cannot distinguish a working lintVirtual
+    // from one that silently returns no findings.
     const fileNames = result.files.map((f) => f.file);
-    assert.ok(fileNames.length >= 0, 'lintVirtual must return a valid result');
+    assert.ok(
+      fileNames.includes('main.mds'),
+      `expected entry 'main.mds' in report; got: [${fileNames.join(', ')}]`,
+    );
+    const entryReport = result.files.find((f) => f.file === 'main.mds');
+    assert.ok(
+      entryReport.diagnostics.length > 0,
+      'expected at least one diagnostic for the unused frontmatter variable',
+    );
+    assert.ok(
+      entryReport.diagnostics.some((d) => d.rule === 'unused-variable'),
+      `expected an unused-variable diagnostic; got rules: [${entryReport.diagnostics.map((d) => d.rule).join(', ')}]`,
+    );
   });
 
   test('U-BR19: browser lint/lintVirtual reject unknown option keys (AC-P3-14)', () => {

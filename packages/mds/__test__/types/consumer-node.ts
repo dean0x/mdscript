@@ -26,7 +26,9 @@ import type {
   LintResult,
   LintRuleName,
   LintSpan,
+  MarkdownResult,
   RuleSeverity,
+  SourceMapV3,
 } from '../../dist/node.js';
 
 // ── Positive cases: basePath accepted on string-surface types ─────────────────
@@ -56,11 +58,29 @@ const _checkFileOpts: CheckFileOptions = { basePath: '/some/dir' };
 // @ts-expect-error — basePath is intentionally absent from LintFileOptions
 const _lintFileOpts: LintFileOptions = { basePath: '/some/dir' };
 
-// ── PR2 guard: invalid rule name must be rejected in LintOptions ──────────────
-// D-224-1 introduced LintRuleName; ensure the type fixture protects both PRs.
+// ── PR2 guard: rule-name and severity typing on LintOptions ──────────────────
+// D-224-1 ruling: an unrecognised RULE NAME is deliberately NOT a type error —
+// `rules` is `Record<string, RuleSeverity>` so configs naming a rule added in a
+// newer binary still compile; the engine warns at runtime via
+// LintResult.lint_warnings. Both cases below must therefore be ACCEPTED.
 const _validRule: LintOptions = { rules: { 'unused-variable': 'warn' } };
-// Record<string, RuleSeverity> is accepted for forward compatibility.
 const _fwdCompat: LintOptions = { rules: { 'a-future-rule': 'off' } };
+
+// The SEVERITY value, by contrast, IS a closed set — an invalid severity must be a
+// type error. This is the negative control proving `rules` is not typed as
+// `Record<string, string>`: if RuleSeverity were widened, tsc reports
+// "Unused @ts-expect-error directive" and the build fails.
+// @ts-expect-error — 'sometimes' is not a RuleSeverity ('error' | 'warn' | 'info' | 'off')
+const _badSeverity: LintOptions = { rules: { 'unused-variable': 'sometimes' } };
+
+// ── SourceMapV3 must be nameable from the entry the exports map resolves ──────
+// MarkdownResult.sourceMap is typed as SourceMapV3; a consumer that cannot name
+// the type cannot annotate the value. dist/index.d.ts does not count — index.ts
+// is unreachable through the package `exports` map (see the note in src/index.ts).
+const _sourceMap: SourceMapV3 = { version: 3, sources: ['input.mds'], names: [], mappings: '' };
+const _markdown: MarkdownResult = {
+  kind: 'markdown', output: '', warnings: [], dependencies: [], sourceMap: _sourceMap,
+};
 
 // ── AC-P3-16: all lint types are nameable from the browser surface ─────────────
 // (browser types are verified in consumer-browser.ts; here we just confirm they
@@ -75,5 +95,6 @@ const _ruleName: LintRuleName = 'unused-variable';
 // Prevent unused-variable TS errors for the above declarations.
 void _compileOpts; void _checkOpts; void _lintOpts;
 void _fileOpts; void _checkFileOpts; void _lintFileOpts;
-void _validRule; void _fwdCompat;
+void _validRule; void _fwdCompat; void _badSeverity;
+void _sourceMap; void _markdown;
 void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;

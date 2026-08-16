@@ -44,7 +44,9 @@ type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string,
  * Shape of the napi addon exports.
  * compile/check accept { basePath?, vars?, sourceMap?, sourcesContent? } for string sources.
  * compileFile/checkFile accept { vars?, sourceMap?, sourcesContent? } for file paths.
- * lint/lintFile/lintVirtual accept { basePath?, vars?, rules? }.
+ * lint accepts { basePath?, vars?, rules? }; lintFile/lintVirtual accept only
+ * { vars?, rules? } — napi rejects `basePath` on both (parse_lint_file_opts /
+ * parse_lint_virtual_opts in crates/mds-napi/src/lib.rs).
  */
 interface NapiAddon {
   compile(source: string, opts?: NapiCompileOpts): unknown;

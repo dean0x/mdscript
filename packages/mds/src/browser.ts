@@ -34,6 +34,7 @@ export type {
   MdsError,
   MdsErrorSpan,
   RuleSeverity,
+  SourceMapV3,
 } from './types.js';
 
 let resolvedBackend: MdsBaseBackend | undefined;
