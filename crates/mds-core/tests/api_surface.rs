@@ -1086,7 +1086,10 @@ fn lint_api_signatures_exist() {
 /// L-API-2: pub types LintDiagnostic, Severity, LintConfig, LintResult are accessible
 /// and have the expected fields/variants.
 #[test]
-#[allow(deprecated)] // exercises LintConfig::from_rules for surface coverage
+#[expect(
+    deprecated,
+    reason = "L-API-2: pins LintConfig::from_rules deprecated constructor for surface coverage; fires unfulfilled_lint_expectations if the deprecation is removed"
+)]
 fn lint_types_exist() {
     // Severity has four variants with lowercase serde names.
     let _off = Severity::Off;
@@ -1142,7 +1145,10 @@ fn lint_types_exist() {
 /// - `UnknownRuleNames` exposes names via accessor, not a public field, and is
 ///   only constructible through the library.
 #[test]
-#[allow(deprecated)] // exercises LintConfig::from_rules for surface coverage
+#[expect(
+    deprecated,
+    reason = "AC-224-7: pins LintConfig::from_rules deprecated constructor for surface coverage; fires unfulfilled_lint_expectations if the deprecation is removed"
+)]
 fn known_lint_rules_and_unknown_detection() {
     use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
 
@@ -1649,18 +1655,22 @@ fn fix_api_incremental_exists() {
     );
 }
 
-/// F-API-3: `apply_fixes` remains reachable on the public API surface and behaviorally
-/// unchanged while deprecated. Remove at v0.5.0 with the function (AD-209-1).
+/// F-API-3: `apply_fixes` remains reachable on the public API surface while deprecated.
+/// This test pins the function signature and the empty-plan early-return path (the
+/// reverify closure is never invoked when `plan.edits.is_empty()`). Remove at v0.5.0
+/// with the function (AD-209-1).
 ///
 /// AD-209-2: `#[expect(deprecated)]` was chosen over a `trybuild` compile-fail fixture
 /// because: (a) trybuild only asserts that the deprecation warning fires; it does not
-/// verify the function's signature or return value; (b) this test also asserts the
-/// runtime behavior (NothingToFix for an empty plan), giving a stronger pin; and
-/// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` under
-/// `cargo clippy --workspace --all-targets -- -D warnings` whenever the
-/// `#[deprecated]` attribute is removed from `apply_fixes`, providing the same
-/// "must not compile cleanly without the attribute" guarantee as trybuild without
-/// a separate test-driver crate.
+/// verify the function's signature or return value; (b) this test asserts the runtime
+/// behavior (NothingToFix for an empty plan -- the `plan.edits.is_empty()` early-return),
+/// giving a stronger pin than a compile-fail fixture alone; and
+/// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` when the
+/// `#[deprecated]` attribute is removed from `apply_fixes`. The mutation control
+/// requires two commands (applies ADR-009): `cargo clippy --workspace --all-targets
+/// -- -D warnings` reports 10 expectations (all in fix.rs) and aborts before the
+/// api_surface integration-test target is compiled; `cargo clippy -p mds-core
+/// --test api_surface -- -D warnings` reports this pin individually.
 ///
 /// All values constructed via named constructors, never struct literals (applies ADR-010).
 #[expect(
