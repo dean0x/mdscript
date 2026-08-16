@@ -17,7 +17,7 @@ import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
 import { buildModulesMap } from './util/module-scanner.js';
-import { assertKnownKeys, getBasePathError } from './util/options.js';
+import { assertKnownKeys, forwardOpts, getBasePathError } from './util/options.js';
 
 // Read MDS_BACKEND at module scope — sync, deterministic, no I/O.
 const rawBackend = process.env['MDS_BACKEND'];
