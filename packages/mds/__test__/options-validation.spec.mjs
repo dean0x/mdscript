@@ -436,7 +436,11 @@ describe('options-validation', () => {
   // ── forwarding drift guard: spy addon (AC-P3-04 / AC-P3-05) ──────────────
 
   test('U-OV-24: all 7 methods forward exactly the accepted keys to the backend (AC-P3-04, AC-P3-05)', async () => {
-    requireNativeAddon(); // hard-fail without addon
+    // No requireNativeAddon() here: the backend under test is a spy object injected
+    // directly into createNativeBackend(), making this test fully environment-independent.
+    // Adding requireNativeAddon() would couple the highest-value drift-guard test to
+    // native-addon availability, which is the opposite of what a forwarding-parity
+    // test should require.
     const { createNativeBackend } = await import('../dist/backend/native.js');
 
     // Minimal valid result shapes for each assertResultShape kind.
@@ -464,8 +468,8 @@ describe('options-validation', () => {
     //
     // MAINTENANCE NOTE: if a new option key is added to any option interface,
     // add a non-null entry here — without it, fullOpts() would supply `undefined`
-    // for the new key, and pickDefined / lintOpt / lintFileOpt would correctly
-    // omit it, making the deepStrictEqual pass vacuously for that key.
+    // for the new key, and forwardOpts would correctly omit it (its != null check
+    // skips absent keys), making the deepStrictEqual pass vacuously for that key.
     const KEY_VALUES = {
       basePath: '/some/base/path',
       vars: { k: 1 },
@@ -476,11 +480,11 @@ describe('options-validation', () => {
 
     // Build an options object with ALL keys that METHOD_KEYS[method] accepts,
     // each with a distinguishable value. This is the AC-P3-05 positive control:
-    // if a key is added to METHOD_KEYS (accepted at validation) but omitted from
-    // the forwarding builder (pickDefined / lintOpt / lintFileOpt), expected still
-    // includes that key, so deepStrictEqual catches the drift — reproducing the
-    // #180 bug class at the point of introduction rather than at runtime in
-    // production (avoids PF-013: a hand-typed expected cannot detect this drift).
+    // if a key is added to METHOD_KEYS (accepted at validation) but not forwarded
+    // by forwardOpts (e.g. accidentally excluded), expected still includes that key
+    // so deepStrictEqual catches the drift — reproducing the #180 bug class at the
+    // point of introduction rather than at runtime in production (avoids PF-013:
+    // a hand-typed expected cannot detect this drift).
     function fullOpts(methodName) {
       const keys = METHOD_KEYS[methodName] ?? [];
       const obj = {};
@@ -620,27 +624,43 @@ describe('options-validation', () => {
         try { await fn({ basePath: undefined }); } catch { nativeThrew = true; }
 
         // WASM path via subprocess. init() must be awaited before any method.
+        // The subprocess emits getBackend() to stdout so the parent can verify the
+        // WASM backend was actually selected — MDS_BACKEND=wasm is advisory and
+        // node.ts only console.warns on unrecognised values, so a drift in the
+        // env-var name or accepted values would silently fall back to native.
+        // Capturing and asserting the backend string here guards against that.
         const { execFileSync } = await import('node:child_process');
         let wasmThrew = false;
+        let wasmBackendStr = '';
+        const script = [
+          `import { init, getBackend, ${name} } from './dist/node.js';`,
+          `const SRC = 'Hello\\n';`,
+          `const F = ${JSON.stringify(file)};`,
+          `const OPTS = { basePath: undefined };`,
+          `await init();`,
+          `process.stdout.write(getBackend());`,
+          `try { ${call}; process.exit(0); } catch { process.exit(1); }`,
+        ].join('\n');
         try {
-          const script = [
-            `import { init, ${name} } from './dist/node.js';`,
-            `const SRC = 'Hello\\n';`,
-            `const F = ${JSON.stringify(file)};`,
-            `const OPTS = { basePath: undefined };`,
-            `await init();`,
-            `try { ${call}; process.exit(0); } catch { process.exit(1); }`,
-          ].join('\n');
-          execFileSync(process.execPath, ['--input-type=module'], {
+          wasmBackendStr = execFileSync(process.execPath, ['--input-type=module'], {
             input: script,
             cwd: PKG_DIR,
             env: { ...process.env, MDS_BACKEND: 'wasm' },
             timeout: 15000,
+            encoding: 'utf8',
           });
-        } catch {
+        } catch (e) {
           wasmThrew = true;
+          // stdout is populated even when exit code is non-zero (the method threw)
+          wasmBackendStr = typeof e.stdout === 'string' ? e.stdout : '';
         }
 
+        assert.strictEqual(
+          wasmBackendStr,
+          'wasm',
+          `${name}: WASM subprocess must use the wasm backend (getBackend() returned ` +
+            `${JSON.stringify(wasmBackendStr)}) — MDS_BACKEND=wasm may be unrecognised`,
+        );
         assert.strictEqual(
           nativeThrew,
           wasmThrew,
