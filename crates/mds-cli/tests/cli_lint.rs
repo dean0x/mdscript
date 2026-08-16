@@ -5011,6 +5011,20 @@ fn lint_single_file_prints_no_directory_summary() {
         !stderr.contains("clean,"),
         "AC-Q18: single-file lint must NOT print a directory summary; got: {stderr:?}"
     );
+
+    // PF-013 / ADR-009: the absence assertion above is only meaningful if "clean," is
+    // the exact substring a real directory summary contains.  A typo in the needle would
+    // make the assertion pass on any output at all.  Prove the needle by running the same
+    // source through directory mode, where the summary IS expected.
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+    let control = lint_path(dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: the same source in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
 }
 
 // ── AC-Q19: stdin lint prints no directory summary ────────────────────────────
@@ -5360,6 +5374,18 @@ fn bare_lint_never_enters_directory_mode() {
         !stderr2.contains("clean,"),
         "AC-Q20: bare lint with two files must NOT emit a directory summary; got: {stderr2:?}"
     );
+
+    // PF-013 / ADR-009: prove "clean," is the exact substring a real directory summary
+    // contains, so both absence assertions above are not vacuous.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
+    let control = lint_path(control_dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: a clean file in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
 }
 
 // ── AC-Q21: empty and all-excluded directory print no summary ─────────────────
@@ -5427,6 +5453,20 @@ fn lint_directory_all_excluded_quiet_no_summary() {
         !stderr.contains("clean,"),
         "AC-Q22: all-excluded must NOT emit a summary line; got: {stderr:?}"
     );
+
+    // PF-013 / ADR-009: prove "clean," is the exact substring a real directory summary
+    // contains.  This scenario fires the all-excluded early return, so no summary is
+    // emitted even without --quiet.  The positive control must therefore use a separate
+    // directory that reaches the full summary path.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
+    let control = lint_path(control_dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: a clean file in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
 }
 
 // ── AC-Q25: hostile filename cannot forge a summary line ─────────────────────
@@ -5492,6 +5532,18 @@ fn lint_directory_summary_is_not_forgeable() {
         !stderr.lines().any(|l| l.trim() == forged_line),
         "AC-Q25: forged summary text must not appear as a standalone summary line; \
          got: {stderr:?}"
+    );
+
+    // AC-Q25 also requires the GENUINE summary appears exactly once, confirming the
+    // directory summary path was reached and a real count was emitted (not suppressed or
+    // omitted).  The directory contains exactly 1 error-severity file, so the genuine
+    // summary is the line below.
+    let genuine_summary = "0 clean, 0 with warnings, 1 with errors, 0 resource-limited";
+    let genuine_count = stderr.lines().filter(|l| l.trim() == genuine_summary).count();
+    assert_eq!(
+        genuine_count,
+        1,
+        "AC-Q25: genuine summary must appear exactly once in stderr; got: {stderr:?}"
     );
 }
 
