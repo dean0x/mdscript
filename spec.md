@@ -969,6 +969,10 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 - Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
   (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
   bucket, the summary is always emitted so the non-zero exit is never unexplained.
+  **Exception (D1-a):** `mds lint --fix --check --quiet <dir>` exits 1 with zero
+  stderr bytes when pending fixes exist but no file is in the error or
+  resource-limited bucket — the `--fix --check` pending-fix signal is treated as
+  status output and is suppressed by `--quiet` alongside the summary line.
 - The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
   regardless of `--quiet` or directory mode — no `"summary"` key is added (D2-B).
 

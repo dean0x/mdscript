@@ -346,8 +346,10 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "elapsed",
         "`u128` elapsed milliseconds from `Instant::elapsed().as_millis()` — pure arithmetic.",
     ),
-    // AD-216-3/5: four counters for the `mds lint <dir>` summary line.
-    // Names are file-unique (limit 2, :106-110) — none collide with existing lint.rs entries.
+    // AD-216-3/5/10: four counters for the `mds lint <dir>` summary line.
+    // AD-216-10: names are file-unique (limit 2, :106-110) — none collide with
+    // existing lint.rs entries; no future variable silently inherits an exemption
+    // by reusing an already-listed name.
     (
         "lint.rs",
         "clean_count",

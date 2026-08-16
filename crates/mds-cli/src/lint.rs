@@ -1231,6 +1231,11 @@ fn run_lint_directory(
     let walk = collect_mds_files_detailed(dir, MAX_DEPTH, None);
     let mut files = walk.files;
 
+    // AD-216-9: empty-dir early return emits no summary — the per-file loop never
+    // runs, so all four counters stay at zero and there is nothing meaningful to
+    // print.  The all-excluded diagnostic (below) bypasses --quiet and exits 2:
+    // parity with `build`/`check`/`fmt` (a silent non-zero exit here would be a
+    // bug, not a feature).
     if files.is_empty() {
         if walk.excluded_by_default > 0 {
             // Always emit — not suppressed by --quiet (avoids silent CI green pass).
@@ -1356,6 +1361,11 @@ fn run_lint_directory(
     // AD-216-8: emitted in both human and JSON format modes.  --format governs the
     // machine-readable channel (stdout); the summary is status output (stderr) and is
     // governed only by --quiet.
+    //
+    // AD-216-4: format — `{clean} clean, {warn} with warnings, {error} with errors,
+    // {limit} resource-limited`.  Fixed arity, comma-separated; matches the sibling
+    // shape used by `build`/`check`/`fmt` and keeps the line greppable across all
+    // summary-emitting subcommands.
     if !quiet || error_file_count > 0 || limit_file_count > 0 {
         eprintln!(
             "{clean_count} clean, {warn_file_count} with warnings, \
