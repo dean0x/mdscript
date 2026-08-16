@@ -39,7 +39,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --test __test__/*.spec.mjs",
+    "test": "tsc -p tsconfig.types.json && node --test __test__/*.spec.mjs",
     "test:native": "node --test __test__/native-backend.spec.mjs",
     "test:perf": "node --test __test__/perf.spec.mjs"
   },

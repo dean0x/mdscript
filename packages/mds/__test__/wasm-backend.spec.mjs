@@ -5,7 +5,7 @@
  * Imports dist/backend/wasm.js directly to exercise internal state
  * without going through the full node.ts entry point.
  */
-import { test, describe, afterEach } from 'node:test';
+import { test, describe, before, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initWasmNode, initWasmBrowser, createWasmBackend, _resetForTesting, validateWasmShape } from '../dist/backend/wasm.js';
 
@@ -261,6 +261,97 @@ describe('wasm backend — browser circuit breaker', () => {
         return true;
       },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WASM basePath rejection (OD-1 / AC-P3-09 / AC-P3-10)
+// ---------------------------------------------------------------------------
+
+describe('wasm backend — basePath rejection (OD-1)', () => {
+  let wasmMod;
+  before(async () => {
+    _resetForTesting(0);
+    wasmMod = await initWasmNode();
+  });
+
+  afterEach(() => {
+    _resetForTesting(0);
+  });
+
+  test('U-WB22: createWasmBackend.compile throws mds::invalid_options when basePath is set (AC-P3-09)', () => {
+    const be = createWasmBackend(wasmMod);
+    let caughtErr;
+    try { be.compile('Hello\n', { basePath: '.' }); } catch (e) { caughtErr = e; }
+
+    assert.ok(caughtErr instanceof Error, 'must throw an Error');
+    assert.equal(caughtErr.code, 'mds::invalid_options');
+    assert.ok(
+      caughtErr.message.includes('basePath'),
+      `message must name basePath: "${caughtErr.message}"`,
+    );
+    assert.ok(
+      caughtErr.message.includes('WASM') || caughtErr.message.includes('filesystem'),
+      `message must name the constraint: "${caughtErr.message}"`,
+    );
+    assert.ok(
+      caughtErr.message.includes('MDS_BACKEND=native') || caughtErr.message.includes('native'),
+      `message must name a remedy: "${caughtErr.message}"`,
+    );
+
+    // AC-P3-10: message must NOT contain internal WASM keys.
+    assert.ok(!caughtErr.message.includes('filename'), `must not expose "filename": "${caughtErr.message}"`);
+    assert.ok(!caughtErr.message.includes('modules'),  `must not expose "modules": "${caughtErr.message}"`);
+
+    // PF-013 positive control: calling the raw WASM module directly DOES produce the
+    // internal "filename"/"modules" error — proving the negative assertion above can
+    // detect a leak if the guard were removed.
+    let rawErr;
+    try { wasmMod.compile('Hello\n', { basePath: '.' }); } catch (e) { rawErr = e; }
+    assert.ok(rawErr instanceof Error, 'raw WASM module must throw for unknown basePath');
+    const rawMsg = rawErr.message ?? '';
+    assert.ok(
+      rawMsg.includes('filename') || rawMsg.includes('modules'),
+      `raw WASM error must contain internal keys (positive control): "${rawMsg}"`,
+    );
+  });
+
+  test('U-WB23: createWasmBackend.check throws mds::invalid_options when basePath is set (AC-P3-09)', () => {
+    const be = createWasmBackend(wasmMod);
+    assert.throws(
+      () => be.check('Hello\n', { basePath: '.' }),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('basePath'));
+        assert.ok(!err.message.includes('filename'), `must not expose "filename": "${err.message}"`);
+        assert.ok(!err.message.includes('modules'),  `must not expose "modules": "${err.message}"`);
+        return true;
+      },
+    );
+  });
+
+  test('U-WB24: createWasmBackend.lint throws mds::invalid_options when basePath is set (AC-P3-09)', () => {
+    const be = createWasmBackend(wasmMod);
+    assert.throws(
+      () => be.lint('Hello\n', { basePath: '.' }),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('basePath'));
+        assert.ok(!err.message.includes('filename'), `must not expose "filename": "${err.message}"`);
+        assert.ok(!err.message.includes('modules'),  `must not expose "modules": "${err.message}"`);
+        return true;
+      },
+    );
+  });
+
+  test('U-WB25: createWasmBackend accepts {basePath: undefined} for compile/check/lint (OD-6 semantic: undefined = absent)', () => {
+    const be = createWasmBackend(wasmMod);
+    // basePath: undefined is treated as absent (value-is-intent semantic).
+    assert.doesNotThrow(() => be.compile('Hello\n', { basePath: undefined }));
+    assert.doesNotThrow(() => be.check('Hello\n', { basePath: undefined }));
+    assert.doesNotThrow(() => be.lint('Hello\n', { basePath: undefined }));
   });
 });
 

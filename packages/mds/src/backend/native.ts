@@ -1,5 +1,6 @@
 import type {
   BackendType,
+  CheckFileOptions,
   CheckOptions,
   CheckResult,
   CompileOptions,
@@ -10,15 +11,10 @@ import type {
   LintResult,
   MdsNodeBackend,
 } from '../types.js';
-import { compileOpt, varsOpt } from '../util/options.js';
+import { forwardOpts } from '../util/options.js';
 import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS } from './contract.js';
 
-/** Options forwarded to the napi addon for source-string lint (accepts basePath). */
-type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
-/** Options forwarded to the napi addon for file-based and virtual lint. */
-type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
-
-/** Options shape forwarded to the napi addon for compile (string source). */
+/** Options forwarded to the napi addon for source-string compile (accepts basePath). */
 type NapiCompileOpts = {
   basePath?: string;
   vars?: Record<string, unknown>;
@@ -26,46 +22,45 @@ type NapiCompileOpts = {
   sourcesContent?: boolean;
 };
 
-/** Options shape forwarded to the napi addon for compileFile. */
+/** Options forwarded to the napi addon for source-string check (accepts basePath). */
+type NapiCheckOpts = {
+  basePath?: string;
+  vars?: Record<string, unknown>;
+};
+
+/** Options forwarded to the napi addon for compileFile (no basePath). */
 type NapiFileCompileOpts = {
   vars?: Record<string, unknown>;
   sourceMap?: boolean;
   sourcesContent?: boolean;
 };
 
+/** Options forwarded to the napi addon for checkFile (no basePath, no sourceMap). */
+type NapiFileCheckOpts = {
+  vars?: Record<string, unknown>;
+};
+
+/** Options forwarded to the napi addon for source-string lint (accepts basePath). */
+type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
+/** Options forwarded to the napi addon for file-based and virtual lint. */
+type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
+
 /**
  * Shape of the napi addon exports.
  * compile/check accept { basePath?, vars?, sourceMap?, sourcesContent? } for string sources.
- * compileFile/checkFile accept { vars?, sourceMap?, sourcesContent? } for file paths.
- * lint/lintFile/lintVirtual accept { basePath?, vars?, rules? }.
+ * compileFile accepts { vars?, sourceMap?, sourcesContent? }; checkFile accepts { vars? } only.
+ * lint accepts { basePath?, vars?, rules? }; lintFile/lintVirtual accept only
+ * { vars?, rules? } — napi rejects `basePath` on both (parse_lint_file_opts /
+ * parse_lint_virtual_opts in crates/mds-napi/src/lib.rs).
  */
 interface NapiAddon {
   compile(source: string, opts?: NapiCompileOpts): unknown;
-  check(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
+  check(source: string, opts?: NapiCheckOpts): unknown;
   compileFile(path: string, opts?: NapiFileCompileOpts): unknown;
-  checkFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
+  checkFile(path: string, opts?: NapiFileCheckOpts): unknown;
   lint(source: string, opts?: NapiLintOpts): unknown;
   lintFile(path: string, opts?: NapiLintFileOpts): unknown;
   lintVirtual(modules: Record<string, string>, entry: string, opts?: NapiLintFileOpts): unknown;
-}
-
-/** Build lint options from LintOptions, omitting null/undefined entries. */
-function lintOpt(options?: LintOptions): NapiLintOpts | undefined {
-  if (options == null) return undefined;
-  const out: NapiLintOpts = {};
-  if (options.basePath != null) out.basePath = options.basePath;
-  if (options.vars != null) out.vars = options.vars;
-  if (options.rules != null) out.rules = options.rules;
-  return Object.keys(out).length > 0 ? out : undefined;
-}
-
-/** Build lint file options from LintFileOptions, omitting null/undefined entries. */
-function lintFileOpt(options?: LintFileOptions): NapiLintFileOpts | undefined {
-  if (options == null) return undefined;
-  const out: NapiLintFileOpts = {};
-  if (options.vars != null) out.vars = options.vars;
-  if (options.rules != null) out.rules = options.rules;
-  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -85,43 +80,43 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
 
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const result: unknown = addon.compile(source, compileOpt(options) as NapiCompileOpts | undefined);
+      const result: unknown = addon.compile(source, forwardOpts(options, 'compile'));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     check(source: string, options?: CheckOptions): CheckResult {
-      const result: unknown = addon.check(source, varsOpt(options));
+      const result: unknown = addon.check(source, forwardOpts(options, 'check'));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-      const result: unknown = await addon.compileFile(path, compileOpt(options) as NapiFileCompileOpts | undefined);
+      const result: unknown = await addon.compileFile(path, forwardOpts(options, 'compileFile'));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
-    async checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
-      const result: unknown = await addon.checkFile(path, varsOpt(options));
+    async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
+      const result: unknown = await addon.checkFile(path, forwardOpts(options, 'checkFile'));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     lint(source: string, options?: LintOptions): LintResult {
-      const result: unknown = addon.lint(source, lintOpt(options));
+      const result: unknown = addon.lint(source, forwardOpts(options, 'lint'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },
 
     async lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
-      const result: unknown = await addon.lintFile(path, lintFileOpt(options));
+      const result: unknown = await addon.lintFile(path, forwardOpts(options, 'lintFile'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },
 
     lintVirtual(modules: Record<string, string>, entry: string, options?: LintFileOptions): LintResult {
-      const result: unknown = addon.lintVirtual(modules, entry, lintFileOpt(options));
+      const result: unknown = addon.lintVirtual(modules, entry, forwardOpts(options, 'lintVirtual'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },
