@@ -162,8 +162,11 @@ export interface FileOptions {
 /**
  * Options for file-based check-only operations.
  *
- * Mirrors {@link LintFileOptions}: `basePath` is absent because the base
- * directory is derived from the file path. Only `vars` is forwarded to the backend.
+ * `basePath` is not accepted on file operations: the base directory is derived
+ * from the file path. The `basePath?: never` declaration rejects assignment from
+ * any variable whose inferred type carries `basePath` (e.g. a `CheckOptions`
+ * value), producing a compile-time error rather than a runtime surprise.
+ * Only `vars` is forwarded to the backend.
  */
 export interface CheckFileOptions {
   /** Runtime variables made available for interpolation in the template. */

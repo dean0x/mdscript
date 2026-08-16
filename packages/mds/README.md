@@ -139,17 +139,21 @@ interface CompileOptions extends CheckOptions {
 
 // FileOptions — accepted by compileFile()
 // basePath is NOT accepted: the base directory is derived from the file path.
+// basePath?: never blocks assigning a CompileOptions variable to this type (TS2322).
 interface FileOptions {
   vars?: Record<string, unknown>;
   sourceMap?: boolean;
   sourcesContent?: boolean;
+  basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // CheckFileOptions — accepted by checkFile()
 // basePath is NOT accepted (base directory from file path).
+// basePath?: never blocks assigning a CheckOptions variable to this type (TS2322).
 // Source-map options are NOT accepted; passing them throws mds::invalid_options.
 interface CheckFileOptions {
   vars?: Record<string, unknown>;
+  basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // LintOptions — accepted by lint() (string-source)
@@ -167,9 +171,11 @@ interface LintOptions {
 // LintFileOptions — accepted by lintFile() and lintVirtual()
 // basePath is NOT accepted: lintFile derives the base directory from the file path;
 // lintVirtual resolves imports against the caller-supplied module map, not the filesystem.
+// basePath?: never blocks assigning a LintOptions variable to this type (TS2322).
 interface LintFileOptions {
   vars?: Record<string, unknown>;
   rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
+  basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // InitOptions
@@ -181,9 +187,10 @@ interface InitOptions {
 **Unknown-option rejection:** passing an unrecognised key to a public method throws
 `Error { code: 'mds::invalid_options' }` before calling the backend; the error names
 the offending key(s) and lists the accepted keys. Exception: passing `basePath` to a
-file-path method (`compileFile` or `checkFile`) surfaces as a rejected promise with a
-purpose-built message rather than a synchronous throw, and the message does not include
-an accepted-keys list.
+file-path method (`compileFile` or `checkFile`) **throws synchronously** with a
+purpose-built message (same channel as unknown-key rejection); the message does not
+include an accepted-keys list. `.catch()` on the returned promise does not receive
+this error — use `try/catch` around the call.
 
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.

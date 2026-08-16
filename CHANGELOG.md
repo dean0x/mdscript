@@ -53,14 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 `compileFile(path, options?)` and `checkFile(path, options?)` previously accepted a
 `basePath` option and silently discarded it — the option passed the unknown-key
 validator but was dropped before the backend was reached, so file resolution always
-used the directory containing the path. Both functions now return a rejected promise
+used the directory containing the path. Both functions now **throw synchronously**
 (`Error { code: 'mds::invalid_options' }`) when `basePath` is non-null. The base
 directory for file-based operations is always derived from the file path itself.
 
 **Migration:** remove `basePath` from any options object passed to `compileFile` or
-`checkFile`. This is a **runtime-only** break — TypeScript does not flag it at
-compile time when you pass a variable whose inferred type contains `basePath`.
-Audit call sites explicitly.
+`checkFile`. This throw is **synchronous** — `.catch()` on the returned promise does
+not receive it; wrap the call in `try/catch`. This is also a **compile-time break**
+when a variable typed as `CompileOptions` or `CheckOptions` is passed to these
+functions — see the compatibility notes below. Audit all call sites.
 
 #### `FileOptions` no longer extends `CompileOptions` (#213)
 
@@ -70,14 +71,19 @@ Audit call sites explicitly.
 operations. `FileOptions` is now a standalone interface with its own `vars`,
 `sourceMap`, and `sourcesContent` fields.
 
-**Compatibility:** this change is **source-compatible** for all previously-compiling
-code. Before this PR, `CompileOptions` had no `basePath` field, so
-`FileOptions extends CompileOptions` already resolved to
-`{ vars?, sourceMap?, sourcesContent? }` — the same shape as the new standalone
-`FileOptions`. Code that assigns a `CompileOptions` value to a `FileOptions` variable
-(or vice versa) continues to compile. The runtime break is the `compileFile`/`checkFile`
-rejection documented above, which TypeScript does not catch — see that entry for
-the migration.
+**Compatibility:** this change is a **compile-time break** for code that passes a
+`CompileOptions`-typed variable to `compileFile`. After this PR, `CompileOptions`
+carries `basePath?: string` while `FileOptions` declares `basePath?: never`;
+TypeScript reports `"Types of property 'basePath' are incompatible"` at any such
+assignment or call. Code that never reuses a string-surface options variable for
+file operations compiles without changes.
+
+**Migration for shared variables:** retype the variable as `FileOptions`, or
+destructure only the accepted fields:
+```ts
+const { vars, sourceMap, sourcesContent } = compileOpts;
+compileFile(path, { vars, sourceMap, sourcesContent });
+```
 
 #### `checkFile` parameter type changed from `CheckOptions` to `CheckFileOptions` (#213)
 
@@ -86,12 +92,32 @@ the migration.
 the parameter is now typed as `CheckFileOptions` — a new interface with only
 `vars?: Record<string, unknown>`.
 
-**Compatibility:** this type narrowing is **source-compatible** for all
-previously-compiling code. Before this PR, `CheckOptions` had no `basePath` field, so
-it was structurally equivalent to the new `CheckFileOptions`. A `CheckOptions`-typed
-variable without `basePath` still satisfies the `CheckFileOptions` parameter. The
-runtime break is the `compileFile`/`checkFile` rejection documented above, which
-TypeScript does not catch — see that entry for the migration.
+**Compatibility:** this type narrowing is a **compile-time break** for code that
+passes a `CheckOptions`-typed variable to `checkFile`. `CheckOptions` carries
+`basePath?: string` while `CheckFileOptions` declares `basePath?: never`; TypeScript
+reports `"Types of property 'basePath' are incompatible"` at any such call. Code
+that never reuses a string-surface variable for `checkFile` compiles without changes.
+
+**Migration for shared variables:** retype the variable as `CheckFileOptions`, or
+restrict it to `{ vars?: Record<string, unknown> }` at the call site.
+
+#### `LintFileOptions` gained `basePath?: never` (#213)
+
+`LintFileOptions` (used by `lintFile` and `lintVirtual`) previously had the shape
+`{ vars?, rules? }`. It now declares `basePath?: never`.
+
+**Compatibility:** this is a **compile-time break** for code that assigns a variable
+whose inferred type includes a `basePath` field to a `LintFileOptions`-typed slot.
+For example, passing a `LintOptions`-typed variable directly to `lintFile` or
+`lintVirtual` now fails with `TS2322` — `LintOptions.basePath` is `string | undefined`
+which is not assignable to `never`. Code that passes a fresh object literal without
+`basePath`, or a variable that was already typed as `{ vars?, rules? }`, continues to
+compile unchanged.
+
+**Migration:** at each `lintFile` / `lintVirtual` call site that passes a
+`LintOptions`-typed variable, either extract a narrowed copy
+(`const { basePath: _unused, ...fileOpts } = opts`) or redeclare the variable as
+`LintFileOptions` when `basePath` was never meaningful there.
 
 #### WASM backend rejects `basePath` on string-surface methods (#180)
 
