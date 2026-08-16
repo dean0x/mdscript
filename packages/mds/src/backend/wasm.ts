@@ -466,7 +466,7 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       // ensures basePath is null/undefined and thus excluded by != null check).
       const result: unknown = wasmModule.lint(
         source,
-        forwardOpts(options, 'lint') as { vars?: Record<string, unknown>; rules?: Record<string, string> } | undefined,
+        forwardOpts(options, 'lint'),
       );
       assertResultShape(result, 'lint');
       return result as LintResult;
@@ -481,7 +481,7 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       const result: unknown = wasmModule.lintVirtual(
         modules,
         entry,
-        forwardOpts(options, 'lintVirtual') as { vars?: Record<string, unknown>; rules?: Record<string, string> } | undefined,
+        forwardOpts(options, 'lintVirtual'),
       );
       assertResultShape(result, 'lint');
       return result as LintResult;

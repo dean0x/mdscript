@@ -29,7 +29,6 @@ export type {
   LintRuleName,
   LintSpan,
   MarkdownResult,
-  MdsBaseBackend,
   MdsError,
   MdsErrorSpan,
   Message,

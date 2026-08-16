@@ -80,43 +80,43 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
 
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const result: unknown = addon.compile(source, forwardOpts(options, 'compile') as NapiCompileOpts | undefined);
+      const result: unknown = addon.compile(source, forwardOpts(options, 'compile'));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     check(source: string, options?: CheckOptions): CheckResult {
-      const result: unknown = addon.check(source, forwardOpts(options, 'check') as NapiCheckOpts | undefined);
+      const result: unknown = addon.check(source, forwardOpts(options, 'check'));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-      const result: unknown = await addon.compileFile(path, forwardOpts(options, 'compileFile') as NapiFileCompileOpts | undefined);
+      const result: unknown = await addon.compileFile(path, forwardOpts(options, 'compileFile'));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
-      const result: unknown = await addon.checkFile(path, forwardOpts(options, 'checkFile') as NapiFileCheckOpts | undefined);
+      const result: unknown = await addon.checkFile(path, forwardOpts(options, 'checkFile'));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     lint(source: string, options?: LintOptions): LintResult {
-      const result: unknown = addon.lint(source, forwardOpts(options, 'lint') as NapiLintOpts | undefined);
+      const result: unknown = addon.lint(source, forwardOpts(options, 'lint'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },
 
     async lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
-      const result: unknown = await addon.lintFile(path, forwardOpts(options, 'lintFile') as NapiLintFileOpts | undefined);
+      const result: unknown = await addon.lintFile(path, forwardOpts(options, 'lintFile'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },
 
     lintVirtual(modules: Record<string, string>, entry: string, options?: LintFileOptions): LintResult {
-      const result: unknown = addon.lintVirtual(modules, entry, forwardOpts(options, 'lintVirtual') as NapiLintFileOpts | undefined);
+      const result: unknown = addon.lintVirtual(modules, entry, forwardOpts(options, 'lintVirtual'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },

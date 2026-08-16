@@ -28,7 +28,6 @@ import type {
   LintResult,
   LintRuleName,
   LintSpan,
-  MdsBaseBackend,
   RuleSeverity,
   SourceMapV3,
 } from '../../dist/browser.js';
@@ -63,13 +62,6 @@ const _ruleName: LintRuleName = 'empty-block';
 // is supported there, so consumers need the result type.
 const _sourceMap: SourceMapV3 = { version: 3, sources: ['input.mds'], names: [], mappings: '' };
 
-// ── MdsBaseBackend must be nameable from the browser entry (AC-P3-21) ────────
-// The browser entry resolves to a MdsBaseBackend at runtime. Consumers that
-// type a variable holding the resolved backend need this type from the entry
-// the exports map resolves. Previously it was exported only from the unreachable
-// src/index.ts barrel.
-const _backendInterface: MdsBaseBackend = {} as MdsBaseBackend;
-
 void _compileOpts; void _checkOpts; void _lintOpts; void _lintFileOpts; void _lintFileFromVar;
 void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;
-void _sourceMap; void _backendInterface;
+void _sourceMap;

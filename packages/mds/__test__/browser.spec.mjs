@@ -207,6 +207,59 @@ describe('browser entry — post-init', () => {
     );
   });
 
+  test('U-BR18: browser compile/check/lint reject non-null basePath on the WASM backend (AC-P3-09, AC-P3-10)', () => {
+    // OD-1: the WASM backend has no filesystem, so a non-null basePath must be
+    // rejected loudly by the browser entry (avoids PF-004). This proves the guard
+    // in createWasmBackend is reachable through the public browser API surface
+    // (avoids PF-007: a test on the wasm-backend internals alone cannot prove the
+    // browser entry carries the guard through to consumers).
+    //
+    // AC-P3-10 negative assertions: the error message MUST NOT contain the internal
+    // WASM keys 'filename' or 'modules' — those appear only if basePath bypasses the
+    // JS guard and reaches reject_unknown_wasm_keys in the Rust layer.
+    //
+    // PF-013 positive control (at bottom of this test): call the raw WasmModule
+    // directly to confirm that 'filename'/'modules' WOULD appear in the error without
+    // the guard, making the negative assertions above meaningful rather than vacuous.
+    for (const [label, fn] of [
+      ['compile', () => compile('Hello\n', { basePath: '/dir' })],
+      ['check',   () => check('Hello\n',   { basePath: '/dir' })],
+      ['lint',    () => lint('Hello\n',    { basePath: '/dir' })],
+    ]) {
+      assert.throws(
+        fn,
+        (err) => {
+          assert.ok(isMdsError(err), `U-BR18 ${label}: expected isMdsError, got: ${err}`);
+          assert.equal(err.code, 'mds::invalid_options', `U-BR18 ${label}: wrong error code`);
+          assert.ok(
+            err.message.includes('basePath'),
+            `U-BR18 ${label}: message must name 'basePath'; got: ${err.message}`,
+          );
+          assert.ok(
+            !err.message.includes('filename'),
+            `U-BR18 ${label}: message must not contain internal key 'filename'; got: ${err.message}`,
+          );
+          assert.ok(
+            !err.message.includes('modules'),
+            `U-BR18 ${label}: message must not contain internal key 'modules'; got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    }
+    // PF-013 positive control: the raw WasmModule DOES expose 'filename'/'modules'
+    // in its error when basePath is passed, proving the JS guard above is what
+    // prevents those internal keys from leaking to callers of the public API.
+    let rawErr;
+    try { sharedWasmModule.compile('Hello\n', { basePath: '/dir' }); } catch (e) { rawErr = e; }
+    assert.ok(rawErr instanceof Error, 'U-BR18 positive control: raw WasmModule must throw for unknown basePath');
+    const rawMsg = rawErr.message ?? '';
+    assert.ok(
+      rawMsg.includes('filename') || rawMsg.includes('modules'),
+      `U-BR18 positive control: raw WASM error must contain internal keys 'filename'/'modules'; got: "${rawMsg}"`,
+    );
+  });
+
   test('U-BR-PARITY: browser lint result equals node lint result at runtime (AC-P3-12, amendment 4, avoids PF-007)', () => {
     // PF-007: per-surface goldens each lock in their OWN value and cannot prove
     // cross-surface parity. Compare browser (WASM) and node surfaces at RUNTIME for

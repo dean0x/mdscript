@@ -27,9 +27,6 @@ import type {
   LintRuleName,
   LintSpan,
   MarkdownResult,
-  MdsBackend,
-  MdsBaseBackend,
-  MdsNodeBackend,
   RuleSeverity,
   SourceMapV3,
 } from '../../dist/node.js';
@@ -101,15 +98,6 @@ const _markdown: MarkdownResult = {
   kind: 'markdown', output: '', warnings: [], dependencies: [], sourceMap: _sourceMap,
 };
 
-// ── Backend interfaces must be nameable from the Node entry (AC-P3-21) ────────
-// MdsBaseBackend, MdsNodeBackend, and MdsBackend are referenced in JSDoc
-// {@link} tags throughout dist/node.d.ts. Consumers must be able to name them
-// to type variables (e.g. a helper accepting any MdsBaseBackend). They were
-// previously re-exported only from the unreachable barrel (src/index.ts).
-const _base: MdsBaseBackend = {} as MdsBaseBackend;
-const _node: MdsNodeBackend = {} as MdsNodeBackend;
-const _compat: MdsBackend = {} as MdsBackend;
-
 // ── AC-P3-16: all lint types are nameable from the browser surface ─────────────
 // (browser types are verified in consumer-browser.ts; here we just confirm they
 // compile correctly when imported from the node entry.)
@@ -126,5 +114,4 @@ void _fileOpts; void _checkFileOpts; void _lintFileOpts;
 void _fileFromCompileVar; void _checkFileFromVar; void _lintFileFromVar;
 void _validRule; void _fwdCompat; void _badSeverity;
 void _sourceMap; void _markdown;
-void _base; void _node; void _compat;
 void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;

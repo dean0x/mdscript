@@ -230,6 +230,14 @@ export function assertKnownKeys(options: object, method: MethodName): void {
  * each hardcoded their own key array — those could drift from METHOD_KEYS without
  * a compile error, which is the root shape of PF-004 / #180.
  *
+ * The generic `T` parameter preserves the caller's concrete options type across
+ * the forwarding boundary. Call sites receive `Partial<T> | undefined` and are
+ * assignable to the backend's parameter type without unchecked casts. The
+ * internal accumulation into `Record<string, unknown>` still loses per-key types,
+ * but the single controlled cast to `Partial<T>` at the return keeps every
+ * external call site cast-free — tsc verifies the forwarded shape against the
+ * backend parameter type at each call site.
+ *
  * Returns `undefined` when `options` is nullish or every accepted key is absent,
  * preserving the backend no-options fast path (avoids allocating empty objects
  * on every call). D-TS-03 / D-TS-05.
@@ -237,10 +245,10 @@ export function assertKnownKeys(options: object, method: MethodName): void {
  * @param options - Caller-supplied options (null/undefined treated as "no options").
  * @param method  - Public method name; selects the key list from METHOD_KEYS.
  */
-export function forwardOpts(
-  options: object | null | undefined,
+export function forwardOpts<T extends object>(
+  options: T | null | undefined,
   method: MethodName,
-): Record<string, unknown> | undefined {
+): Partial<T> | undefined {
   if (options == null) return undefined;
   const keys = METHOD_KEYS[method];
   const src = options as Record<string, unknown>;
@@ -249,11 +257,12 @@ export function forwardOpts(
   for (const k of keys) {
     const v = src[k];
     if (v != null) {
-      // unavoidable: accumulating into Record<string,unknown> loses per-key value
-      // types, but callers cast to their concrete options type at the call site.
+      // The accumulation into Record<string,unknown> loses per-key types
+      // internally; the single controlled cast to Partial<T> at the return
+      // keeps callers cast-free while tsc verifies shape at each call site.
       out[k] = v;
       any = true;
     }
   }
-  return any ? out : undefined;
+  return any ? (out as Partial<T>) : undefined;
 }

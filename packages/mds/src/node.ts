@@ -91,6 +91,13 @@ function wrapWithFileOps(
     ...base,
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
+      // Defense in depth (PF-004): the public compileFile wrapper already rejects
+      // basePath synchronously, but guard here so any future internal caller that
+      // bypasses the public wrapper cannot get the original silent-drop semantics.
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'compileFile');
+        if (bpErr != null) throw bpErr;
+      }
       const { source, opts } = await prepareFileArgs(path, options);
       const result: unknown = wasmModule.compile(source, opts);
       assertResultShape(result, 'compile');
@@ -98,6 +105,12 @@ function wrapWithFileOps(
     },
 
     async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
+      // Defense in depth (PF-004): same contract as compileFile — guard before
+      // prepareFileArgs so any future internal caller cannot bypass the check.
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'checkFile');
+        if (bpErr != null) throw bpErr;
+      }
       // CheckFileOptions is a structural subset of FileOptions (only vars, no
       // sourceMap/sourcesContent), so the cast is safe: prepareFileArgs calls
       // fileOpts which uses forwardOpts over METHOD_KEYS.compileFile; the absent
@@ -130,16 +143,16 @@ function wrapWithFileOps(
       delete extraModules[entryFilename];
       // forwardOpts uses METHOD_KEYS.lintFile (vars, rules) as the single key source.
       // filename and extraModules are WASM-internal keys absent from METHOD_KEYS.
-      // Spread forwarded directly so any future key added to METHOD_KEYS.lintFile is
-      // picked up automatically — no per-key manual copying that could drift (avoids PF-004).
+      // Spread forwarded first so filename and modules are always last — a future key
+      // added to METHOD_KEYS.lintFile can never silently clobber them (avoids PF-004).
       const forwarded = forwardOpts(options, 'lintFile') as {
         vars?: Record<string, unknown>;
         rules?: Record<string, string>;
       } | undefined;
       const lintOpts = {
+        ...forwarded,
         filename: entryFilename,
         ...(Object.keys(extraModules).length > 0 ? { modules: extraModules } : undefined),
-        ...forwarded,
       };
       const result: unknown = wasmModule.lint(entrySource, lintOpts);
       assertResultShape(result, 'lint');
@@ -328,10 +341,9 @@ export function getBackend(): BackendType {
   return assertReady().getBackend();
 }
 
-// `LINT_RULE_NAMES` is exported here, not only from `index.ts`: the package
-// `exports` map resolves `@mdscript/mds` to `dist/node.js` (Node) or
-// `dist/browser.js`, and never to `dist/index.js` — a value re-exported only
-// from `index.ts` is unreachable for consumers.
+// `LINT_RULE_NAMES` is a value export; exported directly from both entry points
+// (dist/node.js and dist/browser.js) so that consumers can import it via
+// `@mdscript/mds` regardless of environment.
 export { isMdsError, LINT_RULE_NAMES } from './types.js';
 export type {
   BackendType,
@@ -350,11 +362,8 @@ export type {
   LintRuleName,
   LintSpan,
   MarkdownResult,
-  MdsBackend,
-  MdsBaseBackend,
   MdsError,
   MdsErrorSpan,
-  MdsNodeBackend,
   Message,
   MessagesResult,
   RuleSeverity,
