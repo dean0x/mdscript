@@ -76,7 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Migration: change `LintConfig::from_rules(map)` to `LintConfig::from_rules_checked(map)`
   and handle the `Option<UnknownRuleNames>` second return value. No removal is scheduled
-  before a major version bump.
+  before v1.0.0; this function will remain available throughout the v0.x series (contrast
+  `apply_fixes` above, which is scheduled for removal at v0.5.0).
 
 ### **BREAKING** — File-method `basePath` rejection, TypeScript option types, and WASM `basePath` rejection (#180, #213)
 
