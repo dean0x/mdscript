@@ -1649,6 +1649,47 @@ fn fix_api_incremental_exists() {
     );
 }
 
+/// F-API-3: `apply_fixes` remains reachable on the public API surface and behaviorally
+/// unchanged while deprecated.
+///
+/// AD-209-2: `#[expect(deprecated)]` was chosen over a `trybuild` compile-fail fixture
+/// because: (a) trybuild only asserts that the deprecation warning fires; it does not
+/// verify the function's signature or return value; (b) this test also asserts the
+/// runtime behavior (NothingToFix for an empty plan), giving a stronger pin; and
+/// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` under
+/// `cargo clippy --workspace --all-targets -- -D warnings` whenever the
+/// `#[deprecated]` attribute is removed from `apply_fixes`, providing the same
+/// "must not compile cleanly without the attribute" guarantee as trybuild without
+/// a separate test-driver crate.
+///
+/// All values constructed via named constructors, never struct literals (applies ADR-010).
+// AD-209-1: apply_fixes is deprecated; this pin is the F-API-3 compile-and-runtime
+// guard for the deprecated public path. Remove at v0.5.0 with the function.
+#[expect(
+    deprecated,
+    reason = "AD-209-2: F-API-3 pins the deprecated apply_fixes public API surface; see fix.rs rustdoc"
+)]
+#[test]
+fn fix_api_apply_fixes_exists() {
+    use mds::fix::{apply_fixes, plan_fixes, FixOutcome};
+
+    // Construct via named constructors; never struct literals (applies ADR-010).
+    let source = "Hello!\n";
+    let original = LintResult::new(vec![]);
+    let plan = plan_fixes(&original, source);
+    let outcome = apply_fixes(
+        source,
+        plan,
+        &original,
+        |_s| -> Result<LintResult, MdsError> { Ok(LintResult::new(vec![])) },
+    );
+    // Empty source with no diagnostics must return NothingToFix (no reverify called).
+    assert!(
+        matches!(outcome, FixOutcome::NothingToFix),
+        "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
+    );
+}
+
 /// Regression gate (issue #9): `STRING_SOURCE_MAP_LABEL` must be reachable from
 /// the public `mds` API so every surface can import it rather than redeclaring
 /// the literal (avoids PF-007 per-surface re-declaration defeating cross-surface

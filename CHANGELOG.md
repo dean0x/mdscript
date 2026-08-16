@@ -1136,6 +1136,27 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   for awareness — it clears as a side effect of applying other fixes (e.g. removing a
   duplicate import that was also the unused one).
 
+### Deprecated
+
+- **`mds::fix::apply_fixes` is deprecated in favor of `apply_fixes_incremental` (#209).**
+  The replacement applies the same ADR-004 three-tier reverify-gate safety contract with a
+  batch-first attempt plus a bounded per-edit fallback, salvaging the safe subset of fixes
+  when some edits fail the reverify gate rather than refusing the whole batch.
+
+  Two behavioral differences require manual migration:
+
+  - **Closure bound**: `apply_fixes` takes `F: FnOnce`; `apply_fixes_incremental` requires
+    `F: Fn` because the reverify closure may be called more than once. A move-once closure
+    cannot be migrated mechanically.
+  - **New reachable outcome**: `apply_fixes_incremental` can return
+    `FixOutcome::PartiallyFixed` when some edits are accepted and some are refused.
+    `apply_fixes` never returns `PartiallyFixed`. Because `FixOutcome` is
+    `#[non_exhaustive]`, existing wildcard arms compile unchanged, but a wildcard that
+    swallows `PartiallyFixed` silently discards partial results.
+
+  Scheduled for removal in v0.5.0. The six ADR-004 regression tests that are pinned only
+  against `apply_fixes` must be ported or explicitly tracked before removal (issue #209).
+
 ### Fixed
 
 - **`mds build -o build/out.md` with sources in `src/` again emits map-relative

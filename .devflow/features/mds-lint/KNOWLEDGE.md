@@ -464,7 +464,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 - **Resting a security invariant on `debug_assert!`** (PF-005): `debug_assert!` is compiled out of release. The old `SanitizedReport` returned `None` for `source()`/`related()` behind a `debug_assert!` that no CLI error populates the aux graph — real in tests, absent in the shipped binary. Enforce invariants with data transformation, not assertions.
 
-- **Calling `apply_plan_unchecked()` on a production write path**: Production code that writes back to disk MUST use `apply_fixes()` or `apply_fixes_incremental()`. The `_unchecked` suffix makes the bypass explicit at every call site.
+- **Calling `apply_plan_unchecked()` on a production write path**: Production code that writes back to disk MUST use `apply_fixes_incremental()`. The `_unchecked` suffix makes the bypass explicit at every call site.
 
 - **Adding a ModuleCache "optimization"**: Per-file fresh resolve is intentional. A shared cache would be unsafe because runtime vars are per-call.
 
