@@ -57,11 +57,9 @@ export function _resetForTesting(): void {
 /**
  * Build the `mds::invalid_options` error for `basePath` on file-surface methods.
  *
- * Separated from the throw so that both the `wrapWithFileOps` guards (synchronous
- * throw inside an async function → rejected promise) and the public API guards
- * (`Promise.reject(fileBasePathError())` — maintains the sync-throw contract for
- * other errors while making basePath a proper promise rejection) can share one
- * message string, satisfying U-OV-27's byte-identical requirement (avoids PF-007).
+ * Separated from the throw so that the public `compileFile` / `checkFile` guards
+ * share one message string with the napi `parse_file_opts` / `parse_check_file_opts`
+ * output, satisfying U-OV-27's byte-identical requirement (avoids PF-007).
  *
  * Message is byte-identical to napi `parse_file_opts` / `parse_check_file_opts`
  * (crates/mds-napi/src/lib.rs). Because this guard short-circuits BEFORE backend
@@ -116,13 +114,6 @@ function wrapWithFileOps(
     ...base,
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-      // D-TS-06 guard: basePath is not valid for file operations on the WASM path.
-      // The native path never enters wrapWithFileOps, so napi handles the rejection
-      // there. BASEPATH_PASSTHROUGH lets basePath through assertKnownKeys; the guard
-      // here fires on the WASM path before buildModulesMap runs (avoids PF-004).
-      if ((options as unknown as { basePath?: string })?.basePath != null) {
-        throw fileBasePathError();
-      }
       const { source, opts } = await prepareFileArgs(path, options);
       const result: unknown = wasmModule.compile(source, opts);
       assertResultShape(result, 'compile');
@@ -130,10 +121,6 @@ function wrapWithFileOps(
     },
 
     async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
-      // D-TS-06 guard: same reason as compileFile above.
-      if ((options as unknown as { basePath?: string })?.basePath != null) {
-        throw fileBasePathError();
-      }
       // CheckFileOptions is a structural subset of FileOptions (only vars, no
       // sourceMap/sourcesContent), so the cast is safe: prepareFileArgs calls
       // fileCompileOpt which only picks defined keys; the absent fields resolve as
@@ -297,19 +284,17 @@ export function check(source: string, options?: CheckOptions): CheckResult {
  * Compile an MDS file, resolving @import directives relative to the file.
  * Returns a discriminated-union CompileResult. Requires init() to have been called and awaited first.
  *
- * Non-async: unknown option keys and pre-init errors throw synchronously (preserving the
- * existing contract verified by U-OV-12 and U-B11). The basePath guard returns
- * `Promise.reject(fileBasePathError())` so that callers using `assert.rejects()` or
- * `.catch()` receive a proper rejected promise rather than a synchronous throw.
+ * Non-async: all option-validation errors — unknown keys (U-OV-12) and basePath
+ * (U-OV-32) — throw synchronously before any I/O, consistent with U-B11. Callers
+ * using `try { compileFile(f, opts) } catch` capture both error classes.
+ * `.catch()` on the returned promise does NOT receive option-validation errors.
  */
 export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
   if (options != null) assertKnownKeys(options, 'compileFile');
   // BASEPATH_PASSTHROUGH: assertKnownKeys skips basePath for file methods (issue #74).
-  // Return a rejected promise (not a synchronous throw) so that the file-op async
-  // contract is consistent: backend errors arrive as rejections, not sync throws.
-  // wrapWithFileOps provides a redundant guard on the WASM path (avoids PF-004).
-  if ((options as unknown as { basePath?: string })?.basePath != null) {
-    return Promise.reject(fileBasePathError());
+  // Throws synchronously — same channel as assertKnownKeys above (U-OV-32).
+  if ((options as CompileOptions | undefined)?.basePath != null) {
+    throw fileBasePathError();
   }
   return assertReady().compileFile(path, options);
 }
@@ -320,13 +305,13 @@ export function compileFile(path: string, options?: FileOptions): Promise<Compil
  * operations (the base directory is derived from the file path).
  * Requires init() to have been called and awaited first.
  *
- * Same async contract as compileFile: basePath guard returns `Promise.reject()`.
+ * Same sync-throw contract as compileFile: basePath guard throws synchronously (U-OV-33).
  */
 export function checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
   if (options != null) assertKnownKeys(options, 'checkFile');
-  // Same basePath guard — returns Promise.reject to preserve async contract.
-  if ((options as unknown as { basePath?: string })?.basePath != null) {
-    return Promise.reject(fileBasePathError());
+  // Same basePath guard — throws synchronously (same channel as assertKnownKeys, U-OV-33).
+  if ((options as CheckOptions | undefined)?.basePath != null) {
+    throw fileBasePathError();
   }
   return assertReady().checkFile(path, options);
 }
@@ -358,11 +343,6 @@ export function getBackend(): BackendType {
   return assertReady().getBackend();
 }
 
-// `LINT_RULE_NAMES` is exported here, not only from `index.ts`: the package
-// `exports` map resolves `@mdscript/mds` to `dist/node.js` (Node) or
-// `dist/browser.js`, and never to `dist/index.js` — a value re-exported only
-// from `index.ts` is unreachable for consumers. The browser entry gains it with
-// the browser lint surface; today it has no lint API to configure.
 export { isMdsError, LINT_RULE_NAMES } from './types.js';
 export type {
   BackendType,
@@ -380,11 +360,14 @@ export type {
   LintResult,
   LintRuleName,
   LintSpan,
-  RuleSeverity,
   MarkdownResult,
-  Message,
-  MessagesResult,
+  MdsBackend,
+  MdsBaseBackend,
   MdsError,
   MdsErrorSpan,
+  MdsNodeBackend,
+  Message,
+  MessagesResult,
+  RuleSeverity,
   SourceMapV3,
 } from './types.js';

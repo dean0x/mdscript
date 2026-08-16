@@ -10,12 +10,29 @@ import type {
 // ── keysOf helper ──────────────────────────────────────────────────────────────
 
 /**
+ * String keys of `T` whose non-nullable type is not `never`.
+ *
+ * Used to exclude `basePath?: never` marker fields from the {@link keysOf}
+ * witness requirement. Those fields exist only to prevent structural
+ * assignability of string-surface options to file-surface option types at
+ * compile time; they carry no runtime meaning and must not appear in the
+ * recognised-key list that {@link assertKnownKeys} enforces.
+ */
+type RuntimeKeys<T extends object> = {
+  [K in keyof T & string]: [NonNullable<T[K]>] extends [never] ? never : K;
+}[keyof T & string];
+
+/**
  * Returns the keys of `T` as a readonly string array.
  *
- * The `witness` parameter must supply `true` for every key of `T` — this
- * binds the returned list to the interface at compile time. If `T` gains a
- * new key the witness literal must be updated; failing to do so is a compile
- * error, not a silent omission.
+ * The `witness` parameter must supply `true` for every runtime key of `T`
+ * (i.e. every key whose non-nullable type is not `never`) — this binds the
+ * returned list to the interface at compile time. If `T` gains a new key the
+ * witness literal must be updated; failing to do so is a compile error, not a
+ * silent omission.
+ *
+ * Keys typed as `?: never` (structural-subtyping blockers) are excluded from
+ * the witness requirement via {@link RuntimeKeys}.
  *
  * @example
  * ```typescript
@@ -23,7 +40,7 @@ import type {
  * // → readonly ['basePath', 'vars', 'rules']
  * ```
  */
-function keysOf<T extends object>(witness: Record<keyof T & string, true>): readonly string[] {
+function keysOf<T extends object>(witness: Record<RuntimeKeys<T>, true>): readonly string[] {
   return Object.keys(witness);
 }
 
@@ -64,13 +81,13 @@ export type MethodName =
  * Reconciliation against napi option parsers (`crates/mds-napi/src/lib.rs`):
  * - `compile` / `check`: `basePath` is now in the public types (#180 fix) and in
  *   the key list; napi's `parse_compile_opts` / `parse_check_opts` accept it.
- * - `compileFile` / `checkFile`: `basePath` is NOT in the key list. It is passed
- *   through without wrapper interception so the backend can emit its own purpose-built
- *   error ("not valid for compileFile/checkFile; the base directory is derived from
- *   the file path"). See {@link BASEPATH_PASSTHROUGH} and issue #74.
+ * - `compileFile` / `checkFile`: `basePath` is NOT in the key list. When a caller
+ *   passes `basePath` on these methods the wrapper emits a purpose-built rejection via
+ *   {@link BASEPATH_PASSTHROUGH}'s error factory — the backend never receives it.
+ *   See {@link getBasePathError} and issue #74.
  * - `lint`, `lintFile`, `lintVirtual`: key lists match napi exactly.
  */
-const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
+export const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
   compile:     keysOf<CompileOptions>({ basePath: true, vars: true, sourceMap: true, sourcesContent: true }),
   check:       keysOf<CheckOptions>({ basePath: true, vars: true }),
   compileFile: keysOf<FileOptions>({ vars: true, sourceMap: true, sourcesContent: true }),

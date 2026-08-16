@@ -27,6 +27,9 @@ import type {
   LintRuleName,
   LintSpan,
   MarkdownResult,
+  MdsBackend,
+  MdsBaseBackend,
+  MdsNodeBackend,
   RuleSeverity,
   SourceMapV3,
 } from '../../dist/node.js';
@@ -58,6 +61,23 @@ const _checkFileOpts: CheckFileOptions = { basePath: '/some/dir' };
 // @ts-expect-error — basePath is intentionally absent from LintFileOptions
 const _lintFileOpts: LintFileOptions = { basePath: '/some/dir' };
 
+// ── Variable-passing negative cases (AC-P3-20 stronger claim) ────────────────
+// Object-literal excess-property checks only fire on fresh literals. The cases
+// below use typed variables — the realistic consumer shape — to prove that the
+// structural type matrix also rejects passing a string-surface options object
+// directly to a file-surface API. `basePath?: never` on the file-surface types
+// causes TypeScript to report: "Type 'string | undefined' is not assignable to
+// type 'undefined'" when a variable carrying basePath is used.
+declare const _compileSrcVar: CompileOptions;
+// @ts-expect-error — CompileOptions (basePath?: string) is not assignable to FileOptions (basePath?: never)
+const _fileFromCompileVar: FileOptions = _compileSrcVar;
+declare const _checkSrcVar: CheckOptions;
+// @ts-expect-error — CheckOptions (basePath?: string) is not assignable to CheckFileOptions (basePath?: never)
+const _checkFileFromVar: CheckFileOptions = _checkSrcVar;
+declare const _lintSrcVar: LintOptions;
+// @ts-expect-error — LintOptions (basePath?: string) is not assignable to LintFileOptions (basePath?: never)
+const _lintFileFromVar: LintFileOptions = _lintSrcVar;
+
 // ── PR2 guard: rule-name and severity typing on LintOptions ──────────────────
 // D-224-1 ruling: an unrecognised RULE NAME is deliberately NOT a type error —
 // `rules` is `Record<string, RuleSeverity>` so configs naming a rule added in a
@@ -75,12 +95,20 @@ const _badSeverity: LintOptions = { rules: { 'unused-variable': 'sometimes' } };
 
 // ── SourceMapV3 must be nameable from the entry the exports map resolves ──────
 // MarkdownResult.sourceMap is typed as SourceMapV3; a consumer that cannot name
-// the type cannot annotate the value. dist/index.d.ts does not count — index.ts
-// is unreachable through the package `exports` map (see the note in src/index.ts).
+// the type cannot annotate the value.
 const _sourceMap: SourceMapV3 = { version: 3, sources: ['input.mds'], names: [], mappings: '' };
 const _markdown: MarkdownResult = {
   kind: 'markdown', output: '', warnings: [], dependencies: [], sourceMap: _sourceMap,
 };
+
+// ── Backend interfaces must be nameable from the Node entry (AC-P3-21) ────────
+// MdsBaseBackend, MdsNodeBackend, and MdsBackend are referenced in JSDoc
+// {@link} tags throughout dist/node.d.ts. Consumers must be able to name them
+// to type variables (e.g. a helper accepting any MdsBaseBackend). They were
+// previously re-exported only from the unreachable barrel (src/index.ts).
+const _base: MdsBaseBackend = {} as MdsBaseBackend;
+const _node: MdsNodeBackend = {} as MdsNodeBackend;
+const _compat: MdsBackend = {} as MdsBackend;
 
 // ── AC-P3-16: all lint types are nameable from the browser surface ─────────────
 // (browser types are verified in consumer-browser.ts; here we just confirm they
@@ -95,6 +123,8 @@ const _ruleName: LintRuleName = 'unused-variable';
 // Prevent unused-variable TS errors for the above declarations.
 void _compileOpts; void _checkOpts; void _lintOpts;
 void _fileOpts; void _checkFileOpts; void _lintFileOpts;
+void _fileFromCompileVar; void _checkFileFromVar; void _lintFileFromVar;
 void _validRule; void _fwdCompat; void _badSeverity;
 void _sourceMap; void _markdown;
+void _base; void _node; void _compat;
 void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;

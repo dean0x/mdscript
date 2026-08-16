@@ -29,10 +29,11 @@ export type {
   LintRuleName,
   LintSpan,
   MarkdownResult,
-  Message,
-  MessagesResult,
+  MdsBaseBackend,
   MdsError,
   MdsErrorSpan,
+  Message,
+  MessagesResult,
   RuleSeverity,
   SourceMapV3,
 } from './types.js';
@@ -116,7 +117,7 @@ export function check(source: string, options?: CheckOptions): CheckResult {
  * Lint an MDS source string. Returns a LintResult with per-rule findings.
  * Requires init() to have been called and awaited first.
  *
- * D-TS-07: `lintFile` is intentionally absent from the browser entry.
+ * `lintFile` is intentionally absent from the browser entry.
  * `MdsBaseBackend` has no `lintFile` — file operations require `node:fs` which
  * is unavailable in browser environments. Use `lintVirtual` to lint a
  * pre-loaded module map, or import from `@mdscript/mds` in Node.js to get
