@@ -1675,11 +1675,19 @@ fn fix_api_apply_fixes_exists() {
     let source = "Hello!\n";
     let original = LintResult::new(vec![]);
     let plan = plan_fixes(&original, source);
+    // The closure moves out of a captured `String`, so it implements `FnOnce` but
+    // NOT `Fn`/`FnMut`. That makes this a real compile-time pin on the `F: FnOnce`
+    // bound: tightening `apply_fixes` to `F: Fn` (the `apply_fixes_incremental`
+    // bound) would break this test's compilation rather than pass silently.
+    let move_once = String::from("consumed-by-value");
     let outcome = apply_fixes(
         source,
         plan,
         &original,
-        |_s| -> Result<LintResult, MdsError> { Ok(LintResult::new(vec![])) },
+        move |_s| -> Result<LintResult, MdsError> {
+            drop(move_once);
+            Ok(LintResult::new(vec![]))
+        },
     );
     // Empty source with no diagnostics must return NothingToFix (no reverify called).
     assert!(

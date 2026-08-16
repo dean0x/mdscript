@@ -660,6 +660,8 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
     result
 }
 
+/// Apply a `FixPlan` with a reverify callback.
+///
 /// # Deprecated (AD-209-1)
 ///
 /// Use [`apply_fixes_incremental`] instead. (applies ADR-004)
@@ -698,14 +700,14 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 /// tests must be ported or explicitly tracked before removal at v0.5.0
 /// (see issue #209):
 ///
-/// - `a4_partial_overlap_still_rejected_after_dedup` (fix.rs:1444) -- A4
-/// - `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (fix.rs:1741) -- A5
-/// - `reverify_preexisting_untargeted_survives_and_fix_applies` (fix.rs:1941) -- AC-F-23
-/// - `reverify_new_untargeted_diagnostic_is_rejected` (fix.rs:1966)
-/// - `tier_b_unused_function_standalone_apply_succeeds` (fix.rs:2037) -- I-13
-/// - `l_fix_rev1_output_delta_causes_rejection` (fix.rs:2108) -- L-FIX-REV1
+/// - `a4_partial_overlap_still_rejected_after_dedup` (fix.rs:1446) -- A4
+/// - `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (fix.rs:1743) -- A5
+/// - `reverify_preexisting_untargeted_survives_and_fix_applies` (fix.rs:1943) -- AC-F-23
+/// - `reverify_new_untargeted_diagnostic_is_rejected` (fix.rs:1968)
+/// - `tier_b_unused_function_standalone_apply_succeeds` (fix.rs:2039) -- I-13
+/// - `l_fix_rev1_output_delta_causes_rejection` (fix.rs:2110) -- L-FIX-REV1
 ///
-/// Apply a `FixPlan` with a reverify callback.
+/// # Behavior
 ///
 /// The `reverify` callback is called with the fixed source and must return:
 /// - `Ok(LintResult)`: the lint result of the fixed source (may be empty).
@@ -734,7 +736,7 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 #[deprecated(
-    note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must be `Fn`, not `FnOnce`. See the item docs."
+    note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must be `Fn`, not `FnOnce`. Removed in v0.5.0; see the item docs."
 )]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
 where
