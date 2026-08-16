@@ -574,7 +574,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - **PF-007** (cross-surface goldens can't catch divergence): `fix_edits` is emitted unconditionally (null when None) across all surfaces; differential tests cover cross-surface parity.
 - **PF-013** (vacuous negative security tests): Every ESC-injection test now pairs a NEGATIVE assertion (raw byte absent) with a POSITIVE one (escaped form present) and a non-vacuity guard (diagnostics non-empty, expected rule matched). T-9 was rewritten from a vacuous YAML-rejection vector to a reachable duplicate-import + U+0085 NEL vector.
 - **PF-014** (sanitize inputs, not rendered artifacts): The `SanitizedReport` design — pre-sanitize message/help/labels before miette renders — is the PF-014-correct boundary. Post-processing the rendered frame corrupts miette's own ANSI SGR codes; CI uses `NO_COLOR=1` and pipes stderr so the failure would stay green. T-ESC-6 pins this on the colour path.
-- **ADR-001** (span-guided rewrite + compile-equivalence gate): All `--fix` edits are span-guided byte rewrites. `TextEdit` ranges are validated fail-closed. `apply_plan_unchecked` is explicitly named to make ADR-001 bypass visible.
+- **ADR-001** (span-guided rewrite + compile-equivalence gate): All `--fix` edits are span-guided byte rewrites. `TextEdit` ranges are validated fail-closed. `apply_plan_unchecked` is explicitly named to make ADR-004 reverify-gate bypass visible.
 - **ADR-004** (three-tier --fix safety model, reverify gate): `apply_fixes_incremental`'s batch-first strategy with bounded per-edit fallback is the AC-F-20 implementation.
 - **ADR-002** (v0.4.0 whitespace contract, interior-verbatim): The `empty-block` rule's "whitespace-only-Text body" definition is directly downstream of this contract.
 - **ADR-003** (@extends FM emission): The `unused-variable` rule is suppressed on `@extends` children.
@@ -590,14 +590,14 @@ The removal is tracked in GitHub issue #304. Before the v0.5.0 tag, the followin
 ADR-004 reverify-gate behaviors must gain equivalent coverage on the
 `apply_fixes_incremental` path or be explicitly retired in #304.
 
-| Test name | Line (v0.4.0 HEAD) | Behavior pinned |
-|---|---|---|
-| `a4_partial_overlap_still_rejected_after_dedup` | fix.rs:1446 | A4: overlapping edits refused after dedup |
-| `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` | fix.rs:1743 | A5: rejection message stability |
-| `reverify_preexisting_untargeted_survives_and_fix_applies` | fix.rs:1943 | AC-F-23: pre-existing untargeted diagnostic survives |
-| `reverify_new_untargeted_diagnostic_is_rejected` | fix.rs:1968 | reverify gate rejects new untargeted diagnostics |
-| `tier_b_unused_function_standalone_apply_succeeds` | fix.rs:2039 | I-13: Tier B fix applies on standalone file |
-| `l_fix_rev1_output_delta_causes_rejection` | fix.rs:2110 | L-FIX-REV1: output delta causes rejection |
+| Test name | Behavior pinned |
+|---|---|
+| `a4_partial_overlap_still_rejected_after_dedup` | A4: overlapping edits refused after dedup |
+| `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` | A5: rejection message stability |
+| `reverify_preexisting_untargeted_survives_and_fix_applies` | AC-F-23: pre-existing untargeted diagnostic survives |
+| `reverify_new_untargeted_diagnostic_is_rejected` | reverify gate rejects new untargeted diagnostics |
+| `tier_b_unused_function_standalone_apply_succeeds` | I-13: Tier B fix applies on standalone file |
+| `l_fix_rev1_output_delta_causes_rejection` | L-FIX-REV1: output delta causes rejection |
 
 Remove this table once all six behaviors are covered by `apply_fixes_incremental` tests
 (migration complete) or retired in #304.
