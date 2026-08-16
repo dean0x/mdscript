@@ -762,7 +762,7 @@ fn run_lint_stdin(
     // before returning.
     set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
 
-    // D4 (AD-216-contract): status message, not an error — suppress under --quiet.
+    // D4 (AD-216-11): status message, not an error — suppress under --quiet.
     // PF-004: stdin is a separate emitter from file/directory mode; the cap notice
     // must reach this path too (avoids the #43/#173 divergence class).
     if result.truncated && fix && !quiet {
@@ -841,7 +841,7 @@ fn run_lint_stdin(
                 (new_source, residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-contract): "fix rejected" is a status message — the safety
+                // D4 (AD-216-11): "fix rejected" is a status message — the safety
                 // gate fired and the original diagnostics are unmodified.  Suppress under
                 // --quiet, matching this function's own `PreviewOutcome::Rejected` arm and
                 // the directory-mode emitters in `lint_one_file_accumulating` /
@@ -935,7 +935,7 @@ fn run_lint_file(
     // every FixFileOutcome carries `filename` as its display path.
     set_diag_display_path(&mut result, filename);
 
-    // D4 (AD-216-contract): status message, not an error — suppress under --quiet
+    // D4 (AD-216-11): status message, not an error — suppress under --quiet
     // (the global `--quiet` help text: "Suppress status and diagnostic output; errors
     // always print").  PF-004: single-file mode is a separate emitter from directory
     // mode; gating only the directory copy would re-create the #43/#173 divergence.
@@ -983,7 +983,7 @@ fn run_lint_file(
                 exit_by_severity(&residual);
             }
             FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-contract): status message — suppress under --quiet,
+                // D4 (AD-216-11): status message — suppress under --quiet,
                 // matching this function's own `PreviewOutcome::Rejected` arm and the
                 // directory-mode emitters.  PF-004: single-file mode is a separate
                 // emitter and must honour the same gate.
@@ -1474,7 +1474,7 @@ fn lint_one_file_accumulating(
 
     if result.truncated {
         *any_truncated = true;
-        // D4 (AD-216-contract): this is a status message, not an error — suppress
+        // D4 (AD-216-11): this is a status message, not an error — suppress
         // under --quiet (main.rs:30 "Suppress status and diagnostic output").
         if fix && !quiet {
             eprintln!(
@@ -1542,7 +1542,7 @@ fn lint_one_file_accumulating(
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-contract): "fix rejected" is a status message — the safety
+                // D4 (AD-216-11): "fix rejected" is a status message — the safety
                 // gate fired, the original diagnostics remain unmodified.  Suppress under
                 // --quiet (main.rs:30).  The residual lint findings (and the exit code)
                 // are unaffected: this message describes the --fix attempt, not the findings.
@@ -1589,7 +1589,7 @@ fn lint_one_file_accumulating(
                 }
             }
             PreviewOutcome::Rejected(ref reason) => {
-                // D4 (AD-216-contract): status message — suppress under --quiet.
+                // D4 (AD-216-11): status message — suppress under --quiet.
                 if !quiet {
                     eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
                 }
@@ -1666,7 +1666,7 @@ fn lint_one_file_human(
 
     if result.truncated {
         *any_truncated = true;
-        // D4 (AD-216-contract): this is a status message, not an error — suppress
+        // D4 (AD-216-11): this is a status message, not an error — suppress
         // under --quiet (main.rs:30 "Suppress status and diagnostic output").
         if fix && !quiet {
             eprintln!(
@@ -1723,7 +1723,7 @@ fn lint_one_file_human(
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                // D4 (AD-216-contract): "fix rejected" is a status message — the safety
+                // D4 (AD-216-11): "fix rejected" is a status message — the safety
                 // gate fired, the original diagnostics remain unmodified.  Suppress under
                 // --quiet (main.rs:30).
                 if !quiet {

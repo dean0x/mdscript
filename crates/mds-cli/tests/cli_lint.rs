@@ -5237,7 +5237,7 @@ fn make_cap_source() -> String {
 
 /// The diagnostic-cap notice is suppressed by `--quiet` in all three input modes.
 ///
-/// D4 (AD-216-contract): the cap notice is a *status* message — gated on `!quiet`
+/// D4 (AD-216-11): the cap notice is a *status* message — gated on `!quiet`
 /// at every emitter.  PF-004: directory, single-file, and stdin are SEPARATE emitters;
 /// a gate on one is not inherited by the others (the #43/#173 divergence class).
 #[test]
