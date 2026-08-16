@@ -361,7 +361,7 @@ function compileOpts(
 } {
   // D-TS-06: use fileCompileOpt (no basePath) — basePath is already excluded
   // from _WasmCompileInput, and the caller guards against it before reaching here.
-  const extra = fileCompileOpt(options as Parameters<typeof fileCompileOpt>[0]);
+  const extra = fileCompileOpt(options);
   const filename = options?.filename ?? DEFAULT_COMPILE_OPTS.filename;
   const modules = options?.modules ?? DEFAULT_COMPILE_OPTS.modules;
   if (extra == null && filename === DEFAULT_COMPILE_OPTS.filename && modules === DEFAULT_COMPILE_OPTS.modules) {
