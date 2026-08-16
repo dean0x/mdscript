@@ -535,6 +535,15 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   suppressed under `--quiet` on a clean run. When any file fails the summary is still always
   printed, so a non-zero exit under `--quiet` is never unexplained. Exit codes are unaffected.
 
+- **`mds lint --quiet` now suppresses the remaining `--fix` status messages (#216).** The
+  `fix rejected: <reason>` notice (emitted when the three-tier safety gate refuses a fix and
+  leaves the file unchanged) and the `diagnostic cap (N) reached` notice are now suppressed
+  under `--quiet` in **all three input modes** — directory, single file, and stdin. Previously
+  each was gated in some modes and not others, so `mds lint --fix --quiet` wrote to stderr for
+  a single file or stdin but stayed silent for a directory. Scripts that grep stderr for
+  `fix rejected` must drop `--quiet`. Exit codes are unaffected, and error-severity
+  diagnostics still print under `--quiet` as always.
+
 ### Added
 
 - **`mds lint <dir>` directory-mode summary (#216).** After linting a directory, one summary

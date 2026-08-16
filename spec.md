@@ -956,15 +956,26 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 - Accumulate-and-continue: per-file errors do not abort the run.
 - After processing all files, emits one summary line to stderr:
   `N clean, N with warnings, N with errors, N resource-limited`
-  "With errors" covers both error-severity lint findings and per-file analysis failures
-  (I/O, config, resource limit exceeding `MAX_BLOCKS_PER_MODULE` does not count here — those
-  are counted in "resource-limited"). "Resource-limited" counts files where `mds::lint`
-  returned `MdsError::ResourceLimit`.
+  Each file falls in exactly one bucket, so the four counts always sum to the number of
+  `.mds` files the walker collected.
+  - "Clean" — no findings.
+  - "With warnings" — warning-severity findings only.
+  - "With errors" — error-severity lint findings **or** a per-file analysis failure
+    (source read, config load, or lint call failure). These two populations are
+    deliberately merged, matching the way `mds build`'s "failed" count merges them.
+  - "Resource-limited" — files where `mds::lint` returned `MdsError::ResourceLimit`
+    (for example, exceeding `MAX_BLOCKS_PER_MODULE`). These are counted here, never
+    under "with errors".
 - Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
   (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
   bucket, the summary is always emitted so the non-zero exit is never unexplained.
 - The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
   regardless of `--quiet` or directory mode — no `"summary"` key is added (D2-B).
+
+**`--quiet` and `--fix` status messages:** the `fix rejected: <reason>` notice and the
+`diagnostic cap (N) reached` notice are status output, not errors, and are suppressed by
+`--quiet` in **all three input modes** (directory, single file, stdin). Error-severity
+diagnostics and the exit code are unaffected.
 
 **Exit codes** (lint-specific; differ from `mds build`/`mds check`):
 

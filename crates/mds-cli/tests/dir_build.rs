@@ -904,4 +904,27 @@ fn dir_build_quiet_works_in_pre_subcommand_position() {
         pre.stderr, post.stderr,
         "pre-subcommand --quiet must produce the same stderr as post-subcommand --quiet"
     );
+
+    // ANCHOR (PF-013): equality alone is vacuous — it holds just as well when BOTH
+    // orderings are broken. Verified by mutation: with the `!quiet || fail_count > 0`
+    // gate removed from build.rs, the two `assert_eq!`s above still passed while
+    // `dir_build_quiet_suppresses_summary_on_success` correctly failed. Pin the
+    // absolute value so this test fails too if --quiet stops suppressing.
+    assert!(
+        post.stderr.is_empty(),
+        "AC-Q30 anchor: an all-success tree under --quiet must produce empty stderr in \
+         BOTH orderings, not merely equal stderr; got: {}",
+        String::from_utf8_lossy(&post.stderr)
+    );
+
+    // Paired positive control: the same sources without --quiet DO print the summary.
+    let control_src = tempfile::tempdir().unwrap();
+    create_plain_mds(control_src.path(), "a.mds");
+    create_plain_mds(control_src.path(), "b.mds");
+    let control = build_dir(control_src.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("2 built, 0 failed"),
+        "positive control: the same tree without --quiet must print '2 built, 0 failed'; got: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
 }

@@ -14,6 +14,18 @@
 //! - `--format json` output → **stdout** only (single JSON object, trailing newline).
 //! - `--quiet` suppresses warning+info human diagnostics and summaries, NOT errors.
 //!
+//! # `--quiet` status-message contract (#216, decision D4)
+//!
+//! Every *status* message on stderr is gated on `!quiet` in **all three input modes**
+//! (directory, single file, stdin) — `Fixed:`, `Partially fixed:`, `Would fix:`,
+//! `Clean:`, `fix rejected:`, the diagnostic-cap notice, and the directory summary.
+//! PF-004: these are separate emitters per mode, so a gate added to one must be added
+//! to all; issue #43/#173 was exactly this divergence for `Partially fixed:`.
+//!
+//! Two messages deliberately bypass `--quiet` because they signal a silent-CI-green-pass
+//! hazard rather than status: the all-excluded diagnostic in [`run_lint_directory`] and
+//! the directory summary when any file is in the error or resource-limited bucket.
+//!
 //! # Exit codes (via direct `std::process::exit`, NEVER via `exit_code()`)
 //!
 //! - 0: clean (no Warn/Error findings)
@@ -815,7 +827,17 @@ fn run_lint_stdin(
                 (new_source, residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("fix rejected: {}", safe_inline(&reason));
+                // D4 (AD-216-contract): "fix rejected" is a status message — the safety
+                // gate fired and the original diagnostics are unmodified.  Suppress under
+                // --quiet, matching this function's own `PreviewOutcome::Rejected` arm and
+                // the directory-mode emitters in `lint_one_file_accumulating` /
+                // `lint_one_file_human`.  PF-004: stdin is a separate emitter from
+                // directory mode and must not bypass the gate (the #43/#173 divergence
+                // class).  Exit code is unaffected; error-severity residual diagnostics
+                // still print through `render_result_human`.
+                if !quiet {
+                    eprintln!("fix rejected: {}", safe_inline(&reason));
+                }
                 (source, original)
             }
             FixFileOutcome::NothingToFix { original } => (source, original),
@@ -899,7 +921,11 @@ fn run_lint_file(
     // every FixFileOutcome carries `filename` as its display path.
     set_diag_display_path(&mut result, filename);
 
-    if result.truncated && fix {
+    // D4 (AD-216-contract): status message, not an error — suppress under --quiet
+    // (the global `--quiet` help text: "Suppress status and diagnostic output; errors
+    // always print").  PF-004: single-file mode is a separate emitter from directory
+    // mode; gating only the directory copy would re-create the #43/#173 divergence.
+    if result.truncated && fix && !quiet {
         eprintln!(
             "diagnostic cap ({}) reached; further findings were suppressed — \
              re-run --fix to continue",
@@ -943,7 +969,13 @@ fn run_lint_file(
                 exit_by_severity(&residual);
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!("fix rejected: {}", safe_inline(&reason));
+                // D4 (AD-216-contract): status message — suppress under --quiet,
+                // matching this function's own `PreviewOutcome::Rejected` arm and the
+                // directory-mode emitters.  PF-004: single-file mode is a separate
+                // emitter and must honour the same gate.
+                if !quiet {
+                    eprintln!("fix rejected: {}", safe_inline(&reason));
+                }
                 emit_result(format, &original, quiet, named_source);
                 exit_by_severity(&original);
             }

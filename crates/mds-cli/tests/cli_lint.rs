@@ -47,6 +47,8 @@
 //! - AC-Q25 (#216): hostile filename cannot forge a summary line (with positive control)
 //! - AC-Q26 (#216): help text documents quiet summary contract (machine-verified)
 //! - AC-Q30 (#216): --quiet works in both argument positions for lint
+//! - D4 (#216, PF-004): `fix rejected:` honours --quiet in directory, single-file AND
+//!   stdin mode — three separate emitters, each with its own positive control
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -4798,9 +4800,14 @@ fn lint_directory_check_exit_still_prints_summary() {
         Some(1),
         "--fix --check with pending fixes must exit 1; stderr: {stderr}"
     );
-    assert!(
-        stderr.contains("clean,") || stderr.contains("with warnings"),
-        "AC-Q13: summary must be emitted even on --fix --check exit; got: {stderr:?}"
+    // Assert the WHOLE summary line, not a disjunction of two weak substrings: a
+    // disjunction would still pass if the line were emitted in a corrupted form.
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        1,
+        "AC-Q08/AC-Q13: the summary must be emitted on the --fix --check exit path and its \
+         four counters must partition the 1-file tree; got stderr: {stderr:?}"
     );
     // --check must never write (file byte-unchanged).
     let content_after = fs::read_to_string(&target).unwrap();
@@ -4838,15 +4845,32 @@ fn lint_directory_quiet_check_exit_matches_d1a_contract() {
     );
     // The residual tally is WarnOnly (legacy-interpolation is Severity::Warn).
     // D1-a gate: !quiet || error_file_count > 0 || limit_file_count > 0 = false → no summary.
-    // Note: if the residual HAS errors, the summary WILL appear (error_file_count > 0 gate).
-    // Positive control: without --quiet the summary IS printed (separate test covers this).
-    // Use "clean," as the canonical absence marker — consistent with AC-Q10, and strictly
-    // stronger than checking only "resource-limited" (the summary is an atomic eprintln!
-    // so it either appears in full or not at all, but "clean," is the clearest signal).
     assert!(
         !stderr.contains("clean,"),
         "D1-a: --fix --check --quiet with warn-only residual must not print summary; \
          got: {stderr:?}"
+    );
+
+    // PF-013 / ADR-009 — PAIRED POSITIVE CONTROL, in this test, on THIS tree.
+    //
+    // Without it the absence assertion above passes vacuously: deleting the summary
+    // emit outright leaves this test green (verified by mutation — removing the
+    // `eprintln!` in `run_lint_directory` failed 8 of the #216 tests but NOT this one).
+    // A cross-test control in `lint_directory_check_exit_still_prints_summary` does not
+    // count: it uses a different fixture, so it cannot prove that THIS tree's summary is
+    // suppressed by `--quiet` rather than never produced at all.
+    let control = lint_path(dir.path(), &["--fix", "--check"]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "positive control: the same tree without --quiet must also exit 1; \
+         got stderr: {control_stderr:?}"
+    );
+    assert!(
+        control_stderr.contains("clean,"),
+        "positive control: the same tree WITHOUT --quiet must print the summary, proving the \
+         --quiet absence assertion above is non-vacuous; got: {control_stderr:?}"
     );
 }
 
@@ -4954,6 +4978,122 @@ fn lint_stdin_prints_no_directory_summary() {
     assert!(
         !stderr.contains("clean,"),
         "AC-Q19: stdin lint must NOT print a directory summary; got: {stderr:?}"
+    );
+
+    // PF-013 / ADR-009: the absence assertion above is only meaningful if `"clean,"` is
+    // the string a real summary would actually contain. A typo in the needle would make
+    // it pass on any output at all. Prove the needle by feeding the SAME source through
+    // directory mode, where the summary IS expected.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.mds"), &content).unwrap();
+    let control = lint_path(dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: the same source in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+// ── D4 cross-mode parity: status messages honour --quiet in ALL three input modes ──
+//
+// PF-004 — an alternate output path can silently bypass a guard. Directory mode,
+// single-file mode and stdin mode are SEPARATE emitters for `fix rejected:` (there
+// are six call sites in lint.rs) and for the diagnostic-cap notice (three sites).
+// #216 gated the directory-mode copies; the single-file and stdin copies were left
+// ungated, re-creating exactly the divergence that issue #43/#173 fixed for
+// "Partially fixed:" (see `dir_and_single_file_agree_on_quiet_for_partially_fixed`).
+//
+// Each mode carries its own paired positive control, so no assertion can pass because
+// the fix was never attempted rather than because the message was suppressed.
+
+/// Source with a single Tier A fix that the reverify gate rejects whole-file:
+/// removing the empty `@define` would orphan the `@export`, so `FixFileOutcome`
+/// is `Rejected` (not `PartiallyFixed`) and `fix rejected:` is emitted.
+const FIX_REJECTED_SOURCE: &str = "\
+@define empty_fn():
+
+@end
+
+@export empty_fn
+";
+
+#[test]
+fn fix_rejected_message_honours_quiet_in_all_three_modes() {
+    let needle = "fix rejected";
+
+    // ── Mode 1: single file ──────────────────────────────────────────────────
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("r.mds");
+    fs::write(&target, FIX_REJECTED_SOURCE).unwrap();
+
+    let loud = lint_path(&target, &["--fix"]);
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains(needle),
+        "positive control (single file): without --quiet the rejection MUST be reported, \
+         otherwise the quiet assertion below is vacuous; got: {loud_stderr:?}"
+    );
+
+    let quiet = lint_path(&target, &["--fix", "--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains(needle),
+        "single-file --fix --quiet must suppress 'fix rejected:' (D4/PF-004); got: {quiet_stderr:?}"
+    );
+    assert_eq!(
+        quiet.status.code(),
+        loud.status.code(),
+        "single file: --quiet must not move the exit code"
+    );
+
+    // ── Mode 2: stdin ────────────────────────────────────────────────────────
+    let loud_stdin = lint_stdin(FIX_REJECTED_SOURCE, &["--fix"]);
+    let loud_stdin_stderr = String::from_utf8_lossy(&loud_stdin.stderr);
+    assert!(
+        loud_stdin_stderr.contains(needle),
+        "positive control (stdin): without --quiet the rejection MUST be reported; \
+         got: {loud_stdin_stderr:?}"
+    );
+
+    let quiet_stdin = lint_stdin(FIX_REJECTED_SOURCE, &["--fix", "--quiet"]);
+    let quiet_stdin_stderr = String::from_utf8_lossy(&quiet_stdin.stderr);
+    assert!(
+        !quiet_stdin_stderr.contains(needle),
+        "stdin --fix --quiet must suppress 'fix rejected:' (D4/PF-004); got: {quiet_stdin_stderr:?}"
+    );
+    assert_eq!(
+        quiet_stdin.status.code(),
+        loud_stdin.status.code(),
+        "stdin: --quiet must not move the exit code"
+    );
+
+    // ── Mode 3: directory ────────────────────────────────────────────────────
+    let loud_dir = lint_path(dir.path(), &["--fix"]);
+    let loud_dir_stderr = String::from_utf8_lossy(&loud_dir.stderr);
+    assert!(
+        loud_dir_stderr.contains(needle),
+        "positive control (directory): without --quiet the rejection MUST be reported; \
+         got: {loud_dir_stderr:?}"
+    );
+
+    let quiet_dir = lint_path(dir.path(), &["--fix", "--quiet"]);
+    let quiet_dir_stderr = String::from_utf8_lossy(&quiet_dir.stderr);
+    assert!(
+        !quiet_dir_stderr.contains(needle),
+        "directory --fix --quiet must suppress 'fix rejected:' (D4/PF-004); got: {quiet_dir_stderr:?}"
+    );
+    assert_eq!(
+        quiet_dir.status.code(),
+        loud_dir.status.code(),
+        "directory: --quiet must not move the exit code"
+    );
+
+    // The rejection leaves the file unmodified in every mode.
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        FIX_REJECTED_SOURCE,
+        "a rejected fix must never rewrite the source file"
     );
 }
 
@@ -5163,13 +5303,23 @@ fn help_documents_quiet_summary_contract() {
         .unwrap();
     let help_text = String::from_utf8_lossy(&lint_help.stdout);
 
+    // Pin the two documentation sites independently. A bare `contains("summary")` is
+    // satisfied by EITHER site alone, so removing the long_about paragraph would leave
+    // this test green on the strength of the after_help example line (and vice versa).
     assert!(
-        help_text.contains("summary"),
-        "AC-Q26: mds lint --help must mention the directory summary; got: {help_text:?}"
+        help_text.contains("summary line to stderr"),
+        "AC-Q26: mds lint --help long_about must document the directory summary line; \
+         got: {help_text:?}"
     );
     assert!(
-        help_text.contains("--quiet") || help_text.contains("-q"),
-        "AC-Q26: mds lint --help must mention --quiet; got: {help_text:?}"
+        help_text.contains("N clean, N with warnings, N with errors, N resource-limited"),
+        "AC-Q26: mds lint --help must show the literal summary format string so the shipped \
+         format and the documented format cannot drift; got: {help_text:?}"
+    );
+    assert!(
+        help_text.contains("mds lint --quiet ."),
+        "AC-Q26: mds lint --help must carry the `mds lint --quiet .` directory example; \
+         got: {help_text:?}"
     );
 
     // mds --help must contain the global --quiet description.
@@ -5218,5 +5368,25 @@ fn lint_directory_quiet_works_in_pre_subcommand_position() {
     assert_eq!(
         pre.stderr, post.stderr,
         "AC-Q30: pre-subcommand --quiet must produce identical stderr to post-subcommand"
+    );
+
+    // ANCHOR (PF-013): equality alone is vacuous — it holds just as well when BOTH
+    // orderings are broken. Verified by mutation: with the summary gate removed
+    // entirely, the two `assert_eq!`s above still passed. Pin the absolute value so
+    // the test fails if `--quiet` stops suppressing, in either position.
+    assert!(
+        post.stderr.is_empty(),
+        "AC-Q30 anchor: a clean tree under --quiet must produce empty stderr in BOTH \
+         orderings, not merely equal stderr; got: {:?}",
+        String::from_utf8_lossy(&post.stderr)
+    );
+
+    // Paired positive control: the same tree without --quiet DOES print the summary,
+    // proving the emptiness assertion above is a real suppression, not a dead code path.
+    let control = lint_path(dir.path(), &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&control.stderr).trim(),
+        "2 clean, 0 with warnings, 0 with errors, 0 resource-limited",
+        "positive control: the same tree without --quiet must print the summary"
     );
 }

@@ -131,10 +131,12 @@ enum Commands {
     /// 3 = resource limit.
     ///
     /// Directory mode prints one summary line to stderr after processing all files:
-    ///   N clean, N with warnings, N with errors, N resource-limited
+    /// N clean, N with warnings, N with errors, N resource-limited
+    ///
     /// Under --quiet the summary is suppressed on a warn-only or clean run, but is
     /// always printed when error- or resource-limited files are present so the non-zero
-    /// exit is never unexplained.
+    /// exit is never unexplained. --quiet also suppresses the `fix rejected:` and
+    /// `diagnostic cap reached` notices in every input mode.
     #[command(
         after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet .                  Directory lint: silent on clean/warn-only; summary still prints on errors\n  mds lint --quiet template.mds       Suppress output; exits 1 on warnings, 2 on errors\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
     )]
