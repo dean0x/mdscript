@@ -1,5 +1,6 @@
 import type {
   BackendType,
+  CheckFileOptions,
   CheckOptions,
   CheckResult,
   CompileOptions,
@@ -10,15 +11,10 @@ import type {
   LintResult,
   MdsNodeBackend,
 } from '../types.js';
-import { compileOpt, varsOpt } from '../util/options.js';
+import { compileSrcOpt, checkSrcOpt, fileCompileOpt, fileCheckOpt } from '../util/options.js';
 import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS } from './contract.js';
 
-/** Options forwarded to the napi addon for source-string lint (accepts basePath). */
-type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
-/** Options forwarded to the napi addon for file-based and virtual lint. */
-type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
-
-/** Options shape forwarded to the napi addon for compile (string source). */
+/** Options forwarded to the napi addon for source-string compile (accepts basePath). */
 type NapiCompileOpts = {
   basePath?: string;
   vars?: Record<string, unknown>;
@@ -26,12 +22,23 @@ type NapiCompileOpts = {
   sourcesContent?: boolean;
 };
 
-/** Options shape forwarded to the napi addon for compileFile. */
+/** Options forwarded to the napi addon for source-string check (accepts basePath). */
+type NapiCheckOpts = {
+  basePath?: string;
+  vars?: Record<string, unknown>;
+};
+
+/** Options forwarded to the napi addon for compileFile (no basePath). */
 type NapiFileCompileOpts = {
   vars?: Record<string, unknown>;
   sourceMap?: boolean;
   sourcesContent?: boolean;
 };
+
+/** Options forwarded to the napi addon for source-string lint (accepts basePath). */
+type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
+/** Options forwarded to the napi addon for file-based and virtual lint. */
+type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string, string> };
 
 /**
  * Shape of the napi addon exports.
@@ -41,7 +48,7 @@ type NapiFileCompileOpts = {
  */
 interface NapiAddon {
   compile(source: string, opts?: NapiCompileOpts): unknown;
-  check(source: string, opts?: { basePath?: string; vars?: Record<string, unknown> }): unknown;
+  check(source: string, opts?: NapiCheckOpts): unknown;
   compileFile(path: string, opts?: NapiFileCompileOpts): unknown;
   checkFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
   lint(source: string, opts?: NapiLintOpts): unknown;
@@ -85,25 +92,25 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
 
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const result: unknown = addon.compile(source, compileOpt(options) as NapiCompileOpts | undefined);
+      const result: unknown = addon.compile(source, compileSrcOpt(options) as NapiCompileOpts | undefined);
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     check(source: string, options?: CheckOptions): CheckResult {
-      const result: unknown = addon.check(source, varsOpt(options));
+      const result: unknown = addon.check(source, checkSrcOpt(options) as NapiCheckOpts | undefined);
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-      const result: unknown = await addon.compileFile(path, compileOpt(options) as NapiFileCompileOpts | undefined);
+      const result: unknown = await addon.compileFile(path, fileCompileOpt(options) as NapiFileCompileOpts | undefined);
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
-    async checkFile(path: string, options?: CheckOptions): Promise<CheckResult> {
-      const result: unknown = await addon.checkFile(path, varsOpt(options));
+    async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
+      const result: unknown = await addon.checkFile(path, fileCheckOpt(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },

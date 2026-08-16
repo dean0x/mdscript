@@ -12,7 +12,7 @@ import type {
   MdsBaseBackend,
 } from '../types.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
-import { compileOpt } from '../util/options.js';
+import { fileCompileOpt } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
@@ -333,16 +333,18 @@ const DEFAULT_COMPILE_OPTS = Object.freeze({
 /**
  * Extended options accepted by the internal WASM `compile` entry point.
  *
- * The public `CompileOptions` type omits `filename` and `modules` because
- * callers of the high-level `compile(source, options)` wrapper do not need
- * them — the WASM module uses sensible defaults for the string-compile path.
+ * D-TS-06: extends `Omit<CompileOptions, 'basePath'>`, not `CompileOptions`
+ * directly. After `CompileOptions` gained `basePath` (fix #180), inheriting it
+ * here would silently widen the internal WASM input type. The WASM module has no
+ * filesystem access, so `basePath` is explicitly excluded from this internal type.
+ * The basePath guard in `createWasmBackend.compile/check/lint` fires BEFORE this
+ * type is used, so no runtime leak is possible (avoids PF-004).
  *
- * This internal extension is used by `compileOpts()` so that callers who go
- * through `createWasmBackend` directly (e.g. `wrapWithFileOps`, CF-SM1 test)
- * and supply `filename`/`modules` explicitly get the expected WASM behaviour.
- * The public API contract is unchanged: no public method accepts these keys.
+ * `filename` and `modules` are WASM-internal: callers who go through
+ * `createWasmBackend` directly (e.g. `wrapWithFileOps`, CF-SM1 test) and supply
+ * these keys explicitly get the expected WASM behaviour. No public method accepts them.
  */
-interface _WasmCompileInput extends CompileOptions {
+interface _WasmCompileInput extends Omit<CompileOptions, 'basePath'> {
   filename?: string;
   modules?: Record<string, string>;
 }
@@ -357,7 +359,9 @@ function compileOpts(
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
-  const extra = compileOpt(options);
+  // D-TS-06: use fileCompileOpt (no basePath) — basePath is already excluded
+  // from _WasmCompileInput, and the caller guards against it before reaching here.
+  const extra = fileCompileOpt(options as Parameters<typeof fileCompileOpt>[0]);
   const filename = options?.filename ?? DEFAULT_COMPILE_OPTS.filename;
   const modules = options?.modules ?? DEFAULT_COMPILE_OPTS.modules;
   if (extra == null && filename === DEFAULT_COMPILE_OPTS.filename && modules === DEFAULT_COMPILE_OPTS.modules) {
@@ -388,10 +392,32 @@ export function fileOpts(
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
-  const extra = compileOpt(options);
+  const extra = fileCompileOpt(options);
   return extra != null
     ? { filename: entryFilename, modules, ...extra }
     : { filename: entryFilename, modules };
+}
+
+/**
+ * Throw `mds::invalid_options` when a caller passes `basePath` to a WASM-backend
+ * string-surface method (compile, check, lint).
+ *
+ * OD-1: the WASM backend has no filesystem access, so a non-null `basePath` cannot
+ * be honoured. Throwing instead of silently ignoring surfaces the misconfiguration
+ * rather than linting / compiling a partially-resolved module graph (avoids PF-004).
+ *
+ * AC-P3-10: the message MUST NOT contain "filename" or "modules" (internal WASM
+ * keys the public API never exposes). Verified by the PF-013-controlled negative
+ * assertion in U-WB22: the raw wasmModule.compile call DOES contain those strings,
+ * proving the negative assertion can detect the leak if the guard is removed.
+ */
+function throwWasmBasePathError(): never {
+  const err = new Error(
+    'option "basePath" is not supported by the WASM backend (no filesystem access); ' +
+    'set MDS_BACKEND=native to use the native backend',
+  ) as Error & { code: string };
+  err.code = 'mds::invalid_options';
+  throw err;
 }
 
 /**
@@ -406,20 +432,24 @@ export function fileOpts(
 export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
+      // OD-1: reject basePath rather than silently ignoring it (avoids PF-004).
+      if (options?.basePath != null) throwWasmBasePathError();
       const result: unknown = wasmModule.compile(source, compileOpts(options as _WasmCompileInput));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     check(source: string, options?: CheckOptions): CheckResult {
+      // OD-1: reject basePath rather than silently ignoring it.
+      if (options?.basePath != null) throwWasmBasePathError();
       const result: unknown = wasmModule.check(source, checkOpts(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     lint(source: string, options?: LintOptions): LintResult {
-      // WASM backend does not support basePath (no filesystem access).
-      // vars and rules are forwarded; basePath is silently ignored.
+      // OD-1: reject basePath rather than silently ignoring it.
+      if (options?.basePath != null) throwWasmBasePathError();
       const opts: {
         vars?: Record<string, unknown>;
         rules?: Record<string, string>;

@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`basePath` option is now honored on `compile()`, `check()`, and `lint()` (#180).**
+  Previously `basePath` was accepted by the unknown-option validator (so no error was
+  thrown) but was silently discarded before reaching the backend: the forwarding builders
+  (`compileOpt`/`varsOpt`) never included it in what they passed through. Templates
+  containing `@import` or `@extends` directives compiled with a string-source call and a
+  `basePath` option would either fail to resolve their imports (native backend) or fail
+  silently (WASM backend). The fix adds `basePath` to both `CompileOptions` and
+  `CheckOptions` and propagates it through all four per-surface option builders
+  (`compileSrcOpt`, `checkSrcOpt`, `fileCompileOpt`, `fileCheckOpt`).
+
+  The WASM backend has no filesystem access and cannot resolve file-relative imports; it
+  now **rejects** a non-null `basePath` immediately with `mds::invalid_options` instead
+  of silently ignoring it, so misconfigured callers receive an actionable error rather
+  than a silent wrong answer. `{basePath: undefined}` is treated as absent on both
+  backends (`!= null` check; value-is-intent). To use `basePath` with import resolution,
+  set `MDS_BACKEND=native` or use `lintVirtual` with a pre-resolved module map.
+
+  **Note:** `compileFile` and `checkFile` reject a non-null `basePath` at the JS layer
+  because the base directory for file-based operations is derived from the file path
+  itself; passing `basePath` there is always a caller error.
+
+### Added
+
+- **`lint` and `lintVirtual` are now exported from the browser entry point (#215).**
+  Previously only `compile` and `check` were available from the WASM/browser surface;
+  the underlying WASM module already supported linting but the exports were missing from
+  `browser.ts`. Both functions are available after `init()` and follow the same
+  unknown-option guard used by `compile`/`check`.
+
+  All seven lint types (`LintDiagnostic`, `LintFileOptions`, `LintFileReport`,
+  `LintOptions`, `LintResult`, `LintRuleName`, `LintSpan`, `RuleSeverity`) and the
+  `LINT_RULE_NAMES` constant are now exported from both the Node.js and browser entry
+  points.
+
+### **BREAKING** — TypeScript option types and WASM `basePath` rejection (#213, #180)
+
+#### `FileOptions` no longer extends `CompileOptions` (#213)
+
+`FileOptions` (used by `compileFile`) was previously declared as
+`interface FileOptions extends CompileOptions`. This inheritance was an error:
+`CompileOptions` now carries `basePath`, which is explicitly not valid for file-based
+operations (the base directory is derived from the file path). `FileOptions` is now
+a standalone interface with its own `vars`, `sourceMap`, and `sourcesContent` fields.
+
+**Migration:** code that assigned a `CompileOptions` to a `FileOptions` variable (or
+vice versa) now needs an explicit mapping. Code that used `FileOptions` purely for
+`vars`, `sourceMap`, and `sourcesContent` is unaffected.
+
+#### `checkFile` parameter type changed from `CheckOptions` to `CheckFileOptions` (#213)
+
+`checkFile(path, options?)` previously accepted `CheckOptions`, which includes a
+`basePath` field that is invalid for file-based operations. The parameter is now typed
+as `CheckFileOptions` — a new interface with only `vars?: Record<string, unknown>`.
+
+**Migration:** if you passed `CheckOptions` to `checkFile`, remove the `basePath` field.
+If you used a shared variable typed as `CheckOptions`, destructure or pick `vars` before
+passing it.
+
+#### WASM backend rejects `basePath` on string-surface methods (#180)
+
+`compile(source, { basePath: '/dir' })` and `check(source, { basePath: '/dir' })`
+previously silently ignored `basePath` on the WASM backend. They now throw
+`Error { code: 'mds::invalid_options' }`. `lint(source, { basePath: '/dir' })` was
+already documented as WASM-unsupported; it now enforces this at runtime too.
+
+**Migration:** switch to the native backend (`MDS_BACKEND=native`) when you need
+import resolution with a `basePath`, or use `lintVirtual` with a pre-resolved module
+map in WASM environments.
+
 ### **BREAKING** — Interpolation syntax: `{x}` → `{{x}}`
 
 Interpolation now uses **double braces**: `{{variable}}`, `{{obj.field}}`,

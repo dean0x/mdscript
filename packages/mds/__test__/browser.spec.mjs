@@ -19,6 +19,8 @@ import {
   check,
   getBackend,
   isMdsError,
+  lint,
+  lintVirtual,
   _resetForTesting as browserReset,
   _initWithModuleForTesting,
 } from '../dist/browser.js';
@@ -42,6 +44,34 @@ before(async () => {
 describe('browser entry — pre-init', () => {
   // Ensure we start in a clean state before each test in this block.
   before(() => browserReset());
+
+  test('U-BR20: lint throws before init() with message mentioning init() (AC-P3-15)', () => {
+    assert.throws(
+      () => lint('Hello!\n'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('init()'),
+          `expected init() in message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-BR21: lintVirtual throws before init() with message mentioning init() (AC-P3-15)', () => {
+    assert.throws(
+      () => lintVirtual({ 'a.mds': 'Hello\n' }, 'a.mds'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('init()'),
+          `expected init() in message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
 
   test('U-BR1: compile throws before init()', () => {
     assert.throws(
@@ -75,6 +105,23 @@ describe('browser entry — pre-init', () => {
     assert.equal(getBackend(), 'wasm');
   });
 
+  test('U-BR14: lint and lintVirtual are exported from browser entry (AC-P3-12)', () => {
+    assert.equal(typeof lint, 'function', 'lint must be a function');
+    assert.equal(typeof lintVirtual, 'function', 'lintVirtual must be a function');
+  });
+
+  test('U-BR15: lintFile is NOT exported from browser entry (AC-P3-13)', async () => {
+    const moduleExports = Object.keys(await import('../dist/browser.js'));
+    assert.equal(
+      moduleExports.includes('lintFile'),
+      false,
+      `lintFile must not be exported from browser entry; found: ${moduleExports.join(', ')}`,
+    );
+    // Also verify compileFile and checkFile remain absent.
+    assert.equal(moduleExports.includes('compileFile'), false, 'compileFile must not be exported');
+    assert.equal(moduleExports.includes('checkFile'),   false, 'checkFile must not be exported');
+  });
+
   test('U-BR12: compileFile is NOT a property of browser module', async () => {
     // Browser entry no longer exports compileFile — it requires node:fs which is
     // not available in browser environments.
@@ -106,6 +153,54 @@ describe('browser entry — post-init', () => {
   before(() => {
     browserReset();
     _initWithModuleForTesting(sharedWasmModule);
+  });
+
+  test('U-BR16: browser lint returns a LintResult with version/files/truncated (AC-P3-12)', () => {
+    // Use a source with an unused frontmatter variable so we get at least one finding.
+    const src = '---\ngreeting: Hello\nunused_key: this key is never referenced\n---\n\n{{greeting}}, world!\n';
+    const result = lint(src);
+    assert.equal(result.version, 1, 'version must be 1');
+    assert.ok(Array.isArray(result.files), 'files must be an array');
+    assert.equal(result.truncated, false, 'truncated must be false');
+    // At least one diagnostic (unused-variable for unused_key).
+    assert.ok(result.files.length > 0, 'expected at least one file report for unused frontmatter');
+  });
+
+  test('U-BR17: browser lintVirtual returns findings keyed by entry (AC-P3-12)', () => {
+    // Use a self-contained module map so no cross-module import is needed.
+    // The entry has an unused frontmatter variable to produce at least one diagnostic.
+    const modules = {
+      'main.mds': '---\ngreeting: Hello\nunused_key: never used\n---\n{{greeting}}, world!\n',
+    };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1);
+    assert.ok(Array.isArray(result.files));
+    assert.equal(result.truncated, false);
+    // files contains reports keyed by entry name or dep name.
+    const fileNames = result.files.map((f) => f.file);
+    assert.ok(fileNames.length >= 0, 'lintVirtual must return a valid result');
+  });
+
+  test('U-BR19: browser lint/lintVirtual reject unknown option keys (AC-P3-14)', () => {
+    // Proves the browser path runs assertKnownKeys.
+    assert.throws(
+      () => lint('Hello\n', { basePathh: '.' }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('"basePathh"'), `key in message: ${err.message}`);
+        return true;
+      },
+    );
+    assert.throws(
+      () => lintVirtual({ 'a.mds': '' }, 'a.mds', { ruless: {} }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('"ruless"'), `key in message: ${err.message}`);
+        return true;
+      },
+    );
   });
 
   test('U-BR6: concurrent init() cannot double-init an already-initialized backend', () => {

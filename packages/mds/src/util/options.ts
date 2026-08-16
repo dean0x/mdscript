@@ -1,4 +1,11 @@
-import type { CompileOptions, CheckOptions, FileOptions, LintOptions, LintFileOptions } from '../types.js';
+import type {
+  CheckFileOptions,
+  CheckOptions,
+  CompileOptions,
+  FileOptions,
+  LintFileOptions,
+  LintOptions,
+} from '../types.js';
 
 // ── keysOf helper ──────────────────────────────────────────────────────────────
 
@@ -39,48 +46,35 @@ export type MethodName =
   | 'lintFile'
   | 'lintVirtual';
 
-// ── Internal backend option shapes ────────────────────────────────────────────
-
-// These represent what napi's option parsers accept — wider than the public
-// TypeScript interfaces for compile and check, which intentionally omit basePath
-// (open issue #180). The backend (parse_compile_opts / parse_check_opts) accepts
-// basePath; the public TS types do not expose it yet.
-
-/** Backend-accepted options for `compile` — superset of public {@link CompileOptions}. */
-interface _CompileBackendOpts extends CompileOptions {
-  basePath?: string;
-}
-
-/** Backend-accepted options for `check` — superset of public {@link CheckOptions}. */
-interface _CheckBackendOpts extends CheckOptions {
-  basePath?: string;
-}
-
 // ── Per-method key table ───────────────────────────────────────────────────────
 
 /**
  * Allowed option keys per public wrapper method.
  *
- * Each list is derived via {@link keysOf} from the corresponding backend option
+ * Each list is derived via {@link keysOf} from the corresponding public option
  * interface, binding the table to the interface at compile time. When a method's
  * accepted options change, the witness object in the {@link keysOf} call must be
  * updated, or the call becomes a type error.
  *
+ * CONSTRAINT: key ORDER within each witness literal is load-bearing — it
+ * determines the `recognised keys are: …` list that {@link assertKnownKeys}
+ * emits, which U-OV-14 byte-compares against the napi addon's output. Do not
+ * reorder without updating the expected strings in that test.
+ *
  * Reconciliation against napi option parsers (`crates/mds-napi/src/lib.rs`):
- * - `compile`/`check`: `basePath` added — napi's `parse_compile_opts` /
- *   `parse_check_opts` accept it; the public TS types do not yet expose it
- *   (open issue #180).
- * - `compileFile`/`checkFile`: `basePath` is NOT in the key list; instead it is
- *   passed through to the backend without wrapper interception so napi's purpose-built
- *   error fires ("not valid for compileFile/checkFile; the base directory is derived
- *   from the file path"). See {@link BASEPATH_PASSTHROUGH} and issue #74.
+ * - `compile` / `check`: `basePath` is now in the public types (#180 fix) and in
+ *   the key list; napi's `parse_compile_opts` / `parse_check_opts` accept it.
+ * - `compileFile` / `checkFile`: `basePath` is NOT in the key list. It is passed
+ *   through without wrapper interception so the backend can emit its own purpose-built
+ *   error ("not valid for compileFile/checkFile; the base directory is derived from
+ *   the file path"). See {@link BASEPATH_PASSTHROUGH} and issue #74.
  * - `lint`, `lintFile`, `lintVirtual`: key lists match napi exactly.
  */
 const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
-  compile:     keysOf<_CompileBackendOpts>({ basePath: true, vars: true, sourceMap: true, sourcesContent: true }),
-  check:       keysOf<_CheckBackendOpts>({ basePath: true, vars: true }),
+  compile:     keysOf<CompileOptions>({ basePath: true, vars: true, sourceMap: true, sourcesContent: true }),
+  check:       keysOf<CheckOptions>({ basePath: true, vars: true }),
   compileFile: keysOf<FileOptions>({ vars: true, sourceMap: true, sourcesContent: true }),
-  checkFile:   keysOf<CheckOptions>({ vars: true }),
+  checkFile:   keysOf<CheckFileOptions>({ vars: true }),
   lint:        keysOf<LintOptions>({ basePath: true, vars: true, rules: true }),
   lintFile:    keysOf<LintFileOptions>({ vars: true, rules: true }),
   lintVirtual: keysOf<LintFileOptions>({ vars: true, rules: true }),
@@ -107,7 +101,7 @@ const BASEPATH_PASSTHROUGH: ReadonlySet<MethodName> = new Set<MethodName>([
  * `checkFile`, the wrapper and napi produce byte-identical messages for the same
  * unknown key. For `compileFile` and `checkFile`, `basePath` is not intercepted
  * here — it is passed through so the backend can emit its own purpose-built error
- * (issue #74; open issue #180).
+ * (issue #74).
  *
  * The `method` parameter is typed as the {@link MethodName} literal union —
  * passing an unrecognised method name is a compile-time error, not a silent no-op.
@@ -142,33 +136,72 @@ export function assertKnownKeys(options: object, method: MethodName): void {
   throw err;
 }
 
+// ── Per-surface option builders ────────────────────────────────────────────────
+//
+// D-TS-03 / D-TS-05: four typed builders, one per method-surface combination.
+// Each builder returns `undefined` when no options are set (preserves the
+// backend's fast path for no-options calls — avoids allocating an empty object
+// on every invocation). The per-surface split ensures that adding a new field to
+// a string-surface type (e.g. `CompileOptions`) cannot accidentally appear in the
+// file-surface options forwarded to the backend.
+
 /**
- * Build the `{ vars }` sub-object only when `options.vars` is defined and non-null.
+ * Build options for the string-source compile surface.
+ * Picks `basePath`, `vars`, `sourceMap`, and `sourcesContent` from `CompileOptions`.
  *
- * Used for check and checkFile where source-map options are not applicable.
- * When the caller passes no vars, omitting the key entirely avoids unnecessary
- * object creation and keeps the options shape minimal.
+ * D-TS-03: used by the native backend's `compile` method and by the WASM
+ * backend's `compileOpts()` wrapper (after the WASM basePath guard fires).
  */
-export function varsOpt(
-  options?: { vars?: Record<string, unknown> },
-): { vars: Record<string, unknown> } | undefined {
-  return options?.vars != null ? { vars: options.vars } : undefined;
+export function compileSrcOpt(options?: CompileOptions): Partial<CompileOptions> | undefined {
+  if (options == null) return undefined;
+  const out: Partial<CompileOptions> = {};
+  if (options.basePath != null) out.basePath = options.basePath;
+  if (options.vars != null) out.vars = options.vars;
+  if (options.sourceMap != null) out.sourceMap = options.sourceMap;
+  if (options.sourcesContent != null) out.sourcesContent = options.sourcesContent;
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
- * Build the options object for compile/compileFile, forwarding vars,
- * sourceMap, and sourcesContent when present and non-null.
+ * Build options for the string-source check surface.
+ * Picks `basePath` and `vars` from `CheckOptions`.
  *
- * Returns `undefined` when no options are set so the backend receives no
- * options argument (avoids allocating a needless empty object on the hot path).
+ * D-TS-03: used by the native backend's `check` method. The WASM backend
+ * guards against `basePath` before calling `checkOpts()`.
  */
-export function compileOpt(
-  options?: CompileOptions | FileOptions,
-): { vars?: Record<string, unknown>; sourceMap?: boolean; sourcesContent?: boolean } | undefined {
+export function checkSrcOpt(options?: CheckOptions): Partial<CheckOptions> | undefined {
   if (options == null) return undefined;
-  const out: { vars?: Record<string, unknown>; sourceMap?: boolean; sourcesContent?: boolean } = {};
+  const out: Partial<CheckOptions> = {};
+  if (options.basePath != null) out.basePath = options.basePath;
   if (options.vars != null) out.vars = options.vars;
-  if ((options as CompileOptions).sourceMap != null) out.sourceMap = (options as CompileOptions).sourceMap;
-  if ((options as CompileOptions).sourcesContent != null) out.sourcesContent = (options as CompileOptions).sourcesContent;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Build options for the file-surface compile path.
+ * Picks `vars`, `sourceMap`, and `sourcesContent` from `FileOptions`.
+ * `basePath` is intentionally absent (D-TS-02).
+ *
+ * D-TS-03: used by the native backend's `compileFile` method and internally by
+ * the WASM backend's `compileOpts()` / `fileOpts()` helpers (which deal with
+ * `filename` and `modules` separately).
+ */
+export function fileCompileOpt(options?: FileOptions): Partial<FileOptions> | undefined {
+  if (options == null) return undefined;
+  const out: Partial<FileOptions> = {};
+  if (options.vars != null) out.vars = options.vars;
+  if (options.sourceMap != null) out.sourceMap = options.sourceMap;
+  if (options.sourcesContent != null) out.sourcesContent = options.sourcesContent;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Build options for the file-surface check path.
+ * Picks only `vars` from `CheckFileOptions`.
+ * `basePath`, `sourceMap`, and `sourcesContent` are all intentionally absent.
+ *
+ * D-TS-03: used by the native backend's `checkFile` method.
+ */
+export function fileCheckOpt(options?: CheckFileOptions): { vars: Record<string, unknown> } | undefined {
+  return options?.vars != null ? { vars: options.vars } : undefined;
 }

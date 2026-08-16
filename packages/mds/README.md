@@ -102,27 +102,64 @@ try {
 
 ### Options
 
+#### Option matrix
+
+Each cell names the accepted option type. `basePath` is a string-surface option only;
+file-path methods derive the base directory from the file argument.
+
+|           | String source                | File path          |
+|-----------|------------------------------|--------------------|
+| `compile` | `CompileOptions`             | `FileOptions`      |
+| `check`   | `CheckOptions`               | `CheckFileOptions` |
+| `lint`    | `LintOptions`                | `LintFileOptions`  |
+
+#### Option types
+
 ```ts
-// CompileOptions — accepted by compile() and compileFile()
-interface CompileOptions {
+// CheckOptions — accepted by check() (string source)
+// basePath: required when the source contains @import or @extends.
+// WASM backend: basePath throws mds::invalid_options (no filesystem access);
+// set MDS_BACKEND=native to use the native backend with import resolution.
+// {basePath: undefined} is treated as absent on both backends.
+interface CheckOptions {
   vars?: Record<string, unknown>;
+  basePath?: string;
+}
+
+// CompileOptions — accepted by compile() (string source)
+// Extends CheckOptions: inherits vars and basePath.
+// basePath behaves the same as for CheckOptions (see above).
+interface CompileOptions extends CheckOptions {
   sourceMap?: boolean;      // generate Source Map v3; result gains a `sourceMap` field
   sourcesContent?: boolean; // embed source text in map (requires sourceMap: true)
                             // ⚠ Privacy: embeds the full template source
 }
 
-// CheckOptions — accepted by check() and checkFile() only
-// Source-map options are NOT accepted; passing them throws mds::invalid_options
-interface CheckOptions {
+// FileOptions — accepted by compileFile()
+// basePath is NOT accepted: the base directory is derived from the file path.
+interface FileOptions {
+  vars?: Record<string, unknown>;
+  sourceMap?: boolean;
+  sourcesContent?: boolean;
+}
+
+// CheckFileOptions — accepted by checkFile()
+// basePath is NOT accepted (base directory from file path).
+// Source-map options are NOT accepted; passing them throws mds::invalid_options.
+interface CheckFileOptions {
   vars?: Record<string, unknown>;
 }
 
 // LintOptions — accepted by lint() (string-source)
+// basePath: required when the source contains @import or @extends.
+// WASM backend: basePath throws mds::invalid_options (OD-1 — rejects instead of
+// silently ignoring so misconfigured callers see an actionable error).
+// Set MDS_BACKEND=native to use the native backend, or use lintVirtual with
+// pre-resolved modules.
 interface LintOptions {
   vars?: Record<string, unknown>;
   rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
-  basePath?: string; // base directory for @import resolution; required when the source
-                     // contains @import or @extends. Ignored by the WASM backend.
+  basePath?: string;
 }
 
 // LintFileOptions — accepted by lintFile() and lintVirtual()
@@ -139,10 +176,9 @@ interface InitOptions {
 }
 ```
 
-**Strict unknown-option rejection:** passing any key not listed above throws
-`Error { code: 'mds::invalid_options' }` immediately, before calling the backend.
-This applies to `compile`, `compileFile`, `check`, `checkFile`, `lint`, `lintFile`,
-and `lintVirtual`.
+**Unknown-option rejection:** passing an unrecognised key to any of the seven
+public methods throws `Error { code: 'mds::invalid_options' }` immediately, before
+calling the backend. The error names the offending key(s) and lists the accepted keys.
 
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
