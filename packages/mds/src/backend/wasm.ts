@@ -375,9 +375,14 @@ function compileOpts(
 function checkOpts(
   options?: CheckOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
-  const vars = options?.vars;
-  return vars != null
-    ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, vars }
+  // D-TS-06: forward only the checkFile-surface keys (vars only) via METHOD_KEYS.checkFile,
+  // mirroring compileOpts (which uses 'compileFile'). basePath is excluded from
+  // METHOD_KEYS.checkFile and the caller guards against it before reaching here;
+  // forwardOpts cannot include it. This makes METHOD_KEYS the single source of truth
+  // for what is forwarded from CheckOptions to the WASM module (avoids PF-004).
+  const extra = forwardOpts(options, 'checkFile');
+  return extra != null
+    ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, ...extra }
     : DEFAULT_COMPILE_OPTS;
 }
 

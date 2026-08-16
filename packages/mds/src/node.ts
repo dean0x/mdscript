@@ -130,19 +130,17 @@ function wrapWithFileOps(
       delete extraModules[entryFilename];
       // forwardOpts uses METHOD_KEYS.lintFile (vars, rules) as the single key source.
       // filename and extraModules are WASM-internal keys absent from METHOD_KEYS.
+      // Spread forwarded directly so any future key added to METHOD_KEYS.lintFile is
+      // picked up automatically — no per-key manual copying that could drift (avoids PF-004).
       const forwarded = forwardOpts(options, 'lintFile') as {
         vars?: Record<string, unknown>;
         rules?: Record<string, string>;
       } | undefined;
-      const lintOpts: {
-        filename: string;
-        modules?: Record<string, string>;
-        vars?: Record<string, unknown>;
-        rules?: Record<string, string>;
-      } = { filename: entryFilename };
-      if (Object.keys(extraModules).length > 0) lintOpts.modules = extraModules;
-      if (forwarded?.vars != null) lintOpts.vars = forwarded.vars;
-      if (forwarded?.rules != null) lintOpts.rules = forwarded.rules;
+      const lintOpts = {
+        filename: entryFilename,
+        ...(Object.keys(extraModules).length > 0 ? { modules: extraModules } : undefined),
+        ...forwarded,
+      };
       const result: unknown = wasmModule.lint(entrySource, lintOpts);
       assertResultShape(result, 'lint');
       return result as LintResult;
