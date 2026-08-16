@@ -235,9 +235,9 @@ fn reverify_failure_reason(err: &MdsError) -> String {
 /// A plan of fix edits for a single file's source.
 ///
 /// Obtain via [`plan_fixes`] or [`plan_fixes_with_options`], then pass to
-/// [`apply_fixes_incremental`]. External crates that need an
-/// empty plan can use `FixPlan::default()`; its fields are `pub`, so they remain
-/// directly readable and writable.
+/// [`apply_fixes_incremental`]. External crates that need an empty plan can
+/// use `FixPlan::default()`; its fields are `pub`, so they remain directly
+/// readable and writable.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases;
 /// do not use a struct literal in external crates.
@@ -731,7 +731,7 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 #[deprecated(
     since = "0.4.0",
     note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must \
-            be `Fn`, not `FnOnce`. Removed in v0.5.0; see the item docs."
+            be `Fn`, not `FnOnce`. To be removed in v0.5.0; see the item docs."
 )]
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome

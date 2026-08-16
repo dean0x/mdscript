@@ -585,19 +585,15 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 ## v0.5.0 Removal Tracker: apply_fixes
 
-`mds::fix::apply_fixes` is deprecated as of v0.4.0 and scheduled for removal at v0.5.0.
-The removal is tracked in GitHub issue #304. Before the v0.5.0 tag, at least the following
-ADR-004 reverify-gate behaviors must gain equivalent coverage on the
-`apply_fixes_incremental` path or be explicitly retired in #304.
+`mds::fix::apply_fixes` is deprecated as of v0.4.0. The authoritative enumeration of
+the six ADR-004 reverify-gate tests that must be ported or retired before removal lives
+in GitHub issue #304 (with line numbers and behavior descriptions).
 
-| Test name | Behavior pinned |
-|---|---|
-| `a4_partial_overlap_still_rejected_after_dedup` | A4: overlapping edits refused after dedup |
-| `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` | A5: rejection message stability |
-| `reverify_preexisting_untargeted_survives_and_fix_applies` | AC-F-23: pre-existing untargeted diagnostic survives |
-| `reverify_new_untargeted_diagnostic_is_rejected` | reverify gate rejects new untargeted diagnostics |
-| `tier_b_unused_function_standalone_apply_succeeds` | I-13: Tier B fix applies on standalone file |
-| `l_fix_rev1_output_delta_causes_rejection` | L-FIX-REV1: output delta causes rejection |
+Six tests to port or retire (see #304 for details):
 
-Remove this table once all six behaviors are covered by `apply_fixes_incremental` tests
-(migration complete) or retired in #304.
+- `a4_partial_overlap_still_rejected_after_dedup`
+- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix`
+- `reverify_preexisting_untargeted_survives_and_fix_applies`
+- `reverify_new_untargeted_diagnostic_is_rejected`
+- `tier_b_unused_function_standalone_apply_succeeds`
+- `l_fix_rev1_output_delta_causes_rejection`
