@@ -5865,8 +5865,9 @@ fn lint_directory_config_failure_forces_summary_under_quiet() {
 // population of the "with errors" disjunction (spec.md §7.5 lines 963-965).
 //
 // Not run on Windows where permission enforcement uses ACLs, not Unix mode bits.
-// Running as root bypasses Unix permission checks; the test is vacuous as root,
-// but CI does not run as root.
+// Running as root bypasses Unix permission checks: the chmod-000 file is readable,
+// so the tree lints clean and `assert_eq!(status, Some(2))` fails loudly rather
+// than passing vacuously.  CI does not run as root.
 
 #[cfg(unix)]
 #[test]
