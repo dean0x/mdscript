@@ -380,15 +380,9 @@ function compileOpts(
 function checkOpts(
   options?: CheckOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
-  // Forward only the check-surface keys via METHOD_KEYS.check, which is
-  // derived from CheckOptions — the same interface as this function's parameter.
-  // METHOD_KEYS.check includes basePath, but forwardOpts only forwards keys whose
-  // value is != null; the caller already threw when basePath was non-null, so
-  // basePath is never included in the forwarded object. Using 'check' (not
-  // 'checkFile') keeps the key list tied to CheckOptions so a future key added to
-  // that interface automatically propagates here — eliminating the PF-004 / #180
-  // topology where METHOD_KEYS.check gained a key but this call forwarded via a
-  // different surface's list and silently dropped it.
+  // Uses METHOD_KEYS.check (not 'checkFile') — same rationale as compileOpts above:
+  // the key list stays tied to CheckOptions so a future field propagates automatically.
+  // basePath is excluded by forwardOpts's != null filter (caller already threw).
   const extra = forwardOpts(options, 'check');
   return extra != null
     ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, ...extra }

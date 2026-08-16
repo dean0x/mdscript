@@ -124,9 +124,8 @@ export const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
  * Message is byte-identical to napi `parse_file_opts` / `parse_check_file_opts`
  * (crates/mds-napi/src/lib.rs). The wrapper emits this error BEFORE backend
  * dispatch, so napi never produces this message for a public `compileFile` /
- * `checkFile` call. Nothing enforces the two strings staying in sync except
- * Keep the two in lockstep; editing either alone will fail the runtime
- * cross-surface message-parity test.
+ * `checkFile` call. Keep the two in lockstep — editing either alone will fail
+ * the runtime cross-surface message-parity test (U-OV-27).
  */
 function makeFileBasePathError(): Error & { code: string } {
   const err = new Error(
