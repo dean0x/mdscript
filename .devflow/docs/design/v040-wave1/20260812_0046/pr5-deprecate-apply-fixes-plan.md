@@ -154,7 +154,7 @@ pub fn apply_fixes<F>(...)
 
 **D7 — No new abstraction.** A `pub(crate) fn apply_fixes_impl` with a deprecated forwarder is rejected: the tests would stop exercising the deprecated public path, which is the only path an external user can reach.
 
-**D8 (NEW) — No compiled doctest, and the literal string `allow(deprecated)` must not appear under `crates/*/src/`.** `cargo clippy --all-targets` does not compile doctests, so a doctest calling `apply_fixes` would emit a permanently ungated warning in every downstream `cargo test`. And because the AC-209-04 audit is a lexical grep over `*.rs`, an `#[allow(deprecated)]` written inside a doc-comment code fence in `src/` would trip it. Migration examples use ```text or ```ignore.
+**D8 (NEW) — No compiled doctest, and this PR must ADD no new `allow(deprecated)` under `crates/*/src/`.** `cargo clippy --all-targets` does not compile doctests, so a doctest calling `apply_fixes` would emit a permanently ungated warning in every downstream `cargo test`. And because the AC-209-04 audit is a lexical grep over `*.rs`, an `#[allow(deprecated)]` written inside a doc-comment code fence in `src/` would trip it. Migration examples use ```text or ```ignore. **This is an "add none" rule, not an absolute-absence rule (avoids PF-015):** `crates/mds-core/src/lint/config.rs` lines 287 and 289 already carry `/// #[allow(deprecated)]` inside the compiled doctest for the earlier `LintConfig::from_rules` deprecation, where they are load-bearing — removing them would make that doctest emit a deprecation warning. They are pre-existing and whitelisted by AC-209-04 group (c). Do not delete them in service of this design decision.
 
 ---
 
