@@ -229,9 +229,12 @@ prints one summary line to stderr after processing all files:
 Under `--quiet`, the summary is suppressed when the worst outcome is warnings or clean; it is
 always printed when any file has errors or hits a resource limit, so the non-zero exit is never
 unexplained in those cases. Exception (D1-a): a warn-only run (`mds lint --quiet <dir>`) exits 1
-with zero stderr; `mds lint --fix --check --quiet <dir>` with pending fixes also exits 1 with zero
-stderr — both are intentional and documented in `--help`. The JSON stdout envelope is unchanged in
-directory mode (no `"summary"` key added).
+with no diagnostics or summary on stderr (the depth-limit warning for directory trees deeper than
+64 levels is not suppressed by `--quiet` — documented limitation per AC-Q05); `mds lint --fix
+--check --quiet <dir>` with pending fixes exits 1 with zero stderr bytes — both are intentional;
+the `--fix --check --quiet` case is documented verbatim in `--help` as "Exception (D1-a)", while
+the warn-only exit-1 behaviour is derivable from the quiet-suppression rules described there. The
+JSON stdout envelope is unchanged in directory mode (no `"summary"` key added).
 
 Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 
@@ -248,7 +251,7 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
 | `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
 
-Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, output is suppressed but exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, diagnostics and status output are suppressed (the directory summary still prints when any file has errors or hits a resource limit); exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Bundler Integration
