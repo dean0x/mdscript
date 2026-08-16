@@ -86,7 +86,7 @@ export interface CheckResult {
  * Options for check-only operations (no source-map generation).
  * Accepted by {@link MdsBaseBackend.check}.
  *
- * D-TS-01: `basePath` is added here so that {@link CompileOptions} inherits it
+ * `basePath` is added here so that {@link CompileOptions} inherits it
  * via `extends CheckOptions`. Both compile and check resolve `@import` directives
  * against this directory when the source string is not backed by a file path.
  * The WASM backend rejects a non-null `basePath` at runtime (no filesystem access);
@@ -101,7 +101,7 @@ export interface CheckOptions {
    *
    * **WASM backend:** rejected at runtime with `mds::invalid_options` — the WASM
    * backend has no filesystem access. Set `MDS_BACKEND=native` to force the native
-   * backend, or supply all modules inline with `lintVirtual`.
+   * backend.
    */
   basePath?: string;
 }
@@ -134,7 +134,7 @@ export interface CompileOptions extends CheckOptions {
 /**
  * Options for file-based compile operations.
  *
- * D-TS-02: `FileOptions` deliberately does NOT extend `CompileOptions`. After
+ * `FileOptions` deliberately does NOT extend `CompileOptions`. After
  * `CompileOptions` gained `basePath`, inheriting it here would silently add a
  * field that is not valid for file-surface operations (the base directory is
  * derived from the file path). The fields are declared directly so that adding
@@ -152,6 +152,11 @@ export interface FileOptions {
    * **Privacy warning**: embeds the full template source. Only use in trusted environments.
    */
   sourcesContent?: boolean;
+  /**
+   * Not accepted on file operations: the base directory is derived from the file
+   * path. Passing a non-null value throws `mds::invalid_options`.
+   */
+  basePath?: never;
 }
 
 /**
@@ -163,6 +168,11 @@ export interface FileOptions {
 export interface CheckFileOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
+  /**
+   * Not accepted on file operations: the base directory is derived from the file
+   * path. Passing a non-null value throws `mds::invalid_options`.
+   */
+  basePath?: never;
 }
 
 // ---------------------------------------------------------------------------
@@ -303,7 +313,7 @@ export interface LintOptions {
    * Base directory for resolving `@import` directives in the source string.
    * Required when the source contains `@import` or `@extends`.
    *
-   * OD-1 resolution: the WASM backend **rejects** a non-null `basePath` with
+   * The WASM backend **rejects** a non-null `basePath` with
    * `mds::invalid_options` rather than silently ignoring it. This surfaces the
    * misconfiguration instead of linting a partially-resolved module graph.
    * Set `MDS_BACKEND=native` to force the native backend, or use
@@ -325,6 +335,12 @@ export interface LintFileOptions {
    * accepted for forward compatibility with future rule names.
    */
   rules?: Record<string, RuleSeverity>;
+  /**
+   * Not accepted: `lintFile` derives the base directory from the file path;
+   * `lintVirtual` resolves imports against the caller-supplied module map.
+   * Passing a non-null value throws `mds::invalid_options`.
+   */
+  basePath?: never;
 }
 
 /** Source location of a compiler error. */
@@ -367,10 +383,10 @@ export interface InitOptions {
  * Browser-safe backend interface — compile/check/lint/lintVirtual/getBackend.
  * Does not include file operations (which require node:fs).
  *
- * D-TS-01: all string-surface methods accept `basePath` via their options type
+ * All string-surface methods accept `basePath` via their options type
  * (`CompileOptions` / `CheckOptions` / `LintOptions`). The WASM implementation's
  * runtime contract for `basePath`: a non-null value throws `mds::invalid_options`
- * instead of silently ignoring it (OD-1; avoids PF-004).
+ * instead of silently ignoring it.
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;

@@ -27,7 +27,7 @@ import {
   isMdsError,
   init,
 } from '../dist/node.js';
-import { assertKnownKeys } from '../dist/util/options.js';
+import { assertKnownKeys, METHOD_KEYS, forwardOpts } from '../dist/util/options.js';
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -312,54 +312,45 @@ describe('options-validation', () => {
   // was that basePath was accepted and then dropped). After the fix, the call MUST
   // throw with code 'mds::invalid_options' and a purpose-built message.
 
-  test('U-OV-25: compileFile rejects basePath with a purposeful error (AC-P3-06, AC-P3-07)', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-test-'));
-    const file = path.join(tmp, 'ok.mds');
-    fs.writeFileSync(file, 'Hello\n', 'utf8');
-    try {
-      await assert.rejects(
-        () => compileFile(file, { basePath: '.' }),
-        (err) => {
-          assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
-          assert.equal(err.code, 'mds::invalid_options');
-          // Must name basePath and state the base is derived from the file path.
-          assert.ok(err.message.includes('basePath'), `basePath in message: ${err.message}`);
-          assert.ok(err.message.includes('derived from the file path'), `remedy in message: ${err.message}`);
-          // Must NOT be the generic unknown-key message (AC-P3-07).
-          assert.ok(
-            !err.message.startsWith('unknown option key'),
-            `must not be generic rejection: "${err.message}"`,
-          );
-          return true;
-        },
-      );
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
-    }
+  test('U-OV-25: compileFile throws for basePath with a purposeful error (AC-P3-06, AC-P3-07)', () => {
+    // basePath guard fires synchronously before any I/O — no real file needed
+    // (per U-OV-32 / the note at line 168–177: assert.rejects does NOT intercept
+    // synchronous throws in Node v22 and the error escapes with failureType
+    // 'testCodeFailure', masking the regression).
+    assert.throws(
+      () => compileFile('/any.mds', { basePath: '.' }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        // Must name basePath and state the base is derived from the file path.
+        assert.ok(err.message.includes('basePath'), `basePath in message: ${err.message}`);
+        assert.ok(err.message.includes('derived from the file path'), `remedy in message: ${err.message}`);
+        // Must NOT be the generic unknown-key message (AC-P3-07).
+        assert.ok(
+          !err.message.startsWith('unknown option key'),
+          `must not be generic rejection: "${err.message}"`,
+        );
+        return true;
+      },
+    );
   });
 
-  test('U-OV-26: checkFile rejects basePath with a purposeful error (AC-P3-06, AC-P3-07)', async () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-test-'));
-    const file = path.join(tmp, 'ok.mds');
-    fs.writeFileSync(file, 'Hello\n', 'utf8');
-    try {
-      await assert.rejects(
-        () => checkFile(file, { basePath: '.' }),
-        (err) => {
-          assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
-          assert.equal(err.code, 'mds::invalid_options');
-          assert.ok(err.message.includes('basePath'), `basePath in message: ${err.message}`);
-          assert.ok(err.message.includes('derived from the file path'), `remedy in message: ${err.message}`);
-          assert.ok(
-            !err.message.startsWith('unknown option key'),
-            `must not be generic rejection: "${err.message}"`,
-          );
-          return true;
-        },
-      );
-    } finally {
-      fs.rmSync(tmp, { recursive: true, force: true });
-    }
+  test('U-OV-26: checkFile throws for basePath with a purposeful error (AC-P3-06, AC-P3-07)', () => {
+    // Same synchronous-throw contract as U-OV-25 — use assert.throws (not assert.rejects).
+    assert.throws(
+      () => checkFile('/any.mds', { basePath: '.' }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('basePath'), `basePath in message: ${err.message}`);
+        assert.ok(err.message.includes('derived from the file path'), `remedy in message: ${err.message}`);
+        assert.ok(
+          !err.message.startsWith('unknown option key'),
+          `must not be generic rejection: "${err.message}"`,
+        );
+        return true;
+      },
+    );
   });
 
   // ── basePath honored on native backend (AC-P3-01 / AC-P3-02 / AC-P3-03) ─────
@@ -468,45 +459,70 @@ describe('options-validation', () => {
 
     const be = createNativeBackend(spyAddon);
 
-    const VARS = { k: 1 };
-    const RULES = { 'unused-variable': 'warn' };
-    const BP = '/some/base/path';
+    // A distinguishable test value for each possible option key. Covers every
+    // key currently appearing in any method's METHOD_KEYS entry.
+    //
+    // MAINTENANCE NOTE: if a new option key is added to any option interface,
+    // add a non-null entry here — without it, fullOpts() would supply `undefined`
+    // for the new key, and pickDefined / lintOpt / lintFileOpt would correctly
+    // omit it, making the deepStrictEqual pass vacuously for that key.
+    const KEY_VALUES = {
+      basePath: '/some/base/path',
+      vars: { k: 1 },
+      sourceMap: true,
+      sourcesContent: true,
+      rules: { 'unused-variable': 'warn' },
+    };
+
+    // Build an options object with ALL keys that METHOD_KEYS[method] accepts,
+    // each with a distinguishable value. This is the AC-P3-05 positive control:
+    // if a key is added to METHOD_KEYS (accepted at validation) but omitted from
+    // the forwarding builder (pickDefined / lintOpt / lintFileOpt), expected still
+    // includes that key, so deepStrictEqual catches the drift — reproducing the
+    // #180 bug class at the point of introduction rather than at runtime in
+    // production (avoids PF-013: a hand-typed expected cannot detect this drift).
+    function fullOpts(methodName) {
+      const keys = METHOD_KEYS[methodName] ?? [];
+      const obj = {};
+      for (const k of keys) obj[k] = KEY_VALUES[k];
+      return obj;
+    }
 
     const cases = [
       {
         name: 'compile',
-        call: () => be.compile('', { basePath: BP, vars: VARS, sourceMap: true, sourcesContent: true }),
-        expected: { basePath: BP, vars: VARS, sourceMap: true, sourcesContent: true },
+        call: () => be.compile('', fullOpts('compile')),
+        expected: fullOpts('compile'),
       },
       {
         name: 'check',
-        call: () => be.check('', { basePath: BP, vars: VARS }),
-        expected: { basePath: BP, vars: VARS },
+        call: () => be.check('', fullOpts('check')),
+        expected: fullOpts('check'),
       },
       {
         name: 'compileFile',
-        call: () => be.compileFile('/any.mds', { vars: VARS, sourceMap: true, sourcesContent: true }),
-        expected: { vars: VARS, sourceMap: true, sourcesContent: true },
+        call: () => be.compileFile('/any.mds', fullOpts('compileFile')),
+        expected: fullOpts('compileFile'),
       },
       {
         name: 'checkFile',
-        call: () => be.checkFile('/any.mds', { vars: VARS }),
-        expected: { vars: VARS },
+        call: () => be.checkFile('/any.mds', fullOpts('checkFile')),
+        expected: fullOpts('checkFile'),
       },
       {
         name: 'lint',
-        call: () => be.lint('', { basePath: BP, vars: VARS, rules: RULES }),
-        expected: { basePath: BP, vars: VARS, rules: RULES },
+        call: () => be.lint('', fullOpts('lint')),
+        expected: fullOpts('lint'),
       },
       {
         name: 'lintFile',
-        call: () => be.lintFile('/any.mds', { vars: VARS, rules: RULES }),
-        expected: { vars: VARS, rules: RULES },
+        call: () => be.lintFile('/any.mds', fullOpts('lintFile')),
+        expected: fullOpts('lintFile'),
       },
       {
         name: 'lintVirtual',
-        call: () => be.lintVirtual({ 'a.mds': '' }, 'a.mds', { vars: VARS, rules: RULES }),
-        expected: { vars: VARS, rules: RULES },
+        call: () => be.lintVirtual({ 'a.mds': '' }, 'a.mds', fullOpts('lintVirtual')),
+        expected: fullOpts('lintVirtual'),
       },
     ];
 
@@ -523,7 +539,7 @@ describe('options-validation', () => {
 
   // ── cross-backend message equality for file basePath (AC-P3-06 / U-OV-27) ─
 
-  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical to napi and backend-independent (AC-P3-06, avoids PF-007)', async () => {
+  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical to napi (AC-P3-06, avoids PF-007)', async () => {
     const addon = requireNativeAddon(); // hard-fail without addon
 
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-'));
@@ -538,10 +554,14 @@ describe('options-validation', () => {
     try {
       for (const method of ['compileFile', 'checkFile']) {
         // The wrapper's public file methods short-circuit basePath in node.ts
-        // (fileBasePathError) BEFORE backend dispatch — verified below by the
-        // backend-independence leg. That makes the wrapper message the operative
-        // one on every backend, so the authoritative parity assertion is
-        // wrapper-vs-napi, NOT wrapper-vs-wrapper.
+        // (getBasePathError) BEFORE assertReady() — the backend is never consulted
+        // for this input. MDS_BACKEND is read only during init(), which this guard
+        // precedes. A subprocess under MDS_BACKEND=wasm therefore produces byte-
+        // identical output to the native path: that assertion would be a tautology
+        // that compares the guard against itself and cannot fail while LEG 1 passes
+        // (avoids PF-013 on the 'backend-independence' claim). The message is
+        // structurally backend-independent by construction, not by test.
+        // LEG 1 below is the real drift guard.
         const wrapperMsg = await captureMsg(
           () => (method === 'compileFile' ? compileFile : checkFile)(file, { basePath: '.' }),
         );
@@ -555,41 +575,14 @@ describe('options-validation', () => {
           () => (method === 'compileFile' ? addon.compileFile : addon.checkFile)(file, { basePath: '.' }),
         );
 
-        // LEG 2: the same public call under MDS_BACKEND=wasm must produce the same
-        // message. Subprocess for full isolation (no shared module singleton).
-        const { execFileSync } = await import('node:child_process');
-        const wasmMsg = await captureMsg(() => {
-          const script = `
-import { ${method} } from './dist/node.js';
-${method}(${JSON.stringify(file)}, { basePath: '.' }).catch(e => {
-  process.stdout.write(e.message);
-  process.exit(0);
-}).then(r => { if (r !== undefined) process.exit(0); });
-`;
-          const out = execFileSync(process.execPath, ['--input-type=module'], {
-            input: script,
-            cwd: PKG_DIR,
-            env: { ...process.env, MDS_BACKEND: 'wasm' },
-            timeout: 15000,
-          });
-          throw new Error(out.toString().trim() || 'WASM subprocess produced no output');
-        });
-
-        // Positive controls: every leg must have actually produced an error. A
-        // silently-empty message would make the equality assertions vacuous.
+        // Positive controls: each leg must have produced an error.
         assert.ok(wrapperMsg.length > 0, `wrapper ${method} must throw for basePath`);
         assert.ok(napiMsg.length > 0, `napi ${method} must throw for basePath`);
-        assert.ok(wasmMsg.length > 0, `WASM-backend ${method} must throw for basePath`);
 
         assert.strictEqual(
           wrapperMsg,
           napiMsg,
           `wrapper must match napi byte-for-byte for ${method} — wrapper: "${wrapperMsg}" | napi: "${napiMsg}"`,
-        );
-        assert.strictEqual(
-          wrapperMsg,
-          wasmMsg,
-          `message must be backend-independent for ${method} — native-default: "${wrapperMsg}" | MDS_BACKEND=wasm: "${wasmMsg}"`,
         );
       }
     } finally {
@@ -773,6 +766,103 @@ ${method}(${JSON.stringify(file)}, { basePath: '.' }).catch(e => {
     assert.doesNotThrow(
       () => compile('Hello\n', { __proto__: 'x' }),
       '__proto__ in object literal is not an own enumerable key; no invalid_options error should fire',
+    );
+  });
+
+  // ── basePath throws synchronously on file methods (single error channel) ──
+  //
+  // assertKnownKeys (unknown-key errors) throws synchronously for ALL methods.
+  // The basePath guard on compileFile/checkFile must use the SAME channel so that
+  // `try { compileFile(f, opts) } catch` captures both error classes.
+  // Using assert.throws (not assert.rejects) is intentional: a regression to
+  // Promise.reject would escape the catch and surface as an unhandled rejection,
+  // failing the test with a process warning rather than a clean assertion failure.
+
+  test('U-OV-32: compileFile throws synchronously for basePath (same channel as assertKnownKeys)', () => {
+    // Fires before assertReady(), so no real file or init() is needed.
+    assert.throws(
+      () => compileFile('/any.mds', { basePath: '.' }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('basePath'), `basePath in message: ${err.message}`);
+        assert.ok(
+          !err.message.startsWith('unknown option key'),
+          `must not be generic rejection: "${err.message}"`,
+        );
+        return true;
+      },
+      'compileFile must throw synchronously for basePath — not return a rejected promise',
+    );
+  });
+
+  test('U-OV-33: checkFile throws synchronously for basePath (same channel as assertKnownKeys)', () => {
+    // Fires before assertReady(), so no real file or init() is needed.
+    assert.throws(
+      () => checkFile('/any.mds', { basePath: '.' }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('basePath'), `basePath in message: ${err.message}`);
+        assert.ok(
+          !err.message.startsWith('unknown option key'),
+          `must not be generic rejection: "${err.message}"`,
+        );
+        return true;
+      },
+      'checkFile must throw synchronously for basePath — not return a rejected promise',
+    );
+  });
+
+  // ── compile-options builder fast path (AC-P3-22 second half) ────────────────
+  //
+  // Test-plan item 17: "a unit assertion that the compile-options builder returns
+  // undefined (strictly, not {}) … assert compileOpts(undefined) === compileOpts({})
+  // by object identity". The WASM backend's compileOpts() fast path at wasm.ts:363-365
+  // fires only when fileCompileOpt (called internally by compileOpts) returns undefined.
+  // If compileSrcOpt or fileCompileOpt returned {} for empty input, every compile call
+  // would allocate a new object rather than reusing DEFAULT_COMPILE_OPTS — the
+  // regression would be invisible to U-PF1/U-PF2 (too much headroom) and no other
+  // test pins this invariant (avoids PF-013: absence of an allocation test cannot
+  // detect a silent allocation regression).
+
+  test('U-OV-34: forwardOpts returns undefined for empty compile input, and the WASM backend reuses DEFAULT_COMPILE_OPTS by identity (AC-P3-22)', async () => {
+    // Part 1: forwardOpts returns undefined (strictly) for empty input — {} would
+    // allocate a new object and defeat the WASM DEFAULT_COMPILE_OPTS identity fast path.
+    assert.strictEqual(forwardOpts(undefined, 'compile'), undefined,
+      'forwardOpts(undefined, compile) must be undefined — {} would defeat the WASM fast path');
+    assert.strictEqual(forwardOpts({}, 'compile'), undefined,
+      'forwardOpts({}, compile) must be undefined — {} would defeat the WASM fast path');
+    assert.strictEqual(forwardOpts(null, 'compile'), undefined,
+      'forwardOpts(null, compile) must be undefined');
+
+    // Part 2: object-identity assertion through a WASM spy. compileOpts() inside
+    // the WASM backend must return the SAME DEFAULT_COMPILE_OPTS reference for both
+    // undefined and {} options, proving the fast-path branch at wasm.ts:363-365 fires.
+    // We test this through a spy wasmModule rather than exporting the private
+    // compileOpts / DEFAULT_COMPILE_OPTS symbols from wasm.ts.
+    const { createWasmBackend } = await import('../dist/backend/wasm.js');
+    let capturedWasmOpts;
+    const spyWasmModule = {
+      compile:     (_src, opts) => { capturedWasmOpts = opts; return { kind: 'markdown', output: '', warnings: [], dependencies: [] }; },
+      check:       (_src, _opts) => ({ warnings: [] }),
+      lint:        (_src, _opts) => ({ version: 1, files: [], truncated: false }),
+      lintVirtual: (_m, _e, _opts) => ({ version: 1, files: [], truncated: false }),
+      scanImports: (_src) => [],
+    };
+    const wasmBe = createWasmBackend(spyWasmModule);
+
+    wasmBe.compile('', undefined);
+    const optsForUndefined = capturedWasmOpts;
+
+    wasmBe.compile('', {});
+    const optsForEmpty = capturedWasmOpts;
+
+    assert.strictEqual(
+      optsForUndefined,
+      optsForEmpty,
+      'compileOpts(undefined) and compileOpts({}) must return the same DEFAULT_COMPILE_OPTS object ' +
+      '— identity fast path at wasm.ts:363-365 must fire for both inputs',
     );
   });
 });

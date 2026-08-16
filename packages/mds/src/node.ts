@@ -17,7 +17,7 @@ import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
 import { buildModulesMap } from './util/module-scanner.js';
-import { assertKnownKeys } from './util/options.js';
+import { assertKnownKeys, forwardOpts, getBasePathError } from './util/options.js';
 
 // Read MDS_BACKEND at module scope — sync, deterministic, no I/O.
 const rawBackend = process.env['MDS_BACKEND'];
@@ -53,29 +53,6 @@ export function _resetForTesting(): void {
 // ---------------------------------------------------------------------------
 // File-ops wrapper
 // ---------------------------------------------------------------------------
-
-/**
- * Build the `mds::invalid_options` error for `basePath` on file-surface methods.
- *
- * Separated from the throw so that the public `compileFile` / `checkFile` guards
- * share one message string with the napi `parse_file_opts` / `parse_check_file_opts`
- * output, satisfying U-OV-27's byte-identical requirement (avoids PF-007).
- *
- * Message is byte-identical to napi `parse_file_opts` / `parse_check_file_opts`
- * (crates/mds-napi/src/lib.rs). Because this guard short-circuits BEFORE backend
- * dispatch, napi never actually produces the message for a public `compileFile` /
- * `checkFile` call — so nothing enforces the two strings staying in sync except
- * U-OV-27, which compares this message against the raw addon's at runtime. Keep
- * the two in lockstep; editing either alone fails that test.
- */
-function fileBasePathError(): Error & { code: string } {
-  const err = new Error(
-    'option "basePath" is not valid for compileFile/checkFile; ' +
-    'the base directory is derived from the file path',
-  ) as Error & { code: string };
-  err.code = 'mds::invalid_options';
-  return err;
-}
 
 /**
  * Wrap a MdsBaseBackend with file-based compile/check operations, producing
@@ -290,11 +267,13 @@ export function check(source: string, options?: CheckOptions): CheckResult {
  * `.catch()` on the returned promise does NOT receive option-validation errors.
  */
 export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
-  if (options != null) assertKnownKeys(options, 'compileFile');
-  // BASEPATH_PASSTHROUGH: assertKnownKeys skips basePath for file methods (issue #74).
-  // Throws synchronously — same channel as assertKnownKeys above (U-OV-32).
-  if ((options as CompileOptions | undefined)?.basePath != null) {
-    throw fileBasePathError();
+  if (options != null) {
+    assertKnownKeys(options, 'compileFile');
+    // BASEPATH_PASSTHROUGH: assertKnownKeys skips basePath for file methods (issue #74).
+    // Throws synchronously — same channel as assertKnownKeys above (U-OV-32).
+    // getBasePathError() handles the cast internally via Record<string, unknown>.
+    const bpErr = getBasePathError(options, 'compileFile');
+    if (bpErr != null) throw bpErr;
   }
   return assertReady().compileFile(path, options);
 }
@@ -308,10 +287,12 @@ export function compileFile(path: string, options?: FileOptions): Promise<Compil
  * Same sync-throw contract as compileFile: basePath guard throws synchronously (U-OV-33).
  */
 export function checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
-  if (options != null) assertKnownKeys(options, 'checkFile');
-  // Same basePath guard — throws synchronously (same channel as assertKnownKeys, U-OV-33).
-  if ((options as CheckOptions | undefined)?.basePath != null) {
-    throw fileBasePathError();
+  if (options != null) {
+    assertKnownKeys(options, 'checkFile');
+    // Same basePath guard — throws synchronously (same channel as assertKnownKeys, U-OV-33).
+    // getBasePathError() handles the cast internally via Record<string, unknown>.
+    const bpErr = getBasePathError(options, 'checkFile');
+    if (bpErr != null) throw bpErr;
   }
   return assertReady().checkFile(path, options);
 }

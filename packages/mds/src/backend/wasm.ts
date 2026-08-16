@@ -12,7 +12,7 @@ import type {
   MdsBaseBackend,
 } from '../types.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
-import { fileCompileOpt } from '../util/options.js';
+import { forwardOpts } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
@@ -359,9 +359,10 @@ function compileOpts(
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
-  // D-TS-06: use fileCompileOpt (no basePath) — basePath is already excluded
-  // from _WasmCompileInput, and the caller guards against it before reaching here.
-  const extra = fileCompileOpt(options);
+  // D-TS-06: forward only the compileFile-surface keys (vars, sourceMap, sourcesContent)
+  // via METHOD_KEYS.compileFile. basePath is excluded from _WasmCompileInput and the
+  // caller guards against it before reaching here; forwardOpts cannot include it.
+  const extra = forwardOpts(options, 'compileFile');
   const filename = options?.filename ?? DEFAULT_COMPILE_OPTS.filename;
   const modules = options?.modules ?? DEFAULT_COMPILE_OPTS.modules;
   if (extra == null && filename === DEFAULT_COMPILE_OPTS.filename && modules === DEFAULT_COMPILE_OPTS.modules) {
@@ -392,7 +393,9 @@ export function fileOpts(
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
-  const extra = fileCompileOpt(options);
+  // Use forwardOpts for the user-visible keys (vars, sourceMap, sourcesContent)
+  // so METHOD_KEYS.compileFile is the single authoritative source for what is forwarded.
+  const extra = forwardOpts(options, 'compileFile');
   return extra != null
     ? { filename: entryFilename, modules, ...extra }
     : { filename: entryFilename, modules };
@@ -450,15 +453,11 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
     lint(source: string, options?: LintOptions): LintResult {
       // OD-1: reject basePath rather than silently ignoring it.
       if (options?.basePath != null) throwWasmBasePathError();
-      const opts: {
-        vars?: Record<string, unknown>;
-        rules?: Record<string, string>;
-      } = {};
-      if (options?.vars != null) opts.vars = options.vars;
-      if (options?.rules != null) opts.rules = options.rules;
+      // forwardOpts uses METHOD_KEYS.lint (vars, rules only after the guard above
+      // ensures basePath is null/undefined and thus excluded by != null check).
       const result: unknown = wasmModule.lint(
         source,
-        Object.keys(opts).length > 0 ? opts : undefined,
+        forwardOpts(options, 'lint') as { vars?: Record<string, unknown>; rules?: Record<string, string> } | undefined,
       );
       assertResultShape(result, 'lint');
       return result as LintResult;
@@ -469,16 +468,11 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       entry: string,
       options?: LintFileOptions,
     ): LintResult {
-      const opts: {
-        vars?: Record<string, unknown>;
-        rules?: Record<string, string>;
-      } = {};
-      if (options?.vars != null) opts.vars = options.vars;
-      if (options?.rules != null) opts.rules = options.rules;
+      // forwardOpts uses METHOD_KEYS.lintVirtual (vars, rules).
       const result: unknown = wasmModule.lintVirtual(
         modules,
         entry,
-        Object.keys(opts).length > 0 ? opts : undefined,
+        forwardOpts(options, 'lintVirtual') as { vars?: Record<string, unknown>; rules?: Record<string, string> } | undefined,
       );
       assertResultShape(result, 'lint');
       return result as LintResult;

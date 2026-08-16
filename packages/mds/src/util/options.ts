@@ -97,25 +97,78 @@ export const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
   lintVirtual: keysOf<LintFileOptions>({ vars: true, rules: true }),
 };
 
+// ── basePath error factory for file-surface methods ────────────────────────────
+
 /**
- * Methods for which `basePath` is passed through to the backend without wrapper
- * interception (issue #74). The backend emits a purpose-built actionable error
- * for these methods ("not valid for compileFile/checkFile; the base directory is
- * derived from the file path") rather than the generic "unknown option key" format.
+ * Build the `mds::invalid_options` error for `basePath` on file-surface methods.
+ *
+ * Message is byte-identical to napi `parse_file_opts` / `parse_check_file_opts`
+ * (crates/mds-napi/src/lib.rs). The wrapper emits this error BEFORE backend
+ * dispatch, so napi never produces this message for a public `compileFile` /
+ * `checkFile` call. Nothing enforces the two strings staying in sync except
+ * U-OV-27, which compares this message against the raw addon's at runtime.
+ * Keep the two in lockstep; editing either alone fails that test.
+ */
+function makeFileBasePathError(): Error & { code: string } {
+  const err = new Error(
+    'option "basePath" is not valid for compileFile/checkFile; ' +
+    'the base directory is derived from the file path',
+  ) as Error & { code: string };
+  err.code = 'mds::invalid_options';
+  return err;
+}
+
+/**
+ * Methods for which `basePath` must be rejected with a purpose-built error rather
+ * than the generic "unknown option key" form.
+ *
+ * Each entry maps a method name to the factory that creates its rejection.
+ * Using a Map (not a Set) means a new method can only be added when an error
+ * factory is simultaneously provided — widening without a handler is a TypeScript
+ * error on the Map literal, not a silent omission.
+ *
+ * The wrapper emits this error BEFORE dispatch (via {@link getBasePathError});
+ * no backend ever receives a `basePath` on these methods. `assertKnownKeys` skips
+ * the generic unknown-key path for `basePath` on these methods because they are
+ * absent from METHOD_KEYS for those surfaces.
  *
  * KNOWN RESIDUAL (OD-5): napi also has purpose-built `basePath` messages for
  * `lintFile` ("not valid for lintFile; …") and `lintVirtual`, but those two methods
- * are deliberately NOT in this set. The wrapper intercepts them first and emits the
+ * are deliberately NOT in this map. The wrapper intercepts them first and emits the
  * generic `unknown option key "basePath"; recognised keys are: vars, rules` form, so
  * the wrapper and napi messages diverge for that one input. This is intentional and
  * locked in by U-OV-7 and U-OV-13; the generic message still names the offending key
- * and is a hard error either way. Widening this set would change those two messages
- * and is deferred rather than bundled into #180/#215/#213.
+ * and is a hard error either way. Widening this map would change those messages and
+ * is deferred rather than bundled into #180/#215/#213.
  */
-const BASEPATH_PASSTHROUGH: ReadonlySet<MethodName> = new Set<MethodName>([
-  'compileFile',
-  'checkFile',
-]);
+const BASEPATH_PASSTHROUGH: ReadonlyMap<MethodName, () => Error & { code: string }> = new Map([
+  ['compileFile', makeFileBasePathError],
+  ['checkFile',   makeFileBasePathError],
+] as const);
+
+/**
+ * Return the purpose-built `basePath` error for `method` if `options.basePath`
+ * is non-null and `method` is in {@link BASEPATH_PASSTHROUGH}, or `undefined`
+ * otherwise.
+ *
+ * Callers throw the returned error synchronously — the same channel as
+ * {@link assertKnownKeys} — so that `try { compileFile(f, opts) } catch` captures
+ * both unknown-key and basePath errors (U-OV-32 / U-OV-33). The structural benefit:
+ * adding a new method to BASEPATH_PASSTHROUGH requires providing a factory via the
+ * Map literal, ensuring the handler is co-located with the set membership.
+ *
+ * @param options - The caller-supplied options object (non-null).
+ * @param method  - Public method name.
+ */
+export function getBasePathError(
+  options: object,
+  method: MethodName,
+): (Error & { code: string }) | undefined {
+  const factory = BASEPATH_PASSTHROUGH.get(method);
+  if (!factory) return undefined;
+  const basePath = (options as Record<string, unknown>)['basePath'];
+  return basePath != null ? factory() : undefined;
+}
 
 // ── Main validator ─────────────────────────────────────────────────────────────
 
@@ -125,9 +178,9 @@ const BASEPATH_PASSTHROUGH: ReadonlySet<MethodName> = new Set<MethodName>([
  * Uses the same message format as `format_unknown_keys_error` in
  * `crates/mds-core/src/options.rs`. For all methods except `compileFile` and
  * `checkFile`, the wrapper and napi produce byte-identical messages for the same
- * unknown key. For `compileFile` and `checkFile`, `basePath` is not intercepted
- * here — it is passed through so the backend can emit its own purpose-built error
- * (issue #74).
+ * unknown key. For `compileFile` and `checkFile`, `basePath` is absent from
+ * METHOD_KEYS for those surfaces and is skipped here — the caller uses
+ * {@link getBasePathError} to emit the purpose-built rejection (issue #74).
  *
  * The `method` parameter is typed as the {@link MethodName} literal union —
  * passing an unrecognised method name is a compile-time error, not a silent no-op.
@@ -143,8 +196,9 @@ export function assertKnownKeys(options: object, method: MethodName): void {
   if (!Object.prototype.hasOwnProperty.call(METHOD_KEYS, method)) return;
   const known = METHOD_KEYS[method];
   const unknowns = Object.keys(options).filter((k) => {
-    // basePath is passed through for file-based methods so the backend emits its
-    // own purpose-built error rather than this generic rejection (issue #74).
+    // basePath is absent from METHOD_KEYS for file-surface methods; skip it here
+    // so the generic "unknown option key" path is not taken. The caller uses
+    // getBasePathError() to emit the purpose-built rejection (issue #74).
     if (BASEPATH_PASSTHROUGH.has(method) && k === 'basePath') return false;
     return !known.includes(k);
   });
@@ -162,75 +216,44 @@ export function assertKnownKeys(options: object, method: MethodName): void {
   throw err;
 }
 
-// ── Per-surface option builders ────────────────────────────────────────────────
-//
-// D-TS-03 / D-TS-05: four typed builders, one per method-surface combination.
-// Each builder returns `undefined` when no options are set (preserves the
-// backend's fast path for no-options calls — avoids allocating an empty object
-// on every invocation). The per-surface split ensures that adding a new field to
-// a string-surface type (e.g. `CompileOptions`) cannot accidentally appear in the
-// file-surface options forwarded to the backend.
+// ── Option forwarding ──────────────────────────────────────────────────────────
 
 /**
- * Return a new object containing only the keys from `keys` whose values in
- * `src` are non-null/undefined. Returns `undefined` when `src` is nullish or
- * every selected value is absent — so callers can use `result ?? undefined`
- * without allocating an empty object on every invocation (backend fast path).
+ * Forward `options` to the backend, keeping only the keys listed in
+ * {@link METHOD_KEYS} for `method`.
  *
- * @internal
- */
-function pickDefined<T extends object>(
-  src: T | null | undefined,
-  keys: readonly (keyof T)[],
-): Partial<T> | undefined {
-  if (src == null) return undefined;
-  const defined = keys.filter(k => src[k] != null);
-  if (defined.length === 0) return undefined;
-  return Object.fromEntries(defined.map(k => [k, src[k]])) as Partial<T>;
-}
-
-/**
- * Build options for the string-source compile surface.
- * Picks `basePath`, `vars`, `sourceMap`, and `sourcesContent` from `CompileOptions`.
+ * This is the **single authoritative forwarding path** for all seven public
+ * methods. When METHOD_KEYS is updated (e.g. a new key is added to a method's
+ * option interface and its {@link keysOf} witness is updated), forwarding picks
+ * it up automatically with no additional edit. The previous design used
+ * independent per-surface builders (`compileSrcOpt`, `checkSrcOpt`, etc.) that
+ * each hardcoded their own key array — those could drift from METHOD_KEYS without
+ * a compile error, which is the root shape of PF-004 / #180.
  *
- * D-TS-03: used by the native backend's `compile` method and by the WASM
- * backend's `compileOpts()` wrapper (after the WASM basePath guard fires).
- */
-export function compileSrcOpt(options?: CompileOptions): Partial<CompileOptions> | undefined {
-  return pickDefined(options, ['basePath', 'vars', 'sourceMap', 'sourcesContent']);
-}
-
-/**
- * Build options for the string-source check surface.
- * Picks `basePath` and `vars` from `CheckOptions`.
+ * Returns `undefined` when `options` is nullish or every accepted key is absent,
+ * preserving the backend no-options fast path (avoids allocating empty objects
+ * on every call). D-TS-03 / D-TS-05.
  *
- * D-TS-03: used by the native backend's `check` method. The WASM backend
- * guards against `basePath` before calling `checkOpts()`.
+ * @param options - Caller-supplied options (null/undefined treated as "no options").
+ * @param method  - Public method name; selects the key list from METHOD_KEYS.
  */
-export function checkSrcOpt(options?: CheckOptions): Partial<CheckOptions> | undefined {
-  return pickDefined(options, ['basePath', 'vars']);
-}
-
-/**
- * Build options for the file-surface compile path.
- * Picks `vars`, `sourceMap`, and `sourcesContent` from `FileOptions`.
- * `basePath` is intentionally absent (D-TS-02).
- *
- * D-TS-03: used by the native backend's `compileFile` method and internally by
- * the WASM backend's `compileOpts()` / `fileOpts()` helpers (which deal with
- * `filename` and `modules` separately).
- */
-export function fileCompileOpt(options?: FileOptions): Partial<FileOptions> | undefined {
-  return pickDefined(options, ['vars', 'sourceMap', 'sourcesContent']);
-}
-
-/**
- * Build options for the file-surface check path.
- * Picks only `vars` from `CheckFileOptions`.
- * `basePath`, `sourceMap`, and `sourcesContent` are all intentionally absent.
- *
- * D-TS-03: used by the native backend's `checkFile` method.
- */
-export function fileCheckOpt(options?: CheckFileOptions): { vars: Record<string, unknown> } | undefined {
-  return options?.vars != null ? { vars: options.vars } : undefined;
+export function forwardOpts(
+  options: object | null | undefined,
+  method: MethodName,
+): Record<string, unknown> | undefined {
+  if (options == null) return undefined;
+  const keys = METHOD_KEYS[method];
+  const src = options as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  let any = false;
+  for (const k of keys) {
+    const v = src[k];
+    if (v != null) {
+      // unavoidable: accumulating into Record<string,unknown> loses per-key value
+      // types, but callers cast to their concrete options type at the call site.
+      out[k] = v;
+      any = true;
+    }
+  }
+  return any ? out : undefined;
 }
