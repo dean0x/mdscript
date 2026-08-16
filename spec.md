@@ -872,7 +872,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
-| `-q, --quiet` | Suppress status messages and warnings on stderr. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. |
+| `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
 
 **Output path resolution** (precedence order, highest first):
 
@@ -915,6 +915,7 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 |--------|-------------|
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
+| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format, so the non-zero exit is never unexplained. |
 
 ### 7.5 `mds lint`
 
@@ -934,7 +935,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 **Channel discipline:**
 - Human-readable diagnostics → **stderr** (via miette).
 - `--format json` output → **stdout** (single JSON object, one trailing newline).
-- Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode).
+- Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode, except under `--fix --diff` which also writes the unified diff to stdout).
 - `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
 
 **Options:**

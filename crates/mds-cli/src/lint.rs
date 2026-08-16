@@ -25,6 +25,9 @@
 //! Two messages deliberately bypass `--quiet` because they signal a silent-CI-green-pass
 //! hazard rather than status: the all-excluded diagnostic in [`run_lint_directory`] and
 //! the directory summary when any file is in the error or resource-limited bucket.
+//! A third emitter also bypasses `--quiet`: `output::collect_mds_files_inner`'s
+//! depth-limit warning (fires on trees deeper than MAX_DEPTH=64) accepts no quiet
+//! parameter — documented limitation per AC-Q05/PF-015, mirroring `build.rs`.
 //!
 //! # Exit codes (via direct `std::process::exit`, NEVER via `exit_code()`)
 //!
@@ -759,6 +762,17 @@ fn run_lint_stdin(
     // before returning.
     set_diag_display_path(&mut result, STDIN_DISPLAY_LABEL);
 
+    // D4 (AD-216-contract): status message, not an error — suppress under --quiet.
+    // PF-004: stdin is a separate emitter from file/directory mode; the cap notice
+    // must reach this path too (avoids the #43/#173 divergence class).
+    if result.truncated && fix && !quiet {
+        eprintln!(
+            "diagnostic cap ({}) reached; further findings were suppressed — \
+             re-run --fix to continue",
+            mds::MAX_DIAGNOSTICS
+        );
+    }
+
     if fix {
         // ── Preview path: --fix --check and/or --fix --diff (never writes source) ───
         // Mirrors run_lint_file's preview path so stdin honours --check / --diff the
@@ -1209,7 +1223,9 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
 ///
 /// **D2 decision (AC-Q16):** the JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`)
 /// is unchanged — no `"summary"` key is added.  The summary is emitted to stderr only,
-/// keeping stdout a single clean JSON document in all modes.
+/// keeping stdout a single clean JSON document in all non-`--diff` modes.  (`--fix --diff`
+/// is a legal invocation that writes the unified diff to stdout ahead of the envelope,
+/// so `--fix --diff --format json` produces non-JSON-parseable stdout by design.)
 ///
 /// **Channel discipline (AD-216-8):** the summary is emitted in BOTH human and JSON
 /// format modes — format governs where machine-readable output goes (stdout), not
