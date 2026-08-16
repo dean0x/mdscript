@@ -153,13 +153,12 @@ impl miette::Diagnostic for StdinRelabeledError {
 /// inner diagnostic that already carries a `NamedSource` (which these do) wins
 /// and the replacement is ignored.
 ///
-/// Call sites (verified line numbers, §5 step 1a of the implementation plan):
-/// - `mds check -`: `crates/mds-cli/src/main.rs:280`
-/// - `mds build -` (single-file path): `crates/mds-cli/src/build.rs:714`
-/// - `mds build -` (directory stdin path): `crates/mds-cli/src/build.rs:1176`
-/// - `mds lint -`: `crates/mds-cli/src/lint.rs` via
-///   `emit_analysis_failure_json_or_stderr` (indirect; symbol cited instead of
-///   a line number — avoids stale citations after line insertions)
+/// Call sites (symbolic references; prefer these over line numbers to avoid stale citations):
+/// - `mds check -`: `run_check` in `crates/mds-cli/src/main.rs`
+/// - `mds build -` (single-file path): `compile_to_content` in `crates/mds-cli/src/build.rs`
+/// - `mds build -` (directory stdin path): `run_build` in `crates/mds-cli/src/build.rs`
+/// - `mds lint -`: `run_lint_stdin` in `crates/mds-cli/src/lint.rs` (direct call)
+///   and `run_lint_file` via `emit_analysis_failure_json_or_stderr` (indirect)
 ///
 /// Any new CLI boundary that renders a stdin analysis failure must call this
 /// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.

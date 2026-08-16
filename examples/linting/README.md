@@ -1,6 +1,6 @@
 # Linting demo
 
-`mds lint` runs nine static-analysis rules over a template *without executing it*,
+`mds lint` runs ten static-analysis rules over a template *without executing it*,
 catching correctness and style problems that `mds check` does not. This directory
 demonstrates the rules, the JSON output, the auto-fixer, and per-rule severity
 configuration via `mds.json`.

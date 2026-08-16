@@ -97,9 +97,14 @@ export interface CheckOptions {
   vars?: Record<string, unknown>;
   /**
    * Base directory for resolving `@import` directives in the source string.
-   * Required when the source contains `@import` or `@extends`.
+   * Defaults to the process cwd when omitted.
    *
-   * **WASM backend:** rejected at runtime with `mds::invalid_options` — the WASM
+   * **Caution:** omitting `basePath` resolves imports against the process cwd,
+   * which succeeds silently but resolves against the wrong directory if the
+   * source string was not loaded from cwd. Provide an explicit path when the
+   * source contains `@import` or `@extends`.
+   *
+   * **WASM backend:** rejected at runtime with `mds::invalid_options` -- the WASM
    * backend has no filesystem access. Set `MDS_BACKEND=native` to force the native
    * backend.
    */
@@ -198,12 +203,15 @@ export interface LintDiagnostic {
   severity: 'error' | 'warn' | 'info';
   /** Human-readable description of the finding. */
   message: string;
-  /** Optional guidance on how to resolve the finding. */
-  help?: string;
+  /** Optional guidance on how to resolve the finding. `null` when the rule emits no hint. */
+  help?: string | null;
   /** Whether the lint engine can auto-fix this diagnostic (`--fix`). */
   fixable: boolean;
-  /** Source location of the finding, if available. */
-  span?: LintSpan;
+  /**
+   * Source location of the finding. `null` when the rule produces no source span.
+   * The key is always present in the JSON wire format; only the value is `null`.
+   */
+  span?: LintSpan | null;
   /**
    * Byte-range replacement edits the fix engine would apply, if available.
    * Each edit is `{ start, end, new_text }` with byte offsets into the source.
@@ -314,7 +322,12 @@ export interface LintOptions {
   rules?: Record<string, RuleSeverity>;
   /**
    * Base directory for resolving `@import` directives in the source string.
-   * Required when the source contains `@import` or `@extends`.
+   * Defaults to the process cwd when omitted.
+   *
+   * **Caution:** omitting `basePath` resolves imports against the process cwd,
+   * which succeeds silently but resolves against the wrong directory if the
+   * source string was not loaded from cwd. Provide an explicit path when the
+   * source contains `@import` or `@extends`.
    *
    * The WASM backend **rejects** a non-null `basePath` with
    * `mds::invalid_options` rather than silently ignoring it. This surfaces the

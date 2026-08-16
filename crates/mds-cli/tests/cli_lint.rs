@@ -1058,7 +1058,7 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
 // diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").  Without set_diag_display_path
 // in the single-file Fixed/PartiallyFixed arms, `mds lint --fix --format json <file>`
 // emitted "input.mds" instead of the real basename.  Directory mode already had the
-// correct relabel (lint.rs:1176/1197); this test pins the single-file parity.
+// correct relabel (`run_lint_file` in lint.rs); this test pins the single-file parity.
 //
 // Fixture: a file with duplicate-export (Tier A, auto-fixed) + unused-variable
 // (Tier C, residual after fix).  After --fix, the residual must appear under
