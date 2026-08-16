@@ -585,15 +585,18 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 ## v0.5.0 Removal Tracker: apply_fixes
 
-`mds::fix::apply_fixes` is deprecated as of v0.4.0. The authoritative enumeration of
-the six ADR-004 reverify-gate tests that must be ported or retired before removal lives
-in GitHub issue #304 (with line numbers and behavior descriptions).
+`mds::fix::apply_fixes` is deprecated as of v0.4.0. The six ADR-004 reverify-gate
+tests that must be ported or retired before removal are enumerated below by name —
+**test names are the durable key; line numbers drift as `fix.rs` evolves**. GitHub
+issue #304 carries behavioral context; its line numbers predate the `#[expect(...)]`
+blocks inserted by this PR and are approximately 50 lines stale.
 
-Six tests to port or retire (see #304 for details):
+Six tests to port or retire (fn-decl lines in `crates/mds-core/src/lint/fix.rs`
+as of the v0.4.0 deprecation PR, post-`#[expect]` insertion):
 
-- `a4_partial_overlap_still_rejected_after_dedup`
-- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix`
-- `reverify_preexisting_untargeted_survives_and_fix_applies`
-- `reverify_new_untargeted_diagnostic_is_rejected`
-- `tier_b_unused_function_standalone_apply_succeeds`
-- `l_fix_rev1_output_delta_causes_rejection`
+- `a4_partial_overlap_still_rejected_after_dedup` (line 1442)
+- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (line 1739)
+- `reverify_preexisting_untargeted_survives_and_fix_applies` (line 1939)
+- `reverify_new_untargeted_diagnostic_is_rejected` (line 1964)
+- `tier_b_unused_function_standalone_apply_succeeds` (line 2035)
+- `l_fix_rev1_output_delta_causes_rejection` (line 2106)
