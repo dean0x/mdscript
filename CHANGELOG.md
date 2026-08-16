@@ -16,15 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   containing `@import` or `@extends` directives compiled with a string-source call and a
   `basePath` option would either fail to resolve their imports (native backend) or fail
   silently (WASM backend). The fix adds `basePath` to both `CompileOptions` and
-  `CheckOptions` and propagates it through all four per-surface option builders
-  (`compileSrcOpt`, `checkSrcOpt`, `fileCompileOpt`, `fileCheckOpt`).
+  `CheckOptions` and propagates it to the backend for the string-source methods
+  (`compile`, `check`). `compileFile` and `checkFile` deliberately exclude
+  `basePath` — the base directory for file operations is derived from the file
+  path itself (see the BREAKING subsection below).
 
   The WASM backend has no filesystem access and cannot resolve file-relative imports; it
   now **rejects** a non-null `basePath` immediately with `mds::invalid_options` instead
   of silently ignoring it, so misconfigured callers receive an actionable error rather
   than a silent wrong answer. `{basePath: undefined}` is treated as absent on both
   backends (`!= null` check; value-is-intent). To use `basePath` with import resolution,
-  set `MDS_BACKEND=native` or use `lintVirtual` with a pre-resolved module map.
+  set `MDS_BACKEND=native`.
 
 ### Added
 
@@ -34,10 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `browser.ts`. Both functions are available after `init()` and follow the same
   unknown-option guard used by `compile`/`check`.
 
-  All seven lint types (`LintDiagnostic`, `LintFileOptions`, `LintFileReport`,
+  All eight lint types (`LintDiagnostic`, `LintFileOptions`, `LintFileReport`,
   `LintOptions`, `LintResult`, `LintRuleName`, `LintSpan`, `RuleSeverity`) and the
-  `LINT_RULE_NAMES` constant are now exported from both the Node.js and browser entry
-  points.
+  `LINT_RULE_NAMES` constant are now exported from the browser entry point as well as
+  the Node.js entry point.
 
 - **`SourceMapV3` is now exported from the Node.js and browser entry points.**
   `MarkdownResult.sourceMap` has always been typed as `SourceMapV3`, but the type was
@@ -99,8 +101,7 @@ previously silently ignored `basePath` on the WASM backend. They now throw
 already documented as WASM-unsupported; it now enforces this at runtime too.
 
 **Migration:** switch to the native backend (`MDS_BACKEND=native`) when you need
-import resolution with a `basePath`, or use `lintVirtual` with a pre-resolved module
-map in WASM environments.
+import resolution with a `basePath` in WASM environments.
 
 ### **BREAKING** — Interpolation syntax: `{x}` → `{{x}}`
 
