@@ -17,7 +17,7 @@ import { assertResultShape } from './backend/contract.js';
 import { initWasmNode, createWasmBackend, fileOpts } from './backend/wasm.js';
 import type { WasmModule } from './backend/wasm.js';
 import { buildModulesMap } from './util/module-scanner.js';
-import { assertKnownKeys, forwardOpts, getBasePathError } from './util/options.js';
+import { assertKnownKeys, getBasePathError } from './util/options.js';
 
 // Read MDS_BACKEND at module scope — sync, deterministic, no I/O.
 const rawBackend = process.env['MDS_BACKEND'];
@@ -100,8 +100,8 @@ function wrapWithFileOps(
     async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
       // CheckFileOptions is a structural subset of FileOptions (only vars, no
       // sourceMap/sourcesContent), so the cast is safe: prepareFileArgs calls
-      // fileCompileOpt which only picks defined keys; the absent fields resolve as
-      // undefined and are not included in the returned opts object.
+      // fileOpts which uses forwardOpts over METHOD_KEYS.compileFile; the absent
+      // fields resolve as undefined and are excluded by forwardOpts's != null check.
       const { source, opts } = await prepareFileArgs(path, options as FileOptions | undefined);
       const result: unknown = wasmModule.check(source, opts);
       assertResultShape(result, 'check');
@@ -128,6 +128,12 @@ function wrapWithFileOps(
       // Build a copy of modules without the entry (lint() inserts it separately).
       const extraModules: Record<string, string> = { ...modules };
       delete extraModules[entryFilename];
+      // forwardOpts uses METHOD_KEYS.lintFile (vars, rules) as the single key source.
+      // filename and extraModules are WASM-internal keys absent from METHOD_KEYS.
+      const forwarded = forwardOpts(options, 'lintFile') as {
+        vars?: Record<string, unknown>;
+        rules?: Record<string, string>;
+      } | undefined;
       const lintOpts: {
         filename: string;
         modules?: Record<string, string>;
@@ -135,8 +141,8 @@ function wrapWithFileOps(
         rules?: Record<string, string>;
       } = { filename: entryFilename };
       if (Object.keys(extraModules).length > 0) lintOpts.modules = extraModules;
-      if (options?.vars != null) lintOpts.vars = options.vars;
-      if (options?.rules != null) lintOpts.rules = options.rules;
+      if (forwarded?.vars != null) lintOpts.vars = forwarded.vars;
+      if (forwarded?.rules != null) lintOpts.rules = forwarded.rules;
       const result: unknown = wasmModule.lint(entrySource, lintOpts);
       assertResultShape(result, 'lint');
       return result as LintResult;
