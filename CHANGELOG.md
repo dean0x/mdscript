@@ -26,10 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backends (`!= null` check; value-is-intent). To use `basePath` with import resolution,
   set `MDS_BACKEND=native` or use `lintVirtual` with a pre-resolved module map.
 
-  **Note:** `compileFile` and `checkFile` reject a non-null `basePath` at the JS layer
-  because the base directory for file-based operations is derived from the file path
-  itself; passing `basePath` there is always a caller error.
-
 ### Added
 
 - **`lint` and `lintVirtual` are now exported from the browser entry point (#215).**
@@ -48,29 +44,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only re-exported from `index.ts`, which the package `exports` map does not resolve —
   so consumers could receive the value but not name its type. Purely additive.
 
-### **BREAKING** — TypeScript option types and WASM `basePath` rejection (#213, #180)
+### **BREAKING** — File-method `basePath` rejection, TypeScript option types, and WASM `basePath` rejection (#180, #213)
+
+#### `compileFile` and `checkFile` now reject `basePath` (#180)
+
+`compileFile(path, options?)` and `checkFile(path, options?)` previously accepted a
+`basePath` option and silently discarded it — the option passed the unknown-key
+validator but was dropped before the backend was reached, so file resolution always
+used the directory containing the path. Both functions now return a rejected promise
+(`Error { code: 'mds::invalid_options' }`) when `basePath` is non-null. The base
+directory for file-based operations is always derived from the file path itself.
+
+**Migration:** remove `basePath` from any options object passed to `compileFile` or
+`checkFile`. This is a **runtime-only** break — TypeScript does not flag it at
+compile time when you pass a variable whose inferred type contains `basePath`.
+Audit call sites explicitly.
 
 #### `FileOptions` no longer extends `CompileOptions` (#213)
 
 `FileOptions` (used by `compileFile`) was previously declared as
 `interface FileOptions extends CompileOptions`. This inheritance was an error:
-`CompileOptions` now carries `basePath`, which is explicitly not valid for file-based
-operations (the base directory is derived from the file path). `FileOptions` is now
-a standalone interface with its own `vars`, `sourceMap`, and `sourcesContent` fields.
+`CompileOptions` now carries `basePath`, which is not valid for file-based
+operations. `FileOptions` is now a standalone interface with its own `vars`,
+`sourceMap`, and `sourcesContent` fields.
 
-**Migration:** code that assigned a `CompileOptions` to a `FileOptions` variable (or
-vice versa) now needs an explicit mapping. Code that used `FileOptions` purely for
-`vars`, `sourceMap`, and `sourcesContent` is unaffected.
+**Compatibility:** this change is **source-compatible** for all previously-compiling
+code. Before this PR, `CompileOptions` had no `basePath` field, so
+`FileOptions extends CompileOptions` already resolved to
+`{ vars?, sourceMap?, sourcesContent? }` — the same shape as the new standalone
+`FileOptions`. Code that assigns a `CompileOptions` value to a `FileOptions` variable
+(or vice versa) continues to compile. The runtime break is the `compileFile`/`checkFile`
+rejection documented above, which TypeScript does not catch — see that entry for
+the migration.
 
 #### `checkFile` parameter type changed from `CheckOptions` to `CheckFileOptions` (#213)
 
-`checkFile(path, options?)` previously accepted `CheckOptions`, which includes a
-`basePath` field that is invalid for file-based operations. The parameter is now typed
-as `CheckFileOptions` — a new interface with only `vars?: Record<string, unknown>`.
+`checkFile(path, options?)` previously accepted `CheckOptions`. After this PR,
+`CheckOptions` carries a `basePath` field that is not valid for file-based operations;
+the parameter is now typed as `CheckFileOptions` — a new interface with only
+`vars?: Record<string, unknown>`.
 
-**Migration:** if you passed `CheckOptions` to `checkFile`, remove the `basePath` field.
-If you used a shared variable typed as `CheckOptions`, destructure or pick `vars` before
-passing it.
+**Compatibility:** this type narrowing is **source-compatible** for all
+previously-compiling code. Before this PR, `CheckOptions` had no `basePath` field, so
+it was structurally equivalent to the new `CheckFileOptions`. A `CheckOptions`-typed
+variable without `basePath` still satisfies the `CheckFileOptions` parameter. The
+runtime break is the `compileFile`/`checkFile` rejection documented above, which
+TypeScript does not catch — see that entry for the migration.
 
 #### WASM backend rejects `basePath` on string-surface methods (#180)
 

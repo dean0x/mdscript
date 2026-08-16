@@ -25,7 +25,7 @@ import {
   _initWithModuleForTesting,
 } from '../dist/browser.js';
 import { initWasmNode, _resetForTesting as wasmReset } from '../dist/backend/wasm.js';
-import { lint as nodeLint, init as nodeInit } from '../dist/node.js';
+import { lint as nodeLint, init as nodeInit, getBackend as nodeGetBackend } from '../dist/node.js';
 
 // Mirror of MAX_INIT_RETRIES from src/backend/wasm.ts.
 // If this value drifts, U-BR11 will surface the mismatch via a test failure.
@@ -115,6 +115,14 @@ describe('browser entry — pre-init', () => {
 
   test('U-BR15: lintFile is NOT exported from browser entry (AC-P3-13)', async () => {
     const moduleExports = Object.keys(await import('../dist/browser.js'));
+    // ADR-009 / avoids PF-013: positive control — if the module resolved to an empty
+    // export map, all three absence assertions below would pass vacuously. Asserting
+    // that 'lint' (added by #215) IS present proves the module was loaded correctly
+    // and that the absence assertions are meaningful.
+    assert.ok(
+      moduleExports.includes('lint'),
+      `lint must be exported from browser entry (positive control); found: ${moduleExports.join(', ')}`,
+    );
     assert.equal(
       moduleExports.includes('lintFile'),
       false,
@@ -204,6 +212,19 @@ describe('browser entry — post-init', () => {
     // cross-surface parity. Compare browser (WASM) and node surfaces at RUNTIME for
     // the same input with deepStrictEqual — no pinned golden, no local assertion.
     // Same fixture as U-BR16 so the result is non-trivial (unused-variable diagnostic).
+    //
+    // Guard (avoids PF-007 / PF-013): node.ts:244 falls back to WASM when the native
+    // addon is unavailable. Without this assertion, the test would silently degrade to
+    // a WASM-vs-WASM self-comparison — a vacuous pass that proves nothing about
+    // cross-backend parity. Every sibling native-dependent test hard-fails via
+    // requireNativeAddon(); this assertion is the equivalent sentinel for U-BR-PARITY.
+    assert.equal(
+      nodeGetBackend(),
+      'native',
+      'U-BR-PARITY requires the native backend on the node side; ' +
+        'without it the test compares WASM against itself (PF-007 shape). ' +
+        'Ensure @mdscript/mds-napi is built before running this suite.',
+    );
     const src = '---\ngreeting: Hello\nunused_key: this key is never referenced\n---\n\n{{greeting}}, world!\n';
     const browserResult = lint(src);
     const nodeResult = nodeLint(src);
@@ -211,6 +232,27 @@ describe('browser entry — post-init', () => {
       browserResult,
       nodeResult,
       'browser (WASM) and node lint must return byte-identical results for the same source',
+    );
+  });
+
+  test('U-BR-WARN: browser lintVirtual with unknown rule name produces lint_warnings, not an error (plan amendment 5, avoids PF-007)', () => {
+    // Plan amendment 5: D-224-1 ruled that an unrecognised rule name is WARNED via
+    // LintResult.lint_warnings, not rejected. U-LG4 (lint.spec.mjs:625) already
+    // covers this behavior on the node/native surface. PF-007: that proof says
+    // nothing about the WASM (browser) surface — a separate browser-entry assertion
+    // is required to close the coverage gap.
+    const mods = { 'main.mds': '---\ngreeting: Hello\n---\n{{greeting}}, world!\n' };
+    const result = lintVirtual(mods, 'main.mds', { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assert.equal(result.version, 1, 'U-BR-WARN: version must be 1');
+    assert.ok(Array.isArray(result.lint_warnings), `U-BR-WARN: lint_warnings must be an array; got ${JSON.stringify(result.lint_warnings)}`);
+    assert.ok(
+      result.lint_warnings.length > 0,
+      `U-BR-WARN: lint_warnings must be non-empty for unknown rule name; got ${JSON.stringify(result.lint_warnings)}`,
+    );
+    const joined = result.lint_warnings.join(' ');
+    assert.ok(
+      joined.includes('no-such-rule-xyzzy'),
+      `U-BR-WARN: lint_warnings must name the unknown rule 'no-such-rule-xyzzy'; got: ${joined}`,
     );
   });
 
