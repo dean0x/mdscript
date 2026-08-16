@@ -588,8 +588,9 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 `mds::fix::apply_fixes` is deprecated as of v0.4.0. The six ADR-004 reverify-gate
 tests that must be ported or retired before removal are enumerated below by name —
 **test names are the durable key; line numbers drift as `fix.rs` evolves**. GitHub
-issue #304 carries behavioral context; its line numbers predate the `#[expect(...)]`
-insertions in PR #209 and have since drifted.
+issue #304 carries behavioral context (which ADR-004 behavior each test pins); its
+line numbers predate the `#[expect(...)]` insertions made by PR #303 (issue #209) and
+have since drifted.
 
 Six tests to port or retire (fn-decl lines in `crates/mds-core/src/lint/fix.rs`
 as of the v0.4.0 deprecation PR, post-`#[expect]` insertion):
