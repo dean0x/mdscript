@@ -56,8 +56,10 @@ describe('compile', () => {
   });
 
   test('U-C7: compile with null vars produces identical output to no-vars compile', () => {
-    // null vars must be treated as absent — varsOpt uses != null so both null
-    // and undefined are omitted from the options passed to the backend.
+    // null vars must be treated as absent — compileSrcOpt (native path) and
+    // fileCompileOpt via compileOpts (WASM path) both use pickDefined, which
+    // filters via != null, so both null and undefined are omitted from the
+    // options forwarded to the backend.
     const source = 'Hello World!\n';
     const withNull = compile(source, { vars: null });
     const withoutVars = compile(source);

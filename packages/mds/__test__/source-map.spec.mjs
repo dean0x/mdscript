@@ -265,8 +265,8 @@ describe('source maps (U-SM)', () => {
   // ── U-SM6: valid option combinations ──────────────────────────────────
   //
   // Unknown key rejection at the binding level is tested in the napi spec
-  // (F-SM6). At the universal package level the adapter's compileOpt()
-  // filters to known keys, so TypeScript type checking is the guard.
+  // (F-SM6). At the universal package level assertKnownKeys() rejects
+  // unknown option keys, with TypeScript type checking as the primary guard.
 
   test('U-SM6: sourceMap:true, sourcesContent:false is accepted', () => {
     const result = compile('Hello!\n', { sourceMap: true, sourcesContent: false });
