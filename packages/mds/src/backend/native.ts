@@ -35,6 +35,11 @@ type NapiFileCompileOpts = {
   sourcesContent?: boolean;
 };
 
+/** Options forwarded to the napi addon for checkFile (no basePath, no sourceMap). */
+type NapiFileCheckOpts = {
+  vars?: Record<string, unknown>;
+};
+
 /** Options forwarded to the napi addon for source-string lint (accepts basePath). */
 type NapiLintOpts = { basePath?: string; vars?: Record<string, unknown>; rules?: Record<string, string> };
 /** Options forwarded to the napi addon for file-based and virtual lint. */
@@ -43,7 +48,7 @@ type NapiLintFileOpts = { vars?: Record<string, unknown>; rules?: Record<string,
 /**
  * Shape of the napi addon exports.
  * compile/check accept { basePath?, vars?, sourceMap?, sourcesContent? } for string sources.
- * compileFile/checkFile accept { vars?, sourceMap?, sourcesContent? } for file paths.
+ * compileFile accepts { vars?, sourceMap?, sourcesContent? }; checkFile accepts { vars? } only.
  * lint accepts { basePath?, vars?, rules? }; lintFile/lintVirtual accept only
  * { vars?, rules? } — napi rejects `basePath` on both (parse_lint_file_opts /
  * parse_lint_virtual_opts in crates/mds-napi/src/lib.rs).
@@ -52,7 +57,7 @@ interface NapiAddon {
   compile(source: string, opts?: NapiCompileOpts): unknown;
   check(source: string, opts?: NapiCheckOpts): unknown;
   compileFile(path: string, opts?: NapiFileCompileOpts): unknown;
-  checkFile(path: string, opts?: { vars?: Record<string, unknown> }): unknown;
+  checkFile(path: string, opts?: NapiFileCheckOpts): unknown;
   lint(source: string, opts?: NapiLintOpts): unknown;
   lintFile(path: string, opts?: NapiLintFileOpts): unknown;
   lintVirtual(modules: Record<string, string>, entry: string, opts?: NapiLintFileOpts): unknown;
