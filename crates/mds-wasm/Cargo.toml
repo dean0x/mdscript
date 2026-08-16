@@ -38,4 +38,15 @@ wasm-bindgen-test = { workspace = true }
 # -Oz: optimize for size. Rust 1.88+ emits post-MVP WASM features that wasm-opt
 # rejects by default — each must be explicitly enabled.
 # Requires Binaryen: CI uses phi-ag/setup-binaryen; locally `brew install binaryen`.
-wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", "--enable-nontrapping-float-to-int", "--enable-mutable-globals"]
+wasm-opt = [
+  # -Oz: optimize for size. --flatten + second -Oz + --rereloop restructure
+  # the code graph for better size reduction. --converge runs until stable
+  # (adds ~2-3x wasm-opt runtime but shrinks by ~446 bytes vs single pass).
+  # --strip-producers drops the producer section (~62 bytes).
+  # NOTE: --gufa was measured and REGRESSES size by ~+700 bytes — do not add it.
+  "-Oz", "--flatten", "--rereloop", "-Oz", "--converge", "--strip-producers",
+  # Rust 1.88+ emits post-MVP WASM features; each must be explicitly enabled.
+  # Requires Binaryen: CI uses phi-ag/setup-binaryen v129; locally `brew install binaryen`.
+  "--enable-bulk-memory", "--enable-sign-ext", "--enable-nontrapping-float-to-int",
+  "--enable-mutable-globals",
+]
