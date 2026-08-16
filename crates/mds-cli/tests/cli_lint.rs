@@ -47,8 +47,10 @@
 //! - AC-Q25 (#216): hostile filename cannot forge a summary line (with positive control)
 //! - AC-Q26 (#216): help text documents quiet summary contract (machine-verified)
 //! - AC-Q30 (#216): --quiet works in both argument positions for lint
-//! - D4 (#216, PF-004): `fix rejected:` honours --quiet in directory, single-file AND
-//!   stdin mode — three separate emitters, each with its own positive control
+//! - D4 (#216, PF-004): `fix rejected:` honours --quiet in directory (human + JSON),
+//!   single-file, and stdin mode — four separate emitters, each with its own positive control
+//! - D4 (#216, PF-004): diagnostic-cap notice honours --quiet in all three input modes
+//!   (directory, single-file, stdin) with paired positive controls (ADR-009/PF-013)
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -4732,12 +4734,23 @@ fn lint_directory_quiet_suppresses_summary_when_only_warnings() {
 }
 
 // ── AC-Q11: quiet lint with error-severity findings still prints summary ──────
+//
+// ADR-009/PF-013: both directions of the quiet gate are pinned in one test.
+// A warn-only file (lint_warn_only.mds) is included so the test can assert:
+//   - error-severity diagnostic body DOES appear under --quiet
+//   - warn-severity diagnostic body does NOT appear under --quiet
+// Without these body assertions the test could pass under the mutation
+// `if quiet` (dropping the Severity filter), which would silence all diagnostic
+// bodies while still printing the summary via the error_file_count > 0 gate.
 
 #[test]
 fn lint_directory_quiet_still_prints_summary_on_errors() {
     let dir = tempfile::tempdir().unwrap();
     fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
     fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+    // Add a warn-severity file so both directions of the quiet gate can be pinned:
+    // error diagnostics must survive --quiet; warn diagnostics must be suppressed.
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("warn.mds")).unwrap();
 
     let out = lint_path(dir.path(), &["--quiet"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -4748,8 +4761,29 @@ fn lint_directory_quiet_still_prints_summary_on_errors() {
         "directory with error file under --quiet must exit 2; stderr: {stderr:?}"
     );
     assert!(
-        stderr.contains("1 clean, 0 with warnings, 1 with errors, 0 resource-limited"),
+        stderr.contains("1 clean, 1 with warnings, 1 with errors, 0 resource-limited"),
         "AC-Q11: --quiet with error files must still print summary; got: {stderr:?}"
+    );
+    // Error-severity diagnostic body must not be silenced by --quiet.
+    // (render_diag_human suppresses only Info|Warn, never Error.)
+    assert!(
+        stderr.contains("duplicate-export"),
+        "AC-Q11: error-severity diagnostic body must survive --quiet; got: {stderr:?}"
+    );
+    // Warn-severity diagnostic body must be suppressed.
+    // Positive control: non-quiet run must show unused-variable to prove this is
+    // non-vacuous (PF-013 / ADR-009).
+    let control = lint_path(dir.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        control_stderr.contains("unused-variable"),
+        "positive control: non-quiet run must print 'unused-variable' warn diagnostic \
+         so the absence assertion below is non-vacuous; got: {control_stderr:?}"
+    );
+    assert!(
+        !stderr.contains("unused-variable"),
+        "AC-Q11: warn-severity 'unused-variable' diagnostic body must be suppressed \
+         under --quiet; got: {stderr:?}"
     );
 }
 
@@ -4826,7 +4860,7 @@ fn lint_directory_check_exit_still_prints_summary() {
 #[test]
 fn lint_directory_quiet_check_exit_matches_d1a_contract() {
     // Uses lint_fixable_warn.mds: contains a single `{name}` legacy-interpolation
-    // occurrence that triggers `unused-legacy-interpolation` (Severity::Warn, auto-fixable).
+    // occurrence that triggers `legacy-interpolation` (Severity::Warn, auto-fixable).
     // No error-severity findings, so D1-a applies: summary suppressed under --quiet.
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("fix_me.mds");
@@ -4850,6 +4884,15 @@ fn lint_directory_quiet_check_exit_matches_d1a_contract() {
         "D1-a: --fix --check --quiet with warn-only residual must not print summary; \
          got: {stderr:?}"
     );
+    // 'Would fix:' is a status message (lint.rs: `if check && !quiet`) and must also
+    // be suppressed under --quiet, distinguishing the --fix --check pending-fix code
+    // path from the ordinary warn-only exit 1 (lint.rs severity exit).  Without this
+    // assertion the test cannot tell those two paths apart if legacy-interpolation ever
+    // loses auto-fixability or the fixture drifts.
+    assert!(
+        !stderr.contains("Would fix:"),
+        "D1-a: --fix --check --quiet must not print 'Would fix:'; got: {stderr:?}"
+    );
 
     // PF-013 / ADR-009 — PAIRED POSITIVE CONTROL, in this test, on THIS tree.
     //
@@ -4871,6 +4914,14 @@ fn lint_directory_quiet_check_exit_matches_d1a_contract() {
         control_stderr.contains("clean,"),
         "positive control: the same tree WITHOUT --quiet must print the summary, proving the \
          --quiet absence assertion above is non-vacuous; got: {control_stderr:?}"
+    );
+    // Paired positive control for the 'Would fix:' absence assertion: confirm the
+    // --fix --check path really was engaged (i.e. the fixture is still auto-fixable).
+    assert!(
+        control_stderr.contains("Would fix:"),
+        "positive control: --fix --check without --quiet must print 'Would fix:', confirming \
+         the test exercises the --fix --check code path and not just an ordinary warn exit; \
+         got: {control_stderr:?}"
     );
 }
 
@@ -4995,17 +5046,18 @@ fn lint_stdin_prints_no_directory_summary() {
     );
 }
 
-// ── D4 cross-mode parity: status messages honour --quiet in ALL three input modes ──
+// ── D4 cross-mode parity: status messages honour --quiet in ALL four input modes ──
 //
-// PF-004 — an alternate output path can silently bypass a guard. Directory mode,
-// single-file mode and stdin mode are SEPARATE emitters for `fix rejected:` (there
-// are six call sites in lint.rs) and for the diagnostic-cap notice (three sites).
-// #216 gated the directory-mode copies; the single-file and stdin copies were left
-// ungated, re-creating exactly the divergence that issue #43/#173 fixed for
-// "Partially fixed:" (see `dir_and_single_file_agree_on_quiet_for_partially_fixed`).
-//
-// Each mode carries its own paired positive control, so no assertion can pass because
-// the fix was never attempted rather than because the message was suppressed.
+// PF-004 — an alternate output path can silently bypass a guard. Directory mode
+// has TWO separate emitters (lint_one_file_human for --format human, and
+// lint_one_file_accumulating for --format json), plus single-file mode and stdin mode.
+// That is eight `fix rejected:` call sites in lint.rs total:
+//   :783 :839 (stdin --fix --check / --fix)
+//   :977 :1016 (single-file --fix / --fix --check)
+//   :1533 :1576 (JSON dir --fix / --fix --check  — lint_one_file_accumulating)
+//   :1713 :1748 (human dir --fix / --fix --check — lint_one_file_human)
+// This test covers all four modes, each with its own paired positive control, so no
+// assertion can pass because the fix was never attempted rather than suppressed.
 
 /// Source with a single Tier A fix that the reverify gate rejects whole-file:
 /// removing the empty `@define` would orphan the `@export`, so `FixFileOutcome`
@@ -5089,11 +5141,165 @@ fn fix_rejected_message_honours_quiet_in_all_three_modes() {
         "directory: --quiet must not move the exit code"
     );
 
+    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
+    // PF-004: --format json routes directory files through lint_one_file_accumulating,
+    // a separate emitter from lint_one_file_human (Mode 3).  This covers the two
+    // newly-gated sites in that emitter: lint.rs:1533 (--fix Rejected arm) and
+    // lint.rs:1576 (--fix --check Rejected arm).
+
+    // Apply path (lint.rs:1533): --fix --format json.
+    let loud_json = lint_path(dir.path(), &["--fix", "--format", "json"]);
+    let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
+    assert!(
+        loud_json_stderr.contains(needle),
+        "positive control (dir --fix --format json): without --quiet the rejection MUST be \
+         reported in stderr; got: {loud_json_stderr:?}"
+    );
+
+    let quiet_json = lint_path(dir.path(), &["--fix", "--format", "json", "--quiet"]);
+    let quiet_json_stderr = String::from_utf8_lossy(&quiet_json.stderr);
+    assert!(
+        !quiet_json_stderr.contains(needle),
+        "dir --fix --format json --quiet must suppress 'fix rejected:' (D4/PF-004 lint.rs:1533); \
+         got: {quiet_json_stderr:?}"
+    );
+    assert_eq!(
+        quiet_json.status.code(),
+        loud_json.status.code(),
+        "dir --format json --fix: --quiet must not move the exit code"
+    );
+
+    // Preview path (lint.rs:1576): --fix --check --format json.
+    let loud_json_check = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+    let loud_json_check_stderr = String::from_utf8_lossy(&loud_json_check.stderr);
+    assert!(
+        loud_json_check_stderr.contains(needle),
+        "positive control (dir --fix --check --format json): without --quiet the rejection MUST \
+         be reported in stderr; got: {loud_json_check_stderr:?}"
+    );
+
+    let quiet_json_check =
+        lint_path(dir.path(), &["--fix", "--check", "--format", "json", "--quiet"]);
+    let quiet_json_check_stderr = String::from_utf8_lossy(&quiet_json_check.stderr);
+    assert!(
+        !quiet_json_check_stderr.contains(needle),
+        "dir --fix --check --format json --quiet must suppress 'fix rejected:' (D4/PF-004 \
+         lint.rs:1576); got: {quiet_json_check_stderr:?}"
+    );
+    assert_eq!(
+        quiet_json_check.status.code(),
+        loud_json_check.status.code(),
+        "dir --format json --fix --check: --quiet must not move the exit code"
+    );
+
     // The rejection leaves the file unmodified in every mode.
     assert_eq!(
         fs::read_to_string(&target).unwrap(),
         FIX_REJECTED_SOURCE,
         "a rejected fix must never rewrite the source file"
+    );
+}
+
+// ── D4 cross-mode parity: diagnostic-cap notice honours --quiet in all three modes ──
+//
+// PF-004: the cap notice is emitted from three separate call sites in lint.rs
+// (run_lint_file, lint_one_file_accumulating, lint_one_file_human) and one in
+// run_lint_stdin (added per this fix).  Each mode must gate on !quiet.
+// PF-013 / ADR-009: each mode carries a paired positive control so the quiet
+// assertion cannot pass vacuously on an uncovered path.
+//
+// Source: 1001 legacy-interpolation instances (one per line) exceed MAX_DIAGNOSTICS
+// (1000) so LintResult.truncated = true.  --fix --check is used so no file is
+// modified between the positive-control run and the quiet run.
+
+/// Build a source that triggers exactly 1001 legacy-interpolation diagnostics
+/// (one `{var_N}` per line).  1001 > MAX_DIAGNOSTICS (1000) forces truncation.
+fn make_cap_source() -> String {
+    (0..=1000)
+        .map(|i| format!("{{var_{i}}}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The diagnostic-cap notice is suppressed by `--quiet` in all three input modes.
+///
+/// D4 (AD-216-contract): the cap notice is a *status* message — gated on `!quiet`
+/// at every emitter.  PF-004: directory, single-file, and stdin are SEPARATE emitters;
+/// a gate on one is not inherited by the others (the #43/#173 divergence class).
+#[test]
+fn cap_notice_honours_quiet_in_all_three_modes() {
+    let needle = "diagnostic cap";
+    let source = make_cap_source();
+
+    // ── Mode 1: single file ──────────────────────────────────────────────────
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("cap.mds");
+    fs::write(&target, &source).unwrap();
+
+    // Positive control: without --quiet the cap notice MUST appear.
+    let loud = lint_path(&target, &["--fix", "--check"]);
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains(needle),
+        "positive control (single file): without --quiet the cap notice MUST be reported \
+         (otherwise the quiet assertion is vacuous; ADR-009); got: {loud_stderr:?}"
+    );
+
+    let quiet = lint_path(&target, &["--fix", "--check", "--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains(needle),
+        "single-file --fix --check --quiet must suppress the cap notice (D4/PF-004); \
+         got: {quiet_stderr:?}"
+    );
+    assert_eq!(
+        quiet.status.code(),
+        loud.status.code(),
+        "single file: --quiet must not move the exit code"
+    );
+
+    // ── Mode 2: stdin ────────────────────────────────────────────────────────
+    let loud_stdin = lint_stdin(&source, &["--fix", "--check"]);
+    let loud_stdin_stderr = String::from_utf8_lossy(&loud_stdin.stderr);
+    assert!(
+        loud_stdin_stderr.contains(needle),
+        "positive control (stdin): without --quiet the cap notice MUST be reported; \
+         got: {loud_stdin_stderr:?}"
+    );
+
+    let quiet_stdin = lint_stdin(&source, &["--fix", "--check", "--quiet"]);
+    let quiet_stdin_stderr = String::from_utf8_lossy(&quiet_stdin.stderr);
+    assert!(
+        !quiet_stdin_stderr.contains(needle),
+        "stdin --fix --check --quiet must suppress the cap notice (D4/PF-004); \
+         got: {quiet_stdin_stderr:?}"
+    );
+    assert_eq!(
+        quiet_stdin.status.code(),
+        loud_stdin.status.code(),
+        "stdin: --quiet must not move the exit code"
+    );
+
+    // ── Mode 3: directory ────────────────────────────────────────────────────
+    let loud_dir = lint_path(dir.path(), &["--fix", "--check"]);
+    let loud_dir_stderr = String::from_utf8_lossy(&loud_dir.stderr);
+    assert!(
+        loud_dir_stderr.contains(needle),
+        "positive control (directory): without --quiet the cap notice MUST be reported; \
+         got: {loud_dir_stderr:?}"
+    );
+
+    let quiet_dir = lint_path(dir.path(), &["--fix", "--check", "--quiet"]);
+    let quiet_dir_stderr = String::from_utf8_lossy(&quiet_dir.stderr);
+    assert!(
+        !quiet_dir_stderr.contains(needle),
+        "directory --fix --check --quiet must suppress the cap notice (D4/PF-004); \
+         got: {quiet_dir_stderr:?}"
+    );
+    assert_eq!(
+        quiet_dir.status.code(),
+        loud_dir.status.code(),
+        "directory: --quiet must not move the exit code"
     );
 }
 
