@@ -915,7 +915,7 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 |--------|-------------|
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
-| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format, so the non-zero exit is never unexplained. |
+| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors `mds lint`'s D1-a). (Two notices bypass `--quiet`: the directory-depth warning and the all-files-excluded diagnostic.) |
 
 ### 7.5 `mds lint`
 
@@ -949,7 +949,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
 | `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
-| `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. |
+| `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. (The directory-depth warning — fires on trees deeper than MAX_DEPTH=64 — is emitted regardless of `--quiet`.) |
 
 **Directory mode** (`mds lint <dir>`):
 
