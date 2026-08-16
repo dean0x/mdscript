@@ -1154,10 +1154,10 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     `#[non_exhaustive]`, existing wildcard arms compile unchanged, but a wildcard that
     swallows `PartiallyFixed` silently discards partial results.
 
-  Scheduled for removal in v0.5.0. The six ADR-004 regression tests that are pinned only
-  against `apply_fixes` must be ported or tracked in a GitHub removal-tracker issue before
-  the v0.5.0 tag; the canonical list is in `.devflow/features/mds-lint/KNOWLEDGE.md`
-  under "v0.5.0 Removal Tracker: apply_fixes".
+  Scheduled for removal in v0.5.0; tracked in GitHub issue #304. The six ADR-004
+  regression tests pinned only against `apply_fixes` must be ported or retired before
+  the v0.5.0 tag (see #304 for the enumerated list with line numbers and the behavior
+  each test pins).
 
 ### Fixed
 

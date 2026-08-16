@@ -116,7 +116,7 @@ pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<Unkn
 /// has no failure mode (PF-005 — a `debug_assert!` here would be a no-op in
 /// release, and a release `assert!` would be a panic in a library).
 ///
-/// Each name is WIRE-escaped with [`sanitize_control_chars_wire`] before it is
+/// Each name is WIRE-escaped with [`crate::sanitize_control_chars_wire`] before it is
 /// interpolated (spec §7.5 per-field rule: a rule name is a single-line
 /// identifier, never prose). A rule name is an arbitrary caller-supplied map key
 /// and JSON `\uXXXX` escapes decode to real control bytes, so the escape is what

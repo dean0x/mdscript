@@ -60,7 +60,7 @@
 //!
 //! ## Containment deduplication (AC-F-26)
 //!
-//! Before overlap detection, [`dedup_contained_or_identical`] removes any edit
+//! Before overlap detection, `dedup_contained_or_identical` removes any edit
 //! whose byte range is fully contained within an earlier retained edit. This handles
 //! the common case where two rules fire on the same block (e.g. `unreachable-branch`
 //! and `empty-block` both targeting the same `@if`): the wider edit subsumes the
@@ -697,11 +697,9 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 /// published to crates.io. However, deleting it would silently drop coverage
 /// of six ADR-004 reverify-gate behaviors that are pinned only through this
 /// function, with no equivalent on the `apply_fixes_incremental` path. These
-/// tests must be ported or explicitly tracked before removal at v0.5.0.
-/// The canonical list is kept in `.devflow/features/mds-lint/KNOWLEDGE.md`
-/// under "v0.5.0 Removal Tracker: apply_fixes" so it survives this function's
-/// deletion. A GitHub removal-tracker issue must be opened and cross-linked
-/// before the v0.5.0 tag.
+/// tests must be ported or retired before removal at v0.5.0. The enumerated
+/// list (test names, line numbers, and the behavior each pins) lives in GitHub
+/// issue #304 (v0.5.0 removal tracker for `apply_fixes`).
 ///
 /// # Behavior
 ///

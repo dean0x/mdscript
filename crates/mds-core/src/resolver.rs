@@ -360,7 +360,7 @@ impl ModuleCache {
         self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
-    /// Like [`resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
     /// returns `(CompiledOutput, Option<SourceMap>)`.
     pub fn resolve_path_intrinsic_opts(
         &mut self,
@@ -541,7 +541,7 @@ impl ModuleCache {
         self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
     }
 
-    /// Like [`resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
     /// returns `(CompiledOutput, Option<SourceMap>)`.
     pub fn resolve_virtual_intrinsic_opts(
         &mut self,
@@ -609,7 +609,7 @@ impl ModuleCache {
 
     /// Resolve a module from an in-memory source string, dispatching on output shape.
     ///
-    /// Like [`resolve_source`] but dispatches on `has_message_block`, returning a
+    /// Like [`Self::resolve_source`] but dispatches on `has_message_block`, returning a
     /// [`crate::CompiledOutput`] (Markdown or Messages) instead of a rendered string.
     pub fn resolve_source_intrinsic(
         &mut self,
@@ -633,7 +633,7 @@ impl ModuleCache {
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
 
-    /// Like [`resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// Like [`Self::resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
     /// returns `(CompiledOutput, Option<SourceMap>)`.
     pub fn resolve_source_intrinsic_opts(
         &mut self,

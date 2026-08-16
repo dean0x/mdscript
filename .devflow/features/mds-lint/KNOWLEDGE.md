@@ -586,11 +586,9 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 ## v0.5.0 Removal Tracker: apply_fixes
 
 `mds::fix::apply_fixes` is deprecated as of v0.4.0 and scheduled for removal at v0.5.0.
-Before the v0.5.0 tag, the following six ADR-004 reverify-gate behaviors must either
-gain equivalent coverage on the `apply_fixes_incremental` path or be carried in a
-GitHub removal-tracker issue (to be opened before the v0.5.0 branch cuts).
-This list is kept here — in a tracked, persistent file — so it survives the function's
-own deletion.
+The removal is tracked in GitHub issue #304. Before the v0.5.0 tag, the following six
+ADR-004 reverify-gate behaviors must gain equivalent coverage on the
+`apply_fixes_incremental` path or be explicitly retired in #304.
 
 | Test name | Line (v0.4.0 HEAD) | Behavior pinned |
 |---|---|---|
@@ -601,6 +599,5 @@ own deletion.
 | `tier_b_unused_function_standalone_apply_succeeds` | fix.rs:2039 | I-13: Tier B fix applies on standalone file |
 | `l_fix_rev1_output_delta_causes_rejection` | fix.rs:2110 | L-FIX-REV1: output delta causes rejection |
 
-When a removal-tracker issue is opened, update `crates/mds-core/src/lint/fix.rs` (the
-`apply_fixes` doc block) and `CHANGELOG.md` to reference the issue number, then remove
-this table once the six behaviors are covered by `apply_fixes_incremental` tests.
+Remove this table once all six behaviors are covered by `apply_fixes_incremental` tests
+(migration complete) or retired in #304.

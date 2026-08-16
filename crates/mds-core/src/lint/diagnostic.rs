@@ -624,7 +624,7 @@ impl miette::Diagnostic for LintDiagnostic {
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases.
 /// Obtain values from `mds::lint_str`, `mds::lint`, and similar lint API functions,
-/// or construct via [`LintResult::new`] (and chain [`.truncated()`] / [`.standalone()`]);
+/// or construct via [`LintResult::new`] (and chain [`LintResult::truncated`] / [`LintResult::standalone`]);
 /// do not construct via struct literal.
 #[non_exhaustive]
 #[derive(Debug)]
@@ -641,7 +641,7 @@ impl LintResult {
     /// Construct a `LintResult` from a diagnostic list.
     ///
     /// Defaults: `truncated = false`, `is_standalone = false`.
-    /// Chain [`.truncated()`] or [`.standalone()`] to override.
+    /// Chain [`Self::truncated`] or [`Self::standalone`] to override.
     ///
     /// This is the supported construction path for external crates — struct literals
     /// are not available because this type is `#[non_exhaustive]`.
@@ -655,7 +655,7 @@ impl LintResult {
     /// (`LintResultBuilder::build`) sorts after truncation, so results produced
     /// by `lint`/`lint_source` always carry the canonical offset order.
     /// A `LintResult` built via this constructor preserves caller order on all
-    /// surfaces — [`to_canonical_json`] included — because `sort_diagnostics`
+    /// surfaces — [`LintResult::to_canonical_json`] included — because `sort_diagnostics`
     /// is the single ordering choke point (AD-202-1) and it is not called here.
     ///
     /// # Examples
