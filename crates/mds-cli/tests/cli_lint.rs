@@ -4605,9 +4605,9 @@ fn lint_directory_summary_counts_each_severity_bucket() {
     );
 
     // AC-Q08: parse the four integers and assert they partition the 4-file set.
-    let re = regex_from_summary(&stderr);
+    let counts = parse_summary_counts(&stderr);
     assert_eq!(
-        re,
+        counts,
         [2, 1, 1, 0],
         "AC-Q08: counters must partition the 4-file set (clean+warn+error+limit == 4)"
     );
@@ -4615,7 +4615,7 @@ fn lint_directory_summary_counts_each_severity_bucket() {
 
 /// Parse [clean, warn, error, limit] from a directory summary line.
 /// Returns [0,0,0,0] on parse failure (test will then fail on the equality check).
-fn regex_from_summary(stderr: &str) -> [usize; 4] {
+fn parse_summary_counts(stderr: &str) -> [usize; 4] {
     // Pattern: "N clean, N with warnings, N with errors, N resource-limited"
     for line in stderr.lines() {
         if let Some(rest) = line.strip_suffix(" resource-limited") {
@@ -4646,6 +4646,14 @@ fn regex_from_summary(stderr: &str) -> [usize; 4] {
     [0, 0, 0, 0]
 }
 
+/// Build content that triggers `MdsError::ResourceLimit` (257 `@block` declarations;
+/// `MAX_BLOCKS_PER_MODULE` is 256).  Shared by AC-Q09 and AC-Q12.
+fn make_resource_limit_content() -> String {
+    (0..257)
+        .map(|i| format!("@block block_{i}:\n@end\n"))
+        .collect()
+}
+
 // ── AC-Q09: resource-limited bucket is genuinely exercised ───────────────────
 //
 // `tally_from_result` can NEVER return FileTally::ResourceLimit — it maps exit codes.
@@ -4654,18 +4662,15 @@ fn regex_from_summary(stderr: &str) -> [usize; 4] {
 
 #[test]
 fn lint_directory_summary_counts_resource_limited() {
-    const BLOCK_COUNT: usize = 257; // MAX_BLOCKS_PER_MODULE is 256
-
     let dir = tempfile::tempdir().unwrap();
 
     // One clean file and one that triggers ResourceLimit.
     fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
-
-    let mut content = String::new();
-    for i in 0..BLOCK_COUNT {
-        content.push_str(&format!("@block block_{i}:\n@end\n"));
-    }
-    fs::write(dir.path().join("too_many_blocks.mds"), &content).unwrap();
+    fs::write(
+        dir.path().join("too_many_blocks.mds"),
+        make_resource_limit_content(),
+    )
+    .unwrap();
 
     let out = lint_path(dir.path(), &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -4682,7 +4687,7 @@ fn lint_directory_summary_counts_resource_limited() {
     );
 
     // AC-Q08 invariant: 1+0+0+1 == 2 files
-    let counts = regex_from_summary(&stderr);
+    let counts = parse_summary_counts(&stderr);
     assert_eq!(
         counts.iter().sum::<usize>(),
         2,
@@ -4750,16 +4755,13 @@ fn lint_directory_quiet_still_prints_summary_on_errors() {
 
 #[test]
 fn lint_directory_quiet_still_prints_summary_on_resource_limit() {
-    const BLOCK_COUNT: usize = 257;
-
     let dir = tempfile::tempdir().unwrap();
     fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
-
-    let mut content = String::new();
-    for i in 0..BLOCK_COUNT {
-        content.push_str(&format!("@block block_{i}:\n@end\n"));
-    }
-    fs::write(dir.path().join("too_many_blocks.mds"), &content).unwrap();
+    fs::write(
+        dir.path().join("too_many_blocks.mds"),
+        make_resource_limit_content(),
+    )
+    .unwrap();
 
     let out = lint_path(dir.path(), &["--quiet"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -4769,13 +4771,10 @@ fn lint_directory_quiet_still_prints_summary_on_resource_limit() {
         Some(3),
         "directory with resource-limited file under --quiet must exit 3; stderr: {stderr:?}"
     );
-    assert!(
-        stderr.contains("resource-limited"),
-        "AC-Q12: --quiet with resource-limited file must still print summary; got: {stderr:?}"
-    );
+    // "1 resource-limited" implies "resource-limited" — one assertion covers both.
     assert!(
         stderr.contains("1 resource-limited"),
-        "AC-Q12: summary must name the resource-limited file count; got: {stderr:?}"
+        "AC-Q12: --quiet with resource-limited file must still print summary with count; got: {stderr:?}"
     );
 }
 
@@ -4841,8 +4840,11 @@ fn lint_directory_quiet_check_exit_matches_d1a_contract() {
     // D1-a gate: !quiet || error_file_count > 0 || limit_file_count > 0 = false → no summary.
     // Note: if the residual HAS errors, the summary WILL appear (error_file_count > 0 gate).
     // Positive control: without --quiet the summary IS printed (separate test covers this).
+    // Use "clean," as the canonical absence marker — consistent with AC-Q10, and strictly
+    // stronger than checking only "resource-limited" (the summary is an atomic eprintln!
+    // so it either appears in full or not at all, but "clean," is the clearest signal).
     assert!(
-        !stderr.contains("resource-limited"),
+        !stderr.contains("clean,"),
         "D1-a: --fix --check --quiet with warn-only residual must not print summary; \
          got: {stderr:?}"
     );
