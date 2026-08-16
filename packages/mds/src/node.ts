@@ -278,16 +278,16 @@ export function check(source: string, options?: CheckOptions): CheckResult {
  * Compile an MDS file, resolving @import directives relative to the file.
  * Returns a discriminated-union CompileResult. Requires init() to have been called and awaited first.
  *
- * Non-async: all option-validation errors — unknown keys (U-OV-12) and basePath
- * (U-OV-32) — throw synchronously before any I/O, consistent with U-B11. Callers
- * using `try { compileFile(f, opts) } catch` capture both error classes.
- * `.catch()` on the returned promise does NOT receive option-validation errors.
+ * Non-async: all option-validation errors — unknown keys and basePath — throw
+ * synchronously before any I/O. Callers using `try { compileFile(f, opts) } catch`
+ * capture both error classes. `.catch()` on the returned promise does NOT receive
+ * option-validation errors.
  */
 export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
   if (options != null) {
     assertKnownKeys(options, 'compileFile');
-    // BASEPATH_PASSTHROUGH: assertKnownKeys skips basePath for file methods (issue #74).
-    // Throws synchronously — same channel as assertKnownKeys above (U-OV-32).
+    // BASEPATH_REJECTORS: assertKnownKeys skips basePath for file methods (issue #74).
+    // Throws synchronously — same channel as assertKnownKeys above.
     // getBasePathError() handles the cast internally via Record<string, unknown>.
     const bpErr = getBasePathError(options, 'compileFile');
     if (bpErr != null) throw bpErr;
@@ -301,12 +301,12 @@ export function compileFile(path: string, options?: FileOptions): Promise<Compil
  * operations (the base directory is derived from the file path).
  * Requires init() to have been called and awaited first.
  *
- * Same sync-throw contract as compileFile: basePath guard throws synchronously (U-OV-33).
+ * Same sync-throw contract as compileFile: basePath guard throws synchronously.
  */
 export function checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
   if (options != null) {
     assertKnownKeys(options, 'checkFile');
-    // Same basePath guard — throws synchronously (same channel as assertKnownKeys, U-OV-33).
+    // Same basePath guard — throws synchronously (same channel as assertKnownKeys).
     // getBasePathError() handles the cast internally via Record<string, unknown>.
     const bpErr = getBasePathError(options, 'checkFile');
     if (bpErr != null) throw bpErr;

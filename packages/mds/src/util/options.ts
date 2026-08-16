@@ -63,6 +63,25 @@ export type MethodName =
   | 'lintFile'
   | 'lintVirtual';
 
+// ── Options-for-method map ─────────────────────────────────────────────────────
+
+/**
+ * Maps each {@link MethodName} to its corresponding public option interface.
+ *
+ * Used as the constraint for the generic parameter of {@link forwardOpts}, binding
+ * the options type and method name at the call site so the compiler rejects
+ * mismatches (e.g. passing `CompileOptions` to a `'checkFile'` call).
+ */
+type OptionsFor = {
+  compile:     CompileOptions;
+  check:       CheckOptions;
+  compileFile: FileOptions;
+  checkFile:   CheckFileOptions;
+  lint:        LintOptions;
+  lintFile:    LintFileOptions;
+  lintVirtual: LintFileOptions;
+};
+
 // ── Per-method key table ───────────────────────────────────────────────────────
 
 /**
@@ -75,15 +94,15 @@ export type MethodName =
  *
  * CONSTRAINT: key ORDER within each witness literal is load-bearing — it
  * determines the `recognised keys are: …` list that {@link assertKnownKeys}
- * emits, which U-OV-14 byte-compares against the napi addon's output. Do not
- * reorder without updating the expected strings in that test.
+ * emits. Do not reorder without updating the expected strings in the
+ * byte-comparison tests.
  *
  * Reconciliation against napi option parsers (`crates/mds-napi/src/lib.rs`):
  * - `compile` / `check`: `basePath` is now in the public types (#180 fix) and in
  *   the key list; napi's `parse_compile_opts` / `parse_check_opts` accept it.
  * - `compileFile` / `checkFile`: `basePath` is NOT in the key list. When a caller
  *   passes `basePath` on these methods the wrapper emits a purpose-built rejection via
- *   {@link BASEPATH_PASSTHROUGH}'s error factory — the backend never receives it.
+ *   {@link BASEPATH_REJECTORS}'s error factory — the backend never receives it.
  *   See {@link getBasePathError} and issue #74.
  * - `lint`, `lintFile`, `lintVirtual`: key lists match napi exactly.
  */
@@ -106,8 +125,8 @@ export const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
  * (crates/mds-napi/src/lib.rs). The wrapper emits this error BEFORE backend
  * dispatch, so napi never produces this message for a public `compileFile` /
  * `checkFile` call. Nothing enforces the two strings staying in sync except
- * U-OV-27, which compares this message against the raw addon's at runtime.
- * Keep the two in lockstep; editing either alone fails that test.
+ * Keep the two in lockstep; editing either alone will fail the runtime
+ * cross-surface message-parity test.
  */
 function makeFileBasePathError(): Error & { code: string } {
   const err = new Error(
@@ -132,29 +151,29 @@ function makeFileBasePathError(): Error & { code: string } {
  * the generic unknown-key path for `basePath` on these methods because they are
  * absent from METHOD_KEYS for those surfaces.
  *
- * KNOWN RESIDUAL (OD-5): napi also has purpose-built `basePath` messages for
+ * KNOWN RESIDUAL: napi also has purpose-built `basePath` messages for
  * `lintFile` ("not valid for lintFile; …") and `lintVirtual`, but those two methods
  * are deliberately NOT in this map. The wrapper intercepts them first and emits the
  * generic `unknown option key "basePath"; recognised keys are: vars, rules` form, so
- * the wrapper and napi messages diverge for that one input. This is intentional and
- * locked in by U-OV-7 and U-OV-13; the generic message still names the offending key
- * and is a hard error either way. Widening this map would change those messages and
- * is deferred rather than bundled into #180/#215/#213.
+ * the wrapper and napi messages diverge for that one input. This is intentional:
+ * the generic message still names the offending key and is a hard error either way.
+ * Widening this map would change those messages and is deferred rather than bundled
+ * into #180/#215/#213.
  */
-const BASEPATH_PASSTHROUGH: ReadonlyMap<MethodName, () => Error & { code: string }> = new Map([
+const BASEPATH_REJECTORS: ReadonlyMap<MethodName, () => Error & { code: string }> = new Map([
   ['compileFile', makeFileBasePathError],
   ['checkFile',   makeFileBasePathError],
 ] as const);
 
 /**
  * Return the purpose-built `basePath` error for `method` if `options.basePath`
- * is non-null and `method` is in {@link BASEPATH_PASSTHROUGH}, or `undefined`
+ * is non-null and `method` is in {@link BASEPATH_REJECTORS}, or `undefined`
  * otherwise.
  *
  * Callers throw the returned error synchronously — the same channel as
  * {@link assertKnownKeys} — so that `try { compileFile(f, opts) } catch` captures
- * both unknown-key and basePath errors (U-OV-32 / U-OV-33). The structural benefit:
- * adding a new method to BASEPATH_PASSTHROUGH requires providing a factory via the
+ * both unknown-key and basePath errors synchronously. The structural benefit:
+ * adding a new method to BASEPATH_REJECTORS requires providing a factory via the
  * Map literal, ensuring the handler is co-located with the set membership.
  *
  * @param options - The caller-supplied options object (non-null).
@@ -164,7 +183,7 @@ export function getBasePathError(
   options: object,
   method: MethodName,
 ): (Error & { code: string }) | undefined {
-  const factory = BASEPATH_PASSTHROUGH.get(method);
+  const factory = BASEPATH_REJECTORS.get(method);
   if (!factory) return undefined;
   const basePath = (options as Record<string, unknown>)['basePath'];
   return basePath != null ? factory() : undefined;
@@ -199,7 +218,7 @@ export function assertKnownKeys(options: object, method: MethodName): void {
     // basePath is absent from METHOD_KEYS for file-surface methods; skip it here
     // so the generic "unknown option key" path is not taken. The caller uses
     // getBasePathError() to emit the purpose-built rejection (issue #74).
-    if (BASEPATH_PASSTHROUGH.has(method) && k === 'basePath') return false;
+    if (BASEPATH_REJECTORS.has(method) && k === 'basePath') return false;
     return !known.includes(k);
   });
   if (unknowns.length === 0) return;
@@ -225,30 +244,29 @@ export function assertKnownKeys(options: object, method: MethodName): void {
  * This is the **single authoritative forwarding path** for all seven public
  * methods. When METHOD_KEYS is updated (e.g. a new key is added to a method's
  * option interface and its {@link keysOf} witness is updated), forwarding picks
- * it up automatically with no additional edit. The previous design used
- * independent per-surface builders (`compileSrcOpt`, `checkSrcOpt`, etc.) that
- * each hardcoded their own key array — those could drift from METHOD_KEYS without
- * a compile error, which is the root shape of PF-004 / #180.
+ * it up automatically with no additional edit. Per-surface builders that each
+ * hardcoded their own key array could drift from METHOD_KEYS without a compile
+ * error — the root shape of PF-004 / #180.
  *
- * The generic `T` parameter preserves the caller's concrete options type across
- * the forwarding boundary. Call sites receive `Partial<T> | undefined` and are
- * assignable to the backend's parameter type without unchecked casts. The
- * internal accumulation into `Record<string, unknown>` still loses per-key types,
- * but the single controlled cast to `Partial<T>` at the return keeps every
- * external call site cast-free — tsc verifies the forwarded shape against the
- * backend parameter type at each call site.
+ * The generic `M` parameter links `options` to `method` via {@link OptionsFor},
+ * so the compiler rejects mismatches (e.g. passing `CompileOptions` to a
+ * `'checkFile'` call). Call sites receive `Partial<OptionsFor[M]> | undefined`
+ * and are assignable to the backend's parameter type without unchecked casts.
+ * The internal accumulation into `Record<string, unknown>` loses per-key types
+ * at the accumulation site; the single controlled cast to `Partial<OptionsFor[M]>`
+ * at the return keeps every external call site cast-free.
  *
  * Returns `undefined` when `options` is nullish or every accepted key is absent,
  * preserving the backend no-options fast path (avoids allocating empty objects
- * on every call). D-TS-03 / D-TS-05.
+ * on every call).
  *
  * @param options - Caller-supplied options (null/undefined treated as "no options").
  * @param method  - Public method name; selects the key list from METHOD_KEYS.
  */
-export function forwardOpts<T extends object>(
-  options: T | null | undefined,
-  method: MethodName,
-): Partial<T> | undefined {
+export function forwardOpts<M extends MethodName>(
+  options: OptionsFor[M] | null | undefined,
+  method: M,
+): Partial<OptionsFor[M]> | undefined {
   if (options == null) return undefined;
   const keys = METHOD_KEYS[method];
   const src = options as Record<string, unknown>;
@@ -258,11 +276,12 @@ export function forwardOpts<T extends object>(
     const v = src[k];
     if (v != null) {
       // The accumulation into Record<string,unknown> loses per-key types
-      // internally; the single controlled cast to Partial<T> at the return
-      // keeps callers cast-free while tsc verifies shape at each call site.
+      // internally; the single controlled cast to Partial<OptionsFor[M]> at the
+      // return keeps callers cast-free — tsc verifies the forwarded shape against
+      // each backend parameter type at the call site.
       out[k] = v;
       any = true;
     }
   }
-  return any ? (out as Partial<T>) : undefined;
+  return any ? (out as Partial<OptionsFor[M]>) : undefined;
 }
