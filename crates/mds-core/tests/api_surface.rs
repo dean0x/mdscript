@@ -1669,12 +1669,15 @@ fn fix_api_incremental_exists() {
 /// `#[deprecated]` attribute is removed from `apply_fixes`. The mutation control
 /// (applies ADR-009): removing the attribute leaves the lib rlib compiling clean, so
 /// both the lib-test (fix.rs `#[cfg(test)]`) and integration-test (api_surface) targets
-/// become ready simultaneously. The union of
-/// `cargo clippy --workspace --all-targets -- -D warnings` and
-/// `cargo clippy -p mds-core --test api_surface -- -D warnings` is exactly 11
-/// unfulfilled_lint_expectations: 10 in fix.rs and 1 in this file. Assert the union,
-/// not a per-command count -- how the 11 split across the two commands depends on
-/// cargo's job scheduling, not on the code.
+/// are affected. A single command is insufficient: `cargo clippy --workspace --all-targets
+/// -- -D warnings` emits 10 errors (all in fix.rs) and then cargo aborts compilation of
+/// the lib-test target; the integration-test (`api_surface`) target is never reached in
+/// that invocation. The two-command control:
+///   (1) `cargo clippy --workspace --all-targets -- -D warnings` → 10 errors, all fix.rs
+///   (2) `cargo clippy -p mds-core --test api_surface -- -D warnings` → 1 error, this file
+/// Total: exactly 11 unfulfilled_lint_expectations. All 10 fix.rs expectations fire on
+/// distinct deprecated calls — none is over-broad (none satisfied by a different deprecated
+/// item such as `LintConfig::from_rules`).
 ///
 /// All values constructed via named constructors, never struct literals (applies ADR-010).
 #[expect(

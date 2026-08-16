@@ -592,12 +592,12 @@ issue #304 carries behavioral context (which ADR-004 behavior each test pins); i
 line numbers predate the `#[expect(...)]` insertions made by PR #303 (issue #209) and
 have since drifted.
 
-Six tests to port or retire (fn-decl lines in `crates/mds-core/src/lint/fix.rs`
-as of the v0.4.0 deprecation PR, post-`#[expect]` insertion):
+Six tests to port or retire (use `grep -n 'fn <name>' crates/mds-core/src/lint/fix.rs`
+to locate current lines — test names are the durable key):
 
-- `a4_partial_overlap_still_rejected_after_dedup` (line 1442)
-- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (line 1739)
-- `reverify_preexisting_untargeted_survives_and_fix_applies` (line 1939)
-- `reverify_new_untargeted_diagnostic_is_rejected` (line 1964)
-- `tier_b_unused_function_standalone_apply_succeeds` (line 2035)
-- `l_fix_rev1_output_delta_causes_rejection` (line 2106)
+- `a4_partial_overlap_still_rejected_after_dedup`
+- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix`
+- `reverify_preexisting_untargeted_survives_and_fix_applies`
+- `reverify_new_untargeted_diagnostic_is_rejected`
+- `tier_b_unused_function_standalone_apply_succeeds`
+- `l_fix_rev1_output_delta_causes_rejection`
