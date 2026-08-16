@@ -25,6 +25,7 @@ import {
   _initWithModuleForTesting,
 } from '../dist/browser.js';
 import { initWasmNode, _resetForTesting as wasmReset } from '../dist/backend/wasm.js';
+import { lint as nodeLint, init as nodeInit } from '../dist/node.js';
 
 // Mirror of MAX_INIT_RETRIES from src/backend/wasm.ts.
 // If this value drifts, U-BR11 will surface the mismatch via a test failure.
@@ -32,9 +33,11 @@ const MAX_INIT_RETRIES = 3;
 
 // Load the WASM module once at file scope using the Node.js loader.
 // All browser tests that need a live backend inject it via _initWithModuleForTesting().
+// nodeInit() is also called here to satisfy the cross-surface parity test (U-BR-PARITY).
 let sharedWasmModule;
 before(async () => {
   sharedWasmModule = await initWasmNode();
+  await nodeInit();
 });
 
 // ---------------------------------------------------------------------------
@@ -193,6 +196,21 @@ describe('browser entry — post-init', () => {
     assert.ok(
       entryReport.diagnostics.some((d) => d.rule === 'unused-variable'),
       `expected an unused-variable diagnostic; got rules: [${entryReport.diagnostics.map((d) => d.rule).join(', ')}]`,
+    );
+  });
+
+  test('U-BR-PARITY: browser lint result equals node lint result at runtime (AC-P3-12, amendment 4, avoids PF-007)', () => {
+    // PF-007: per-surface goldens each lock in their OWN value and cannot prove
+    // cross-surface parity. Compare browser (WASM) and node surfaces at RUNTIME for
+    // the same input with deepStrictEqual — no pinned golden, no local assertion.
+    // Same fixture as U-BR16 so the result is non-trivial (unused-variable diagnostic).
+    const src = '---\ngreeting: Hello\nunused_key: this key is never referenced\n---\n\n{{greeting}}, world!\n';
+    const browserResult = lint(src);
+    const nodeResult = nodeLint(src);
+    assert.deepStrictEqual(
+      browserResult,
+      nodeResult,
+      'browser (WASM) and node lint must return byte-identical results for the same source',
     );
   });
 
