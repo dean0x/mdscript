@@ -17,15 +17,17 @@
 //! # `--quiet` status-message contract (#216, decision D4)
 //!
 //! Every *status* message on stderr is gated on `!quiet` wherever it is emitted.
-//! Per-mode scope (PF-015: scoped claim rather than vacuously-true absolute):
-//! `Partially fixed:`, `Would fix:`, `fix rejected:`, and the diagnostic-cap notice
-//! are gated in all three input modes (single-file, directory, stdin); `Fixed:` is
-//! single-file and directory modes only — stdin writes fixed source to stdout
-//! instead, so no `Fixed:` line appears there; `Clean:` is single-file mode only;
+//! Per-mode scope (PF-015: scoped claim rather than vacuously-true absolute).
+//! Directory mode has two separate emitters (`lint_one_file_human` for --format
+//! human and `lint_one_file_accumulating` for --format json), giving four emitter
+//! sites in total. `Partially fixed:`, `Would fix:`, `fix rejected:`, and the
+//! diagnostic-cap notice are gated at all four sites (single-file, directory-human,
+//! directory-JSON, stdin). `Fixed:` is emitted in single-file and both directory
+//! modes (both human and JSON); stdin emits `Partially fixed:` but no `Fixed:` —
+//! the fixed source on stdout is the signal. `Clean:` is single-file mode only;
 //! the directory summary is directory mode only.
-//! PF-004: these are separate emitters per mode, so a gate added to one must be added
-//! to all; issue #173 is the dispatch-spine refactor that addressed this divergence
-//! class for `Partially fixed:`.
+//! PF-004: these are separate emitters; a gate on one is not inherited by the others
+//! (the #43/#173 divergence class).
 //!
 //! Two messages deliberately bypass `--quiet` because they signal a silent-CI-green-pass
 //! hazard rather than status: the all-excluded diagnostic in [`run_lint_directory`] and

@@ -57,8 +57,10 @@
 //! - D3-a (#216, unix): chmod-000 source-read failure counted in the "with errors" bucket
 //! - D3-a (#216, unix): chmod-000 source-read failure forces summary under --quiet
 //! - D4 (#216, PF-004): `Fixed:` honours --quiet in dir-mode JSON emitter (positive + negative)
+//! - D4 (#216, PF-004): `Fixed:` honours --quiet in dir-mode human emitter (positive + negative)
 //! - D4 (#216, PF-004): `Would fix:` honours --quiet in dir-mode JSON emitter (positive + negative)
 //! - D4 (#216, PF-004, unix): write failure in dir-JSON mode must not print `Fixed:` (positive + negative)
+//! - D1-a (#216): `--fix --diff --format json` diff precedes JSON envelope on stdout
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -6054,4 +6056,113 @@ fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
             panic!("stdout must remain valid JSON under --quiet; err: {e}; stdout: {stdout}")
         });
     }
+}
+
+// ── D4 (PF-004): Fixed: honours --quiet in dir-mode HUMAN emitter ─────────────
+//
+// PF-007: per-surface assertions cannot prove cross-surface parity.
+// The JSON-side test (dir_json_fix_emits_fixed_and_quiet_suppresses_it) cannot
+// substitute for this test — lint_one_file_human is a separate emitter from
+// lint_one_file_accumulating.
+// Mutation-verified: without this test, changing the human-mode gate at
+// lint.rs:1723 from `!quiet` to `true` leaves all prior tests passing.
+
+/// D4/PF-004: dir-mode `--fix` (human format, the default) emits `Fixed:` to stderr
+/// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013/ADR-009.
+///
+/// PF-007: this is a separate emitter (`lint_one_file_human`) from the JSON-mode
+/// equivalent (`lint_one_file_accumulating`); a gate on one is not inherited by the
+/// other.  The JSON-mode equivalent is `dir_json_fix_emits_fixed_and_quiet_suppresses_it`.
+#[test]
+fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
+    // Case A (positive control — ADR-009/PF-013): Fixed: must appear without --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix (human format) must emit 'Fixed:' when a file is \
+             successfully fixed (lint_one_file_human gate, lint.rs:1723); got stderr: {stderr}"
+        );
+        // Stdout must remain empty in human format mode.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.is_empty(),
+            "D4: dir --fix human format must not write to stdout; got: {stdout:?}"
+        );
+    }
+
+    // Case B (quiet gate): Fixed: must be suppressed by --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix --quiet (human format) must suppress 'Fixed:' \
+             (lint_one_file_human gate, lint.rs:1723); got stderr: {stderr}"
+        );
+    }
+}
+
+// ── D1-a exception: --fix --diff --format json writes diff then JSON envelope ──
+//
+// spec.md:938 and lint.rs:1231-1233 document that `--fix --diff --format json`
+// writes the unified diff to stdout before the JSON envelope, making stdout
+// non-JSON-parseable as a whole by design.  This test pins the wire contract so
+// rerouting the diff to stderr (silently 'fixing' the exception) is caught.
+
+/// D1-a: `mds lint --fix --diff --format json <dir>` writes the unified diff to
+/// stdout before the JSON envelope.  The final stdout line must parse as JSON;
+/// stdout as a whole must NOT parse as JSON (the diff header breaks it).
+///
+/// Pins spec.md:938 and the D2-decision comment at lint.rs:1231-1233.  Without
+/// this test, rerouting the diff to stderr would silently remove the documented
+/// exception with no test failure.
+#[test]
+fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    // lint_error.mds has a Tier A auto-fixable issue (duplicate @export greet),
+    // so --fix --diff produces a non-empty unified diff.
+    fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--fix", "--diff", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        !lines.is_empty(),
+        "--fix --diff --format json must produce output on stdout; got empty"
+    );
+
+    // The final stdout line must parse as JSON (the envelope).
+    let last = lines[lines.len() - 1];
+    let _: serde_json::Value = serde_json::from_str(last).unwrap_or_else(|e| {
+        panic!(
+            "D1-a: final stdout line must parse as JSON (the envelope follows the diff); \
+             err: {e}; last line: {last:?}; full stdout: {stdout:?}"
+        )
+    });
+
+    // At least one line preceding the envelope must be a unified-diff marker.
+    let diff_present = lines[..lines.len().saturating_sub(1)]
+        .iter()
+        .any(|l| l.starts_with("@@") || l.starts_with("--- ") || l.starts_with("+++ "));
+    assert!(
+        diff_present,
+        "D1-a: unified diff must precede the JSON envelope on stdout (spec.md:938, \
+         lint.rs:1231-1233); full stdout: {stdout:?}"
+    );
+
+    // Stdout as a whole must NOT parse as JSON — the diff header breaks the shape.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
+        "D1-a: stdout as a whole must not parse as JSON under --fix --diff --format json; \
+         this is the documented exception (spec.md:938); stdout: {stdout:?}"
+    );
 }
