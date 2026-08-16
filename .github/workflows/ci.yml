@@ -62,7 +62,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to 1.96.0 (released 2026-05-25, >30-day soak per project convention).
+      # RATIONALE: unpinned `stable` lets compiler drift silently change the wasm-opt
+      # output size independently of any source change, making the 850 KB guard measure
+      # a different thing each week.  Previous guard raises were partly caused by this.
+      # Scoped to this job only (not repo-wide rust-toolchain.toml) to limit blast radius.
+      # WHEN BUMPING: rebuild, re-measure with the new compiler, and update the
+      # budget-history ledger comment above with the new baseline before changing the pin.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
