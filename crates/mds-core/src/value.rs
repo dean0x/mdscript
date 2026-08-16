@@ -231,9 +231,11 @@ impl fmt::Display for Value {
                 Ok(())
             }
             Value::Object(map) => {
-                // Sort keys alphabetically for deterministic output
+                // Sort keys alphabetically for deterministic output.
+                // SAFE to use unstable sort: `map` is a `HashMap` — keys are
+                // unique by construction so no two elements compare equal (tie-free).
                 let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
+                keys.sort_unstable();
                 for (i, key) in keys.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;

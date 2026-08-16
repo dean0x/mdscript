@@ -495,8 +495,11 @@ fn sort_strings(arr: &[Value]) -> Result<Value, MdsError> {
             )));
         }
     }
+    // SAFE to use unstable sort: `Value::String` comparisons are total on the full
+    // payload — two elements that compare equal ARE identical strings, so any
+    // permutation of ties produces the same observable array (tie-free in effect).
     let mut sorted = arr.to_vec();
-    sorted.sort_by(|a, b| match (a, b) {
+    sorted.sort_unstable_by(|a, b| match (a, b) {
         (Value::String(a), Value::String(b)) => a.cmp(b),
         _ => unreachable!(),
     });
@@ -524,8 +527,11 @@ fn sort_numbers(arr: &[Value]) -> Result<Value, MdsError> {
             }
         }
     }
+    // SAFE to use unstable sort: `total_cmp` equality implies identical bit patterns —
+    // equal elements are physically identical `f64` values, so any permutation of ties
+    // produces the same observable array (tie-free in effect).
     let mut sorted = arr.to_vec();
-    sorted.sort_by(|a, b| match (a, b) {
+    sorted.sort_unstable_by(|a, b| match (a, b) {
         (Value::Number(a), Value::Number(b)) => a.total_cmp(b),
         _ => unreachable!(),
     });
