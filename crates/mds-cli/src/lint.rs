@@ -16,11 +16,13 @@
 //!
 //! # `--quiet` status-message contract (#216, decision D4)
 //!
-//! Every *status* message on stderr is gated on `!quiet` wherever it is emitted:
-//! `Fixed:`, `Partially fixed:`, `Would fix:`, `fix rejected:`, the diagnostic-cap
-//! notice, and the directory summary appear (and are gated) across all three input
-//! modes; `Clean:` is single-file/stdin only — directory mode emits no per-file
-//! clean message (PF-015: scoped claim rather than vacuously-true absolute).
+//! Every *status* message on stderr is gated on `!quiet` wherever it is emitted.
+//! Per-mode scope (PF-015: scoped claim rather than vacuously-true absolute):
+//! `Partially fixed:`, `Would fix:`, `fix rejected:`, and the diagnostic-cap notice
+//! are gated in all three input modes (single-file, directory, stdin); `Fixed:` is
+//! single-file and directory modes only — stdin writes fixed source to stdout
+//! instead, so no `Fixed:` line appears there; `Clean:` is single-file mode only;
+//! the directory summary is directory mode only.
 //! PF-004: these are separate emitters per mode, so a gate added to one must be added
 //! to all; issue #173 is the dispatch-spine refactor that addressed this divergence
 //! class for `Partially fixed:`.
@@ -1359,7 +1361,7 @@ fn run_lint_directory(
     // AD-216-5: assert the four-counter partition invariant in production code
     // (per project reliability rule: "Assert preconditions and invariants in
     // production code — not just tests").  Zero release-build cost: debug_assert!
-    // compiles away in release mode.  Catches a future early continue/return inserted
+    // compiles away in release mode.  Catches a future early continue inserted
     // into the per-file loop body that would silently undercount the summary.
     debug_assert_eq!(
         clean_count + warn_file_count + error_file_count + limit_file_count,

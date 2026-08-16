@@ -977,10 +977,14 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 - The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
   regardless of `--quiet` or directory mode — no `"summary"` key is added (D2-B).
 
-**`--quiet` and `--fix` status messages:** the `fix rejected: <reason>` notice and the
-`diagnostic cap (N) reached` notice are status output, not errors, and are suppressed by
-`--quiet` in **all three input modes** (directory, single file, stdin). Error-severity
-diagnostics and the exit code are unaffected.
+**`--quiet` and `--fix` status messages:** `fix rejected: <reason>`, `Partially fixed:`,
+`Would fix:`, and the `diagnostic cap (N) reached` notice are status output gated by
+`--quiet` in **all three input modes** (directory, single file, stdin). `Fixed: <path>` is
+gated by `--quiet` in single-file and directory modes (both `--format human` and `--format
+json`); stdin writes fixed source to stdout rather than writing back to a file, so no
+path-bearing `Fixed:` line appears there. All of these status messages go to **stderr**
+regardless of `--format`; the JSON stdout envelope is unaffected. Error-severity diagnostics
+and the exit code are unaffected by `--quiet`.
 
 **Exit codes** (lint-specific; differ from `mds build`/`mds check`):
 
