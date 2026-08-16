@@ -35,20 +35,22 @@ console.log(getBackend()); // 'native' | 'wasm'
 
 ## Browser usage
 
-The browser entry requires an explicit `init()` call before any compile/check
+The browser entry requires an explicit `init()` call before any compile/check/lint
 operations. `init()` is idempotent and safe to call multiple times.
 
 ```ts
-import { init, compile, check, isMdsError } from '@mdscript/mds';
+import { init, compile, check, lint, lintVirtual, isMdsError } from '@mdscript/mds';
 
 await init();
 // or with a custom WASM URL:
 await init({ wasmUrl: '/assets/mds_bg.wasm' });
 
 const result = compile('# {{title}}', { vars: { title: 'Hello' } });
+const lintResult = lint('# {{title}}', { vars: { title: 'Hello' } });
+const virtualResult = lintVirtual({ 'entry.mds': '# {{title}}' }, 'entry.mds');
 ```
 
-> `compileFile` and `checkFile` are not available in browser environments.
+> `compileFile`, `checkFile`, and `lintFile` are not available in browser environments.
 
 ## Backend selection (`MDS_BACKEND`)
 
@@ -152,8 +154,8 @@ interface CheckFileOptions {
 
 // LintOptions — accepted by lint() (string-source)
 // basePath: required when the source contains @import or @extends.
-// WASM backend: basePath throws mds::invalid_options (OD-1 — rejects instead of
-// silently ignoring so misconfigured callers see an actionable error).
+// WASM backend: basePath throws mds::invalid_options — rejects instead of
+// silently ignoring so misconfigured callers see an actionable error.
 // Set MDS_BACKEND=native to use the native backend, or use lintVirtual with
 // pre-resolved modules.
 interface LintOptions {
@@ -176,9 +178,12 @@ interface InitOptions {
 }
 ```
 
-**Unknown-option rejection:** passing an unrecognised key to any of the seven
-public methods throws `Error { code: 'mds::invalid_options' }` immediately, before
-calling the backend. The error names the offending key(s) and lists the accepted keys.
+**Unknown-option rejection:** passing an unrecognised key to a public method throws
+`Error { code: 'mds::invalid_options' }` before calling the backend; the error names
+the offending key(s) and lists the accepted keys. Exception: passing `basePath` to a
+file-path method (`compileFile` or `checkFile`) surfaces as a rejected promise with a
+purpose-built message rather than a synchronous throw, and the message does not include
+an accepted-keys list.
 
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
