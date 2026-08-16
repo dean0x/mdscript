@@ -146,6 +146,24 @@ export function assertKnownKeys(options: object, method: MethodName): void {
 // file-surface options forwarded to the backend.
 
 /**
+ * Return a new object containing only the keys from `keys` whose values in
+ * `src` are non-null/undefined. Returns `undefined` when `src` is nullish or
+ * every selected value is absent — so callers can use `result ?? undefined`
+ * without allocating an empty object on every invocation (backend fast path).
+ *
+ * @internal
+ */
+function pickDefined<T extends object>(
+  src: T | null | undefined,
+  keys: readonly (keyof T)[],
+): Partial<T> | undefined {
+  if (src == null) return undefined;
+  const defined = keys.filter(k => src[k] != null);
+  if (defined.length === 0) return undefined;
+  return Object.fromEntries(defined.map(k => [k, src[k]])) as Partial<T>;
+}
+
+/**
  * Build options for the string-source compile surface.
  * Picks `basePath`, `vars`, `sourceMap`, and `sourcesContent` from `CompileOptions`.
  *
@@ -153,13 +171,7 @@ export function assertKnownKeys(options: object, method: MethodName): void {
  * backend's `compileOpts()` wrapper (after the WASM basePath guard fires).
  */
 export function compileSrcOpt(options?: CompileOptions): Partial<CompileOptions> | undefined {
-  if (options == null) return undefined;
-  const out: Partial<CompileOptions> = {};
-  if (options.basePath != null) out.basePath = options.basePath;
-  if (options.vars != null) out.vars = options.vars;
-  if (options.sourceMap != null) out.sourceMap = options.sourceMap;
-  if (options.sourcesContent != null) out.sourcesContent = options.sourcesContent;
-  return Object.keys(out).length > 0 ? out : undefined;
+  return pickDefined(options, ['basePath', 'vars', 'sourceMap', 'sourcesContent']);
 }
 
 /**
@@ -170,11 +182,7 @@ export function compileSrcOpt(options?: CompileOptions): Partial<CompileOptions>
  * guards against `basePath` before calling `checkOpts()`.
  */
 export function checkSrcOpt(options?: CheckOptions): Partial<CheckOptions> | undefined {
-  if (options == null) return undefined;
-  const out: Partial<CheckOptions> = {};
-  if (options.basePath != null) out.basePath = options.basePath;
-  if (options.vars != null) out.vars = options.vars;
-  return Object.keys(out).length > 0 ? out : undefined;
+  return pickDefined(options, ['basePath', 'vars']);
 }
 
 /**
@@ -187,12 +195,7 @@ export function checkSrcOpt(options?: CheckOptions): Partial<CheckOptions> | und
  * `filename` and `modules` separately).
  */
 export function fileCompileOpt(options?: FileOptions): Partial<FileOptions> | undefined {
-  if (options == null) return undefined;
-  const out: Partial<FileOptions> = {};
-  if (options.vars != null) out.vars = options.vars;
-  if (options.sourceMap != null) out.sourceMap = options.sourceMap;
-  if (options.sourcesContent != null) out.sourcesContent = options.sourcesContent;
-  return Object.keys(out).length > 0 ? out : undefined;
+  return pickDefined(options, ['vars', 'sourceMap', 'sourcesContent']);
 }
 
 /**

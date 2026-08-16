@@ -126,7 +126,11 @@ export function lint(source: string, options?: LintOptions): LintResult {
   return assertReady().lint(source, options);
 }
 
-/** Lint a multi-module virtual filesystem. Caller provides the full module map and entry key. Requires init() to have been called and awaited first. */
+/**
+ * Lint a multi-module virtual filesystem. Caller provides the full module map
+ * and entry key. Returns a LintResult with per-rule findings.
+ * Requires init() to have been called and awaited first.
+ */
 export function lintVirtual(
   modules: Record<string, string>,
   entry: string,

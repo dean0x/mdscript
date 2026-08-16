@@ -75,11 +75,6 @@ function fileBasePathError(): Error & { code: string } {
   return err;
 }
 
-/** Throw the file-surface basePath error (for use inside async functions). */
-function throwFileBasePathError(): never {
-  throw fileBasePathError();
-}
-
 /**
  * Wrap a MdsBaseBackend with file-based compile/check operations, producing
  * a MdsNodeBackend. The wasmModule is captured so compileFile/checkFile can
@@ -122,7 +117,7 @@ function wrapWithFileOps(
       // there. BASEPATH_PASSTHROUGH lets basePath through assertKnownKeys; the guard
       // here fires on the WASM path before buildModulesMap runs (avoids PF-004).
       if ((options as unknown as { basePath?: string })?.basePath != null) {
-        throwFileBasePathError();
+        throw fileBasePathError();
       }
       const { source, opts } = await prepareFileArgs(path, options);
       const result: unknown = wasmModule.compile(source, opts);
@@ -133,7 +128,7 @@ function wrapWithFileOps(
     async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
       // D-TS-06 guard: same reason as compileFile above.
       if ((options as unknown as { basePath?: string })?.basePath != null) {
-        throwFileBasePathError();
+        throw fileBasePathError();
       }
       // CheckFileOptions is a structural subset of FileOptions (only vars, no
       // sourceMap/sourcesContent), so the cast is safe: prepareFileArgs calls
