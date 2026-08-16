@@ -5272,8 +5272,10 @@ fn fix_rejected_message_honours_quiet_in_all_four_modes() {
          be reported in stderr; got: {loud_json_check_stderr:?}"
     );
 
-    let quiet_json_check =
-        lint_path(dir.path(), &["--fix", "--check", "--format", "json", "--quiet"]);
+    let quiet_json_check = lint_path(
+        dir.path(),
+        &["--fix", "--check", "--format", "json", "--quiet"],
+    );
     let quiet_json_check_stderr = String::from_utf8_lossy(&quiet_json_check.stderr);
     assert!(
         !quiet_json_check_stderr.contains(needle),
@@ -5656,10 +5658,12 @@ fn lint_directory_summary_is_not_forgeable() {
     // omitted).  The directory contains exactly 1 error-severity file, so the genuine
     // summary is the line below.
     let genuine_summary = "0 clean, 0 with warnings, 1 with errors, 0 resource-limited";
-    let genuine_count = stderr.lines().filter(|l| l.trim() == genuine_summary).count();
+    let genuine_count = stderr
+        .lines()
+        .filter(|l| l.trim() == genuine_summary)
+        .count();
     assert_eq!(
-        genuine_count,
-        1,
+        genuine_count, 1,
         "AC-Q25: genuine summary must appear exactly once in stderr; got: {stderr:?}"
     );
 }
@@ -5997,9 +6001,8 @@ fn dir_json_fix_emits_fixed_and_quiet_suppresses_it() {
         );
         // Stdout must remain parseable JSON (PR1 contract: stdout carries ONLY the JSON).
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}")
-        });
+        let _: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}"));
     }
 
     // Case B (quiet gate): Fixed: must be suppressed by --quiet.
@@ -6041,9 +6044,8 @@ fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
         );
         // Stdout must remain parseable JSON (PR1 contract).
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}")
-        });
+        let _: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}"));
     }
 
     // Case B (quiet gate): Would fix: must be suppressed by --quiet.
@@ -6051,7 +6053,10 @@ fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
         let dir = tempfile::tempdir().unwrap();
         fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
 
-        let out = lint_path(dir.path(), &["--fix", "--check", "--format", "json", "--quiet"]);
+        let out = lint_path(
+            dir.path(),
+            &["--fix", "--check", "--format", "json", "--quiet"],
+        );
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !stderr.contains("Would fix:"),
