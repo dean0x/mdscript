@@ -1,11 +1,17 @@
 /**
- * Options-validation tests — assertKnownKeys wrapper-level enforcement.
- * Tests: U-OV-1 through U-OV-20
+ * Options-validation tests — assertKnownKeys wrapper-level enforcement, plus
+ * basePath forwarding and rejection across both backends.
+ * Tests: U-OV-1 through U-OV-34.
  *
  * Verifies that the universal @mdscript/mds wrapper rejects unknown option keys
  * with code === 'mds::invalid_options' before dispatching to any backend.
- * Since validation runs inside the wrapper (before backend dispatch) it is
- * backend-agnostic: the same rejection fires on native and WASM paths.
+ * Unknown-key validation runs inside the wrapper (before backend dispatch) and is
+ * therefore backend-agnostic: the same rejection fires on native and WASM paths.
+ *
+ * basePath behaviour is NOT backend-agnostic (OD-1): the native backend honors it
+ * on the string surface, while the WASM backend rejects it (no filesystem access).
+ * Tests touching basePath are therefore either native-gated via requireNativeAddon()
+ * or written backend-aware via assertWrapperAcceptsBasePath().
  *
  * U-OV-14 performs a byte-identical message parity check across all seven
  * methods against the native napi backend. That test hard-fails when the
@@ -26,6 +32,7 @@ import {
   lintVirtual,
   isMdsError,
   init,
+  getBackend,
 } from '../dist/node.js';
 import { assertKnownKeys, METHOD_KEYS, forwardOpts } from '../dist/util/options.js';
 import * as os from 'node:os';
@@ -130,16 +137,65 @@ describe('options-validation', () => {
 
   // ── valid options pass through ─────────────────────────────────────────────
 
+  /**
+   * Assert that the WRAPPER does not reject `basePath` as an unknown option key.
+   *
+   * OD-1 made a bare `doesNotThrow` backend-dependent: the native backend honors
+   * `basePath` (no throw), while the WASM backend rejects it because it has no
+   * filesystem. Both outcomes prove the property these tests exist for — that
+   * `assertKnownKeys` no longer intercepts `basePath` on the string surface (#180).
+   * Asserting backend-aware keeps the test meaningful on a machine that falls back
+   * to WASM (node.ts:225) instead of failing with a misleading
+   * "wrapper reconciliation" message that misattributes correct WASM behaviour to
+   * a wrapper regression.
+   *
+   * The WASM branch is not a free pass: it asserts the error is the WASM-backend
+   * rejection and explicitly NOT the generic `unknown option key` form, which is
+   * the exact regression being guarded (avoids PF-013 — a bare "it threw" would
+   * accept the very failure this test must catch).
+   */
+  function assertWrapperAcceptsBasePath(fn, label) {
+    let caught;
+    try {
+      fn();
+    } catch (err) {
+      caught = err;
+    }
+    if (caught === undefined) {
+      assert.equal(
+        getBackend(), 'native',
+        `${label}: only the native backend may accept basePath without throwing; backend=${getBackend()}`,
+      );
+      return;
+    }
+    assert.equal(
+      getBackend(), 'wasm',
+      `${label}: basePath must not throw on the native backend — wrapper regression? err: ${caught.message}`,
+    );
+    assert.ok(isMdsError(caught), `${label}: expected isMdsError, got: ${caught}`);
+    assert.equal(caught.code, 'mds::invalid_options', `${label}: wrong error code`);
+    assert.ok(
+      !caught.message.startsWith('unknown option key'),
+      `${label}: wrapper must not reject basePath as an unknown key (#180 regression): ${caught.message}`,
+    );
+    assert.ok(
+      caught.message.includes('WASM'),
+      `${label}: expected the WASM-backend basePath rejection, got: ${caught.message}`,
+    );
+  }
+
   test('U-OV-8: compile accepts all valid keys without error', () => {
     assert.doesNotThrow(() => compile('Hello\n', { vars: {}, sourceMap: false, sourcesContent: false }));
-    // basePath is now also accepted (reconciled with napi parse_compile_opts — issue #180)
-    assert.doesNotThrow(() => compile('Hello\n', { basePath: '.' }));
+    // basePath is now also accepted by the wrapper (reconciled with napi
+    // parse_compile_opts — issue #180). Backend-aware: see the helper above.
+    assertWrapperAcceptsBasePath(() => compile('Hello\n', { basePath: '.' }), 'U-OV-8 compile');
   });
 
   test('U-OV-9: check accepts vars and basePath without error', () => {
     assert.doesNotThrow(() => check('Hello\n', { vars: {} }));
-    // basePath is now also accepted (reconciled with napi parse_check_opts — issue #180)
-    assert.doesNotThrow(() => check('Hello\n', { basePath: '.' }));
+    // basePath is now also accepted by the wrapper (reconciled with napi
+    // parse_check_opts — issue #180). Backend-aware: see the helper above.
+    assertWrapperAcceptsBasePath(() => check('Hello\n', { basePath: '.' }), 'U-OV-9 check');
   });
 
   test('U-OV-10: no options does not throw', () => {
@@ -289,19 +345,15 @@ describe('options-validation', () => {
   test('U-OV-15: compile now accepts basePath (reconciled with napi parse_compile_opts — issue #180)', () => {
     // napi's parse_compile_opts has always accepted basePath; the wrapper was wrong to
     // reject it. After the fix, the wrapper no longer intercepts it.
-    assert.doesNotThrow(
-      () => compile('Hello\n', { basePath: '.' }),
-      'compile must not throw invalid_options for basePath after wrapper reconciliation',
-    );
+    // Backend-aware per OD-1 — see assertWrapperAcceptsBasePath above.
+    assertWrapperAcceptsBasePath(() => compile('Hello\n', { basePath: '.' }), 'U-OV-15');
   });
 
   test('U-OV-16: check now accepts basePath (reconciled with napi parse_check_opts — issue #180)', () => {
     // napi's parse_check_opts has always accepted basePath; the wrapper was wrong to
     // reject it. After the fix, the wrapper no longer intercepts it.
-    assert.doesNotThrow(
-      () => check('Hello\n', { basePath: '.' }),
-      'check must not throw invalid_options for basePath after wrapper reconciliation',
-    );
+    // Backend-aware per OD-1 — see assertWrapperAcceptsBasePath above.
+    assertWrapperAcceptsBasePath(() => check('Hello\n', { basePath: '.' }), 'U-OV-16');
   });
 
   // ── basePath passthrough on file methods: purposeful rejection (issue #74) ──
@@ -952,6 +1004,41 @@ describe('options-validation', () => {
       optsForUndefined,
       { filename: 'input.mds', modules: {} },
       'DEFAULT_COMPILE_OPTS must have shape { filename: "input.mds", modules: {} }',
+    );
+  });
+
+  // ── checkFile WASM-path forwarding invariant (avoids PF-004 / #180 bug class) ──
+
+  test('U-OV-35: METHOD_KEYS.checkFile is a subset of METHOD_KEYS.compileFile (WASM checkFile forwarding invariant)', () => {
+    // On the WASM backend, node.ts checkFile routes through prepareFileArgs → fileOpts,
+    // which forwards using METHOD_KEYS.compileFile — NOT METHOD_KEYS.checkFile
+    // (see the cast comment at node.ts:114-117). That is correct only while every
+    // checkFile key is also a compileFile key.
+    //
+    // If CheckFileOptions ever gains a key that FileOptions lacks, assertKnownKeys
+    // would ACCEPT it on checkFile while the WASM path silently DROPPED it —
+    // reintroducing the exact #180 bug class (validated-then-discarded) on one backend
+    // only. The native path is unaffected, so a native-only test suite would not catch
+    // it. This assertion converts that silent drift into a loud failure (avoids PF-004:
+    // an alternate code path silently bypassing the authoritative key list).
+    const missing = METHOD_KEYS.checkFile.filter((k) => !METHOD_KEYS.compileFile.includes(k));
+    assert.deepStrictEqual(
+      missing,
+      [],
+      `METHOD_KEYS.checkFile keys absent from METHOD_KEYS.compileFile: [${missing.join(', ')}]. ` +
+        'Either add them to FileOptions, or give checkFile its own forwarding path in ' +
+        'node.ts prepareFileArgs/fileOpts — otherwise the WASM backend drops them silently.',
+    );
+
+    // Positive controls (avoids PF-013): an empty-vs-empty comparison passes vacuously.
+    // Prove both operands are non-empty and that the filter can actually report a key
+    // as missing, so the assertion above is capable of failing.
+    assert.ok(METHOD_KEYS.checkFile.length > 0, 'METHOD_KEYS.checkFile must be non-empty');
+    assert.ok(METHOD_KEYS.compileFile.length > 0, 'METHOD_KEYS.compileFile must be non-empty');
+    assert.deepStrictEqual(
+      METHOD_KEYS.checkFile.filter((k) => !['__no_such_key__'].includes(k)),
+      [...METHOD_KEYS.checkFile],
+      'positive control: the subset filter must be able to report keys as missing',
     );
   });
 });
