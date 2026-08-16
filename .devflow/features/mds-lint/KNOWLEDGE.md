@@ -589,7 +589,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 tests that must be ported or retired before removal are enumerated below by name —
 **test names are the durable key; line numbers drift as `fix.rs` evolves**. GitHub
 issue #304 carries behavioral context; its line numbers predate the `#[expect(...)]`
-blocks inserted by this PR and are approximately 50 lines stale.
+insertions in PR #209 and have since drifted.
 
 Six tests to port or retire (fn-decl lines in `crates/mds-core/src/lint/fix.rs`
 as of the v0.4.0 deprecation PR, post-`#[expect]` insertion):
