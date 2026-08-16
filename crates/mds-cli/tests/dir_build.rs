@@ -10,6 +10,9 @@
 //! - T-CLI-20 (FUNC-26): `check <dir>` validates tree, continues on error, non-zero exit on failure
 //! - T-CLI-21 (FUNC-16, unit): `output_path_for("json"/"md")` + `..`-containment (AC-M7)
 //!   (covered in output.rs unit tests; here we test via CLI)
+//! - AC-Q01 (#216): `mds build --quiet <dir>` on all-success tree produces no stderr
+//! - AC-Q02 (#216): `mds build --quiet <dir>` with a failing file still prints summary
+//! - AC-Q30 (#216): `--quiet` before subcommand and after produce identical results
 
 mod common;
 use common::mds_bin;
@@ -786,5 +789,119 @@ fn dir_fmt_all_excluded_quiet_still_emits_diagnostic() {
     assert!(
         !stderr.is_empty() && (stderr.contains("excluded") || stderr.contains("default-excluded")),
         "all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q01: quiet build on all-success tree produces no stderr ────────────────
+//
+// Positive control: the identical tree without --quiet MUST still print the summary,
+// proving the absence assertion under --quiet cannot pass vacuously.
+// (PF-013/ADR-009: every absence assertion needs a paired positive control.)
+//
+// Scope: depth <= 64, no pre-existing stale sibling outputs (AC-Q05: two ungated
+// warning writers in output.rs fire above MAX_DEPTH=64 or on a stale-unlink failure;
+// documentation words those cases as "no output on a *successful* build", not absolute
+// silence — see run_build_directory doc block).
+
+#[test]
+fn dir_build_quiet_suppresses_summary_on_success() {
+    // Both the quiet run and the positive control run need their own tempdir so
+    // build outputs from the first run do not affect the second.
+    let src1 = tempfile::tempdir().unwrap();
+    create_plain_mds(src1.path(), "a.mds");
+    create_plain_mds(src1.path(), "b.mds");
+
+    let quiet_out = build_dir(src1.path(), &["--quiet"]);
+
+    assert_eq!(
+        quiet_out.status.code(),
+        Some(0),
+        "quiet build over an all-success tree must exit 0; stderr: {}",
+        String::from_utf8_lossy(&quiet_out.stderr)
+    );
+    let quiet_stderr = String::from_utf8_lossy(&quiet_out.stderr);
+    assert!(
+        quiet_stderr.is_empty(),
+        "AC-Q01: --quiet build with no failures must produce empty stderr; got: {quiet_stderr:?}"
+    );
+
+    // Positive control: without --quiet the summary MUST appear.
+    // (Proves the `is_empty` assertion above is not vacuously passing on a broken check.)
+    let src2 = tempfile::tempdir().unwrap();
+    create_plain_mds(src2.path(), "a.mds");
+    create_plain_mds(src2.path(), "b.mds");
+
+    let control_out = build_dir(src2.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control_out.stderr);
+    assert!(
+        control_stderr.contains("2 built"),
+        "positive control: non-quiet run must print '2 built' so the quiet absence assertion \
+         is non-vacuous; got: {control_stderr:?}"
+    );
+}
+
+// ── AC-Q02: quiet build with a failing file still prints the summary ──────────
+//
+// When any file fails, the summary is always printed under --quiet so the
+// non-zero exit is explained.  Exit codes are unaffected (AD-216-2).
+
+#[test]
+fn dir_build_quiet_still_prints_summary_on_failure() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "good.mds");
+    create_bad_mds(src.path(), "bad.mds");
+
+    let output = build_dir(src.path(), &["--quiet"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "quiet build with a failing file must exit 1; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 built"),
+        "AC-Q02: --quiet build with failures must print summary so non-zero exit is explained; \
+         got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("1 failed"),
+        "AC-Q02: summary must include '1 failed'; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q30 (build half): --quiet in both argument positions (global flag) ─────
+//
+// --quiet is declared `global = true` (main.rs:31), so `mds --quiet build <dir>`
+// and `mds build <dir> --quiet` must behave identically.
+
+#[test]
+fn dir_build_quiet_works_in_pre_subcommand_position() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "a.mds");
+    create_plain_mds(src.path(), "b.mds");
+
+    // --quiet after subcommand (post-subcommand position).
+    let post = build_dir(src.path(), &["--quiet"]);
+
+    // --quiet before subcommand (pre-subcommand, global position).
+    let pre = mds_bin()
+        .arg("--quiet")
+        .arg("build")
+        .arg(src.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        pre.status.code(),
+        post.status.code(),
+        "pre-subcommand --quiet must produce the same exit code as post-subcommand --quiet"
+    );
+    assert_eq!(
+        pre.stderr, post.stderr,
+        "pre-subcommand --quiet must produce the same stderr as post-subcommand --quiet"
     );
 }

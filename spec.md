@@ -858,7 +858,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - Output extension per file is intrinsic (`.md` or `.json`).
 - With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source.
 - `-o` is rejected for a directory input.
-- Continue-on-error: all compilable files are attempted; a summary and non-zero exit are produced if any file failed.
+- Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
 - When the directory contains no `.mds` files, exits 0 with a "no files found" message.
 - **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
 - stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
@@ -872,7 +872,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
-| `-q, --quiet` | Suppress status messages and warnings on stderr. |
+| `-q, --quiet` | Suppress status messages and warnings on stderr. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. |
 
 **Output path resolution** (precedence order, highest first):
 
@@ -934,6 +934,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 **Channel discipline:**
 - Human-readable diagnostics → **stderr** (via miette).
 - `--format json` output → **stdout** (single JSON object, one trailing newline).
+- Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode).
 - `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
 
 **Options:**
@@ -947,7 +948,23 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
 | `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
-| `-q, --quiet` | Suppress warning/info human diagnostics; errors still print. |
+| `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. |
+
+**Directory mode** (`mds lint <dir>`):
+
+- Lints every `.mds` file recursively (including `_`-prefixed partials).
+- Accumulate-and-continue: per-file errors do not abort the run.
+- After processing all files, emits one summary line to stderr:
+  `N clean, N with warnings, N with errors, N resource-limited`
+  "With errors" covers both error-severity lint findings and per-file analysis failures
+  (I/O, config, resource limit exceeding `MAX_BLOCKS_PER_MODULE` does not count here — those
+  are counted in "resource-limited"). "Resource-limited" counts files where `mds::lint`
+  returned `MdsError::ResourceLimit`.
+- Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
+  (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
+  bucket, the summary is always emitted so the non-zero exit is never unexplained.
+- The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
+  regardless of `--quiet` or directory mode — no `"summary"` key is added (D2-B).
 
 **Exit codes** (lint-specific; differ from `mds build`/`mds check`):
 

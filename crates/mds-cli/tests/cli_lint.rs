@@ -28,6 +28,25 @@
 //! - AC-224-19: directory with N files emits exactly ONE unknown-rule warning
 //! - AC-224-21: stdout JSON remains valid when unknown rule name is present
 //! - AC-224-22: --quiet suppresses the unknown-rule warning
+//! - AC-Q06 (#216): clean directory prints exact summary line, nothing else
+//! - AC-Q07 (#216): mixed-severity directory yields exact per-bucket counts
+//! - AC-Q08 (#216): counters partition the file set with no drops or double-counts
+//! - AC-Q09 (#216): resource-limited bucket is genuinely exercised
+//! - AC-Q10 (#216): quiet warn-only lint is silent (with positive control)
+//! - AC-Q11 (#216): quiet lint with error-severity findings still prints summary
+//! - AC-Q12 (#216): quiet lint with resource-limit still prints summary
+//! - AC-Q13 (#216): --fix --check exit path does not skip the summary
+//! - AC-Q14 (#216): warn-only and --fix --check --quiet are silent (D1-a)
+//! - AC-Q15 (#216): JSON directory mode keeps stdout clean; summary on stderr only
+//! - AC-Q16 (#216): JSON envelope key contract is exactly {"files","truncated","version"}
+//! - AC-Q18 (#216): single-file lint prints no directory summary
+//! - AC-Q19 (#216): stdin lint prints no directory summary
+//! - AC-Q20 (#216): bare `mds lint` cannot reach directory mode
+//! - AC-Q21 (#216): empty directory prints no summary
+//! - AC-Q22 (#216): all-excluded quiet lint still emits diagnostic and no summary
+//! - AC-Q25 (#216): hostile filename cannot forge a summary line (with positive control)
+//! - AC-Q26 (#216): help text documents quiet summary contract (machine-verified)
+//! - AC-Q30 (#216): --quiet works in both argument positions for lint
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -4516,5 +4535,686 @@ fn unknown_rule_nested_config_warns_once_and_envelope_unchanged() {
     assert!(
         files.iter().any(|f| f == "sub/nested.mds"),
         "non-vacuity: the nested file must still be linted; got files: {files:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #216 — CLI quiet-mode and directory-summary contract
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── AC-Q06: clean directory prints exactly one summary line ──────────────────
+//
+// Verified: directory mode emits NO per-file `Clean:` line (those live at
+// lint.rs::835 and ::881, single-file/stdin only).  After this change, the
+// summary IS the only stderr line for a clean directory run, so we can assert
+// exact string equality rather than substring containment (ADR-009).
+
+#[test]
+fn lint_directory_prints_summary_when_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in &["a.mds", "b.mds", "c.mds"] {
+        fs::copy(fixture("lint_clean.mds"), dir.path().join(name)).unwrap();
+    }
+
+    let out = lint_path(dir.path(), &[]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean directory must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "stdout must be empty in human mode; got: {stdout:?}"
+    );
+
+    // Exact equality — proved correct because dir mode never emits per-file Clean: lines.
+    let stderr_trimmed = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    assert_eq!(
+        stderr_trimmed, "3 clean, 0 with warnings, 0 with errors, 0 resource-limited",
+        "AC-Q06: trimmed stderr must equal the exact summary string"
+    );
+}
+
+// ── AC-Q07: mixed-severity tree yields exact per-bucket counts ────────────────
+// AC-Q08: the four counters partition the file set (no drops, no double-counts).
+
+#[test]
+fn lint_directory_summary_counts_each_severity_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    // 2 clean, 1 warn-only (unused-variable), 1 error (duplicate-export)
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean1.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean2.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("warn.mds")).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "directory with an error file must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("2 clean, 1 with warnings, 1 with errors, 0 resource-limited"),
+        "AC-Q07: summary must contain '2 clean, 1 with warnings, 1 with errors, 0 resource-limited'; \
+         got: {stderr:?}"
+    );
+
+    // AC-Q08: parse the four integers and assert they partition the 4-file set.
+    let re = regex_from_summary(&stderr);
+    assert_eq!(
+        re,
+        [2, 1, 1, 0],
+        "AC-Q08: counters must partition the 4-file set (clean+warn+error+limit == 4)"
+    );
+}
+
+/// Parse [clean, warn, error, limit] from a directory summary line.
+/// Returns [0,0,0,0] on parse failure (test will then fail on the equality check).
+fn regex_from_summary(stderr: &str) -> [usize; 4] {
+    // Pattern: "N clean, N with warnings, N with errors, N resource-limited"
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_suffix(" resource-limited") {
+            let parts: Vec<&str> = rest.split(", ").collect();
+            if parts.len() == 4 {
+                let clean = parts[0]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok());
+                let warn = parts[1]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok());
+                let error = parts[2]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok());
+                let limit = parts[3]
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok());
+                if let (Some(c), Some(w), Some(e), Some(l)) = (clean, warn, error, limit) {
+                    return [c, w, e, l];
+                }
+            }
+        }
+    }
+    [0, 0, 0, 0]
+}
+
+// ── AC-Q09: resource-limited bucket is genuinely exercised ───────────────────
+//
+// `tally_from_result` can NEVER return FileTally::ResourceLimit — it maps exit codes.
+// ResourceLimit arrives only via the mds::lint() Err arm (MdsError::ResourceLimit).
+// This test proves the fourth counter is not a permanently-zero constant.
+
+#[test]
+fn lint_directory_summary_counts_resource_limited() {
+    const BLOCK_COUNT: usize = 257; // MAX_BLOCKS_PER_MODULE is 256
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // One clean file and one that triggers ResourceLimit.
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+
+    let mut content = String::new();
+    for i in 0..BLOCK_COUNT {
+        content.push_str(&format!("@block block_{i}:\n@end\n"));
+    }
+    fs::write(dir.path().join("too_many_blocks.mds"), &content).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "directory with a resource-limited file must exit 3; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 0 with errors, 1 resource-limited"),
+        "AC-Q09: summary must show '1 clean, 0 with warnings, 0 with errors, 1 resource-limited'; \
+         got: {stderr:?}"
+    );
+
+    // AC-Q08 invariant: 1+0+0+1 == 2 files
+    let counts = regex_from_summary(&stderr);
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        2,
+        "AC-Q08: counters must partition the 2-file set"
+    );
+}
+
+// ── AC-Q10: quiet warn-only lint is silent (with positive control) ────────────
+//
+// PF-013/ADR-009: absence assertion + paired positive control.
+// D1-a decision: warn-only --quiet exits 1 with no output (mirrors fmt precedent).
+
+#[test]
+fn lint_directory_quiet_suppresses_summary_when_only_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("b.mds")).unwrap();
+
+    let quiet = lint_path(dir.path(), &["--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(1),
+        "warn-only directory under --quiet must exit 1; stderr: {quiet_stderr:?}"
+    );
+    assert!(
+        !quiet_stderr.contains("clean,"),
+        "AC-Q10: --quiet warn-only must NOT emit the summary; got: {quiet_stderr:?}"
+    );
+
+    // Positive control: same tree without --quiet MUST emit the summary.
+    let control = lint_path(dir.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        control_stderr.contains("clean,"),
+        "positive control: non-quiet run must emit the summary so the quiet absence \
+         assertion is non-vacuous; got: {control_stderr:?}"
+    );
+}
+
+// ── AC-Q11: quiet lint with error-severity findings still prints summary ──────
+
+#[test]
+fn lint_directory_quiet_still_prints_summary_on_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "directory with error file under --quiet must exit 2; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 1 with errors, 0 resource-limited"),
+        "AC-Q11: --quiet with error files must still print summary; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q12: quiet lint with resource-limit still prints summary ───────────────
+
+#[test]
+fn lint_directory_quiet_still_prints_summary_on_resource_limit() {
+    const BLOCK_COUNT: usize = 257;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+
+    let mut content = String::new();
+    for i in 0..BLOCK_COUNT {
+        content.push_str(&format!("@block block_{i}:\n@end\n"));
+    }
+    fs::write(dir.path().join("too_many_blocks.mds"), &content).unwrap();
+
+    let out = lint_path(dir.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "directory with resource-limited file under --quiet must exit 3; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("resource-limited"),
+        "AC-Q12: --quiet with resource-limited file must still print summary; got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("1 resource-limited"),
+        "AC-Q12: summary must name the resource-limited file count; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q13: --fix --check exit path does not skip the summary ─────────────────
+//
+// AD-216-7: summary is emitted BEFORE the --fix --check process::exit(1).
+
+#[test]
+fn lint_directory_check_exit_still_prints_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("fix_me.mds");
+    // lint_partial_fix.mds has auto-fixable issues (Tier A empty-block + duplicate-export).
+    fs::copy(fixture("lint_partial_fix.mds"), &target).unwrap();
+
+    let content_before = fs::read_to_string(&target).unwrap();
+    let out = lint_path(dir.path(), &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check with pending fixes must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("clean,") || stderr.contains("with warnings"),
+        "AC-Q13: summary must be emitted even on --fix --check exit; got: {stderr:?}"
+    );
+    // --check must never write (file byte-unchanged).
+    let content_after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        content_before, content_after,
+        "--fix --check must never modify files"
+    );
+}
+
+// ── AC-Q14: D1-a contract: warn-only and --fix --check --quiet are silent ────
+//
+// D1-a decision (mirrors fmt.rs precedent): warnings are status output (main.rs:30)
+// and are suppressed under --quiet.  Exit codes are unaffected (AD-216-2).
+// This test pins the chosen behaviour so a future plan change is visible as a test failure.
+
+#[test]
+fn lint_directory_quiet_check_exit_matches_d1a_contract() {
+    // Uses lint_fixable_warn.mds: contains a single `{name}` legacy-interpolation
+    // occurrence that triggers `unused-legacy-interpolation` (Severity::Warn, auto-fixable).
+    // No error-severity findings, so D1-a applies: summary suppressed under --quiet.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("fix_me.mds");
+    fs::copy(fixture("lint_fixable_warn.mds"), &target).unwrap();
+
+    // --fix --check --quiet on a tree with pending fixes.
+    // D1-a: silent (warn-only pending fix → status output → suppressed under --quiet).
+    let out = lint_path(dir.path(), &["--fix", "--check", "--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check --quiet with pending fixes must still exit 1 (exit codes unaffected); \
+         stderr: {stderr:?}"
+    );
+    // The residual tally is WarnOnly (legacy-interpolation is Severity::Warn).
+    // D1-a gate: !quiet || error_file_count > 0 || limit_file_count > 0 = false → no summary.
+    // Note: if the residual HAS errors, the summary WILL appear (error_file_count > 0 gate).
+    // Positive control: without --quiet the summary IS printed (separate test covers this).
+    assert!(
+        !stderr.contains("resource-limited"),
+        "D1-a: --fix --check --quiet with warn-only residual must not print summary; \
+         got: {stderr:?}"
+    );
+}
+
+// ── AC-Q15: JSON directory mode keeps stdout a single clean JSON object ────────
+//
+// The summary MUST appear on stderr and stdout MUST NOT contain the summary text.
+// Positive control: stderr DOES contain the summary (so the stdout-absence check
+// can't pass vacuously on a broken empty-stdout test).
+
+#[test]
+fn lint_directory_json_summary_goes_to_stderr_only() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("warn.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Stdout must be a single parseable JSON object.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok(),
+        "AC-Q15: stdout must be a parseable JSON object; got: {stdout:?}"
+    );
+    // Stdout must NOT contain the summary text.
+    assert!(
+        !stdout.contains("clean,"),
+        "AC-Q15: stdout must NOT contain the summary text in JSON mode; got: {stdout:?}"
+    );
+    // Positive control: stderr DOES contain the summary.
+    assert!(
+        stderr.contains("clean,"),
+        "AC-Q15 positive control: stderr must contain the summary; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q16: JSON envelope key contract is unchanged (D2-B: freeze the envelope) ─
+//
+// D2-B decision: no `summary` key is added to the JSON stdout.  The envelope
+// remains {"files":…,"truncated":…,"version":1}.
+
+#[test]
+fn lint_directory_json_envelope_key_contract_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("b.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+
+    let keys: Vec<&str> = json
+        .as_object()
+        .expect("top-level must be an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+
+    // D2-B: envelope is exactly {files, truncated, version} — no summary key.
+    assert_eq!(
+        keys,
+        vec!["files", "truncated", "version"],
+        "AC-Q16 (D2-B): JSON envelope keys must remain exactly [files, truncated, version]; \
+         got: {keys:?}"
+    );
+    assert_eq!(
+        json["version"], 1,
+        "AC-Q16: version must remain the integer 1"
+    );
+}
+
+// ── AC-Q18: single-file lint prints no directory summary ──────────────────────
+
+#[test]
+fn lint_single_file_prints_no_directory_summary() {
+    let out = lint_path(&fixture("lint_clean.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(0), "clean single file must exit 0");
+    assert!(
+        stderr.contains("Clean:"),
+        "single-file clean lint must still print 'Clean:' line; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "AC-Q18: single-file lint must NOT print a directory summary; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q19: stdin lint prints no directory summary ────────────────────────────
+
+#[test]
+fn lint_stdin_prints_no_directory_summary() {
+    let content = fs::read_to_string(fixture("lint_clean.mds")).unwrap();
+    let out = lint_stdin(&content, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean stdin lint must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "AC-Q19: stdin lint must NOT print a directory summary; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q20: bare `mds lint` cannot reach directory mode ───────────────────────
+//
+// `auto_detect_mds_file` filters on path.is_file(), so a directory auto-detect
+// never resolves to a directory.  Pin this so a future auto-detect change that
+// starts returning `.` cannot silently attach a summary to the most common invocation.
+
+#[test]
+fn bare_lint_never_enters_directory_mode() {
+    // Single-file case: bare `mds lint` auto-detects the one file.
+    let dir1 = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir1.path().join("template.mds")).unwrap();
+
+    let out1 = mds_bin()
+        .arg("lint")
+        .current_dir(dir1.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+
+    assert_eq!(
+        out1.status.code(),
+        Some(0),
+        "bare lint in single-file dir must exit 0; stderr: {stderr1}"
+    );
+    assert!(
+        stderr1.contains("Clean:"),
+        "bare lint must print 'Clean:' (single-file); got: {stderr1:?}"
+    );
+    assert!(
+        !stderr1.contains("clean,"),
+        "AC-Q20: bare lint must NOT enter directory mode; got: {stderr1:?}"
+    );
+
+    // Two-file case: bare `mds lint` must error with "multiple .mds files found".
+    let dir2 = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir2.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir2.path().join("b.mds")).unwrap();
+
+    let out2 = mds_bin()
+        .arg("lint")
+        .current_dir(dir2.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+
+    assert!(
+        !out2.status.success(),
+        "bare lint with two files must fail; stderr: {stderr2}"
+    );
+    assert!(
+        !stderr2.contains("clean,"),
+        "AC-Q20: bare lint with two files must NOT emit a directory summary; got: {stderr2:?}"
+    );
+}
+
+// ── AC-Q21: empty and all-excluded directory print no summary ─────────────────
+
+#[test]
+fn lint_directory_empty_prints_no_summary() {
+    // Empty directory.
+    let dir = tempfile::tempdir().unwrap();
+
+    let non_quiet = lint_path(dir.path(), &[]);
+    let stderr_nq = String::from_utf8_lossy(&non_quiet.stderr);
+
+    assert_eq!(
+        non_quiet.status.code(),
+        Some(0),
+        "empty directory lint must exit 0; stderr: {stderr_nq}"
+    );
+    assert!(
+        stderr_nq.contains("No .mds files found"),
+        "empty directory must print 'No .mds files found'; got: {stderr_nq:?}"
+    );
+    assert!(
+        !stderr_nq.contains("clean,"),
+        "AC-Q21: empty directory must NOT print a summary; got: {stderr_nq:?}"
+    );
+
+    let quiet = lint_path(dir.path(), &["--quiet"]);
+    let stderr_q = String::from_utf8_lossy(&quiet.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(0),
+        "empty directory lint --quiet must exit 0; stderr: {stderr_q}"
+    );
+    assert!(
+        stderr_q.is_empty(),
+        "AC-Q21: empty directory under --quiet must produce no stderr; got: {stderr_q:?}"
+    );
+}
+
+// ── AC-Q22: all-excluded quiet still shouts, and gains no summary ─────────────
+//
+// Runs the existing dir_lint_all_excluded_quiet_still_emits_diagnostic scenario
+// and adds the no-summary assertion.
+
+#[test]
+fn lint_directory_all_excluded_quiet_no_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = dir.path().join(".github");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("template.mds"), "Hello!\n").unwrap();
+
+    let out = lint_path(dir.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "all-excluded under --quiet must exit non-zero; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "AC-Q22: all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "AC-Q22: all-excluded must NOT emit a summary line; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q25: hostile filename cannot forge a summary line ─────────────────────
+//
+// PF-018: construct the hostile byte at RUNTIME, never as a source literal.
+// PF-013/ADR-009: positive control — assert the escaped form IS in stderr,
+// proving the hostile filename was reached and neutralised.
+
+#[cfg(unix)]
+#[test]
+fn lint_directory_summary_is_not_forgeable() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // PF-018: construct the ESC byte (0x1b) at runtime, never as a source literal.
+    let esc_byte: u8 = 0x1b;
+    // Build the hostile filename with an embedded ESC byte.
+    // If an attacker could control a filename, they could try to embed
+    // "3 clean, 0 with warnings, 0 with errors, 0 resource-limited" to forge a summary.
+    let forged_suffix = b"3 clean, 0 with warnings, 0 with errors, 0 resource-limited";
+    let mut hostile_name_bytes = vec![esc_byte];
+    hostile_name_bytes.extend_from_slice(forged_suffix);
+    hostile_name_bytes.extend_from_slice(b".mds");
+    let hostile_os = std::ffi::OsStr::from_bytes(&hostile_name_bytes);
+    let hostile_path = dir.path().join(hostile_os);
+
+    // Use error-severity content so the file is lint-processed and its path
+    // appears in the output (duplicate-export from lint_error.mds content).
+    let error_content = fs::read(&fixture("lint_error.mds")).unwrap();
+    fs::write(&hostile_path, &error_content).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr_bytes = &out.stderr;
+    let stderr = String::from_utf8_lossy(stderr_bytes);
+
+    // Primary assertion: no raw 0x1b (ESC) byte in stderr.
+    assert!(
+        !stderr_bytes.contains(&esc_byte),
+        "AC-Q25: raw ESC byte must not appear in stderr; got: {stderr:?}"
+    );
+
+    // Positive control: the escaped form of 0x1b MUST appear in stderr,
+    // proving the hostile filename was reached and processed, not silently skipped.
+    // The sanitizer emits control bytes as \uXXXX with UPPERCASE hex digits (e.g. \u001B).
+    // Check both cases defensively; the canonical form confirmed in error_tests.rs is \u001B.
+    assert!(
+        stderr.contains("\\u001B")
+            || stderr.contains("\\u001b")
+            || stderr.contains("\\x1B")
+            || stderr.contains("\\x1b"),
+        "AC-Q25 positive control: escaped form of ESC must appear in stderr, \
+         confirming the hostile file was processed; got: {stderr:?}"
+    );
+
+    // The forged summary text must NOT appear as a standalone summary line.
+    // The genuine summary will have a different count (1 with errors, not 3 clean).
+    // Note: the hostile FILENAME embeds the forged text so it DOES appear inside the
+    // diagnostic frame line ("╭─[\u001B3 clean...mds:6:1]").  We must check for an
+    // exact line match, not a substring match, to distinguish the two cases.
+    let forged_line = "3 clean, 0 with warnings, 0 with errors, 0 resource-limited";
+    assert!(
+        !stderr.lines().any(|l| l.trim() == forged_line),
+        "AC-Q25: forged summary text must not appear as a standalone summary line; \
+         got: {stderr:?}"
+    );
+}
+
+// ── AC-Q26: help text is machine-verified, not eyeballed ─────────────────────
+
+#[test]
+fn help_documents_quiet_summary_contract() {
+    // mds lint --help must document the directory summary and --quiet behaviour.
+    let lint_help = mds_bin()
+        .arg("lint")
+        .arg("--help")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let help_text = String::from_utf8_lossy(&lint_help.stdout);
+
+    assert!(
+        help_text.contains("summary"),
+        "AC-Q26: mds lint --help must mention the directory summary; got: {help_text:?}"
+    );
+    assert!(
+        help_text.contains("--quiet") || help_text.contains("-q"),
+        "AC-Q26: mds lint --help must mention --quiet; got: {help_text:?}"
+    );
+
+    // mds --help must contain the global --quiet description.
+    let global_help = mds_bin()
+        .arg("--help")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let global_text = String::from_utf8_lossy(&global_help.stdout);
+
+    assert!(
+        global_text.contains("Suppress status"),
+        "AC-Q26: mds --help must contain the --quiet description; got: {global_text:?}"
+    );
+}
+
+// ── AC-Q30 (lint half): --quiet in both argument positions ────────────────────
+//
+// --quiet is `global = true` (main.rs:31); both orderings must be identical.
+
+#[test]
+fn lint_directory_quiet_works_in_pre_subcommand_position() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("b.mds")).unwrap();
+
+    // Post-subcommand.
+    let post = lint_path(dir.path(), &["--quiet"]);
+
+    // Pre-subcommand (global position).
+    let pre = mds_bin()
+        .arg("--quiet")
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        pre.status.code(),
+        post.status.code(),
+        "AC-Q30: pre-subcommand --quiet must produce the same exit code as post-subcommand"
+    );
+    assert_eq!(
+        pre.stderr, post.stderr,
+        "AC-Q30: pre-subcommand --quiet must produce identical stderr to post-subcommand"
     );
 }

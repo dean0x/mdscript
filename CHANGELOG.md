@@ -527,7 +527,23 @@ The `"file"` key in lint JSON output is sanitized on the same pass as `message`/
 **Migration:** consumers that test for exact control byte sequences in error or
 diagnostic messages must update to check for the `\uXXXX` literal form instead.
 
+### Changed
+
+- **`mds build --quiet <dir>` no longer prints its summary line on a fully-successful run (#216).**
+  Previously `mds build --quiet <dir>` printed `N built, 0 failed` even when every file
+  succeeded. CI jobs that grep for `N built` in their logs should note that this line is now
+  suppressed under `--quiet` on a clean run. When any file fails the summary is still always
+  printed, so a non-zero exit under `--quiet` is never unexplained. Exit codes are unaffected.
+
 ### Added
+
+- **`mds lint <dir>` directory-mode summary (#216).** After linting a directory, one summary
+  line is printed to stderr:
+  `N clean, N with warnings, N with errors, N resource-limited`
+  Under `--quiet`, the summary is suppressed when the worst outcome is warnings only (mirrors
+  `mds fmt`); it is always emitted when any file is in the error or resource-limited bucket.
+  The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged — no
+  `"summary"` key is added, so existing consumers of `--format json` are unaffected.
 
 - **Lint rule-name registry, exposed on every surface (#224).** The recognised rule
   names now have one source of truth, derived from each rule module's own name constant.

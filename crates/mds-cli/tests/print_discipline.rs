@@ -346,6 +346,30 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "elapsed",
         "`u128` elapsed milliseconds from `Instant::elapsed().as_millis()` — pure arithmetic.",
     ),
+    // AD-216-3/5: four counters for the `mds lint <dir>` summary line.
+    // Names are file-unique (limit 2, :106-110) — none collide with existing lint.rs entries.
+    (
+        "lint.rs",
+        "clean_count",
+        "`usize` tally of files with no lint findings in the `mds lint <dir>` summary line.",
+    ),
+    (
+        "lint.rs",
+        "warn_file_count",
+        "`usize` tally of files with warning-severity findings in the `mds lint <dir>` summary line.",
+    ),
+    (
+        "lint.rs",
+        "error_file_count",
+        "`usize` tally of files with error-severity findings or analysis failures \
+         in the `mds lint <dir>` summary line.",
+    ),
+    (
+        "lint.rs",
+        "limit_file_count",
+        "`usize` tally of files that aborted with `MdsError::ResourceLimit` \
+         in the `mds lint <dir>` summary line.",
+    ),
 ];
 
 /// Arguments to a [`SANITIZING_PRINT_HELPERS`] call that the one-hop binding trace cannot

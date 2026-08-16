@@ -1156,6 +1156,33 @@ fn tally_from_result(result: &mds::LintResult) -> FileTally {
 ///
 /// Accumulate-and-continue past per-file failures. Exit = max severity across files.
 /// Output is path-sorted (F1 — `collect_mds_files` does NOT sort).
+///
+/// **Directory summary (AD-216-3):** after processing all files, emits one summary
+/// line to stderr in the form
+/// `{clean} clean, {warn} with warnings, {error} with errors, {limit} resource-limited`.
+/// "With errors" covers both error-severity lint findings AND per-file analysis failures
+/// (read error, config error, lint call failure) — the same conflation `mds build`'s
+/// "failed" bucket makes (D3-a).  "Resource-limited" counts files where `mds::lint`
+/// returned `MdsError::ResourceLimit` — distinct from lint findings.
+///
+/// **Summary / quiet contract (AD-216-6):** the summary is suppressed under `--quiet`
+/// unless at least one file is in the `error` or `resource-limited` bucket.  Warn-only
+/// runs are silent under `--quiet` (mirrors `mds fmt`, which does not force its summary
+/// on a `changed_count`-only run).  Exit codes are unaffected (AD-216-2).
+///
+/// **D1 decision (AC-Q14):** `mds lint --quiet <dir>` on a warn-only tree exits 1 with
+/// no output.  `mds lint --fix --check --quiet <dir>` with pending fixes exits 1 with
+/// no output.  Both are intentional: warnings are status output, which `main.rs:30`
+/// says `--quiet` suppresses.
+///
+/// **D2 decision (AC-Q16):** the JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`)
+/// is unchanged — no `"summary"` key is added.  The summary is emitted to stderr only,
+/// keeping stdout a single clean JSON document in all modes.
+///
+/// **Channel discipline (AD-216-8):** the summary is emitted in BOTH human and JSON
+/// format modes — format governs where machine-readable output goes (stdout), not
+/// whether status output (stderr) appears.  JSON consumers who filter on `--quiet`
+/// continue to receive valid parseable JSON on stdout regardless of stderr content.
 fn run_lint_directory(
     dir: &Path,
     flags: LintFlags,
@@ -1230,6 +1257,15 @@ fn run_lint_directory(
 
     let mut any_would_fix = false;
 
+    // AD-216-3/5: four counters for the directory summary, one per FileTally variant.
+    // Names are file-unique (print_discipline.rs limit 2, :106-110): `clean_count`,
+    // `warn_file_count`, `error_file_count`, `limit_file_count` — none reuse an already-
+    // exempted name from another summary line in this file.
+    let mut clean_count: usize = 0;
+    let mut warn_file_count: usize = 0;
+    let mut error_file_count: usize = 0;
+    let mut limit_file_count: usize = 0;
+
     let ctx = LintDirCtx {
         lint_root: dir,
         flags,
@@ -1250,6 +1286,14 @@ fn run_lint_directory(
         } else {
             lint_one_file_human(file, &ctx, &mut any_truncated, &mut any_would_fix)
         };
+        // AD-216-5: exhaustive match — a future FileTally variant becomes a compile
+        // error here rather than being silently uncounted in the summary.
+        match tally {
+            FileTally::Clean => clean_count += 1,
+            FileTally::WarnOnly => warn_file_count += 1,
+            FileTally::Error => error_file_count += 1,
+            FileTally::ResourceLimit => limit_file_count += 1,
+        }
         if tally > max_tally {
             max_tally = tally;
         }
@@ -1267,6 +1311,24 @@ fn run_lint_directory(
             "{}\n",
             serde_json::to_string(&json).expect("canonical lint JSON is always serializable")
         ));
+    }
+
+    // AD-216-7: emit the summary AFTER the JSON envelope (so consumers always get a
+    // parseable JSON object on stdout) and BEFORE the --fix --check exit (so a
+    // --fix --check run that would exit 1 still prints the summary on the way out).
+    //
+    // AD-216-6: suppress under --quiet unless error- or resource-limited files are
+    // present.  Warn-only runs are silent under --quiet (D1-a — mirrors fmt.rs:342:
+    // `changed_count` does not force the summary under --quiet).
+    //
+    // AD-216-8: emitted in both human and JSON format modes.  --format governs the
+    // machine-readable channel (stdout); the summary is status output (stderr) and is
+    // governed only by --quiet.
+    if !quiet || error_file_count > 0 || limit_file_count > 0 {
+        eprintln!(
+            "{clean_count} clean, {warn_file_count} with warnings, \
+             {error_file_count} with errors, {limit_file_count} resource-limited"
+        );
     }
 
     // --fix --check: exit 1 if any file would have been modified (accumulate-and-continue,
@@ -1352,7 +1414,9 @@ fn lint_one_file_accumulating(
 
     if result.truncated {
         *any_truncated = true;
-        if fix {
+        // D4 (AD-216-contract): this is a status message, not an error — suppress
+        // under --quiet (main.rs:30 "Suppress status and diagnostic output").
+        if fix && !quiet {
             eprintln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
@@ -1418,11 +1482,17 @@ fn lint_one_file_accumulating(
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!(
-                    "{}: fix rejected: {}",
-                    safe_path(file),
-                    safe_inline(&reason)
-                );
+                // D4 (AD-216-contract): "fix rejected" is a status message — the safety
+                // gate fired, the original diagnostics remain unmodified.  Suppress under
+                // --quiet (main.rs:30).  The residual lint findings (and the exit code)
+                // are unaffected: this message describes the --fix attempt, not the findings.
+                if !quiet {
+                    eprintln!(
+                        "{}: fix rejected: {}",
+                        safe_path(file),
+                        safe_inline(&reason)
+                    );
+                }
                 accumulate_result_json(&original, json_files);
                 tally_from_result(&original)
             }
@@ -1459,7 +1529,10 @@ fn lint_one_file_accumulating(
                 }
             }
             PreviewOutcome::Rejected(ref reason) => {
-                eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
+                // D4 (AD-216-contract): status message — suppress under --quiet.
+                if !quiet {
+                    eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
+                }
             }
             PreviewOutcome::NothingToFix => {}
         }
@@ -1533,7 +1606,9 @@ fn lint_one_file_human(
 
     if result.truncated {
         *any_truncated = true;
-        if fix {
+        // D4 (AD-216-contract): this is a status message, not an error — suppress
+        // under --quiet (main.rs:30 "Suppress status and diagnostic output").
+        if fix && !quiet {
             eprintln!(
                 "{}: diagnostic cap ({}) reached; further findings were suppressed — \
                  re-run --fix to continue",
@@ -1588,11 +1663,16 @@ fn lint_one_file_human(
                 tally_from_result(&residual)
             }
             FixFileOutcome::Rejected { reason, original } => {
-                eprintln!(
-                    "{}: fix rejected: {}",
-                    safe_path(file),
-                    safe_inline(&reason)
-                );
+                // D4 (AD-216-contract): "fix rejected" is a status message — the safety
+                // gate fired, the original diagnostics remain unmodified.  Suppress under
+                // --quiet (main.rs:30).
+                if !quiet {
+                    eprintln!(
+                        "{}: fix rejected: {}",
+                        safe_path(file),
+                        safe_inline(&reason)
+                    );
+                }
                 render_result_human(&original, quiet, named_source);
                 tally_from_result(&original)
             }
