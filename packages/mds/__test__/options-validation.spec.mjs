@@ -488,9 +488,32 @@ describe('options-validation', () => {
     function fullOpts(methodName) {
       const keys = METHOD_KEYS[methodName] ?? [];
       const obj = {};
-      for (const k of keys) obj[k] = KEY_VALUES[k];
+      for (const k of keys) {
+        // Hard-fail if KEY_VALUES is missing an entry for this key. Without this guard,
+        // fullOpts would set obj[k] = undefined; forwardOpts would skip it (its != null
+        // check); deepStrictEqual would compare {k: undefined} against an object without
+        // the key and fail with a confusing message. This assertion surfaces the problem
+        // at KEY_VALUES lookup time with a clear diagnosis (avoids PF-013).
+        assert.ok(
+          Object.prototype.hasOwnProperty.call(KEY_VALUES, k) && KEY_VALUES[k] !== undefined,
+          `KEY_VALUES["${k}"] must be a non-null value — add it or the forwarding test for "${methodName}" passes vacuously for that key`,
+        );
+        obj[k] = KEY_VALUES[k];
+      }
       return obj;
     }
+
+    // Independent oracle: verify the lint surface against a hand-typed literal that
+    // does NOT pass through fullOpts() or derive from METHOD_KEYS/KEY_VALUES, so
+    // that a systematic corruption of KEY_VALUES (all values undefined, or fullOpts
+    // returning the wrong shape) is caught by something other than the self-referential
+    // deepStrictEqual loop below (avoids PF-013: assertion that cannot fail for the
+    // stated reason). Update this literal when METHOD_KEYS.lint or KEY_VALUES changes.
+    assert.deepStrictEqual(
+      fullOpts('lint'),
+      { basePath: '/some/base/path', vars: { k: 1 }, rules: { 'unused-variable': 'warn' } },
+      'lint independent oracle mismatch — update this literal if METHOD_KEYS.lint or KEY_VALUES changes',
+    );
 
     const cases = [
       {
@@ -543,7 +566,7 @@ describe('options-validation', () => {
 
   // ── cross-backend message equality for file basePath (AC-P3-06 / U-OV-27) ─
 
-  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical to napi (AC-P3-06, avoids PF-007)', async () => {
+  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical to napi and WASM (AC-P3-06, avoids PF-007)', async () => {
     const addon = requireNativeAddon(); // hard-fail without addon
 
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-'));
@@ -555,38 +578,72 @@ describe('options-validation', () => {
       return '';
     }
 
+    const { execFileSync } = await import('node:child_process');
+
     try {
       for (const method of ['compileFile', 'checkFile']) {
-        // The wrapper's public file methods short-circuit basePath in node.ts
-        // (getBasePathError) BEFORE assertReady() — the backend is never consulted
-        // for this input. MDS_BACKEND is read only during init(), which this guard
-        // precedes. A subprocess under MDS_BACKEND=wasm therefore produces byte-
-        // identical output to the native path: that assertion would be a tautology
-        // that compares the guard against itself and cannot fail while LEG 1 passes
-        // (avoids PF-013 on the 'backend-independence' claim). The message is
-        // structurally backend-independent by construction, not by test.
-        // LEG 1 below is the real drift guard.
+        // LEG 1 (wrapper vs napi — canonical drift guard): compare the wrapper's
+        // purpose-built rejection against the RAW napi addon's message
+        // (parse_file_opts / parse_check_file_opts in crates/mds-napi/src/lib.rs).
+        // The wrapper fires getBasePathError() in node.ts BEFORE assertReady(), so
+        // napi never receives this input. Without this leg, editing either string
+        // silently diverges the two surfaces.
         const wrapperMsg = await captureMsg(
           () => (method === 'compileFile' ? compileFile : checkFile)(file, { basePath: '.' }),
         );
-
-        // LEG 1 (the real drift guard): compare against the RAW napi addon, which
-        // owns the canonical message (parse_file_opts / parse_check_file_opts in
-        // crates/mds-napi/src/lib.rs). Nothing else in the suite pins these two
-        // together; without this leg, editing either string silently diverges the
-        // surfaces because the wrapper never calls napi for this input.
         const napiMsg = await captureMsg(
           () => (method === 'compileFile' ? addon.compileFile : addon.checkFile)(file, { basePath: '.' }),
         );
 
-        // Positive controls: each leg must have produced an error.
         assert.ok(wrapperMsg.length > 0, `wrapper ${method} must throw for basePath`);
         assert.ok(napiMsg.length > 0, `napi ${method} must throw for basePath`);
-
         assert.strictEqual(
           wrapperMsg,
           napiMsg,
           `wrapper must match napi byte-for-byte for ${method} — wrapper: "${wrapperMsg}" | napi: "${napiMsg}"`,
+        );
+
+        // LEG 2 (WASM subprocess — regression barrier per AC-P3-06 / PF-004):
+        // Run under MDS_BACKEND=wasm and assert (a) the throw still occurs and
+        // (b) the message is byte-identical to the wrapper (test-plan item 5:
+        // assert.strictEqual(nativeMsg, wasmMsg)). The guard fires in node.ts
+        // before assertReady(), so MDS_BACKEND has no effect on this input today —
+        // making the byte-equality assertion technically tautological with LEG 1.
+        // But that tautology IS the regression barrier: if the guard is ever
+        // refactored into the backend layer, a WASM-specific divergence is caught
+        // here instead of silently reaching production (avoids PF-004: alternate
+        // code path can silently bypass a guard). The throw is synchronous (before
+        // assertReady()), so init() is not needed in the subprocess.
+        const fnName = method === 'compileFile' ? 'compileFile' : 'checkFile';
+        const wasmScript = [
+          `import { ${fnName} } from './dist/node.js';`,
+          `try {`,
+          `  ${fnName}(${JSON.stringify(file)}, { basePath: '.' });`,
+          `  process.stdout.write('');`,
+          `} catch (e) {`,
+          `  process.stdout.write(e instanceof Error ? e.message : String(e));`,
+          `}`,
+        ].join('\n');
+        let wasmMsg = '';
+        try {
+          wasmMsg = execFileSync(process.execPath, ['--input-type=module'], {
+            input: wasmScript,
+            cwd: PKG_DIR,
+            env: { ...process.env, MDS_BACKEND: 'wasm' },
+            timeout: 15000,
+            encoding: 'utf8',
+          });
+        } catch (e) {
+          // execFileSync throws on non-zero exit. The subprocess catches all errors
+          // and writes to stdout before exiting 0, so this branch handles unexpected
+          // subprocess failures only — capture stdout if available.
+          wasmMsg = (typeof e === 'object' && e !== null && typeof e.stdout === 'string') ? e.stdout : '';
+        }
+        assert.ok(wasmMsg.length > 0, `WASM subprocess ${method} must throw for basePath`);
+        assert.strictEqual(
+          wrapperMsg,
+          wasmMsg,
+          `WASM path must match wrapper byte-for-byte for ${method} — wrapper: "${wrapperMsg}" | wasm: "${wasmMsg}"`,
         );
       }
     } finally {
@@ -883,6 +940,18 @@ describe('options-validation', () => {
       optsForEmpty,
       'compileOpts(undefined) and compileOpts({}) must return the same DEFAULT_COMPILE_OPTS object ' +
       '— identity fast path at wasm.ts:363-365 must fire for both inputs',
+    );
+
+    // Strengthen: the identity assertion proves A singleton is reused but not WHICH
+    // singleton. Assert the documented default shape so a fast path that reuses the
+    // wrong constant (any frozen object other than DEFAULT_COMPILE_OPTS) is still
+    // caught. AC-P3-22: 'the compile-options builder MUST return undefined (not {})
+    // when no option is set' — the shape check locks in that the singleton is the
+    // documented default, not an incidental constant (avoids PF-013).
+    assert.deepStrictEqual(
+      optsForUndefined,
+      { filename: 'input.mds', modules: {} },
+      'DEFAULT_COMPILE_OPTS must have shape { filename: "input.mds", modules: {} }',
     );
   });
 });
