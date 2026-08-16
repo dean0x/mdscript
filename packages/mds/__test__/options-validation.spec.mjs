@@ -819,12 +819,12 @@ describe('options-validation', () => {
   // Test-plan item 17: "a unit assertion that the compile-options builder returns
   // undefined (strictly, not {}) … assert compileOpts(undefined) === compileOpts({})
   // by object identity". The WASM backend's compileOpts() fast path at wasm.ts:363-365
-  // fires only when fileCompileOpt (called internally by compileOpts) returns undefined.
-  // If compileSrcOpt or fileCompileOpt returned {} for empty input, every compile call
-  // would allocate a new object rather than reusing DEFAULT_COMPILE_OPTS — the
-  // regression would be invisible to U-PF1/U-PF2 (too much headroom) and no other
-  // test pins this invariant (avoids PF-013: absence of an allocation test cannot
-  // detect a silent allocation regression).
+  // fires only when forwardOpts (called internally by compileOpts) returns undefined.
+  // If forwardOpts returned {} for empty input, every compile call would allocate a
+  // new object rather than reusing DEFAULT_COMPILE_OPTS — the regression would be
+  // invisible to U-PF1/U-PF2 (too much headroom) and no other test pins this
+  // invariant (avoids PF-013: absence of an allocation test cannot detect a silent
+  // allocation regression).
 
   test('U-OV-34: forwardOpts returns undefined for empty compile input, and the WASM backend reuses DEFAULT_COMPILE_OPTS by identity (AC-P3-22)', async () => {
     // Part 1: forwardOpts returns undefined (strictly) for empty input — {} would
