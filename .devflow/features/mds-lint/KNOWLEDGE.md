@@ -582,3 +582,25 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/tests/api_surface.rs` — pins the public lint API signatures.
 - `.devflow/features/mds-fmt/KNOWLEDGE.md` — `mds fmt` knowledge base; `atomic_write_file` is shared between both subcommands via `output.rs`.
 - `.devflow/features/source-map-security/KNOWLEDGE.md` — source map path-containment choke-point.
+
+## v0.5.0 Removal Tracker: apply_fixes
+
+`mds::fix::apply_fixes` is deprecated as of v0.4.0 and scheduled for removal at v0.5.0.
+Before the v0.5.0 tag, the following six ADR-004 reverify-gate behaviors must either
+gain equivalent coverage on the `apply_fixes_incremental` path or be carried in a
+GitHub removal-tracker issue (to be opened before the v0.5.0 branch cuts).
+This list is kept here — in a tracked, persistent file — so it survives the function's
+own deletion.
+
+| Test name | Line (v0.4.0 HEAD) | Behavior pinned |
+|---|---|---|
+| `a4_partial_overlap_still_rejected_after_dedup` | fix.rs:1446 | A4: overlapping edits refused after dedup |
+| `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` | fix.rs:1743 | A5: rejection message stability |
+| `reverify_preexisting_untargeted_survives_and_fix_applies` | fix.rs:1943 | AC-F-23: pre-existing untargeted diagnostic survives |
+| `reverify_new_untargeted_diagnostic_is_rejected` | fix.rs:1968 | reverify gate rejects new untargeted diagnostics |
+| `tier_b_unused_function_standalone_apply_succeeds` | fix.rs:2039 | I-13: Tier B fix applies on standalone file |
+| `l_fix_rev1_output_delta_causes_rejection` | fix.rs:2110 | L-FIX-REV1: output delta causes rejection |
+
+When a removal-tracker issue is opened, update `crates/mds-core/src/lint/fix.rs` (the
+`apply_fixes` doc block) and `CHANGELOG.md` to reference the issue number, then remove
+this table once the six behaviors are covered by `apply_fixes_incremental` tests.

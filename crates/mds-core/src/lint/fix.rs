@@ -697,15 +697,11 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 /// published to crates.io. However, deleting it would silently drop coverage
 /// of six ADR-004 reverify-gate behaviors that are pinned only through this
 /// function, with no equivalent on the `apply_fixes_incremental` path. These
-/// tests must be ported or explicitly tracked before removal at v0.5.0
-/// (see issue #209):
-///
-/// - `a4_partial_overlap_still_rejected_after_dedup` (fix.rs:1446) -- A4
-/// - `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix` (fix.rs:1743) -- A5
-/// - `reverify_preexisting_untargeted_survives_and_fix_applies` (fix.rs:1943) -- AC-F-23
-/// - `reverify_new_untargeted_diagnostic_is_rejected` (fix.rs:1968)
-/// - `tier_b_unused_function_standalone_apply_succeeds` (fix.rs:2039) -- I-13
-/// - `l_fix_rev1_output_delta_causes_rejection` (fix.rs:2110) -- L-FIX-REV1
+/// tests must be ported or explicitly tracked before removal at v0.5.0.
+/// The canonical list is kept in `.devflow/features/mds-lint/KNOWLEDGE.md`
+/// under "v0.5.0 Removal Tracker: apply_fixes" so it survives this function's
+/// deletion. A GitHub removal-tracker issue must be opened and cross-linked
+/// before the v0.5.0 tag.
 ///
 /// # Behavior
 ///
@@ -736,6 +732,7 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 #[deprecated(
+    since = "0.4.0",
     note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must be `Fn`, not `FnOnce`. Removed in v0.5.0; see the item docs."
 )]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome

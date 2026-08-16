@@ -1155,7 +1155,9 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
     swallows `PartiallyFixed` silently discards partial results.
 
   Scheduled for removal in v0.5.0. The six ADR-004 regression tests that are pinned only
-  against `apply_fixes` must be ported or explicitly tracked before removal (issue #209).
+  against `apply_fixes` must be ported or tracked in a GitHub removal-tracker issue before
+  the v0.5.0 tag; the canonical list is in `.devflow/features/mds-lint/KNOWLEDGE.md`
+  under "v0.5.0 Removal Tracker: apply_fixes".
 
 ### Fixed
 
