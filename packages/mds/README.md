@@ -119,7 +119,9 @@ file-path methods derive the base directory from the file argument.
 
 ```ts
 // CheckOptions — accepted by check() (string source)
-// basePath: required when the source contains @import or @extends.
+// basePath: defaults to process cwd when omitted. Caution: omitting it resolves
+// imports against cwd, which may be the wrong directory. Provide an explicit
+// path when the source contains @import or @extends.
 // WASM backend: basePath throws mds::invalid_options (no filesystem access);
 // set MDS_BACKEND=native to use the native backend with import resolution.
 // {basePath: undefined} is treated as absent on both backends.
@@ -157,7 +159,9 @@ interface CheckFileOptions {
 }
 
 // LintOptions — accepted by lint() (string-source)
-// basePath: required when the source contains @import or @extends.
+// basePath: defaults to process cwd when omitted. Caution: omitting it resolves
+// imports against cwd, which may be the wrong directory. Provide an explicit
+// path when the source contains @import or @extends.
 // WASM backend: basePath throws mds::invalid_options — rejects instead of
 // silently ignoring so misconfigured callers see an actionable error.
 // Set MDS_BACKEND=native to use the native backend, or use lintVirtual with
@@ -204,5 +208,6 @@ surfaces it appears in `lint_warnings`.
 **Lint result shape:**
 ```ts
 { version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean, lint_warnings?: string[] }
-// LintDiagnostic: { rule, severity, message, help?, fixable, fix_edits, span? }
+// LintDiagnostic: { rule, severity, message, help?: string | null, fixable, fix_edits?: ... | null, span?: LintSpan | null }
+// help, span, and fix_edits are always-present keys in the JSON wire format; their value is null when absent.
 ```

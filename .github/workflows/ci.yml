@@ -138,14 +138,12 @@ jobs:
             #   ticket/wasm-size-optimization (2026-08-16): wasm-opt flag tuning
             #   (-Oz --flatten --rereloop -Oz --converge --strip-producers) plus
             #   sort_unstable at four tie-free sites (value.rs, evaluator.rs,
-            #   builtins.rs x2). PR2 baseline 844,172, post-change 841,937
-            #   (wasm-pack 0.15.0 bundled wasm-opt v117, nodejs target, measured
-            #   locally at HEAD 13cb2a5 before commit). Net local savings: -2,235 bytes.
-            #   NOTE: local uses bundled wasm-opt v117, CI uses Binaryen v129 -- the
-            #   analysis predicted -7,527 bytes (flags) + ~4-6 KB (sort) with v129;
-            #   local savings with v117 are smaller. CI number is authoritative.
-            #   Guard NOT raised: >=5,828 bytes (>=0.69%) headroom on local toolchain;
-            #   CI Binaryen v129 is expected to show a larger reduction.
+            #   builtins.rs x2). PR2 baseline 844,172. CI-measured post-change:
+            #   836,126 bytes (Binaryen v129, CI run 31946611856). Local wasm-opt
+            #   v117 (bundled by wasm-pack) reads roughly 2-3 KB higher (841,937
+            #   was the local pre-commit estimate; CI number is authoritative).
+            #   Net CI savings vs PR2 baseline: -8,046 bytes.
+            #   Guard NOT raised: 13,874 bytes (1.63%) headroom.
             #   Toolchain now pinned to 1.96.0 in the wasm job (see companion commit).
             if [ "$raw" -gt 850000 ]; then
               echo "::error::WASM binary exceeds 850,000 byte threshold: ${label} is ${raw} bytes"
