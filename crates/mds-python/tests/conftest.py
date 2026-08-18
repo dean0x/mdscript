@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for the mdscript binding suite."""
+"""Shared pytest fixtures for the markdown_script binding suite."""
 
 from __future__ import annotations
 

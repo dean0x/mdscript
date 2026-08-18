@@ -1,4 +1,4 @@
-"""mdscript — composable LLM prompt template compiler (native Python bindings).
+"""markdown_script — composable LLM prompt template compiler (native Python bindings).
 
 Compile ``.mds`` templates to Markdown or structured chat messages in-process, via
 the same Rust core that powers the MDS CLI and Node.js/WASM bindings. Output is
@@ -6,8 +6,8 @@ byte-identical across all bindings.
 
 Example
 -------
->>> import mdscript
->>> r = mdscript.compile("Hello {{name}}!", vars={"name": "Alice"})
+>>> import markdown_script
+>>> r = markdown_script.compile("Hello {{name}}!", vars={"name": "Alice"})
 >>> r.kind, r.output
 ('markdown', 'Hello Alice!')
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from importlib import metadata as _metadata
 
-from ._mdscript import (
+from ._markdown_script import (
     CheckResult,
     CompileResult,
     LintDiagnostic,
@@ -41,13 +41,13 @@ from ._mdscript import (
     scan_imports,
 )
 
-# The native exception is registered under the extension submodule `_mdscript`.
-# Retag it (and it alone — the result classes already declare `module = "mdscript"`)
-# to the public package so `pickle`, `repr`, and tracebacks resolve `mdscript.MdsError`.
-MdsError.__module__ = "mdscript"
+# The native exception is registered under the extension submodule `_markdown_script`.
+# Retag it (and it alone — the result classes already declare `module = "markdown_script"`)
+# to the public package so `pickle`, `repr`, and tracebacks resolve `markdown_script.MdsError`.
+MdsError.__module__ = "markdown_script"
 
 try:
-    __version__ = _metadata.version("mdscript")
+    __version__ = _metadata.version("markdown-script")
 except _metadata.PackageNotFoundError:  # pragma: no cover - source tree without an install
     __version__ = "0.0.0"
 

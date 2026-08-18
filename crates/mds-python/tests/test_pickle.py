@@ -6,7 +6,7 @@ import pickle
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 RESULTS = [
     m.compile("Hello {{n}}!\n", vars={"n": "A"}),
@@ -87,7 +87,7 @@ def test_pk2_mdserror_round_trip_without_span() -> None:
 
 def _mp_worker(source: str) -> object:
     """Compile in a child process and return the (picklable) result."""
-    import mdscript as _m
+    import markdown_script as _m
 
     return _m.compile(source, vars={"name": "MP"})
 

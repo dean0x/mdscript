@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Runnable tour of the ``mdscript`` Python bindings (PyO3).
+"""Runnable tour of the ``markdown_script`` Python bindings (PyO3).
 
 Demonstrates four things a real user needs:
 
 1. Compiling a template to Markdown.
 2. Generating a Source Map v3 with ``source_map=True`` and reading it back.
-3. Handling compile errors via ``mdscript.MdsError`` (``.code`` / ``.help`` / ``.span``).
+3. Handling compile errors via ``markdown_script.MdsError`` (``.code`` / ``.help`` / ``.span``).
 4. Linting a template and inspecting the structured findings.
 
 Run it against the repo's virtualenv (see the README):
@@ -17,7 +17,7 @@ Run it against the repo's virtualenv (see the README):
 import json
 import os
 
-import mdscript
+import markdown_script
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Reuse the two-source example from examples/source-maps/ for the file demo.
@@ -30,7 +30,7 @@ def rule(title: str) -> None:
 
 # ── 1. Compile a string to Markdown ─────────────────────────────────────────
 rule("compile a string")
-result = mdscript.compile(
+result = markdown_script.compile(
     "# Hi {{name}}\n\n@for item in items:\n- {{item}}\n@end\n",
     vars={"name": "World", "items": ["alpha", "beta"]},
 )
@@ -40,7 +40,7 @@ print("output:\n" + result.output)
 
 # ── 2. Compile with a Source Map v3 ─────────────────────────────────────────
 rule("compile a string with source_map=True")
-mapped = mdscript.compile(
+mapped = markdown_script.compile(
     "# Hi {{name}}\n\n@for item in items:\n- {{item}}\n@end\n",
     vars={"name": "World", "items": ["alpha", "beta"]},
     source_map=True,
@@ -55,7 +55,7 @@ print("mappings:", sm["mappings"])
 # When not requested, the attribute is None.
 # to_dict() always includes "sourceMap": None (Python-idiomatic always-present);
 # to_json() omits the key (canonical wire format shared with other surfaces).
-plain = mdscript.compile("# no map\n")
+plain = markdown_script.compile("# no map\n")
 print("without source_map -> .source_map is None:", plain.source_map is None)
 d = plain.to_dict()
 print("to_dict has 'sourceMap' key:", "sourceMap" in d)
@@ -64,7 +64,7 @@ print("to_dict['sourceMap'] is None:", d["sourceMap"] is None)
 # File compile resolves @import chains; sources become project-root-relative
 # (or basenames when no .git/.mdsroot marker is found above the file).
 rule("compile_file with an @import + embedded sources")
-filemap = mdscript.compile_file(ANNOTATED, source_map=True, sources_content=True)
+filemap = markdown_script.compile_file(ANNOTATED, source_map=True, sources_content=True)
 fsm = filemap.source_map
 print("sources:", fsm["sources"])  # entry template + imported _style.mds
 print("sourcesContent lengths:", [len(c) for c in fsm["sourcesContent"]])
@@ -73,16 +73,16 @@ print("dependencies:", [os.path.basename(d) for d in filemap.dependencies])
 # Requesting sources_content without source_map is rejected.
 rule("sources_content without source_map is an error")
 try:
-    mdscript.compile("x\n", sources_content=True)
-except mdscript.MdsError as exc:
+    markdown_script.compile("x\n", sources_content=True)
+except markdown_script.MdsError as exc:
     print("raised MdsError, code:", exc.code)
 
 
 # ── 3. Error handling via MdsError ──────────────────────────────────────────
 rule("error handling")
 try:
-    mdscript.compile("Hello {{missing}}!\n")
-except mdscript.MdsError as exc:
+    markdown_script.compile("Hello {{missing}}!\n")
+except markdown_script.MdsError as exc:
     print("code:", exc.code)
     print("help:", exc.help)
     span = exc.span
@@ -93,7 +93,7 @@ except mdscript.MdsError as exc:
 
 # ── 4. Lint a template ──────────────────────────────────────────────────────
 rule("lint")
-lint_result = mdscript.lint("---\nunused: 1\nused: hi\n---\n{{used}}\n")
+lint_result = markdown_script.lint("---\nunused: 1\nused: hi\n---\n{{used}}\n")
 print("lint schema version:", lint_result.version, "truncated:", lint_result.truncated)
 # LintResult.files returns a list of LintFileReport objects (B6/F10 typed access).
 for report in lint_result.files:

@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 from conftest import FIXTURES
 
 # Base64 alphabet used by VLQ mappings (excludes <, >, - per security constraint).

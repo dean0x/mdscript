@@ -14,7 +14,7 @@ import time
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 pytestmark = pytest.mark.perf
 

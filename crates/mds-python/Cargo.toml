@@ -26,10 +26,10 @@ debug-panics = []
 
 [lib]
 crate-type = ["cdylib"]
-# The compiled module is imported as `mdscript._mdscript`; the Rust symbol is
-# `PyInit__mdscript`, so the lib name must be `_mdscript` and match the
-# `#[pymodule] fn _mdscript` in src/lib.rs.
-name = "_mdscript"
+# The compiled module is imported as `markdown_script._markdown_script`; the Rust symbol is
+# `PyInit__markdown_script`, so the lib name must be `_markdown_script` and match the
+# `#[pymodule] fn _markdown_script` in src/lib.rs.
+name = "_markdown_script"
 # No Rust unit tests and no doctests: `abi3-py311` is always on and this is a
 # cdylib, so `cargo build/clippy/test --workspace` compile the extension without
 # linking libpython. All coverage is the pytest suite. `test = false`

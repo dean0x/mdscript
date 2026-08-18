@@ -6,7 +6,7 @@ requires = ["maturin>=1.13.3,<1.14"]
 build-backend = "maturin"
 
 [project]
-name = "mdscript"
+name = "markdown-script"
 description = "Composable LLM prompt template compiler — native Python bindings for MDS (Markdown Script)"
 requires-python = ">=3.11"
 # PEP 639: an SPDX license expression as a plain string (NOT a `{ text = ... }`
@@ -47,10 +47,10 @@ markers = [
 ]
 
 [tool.maturin]
-# Mixed Rust/Python layout: the pure-Python package lives under python/mdscript/ and
-# the compiled extension is injected as the submodule `mdscript._mdscript`.
+# Mixed Rust/Python layout: the pure-Python package lives under python/markdown_script/
+# and the compiled extension is injected as the submodule `markdown_script._markdown_script`.
 python-source = "python"
-module-name = "mdscript._mdscript"
+module-name = "markdown_script._markdown_script"
 # abi3-py311: emit a single `cp311-abi3` wheel usable on CPython 3.11+. Redundant with
 # the always-on workspace pyo3 feature, but stated explicitly for clarity.
 features = ["pyo3/abi3-py311"]

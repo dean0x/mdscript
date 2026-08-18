@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public `mds-core` API: `format_str` / `format_str_with`. (#60)
 
 - **Native Python bindings** (`crates/mds-python`, PyO3 + maturin), to be distributed
-  as `mdscript` on PyPI. Seven functions — `compile`, `compile_file`,
+  as `markdown-script` on PyPI (importable as `markdown_script`). Seven functions — `compile`, `compile_file`,
   `compile_virtual`, `check`, `check_file`, `check_virtual`, and `scan_imports` —
   with idiomatic keyword-only signatures. Results are typed, frozen, and picklable
   (`CompileResult` / `Message` / `Span` / `CheckResult`), and failures raise a native
@@ -158,9 +158,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and WASM backends implement the full surface; `lintFile()` on the WASM backend
   uses `buildModulesMap` for `@import` resolution.
 
-  **Python** (`mdscript`): `lint()`, `lint_file()`, `lint_virtual()` with keyword-only
+  **Python** (`markdown_script`): `lint()`, `lint_file()`, `lint_virtual()` with keyword-only
   `rules` and `base_path` / `vars` options; `LintResult` with `.version`, `.truncated`,
-  `.files`, `.to_dict()`, `.to_json()`. Stubs shipped in `_mdscript.pyi` / `__init__.pyi`.
+  `.files`, `.to_dict()`, `.to_json()`. Stubs shipped in `_markdown_script.pyi` / `__init__.pyi`.
 
   **⚠ TypeScript interface implementers**: `MdsBaseBackend` gained `lint` and
   `lintVirtual` as required members; `MdsNodeBackend` gained `lintFile`. Code that
@@ -186,7 +186,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **WASM** (`@mdscript/mds-wasm`): same `sourceMap`/`sourcesContent` options on `compile()`.
 
-  **Python** (`mdscript`): `compile()`, `compile_file()`, and `compile_virtual()` accept
+  **Python** (`markdown_script`): `compile()`, `compile_file()`, and `compile_virtual()` accept
   `source_map=True` and `sources_content=True` keyword arguments. Results expose a
   `.source_map` property (`dict | None`).
 
@@ -527,6 +527,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wasm-opt flags were tuned (`-Oz --flatten --rereloop -Oz --converge --strip-producers`) and
   four tie-free sort sites switched to `sort_unstable`. CI-measured size: 836,126 bytes
   (Binaryen v129) against the 850,000-byte guard.
+
+- **Python distribution renamed: `mdscript` → `markdown-script`; import as `markdown_script` (#292, ADR-012).**
+  The PyPI name `mdscript` is held by a genuine dormant 2021 project with a direct
+  topical collision (`top_level.txt` is exactly `mdscript`), and there is no PEP 541
+  route for reclaiming it. Both the distribution name and the importable module name
+  must change together because they were identical before (`mdscript`/`mdscript`). The
+  private extension module is renamed from `_mdscript` to `_markdown_script` for
+  consistency with the new public package name.
+
+  This rename is pre-publication: `publish = false` in `crates/mds-python/Cargo.toml`
+  and there is no PyPI publish step in `release.yml`, so there are zero existing PyPI
+  consumers. No deprecation shim or compat alias is provided.
+
+  Migration: `pip install markdown-script` (hyphen), then `import markdown_script` (underscore).
 
 ### Deprecated
 

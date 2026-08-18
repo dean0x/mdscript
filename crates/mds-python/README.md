@@ -1,4 +1,4 @@
-# mdscript
+# markdown-script
 
 Native **Python bindings** for [MDS (Markdown Script)](https://github.com/dean0x/mdscript) —
 a composable LLM prompt-template compiler. Compile `.mds` templates to Markdown or
@@ -6,10 +6,10 @@ structured chat messages in-process, backed by the same Rust core as the MDS CLI
 the Node.js / WASM bindings. Output is byte-identical across every binding.
 
 ```bash
-pip install mdscript
+pip install markdown-script
 ```
 
-> **Not yet on PyPI** — publishing and the `mdscript` name registration are tracked in
+> **Not yet on PyPI** — publishing and the `markdown-script` name registration are tracked in
 > [#132]. For now, build from source: `pip install ./crates/mds-python` (or `maturin
 > build -m crates/mds-python/Cargo.toml` to produce a wheel), with a Rust toolchain and
 > `python3` on `PATH`. Once published, wheels ship as `cp311-abi3` (CPython 3.11+, one
@@ -20,24 +20,24 @@ pip install mdscript
 ## Quick start
 
 ```python
-import mdscript
+import markdown_script
 
 # Markdown template
-r = mdscript.compile("Hello {{name}}!", vars={"name": "Alice"})
+r = markdown_script.compile("Hello {{name}}!", vars={"name": "Alice"})
 assert r.kind == "markdown"
 assert r.output == "Hello Alice!"
 
 # @message template → structured messages
-r = mdscript.compile("@message user:\nHi\n@end\n")
+r = markdown_script.compile("@message user:\nHi\n@end\n")
 assert r.kind == "messages"
 assert r.messages[0].role == "user"
 assert r.output is None            # inactive payload is None
 
 # Validate without rendering
-mdscript.check("Hello {{name}}!", vars={"name": "Bob"})
+markdown_script.check("Hello {{name}}!", vars={"name": "Bob"})
 
 # Compile a file (dependencies come back as absolute paths)
-r = mdscript.compile_file("prompts/agent.mds")
+r = markdown_script.compile_file("prompts/agent.mds")
 print(r.dependencies)
 ```
 
@@ -93,12 +93,12 @@ Results are frozen, comparable by value, intentionally unhashable, and picklable
 
 ### Errors
 
-Every failure raises `mdscript.MdsError` (a subclass of `Exception`):
+Every failure raises `markdown_script.MdsError` (a subclass of `Exception`):
 
 ```python
 try:
-    mdscript.compile("Hello {{undefined}}!")
-except mdscript.MdsError as e:
+    markdown_script.compile("Hello {{undefined}}!")
+except markdown_script.MdsError as e:
     print(e.code)          # "mds::undefined_var"
     print(str(e))          # == e.message
     print(e.help)          # hint, or None
@@ -109,7 +109,7 @@ except mdscript.MdsError as e:
 ## Concurrency
 
 Compilation is synchronous, stateless CPU work and **releases the GIL**, so calls
-parallelise across threads. For `asyncio`, offload with `asyncio.to_thread(mdscript.compile, src)`.
+parallelise across threads. For `asyncio`, offload with `asyncio.to_thread(markdown_script.compile, src)`.
 The extension is also free-threading (`cp314t`) ready — result classes are frozen and
 the module declares `gil_used = false` — though a free-threaded wheel is not yet shipped.
 

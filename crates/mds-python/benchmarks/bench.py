@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""On-demand throughput + GIL-scaling benchmark for mdscript (stdlib only).
+"""On-demand throughput + GIL-scaling benchmark for markdown_script (stdlib only).
 
 Not part of the gated test suite. Run directly:
 
@@ -16,7 +16,7 @@ import statistics
 import threading
 import time
 
-import mdscript
+import markdown_script
 
 REPRESENTATIVE = "---\nname: Alice\n---\n@for i in items:\n- {{name}}: item {{i}}\n@end\n"
 ITEMS = list(range(200))
@@ -24,11 +24,11 @@ VARS = {"items": ITEMS}
 
 
 def bench_latency(iterations: int = 2000) -> None:
-    mdscript.compile(REPRESENTATIVE, vars=VARS)  # warm up
+    markdown_script.compile(REPRESENTATIVE, vars=VARS)  # warm up
     samples = []
     for _ in range(iterations):
         t0 = time.perf_counter()
-        mdscript.compile(REPRESENTATIVE, vars=VARS)
+        markdown_script.compile(REPRESENTATIVE, vars=VARS)
         samples.append(time.perf_counter() - t0)
     samples.sort()
     p50 = statistics.median(samples) * 1e6
@@ -40,7 +40,7 @@ def bench_latency(iterations: int = 2000) -> None:
 def bench_gil_scaling(total: int = 4000) -> None:
     def run_n(n: int) -> None:
         for _ in range(n):
-            mdscript.compile(REPRESENTATIVE, vars=VARS)
+            markdown_script.compile(REPRESENTATIVE, vars=VARS)
 
     t0 = time.perf_counter()
     run_n(total)
@@ -68,7 +68,7 @@ def bench_gil_scaling(total: int = 4000) -> None:
 
 
 def main() -> None:
-    print(f"mdscript {mdscript.__version__}\n")
+    print(f"markdown-script {markdown_script.__version__}\n")
     bench_latency()
     bench_gil_scaling()
 

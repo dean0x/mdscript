@@ -1,7 +1,7 @@
 //! Native Python bindings for the MDS compiler via PyO3.
 //!
 //! Exposes ten functions to Python as the native extension module
-//! `mdscript._mdscript` (re-exported by the pure-Python `mdscript` package):
+//! `markdown_script._markdown_script` (re-exported by the pure-Python `markdown_script` package):
 //! [`compile`], [`compile_file`], [`compile_virtual`], [`check`], [`check_file`],
 //! [`check_virtual`], [`scan_imports`], [`lint`], [`lint_file`], and
 //! [`lint_virtual`].
@@ -29,7 +29,7 @@
 //!
 //! ## Error codes
 //!
-//! Every failure raises [`MdsError`] (a native, catchable `mdscript.MdsError`) with a
+//! Every failure raises [`MdsError`] (a native, catchable `markdown_script.MdsError`) with a
 //! `.code`. Codes originating in `mds-core` (e.g. `"mds::syntax"`) are defined by
 //! [`mds::MdsError`]. Three codes are **binding-only** — synthesised here:
 //!
@@ -80,7 +80,7 @@ const MAX_MODULES_AGGREGATE_SIZE: usize = MAX_SOURCE_SIZE;
 // ── Native exception ───────────────────────────────────────────────────────────
 
 create_exception!(
-    _mdscript,
+    _markdown_script,
     MdsError,
     PyException,
     "Raised for every MDS compilation failure.\n\n\
@@ -95,7 +95,7 @@ create_exception!(
 /// `offset`/`length` are byte offsets into the source; `line` is 1-indexed and
 /// `column` is the 1-indexed character (Unicode scalar) position, or `None` when
 /// the core could not resolve them. All values are Python `int`s — no truncation.
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct Span {
     #[pyo3(get)]
@@ -168,7 +168,7 @@ impl Span {
 }
 
 /// A single chat message produced by a `@message`-bearing template.
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct Message {
     #[pyo3(get)]
@@ -214,7 +214,7 @@ impl Message {
 }
 
 /// The result of [`check`], [`check_file`], or [`check_virtual`].
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct CheckResult {
     #[pyo3(get)]
@@ -259,7 +259,7 @@ impl CheckResult {
 /// Retains the canonical `to_canonical_json()` value as its single backing store;
 /// every typed getter and `to_dict()`/`to_json()` reads from it, so they can never
 /// diverge. `__eq__` is wire equality; the object is intentionally unhashable.
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq)]
 pub struct CompileResult {
     /// The canonical discriminated-union value — the single source of truth.
@@ -419,7 +419,7 @@ impl CompileResult {
 /// the rule emits no hint, produces no source span, or carries no fix edits
 /// respectively.  In the JSON wire format all three are JSON `null` (not
 /// absent keys) when `None`.
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct LintDiagnostic {
     #[pyo3(get)]
@@ -639,7 +639,7 @@ type LintFileReportReduce<'py> = (Bound<'py, PyType>, (String, Vec<Py<LintDiagno
 ///
 /// Contains the file path (`file`) and a typed list of findings (`diagnostics`).
 /// Each diagnostic is a [`LintDiagnostic`] instance with fully-typed attributes.
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq, Eq)]
 pub struct LintFileReport {
     #[pyo3(get)]
@@ -716,7 +716,7 @@ impl LintFileReport {
 /// Stores the canonical `to_canonical_json()` value as its single backing store;
 /// typed getters and `to_dict()`/`to_json()` read from it so they can never diverge.
 /// `__eq__` is wire equality. Byte-identical to the WASM and Node.js lint surfaces.
-#[pyclass(frozen, eq, skip_from_py_object, module = "mdscript")]
+#[pyclass(frozen, eq, skip_from_py_object, module = "markdown_script")]
 #[derive(Clone, PartialEq)]
 pub struct LintResult {
     /// Single authoritative source of truth — the canonical lint JSON.
@@ -1624,13 +1624,13 @@ fn lint_virtual(
 
 // ── Module ──────────────────────────────────────────────────────────────────────
 
-/// The native extension module — registered as `mdscript._mdscript`.
+/// The native extension module — registered as `markdown_script._markdown_script`.
 ///
 /// `gil_used = false` marks the module free-threading ready: the result classes are
 /// frozen, there is no mutable global state, and the GIL is released around every
 /// core call.
 #[pymodule(gil_used = false)]
-fn _mdscript(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _markdown_script(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("MdsError", m.py().get_type::<MdsError>())?;
     m.add_class::<Span>()?;
     m.add_class::<Message>()?;
