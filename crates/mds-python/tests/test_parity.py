@@ -15,7 +15,7 @@ import subprocess
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 from conftest import cli_build
 
 # (id, source, vars, expected canonical dict) — import-free so `dependencies == []`.

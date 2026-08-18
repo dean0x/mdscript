@@ -1,4 +1,4 @@
-"""Type stubs for the native ``mdscript._mdscript`` extension module.
+"""Type stubs for the native ``markdown_script._markdown_script`` extension module.
 
 The runtime objects are implemented in Rust (PyO3). These stubs describe the public
 surface for ``mypy``/``pyright``. Result classes are frozen — their attributes are

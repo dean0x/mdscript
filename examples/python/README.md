@@ -1,6 +1,6 @@
 # Python bindings
 
-`mdscript` is the native Python binding for the MDS compiler (built with PyO3).
+`markdown_script` is the native Python binding for the MDS compiler (built with PyO3).
 It exposes the same compiler as the CLI and the JavaScript packages, including
 **Source Map v3** generation.
 
@@ -16,7 +16,7 @@ pip install "maturin==1.13.3" pytest
 maturin develop -m crates/mds-python/Cargo.toml
 ```
 
-Once the venv is active, `import mdscript` works.
+Once the venv is active, `import markdown_script` works.
 
 ## Run the demo
 
@@ -30,17 +30,17 @@ python examples/python/demo.py
 1. **Compile a string** to Markdown with runtime `vars`.
 2. **Generate a source map** with `source_map=True` and read it back — plus
    `compile_file(..., sources_content=True)` to embed the original template text.
-3. **Handle errors** — a failed compile raises `mdscript.MdsError`, which carries
+3. **Handle errors** — a failed compile raises `markdown_script.MdsError`, which carries
    `.code`, `.help`, and a `.span` (`offset` / `length` / `line` / `column`).
 4. **Lint** a template and inspect the structured findings.
 
 ## API quick reference
 
 ```python
-import mdscript
+import markdown_script
 
 # Compile a source string. Keyword-only options.
-r = mdscript.compile(
+r = markdown_script.compile(
     source,
     vars=None,            # dict of runtime variables
     base_path=None,       # directory for resolving @import in a string source
@@ -58,14 +58,14 @@ r.to_dict()     # plain dict; always includes "sourceMap": None when not request
 r.to_json()     # JSON string; omits "sourceMap" key when absent (canonical wire format)
 
 # Compile a file, resolving @import relative to it.
-mdscript.compile_file(path, vars=None, source_map=False, sources_content=False)
+markdown_script.compile_file(path, vars=None, source_map=False, sources_content=False)
 
 # Validate without rendering. Passing source_map or sources_content raises
 # MdsError(code="mds::invalid_options") — source maps are a compile-only concept.
-mdscript.check(source, vars=None, base_path=None)
+markdown_script.check(source, vars=None, base_path=None)
 
 # Lint. LintResult.files returns typed LintFileReport objects (B6/F10).
-lr = mdscript.lint(source, vars=None, base_path=None, rules=None)
+lr = markdown_script.lint(source, vars=None, base_path=None, rules=None)
 lr.version, lr.truncated
 for report in lr.files:          # list[LintFileReport]
     report.file                  # str — file key

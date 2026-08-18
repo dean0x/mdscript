@@ -10,8 +10,8 @@ from __future__ import annotations
 import pathlib
 from typing import Any
 
-import mdscript
-from mdscript import (
+import markdown_script
+from markdown_script import (
     CheckResult,
     CompileResult,
     LintDiagnostic,
@@ -24,14 +24,14 @@ from mdscript import (
 
 
 def render_markdown() -> str:
-    result: CompileResult = mdscript.compile("Hello {{name}}!", vars={"name": "Alice"})
+    result: CompileResult = markdown_script.compile("Hello {{name}}!", vars={"name": "Alice"})
     if result.output is not None:  # narrow str | None -> str
         return result.output
     return ""
 
 
 def collect_roles() -> list[str]:
-    result = mdscript.compile("@message user:\nHi\n@end\n")
+    result = markdown_script.compile("@message user:\nHi\n@end\n")
     roles: list[str] = []
     if result.messages is not None:
         for message in result.messages:
@@ -41,26 +41,26 @@ def collect_roles() -> list[str]:
 
 
 def compile_from_file(path: pathlib.Path) -> CompileResult:
-    return mdscript.compile_file(path, vars={"count": 3})
+    return markdown_script.compile_file(path, vars={"count": 3})
 
 
 def compile_virtual_graph() -> CompileResult:
     modules: dict[str, str] = {"main.mds": "hi\n"}
-    return mdscript.compile_virtual(modules, "main.mds")
+    return markdown_script.compile_virtual(modules, "main.mds")
 
 
 def validate(source: str) -> list[str]:
-    check_result: CheckResult = mdscript.check(source, base_path="/tmp")
+    check_result: CheckResult = markdown_script.check(source, base_path="/tmp")
     return check_result.warnings
 
 
 def imports(source: str) -> list[str]:
-    return mdscript.scan_imports(source)
+    return markdown_script.scan_imports(source)
 
 
 def describe_error() -> str:
     try:
-        mdscript.compile("{{undef}}")
+        markdown_script.compile("{{undef}}")
     except MdsError as err:
         code: str = err.code
         span: Span | None = err.span
@@ -73,7 +73,7 @@ def describe_error() -> str:
 
 
 def package_version() -> str:
-    return mdscript.__version__
+    return markdown_script.__version__
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +85,7 @@ def package_version() -> str:
 
 def lint_source(source: str) -> int:
     """Lint inline source; return the number of files in the result."""
-    result: LintResult = mdscript.lint(source)
+    result: LintResult = markdown_script.lint(source)
     version: int = result.version
     truncated: bool = result.truncated
     files: list[LintFileReport] = result.files
@@ -95,7 +95,7 @@ def lint_source(source: str) -> int:
 
 def lint_typed_access(source: str) -> list[str]:
     """Demonstrate fully-typed attribute access on lint results (B6/F10)."""
-    result: LintResult = mdscript.lint(source)
+    result: LintResult = markdown_script.lint(source)
     # AC-224-1 / D8: the unknown-rule warning channel is typed as list[str], so a
     # consumer can read it without a cast or a `type: ignore`.
     lint_warnings: list[str] = result.lint_warnings
@@ -120,7 +120,7 @@ def lint_typed_access(source: str) -> list[str]:
 def lint_source_with_options(source: str) -> str:
     """Lint source with all optional keyword arguments; return canonical JSON."""
     rules: dict[str, str] = {"shadow-variable": "warn", "unused-variable": "off"}
-    result: LintResult = mdscript.lint(
+    result: LintResult = markdown_script.lint(
         source,
         base_path="/tmp",
         vars={"env": "ci"},
@@ -133,7 +133,7 @@ def lint_source_with_options(source: str) -> str:
 
 def lint_from_file(path: pathlib.Path) -> LintResult:
     """Lint a .mds file on disk and return the result."""
-    return mdscript.lint_file(
+    return markdown_script.lint_file(
         path,
         vars={"count": 1},
         rules={"unused-variable": "off"},
@@ -143,7 +143,7 @@ def lint_from_file(path: pathlib.Path) -> LintResult:
 def lint_virtual_graph() -> bool:
     """Lint a virtual module graph; return whether the result was truncated."""
     modules: dict[str, str] = {"entry.mds": "Hello!\n"}
-    result: LintResult = mdscript.lint_virtual(
+    result: LintResult = markdown_script.lint_virtual(
         modules,
         "entry.mds",
         vars={"name": "world"},

@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 MD = m.compile("Hello {{name}}!\n", vars={"name": "Alice"})
 MSG = m.compile("@message user:\nHi\n@end\n")
