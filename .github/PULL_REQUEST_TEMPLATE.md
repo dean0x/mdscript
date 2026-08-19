@@ -22,5 +22,5 @@ PR titles follow Conventional Commits (feat:, fix:, refactor:, chore:, docs:, ..
 - [ ] No new compiler/linter warnings
 - [ ] Source hygiene: `node scripts/verify-no-control-bytes.mjs` exits 0
 - [ ] **Before any `--admin` merge**: run `node scripts/verify-pr-checks.mjs <pr-number>`
-      and use the `gh pr merge --squash --match-head-commit <sha>` command it emits
+      and use the `gh pr merge --squash --admin --match-head-commit <sha>` command it emits
       (PF-017: a cancelled run reads as green without this check)

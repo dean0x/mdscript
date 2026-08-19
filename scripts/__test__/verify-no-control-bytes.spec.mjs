@@ -13,7 +13,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync, readFileSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync, execFileSync } from 'node:child_process';
@@ -240,6 +240,46 @@ describe('AC-7 AC-8 AC-9: positive controls and clean-file checks', () => {
     } finally { cleanup(dir); }
   });
 
+  test('AC-7 PC-6: planted U+FEFF (BOM) at offset 0 → exits 1 naming U+FEFF', () => {
+    // U+FEFF is the most likely codepoint to be special-cased by a future
+    // change to the decoder (BOM-stripping is a common optimization) and must
+    // therefore be exercised end-to-end through the full decode → predicate →
+    // report pipeline, not only via the table-driven isHazardous unit tests.
+    //
+    // UTF-8 encoding of U+FEFF: 0xEF 0xBB 0xBF (3 bytes).
+    // Bytes constructed at runtime from hex — no backslash-u escape (PF-018).
+    const { dir, git } = mkTempGitRepo();
+    try {
+      const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+      writeFileSync(join(dir, 'bom.mjs'), Buffer.concat([bom, Buffer.from('export const x = 1;')]));
+      git('add', 'bom.mjs');
+      const r = runScanner([], { cwd: dir });
+      assert.equal(r.status, 1, 'scanner must exit 1 on U+FEFF (BOM) at offset 0');
+      assert.ok(r.stderr.includes('bom.mjs'), 'error must name the file');
+      assert.ok(r.stderr.includes('U+FEFF'), 'error must include U+FEFF codepoint');
+    } finally { cleanup(dir); }
+  });
+
+  test('AC-7 PC-7: planted U+2028 (Line Separator) mid-file → exits 1 naming U+2028', () => {
+    // U+2028 (LINE SEPARATOR) is the second codepoint most likely to be
+    // special-cased by a future change to scanBuffer (it looks like a line
+    // break and some decoders treat it as whitespace).  Exercise it
+    // end-to-end through the full pipeline.
+    //
+    // UTF-8 encoding of U+2028: 0xE2 0x80 0xA8 (3 bytes).
+    // Bytes constructed at runtime from hex — no backslash-u escape (PF-018).
+    const { dir, git } = mkTempGitRepo();
+    try {
+      const ls = Buffer.from([0xe2, 0x80, 0xa8]);
+      writeFileSync(join(dir, 'ls.md'), Buffer.concat([Buffer.from('before'), ls, Buffer.from('after')]));
+      git('add', 'ls.md');
+      const r = runScanner([], { cwd: dir });
+      assert.equal(r.status, 1, 'scanner must exit 1 on U+2028 (Line Separator) mid-file');
+      assert.ok(r.stderr.includes('ls.md'), 'error must name the file');
+      assert.ok(r.stderr.includes('U+2028'), 'error must include U+2028 codepoint');
+    } finally { cleanup(dir); }
+  });
+
   test('AC-9 NEG-1: clean international text (accented Latin, CJK, emoji) → exits 0', () => {
     const { dir, git } = mkTempGitRepo();
     try {
@@ -321,11 +361,16 @@ describe('AC-11: git ls-files discovery path', () => {
       // Remove from git tracking (but keep on disk as untracked)
       git('rm', '--cached', 'tracked.md');
       const r2 = runScanner([], { cwd: dir });
-      // With zero tracked files, non-vacuity guard fires (exit 1) — which is correct.
-      // The scanner proves it reads the tracked set: the hostile file is on disk but untracked.
-      // If it read the working tree, it would still find the hostile byte even after `git rm --cached`.
-      // Since zero tracked files → non-vacuity exit 1, we know the scanner used git ls-files.
-      // To confirm: add a clean file and verify the scanner passes.
+      // Zero tracked files → non-vacuity guard fires (exit 1), proving the scanner
+      // reads the git-tracked set rather than the working tree directory.
+      // The hostile file is still on disk but is now untracked; a working-tree
+      // scanner would still find it and exit 1 for the wrong reason.
+      assert.equal(r2.status, 1, 'zero tracked files (hostile file on disk but untracked) → non-vacuity guard exits 1');
+      assert.ok(
+        r2.stderr.includes('zero files scanned') || r2.stderr.includes('empty scan'),
+        `non-vacuity message must mention zero files; got: ${r2.stderr}`
+      );
+      // Add a clean tracked file; hostile file is still on disk but untracked.
       writeFileSync(join(dir, 'clean.md'), 'clean content\n');
       git('add', 'clean.md');
       const r3 = runScanner([], { cwd: dir });
@@ -372,12 +417,13 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6 --staged: no staged content (amend/nothing staged) → exits 0 with explicit message', () => {
-    // D-CB5's non-vacuity guard applies to full-tree mode only. In --staged mode
-    // an empty ACMR-filtered set is a legitimate state — `git commit --amend
-    // --no-edit` and `--allow-empty` produce exactly this. Exiting 1 here blocks
-    // valid commits and trains contributors to reach for --no-verify, which
-    // disables the gate for ALL commits. Fix: exit 0 with an explicit message.
+  test('D-CB5 --staged carve-out from AC-6: no staged content (amend/nothing staged) → exits 0 with explicit message', () => {
+    // AC-6 requires exit 1 when the scanned file set is empty in FULL-TREE mode.
+    // --staged mode has an explicit carve-out: an empty ACMR-filtered set is a
+    // LEGITIMATE state — `git commit --amend --no-edit` and `--allow-empty`
+    // produce exactly this. Exiting 1 here blocks valid commits and trains
+    // contributors to reach for --no-verify, which disables the gate for ALL
+    // commits. Documented exception: exit 0 with an explicit message.
     const { dir } = mkTempGitRepo();
     try {
       // Nothing staged — `git diff --cached` returns empty.
@@ -390,10 +436,12 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
     } finally { cleanup(dir); }
   });
 
-  test('AC-6 --staged: deletion-only commit → exits 0 with deletion count', () => {
-    // A commit that removes files only (git rm) yields zero ACMR-filtered paths
-    // because D = deletion is excluded from the ACMR filter. The scanner must
-    // exit 0, not 1. D-CB5 non-vacuity applies to full-tree mode only.
+  test('D-CB5 --staged carve-out from AC-6: deletion-only commit → exits 0 with deletion count', () => {
+    // AC-6 requires exit 1 when the scanned file set is empty in FULL-TREE mode.
+    // --staged mode carve-out: a commit that removes files only (git rm) yields
+    // zero ACMR-filtered paths because D = deletion is excluded from the ACMR
+    // filter. The scanner must exit 0, not 1. D-CB5 non-vacuity applies to
+    // full-tree mode only.
     const { dir, git } = mkTempGitRepo();
     try {
       // Commit a clean file, then stage its deletion
@@ -407,6 +455,55 @@ describe('AC-5 AC-6: full-tree scan and non-vacuity', () => {
       assert.ok(
         r.stdout.includes('deletion') || r.stdout.includes('nothing to scan'),
         `stdout must explain why scanning was skipped; got stdout: ${r.stdout}`
+      );
+    } finally { cleanup(dir); }
+  });
+
+  test('D-CB5 --staged carve-out from AC-6: amend-message-only (prior commit + nothing newly staged) → exits 0', () => {
+    // Regression for the empirically-confirmed bug: `git commit --amend -m "..."` was
+    // rejected with exit 1 by the pre-commit hook. During a message-only amend the
+    // index is identical to HEAD, so `git diff --cached --diff-filter=ACMR` returns
+    // zero paths. The non-vacuity guard (D-CB5) MUST NOT fire in --staged mode for
+    // this legitimate git state.
+    //
+    // This test uses a repo with a real prior commit (unlike the fresh-repo test above)
+    // to faithfully simulate the amend scenario where HEAD exists.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Establish a prior commit — this is the HEAD that an amend would rewrite.
+      writeFileSync(join(dir, 'initial.md'), 'initial content\n');
+      git('add', 'initial.md');
+      git('commit', '-m', 'initial commit');
+      // Index == HEAD: `git diff --cached` returns nothing. Simulates --amend -m.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        '--staged with index == HEAD must exit 0 (amend -m "..." is a valid workflow)');
+      assert.ok(
+        r.stdout.includes('nothing to scan') || r.stdout.includes('no staged'),
+        `stdout must explain why scanning was skipped; got: ${r.stdout}`
+      );
+    } finally { cleanup(dir); }
+  });
+
+  test('D-CB5 --staged carve-out from AC-6: allow-empty commit (nothing staged, prior commit) → exits 0', () => {
+    // Regression for the empirically-confirmed bug: `git commit --allow-empty` was
+    // rejected with exit 1 by the pre-commit hook. An allow-empty commit intentionally
+    // carries no staged content; `git diff --cached --diff-filter=ACMR` returns zero
+    // paths, which is a LEGITIMATE state. The scanner must exit 0 with an explicit
+    // message so the contributor knows the gate ran and found nothing to check.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Establish a prior commit so HEAD exists (matching typical allow-empty usage).
+      writeFileSync(join(dir, 'initial.md'), 'initial content\n');
+      git('add', 'initial.md');
+      git('commit', '-m', 'initial commit');
+      // Nothing staged — simulates `git commit --allow-empty`.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        '--staged with nothing staged must exit 0 (allow-empty is a valid workflow)');
+      assert.ok(
+        r.stdout.includes('nothing to scan') || r.stdout.includes('no staged'),
+        `stdout must explain why scanning was skipped; got: ${r.stdout}`
       );
     } finally { cleanup(dir); }
   });
@@ -512,6 +609,40 @@ describe('AC-18: --staged mode reads index blob, not working tree', () => {
     } finally { cleanup(dir); }
   });
 
+  test('Case C: type-change (T) staged blob with hostile content exits 1 (ACMRT positive control)', () => {
+    // A git type-change (T) occurs when a tracked symlink is replaced by a regular
+    // file (or vice versa) and the result is staged.  --diff-filter=ACMR excludes T,
+    // which silently bypasses the pre-commit hook for any hostile content in that blob.
+    // D-CB5b fix: --diff-filter=ACMRT captures T-type changes for scanning.
+    //
+    // This test is the positive control required by ADR-009 / PF-013: it proves the
+    // scanner DETECTS hostile content in a T-type staged blob.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // 1. Commit a symlink (mode 120000) so victim.md is tracked as a symlink.
+      writeFileSync(join(dir, 'target.txt'), 'clean target\n');
+      symlinkSync('target.txt', join(dir, 'victim.md'));
+      git('add', 'target.txt', 'victim.md');
+      git('commit', '-m', 'add symlink');
+
+      // 2. Replace the symlink with a regular file containing ESC (0x1B).
+      //    rmSync removes the symlink inode; writeFileSync creates a regular file.
+      rmSync(join(dir, 'victim.md'));
+      const esc = Buffer.from([0x1b]); // ESC constructed at runtime, not a literal (PF-018)
+      writeFileSync(join(dir, 'victim.md'), Buffer.concat([Buffer.from('evil '), esc]));
+      // git add produces T (type-change): victim.md was symlink (120000), now regular (100644)
+      git('add', 'victim.md');
+
+      // Pre-delta (ACMR filter): would exit 0, silently passing a hostile blob.
+      // Post-fix (ACMRT filter): blob is scanned and exits 1.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 1,
+        'T-type staged change (symlink to file) with hostile ESC must exit 1 (ACMRT positive control)');
+      assert.ok(r.stderr.includes('victim.md'), `error must name the file; got: ${r.stderr}`);
+      assert.ok(r.stderr.includes('U+001B'), `error must name U+001B; got: ${r.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -540,15 +671,30 @@ describe('AC-15: scanner source is self-clean', () => {
     // The forbidden grep invocation is 'grep' joined with ' -P'; split here so
     // the contiguous substring is absent from this source file.
     const grepPFlag = 'grep' + ' -P';
-    // 0x5C = backslash, then 'u' and 4 hex digits:
+    // 0x5C = backslash. Doubling it (bs + bs) yields two backslash chars as a
+    // string value; the RegExp constructor interprets that pair as an escaped
+    // literal backslash, producing /\\u[0-9a-fA-F]{4}/ — a pattern that matches
+    // an actual backslash followed by 'u' and four hex digits. A single bs would
+    // compile to /\u[0-9a-fA-F]{4}/ where \u is an Annex-B identity escape and
+    // matches bare 'u' — the false-positive trap identified in review finding #4.
     const bs = String.fromCodePoint(0x5c);
-    const bsUPattern = new RegExp(bs + 'u[0-9a-fA-F]{4}');
+    const bsUPattern = new RegExp(bs + bs + 'u[0-9a-fA-F]{4}');
 
+    // Auto-discover all spec files so new files added to scripts/__test__/ are
+    // automatically covered. A hardcoded list silently under-covers when files
+    // are added (the gap that let code-of-conduct.spec.mjs escape — review
+    // findings #1/#2). A minimum-count assertion catches accidental narrowing.
+    const specFiles = readdirSync(join(ROOT, 'scripts/__test__'))
+      .filter(f => f.endsWith('.spec.mjs'))
+      .map(f => `scripts/__test__/${f}`);
+    assert.ok(
+      specFiles.length >= 3,
+      `expected at least 3 spec files in scripts/__test__; got ${specFiles.length}: ${specFiles.join(', ')}`,
+    );
     const fileSet = [
       'scripts/verify-no-control-bytes.mjs',
       'scripts/verify-pr-checks.mjs',
-      'scripts/__test__/verify-no-control-bytes.spec.mjs',
-      'scripts/__test__/verify-pr-checks.spec.mjs',
+      ...specFiles,
       'scripts/hooks/pre-commit',
     ];
 
@@ -569,17 +715,26 @@ describe('AC-15: scanner source is self-clean', () => {
 
 // ---------------------------------------------------------------------------
 // AC-30: hex context stored per hit as a pre-computed string, not as the raw
-//        buffer — one-file-at-a-time memory discipline, verified by code shape.
+//        buffer — hazardHits never retains file buffers; verified by code shape.
 //
 // AC-30 has three clauses:
 //   (a) Wall-clock full-tree scan < 5 s — asserted with Date.now() in the
 //       AC-5 test above (generous CI-safe bound).
-//   (b) --staged mode < 2 s for a 20-file commit — not directly timed here;
-//       the same structural bound holds (git cat-file reads one blob at a time).
-//   (c) MUST NOT hold more than one file's contents in memory at a time —
-//       verified by code shape: at verify-no-control-bytes.mjs:473,
+//   (b) --staged mode < 2 s for a 20-file commit — not directly timed here.
+//       NOTE: readAllIndexBlobs() collapses N per-file `git cat-file blob`
+//       spawns into ONE `git cat-file --batch` call. The entire staged set is
+//       materialized into a single r.stdout buffer; out.slice(pos, pos+size)
+//       returns Buffer views that pin that buffer. --staged mode therefore holds
+//       all staged file contents in memory simultaneously, bounded by the 256 MB
+//       maxBuffer cap (r.error -> exit 2). This is a known trade-off (spawn cost
+//       vs memory) that was accepted when readAllIndexBlobs() replaced readIndexBlob().
+//   (c) hazardHits MUST NOT retain file buffers — verified by code shape:
 //       hazardHits.push stores { hexCtx } (a pre-computed string) not { buf }
-//       (the raw buffer), so the buffer is GC-eligible after each iteration.
+//       (the raw buffer). In full-tree mode buf is GC-eligible after each loop
+//       iteration. In --staged mode buf is a view into the already-pinned blobMap
+//       buffer (clause b), so GC-eligibility at the hazardHits level is academic
+//       there — but the key property holds: hazardHits does NOT additionally
+//       retain file buffers.
 //
 // This describe block tests clause (c) indirectly: by proving the correct
 // hexCtx string reaches the output across multiple files, it demonstrates
@@ -590,10 +745,13 @@ describe('AC-30: hex context stored as string per hit, not as file buffer', () =
 
   test('scanner reports hex context for every hazard across multiple files', () => {
     // Verify that hexCtx is computed and stored correctly for each hit.
-    // Memory discipline (clause c) is by code shape: hazardHits stores { hexCtx }
-    // not { buf } (scanner:473), so buf is GC-eligible after each file's iteration.
-    // This test proves the correct context string reaches the output regardless
-    // of how many files are scanned.
+    // Memory discipline (clause c) is by code shape: hazardHits.push stores
+    // { hexCtx } (a pre-computed string) not { buf } (the raw buffer), so buf
+    // is not additionally retained in hazardHits. In full-tree mode buf is
+    // GC-eligible after each iteration; in --staged mode buf is a view into
+    // the blobMap buffer (all blobs held simultaneously per clause b). This
+    // test proves the correct context string reaches the output regardless of
+    // how many files are scanned.
     const { dir, git } = mkTempGitRepo();
     try {
       // Construct two files each with an ESC at a known position
@@ -707,6 +865,89 @@ describe('AC-17: allowlist entries are self-invalidating', () => {
     } finally { cleanup(dir); }
   });
 
+  /**
+   * D-CB6a: staleness is a whole-tree claim, so it is adjudicated in full-tree
+   * mode only. --staged scans a SUBSET; judging staleness there reports every
+   * allowlisted file the commit did not happen to touch as "no longer tracked"
+   * and rejects the commit. That would make the pre-commit hook unusable from
+   * the first legitimate allowlist entry onward and push contributors to
+   * --no-verify, which disables the gate for ALL commits.
+   *
+   * Case 4 is paired with an explicit positive control (Case 5) so the fix
+   * cannot be satisfied by simply deleting the staleness check
+   * (applies ADR-009, avoids PF-013).
+   */
+  test('Case 4: --staged does not misreport an untouched allowlisted file as stale', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // evil.md carries its declared hazard and stays tracked but UNTOUCHED
+      // by the staged change.
+      writeFileSync(join(dir, 'evil.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      writeFileSync(join(dir, 'notes.md'), 'first\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'evil.md', 'notes.md', 'scan.mjs');
+      git('commit', '-m', 'init');
+
+      // Stage an edit to a DIFFERENT, clean file — the ordinary commit shape.
+      writeFileSync(join(dir, 'notes.md'), 'second\n');
+      git('add', 'notes.md');
+
+      const r = spawnSync(process.execPath, [target, '--staged'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(r.status, 0,
+        'a commit that does not touch the allowlisted file must not be rejected; ' +
+        `stdout: ${r.stdout} stderr: ${r.stderr}`);
+      assert.ok(!/stale/.test(r.stderr),
+        `evil.md is still tracked, so "stale" is a false claim; got: ${r.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
+  test('Case 5 (positive control): the same entry IS reported stale by the full-tree scan', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Identical patched scanner and identical entry as Case 4 — but here
+      // evil.md is genuinely absent, so full-tree mode must still catch it.
+      // Without this control, Case 4 would also pass if staleness detection
+      // were removed outright rather than scoped to full-tree mode.
+      writeFileSync(join(dir, 'notes.md'), 'first\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'notes.md', 'scan.mjs');
+
+      const r = runPatched(dir, target);
+      assert.equal(r.status, 1, 'full-tree mode must still adjudicate staleness');
+      assert.ok(r.stderr.includes('stale'), `must identify the entry as stale; got: ${r.stderr}`);
+      assert.ok(r.stderr.includes('evil.md'), 'must name the stale path');
+    } finally { cleanup(dir); }
+  });
+
+  test('Case 6: --staged still SUPPRESSES an allowlisted hazard in a staged file', () => {
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Suppression is path-keyed and unaffected by D-CB6a: staging the
+      // allowlisted file itself must still pass, while an identical hazard in a
+      // NON-allowlisted staged file must still fail (the discriminating half).
+      writeFileSync(join(dir, 'notes.md'), 'first\n');
+      const target = writePatchedScanner(dir, "{ path: 'evil.md', codepoints: [0x1b], reason: 'test fixture' }");
+      git('add', 'notes.md', 'scan.mjs');
+      git('commit', '-m', 'init');
+
+      writeFileSync(join(dir, 'evil.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      git('add', 'evil.md');
+      const allowed = spawnSync(process.execPath, [target, '--staged'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(allowed.status, 0,
+        `an allowlisted staged file must pass; stdout: ${allowed.stdout} stderr: ${allowed.stderr}`);
+
+      writeFileSync(join(dir, 'other.md'), Buffer.concat([Buffer.from('x '), Buffer.from([0x1b])]));
+      git('add', 'other.md');
+      const denied = spawnSync(process.execPath, [target, '--staged'],
+        { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      assert.equal(denied.status, 1,
+        'the same hazard in a NON-allowlisted staged file must still fail');
+      assert.ok(denied.stderr.includes('other.md'), `must name the offending path; got: ${denied.stderr}`);
+    } finally { cleanup(dir); }
+  });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -759,6 +1000,65 @@ describe('AC-20: symlinks are skipped and counted, not read', () => {
         `skipped entries must be counted separately; got: ${r.stdout}`);
       assert.ok(/Scanned 1 file\(s\)/.test(r.stdout), 'only the regular file is scanned');
     } finally { cleanup(dir); }
+  });
+
+  test('AC-20: a staged gitlink (mode 160000) is skipped in --staged mode, not reported as an error', () => {
+    // Regression test for the pre-fix bug: without mode-aware skip in getStagedFiles(),
+    // a staged gitlink (submodule) would reach readAllIndexBlobs(), and
+    // `git cat-file --batch` would return 'missing' (gitlinks store a commit SHA,
+    // not a blob), causing exit 2 with the misleading message
+    // "staged path not in index: <submodule-name>".
+    //
+    // Fix (D-CB5a): getStagedFiles() now uses `git diff --cached --raw -z`
+    // to obtain the new-file mode for each staged entry. Entries with new-mode
+    // 160000 (gitlink) are marked skip:true before they reach readAllIndexBlobs(),
+    // consistent with full-tree mode's AC-20 behavior.
+    //
+    // A real commit SHA is required because git validates the SHA format when
+    // updating the index via --cacheinfo. We harvest a SHA from a sibling temp
+    // repo to avoid network access and keep the test hermetic.
+    const { dir, git } = mkTempGitRepo();
+    const innerDir = mkdtempSync(join(tmpdir(), 'mds-inner-'));
+    try {
+      // Create an inner repo and commit one file to get a real commit SHA.
+      execFileSync('git', ['init'], { cwd: innerDir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.email', 'test@test.test'], { cwd: innerDir, stdio: 'pipe' });
+      execFileSync('git', ['config', 'user.name', 'Test'], { cwd: innerDir, stdio: 'pipe' });
+      writeFileSync(join(innerDir, 'inner.md'), 'inner\n');
+      execFileSync('git', ['add', 'inner.md'], { cwd: innerDir, stdio: 'pipe' });
+      execFileSync('git', ['commit', '-m', 'inner'], { cwd: innerDir, stdio: 'pipe' });
+      const innerSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: innerDir, encoding: 'utf8', stdio: 'pipe',
+      }).trim();
+
+      // Stage a clean regular file alongside a gitlink (mode 160000) in the outer repo.
+      // `git update-index --cacheinfo 160000,<sha>,<path>` injects a gitlink entry
+      // directly into the index without requiring a real .gitmodules or disk presence.
+      writeFileSync(join(dir, 'clean.md'), 'clean content\n');
+      git('add', 'clean.md');
+      execFileSync('git', [
+        'update-index', '--add', '--cacheinfo', `160000,${innerSha},sub`,
+      ], { cwd: dir, stdio: 'pipe' });
+
+      // Confirm the gitlink is actually in the index at mode 160000.
+      const modes = execFileSync('git', ['ls-files', '-s'], { cwd: dir, encoding: 'utf8' });
+      assert.ok(modes.includes('160000'), 'fixture must actually stage a gitlink at mode 160000');
+
+      // --staged mode: the gitlink must be skipped (not cause an error), and the
+      // regular file must be scanned and pass.
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        `staged gitlink must be skipped without error; stderr: ${r.stderr}`);
+      // The success output must report the skipped gitlink count.
+      assert.ok(r.stdout.includes('symlink/gitlink skipped'),
+        `output must report the skipped gitlink; got: ${r.stdout}`);
+      // The regular file must be scanned (not silently dropped with the gitlink).
+      assert.ok(/Scanned 1 file\(s\)/.test(r.stdout),
+        `must scan the one regular file; got: ${r.stdout}`);
+    } finally {
+      cleanup(dir);
+      cleanup(innerDir);
+    }
   });
 
 });

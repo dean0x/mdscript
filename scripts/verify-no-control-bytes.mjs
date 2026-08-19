@@ -23,9 +23,24 @@
  *
  * D-CB5: Fails closed. In full-tree mode, zero-files-scanned is exit 1, not
  * exit 0 (avoids PF-016 — an empty scan masquerades as clean). In --staged
- * mode, an empty ACMR-filtered set is a legitimate state (deletion-only
+ * mode, an empty ACMRT-filtered set is a legitimate state (deletion-only
  * commits, amend with no content changes) and exits 0 with an explicit
  * message; the full-tree scan is the authoritative non-vacuity gate.
+ *
+ * AC-6 AMENDMENT (--staged mode): AC-6 requires exit 1 when the scanned
+ * file set is empty. --staged mode intentionally exits 0 for a legitimately-
+ * empty content-bearing set (deletion-only commits via `git rm`, `git commit
+ * --amend -m`, `git commit --allow-empty`). Exiting 1 there would train
+ * contributors toward `--no-verify`, which disables the gate for ALL commits
+ * — the opposite of the security goal. No bypass exists: any staged file with
+ * hazardous content appears under the ACMRT filter. This amendment is
+ * deliberate, tested (see spec test "D-CB5 --staged carve-out from AC-6"),
+ * and leaves the full-tree CI scan as the authoritative AC-6 gate.
+ *
+ * D-CB6a: allowlist STALENESS is adjudicated in full-tree mode only. Staleness
+ * is a claim about the whole tracked tree, and --staged / explicit-path modes
+ * scan a subset that cannot support it. Hazard SUPPRESSION by an allowlist
+ * entry still applies in every mode. See the stale-allowlist block in main().
  *
  * D-CB8: --staged mode reads file content from the git index via a single
  * `git cat-file --batch` subprocess (all staged blobs at once), never from
@@ -67,7 +82,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
  * @param {string} metaUrl — the caller's import.meta.url
  * @returns {boolean}
  */
-export function isMainModule(metaUrl) {
+function isMainModule(metaUrl) {
   const entry = process.argv[1];
   if (!entry) return false;
   const modulePath = fileURLToPath(metaUrl);
@@ -185,22 +200,33 @@ function hexContext(buf, offset) {
   return hex.join(' ');
 }
 
-
 // ---------------------------------------------------------------------------
 // git helpers
 // ---------------------------------------------------------------------------
 
 function gitExec(args, cwd = process.cwd()) {
-  const result = spawnSync('git', args, { cwd, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+  // Hard per-call bound: an index lock or credential prompt must not hang the
+  // pre-commit hook indefinitely. ETIMEDOUT is indeterminate → exit 2, never 0.
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'buffer',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
   if (result.error) {
     if (result.error.code === 'ENOENT') {
       // AC-16: fail-closed (exit 1) — "git missing" is a known, named failure,
       // not an indeterminate tool error.
       console.error('✖ verify-no-control-bytes: git is not on PATH');
       process.exit(1);
+    } else if (result.error.code === 'ETIMEDOUT') {
+      // Timeout is indeterminate — a hung git call is not evidence of a clean tree.
+      console.error('✖ verify-no-control-bytes: git timed out after 30 s — indeterminate, not clean');
+      process.exit(2);
+    } else {
+      console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
+      process.exit(2);
     }
-    console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
-    process.exit(2);
   }
   return result;
 }
@@ -252,15 +278,36 @@ function getTrackedFiles(cwd) {
 
 /**
  * Get staged file list for --staged mode.
- * Uses `git diff --cached --name-only -z --diff-filter=ACMR` for paths.
+ * Uses `git diff --cached --raw -z --diff-filter=ACMRT` to obtain both paths
+ * and git mode information so that gitlinks (160000) and symlinks (120000) can
+ * be skipped consistently with full-tree mode's AC-20 behavior.
  * D-CB8: content is fetched later in batch via readAllIndexBlobs().
+ *
+ * D-CB5a: mode-aware skip for staged mode. Unlike `git diff --cached
+ * --name-only`, the `--raw` format carries the new-file mode (octal) for each
+ * staged entry. Entries with new-mode 120000 (symlink) or 160000 (gitlink) are
+ * marked skip:true — identical to full-tree mode's AC-20 treatment. This
+ * resolves the pre-fix divergence where gitlinks reaching readAllIndexBlobs()
+ * would trigger a misleading "staged path not in index" error because
+ * `git cat-file --batch` returns 'missing' for a commit-typed index entry.
+ *
+ * D-CB5b: include T (type-change) in the diff-filter so a tracked symlink
+ * (120000) replaced by a regular file (100644) containing a hazard codepoint
+ * is not silently excluded. The raw format carries the new mode, so a T-change
+ * landing on mode 100644 is scanned; one landing on 120000 or 160000 is
+ * skipped. A T-change landing on 160000 would previously have caused a
+ * misleading error — it is now skipped cleanly.
+ *
+ * Raw diff format (git diff --cached --raw -z), per entry:
+ *   :<old-mode> <new-mode> <old-sha> <new-sha> <status>\0<path>\0
+ * Rename/copy (status starts with R or C):
+ *   :<old-mode> <new-mode> <old-sha> <new-sha> Rscore\0<old-path>\0<new-path>\0
  */
 function getStagedFiles(cwd) {
-  const r = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMR'], cwd);
+  const r = gitExec(['diff', '--cached', '--raw', '-z', '--diff-filter=ACMRT'], cwd);
   if (r.status !== 0) {
-    // D-CB5: fail closed. `git diff --cached` exits 0 even when nothing is
-    // staged, so a non-zero status is a real tool failure (corrupt index,
-    // unreadable object). Treating it as "no staged files" would let the
+    // D-CB5: fail closed — a non-zero status is a real tool failure (corrupt
+    // index, unreadable object). Treating it as "no staged files" would let the
     // pre-commit hook report success on a scan that never happened.
     console.error(
       `✖ verify-no-control-bytes: git diff --cached failed (status ${r.status}): ` +
@@ -268,8 +315,38 @@ function getStagedFiles(cwd) {
     );
     process.exit(2);
   }
-  const paths = r.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
-  return paths.map(p => ({ path: p, mode: 0o100644, skip: false, staged: true }));
+
+  const parts = r.stdout.toString('utf8').split('\0');
+  const files = [];
+  let i = 0;
+  while (i < parts.length) {
+    const header = parts[i];
+    // Raw diff headers start with ':'. Skip empty parts and non-header tokens.
+    if (!header || !header.startsWith(':')) { i++; continue; }
+    // `:old-mode new-mode old-sha new-sha status`
+    const fields = header.slice(1).split(' ');
+    const newMode = parseInt(fields[1], 8); // new-mode is octal (e.g. "100644")
+    const status = fields[4] || '';
+    i++;
+    // Rename (R) and copy (C) entries have two paths: old-path then new-path.
+    // Advance past old-path and use new-path (the content we care about).
+    if (status.startsWith('R') || status.startsWith('C')) {
+      i++; // skip old-path
+    }
+    const path = parts[i] || '';
+    i++;
+    if (!path) continue;
+    // AC-20: skip symlinks (120000) and gitlinks (160000) — identical to
+    // full-tree mode. A gitlink's cat-file lookup returns 'missing' (commit
+    // object, not a blob) and would otherwise cause a misleading "staged path
+    // not in index" error. Symlink blobs contain the target path; POSIX permits
+    // any byte except NUL and '/' in symlink targets, so control bytes are
+    // theoretically possible and scanning them could produce false-positive gate
+    // failures. Skipping keeps the gate focused on source-file content (avoids PF-015).
+    const skip = newMode === 0o120000 || newMode === 0o160000;
+    files.push({ path, mode: newMode, skip, staged: true });
+  }
+  return files;
 }
 
 /**
@@ -288,16 +365,27 @@ function getStagedFiles(cwd) {
 function readAllIndexBlobs(paths, cwd) {
   if (paths.length === 0) return new Map();
 
-  // Input: ":<path>\n" for every staged path
-  const stdin = Buffer.from(paths.map(p => `:${p}\n`).join(''), 'utf8');
-  const r = spawnSync('git', ['cat-file', '--batch'], {
+  // Input: ":<path>\0" for every staged path.
+  // Use NUL as delimiter (matching getStagedFiles' -z output) so that git paths
+  // containing a literal LF do not split into two batch requests and
+  // desynchronize the response parser.
+  const stdin = Buffer.from(paths.map(p => `:${p}\0`).join(''), 'utf8');
+  // Hard bound: mirrors gitExec's contract. An index lock, network-FS hang, or
+  // stuck git subprocess in the pre-commit hook must not block indefinitely.
+  // ETIMEDOUT is indeterminate → exit 2, never 0.
+  const r = spawnSync('git', ['cat-file', '--batch', '-z'], {
     cwd,
     input: stdin,
     encoding: 'buffer',
     maxBuffer: 256 * 1024 * 1024,
+    timeout: 30_000,
   });
   if (r.error) {
-    console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
+    if (r.error.code === 'ETIMEDOUT') {
+      console.error('✖ verify-no-control-bytes: git cat-file --batch timed out after 30 s — indeterminate, not clean');
+    } else {
+      console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
+    }
     process.exit(2);
   }
   if (r.status !== 0) {
@@ -446,6 +534,11 @@ function main() {
 
   const cwd = process.cwd();
 
+  // Full-tree mode is the only mode in which `fileEntries` is the COMPLETE
+  // tracked set. --staged and explicit-path modes scan a subset, which changes
+  // what the allowlist staleness check below can legitimately conclude.
+  const isFullTree = explicitPaths.length === 0 && !isStaged;
+
   // Verify git is accessible and we are in a repo (D-CB5)
   assertGitRepo(cwd);
 
@@ -463,8 +556,12 @@ function main() {
       absolutePath: resolve(cwd, p),
     }));
   } else if (isStaged) {
-    // D-CB8: staged mode — read from git index
-    fileEntries = getStagedFiles(cwd).map(e => ({ ...e, absolutePath: null }));
+    // D-CB8: staged mode — read from git index.
+    // getStagedFiles() now provides mode info; skip gitlinks and symlinks
+    // exactly as full-tree mode does (AC-20, D-CB5a).
+    const all = getStagedFiles(cwd);
+    skippedCount = all.filter(e => e.skip).length;
+    fileEntries = all.filter(e => !e.skip).map(e => ({ ...e, absolutePath: null }));
   } else {
     // Default: full tracked tree
     const all = getTrackedFiles(cwd);
@@ -476,8 +573,8 @@ function main() {
 
   // ---- D-CB5: Non-vacuity guard (AC-6) ----
   // Full-tree mode: zero tracked files means path discovery broke — fail closed.
-  // --staged mode: an empty ACMR-filtered set is a LEGITIMATE state:
-  //   • deletion-only commit (git rm): ACMR excludes deletions; files ARE staged.
+  // --staged mode: an empty ACMRT-filtered set is a LEGITIMATE state:
+  //   • deletion-only commit (git rm): ACMRT excludes deletions; files ARE staged.
   //   • amend with no content changes: index equals HEAD; diff is empty.
   // In both cases exit 0 with an explicit message. The full-tree scan is the
   // authoritative non-vacuity gate; the hook must not block valid commits.
@@ -487,21 +584,25 @@ function main() {
       console.error('  If this is a new repo with no commits, run `git add` first.');
       process.exit(1);
     }
-    // --staged: check unfiltered diff to provide an accurate message.
-    const rAll = gitExec(['diff', '--cached', '--name-only', '-z'], cwd);
-    if (rAll.status !== 0) {
+    // --staged: query actual deletions via --diff-filter=D rather than
+    // inferring from the unfiltered diff.  Using the unfiltered set is wrong
+    // when a T (type-change) is the only staged path: ACMRT already captures
+    // T-type content-bearing blobs, so if we arrive here the staged set truly
+    // contains only deletions (D) or nothing at all.
+    const rDel = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=D'], cwd);
+    if (rDel.status !== 0) {
       console.error(
-        `✖ verify-no-control-bytes: git diff --cached (unfiltered) failed: ` +
-        `${rAll.stderr.toString('utf8').trim()}`,
+        `✖ verify-no-control-bytes: git diff --cached (deletions) failed: ` +
+        `${rDel.stderr.toString('utf8').trim()}`,
       );
       process.exit(2);
     }
-    const allPaths = rAll.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
-    if (allPaths.length > 0) {
+    const deletionPaths = rDel.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
+    if (deletionPaths.length > 0) {
       // Staged changes exist but are all deletions — nothing for the content scanner to do.
       console.log(
         `✓ source-hygiene gate: 0 content-bearing staged paths` +
-        ` (${allPaths.length} deletion(s)) — nothing to scan`,
+        ` (${deletionPaths.length} deletion(s)) — nothing to scan`,
       );
     } else {
       // Index equals HEAD (amend --no-edit, reword, --allow-empty, etc.).
@@ -569,28 +670,51 @@ function main() {
         exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
       } else {
         // AC-30: compute hex context now so buf is not retained after this iteration.
-        hazardHits.push({ path: entry.path, codepoint: hit.codepoint, byteOffset: hit.byteOffset, hexCtx: hexContext(buf, hit.byteOffset) });
+        hazardHits.push({
+          path: entry.path,
+          codepoint: hit.codepoint,
+          byteOffset: hit.byteOffset,
+          hexCtx: hexContext(buf, hit.byteOffset),
+        });
       }
     }
   }
 
   // ---- Stale allowlist check (D-CB6) ----
-  for (const entry of BINARY_ALLOWLIST) {
-    const exists = fileEntries.some(e => e.path === entry.path);
-    if (!exists) {
-      errors.push(`BINARY_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+  //
+  // D-CB6a: FULL-TREE MODE ONLY. Staleness is a claim about the whole tracked
+  // tree ("this entry no longer corresponds to anything"), and only full-tree
+  // mode holds the evidence for it. In --staged and explicit-path modes
+  // `fileEntries` is a SUBSET, so every allowlist entry outside that subset
+  // would be reported as "no longer tracked" — a factually false message that
+  // fails every commit not touching the allowlisted file. That turns the
+  // pre-commit hook into a wall the moment a first legitimate entry is added,
+  // and trains contributors toward `--no-verify`, which disables the gate for
+  // ALL commits — the same reasoning that drives the AC-6 --staged carve-out
+  // above. The full-tree CI scan is the authoritative allowlist validator, and
+  // it runs on every pull_request and on every tag push.
+  //
+  // Hazard SUPPRESSION is unaffected and still applies in every mode:
+  // hazardAllowMap is keyed by path, so an allowlisted file staged with its
+  // declared codepoints still passes. Only the staleness verdict is deferred.
+  if (isFullTree) {
+    for (const entry of BINARY_ALLOWLIST) {
+      const exists = fileEntries.some(e => e.path === entry.path);
+      if (!exists) {
+        errors.push(`BINARY_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+      }
     }
-  }
-  for (const entry of HAZARD_ALLOWLIST) {
-    const exists = fileEntries.some(e => e.path === entry.path);
-    if (!exists) {
-      errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
-    } else {
-      // Verify the declared codepoints actually occur in the file
-      for (const cp of entry.codepoints) {
-        const key = `${entry.path}:${cp}`;
-        if (!exercisedAllowlist.has(key)) {
-          errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" cp U+${cp.toString(16).toUpperCase().padStart(4, '0')} — codepoint not found in file`);
+    for (const entry of HAZARD_ALLOWLIST) {
+      const exists = fileEntries.some(e => e.path === entry.path);
+      if (!exists) {
+        errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+      } else {
+        // Verify the declared codepoints actually occur in the file
+        for (const cp of entry.codepoints) {
+          const key = `${entry.path}:${cp}`;
+          if (!exercisedAllowlist.has(key)) {
+            errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" cp U+${cp.toString(16).toUpperCase().padStart(4, '0')} — codepoint not found in file`);
+          }
         }
       }
     }

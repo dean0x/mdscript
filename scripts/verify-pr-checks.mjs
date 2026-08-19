@@ -16,12 +16,23 @@
  * is a vacuous green, and vacuous greens are what PF-017 was made of.
  *
  * D-PR2a: A required context is resolved against the UNION of check-runs AND
- * commit statuses (GitHub branch protection accepts either namespace).
+ * commit statuses (GitHub branch protection accepts either namespace). Both
+ * namespaces are checked independently: a failing commit status is not masked
+ * by a passing check-run under the same name.
  *
  * D-PR3: Three tiers:
- *   Tier A (required): MUST be completed+success — missing/cancelled/etc = FAIL
- *   Tier B (non-required check-runs): failure/cancelled/timed_out = FAIL
- *   Tier C (legacy commit statuses): advisory unless the context is required
+ *   Tier A  (required):          MUST be completed+success — missing/cancelled/etc = FAIL
+ *   Tier A+ (expected, local):   Same semantics as Tier A, but sourced from EXPECTED_CONTEXTS
+ *                                rather than branch protection. Absence = FAIL (not advisory).
+ *   Tier B  (non-required runs): failure/cancelled/timed_out = FAIL; not-yet-completed = FAIL
+ *   Tier C  (legacy statuses):   advisory unless the context is required
+ *
+ * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing even though
+ * they are not (yet) in branch protection. Currently: ['Source hygiene'] — the
+ * control-byte gate added in #288. Tier B alone cannot make it binding because Tier B
+ * only iterates runs that ALREADY EXIST in the check-run list; an absent job has
+ * nothing to iterate. Tier A+ fills this gap by asserting presence (applies ADR-009,
+ * avoids PF-013: absence is never evidence of success).
  *
  * D-PR4: Non-vacuity guard — zero check-runs = FAIL (the #239 case).
  *        Counts are always printed on every run (avoids PF-013).
@@ -30,9 +41,10 @@
  *         `filter=latest` is pinned explicitly (default today, but implicit
  *         defaults can change and this gate's verdict depends on it).
  *
- * D-PR5: On PASS the tool prints a merge command with --match-head-commit
- *        <headSha>, closing the TOCTOU window where the verified SHA diverges
- *        from HEAD by the time the merge runs.
+ * D-PR5: On PASS the tool prints `gh pr merge --squash --admin --match-head-commit
+ *        <headSha>` so the operator copies it verbatim. --admin is required for
+ *        protected main; --match-head-commit closes the TOCTOU window where the
+ *        verified SHA diverges from HEAD by the time the merge runs (avoids PF-017).
  *
  * D-PR6: Exit codes — 0 PASS, 1 FAIL, 2 indeterminate. "Cannot tell" is
  *        never 0.
@@ -80,31 +92,84 @@ const MAX_PAGES = 20;
 const MIN_GH_MAJOR = 2;
 const MIN_GH_MINOR = 31;
 
+/**
+ * D-PR3b: Locally-expected contexts — enforced with Tier A semantics regardless
+ * of whether they appear in branch protection. An absent job is FAIL, not
+ * advisory (applies ADR-009, avoids PF-013).
+ *
+ * 'Source hygiene' is the control-byte gate added in #288. It is not yet a
+ * required context in branch protection (Open Decision 1), so Tier B is the
+ * only thing making it binding — but Tier B only iterates runs that ALREADY
+ * APPEAR in the check-run list. When the job is absent (renamed, deleted, not
+ * yet started, or cancelled before reporting), Tier B has nothing to iterate
+ * and the verifier would emit a PASS. EXPECTED_CONTEXTS closes this gap by
+ * asserting presence, mirroring Tier A semantics.
+ */
+export const EXPECTED_CONTEXTS = ['Source hygiene'];
+
 // ---------------------------------------------------------------------------
 // gh runner (thin IO shim; injected in tests for offline operation)
 // ---------------------------------------------------------------------------
 
 /**
+ * Extract the HTTP status code from gh's stderr string.
+ *
+ * gh prints errors in the format "gh: <message> (HTTP NNN)" for API errors.
+ * The process exit code is always 1 regardless of the HTTP status, so `status`
+ * alone cannot distinguish 404 from 403. This pure function is exported so
+ * tests can pin the stub contract to the production parsing contract (avoids
+ * PF-013: dead branches that only trigger on a value the runner never produces).
+ *
+ * @param {string|null|undefined} stderr
+ * @returns {number|null} HTTP status code, or null if not found
+ */
+export function parseGhStderrHttpStatus(stderr) {
+  if (!stderr) return null;
+  const m = stderr.match(/\(HTTP (\d+)\)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+/**
  * Default runner: calls `gh api` and returns parsed JSON.
+ *
+ * On error, returns `{ __error: true, status: <process-exit>, httpStatus: <HTTP-code|null>, stderr }`.
+ * `httpStatus` is parsed from gh's stderr format "gh: <message> (HTTP NNN)" and is the
+ * value callers should branch on for 404/403 distinctions — the process exit code is
+ * always 1 regardless of the HTTP status, so `status` alone cannot distinguish 404 from 403.
+ *
  * @param {string[]} args
  * @returns {any}
  */
 function defaultGhRunner(args) {
-  const r = spawnSync('gh', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  // AC-30: hard wall per gh invocation so a hung or throttled connection cannot
+  // block the tool indefinitely (avoids PF-017: indeterminate ≠ success).
+  // ETIMEDOUT maps to the __error path, which callers classify as exit 2.
+  const r = spawnSync('gh', args, {
+    encoding: 'utf8',
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: 30_000,
+  });
   if (r.error) {
-    const stderr = r.error.code === 'ENOENT'
-      ? 'gh is not on PATH'
-      : `gh error: ${r.error.message}`;
-    return { __error: true, status: -1, stderr };
+    let stderr;
+    if (r.error.code === 'ENOENT') {
+      stderr = 'gh is not on PATH';
+    } else if (r.error.code === 'ETIMEDOUT') {
+      stderr = 'gh timed out after 30 s (AC-30: indeterminate, not clean)';
+    } else {
+      stderr = `gh error: ${r.error.message}`;
+    }
+    return { __error: true, status: -1, httpStatus: null, stderr };
   }
   if (r.status !== 0) {
-    // Return status code so caller can handle 404/403
-    return { __error: true, status: r.status, stderr: r.stderr };
+    // parseGhStderrHttpStatus is tested separately so the stub contract and
+    // the production parsing contract are pinned to each other (avoids PF-013).
+    const httpStatus = parseGhStderrHttpStatus(r.stderr);
+    return { __error: true, status: r.status, httpStatus, stderr: r.stderr };
   }
   try {
     return JSON.parse(r.stdout);
   } catch {
-    return { __error: true, status: r.status, raw: r.stdout, stderr: r.stderr };
+    return { __error: true, status: r.status, httpStatus: null, raw: r.stdout, stderr: r.stderr };
   }
 }
 
@@ -129,6 +194,7 @@ function defaultGhRunner(args) {
  *   checkRuns: CheckRun[];
  *   statuses: CommitStatus[];
  *   headSha: string;
+ *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
  * }} EvaluateInput
  *
  * @typedef {{
@@ -149,7 +215,13 @@ function defaultGhRunner(args) {
  * @param {EvaluateInput} input
  * @returns {EvaluateResult}
  */
-export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha }) {
+export function evaluateChecks({
+  requiredContexts,
+  checkRuns,
+  statuses,
+  headSha,
+  expectedContexts = EXPECTED_CONTEXTS,
+}) {
   const lines = [];
   const failures = [];
   let pass = true;
@@ -208,31 +280,41 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   }
 
   // ---- Tier A: required contexts ----
-  // D-PR2a: resolved against the UNION of check-runs and commit statuses.
+  // D-PR2a: resolved against BOTH check-runs AND commit statuses independently.
+  // GitHub branch protection enforcement considers both namespaces; a failing
+  // commit status is not masked by a passing check-run under the same name.
   // avoids PF-017: must be status=completed AND conclusion=success.
   for (const ctx of requiredContexts) {
     const crs = checksByName.get(ctx);
     const st = statusByContext.get(ctx);
+    let found = false;
 
     if (crs) {
-      // Found in check-runs namespace — EVERY run under this name must pass.
-      for (const cr of crs) {
+      found = true;
+      // Every run under this name must pass — keeping only the last entry would
+      // let a later success mask an earlier failure from a different check-suite.
+      for (const [idx, cr] of crs.entries()) {
         if (cr.status !== 'completed' || cr.conclusion !== 'success') {
           failures.push(
             `Tier A (required): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'}` +
-            (crs.length > 1 ? ` (1 of ${crs.length} runs sharing this name)` : '') +
+            (crs.length > 1 ? ` (${idx + 1} of ${crs.length} runs sharing this name)` : '') +
             ` (avoids PF-017: cancelled/skipped/in_progress are not success)`,
           );
           pass = false;
         }
       }
-    } else if (st) {
-      // Found in commit statuses namespace
+    }
+    if (st) {
+      // Always check the status namespace too, even when a check-run was found.
+      // D-PR2a: both namespaces are checked independently so a failing status
+      // is not silently ignored when a check-run of the same name is green.
+      found = true;
       if (st.state !== 'success') {
         failures.push(`Tier A (required): "${ctx}" — status.state=${st.state} (must be "success")`);
         pass = false;
       }
-    } else {
+    }
+    if (!found) {
       // Not found in either namespace
       failures.push(`Tier A (required): "${ctx}" — not found in check-runs or statuses (never ran)`);
       pass = false;
@@ -241,15 +323,76 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
 
   const requiredSet = new Set(requiredContexts);
 
+  // ---- Tier A+: locally-expected contexts (Tier A semantics, protection-independent) ----
+  // D-PR3b: jobs in EXPECTED_CONTEXTS must be present and passing regardless of
+  // whether they appear in branch protection. 'Source hygiene' is the primary
+  // example: it is not yet a required context (Open Decision 1), so without
+  // this tier, an absent or renamed job would yield exitCode=0. Absence is FAIL,
+  // not advisory — applies ADR-009, avoids PF-013.
+  for (const ctx of expectedContexts) {
+    if (requiredSet.has(ctx)) continue; // Already enforced in Tier A with full context
+    const crs = checksByName.get(ctx);
+    const st = statusByContext.get(ctx);
+    let found = false;
+
+    if (crs) {
+      found = true;
+      for (const cr of crs) {
+        if (cr.status !== 'completed' || cr.conclusion !== 'success') {
+          failures.push(
+            `Tier A+ (expected): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
+            `(locally-expected job must be completed+success, D-PR3b)`,
+          );
+          pass = false;
+        }
+      }
+    }
+    if (st) {
+      found = true;
+      if (st.state !== 'success') {
+        failures.push(`Tier A+ (expected): "${ctx}" — status.state=${st.state} (must be "success", D-PR3b)`);
+        pass = false;
+      }
+    }
+    if (!found) {
+      // ABSENCE IS FAIL — this is the central defect this tier exists to close.
+      // When source-hygiene is absent from check-runs, Tier B has nothing to
+      // iterate and would have emitted a PASS. Tier A+ prevents that.
+      failures.push(
+        `Tier A+ (expected): "${ctx}" — not found in check-runs or statuses (never ran). ` +
+        `This job must exist and pass; its absence is not evidence of success (D-PR3b, avoids PF-013)`,
+      );
+      pass = false;
+    }
+  }
+
   // ---- Tier B: non-required check-runs ----
   // failure/cancelled/timed_out/action_required/stale = FAIL
+  // not-yet-completed (queued/in_progress) = FAIL: a PASS must not be emitted
+  //   while an active check is still outstanding; the outstanding check might
+  //   later fail, rendering the verified SHA stale and the merge command unsafe.
+  //   avoids PF-017: indeterminate state must never read as success.
   // skipped/neutral = advisory (reported but not fatal)
   const TIER_B_FAIL = new Set(['failure', 'timed_out', 'cancelled', 'action_required', 'stale']);
   const TIER_B_ADVISORY = new Set(['skipped', 'neutral']);
 
   for (const cr of checkRuns) {
     if (requiredSet.has(cr.name)) continue; // Already handled in Tier A
-    if (cr.status !== 'completed') continue; // Still running — skip advisory
+    // Also skip if already handled in Tier A+
+    if (expectedContexts.includes(cr.name)) continue;
+
+    if (cr.status !== 'completed') {
+      // Non-completed non-required run: a queued or in_progress check means the
+      // CI suite is still running. Emitting a PASS while checks are outstanding
+      // would defeat the gate — the outstanding check might later fail.
+      // avoids PF-017: indeterminate state (not-yet-completed) is never success.
+      failures.push(
+        `Tier B (non-required): "${cr.name}" — status=${cr.status} (not yet completed; ` +
+        `must not merge while checks are still running)`,
+      );
+      pass = false;
+      continue;
+    }
     if (cr.conclusion == null) continue;
 
     if (TIER_B_FAIL.has(cr.conclusion)) {
@@ -266,7 +409,12 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   // in state=error due to account-plan limits — not a workflow in this repo.
   for (const st of statuses) {
     if (requiredSet.has(st.context)) continue; // Already handled in Tier A
-    if (st.state !== 'success' && st.state !== 'pending') {
+    if (st.state === 'pending') {
+      // Asymmetric with Tier B (which FAILs on not-yet-completed runs): a
+      // non-required pending status is advisory only, but it must not be
+      // silently swallowed — the caller cannot know if this is benign.
+      lines.push(`  advisory (Tier C): "${st.context}" — state=pending (not yet resolved)`);
+    } else if (st.state !== 'success') {
       lines.push(`  advisory (Tier C): "${st.context}" — state=${st.state}`);
     }
   }
@@ -277,7 +425,11 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
   }
 
   if (pass) {
-    const cmd = `gh pr merge --squash --match-head-commit ${headSha}`;
+    // D-PR5: --admin is required because main is protected and the sole
+    // code-owner cannot self-approve. Emit it here so the operator can
+    // copy the command verbatim without hand-editing (avoids PF-017: a
+    // hand-edited command is where --match-head-commit gets dropped).
+    const cmd = `gh pr merge --squash --admin --match-head-commit ${headSha}`;
     lines.push(`✓ PASS — all ${nRequired} required contexts completed+success`);
     lines.push(`  Verified SHA: ${headSha}`);
     lines.push(`  Merge command: ${cmd}`);
@@ -302,7 +454,9 @@ export function evaluateChecks({ requiredContexts, checkRuns, statuses, headSha 
 // ---------------------------------------------------------------------------
 
 function ghVersion() {
-  const r = spawnSync('gh', ['--version'], { encoding: 'utf8' });
+  // Short timeout: --version is a local binary probe with no network I/O.
+  // ETIMEDOUT sets r.error → null return → main() exits 2 (indeterminate).
+  const r = spawnSync('gh', ['--version'], { encoding: 'utf8', timeout: 10_000 });
   if (r.error || r.status !== 0) return null;
   // Output: "gh version 2.88.1 (2026-07-17)"
   const m = r.stdout.match(/gh version (\d+)\.(\d+)/);
@@ -365,15 +519,40 @@ export function fetchCheckRuns(headSha, runner) {
 
 /**
  * Fetch commit statuses for a sha.
+ *
+ * The combined-status endpoint caps at 30 statuses per response and offers no
+ * pagination. If total_count exceeds what was returned, a required context
+ * backed by a status beyond position 30 would be falsely reported as 'never
+ * ran'. Fail closed (exit 2) rather than silently evaluate a partial set —
+ * consistent with D-PR4a's total_count assertion on check-runs.
+ *
  * @returns {{ ok: true, statuses: CommitStatus[] } | { ok: false, exitCode: 2, message: string }}
  */
 export function fetchStatuses(headSha, runner) {
-  const url = `/repos/{owner}/{repo}/commits/${headSha}/status`;
+  // per_page=100 requests the maximum from the combined-status endpoint so that
+  // a context at position 31+ is not silently missed. D-PR4a parity: assert
+  // returned count against total_count and fail closed on any shortfall.
+  const url = `/repos/{owner}/{repo}/commits/${headSha}/status?per_page=100`;
   const data = runner(['api', url]);
   if (data.__error) {
     return { ok: false, exitCode: 2, message: `commit-status API error: ${data.stderr}` };
   }
-  return { ok: true, statuses: data.statuses ?? [] };
+  const statuses = data.statuses ?? [];
+  // D-PR4a parity: combined-status returns at most 30 statuses with no pagination.
+  // If total_count exceeds the returned count, we have a partial view and must
+  // fail closed rather than evaluate an incomplete set.
+  const totalCount = data.total_count ?? statuses.length;
+  if (totalCount > statuses.length) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message:
+        `commit-status endpoint returned ${statuses.length} of ${totalCount} statuses — ` +
+        `at least one status may be missing (API cap at 30). ` +
+        `A required context beyond position 30 would be falsely reported as never-ran.`,
+    };
+  }
+  return { ok: true, statuses };
 }
 
 /**
@@ -386,6 +565,10 @@ export function fetchStatuses(headSha, runner) {
  * deprecated `contexts` would silently yield an empty required set — and an
  * empty required set is a vacuous pass, not a pass.
  *
+ * Error objects from defaultGhRunner carry `httpStatus` (parsed from gh's stderr
+ * format "gh: <message> (HTTP NNN)") rather than the process exit code, which
+ * is always 1 regardless of the HTTP status. Callers branch on `httpStatus`.
+ *
  * @returns {{ ok: true, contexts: string[], resolvedBranch: string, notes: string[] }
  *          | { ok: false, exitCode: 2, message: string }}
  */
@@ -395,7 +578,7 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
   const data = runner(['api', url]);
 
   if (data.__error) {
-    if (data.status === 404) {
+    if (data.httpStatus === 404) {
       const message = requiredFrom
         ? `--required-from branch "${requiredFrom}" has no protection (404)`
         : `base branch "${baseBranch}" has no protection (404). ` +
@@ -403,7 +586,7 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
           `(AC-29: an unprotected base is not a pass — D-PR2)`;
       return { ok: false, exitCode: 2, message };
     }
-    if (data.status === 403) {
+    if (data.httpStatus === 403) {
       return {
         ok: false,
         exitCode: 2,

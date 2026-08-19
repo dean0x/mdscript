@@ -68,7 +68,8 @@ grep -rn 'since = ' crates/ --include='*.rs'
 node scripts/verify-no-control-bytes.mjs
 npm run test:gates                           # positive-control spec suite
 # Before any --admin merge (PF-017 guard — cancelled runs read as green):
-node scripts/verify-pr-checks.mjs <pr-number>
+PR_NUMBER=NNN  # replace NNN with the bump PR number
+node scripts/verify-pr-checks.mjs "$PR_NUMBER"
 
 # Packaging spot-check (inspect tarball contents)
 npm pack -w @mdscript/mds --dry-run
@@ -108,11 +109,12 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
    ```
    On exit 0 the script prints the exact merge command — copy and run it verbatim:
    ```bash
-   gh pr merge --squash --match-head-commit <headSha>
+   gh pr merge --squash --admin --match-head-commit <headSha>
    ```
-   (`main` is protected; the sole code-owner can't self-approve so `--admin` is
-   required. `--match-head-commit` closes the TOCTOU window between verification
-   and merge.)
+   (`--admin` is required because `main` is protected and the sole code-owner
+   cannot self-approve. `--match-head-commit` closes the TOCTOU window between
+   verification and merge. Both flags are emitted by the script — copy the
+   printed command without modification.)
 3. **Tag the merged commit and push:**
    ```bash
    git tag -a vX.Y.Z -m vX.Y.Z
