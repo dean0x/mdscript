@@ -36,11 +36,9 @@ pub const KNOWN_LINT_RULES: &[&str] = rules::ALL_RULE_NAMES;
 /// AD-224-1: this is NOT an error. Under the 2026-08-12 ruling, an unknown rule name
 /// warns and lint continues — the rule simply has no effect. See [`find_unknown_rule_names`].
 ///
-/// The names are sorted lexicographically. This type is `#[non_exhaustive]`:
-/// use the [`UnknownRuleNames::names`] accessor, not a struct literal.
-///
-/// This type is `#[non_exhaustive]` per ADR-010. It is constructible only through
-/// the library — external crates MUST NOT build it via a struct literal.
+/// The names are sorted lexicographically. This type is `#[non_exhaustive]` per ADR-010:
+/// use the [`UnknownRuleNames::names`] accessor, not a struct literal. External crates
+/// MUST NOT construct it directly.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct UnknownRuleNames {
@@ -89,7 +87,7 @@ impl UnknownRuleNames {
 /// ]);
 /// let u = find_unknown_rule_names(&mixed).expect("should have unknown");
 /// assert_eq!(u.names(), &["no-such-rule".to_string()]);
-/// assert_eq!(KNOWN_LINT_RULES.len(), 10);
+/// assert!(!KNOWN_LINT_RULES.is_empty());
 /// ```
 pub fn find_unknown_rule_names(rules: &HashMap<String, Severity>) -> Option<UnknownRuleNames> {
     let unknowns: Vec<String> = rules
@@ -215,9 +213,7 @@ impl LintConfig {
     /// about unknown rule names (the 2026-08-12 ruling: unknown names warn and lint
     /// continues — the silence is the only thing that changes). The return type
     /// carries the unknowns report alongside the config so the caller cannot
-    /// accidentally omit the detection step — compare with [`LintConfig::from_rules`],
-    /// where forgetting a follow-up [`find_unknown_rule_names`] call silently reverts
-    /// to the pre-warning behaviour on that surface (R12 in the PR plan).
+    /// accidentally omit the detection step.
     ///
     /// Marked `#[must_use]` — the compiler emits a warning if the return value is
     /// discarded entirely, making it structurally harder to drop the unknowns report.
@@ -259,47 +255,6 @@ impl LintConfig {
     ) -> (Self, Option<UnknownRuleNames>) {
         let unknown = find_unknown_rule_names(&rules);
         (LintConfig { rules }, unknown)
-    }
-
-    /// Construct a `LintConfig` with the given per-rule severity overrides.
-    ///
-    /// This is the supported construction path for external crates — struct literals
-    /// are not available because this type is `#[non_exhaustive]`.
-    ///
-    /// Per Rust API guidelines (C-CTOR): constructors are named `new`, `from_*`,
-    /// or `with_*` only when taking `self`. This function does not take `self`,
-    /// so it is named `from_rules`.
-    ///
-    /// **Prefer [`LintConfig::from_rules_checked`]** — it returns the unknowns report
-    /// in a single call, making it structurally impossible to miss the detection step.
-    /// `from_rules` remains available for external crates that have already performed
-    /// the unknowns check separately; it will not be removed without a major-version bump.
-    ///
-    /// Unknown rule names in the map do not cause this constructor to fail — the rule
-    /// simply has no effect, and lint continues. mds-core itself emits no warning;
-    /// call [`find_unknown_rule_names`] on the same map before passing it here if you
-    /// need to inspect or surface those names.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::collections::HashMap;
-    /// #[allow(deprecated)]
-    /// use mds::{LintConfig, Severity};
-    /// #[allow(deprecated)]
-    /// let config = LintConfig::from_rules(HashMap::from([
-    ///     ("unused-variable".to_string(), Severity::Off),
-    /// ]));
-    /// assert_eq!(config.severity_for("unused-variable"), Some(&Severity::Off));
-    /// ```
-    #[deprecated(
-        since = "0.4.0",
-        note = "prefer `LintConfig::from_rules_checked`, which returns the unknowns report \
-                in one atomic call — all built-in callers have migrated"
-    )]
-    #[must_use]
-    pub fn from_rules(rules: HashMap<String, Severity>) -> Self {
-        LintConfig { rules }
     }
 
     /// Look up the configured severity for a rule name.
@@ -347,6 +302,25 @@ mod tests {
         assert!(
             msg.starts_with("unknown lint rules: 'aaa-bad', 'mmm-bad', 'zzz-bad'; "),
             "offenders must be sorted lexicographically; got: {msg}"
+        );
+    }
+
+    /// AC-224-3 (byte pin): plural branch output is byte-identical to the canonical
+    /// `format!`/`join` equivalent. The singular branch is already pinned via
+    /// `assert_eq!` in `warning_singular_names_rule_and_full_registry`; this closes
+    /// the gap for the plural branch (complexity-11). The hand-rolled `push_str` join
+    /// in `format_unknown_rule_names_warning` is justified by WASM binary size
+    /// (AC-224-18) and must stay; this test is the accuracy contract for it.
+    #[test]
+    fn warning_plural_byte_identical_to_format_equivalent() {
+        let msg = format_unknown_rule_names_warning(&unknowns(&["aaa-bad", "zzz-bad"]));
+        assert_eq!(
+            msg,
+            format!(
+                "unknown lint rules: 'aaa-bad', 'zzz-bad'; recognised rules are: {}; ignoring",
+                KNOWN_LINT_RULES.join(", ")
+            ),
+            "plural branch must be byte-identical to the canonical format!/join form"
         );
     }
 

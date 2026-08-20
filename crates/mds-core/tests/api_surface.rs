@@ -1086,10 +1086,6 @@ fn lint_api_signatures_exist() {
 /// L-API-2: pub types LintDiagnostic, Severity, LintConfig, LintResult are accessible
 /// and have the expected fields/variants.
 #[test]
-#[expect(
-    deprecated,
-    reason = "L-API-2: pins LintConfig::from_rules deprecated constructor for surface coverage; fires unfulfilled_lint_expectations if the deprecation is removed"
-)]
 fn lint_types_exist() {
     // Severity has four variants with lowercase serde names.
     let _off = Severity::Off;
@@ -1098,7 +1094,7 @@ fn lint_types_exist() {
     let _err = Severity::Error;
 
     // LintConfig has a `rules` field (HashMap<String, Severity>).
-    let config = LintConfig::from_rules(HashMap::from([(
+    let (config, _) = LintConfig::from_rules_checked(HashMap::from([(
         "unused-variable".to_string(),
         Severity::Off,
     )]));
@@ -1138,17 +1134,13 @@ fn lint_types_exist() {
 ///
 /// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
 /// - It contains exactly the ten registered rule names.
-/// - Every entry in the registry is accepted by `LintConfig::from_rules` without
-///   error or warning (exercises the deprecated constructor for surface coverage).
+/// - Every entry in the registry is accepted by `LintConfig::from_rules_checked` without
+///   unknowns.
 /// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
 ///   maps containing unknown names.
 /// - `UnknownRuleNames` exposes names via accessor, not a public field, and is
 ///   only constructible through the library.
 #[test]
-#[expect(
-    deprecated,
-    reason = "AC-224-7: pins LintConfig::from_rules deprecated constructor for surface coverage; fires unfulfilled_lint_expectations if the deprecation is removed"
-)]
 fn known_lint_rules_and_unknown_detection() {
     use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
 
@@ -1177,12 +1169,12 @@ fn known_lint_rules_and_unknown_detection() {
         "KNOWN_LINT_RULES must match the expected sorted list"
     );
 
-    // AC-224-8: every known rule is accepted by from_rules without unknowns.
+    // AC-224-8: every known rule is accepted by from_rules_checked without unknowns.
     let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
         .iter()
         .map(|&n| (n.to_string(), Severity::Warn))
         .collect();
-    let _config = LintConfig::from_rules(all_known.clone());
+    let (_config, _u) = LintConfig::from_rules_checked(all_known.clone());
     assert!(
         find_unknown_rule_names(&all_known).is_none(),
         "all-known rules map must produce no unknowns"
@@ -1229,8 +1221,7 @@ fn known_lint_rules_and_unknown_detection() {
 /// - Both arms return a usable `LintConfig` (lint always continues).
 /// - `from_rules_checked` is `#[must_use]`: the compiler warns if the caller
 ///   discards the return value entirely, making it structurally harder to miss
-///   the detection step compared with calling `from_rules` and `find_unknown_rule_names`
-///   separately.
+///   the detection step.
 #[test]
 fn from_rules_checked_structurally_returns_unknowns() {
     use mds::{LintConfig, KNOWN_LINT_RULES};
@@ -1672,12 +1663,9 @@ fn fix_api_incremental_exists() {
 /// are affected. A single command is insufficient: `cargo clippy --workspace --all-targets
 /// -- -D warnings` emits 10 errors (all in fix.rs) and then cargo aborts compilation of
 /// the lib-test target; the integration-test (`api_surface`) target is never reached in
-/// that invocation. The two-command control:
-///   (1) `cargo clippy --workspace --all-targets -- -D warnings` → 10 errors, all fix.rs
-///   (2) `cargo clippy -p mds-core --test api_surface -- -D warnings` → 1 error, this file
-/// Total: exactly 11 unfulfilled_lint_expectations. All 10 fix.rs expectations fire on
-/// distinct deprecated calls — none is over-broad (none satisfied by a different deprecated
-/// item such as `LintConfig::from_rules`).
+/// that invocation. Run `cargo clippy --workspace --all-targets -- -D warnings` to verify.
+/// Total: exactly 10 unfulfilled_lint_expectations, all in fix.rs — one per deprecated
+/// `apply_fixes` call. All expectations are distinct; none is over-broad.
 ///
 /// All values constructed via named constructors, never struct literals (applies ADR-010).
 #[expect(

@@ -95,8 +95,8 @@ pub(crate) fn check(
                 let alias = imp.alias.as_deref().unwrap_or("");
                 let is_used =
                     ctx.used_namespaces.contains(alias) || ctx.used_include_aliases.contains(alias);
-                if !is_used
-                    && !builder.push(make_diag(
+                if !is_used {
+                    let diag = make_diag(
                         severity,
                         filename,
                         format!(
@@ -110,9 +110,10 @@ pub(crate) fn check(
                         ),
                         imp.offset,
                         "@import".len(),
-                    ))
-                {
-                    return;
+                    );
+                    if !builder.push(diag) {
+                        return;
+                    }
                 }
             }
             ImportKind::Selective => {
