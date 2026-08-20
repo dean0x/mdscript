@@ -826,11 +826,12 @@ describe('options-validation', () => {
 
     // Semantic: basePath: undefined is treated as absent ("value is intent") on the
     // wrapper side. The WASM guard checks != null so undefined passes through.
-    // On native, the per-surface builders drop the undefined value entirely, so napi's
+    // On native, `forwardOpts` (driven by METHOD_KEYS) drops undefined values with a
+    // `!= null` guard before the backend receives the object, so napi's
     // has_named_property("basePath") gate never sees the key. Both backends must agree.
     //
     // AC-P3-08 requires all FOUR methods: the file surfaces are the interesting half,
-    // because napi keys off property PRESENCE — if a builder ever forwarded
+    // because napi keys off property PRESENCE — if forwardOpts ever included
     // `basePath: undefined` verbatim, native would throw while WASM would not.
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-undef-'));
     const file = path.join(tmp, 'ok.mds');

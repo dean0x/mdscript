@@ -52,6 +52,17 @@ const _lintFileFromVar: LintFileOptions = _lintSrcVar;
 
 // ── AC-P3-16: all seven lint types are nameable from the browser entry ────────
 const _diagArr: LintDiagnostic[] = [];
+// testing-03: pins LintDiagnostic.help: string | null and .span: LintSpan | null.
+// Reverting either `| null` widening in types.ts causes TS2322 on these
+// assignments, making the breaking type change detectable at compile time.
+const _diagWithNulls: LintDiagnostic = {
+  rule: 'empty-block',
+  severity: 'error',
+  message: 'empty block',
+  help: null,
+  fixable: false,
+  span: null,
+};
 const _span: LintSpan = { offset: 0, length: 0 };
 const _report: LintFileReport = { file: 'a.mds', diagnostics: _diagArr };
 const _result: LintResult = { version: 1, files: [_report], truncated: false };
@@ -63,5 +74,5 @@ const _ruleName: LintRuleName = 'empty-block';
 const _sourceMap: SourceMapV3 = { version: 3, sources: ['input.mds'], names: [], mappings: '' };
 
 void _compileOpts; void _checkOpts; void _lintOpts; void _lintFileOpts; void _lintFileFromVar;
-void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;
+void _diagArr; void _diagWithNulls; void _span; void _report; void _result; void _severity; void _ruleName;
 void _sourceMap;

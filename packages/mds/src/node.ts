@@ -325,9 +325,10 @@ export function lint(source: string, options?: LintOptions): LintResult {
  * Lint an MDS file, resolving @import directives relative to the file.
  * Requires init() to have been called and awaited first.
  *
- * Non-async: basePath validation throws synchronously before any I/O, matching
- * the contract of compileFile/checkFile. Callers using `try { lintFile(f, opts) }
- * catch` capture both unknown-key and basePath errors synchronously.
+ * Non-async: all option-validation errors — unknown keys and basePath — throw
+ * synchronously before any I/O. Callers using `try { lintFile(f, opts) } catch`
+ * capture both error classes. `.catch()` on the returned promise does NOT receive
+ * option-validation errors.
  */
 export function lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
   if (options != null) {

@@ -85,6 +85,17 @@ declare const _lintSrcVar: LintOptions;
 // @ts-expect-error — LintOptions (basePath?: string) is not assignable to LintFileOptions (basePath?: never)
 const _lintFileFromVar: LintFileOptions = _lintSrcVar;
 
+// ── Inferred-object case (AC-P3-20 / testing-05) ─────────────────────────────
+// The PR description claimed that inferred-object variables (type inferred from
+// the literal, e.g. `{ basePath: string }`) are NOT rejected by file-surface
+// types. The compiler disagrees: TS2322 fires — `string` is not assignable to
+// `undefined` (the effective type of `basePath?: never`). The fixture encodes
+// the ACTUAL compiler behaviour and prevents the PR-description claim from
+// becoming silently true in a future TypeScript release.
+const _inferredWithBasePath = { basePath: '/some/dir' };
+// @ts-expect-error — { basePath: string } is rejected by CompileFileOptions (basePath?: never)
+const _compileFileFromInferred: CompileFileOptions = _inferredWithBasePath;
+
 // ── PR2 guard: rule-name and severity typing on LintOptions ──────────────────
 // D-224-1 ruling: an unrecognised RULE NAME is deliberately NOT a type error —
 // `rules` is `Record<string, RuleSeverity>` so configs naming a rule added in a
@@ -112,6 +123,17 @@ const _markdown: MarkdownResult = {
 // (browser types are verified in consumer-browser.ts; here we just confirm they
 // compile correctly when imported from the node entry.)
 const _diagArr: LintDiagnostic[] = [];
+// testing-03: pins LintDiagnostic.help: string | null and .span: LintSpan | null.
+// Reverting either `| null` widening in types.ts causes TS2322 on these
+// assignments, making the breaking type change detectable at compile time.
+const _diagWithNulls: LintDiagnostic = {
+  rule: 'unused-variable',
+  severity: 'warn',
+  message: 'variable is unused',
+  help: null,
+  fixable: false,
+  span: null,
+};
 const _span: LintSpan = { offset: 0, length: 0 };
 const _report: LintFileReport = { file: 'a.mds', diagnostics: _diagArr };
 const _result: LintResult = { version: 1, files: [_report], truncated: false };
@@ -123,6 +145,7 @@ void _compileOpts; void _checkOpts; void _lintOpts;
 void _compileFileOpts; void _compileFileBasePath;
 void _fileOpts; void _checkFileOpts; void _lintFileOpts;
 void _fileFromCompileVar; void _checkFileFromVar; void _lintFileFromVar;
+void _inferredWithBasePath; void _compileFileFromInferred;
 void _validRule; void _fwdCompat; void _badSeverity;
 void _sourceMap; void _markdown;
-void _diagArr; void _span; void _report; void _result; void _severity; void _ruleName;
+void _diagArr; void _diagWithNulls; void _span; void _report; void _result; void _severity; void _ruleName;
