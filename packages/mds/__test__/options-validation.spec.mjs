@@ -44,6 +44,21 @@ const require = createRequire(import.meta.url);
 describe('options-validation', () => {
   before(() => init());
 
+  // Shared test helpers used by multiple U-OV-* tests below.
+
+  /** Reusable virtual module set for lintVirtual cases. */
+  const VIRTUAL_MODS = { 'a.mds': '' };
+  const VIRTUAL_ENTRY = 'a.mds';
+
+  /**
+   * Call fn(), awaiting if it returns a Promise. Returns the thrown error
+   * message (sync or async) or an empty string if fn does not throw.
+   */
+  async function captureMsg(fn) {
+    try { await fn(); } catch (e) { return e instanceof Error ? e.message : String(e); }
+    return '';
+  }
+
   // ── compile: typo'd key ────────────────────────────────────────────────────
 
   test('U-OV-1: compile rejects unknown key "sourceMaps"', () => {
@@ -267,24 +282,6 @@ describe('options-validation', () => {
     // "unknown option key" format from both wrapper and napi.
     // 'sourceMaps' is a common typo for 'sourceMap'; not in any method's list.
     const BAD_OPT = { sourceMaps: true };
-
-    // Virtual modules for lintVirtual: modules must be valid before options are checked.
-    const VIRTUAL_MODS = { 'a.mds': '' };
-    const VIRTUAL_ENTRY = 'a.mds';
-
-    // Call fn(), awaiting if it returns a Promise. Returns the error message if fn
-    // throws (sync or async), or an empty string if it does not throw.
-    async function captureMsg(fn) {
-      try {
-        const result = fn();
-        if (result != null && typeof result === 'object' && typeof result.then === 'function') {
-          await result;
-        }
-      } catch (e) {
-        return e instanceof Error ? e.message : String(e);
-      }
-      return '';
-    }
 
     const cases = [
       {
@@ -625,14 +622,7 @@ describe('options-validation', () => {
     const file = path.join(tmp, 'ok.mds');
     fs.writeFileSync(file, 'Hello\n', 'utf8');
 
-    async function captureMsg(fn) {
-      try { await fn(); } catch (e) { return e instanceof Error ? e.message : String(e); }
-      return '';
-    }
-
     const { execFileSync } = await import('node:child_process');
-    const VIRTUAL_MODS = { 'a.mds': '' };
-    const VIRTUAL_ENTRY = 'a.mds';
 
     // Per-method cases: wrapperFn, addonFn, and wasmScript cover four surfaces.
     // lintFile and lintVirtual guards fire synchronously (before assertReady()),
@@ -760,14 +750,6 @@ describe('options-validation', () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-null-'));
     const file = path.join(tmp, 'ok.mds');
     fs.writeFileSync(file, 'Hello\n', 'utf8');
-
-    async function captureMsg(fn) {
-      try { await fn(); } catch (e) { return e instanceof Error ? e.message : String(e); }
-      return '';
-    }
-
-    const VIRTUAL_MODS = { 'a.mds': '' };
-    const VIRTUAL_ENTRY = 'a.mds';
 
     try {
       // All four file-surface methods must reject {basePath: null} with the same
@@ -932,16 +914,6 @@ describe('options-validation', () => {
 
     // Two unknown keys: triggers the plural "unknown option keys:" form.
     const BAD_OPT = { sourceMaps: true, varsJson: '{}' };
-    const VIRTUAL_MODS = { 'a.mds': '' };
-    const VIRTUAL_ENTRY = 'a.mds';
-
-    async function captureMsg(fn) {
-      try {
-        const r = fn();
-        if (r != null && typeof r === 'object' && typeof r.then === 'function') await r;
-      } catch (e) { return e instanceof Error ? e.message : String(e); }
-      return '';
-    }
 
     const cases = [
       { name: 'compile',     wrapperFn: () => compile('', BAD_OPT),                               addonFn: () => addon.compile('', BAD_OPT) },

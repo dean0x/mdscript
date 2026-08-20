@@ -123,12 +123,25 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
     },
 
     async lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+      // Defense in depth (PF-004): same contract as compileFile above — guard before
+      // the napi call so any future internal caller that bypasses the public wrapper
+      // cannot get the silent-drop semantics of forwardOpts (basePath absent from
+      // METHOD_KEYS.lintFile).
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'lintFile');
+        if (bpErr != null) throw bpErr;
+      }
       const result: unknown = await addon.lintFile(path, forwardOpts(options, 'lintFile'));
       assertResultShape(result, 'lint');
       return result as LintResult;
     },
 
     lintVirtual(modules: Record<string, string>, entry: string, options?: LintFileOptions): LintResult {
+      // Defense in depth (PF-004): same contract as compileFile above.
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'lintVirtual');
+        if (bpErr != null) throw bpErr;
+      }
       const result: unknown = addon.lintVirtual(modules, entry, forwardOpts(options, 'lintVirtual'));
       assertResultShape(result, 'lint');
       return result as LintResult;

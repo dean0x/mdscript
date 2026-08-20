@@ -123,6 +123,14 @@ function wrapWithFileOps(
     },
 
     async lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
+      // Defense in depth (PF-004): same contract as compileFile above — guard before
+      // the WASM call so any future internal caller that bypasses the public wrapper
+      // cannot get the silent-drop semantics of forwardOpts (basePath absent from
+      // METHOD_KEYS.lintFile).
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'lintFile');
+        if (bpErr != null) throw bpErr;
+      }
       // Use buildModulesMap so the WASM check gate can resolve @import chains,
       // matching the behaviour of the native lintFile (which uses NativeFs).
       // Note: entryFilename is project-root-relative (e.g. "templates/foo.mds"),
