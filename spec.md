@@ -895,7 +895,7 @@ echo "@if flag:" | mds check -             # Validate from stdin
 mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files.
+Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
 
 ### 7.4 `mds fmt`
 
@@ -1068,7 +1068,7 @@ escaped, in either mode.
 This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
-All four surfaces emit byte-identical values on the fields they share, with two exceptions. First, `"lint_warnings"` is a binding-surface-only key: it is absent from the CLI's `--format json` output (the CLI writes unknown-rule warnings to stderr instead). Second, the `"file"` key differs when the source is piped via stdin: `mds lint -` (CLI) relabels the internal virtual-FS key `"input.mds"` to `"<stdin>"` at the output boundary; the binding surfaces (`lintVirtual` / `lint` on napi, WASM, and Python) retain `"input.mds"`. All other fields — `message`, `help`, `rule`, `severity`, `span`, `fix_edits` — are byte-identical across all four surfaces.
+All four surfaces emit byte-identical values on the fields they share, with two exceptions. First, `"lint_warnings"` is a binding-surface-only key: it is absent from the CLI's `--format json` output (the CLI writes unknown-rule warnings to stderr instead). Second, the `"file"` key takes different values by surface and input method: `mds lint -` (CLI) relabels `"input.mds"` to `"<stdin>"` at the output boundary; the string-source `lint()` entrypoint on napi, WASM, and Python retains `"input.mds"`; `lintVirtual` (napi/WASM) and `lint_virtual` (Python) emit the caller-supplied entry key instead. The fields `message`, `help`, `rule`, `severity`, `span`, and `fix_edits` share the same Rust serializer across all surfaces and are designed to be byte-identical, but no live cross-surface differential test currently compares these fields between the CLI and binding surfaces on a source that produces findings — the existing parity test uses a clean source with no diagnostics. For source maps, the same stdin-relabeling asymmetry applies: `mds build -` (CLI) replaces the internal `"input.mds"` entry with `"<stdin>"` in `sources[]`; binding surface string-source compiles always carry `"input.mds"` in `sources[0]`, and virtual-FS compiles carry the caller-supplied entry key.
 
 ##### Mode is chosen per field, not per surface
 

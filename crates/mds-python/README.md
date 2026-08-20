@@ -9,12 +9,14 @@ the Node.js / WASM bindings. Output is byte-identical across every binding.
 pip install markdown-script
 ```
 
-> **Not yet on PyPI** — publishing and the `markdown-script` name registration are tracked in
-> [#132]. For now, build from source: `pip install ./crates/mds-python` (or `maturin
+> **Not yet on PyPI** — the `markdown-script` name registration and PyPI publishing are
+> tracked in [#292] (rename + registration) and [#132] (wheel matrix + PyPI publishing
+> pipeline). For now, build from source: `pip install ./crates/mds-python` (or `maturin
 > build -m crates/mds-python/Cargo.toml` to produce a wheel), with a Rust toolchain and
 > `python3` on `PATH`. Once published, wheels ship as `cp311-abi3` (CPython 3.11+, one
 > wheel per platform).
 
+[#292]: https://github.com/dean0x/mdscript/issues/292
 [#132]: https://github.com/dean0x/mdscript/issues/132
 
 ## Quick start
@@ -77,6 +79,9 @@ keyword-only; `scan_imports` takes its argument positionally.
   (`list[LintDiagnostic]`). `LintDiagnostic` carries `.rule`, `.severity`, `.message`,
   `.help` (`str | None`), `.fixable` (`bool`), `.fix_edits` (`list[dict] | None`), and `.span` (`Span | None`).
   `LintFileReport` and `LintDiagnostic` are frozen, picklable, and comparable by value.
+  **`files[].file` key:** `lint()` sets this to `"input.mds"` (string-source); `lint_file()` sets it to
+  the file's path; `lint_virtual()` sets it to the caller-supplied entry key. The CLI additionally
+  relabels stdin input as `"<stdin>"` — this asymmetry does not apply to the Python binding.
 
 ### Result objects
 

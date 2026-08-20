@@ -58,6 +58,8 @@ const lintResult = lint(source, { rules: { 'shadow-variable': 'warn' } });
 // entry: string — key of the entry module within modules.
 // Accepted option keys: vars, rules. (filename and modules are top-level args, not options.)
 const vResult = lintVirtual({ 'main.mds': source }, 'main.mds', { rules: {} });
+// files[].file key: lint() sets this to options.filename (default "input.mds");
+// lintVirtual() sets it to the caller-supplied entry key.
 ```
 
 ## Build

@@ -70,6 +70,8 @@ Static analysis. Returns the canonical lint JSON:
 Options: `basePath` (lint only — lintFile derives the base from the file path; lintVirtual resolves against the module map), `vars`, `rules` (`Record<string, "off"|"info"|"warn"|"error">`).
 Unknown rule names in `rules` emit a warning and lint continues — the unknown name has no effect but `result.lint_warnings` (a `string[]` field, absent when empty) is populated so callers can surface the issue; unknown severity values throw `mds::invalid_options`.
 
+**`files[].file` key:** `lint()` sets this to `"input.mds"` (string-source); `lintFile()` sets it to the file's path; `lintVirtual()` sets it to the caller-supplied entry key. The CLI additionally relabels stdin input as `"<stdin>"` — this asymmetry does not apply to the napi binding.
+
 See `index.d.ts` for the full typed surface.
 
 ## License

@@ -125,6 +125,7 @@ file-path methods derive the base directory from the file argument.
 // WASM backend: basePath throws mds::invalid_options (no filesystem access);
 // set MDS_BACKEND=native to use the native backend with import resolution.
 // {basePath: undefined} is treated as absent on both backends.
+// {basePath: ''} (empty string) is rejected — omit the key rather than passing an empty string.
 interface CheckOptions {
   vars?: Record<string, unknown>;
   basePath?: string;
@@ -190,11 +191,12 @@ interface InitOptions {
 
 **Unknown-option rejection:** passing an unrecognised key to a public method throws
 `Error { code: 'mds::invalid_options' }` before calling the backend; the error names
-the offending key(s) and lists the accepted keys. Exception: passing `basePath` to a
-file-path method (`compileFile` or `checkFile`) **throws synchronously** with a
-purpose-built message (same channel as unknown-key rejection); the message does not
-include an accepted-keys list. `.catch()` on the returned promise does not receive
-this error — use `try/catch` around the call.
+the offending key(s) and lists the accepted keys. **All option-validation errors throw
+synchronously** before any I/O begins — this includes unknown-key rejection from every
+method and the `basePath`-rejection guard on `compileFile`/`checkFile`. For the
+Promise-returning file-path methods (`compileFile`, `checkFile`, `lintFile`), `.catch()`
+on the returned promise does **not** capture option-validation errors — use `try/catch`
+around the call.
 
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
@@ -211,3 +213,5 @@ surfaces it appears in `lint_warnings`.
 // LintDiagnostic: { rule, severity, message, help?: string | null, fixable, fix_edits?: ... | null, span?: LintSpan | null }
 // help, span, and fix_edits are always-present keys in the JSON wire format; their value is null when absent.
 ```
+
+**`files[].file` key:** `lint()` sets this to `"input.mds"` (string-source); `lintFile()` sets it to the file's path; `lintVirtual()` sets it to the caller-supplied entry key. The CLI additionally relabels stdin input as `"<stdin>"` — this asymmetry does not apply to the binding surfaces.
