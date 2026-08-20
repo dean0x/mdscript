@@ -306,9 +306,10 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 /// this function's output so that the sort key matches the sanitized
 /// `files[].file` value emitted by `to_canonical_json` for diagnostic entries,
 /// keeping array position consistent with the emitted key order (AC-P1-10).
-/// Error-only entries (`{"file": …, "error": …}`) push the raw display path
-/// without a second sanitization pass — a pre-existing asymmetry; their array
-/// position is still determined by the sanitized sort key.
+/// Error-only entries (`{"file": …, "error": …}`) bypass `to_canonical_json`
+/// and therefore its own `sanitize_control_chars_wire` pass; they are instead
+/// pre-sanitized at the push site via `file_key` — so both diagnostic and
+/// error-only entry types carry identically-sanitized `file` values (ADR-008).
 ///
 /// Forward slashes (`/`, 0x2F) are used instead of
 /// the native backslash separator (`\`, 0x5C) because bytes in the range
@@ -319,7 +320,13 @@ fn set_diag_display_path(result: &mut mds::LintResult, display: &str) {
 /// relative to the emitted key order.
 fn relative_display(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
+    // Hardening: strip_prefix is verified UNREACHABLE today (both call sites pass
+    // ctx.lint_root and every entry originates from read_dir(dir)).  Filter to
+    // Normal components so the fallback degrades to a relative-looking path rather
+    // than joining RootDir/Prefix components into `//foo/bar.mds` (Unix) or
+    // `C:/\/foo/bar.mds` (Windows).
     rel.components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
         .map(|c| c.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
@@ -1367,11 +1374,11 @@ fn run_lint_directory(
             max_tally = tally;
         }
     }
-    // AD-216-5: assert the four-counter partition invariant in production code
-    // (per project reliability rule: "Assert preconditions and invariants in
-    // production code — not just tests").  Zero release-build cost: debug_assert!
-    // compiles away in release mode.  Catches a future early continue inserted
-    // into the per-file loop body that would silently undercount the summary.
+    // AD-216-5: dev-only tripwire for the four-counter partition invariant (avoids PF-005
+    // in intent, not in substance — debug_assert_eq! compiles away in release mode).
+    // A future early-continue in the per-file loop would silently undercount in shipped
+    // binaries; release consequence: a miscounted status line or spurious --quiet
+    // suppression, never data corruption.
     debug_assert_eq!(
         clean_count + warn_file_count + error_file_count + limit_file_count,
         files.len(),
@@ -1405,9 +1412,11 @@ fn run_lint_directory(
     // governed only by --quiet.
     //
     // AD-216-4: format — `{clean} clean, {warn} with warnings, {error} with errors,
-    // {limit} resource-limited`.  Fixed arity, comma-separated; matches the sibling
-    // shape used by `build`/`check`/`fmt` and keeps the line greppable across all
-    // summary-emitting subcommands.
+    // {limit} resource-limited`.  Fixed arity, comma-separated.  Lint uses
+    // deliberately distinct vocabulary from the sibling subcommands (`build`/`check`/
+    // `fmt` all end in "N failed"): the four-bucket partition expresses distinct failure
+    // modes (warn-only vs error vs resource-limit) not captured by a single "failed"
+    // count.  The format is pinned by spec §7.5 and tests.
     if !quiet || error_file_count > 0 || limit_file_count > 0 {
         eprintln!(
             "{clean_count} clean, {warn_file_count} with warnings, \
