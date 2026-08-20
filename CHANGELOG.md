@@ -7,6 +7,387 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### **BREAKING** — lint JSON wire contract (#202, #203, #211)
+
+#### Lint JSON wire contract (#202, #203, #211)
+
+> This block is the **single wire-change ledger** for the lint JSON envelope.
+> Later changes to `mds lint --format json` append here rather than opening a
+> parallel section, so a consumer has one place to read.
+
+**Before / after**, for `mds lint - --format json` on a source with one unused
+selective import:
+
+```jsonc
+// abbreviated — see spec.md for the full schema
+// before
+{ "files": [ { "diagnostics": [
+    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } },
+    { "rule": "unused-import",    "span": { "length": 7, "offset":  0 } }
+  ], "file": "input.mds" } ], "truncated": false, "version": 1 }
+
+// after
+{ "files": [ { "diagnostics": [
+    { "rule": "unused-import",    "span": { "length": 5, "offset": 10 } },
+    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } }
+  ], "file": "<stdin>" } ], "truncated": false, "version": 1 }
+```
+
+**A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
+output, matches `<source>` in a rendered diagnostic frame (stderr only — the JSON
+`error.message` field cannot carry source identity; no `MdsError` Display template
+interpolates `ctx.file_str`, per AD-211-5), relies on
+`diagnostics[]` arriving in rule-execution order, assumes `unused-import`
+spans have length 7, relies on the `mds lint <dir>` file-group order being
+component-wise (`Path::Ord`), or on Windows assumes `files[].file` values use
+the native backslash separator. File groups are now ordered by the byte-wise string
+of the relative display path (e.g. `api-utils.mds` sorts before `api/x.mds`
+because `'-'` (0x2D) < `'/'` (0x2F)). On Windows, `relative_display` normalises
+path separators to forward slashes, so a nested path that previously appeared as
+`sub\c.mds` in the JSON now appears as `sub/c.mds`; a consumer that string-matches
+or splits on `\` in `files[].file` values will silently fail to match.
+
+**1. Diagnostics are sorted by byte offset (#202).** Within each
+`files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`
+for results produced by the lint engine; a `LintResult` assembled directly via
+`LintResult::new` is emitted in the order the caller supplied.
+Previously the order was rule-execution order (implementation-defined).
+
+- Diagnostics without a span sort to the end of their file group.
+- Equal-offset diagnostics preserve rule-execution order (stable sort).
+- File groups have a defined order: `mds lint <dir>` sorts `files[]` by the
+  byte-wise (lexicographic) string comparison of the relative display path — e.g.
+  `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'` (0x2F).
+  This is a CLI directory-mode contract only: the binding surfaces (napi / WASM /
+  Python) lint a single entry source, so their `files[]` array never carries more
+  than one entry.
+- Ordering is established on `LintResult.diagnostics` itself, so the CLI human
+  path and the napi / WASM / Python surfaces observe the same order.
+- **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is
+  `true`, the retained diagnostics are still the first `MAX_DIAGNOSTICS` (1,000)
+  in rule-execution order, re-sorted afterwards — not the 1,000 smallest offsets.
+- **Sort cost (AC-P1-22):** The sort key is a borrowed tuple `(bool, &str, bool,
+  usize)` — zero per-comparison heap allocations. The sort runs at most once per
+  `LintResultBuilder::build` call over n <= `MAX_DIAGNOSTICS` (1,000) items.
+
+**2. The stdin source identity is `<stdin>` (CLI only — see below) (#211).** Every CLI context
+that names a stdin source now uses the single sentinel `<stdin>`:
+
+- the JSON `files[].file` key (previously `"input.mds"`, the internal VFS key);
+- human diagnostic frames for `mds lint -` (previously `input.mds`);
+- fix-preview status lines and diff headers (previously bare `stdin`);
+- the **analysis-failure envelope** — a stdin source that fails the check gate
+  used to render `<source>:L:C`, the resolver's internal label. `mds check -` and
+  `mds build -` rendered `<source>` on the same path and now render `<stdin>`
+  too, so all four subcommands agree.  Note: the analysis-failure JSON envelope
+  shape is `{"version":1,"error":{"code","message","help","span"}}` — it carries
+  **no `file` key** (unlike the success envelope which has `files[].file`).  A
+  JSON consumer reading `error` results MUST NOT look for a `file` key there.
+
+`mds::STRING_SOURCE_MAP_LABEL` is **unchanged** and remains `"input.mds"`: it is a
+virtual-FS entry key, not a display label. The napi, WASM and Python lint APIs
+continue to report `"input.mds"` for string-source input. The relabel is applied
+only at the CLI output boundary.
+
+**Zero-diagnostic behaviour:** when stdin lint completes with no findings, the
+JSON is `{"files":[],"truncated":false,"version":1}` — no file entry. The
+`<stdin>` sentinel appears in `files[0].file` only when at least one diagnostic is
+emitted. This matches non-stdin zero-diagnostic behaviour and keeps the JSON
+identical across the CLI and binding surfaces (napi, WASM, Python) for the clean
+case.
+
+**3. `unused-import` spans anchor at the unused name (#203).** For selective
+imports (`@import { name1, name2 } from "path"`), the span now covers the unused
+name rather than the `@import` keyword, and `span.length` is the name's length
+instead of a constant 7. Alias imports (`@import "path" as alias`) are unchanged —
+their span still covers the `@import` keyword.
+
+#### New `fix_edits` field on `LintDiagnostic`
+
+`LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;
+an array of `{start, end, new_text}` byte-span edit objects when fixable). This
+field is present across all binding surfaces: CLI JSON output, napi
+(`LintDiagnostic.fix_edits?: …`), WASM, and Python
+(`LintDiagnostic.fix_edits: list[dict] | None`).
+
+#### `Fixed: <path>` and `Would fix: <path>` now emitted in JSON directory mode
+
+`mds lint --fix <dir>` (with `--format json`) now emits `Fixed: <path>` to stderr per
+fixed file, and `mds lint --fix --check <dir>` (with `--format json`) emits
+`Would fix: <path>` per file with pending fixes. Previously both lines appeared only in
+`--format human` mode. Both are suppressed under `--quiet`. The JSON document on stdout
+is unchanged. **A CI job that asserts zero stderr from these invocations on a non-quiet
+run will now receive output when any file is fixed or has fixable issues.**
+
+### **BREAKING** — Error/lint messages now carry `\uXXXX` literals for embedded control bytes (#176)
+
+Across the JS / Python / WASM API surfaces, `err.message`, `err.help`, and lint
+`LintDiagnostic.message` / `LintDiagnostic.help` now contain six-character `\uXXXX`
+Unicode escape literals (e.g. `\u001B`, `\u007F`, `\u0085`) wherever MDS source
+content caused raw C0-minus-`\n`/`\t`, DEL (U+007F), or C1 (U+0080–U+009F) control
+bytes to appear in error or diagnostic messages.
+
+**Not affected:** `span.offset`, `span.length`, and `fix_edits` byte ranges are raw
+byte offsets and are never sanitized. The `rule` field is a fixed ASCII identifier.
+The `"file"` key in lint JSON output is sanitized on the same pass as `message`/`help`.
+
+**Migration:** consumers that test for exact control byte sequences in error or
+diagnostic messages must update to check for the `\uXXXX` literal form instead.
+
+### **BREAKING** — Options validation, directory walker, source-map labels, check API (#196)
+
+- **`@mdscript/mds` now rejects unknown option keys** with
+  `Error { code: 'mds::invalid_options' }` before forwarding to the backend. Previously
+  unrecognized keys were silently passed through (napi and WASM backends would reject
+  them, but the universal JS wrapper did not validate). Callers with typos in option
+  objects will now get immediate, accurate error messages. (#196)
+
+- **`CheckOptions` is now split from `CompileOptions`** in `@mdscript/mds`.
+  `check()` accepts `{ vars?, basePath? }` (via `CheckOptions`); `checkFile()` accepts
+  `{ vars? }` only — `CheckFileOptions` declares `basePath?: never`, so passing a non-null
+  `basePath` to `checkFile` throws `mds::invalid_options` synchronously. Source-map options
+  (`sourceMap`, `sourcesContent`) are not valid for either check call and are rejected with
+  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`. TS interface
+  implementers: `check` narrows to `CheckOptions`; `checkFile` narrows to `CheckFileOptions`
+  (amended by #180). Non-`strict`-mode TypeScript consumers who guard on
+  `diag.span !== undefined` must update to `diag.span != null` — `help` and `span` on
+  `LintDiagnostic` are now typed as `... | null` so the `!== undefined` guard no longer
+  catches `null` values. (#196)
+
+- **String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
+  across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
+  output for `compile(src, {sourceMap:true})` / `compile_str*` / WASM `compile` now reads
+  `"input.mds"` instead of `"<source>"`. CLI stdin builds use `"<stdin>"` (unchanged).
+  Code inspecting `sources[0]` for the string `"<source>"` must be updated. (#196)
+
+- **Directory walker now excludes hidden directories and `node_modules` by default**
+  across all subcommands (`mds build`, `mds check`, `mds watch`, `mds fmt`,
+  `mds lint`). Directories whose name starts with `.` (e.g. `.git`, `.venv`) and
+  `node_modules` are silently skipped during recursive traversal. Templates inside these
+  directories are no longer compiled, formatted, or linted in directory mode. (#196)
+
+- **`mds check` summary wording changed** from `N checked` to `N passed, M
+  failed`. Scripts parsing CLI output must be updated. (#196)
+
+- **lint `--format json` `"file"` keys are now full relative paths** in directory mode.
+  When running `mds lint --format json .`, the `"file"` key in each JSON result is now
+  the path relative to the lint root (e.g. `"src/template.mds"`) rather than just the
+  basename (e.g. `"template.mds"`). This prevents key collisions when two different
+  files have the same filename. (#196)
+
+- **`mds-core::CompileOptions` gained `source_map_base: Option<PathBuf>`**.  Rust code
+  that initializes `CompileOptions` with a struct literal must either add
+  `source_map_base: None` or use the `..Default::default()` tail.  Binding surfaces
+  (napi, Python, WASM) are not affected. (#3)
+
+### **BREAKING** — File-method `basePath` rejection, TypeScript option types, and WASM `basePath` rejection (#180, #213)
+
+#### `compileFile` and `checkFile` now reject `basePath` (#180)
+
+`compileFile(path, options?)` and `checkFile(path, options?)` previously accepted a
+`basePath` option and silently discarded it — the option passed the unknown-key
+validator but was dropped before the backend was reached, so file resolution always
+used the directory containing the path. Both functions now **throw synchronously**
+(`Error { code: 'mds::invalid_options' }`) when `basePath` is non-null. The base
+directory for file-based operations is always derived from the file path itself.
+
+**Migration:** remove `basePath` from any options object passed to `compileFile` or
+`checkFile`. This throw is **synchronous** — `.catch()` on the returned promise does
+not receive it; wrap the call in `try/catch`. This is also a **compile-time break**
+when a variable typed as `CompileOptions` or `CheckOptions` is passed to these
+functions — see the compatibility notes below. Audit all call sites.
+
+#### `FileOptions` no longer extends `CompileOptions` (#213)
+
+`FileOptions` (used by `compileFile`) was previously declared as
+`interface FileOptions extends CompileOptions`. This inheritance was an error:
+`CompileOptions` now carries `basePath`, which is not valid for file-based
+operations. `FileOptions` is now a standalone interface with its own `vars`,
+`sourceMap`, and `sourcesContent` fields.
+
+**Compatibility:** this change is a **compile-time break** for code that passes a
+`CompileOptions`-typed variable to `compileFile`. After this PR, `CompileOptions`
+carries `basePath?: string` while `FileOptions` declares `basePath?: never`;
+TypeScript reports `"Types of property 'basePath' are incompatible"` at any such
+assignment or call. Code that never reuses a string-surface options variable for
+file operations compiles without changes.
+
+**Migration for shared variables:** retype the variable as `FileOptions`, or
+destructure only the accepted fields:
+```ts
+const { vars, sourceMap, sourcesContent } = compileOpts;
+compileFile(path, { vars, sourceMap, sourcesContent });
+```
+
+#### `checkFile` parameter type changed from `CheckOptions` to `CheckFileOptions` (#213)
+
+`checkFile(path, options?)` previously accepted `CheckOptions`. After this PR,
+`CheckOptions` carries a `basePath` field that is not valid for file-based operations;
+the parameter is now typed as `CheckFileOptions` — a new interface with only
+`vars?: Record<string, unknown>`.
+
+**Compatibility:** this type narrowing is a **compile-time break** for code that
+passes a `CheckOptions`-typed variable to `checkFile`. `CheckOptions` carries
+`basePath?: string` while `CheckFileOptions` declares `basePath?: never`; TypeScript
+reports `"Types of property 'basePath' are incompatible"` at any such call. Code
+that never reuses a string-surface variable for `checkFile` compiles without changes.
+
+**Migration for shared variables:** retype the variable as `CheckFileOptions`, or
+restrict it to `{ vars?: Record<string, unknown> }` at the call site.
+
+#### `LintFileOptions` gained `basePath?: never` (#213)
+
+`LintFileOptions` (used by `lintFile` and `lintVirtual`) previously had the shape
+`{ vars?, rules? }`. It now declares `basePath?: never`.
+
+**Compatibility:** this is a **compile-time break** for code that assigns a variable
+whose inferred type includes a `basePath` field to a `LintFileOptions`-typed slot.
+For example, passing a `LintOptions`-typed variable directly to `lintFile` or
+`lintVirtual` now fails with `TS2322` — `LintOptions.basePath` is `string | undefined`
+which is not assignable to `never`. Code that passes a fresh object literal without
+`basePath`, or a variable that was already typed as `{ vars?, rules? }`, continues to
+compile unchanged.
+
+**Migration:** at each `lintFile` / `lintVirtual` call site that passes a
+`LintOptions`-typed variable, either extract a narrowed copy
+(`const { basePath: _unused, ...fileOpts } = opts`) or redeclare the variable as
+`LintFileOptions` when `basePath` was never meaningful there.
+
+#### WASM backend rejects `basePath` on string-surface methods (#180)
+
+`compile(source, { basePath: '/dir' })` and `check(source, { basePath: '/dir' })`
+previously silently ignored `basePath` on the WASM backend. They now throw
+`Error { code: 'mds::invalid_options' }`. `lint(source, { basePath: '/dir' })` was
+already documented as WASM-unsupported; it now enforces this at runtime too.
+
+**Migration:** switch to the native backend (`MDS_BACKEND=native`) when you need
+import resolution with a `basePath` in WASM environments.
+
+### **BREAKING** — Interpolation syntax: `{x}` → `{{x}}` (#236)
+
+Interpolation now uses **double braces**: `{{variable}}`, `{{obj.field}}`,
+`{{func("arg")}}`, `{{alias.func()}}`. Single `{` and `}` are always **literal
+text** — no escaping needed for lone braces.
+
+#### Interpolation syntax changed (#236)
+
+Templates using the old `{var}` form will no longer interpolate — they will emit
+the literal text `{var}` instead. This affects every template that uses variable
+substitution, function calls, or dynamic message roles.
+
+**Migration:** run `mds lint --fix` to auto-migrate (the `legacy-interpolation`
+lint rule, Tier A, rewrites every `{x}` → `{{x}}` in one pass), then run
+`mds fmt` to normalize formatting.
+
+```
+# One-command migration for a project:
+mds lint --fix && mds fmt
+```
+
+#### Escape syntax changed
+
+- Old: `\{` → literal `{`, `\}` → literal `}` — **deleted**; these escapes are
+  no longer recognized (single braces are ordinary text and need no escaping).
+- New: `\{{` → literal `{{` in output. Use this only when you need `{{` as
+  literal text in the output (e.g. inside a Jinja/Python f-string example).
+
+#### `@message {{role}}:` dynamic roles
+
+Dynamic message roles now use double braces: `@message {{role}}:` instead of
+`@message {role}:`. Bare-word roles (`@message system:`) are unchanged.
+
+#### `LintDiagnostic` is now `#[non_exhaustive]`; use the constructor, not struct literals
+
+`LintDiagnostic` is marked `#[non_exhaustive]` so future minor releases can add
+fields without a breaking change. External Rust crates can no longer construct it
+via a struct literal. Use `LintDiagnostic::new(rule, severity, message)` to create
+a diagnostic with required fields and all optional fields defaulting to `None`, then
+chain the builder methods `with_help`, `with_span`, `with_file`, `with_fix_removals`,
+and `with_fix_edits` to set optional fields.
+
+#### Nine additional public types are now `#[non_exhaustive]`; migrate struct literals to constructors
+
+The following types are marked `#[non_exhaustive]` so future minor releases can add
+fields without a breaking change. External Rust crates can no longer construct them
+via struct literals. Use the named constructor or builder listed for each:
+
+- **`LintResult`** — use `LintResult::new(diagnostics)` (defaults: `truncated=false`, `is_standalone=false`),
+  then chain `.truncated()` or `.standalone()` to override.
+- **`SerializedError`** — not externally constructable by design; obtain via `MdsError::serialize()`.
+- **`SerializedSpan`** — use `SerializedSpan::new(offset, length)`, then chain `.with_line(n)` and/or `.with_column(n)`.
+- **`TextEdit`** — use `TextEdit::new(start, end, new_text)`. Previously this type was `pub`
+  inside a `pub(crate)` module and was thus unnameable from external crates; this PR re-exports
+  it at the crate root, making `mds::TextEdit` accessible for the first time. The `fix_edits`
+  field on `LintDiagnostic` (and the corresponding JSON field) was effectively unusable from
+  Rust until this change.
+- **`FixLineSpan`** — use `FixLineSpan::single(offset)` for single-line removals,
+  `FixLineSpan::range_inclusive(from, to)` to remove through the line containing `to`,
+  or `FixLineSpan::range_exclusive(from, to)` to keep the line containing `to`.
+- **`ByteEdit`** — use `ByteEdit::deletion(start, end, rule)` for pure deletions or
+  `ByteEdit::replacement(start, end, rule, text)` for in-place replacements.
+- **`RejectedEdit`** — use `RejectedEdit::new(edit, reason)`.
+- **`FixPlan`** — use `FixPlan::default()` for an empty plan; its fields are `pub`, so they
+  remain directly readable and writable from external crates.
+- **`LintConfig`** — use `LintConfig::from_rules_checked(rules)` or `LintConfig::default()` for no overrides.
+- **`LintDiagnostic::sanitized_for_render()`** — a new method that returns a sanitized clone
+  suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
+  this method instead of assembling sanitized copies itself, keeping the escape logic co-located
+  with the struct definition (PF-014).
+
+### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API (#146, #150, #151, #152, #154)
+
+These changes alter observable runtime behavior and compiled output. Templates relying
+on the previous (buggy) behavior must be updated.
+
+#### Cross-type comparisons are now errors (#152)
+
+`@if a == b:` or `@if a != b:` where `a` and `b` are different types (e.g. a number
+vs. a string, or a boolean vs. null) now raises `mds::type_mismatch` at runtime
+instead of silently returning `false` (for `==`) or `true` (for `!=`).
+
+**Migration:** add an explicit conversion before comparing:
+- `@if string(count) == "3":` — convert number to string
+- `@if count == 3:` — compare number to number literal
+
+#### Cross-flag duplicate keys in `--set` / `--set-string` are now a hard error (#152)
+
+Supplying the same variable key via both `--set KEY=VALUE` and `--set-string KEY=VALUE`
+in a single invocation is now rejected at startup with an explicit error.
+
+**Migration:** remove the duplicate key from one flag.
+
+#### `@extends` emits deep-merged frontmatter (#154)
+
+Compiled output for a child template now contains the **deep-merged** frontmatter
+(base keys + child keys, child wins on collision, reserved keys `imports`/`type`/`extends`
+excluded) rather than only the child's raw frontmatter. Base-only frontmatter keys
+now appear in the compiled output.
+
+**Migration:** if your pipeline depends on base frontmatter keys being absent from the
+compiled output, strip them downstream or move them to a non-frontmatter location.
+
+#### Interior-verbatim whitespace contract for `@block` bodies and `mds fmt` (#150, #151)
+
+Leading blank lines and interior blank runs inside `@block` bodies and
+`mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
+The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
+equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
+exactly one final newline). `@message` and `@define` bodies continue to edge-trim —
+leading and trailing blank lines are stripped — and are not covered by this contract.
+
+**Migration:** compiled outputs may gain blank lines that were previously collapsed or
+stripped; templates relying on this collapse must remove the extra blank lines at the
+source level.
+
+#### `FileSystem` trait now requires `normalize_in_dir` and `parent_dir` (#146)
+
+`FileSystem` now requires two new methods — `normalize_in_dir` and `parent_dir` — that
+replace the internal `<source>` path-sentinel pattern. String-source `@import`/`@extends`
+resolution is now directly directory-anchored: `ctx.base_dir` carries the importing
+directory explicitly, with no synthetic filename appended. No behavior change for
+`compile`/`check` users; only affects code that implements the `FileSystem` trait
+directly via `ModuleCache::with_fs`.
+
 ### Added
 
 - **`lint` and `lintVirtual` are now exported from the browser entry point (#215).**
@@ -331,7 +712,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **TypeScript: `LintDiagnostic.help` and `LintDiagnostic.span` widened to include `null`**
   (`help?: string | null`, `span?: LintSpan | null`). The JSON wire format has always emitted
-  these as `null` (not absent keys) when no hint or span is available -- only the TypeScript
+  these as `null` (not absent keys) when no hint or span is available — only the TypeScript
   declaration was narrower than the runtime value. This is a semver event for consumers who
   pattern-matched on `diag.span !== undefined` to detect the no-span case; after this change,
   both `undefined` and `null` indicate "no span" and the guard should use `diag.span != null`.
@@ -601,378 +982,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `initWasmNode`, `initWasmBrowser`, and `createWasmBackend` — were never reachable from
   `@mdscript/mds` via a published import path.
 
-### **BREAKING** — File-method `basePath` rejection, TypeScript option types, and WASM `basePath` rejection (#180, #213)
-
-#### `compileFile` and `checkFile` now reject `basePath` (#180)
-
-`compileFile(path, options?)` and `checkFile(path, options?)` previously accepted a
-`basePath` option and silently discarded it — the option passed the unknown-key
-validator but was dropped before the backend was reached, so file resolution always
-used the directory containing the path. Both functions now **throw synchronously**
-(`Error { code: 'mds::invalid_options' }`) when `basePath` is non-null. The base
-directory for file-based operations is always derived from the file path itself.
-
-**Migration:** remove `basePath` from any options object passed to `compileFile` or
-`checkFile`. This throw is **synchronous** — `.catch()` on the returned promise does
-not receive it; wrap the call in `try/catch`. This is also a **compile-time break**
-when a variable typed as `CompileOptions` or `CheckOptions` is passed to these
-functions — see the compatibility notes below. Audit all call sites.
-
-#### `FileOptions` no longer extends `CompileOptions` (#213)
-
-`FileOptions` (used by `compileFile`) was previously declared as
-`interface FileOptions extends CompileOptions`. This inheritance was an error:
-`CompileOptions` now carries `basePath`, which is not valid for file-based
-operations. `FileOptions` is now a standalone interface with its own `vars`,
-`sourceMap`, and `sourcesContent` fields.
-
-**Compatibility:** this change is a **compile-time break** for code that passes a
-`CompileOptions`-typed variable to `compileFile`. After this PR, `CompileOptions`
-carries `basePath?: string` while `FileOptions` declares `basePath?: never`;
-TypeScript reports `"Types of property 'basePath' are incompatible"` at any such
-assignment or call. Code that never reuses a string-surface options variable for
-file operations compiles without changes.
-
-**Migration for shared variables:** retype the variable as `FileOptions`, or
-destructure only the accepted fields:
-```ts
-const { vars, sourceMap, sourcesContent } = compileOpts;
-compileFile(path, { vars, sourceMap, sourcesContent });
-```
-
-#### `checkFile` parameter type changed from `CheckOptions` to `CheckFileOptions` (#213)
-
-`checkFile(path, options?)` previously accepted `CheckOptions`. After this PR,
-`CheckOptions` carries a `basePath` field that is not valid for file-based operations;
-the parameter is now typed as `CheckFileOptions` — a new interface with only
-`vars?: Record<string, unknown>`.
-
-**Compatibility:** this type narrowing is a **compile-time break** for code that
-passes a `CheckOptions`-typed variable to `checkFile`. `CheckOptions` carries
-`basePath?: string` while `CheckFileOptions` declares `basePath?: never`; TypeScript
-reports `"Types of property 'basePath' are incompatible"` at any such call. Code
-that never reuses a string-surface variable for `checkFile` compiles without changes.
-
-**Migration for shared variables:** retype the variable as `CheckFileOptions`, or
-restrict it to `{ vars?: Record<string, unknown> }` at the call site.
-
-#### `LintFileOptions` gained `basePath?: never` (#213)
-
-`LintFileOptions` (used by `lintFile` and `lintVirtual`) previously had the shape
-`{ vars?, rules? }`. It now declares `basePath?: never`.
-
-**Compatibility:** this is a **compile-time break** for code that assigns a variable
-whose inferred type includes a `basePath` field to a `LintFileOptions`-typed slot.
-For example, passing a `LintOptions`-typed variable directly to `lintFile` or
-`lintVirtual` now fails with `TS2322` — `LintOptions.basePath` is `string | undefined`
-which is not assignable to `never`. Code that passes a fresh object literal without
-`basePath`, or a variable that was already typed as `{ vars?, rules? }`, continues to
-compile unchanged.
-
-**Migration:** at each `lintFile` / `lintVirtual` call site that passes a
-`LintOptions`-typed variable, either extract a narrowed copy
-(`const { basePath: _unused, ...fileOpts } = opts`) or redeclare the variable as
-`LintFileOptions` when `basePath` was never meaningful there.
-
-#### WASM backend rejects `basePath` on string-surface methods (#180)
-
-`compile(source, { basePath: '/dir' })` and `check(source, { basePath: '/dir' })`
-previously silently ignored `basePath` on the WASM backend. They now throw
-`Error { code: 'mds::invalid_options' }`. `lint(source, { basePath: '/dir' })` was
-already documented as WASM-unsupported; it now enforces this at runtime too.
-
-**Migration:** switch to the native backend (`MDS_BACKEND=native`) when you need
-import resolution with a `basePath` in WASM environments.
-
-### **BREAKING** — Interpolation syntax: `{x}` → `{{x}}`
-
-Interpolation now uses **double braces**: `{{variable}}`, `{{obj.field}}`,
-`{{func("arg")}}`, `{{alias.func()}}`. Single `{` and `}` are always **literal
-text** — no escaping needed for lone braces.
-
-#### Interpolation syntax changed (#236)
-
-Templates using the old `{var}` form will no longer interpolate — they will emit
-the literal text `{var}` instead. This affects every template that uses variable
-substitution, function calls, or dynamic message roles.
-
-**Migration:** run `mds lint --fix` to auto-migrate (the `legacy-interpolation`
-lint rule, Tier A, rewrites every `{x}` → `{{x}}` in one pass), then run
-`mds fmt` to normalize formatting.
-
-```
-# One-command migration for a project:
-mds lint --fix && mds fmt
-```
-
-#### Escape syntax changed
-
-- Old: `\{` → literal `{`, `\}` → literal `}` — **deleted**; these escapes are
-  no longer recognized (single braces are ordinary text and need no escaping).
-- New: `\{{` → literal `{{` in output. Use this only when you need `{{` as
-  literal text in the output (e.g. inside a Jinja/Python f-string example).
-
-#### `@message {{role}}:` dynamic roles
-
-Dynamic message roles now use double braces: `@message {{role}}:` instead of
-`@message {role}:`. Bare-word roles (`@message system:`) are unchanged.
-
-#### `LintDiagnostic` is now `#[non_exhaustive]`; use the constructor, not struct literals
-
-`LintDiagnostic` is marked `#[non_exhaustive]` so future minor releases can add
-fields without a breaking change. External Rust crates can no longer construct it
-via a struct literal. Use `LintDiagnostic::new(rule, severity, message)` to create
-a diagnostic with required fields and all optional fields defaulting to `None`, then
-chain the builder methods `with_help`, `with_span`, `with_file`, `with_fix_removals`,
-and `with_fix_edits` to set optional fields.
-
-#### Nine additional public types are now `#[non_exhaustive]`; migrate struct literals to constructors
-
-The following types are marked `#[non_exhaustive]` so future minor releases can add
-fields without a breaking change. External Rust crates can no longer construct them
-via struct literals. Use the named constructor or builder listed for each:
-
-- **`LintResult`** — use `LintResult::new(diagnostics)` (defaults: `truncated=false`, `is_standalone=false`),
-  then chain `.truncated()` or `.standalone()` to override.
-- **`SerializedError`** — not externally constructable by design; obtain via `MdsError::serialize()`.
-- **`SerializedSpan`** — use `SerializedSpan::new(offset, length)`, then chain `.with_line(n)` and/or `.with_column(n)`.
-- **`TextEdit`** — use `TextEdit::new(start, end, new_text)`. Previously this type was `pub`
-  inside a `pub(crate)` module and was thus unnameable from external crates; this PR re-exports
-  it at the crate root, making `mds::TextEdit` accessible for the first time. The `fix_edits`
-  field on `LintDiagnostic` (and the corresponding JSON field) was effectively unusable from
-  Rust until this change.
-- **`FixLineSpan`** — use `FixLineSpan::single(offset)` for single-line removals,
-  `FixLineSpan::range_inclusive(from, to)` to remove through the line containing `to`,
-  or `FixLineSpan::range_exclusive(from, to)` to keep the line containing `to`.
-- **`ByteEdit`** — use `ByteEdit::deletion(start, end, rule)` for pure deletions or
-  `ByteEdit::replacement(start, end, rule, text)` for in-place replacements.
-- **`RejectedEdit`** — use `RejectedEdit::new(edit, reason)`.
-- **`FixPlan`** — use `FixPlan::default()` for an empty plan; its fields are `pub`, so they
-  remain directly readable and writable from external crates.
-- **`LintConfig`** — use `LintConfig::from_rules_checked(rules)` or `LintConfig::default()` for no overrides.
-- **`LintDiagnostic::sanitized_for_render()`** — a new method that returns a sanitized clone
-  suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
-  this method instead of assembling sanitized copies itself, keeping the escape logic co-located
-  with the struct definition (PF-014).
-
-### **BREAKING** — lint JSON wire contract
-
-#### Lint JSON wire contract (#202, #203, #211)
-
-> This block is the **single wire-change ledger** for the lint JSON envelope.
-> Later changes to `mds lint --format json` append here rather than opening a
-> parallel section, so a consumer has one place to read.
-
-**Before / after**, for `mds lint - --format json` on a source with one unused
-selective import:
-
-```jsonc
-// abbreviated — see spec.md for the full schema
-// before
-{ "files": [ { "diagnostics": [
-    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } },
-    { "rule": "unused-import",    "span": { "length": 7, "offset":  0 } }
-  ], "file": "input.mds" } ], "truncated": false, "version": 1 }
-
-// after
-{ "files": [ { "diagnostics": [
-    { "rule": "unused-import",    "span": { "length": 5, "offset": 10 } },
-    { "rule": "duplicate-export", "span": { "length": 7, "offset": 59 } }
-  ], "file": "<stdin>" } ], "truncated": false, "version": 1 }
-```
-
-**A consumer breaks if it** keys off `files[].file == "input.mds"` for CLI stdin
-output, matches `<source>` in a rendered diagnostic frame (stderr only — the JSON
-`error.message` field cannot carry source identity; no `MdsError` Display template
-interpolates `ctx.file_str`, per AD-211-5), relies on
-`diagnostics[]` arriving in rule-execution order, assumes `unused-import`
-spans have length 7, relies on the `mds lint <dir>` file-group order being
-component-wise (`Path::Ord`), or on Windows assumes `files[].file` values use
-the native backslash separator. File groups are now ordered by the byte-wise string
-of the relative display path (e.g. `api-utils.mds` sorts before `api/x.mds`
-because `'-'` (0x2D) < `'/'` (0x2F)). On Windows, `relative_display` normalises
-path separators to forward slashes, so a nested path that previously appeared as
-`sub\c.mds` in the JSON now appears as `sub/c.mds`; a consumer that string-matches
-or splits on `\` in `files[].file` values will silently fail to match.
-
-**1. Diagnostics are sorted by byte offset (#202).** Within each
-`files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`
-for results produced by the lint engine; a `LintResult` assembled directly via
-`LintResult::new` is emitted in the order the caller supplied.
-Previously the order was rule-execution order (implementation-defined).
-
-- Diagnostics without a span sort to the end of their file group.
-- Equal-offset diagnostics preserve rule-execution order (stable sort).
-- File groups have a defined order: `mds lint <dir>` sorts `files[]` by the
-  byte-wise (lexicographic) string comparison of the relative display path — e.g.
-  `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'` (0x2F).
-  This is a CLI directory-mode contract only: the binding surfaces (napi / WASM /
-  Python) lint a single entry source, so their `files[]` array never carries more
-  than one entry.
-- Ordering is established on `LintResult.diagnostics` itself, so the CLI human
-  path and the napi / WASM / Python surfaces observe the same order.
-- **Truncation is unchanged and is NOT offset-ranked.** When `truncated` is
-  `true`, the retained diagnostics are still the first `MAX_DIAGNOSTICS` (1,000)
-  in rule-execution order, re-sorted afterwards — not the 1,000 smallest offsets.
-- **Sort cost (AC-P1-22):** The sort key is a borrowed tuple `(bool, &str, bool,
-  usize)` — zero per-comparison heap allocations. The sort runs at most once per
-  `LintResultBuilder::build` call over n <= `MAX_DIAGNOSTICS` (1,000) items.
-
-**2. The stdin source identity is always `<stdin>` (#211).** Every CLI context
-that names a stdin source now uses the single sentinel `<stdin>`:
-
-- the JSON `files[].file` key (previously `"input.mds"`, the internal VFS key);
-- human diagnostic frames for `mds lint -` (previously `input.mds`);
-- fix-preview status lines and diff headers (previously bare `stdin`);
-- the **analysis-failure envelope** — a stdin source that fails the check gate
-  used to render `<source>:L:C`, the resolver's internal label. `mds check -` and
-  `mds build -` rendered `<source>` on the same path and now render `<stdin>`
-  too, so all four subcommands agree.  Note: the analysis-failure JSON envelope
-  shape is `{"version":1,"error":{"code","message","help","span"}}` — it carries
-  **no `file` key** (unlike the success envelope which has `files[].file`).  A
-  JSON consumer reading `error` results MUST NOT look for a `file` key there.
-
-`mds::STRING_SOURCE_MAP_LABEL` is **unchanged** and remains `"input.mds"`: it is a
-virtual-FS entry key, not a display label. The napi, WASM and Python lint APIs
-continue to report `"input.mds"` for string-source input. The relabel is applied
-only at the CLI output boundary.
-
-**Zero-diagnostic behaviour:** when stdin lint completes with no findings, the
-JSON is `{"files":[],"truncated":false,"version":1}` — no file entry. The
-`<stdin>` sentinel appears in `files[0].file` only when at least one diagnostic is
-emitted. This matches non-stdin zero-diagnostic behaviour and keeps the JSON
-identical across the CLI and binding surfaces (napi, WASM, Python) for the clean
-case.
-
-**3. `unused-import` spans anchor at the unused name (#203).** For selective
-imports (`@import { name1, name2 } from "path"`), the span now covers the unused
-name rather than the `@import` keyword, and `span.length` is the name's length
-instead of a constant 7. Alias imports (`@import "path" as alias`) are unchanged —
-their span still covers the `@import` keyword.
-
-#### New `fix_edits` field on `LintDiagnostic`
-
-`LintDiagnostic` gains an additive `fix_edits` field (null when not fixable;
-an array of `{start, end, new_text}` byte-span edit objects when fixable). This
-field is present across all binding surfaces: CLI JSON output, napi
-(`LintDiagnostic.fix_edits?: …`), WASM, and Python
-(`LintDiagnostic.fix_edits: list[dict] | None`).
-
-### **BREAKING** — Strict cross-type comparisons, merged `@extends` frontmatter, interior-verbatim whitespace, filesystem API
-
-These changes alter observable runtime behavior and compiled output. Templates relying
-on the previous (buggy) behavior must be updated.
-
-#### Cross-type comparisons are now errors (#152)
-
-`@if a == b:` or `@if a != b:` where `a` and `b` are different types (e.g. a number
-vs. a string, or a boolean vs. null) now raises `mds::type_mismatch` at runtime
-instead of silently returning `false` (for `==`) or `true` (for `!=`).
-
-**Migration:** add an explicit conversion before comparing:
-- `@if string(count) == "3":` — convert number to string
-- `@if count == 3:` — compare number to number literal
-
-#### Cross-flag duplicate keys in `--set` / `--set-string` are now a hard error (#152)
-
-Supplying the same variable key via both `--set KEY=VALUE` and `--set-string KEY=VALUE`
-in a single invocation is now rejected at startup with an explicit error.
-
-**Migration:** remove the duplicate key from one flag.
-
-#### `@extends` emits deep-merged frontmatter (#154)
-
-Compiled output for a child template now contains the **deep-merged** frontmatter
-(base keys + child keys, child wins on collision, reserved keys `imports`/`type`/`extends`
-excluded) rather than only the child's raw frontmatter. Base-only frontmatter keys
-now appear in the compiled output.
-
-**Migration:** if your pipeline depends on base frontmatter keys being absent from the
-compiled output, strip them downstream or move them to a non-frontmatter location.
-
-#### Interior-verbatim whitespace contract for `@block` bodies and `mds fmt` (#150, #151)
-
-Leading blank lines and interior blank runs inside `@block` bodies and
-`mds fmt` output are now preserved verbatim; previously they were collapsed or stripped.
-The `mds fmt` blank-line collapsing rule (R3) has been removed to maintain compile
-equivalence with the updated evaluator behavior. Only the trailing edge normalizes (to
-exactly one final newline). `@message` and `@define` bodies continue to edge-trim —
-leading and trailing blank lines are stripped — and are not covered by this contract.
-
-**Migration:** compiled outputs may gain blank lines that were previously collapsed or
-stripped; templates relying on this collapse must remove the extra blank lines at the
-source level.
-
-#### `FileSystem` trait now requires `normalize_in_dir` and `parent_dir` (#146)
-
-`FileSystem` now requires two new methods — `normalize_in_dir` and `parent_dir` — that
-replace the internal `<source>` path-sentinel pattern. String-source `@import`/`@extends`
-resolution is now directly directory-anchored: `ctx.base_dir` carries the importing
-directory explicitly, with no synthetic filename appended. No behavior change for
-`compile`/`check` users; only affects code that implements the `FileSystem` trait
-directly via `ModuleCache::with_fs`.
-
-### **BREAKING** — Options validation, directory walker, source-map labels, check API (#196)
-
-- **`@mdscript/mds` now rejects unknown option keys** with
-  `Error { code: 'mds::invalid_options' }` before forwarding to the backend. Previously
-  unrecognized keys were silently passed through (napi and WASM backends would reject
-  them, but the universal JS wrapper did not validate). Callers with typos in option
-  objects will now get immediate, accurate error messages. (#196)
-
-- **`CheckOptions` is now split from `CompileOptions`** in `@mdscript/mds`.
-  `check()` accepts `{ vars?, basePath? }` (via `CheckOptions`); `checkFile()` accepts
-  `{ vars? }` only — `CheckFileOptions` declares `basePath?: never`, so passing a non-null
-  `basePath` to `checkFile` throws `mds::invalid_options` synchronously. Source-map options
-  (`sourceMap`, `sourcesContent`) are not valid for either check call and are rejected with
-  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`. TS interface
-  implementers: `check` narrows to `CheckOptions`; `checkFile` narrows to `CheckFileOptions`
-  (amended by #180). Non-`strict`-mode TypeScript consumers who guard on
-  `diag.span !== undefined` must update to `diag.span != null` — `help` and `span` on
-  `LintDiagnostic` are now typed as `... | null` so the `!== undefined` guard no longer
-  catches `null` values. (#196)
-
-- **String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
-  across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
-  output for `compile(src, {sourceMap:true})` / `compile_str*` / WASM `compile` now reads
-  `"input.mds"` instead of `"<source>"`. CLI stdin builds use `"<stdin>"` (unchanged).
-  Code inspecting `sources[0]` for the string `"<source>"` must be updated. (#196)
-
-- **Directory walker now excludes hidden directories and `node_modules` by default**
-  across all subcommands (`mds build`, `mds check`, `mds watch`, `mds fmt`,
-  `mds lint`). Directories whose name starts with `.` (e.g. `.git`, `.venv`) and
-  `node_modules` are silently skipped during recursive traversal. Templates inside these
-  directories are no longer compiled, formatted, or linted in directory mode. (#196)
-
-- **`mds check` summary wording changed** from `N checked` to `N passed, M
-  failed`. Scripts parsing CLI output must be updated. (#196)
-
-- **lint `--format json` `"file"` keys are now full relative paths** in directory mode.
-  When running `mds lint --format json .`, the `"file"` key in each JSON result is now
-  the path relative to the lint root (e.g. `"src/template.mds"`) rather than just the
-  basename (e.g. `"template.mds"`). This prevents key collisions when two different
-  files have the same filename. (#196)
-
-- **`mds-core::CompileOptions` gained `source_map_base: Option<PathBuf>`**.  Rust code
-  that initializes `CompileOptions` with a struct literal must either add
-  `source_map_base: None` or use the `..Default::default()` tail.  Binding surfaces
-  (napi, Python, WASM) are not affected. (#3)
-
-### **BREAKING** — Error/lint messages now carry `\uXXXX` literals for embedded control bytes (#176)
-
-Across the JS / Python / WASM API surfaces, `err.message`, `err.help`, and lint
-`LintDiagnostic.message` / `LintDiagnostic.help` now contain six-character `\uXXXX`
-Unicode escape literals (e.g. `\u001B`, `\u007F`, `\u0085`) wherever MDS source
-content caused raw C0-minus-`\n`/`\t`, DEL (U+007F), or C1 (U+0080–U+009F) control
-bytes to appear in error or diagnostic messages.
-
-**Not affected:** `span.offset`, `span.length`, and `fix_edits` byte ranges are raw
-byte offsets and are never sanitized. The `rule` field is a fixed ASCII identifier.
-The `"file"` key in lint JSON output is sanitized on the same pass as `message`/`help`.
-
-**Migration:** consumers that test for exact control byte sequences in error or
-diagnostic messages must update to check for the `\uXXXX` literal form instead.
-
 ### Fixed
 
 - **`basePath` option is now honored on `compile()`, `check()`, and `lint()` (#180).**
@@ -985,7 +994,7 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   `CheckOptions` and propagates it to the backend for the string-source methods
   (`compile`, `check`). `compileFile` and `checkFile` deliberately exclude
   `basePath` — the base directory for file operations is derived from the file
-  path itself (see the BREAKING subsection below).
+  path itself (see the [BREAKING section above](#breaking--file-method-basepath-rejection-typescript-option-types-and-wasm-basepath-rejection-180-213)).
 
   The WASM backend has no filesystem access and cannot resolve file-relative imports; it
   now **rejects** a non-null `basePath` immediately with `mds::invalid_options` instead
@@ -1050,6 +1059,8 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   `set_diag_display_path(&mut residual, filename)` in the `Fixed` and
   `PartiallyFixed` match arms of `run_lint_file`, mirroring the existing relabel
   in directory mode (which was already correct).
+
+- **Python `LintDiagnostic.to_dict()` now conditionally includes `"line"` and `"column"` in the `span` object; `LintResult.files[]` now parses these fields from backing JSON.** Previously `to_dict()` dropped `"line"` and `"column"` unconditionally, emitting only `{"offset": …, "length": …}` in the `span` sub-dict. A caller round-tripping a user-constructed `LintDiagnostic` through `to_dict()` previously received `{"offset": N, "length": M}` and now receives `{"column": …, "length": M, "line": …, "offset": N}` — breaking golden-file assertions and strict JSON-schema validators using `additionalProperties: false`. No built-in lint rule sets `"line"` or `"column"`, so live lint output from the engine is unchanged. `LintResult.files[]` previously hardcoded `line=None` and `column=None` when parsing backing JSON; it now reads the actual values.
 
 ### Security
 
