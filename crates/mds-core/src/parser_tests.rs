@@ -1,6 +1,5 @@
 //! Parser unit and integration tests, extracted from parser.rs.
 
-use super::helpers::*;
 use super::*;
 use crate::ast::{Arg, Condition, ExportDirective, Expr, ImportDirective, Node};
 use crate::lexer::tokenize;

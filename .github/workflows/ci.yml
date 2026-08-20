@@ -333,7 +333,7 @@ jobs:
       - name: Install the built wheel (not editable) + import smoke
         run: |
           python -m pip install --find-links dist --no-index markdown-script
-          python -c "import markdown_script as m; r = m.compile('Hello {{n}}!', vars={'n': 'CI'}); assert r.kind == 'markdown', r.kind; assert r.output == 'Hello CI!', repr(r.output); print('smoke ok:', r.output)"
+          python -c "import markdown_script as m; r = m.compile('Hello {{n}}!', vars={'n': 'CI'}); assert r.kind == 'markdown', r.kind; assert r.output == 'Hello CI!\n', repr(r.output); print('smoke ok:', r.output)"
       # Run the suite against the INSTALLED wheel (mypy/pyright deselected — they
       # are covered in the develop job; parity CLI is built for the live check).
       - name: Build mds CLI (parity producer)
