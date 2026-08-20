@@ -1,8 +1,8 @@
 import type {
   CheckFileOptions,
   CheckOptions,
+  CompileFileOptions,
   CompileOptions,
-  FileOptions,
   LintFileOptions,
   LintOptions,
 } from '../types.js';
@@ -75,7 +75,7 @@ export type MethodName =
 type OptionsFor = {
   compile:     CompileOptions;
   check:       CheckOptions;
-  compileFile: FileOptions;
+  compileFile: CompileFileOptions;
   checkFile:   CheckFileOptions;
   lint:        LintOptions;
   lintFile:    LintFileOptions;
@@ -113,7 +113,7 @@ type OptionsFor = {
 export const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
   compile:     keysOf<CompileOptions>({ basePath: true, vars: true, sourceMap: true, sourcesContent: true }),
   check:       keysOf<CheckOptions>({ basePath: true, vars: true }),
-  compileFile: keysOf<FileOptions>({ vars: true, sourceMap: true, sourcesContent: true }),
+  compileFile: keysOf<CompileFileOptions>({ vars: true, sourceMap: true, sourcesContent: true }),
   checkFile:   keysOf<CheckFileOptions>({ vars: true }),
   lint:        keysOf<LintOptions>({ basePath: true, vars: true, rules: true }),
   lintFile:    keysOf<LintFileOptions>({ vars: true, rules: true }),

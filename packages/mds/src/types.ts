@@ -139,13 +139,13 @@ export interface CompileOptions extends CheckOptions {
 /**
  * Options for file-based compile operations.
  *
- * `FileOptions` deliberately does NOT extend `CompileOptions`. After
+ * `CompileFileOptions` deliberately does NOT extend `CompileOptions`. After
  * `CompileOptions` gained `basePath`, inheriting it here would silently add a
  * field that is not valid for file-surface operations (the base directory is
  * derived from the file path). The fields are declared directly so that adding
  * a new string-surface option never implicitly appears on the file surface.
  */
-export interface FileOptions {
+export interface CompileFileOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
   /** When `true`, appends a Source Map v3 document to the result. */
@@ -163,6 +163,13 @@ export interface FileOptions {
    */
   basePath?: never;
 }
+
+/**
+ * @deprecated Renamed to {@link CompileFileOptions} for consistency with
+ * {@link CheckFileOptions} and {@link LintFileOptions}. This alias is preserved
+ * for backward compatibility and will be removed in a future major version.
+ */
+export type FileOptions = CompileFileOptions;
 
 /**
  * Options for file-based check-only operations.
@@ -208,8 +215,8 @@ export interface LintDiagnostic {
   /** Whether the lint engine can auto-fix this diagnostic (`--fix`). */
   fixable: boolean;
   /**
-   * Source location of the finding. `null` when the rule produces no source span.
-   * The key is always present in the JSON wire format; only the value is `null`.
+   * Source location of the finding. May be absent (`undefined`) or `null` when
+   * the rule produces no source span.
    */
   span?: LintSpan | null;
   /**
@@ -425,7 +432,7 @@ export interface MdsBaseBackend {
  * Extends MdsBaseBackend with file-based compile/check/lint operations.
  */
 export interface MdsNodeBackend extends MdsBaseBackend {
-  compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
+  compileFile(path: string, options?: CompileFileOptions): Promise<CompileResult>;
   /**
    * Validate an MDS file without rendering. Only `vars` is forwarded;
    * source-map options and `basePath` are not applicable to file-path operations
@@ -435,12 +442,6 @@ export interface MdsNodeBackend extends MdsBaseBackend {
   /** Lint an MDS file, resolving @import directives relative to the file. */
   lintFile(path: string, options?: LintFileOptions): Promise<LintResult>;
 }
-
-/**
- * Backward-compatible alias. New code should prefer MdsNodeBackend.
- * @deprecated Use MdsNodeBackend directly.
- */
-export type MdsBackend = MdsNodeBackend;
 
 /**
  * Type guard that identifies errors thrown by the MDS compiler.

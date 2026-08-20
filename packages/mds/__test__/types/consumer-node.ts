@@ -17,6 +17,7 @@
 import type {
   CheckFileOptions,
   CheckOptions,
+  CompileFileOptions,
   CompileOptions,
   FileOptions,
   LintDiagnostic,
@@ -42,11 +43,20 @@ const _checkOpts: CheckOptions = { basePath: '/some/dir', vars: {} };
 // LintOptions already had basePath; confirm it still does.
 const _lintOpts: LintOptions = { basePath: '/some/dir', vars: {}, rules: { 'unused-variable': 'warn' } };
 
+// ── Positive cases: CompileFileOptions accepts compile-surface keys ────────────
+
+// D-TS-03: CompileFileOptions must accept vars, sourceMap, sourcesContent.
+const _compileFileOpts: CompileFileOptions = { vars: {}, sourceMap: true, sourcesContent: false };
+
 // ── Negative cases: basePath NOT accepted on file-surface types ───────────────
 // Each @ts-expect-error is self-verifying: if basePath were ever added to these
 // types, tsc emits "Unused @ts-expect-error directive" and the build fails.
 
-// D-TS-02: FileOptions must NOT have basePath.
+// D-TS-03: CompileFileOptions must NOT have basePath.
+// @ts-expect-error — basePath is intentionally absent from CompileFileOptions (D-TS-03)
+const _compileFileBasePath: CompileFileOptions = { basePath: '/some/dir' };
+
+// D-TS-02: FileOptions (deprecated alias for CompileFileOptions) must NOT have basePath.
 // @ts-expect-error — basePath is intentionally absent from FileOptions (D-TS-02)
 const _fileOpts: FileOptions = { basePath: '/some/dir' };
 
@@ -110,6 +120,7 @@ const _ruleName: LintRuleName = 'unused-variable';
 
 // Prevent unused-variable TS errors for the above declarations.
 void _compileOpts; void _checkOpts; void _lintOpts;
+void _compileFileOpts; void _compileFileBasePath;
 void _fileOpts; void _checkFileOpts; void _lintFileOpts;
 void _fileFromCompileVar; void _checkFileFromVar; void _lintFileFromVar;
 void _validRule; void _fwdCompat; void _badSeverity;

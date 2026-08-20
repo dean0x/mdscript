@@ -3,6 +3,7 @@ import type {
   CheckFileOptions,
   CheckOptions,
   CheckResult,
+  CompileFileOptions,
   CompileOptions,
   CompileResult,
   FileOptions,
@@ -74,7 +75,7 @@ function wrapWithFileOps(
    */
   async function prepareFileArgs(
     path: string,
-    options: FileOptions | undefined,
+    options: CompileFileOptions | undefined,
   ): Promise<{ source: string; opts: ReturnType<typeof fileOpts> }> {
     const { entryFilename, modules } = await buildModulesMap(path, (src) => wasmModule.scanImports(src));
     const source = modules[entryFilename];
@@ -90,7 +91,7 @@ function wrapWithFileOps(
   return {
     ...base,
 
-    async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
+    async compileFile(path: string, options?: CompileFileOptions): Promise<CompileResult> {
       // Defense in depth (PF-004): the public compileFile wrapper already rejects
       // basePath synchronously, but guard here so any future internal caller that
       // bypasses the public wrapper cannot get the original silent-drop semantics.
@@ -111,11 +112,11 @@ function wrapWithFileOps(
         const bpErr = getBasePathError(options, 'checkFile');
         if (bpErr != null) throw bpErr;
       }
-      // CheckFileOptions is a structural subset of FileOptions (only vars, no
+      // CheckFileOptions is a structural subset of CompileFileOptions (only vars, no
       // sourceMap/sourcesContent), so the cast is safe: prepareFileArgs calls
       // fileOpts which uses forwardOpts over METHOD_KEYS.compileFile; the absent
       // fields resolve as undefined and are excluded by forwardOpts's != null check.
-      const { source, opts } = await prepareFileArgs(path, options as FileOptions | undefined);
+      const { source, opts } = await prepareFileArgs(path, options as CompileFileOptions | undefined);
       const result: unknown = wasmModule.check(source, opts);
       assertResultShape(result, 'check');
       return result as CheckResult;
@@ -283,7 +284,7 @@ export function check(source: string, options?: CheckOptions): CheckResult {
  * capture both error classes. `.catch()` on the returned promise does NOT receive
  * option-validation errors.
  */
-export function compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
+export function compileFile(path: string, options?: CompileFileOptions): Promise<CompileResult> {
   if (options != null) {
     assertKnownKeys(options, 'compileFile');
     // BASEPATH_REJECTORS: assertKnownKeys skips basePath for file methods (issue #74).
@@ -369,6 +370,7 @@ export type {
   CheckFileOptions,
   CheckOptions,
   CheckResult,
+  CompileFileOptions,
   CompileOptions,
   CompileResult,
   FileOptions,

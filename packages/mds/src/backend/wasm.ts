@@ -2,9 +2,9 @@ import type {
   BackendType,
   CheckOptions,
   CheckResult,
+  CompileFileOptions,
   CompileOptions,
   CompileResult,
-  FileOptions,
   InitOptions,
   LintFileOptions,
   LintOptions,
@@ -393,7 +393,7 @@ function checkOpts(
 export function fileOpts(
   entryFilename: string,
   modules: Record<string, string>,
-  options?: FileOptions,
+  options?: CompileFileOptions,
 ): {
   filename: string;
   modules: Record<string, string>;
@@ -445,7 +445,7 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
     compile(source: string, options?: CompileOptions): CompileResult {
       // Reject basePath rather than silently ignoring it (avoids PF-004).
       if (options?.basePath != null) throwWasmBasePathError();
-      const result: unknown = wasmModule.compile(source, compileOpts(options as _WasmCompileInput));
+      const result: unknown = wasmModule.compile(source, compileOpts(options));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
