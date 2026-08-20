@@ -129,6 +129,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `unreachable-branch` (error): branch condition is always-true or always-false (auto-fixable)
   - `duplicate-import` (error): same file imported more than once (auto-fixable)
   - `duplicate-export` (error): same export name defined more than once (auto-fixable)
+  - `legacy-interpolation` (warn): single-brace `{x}` interpolation syntax superseded by `{{x}}` — flags all occurrences requiring migration to the double-brace form (auto-fixable)
 
   **CLI** (`mds lint`): file, directory, and stdin input modes; `--fix` for
   auto-fixable issues (Tier A always; Tier B for standalone files); `--check`
@@ -162,9 +163,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rules` and `base_path` / `vars` options; `LintResult` with `.version`, `.truncated`,
   `.files`, `.to_dict()`, `.to_json()`. Stubs shipped in `_markdown_script.pyi` / `__init__.pyi`.
 
-  **⚠ TypeScript interface implementers**: `MdsBaseBackend` gained `lint` and
-  `lintVirtual` as required members; `MdsNodeBackend` gained `lintFile`. Code that
-  directly implements these interfaces (not just calls them) must add these methods.
+  **Backend interfaces** (`MdsBaseBackend`, `MdsNodeBackend`): `MdsBaseBackend` gained
+  `lint` and `lintVirtual` as required members; `MdsNodeBackend` gained `lintFile`. These
+  interfaces are internal to the package — defined in `packages/mds/src/index.ts`, which is
+  not listed in the `@mdscript/mds` export map and is removed in this release (see
+  `### Removed`). No migration is required for consumers of the published package.
 
 - **Source Map v3** (#62). Compile calls can now produce a [Source Map v3](https://sourcemaps.info/spec.html)
   document alongside the rendered output.
@@ -310,6 +313,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --match-head-commit <sha>` command pinned to the verified SHA. Exit 0: Tier A,
   Tier A+, and Tier B pass; exit 1: any Tier A, Tier A+, or Tier B failure, or
   zero check-runs found; exit 2: tool/permission errors.
+
+- **`MdsError::source_name() -> Option<&str>`** — a new method that returns the name embedded
+  in the error's `NamedSource`, or `None` for errors without a source (e.g. `MdsError::Io`).
+  `source_name()` is domain-neutral; callers that need to detect the string-source analysis
+  path should use `MdsError::is_string_source()` rather than comparing the returned name
+  against the sentinel value themselves — the internal sentinel is `pub(crate)` and is not
+  reachable from downstream crates.
+
+- **`MdsError::is_string_source() -> bool`** — a new predicate that returns `true` when the
+  error was produced by the string-source analysis path (`resolve_source_intrinsic`). Use this
+  instead of comparing `source_name()` against a bare string literal: the internal sentinel
+  (`SOURCE_LABEL`) is `pub(crate)` and is not accessible from downstream crates.
 
 
 ### Changed
@@ -577,6 +592,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before v1.0.0; this function will remain available throughout the v0.x series (contrast
   `apply_fixes` above, which is scheduled for removal at v0.5.0).
 
+### Removed
+
+- **`packages/mds/src/index.ts` removed.** This file was not listed in the package
+  `exports` map (which resolves only `./dist/node.js` and `./dist/browser.js`), so no
+  supported import path from `@mdscript/mds` is affected. The internal backend interfaces
+  it defined — `MdsBackend`, `MdsBaseBackend`, `MdsNodeBackend`, `WasmModule`,
+  `initWasmNode`, `initWasmBrowser`, and `createWasmBackend` — were never reachable from
+  `@mdscript/mds` via a published import path.
+
 ### **BREAKING** — File-method `basePath` rejection, TypeScript option types, and WASM `basePath` rejection (#180, #213)
 
 #### `compileFile` and `checkFile` now reject `basePath` (#180)
@@ -730,16 +754,6 @@ via struct literals. Use the named constructor or builder listed for each:
   suitable for miette render boundaries. `mds-cli`'s diagnostic render path now delegates to
   this method instead of assembling sanitized copies itself, keeping the escape logic co-located
   with the struct definition (PF-014).
-- **`MdsError::source_name() -> Option<&str>`** — a new method that returns the name embedded
-  in the error's `NamedSource`, or `None` for errors without a source (e.g. `MdsError::Io`).
-  `source_name()` is domain-neutral; callers that need to detect the string-source analysis
-  path should use `MdsError::is_string_source()` rather than comparing the returned name
-  against the sentinel value themselves — the internal sentinel is `pub(crate)` and is not
-  reachable from downstream crates.
-- **`MdsError::is_string_source() -> bool`** — a new predicate that returns `true` when the
-  error was produced by the string-source analysis path (`resolve_source_intrinsic`). Use this
-  instead of comparing `source_name()` against a bare string literal: the internal sentinel
-  (`SOURCE_LABEL`) is `pub(crate)` and is not accessible from downstream crates.
 
 ### **BREAKING** — lint JSON wire contract
 
@@ -907,10 +921,16 @@ directly via `ModuleCache::with_fs`.
   objects will now get immediate, accurate error messages. (#196)
 
 - **`CheckOptions` is now split from `CompileOptions`** in `@mdscript/mds`.
-  `check()` and `checkFile()` accept `{ vars?, basePath? }` — source-map options
-  (`sourceMap`, `sourcesContent`) are not valid for check calls and are rejected with
-  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`.
-  TS interface implementers: `check`/`checkFile` signatures narrow to `CheckOptions`. (#196)
+  `check()` accepts `{ vars?, basePath? }` (via `CheckOptions`); `checkFile()` accepts
+  `{ vars? }` only — `CheckFileOptions` declares `basePath?: never`, so passing a non-null
+  `basePath` to `checkFile` throws `mds::invalid_options` synchronously. Source-map options
+  (`sourceMap`, `sourcesContent`) are not valid for either check call and are rejected with
+  `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`. TS interface
+  implementers: `check` narrows to `CheckOptions`; `checkFile` narrows to `CheckFileOptions`
+  (amended by #180). Non-`strict`-mode TypeScript consumers who guard on
+  `diag.span !== undefined` must update to `diag.span != null` — `help` and `span` on
+  `LintDiagnostic` are now typed as `... | null` so the `!== undefined` guard no longer
+  catches `null` values. (#196)
 
 - **String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
   across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
