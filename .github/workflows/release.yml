@@ -12,6 +12,14 @@ on:
 permissions:
   contents: read
 
+# cancel-in-progress: false is LOAD-BEARING: setting true would cancel a run
+# mid-sequence (e.g., between cargo publish and npm publish). A cancelled run
+# reads as "not failing" (PF-017), which would let --admin merge bypass the CI
+# gate and could manufacture the partial-publish state reliability-05 guards against.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -165,8 +173,12 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-crates:
     name: Publish to crates.io
-    needs: [version-gate]
-    if: ${{ !cancelled() && needs.version-gate.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    # stage-and-verify-napi is listed here so the critical A3 name<->loader gate
+    # (RELEASING.md "hard checkpoint") must pass before crates.io (irreversible)
+    # publishes. Without this, the 7-target napi matrix can still be running while
+    # crates.io is already live at the new version.
+    needs: [version-gate, stage-and-verify-napi]
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -276,25 +288,62 @@ jobs:
         run: npx napi build --platform --release --no-js
       - name: Re-run A3 gate against the restored tree
         run: node scripts/verify-napi-names.mjs
-      - name: Publish platform packages (napi prepublish)
-        working-directory: crates/mds-napi
-        run: npx napi prepublish -t npm
-      - name: Publish host napi package
-        run: npm publish -w @mdscript/mds-napi --access public
+      # Build all artifacts BEFORE the first irreversible publish. A tsc/wasm-opt
+      # failure after any npm publish leaves partial state that cannot be healed
+      # without a manual laptop publish (which loses OIDC provenance).
       - name: Build WASM + TS packages
         run: |
           npm run build -w @mdscript/mds-wasm
           npm run build --workspaces --if-present
-      - name: Publish @mdscript/mds-wasm
-        run: npm publish -w @mdscript/mds-wasm --access public
-      - name: Publish @mdscript/mds + bundler packages
+      - name: Publish platform packages (napi prepublish)
+        working-directory: crates/mds-napi
         run: |
-          npm publish -w @mdscript/mds --access public
-          npm publish -w @mdscript/bundler-utils --access public
-          npm publish -w @mdscript/vite-plugin --access public
-          npm publish -w @mdscript/rollup-plugin --access public
-          npm publish -w @mdscript/webpack-loader --access public
-          npm publish -w @mdscript/rspack-loader --access public
+          # Idempotency: a re-run finds already-published platform packages and
+          # returns E403. Tolerate E403-only failures; any other error fails loudly.
+          # Do NOT use continue-on-error: it converts a hard failure into a silent
+          # partial release unrecoverable without a manual laptop publish (which
+          # loses OIDC provenance). PF-023.
+          if OUTPUT=$(npx napi prepublish -t npm 2>&1); then
+            echo "$OUTPUT"
+          else
+            NON_E403=$(echo "$OUTPUT" | grep -i "npm error" | grep -vi "E403" || true)
+            if [ -n "$NON_E403" ]; then
+              echo "::error::napi prepublish failed with non-E403 errors"
+              echo "$OUTPUT"
+              exit 1
+            fi
+            echo "::notice::All platform packages already published (E403) — idempotent re-run, skipping"
+            echo "$OUTPUT"
+          fi
+      - name: Publish npm packages
+        run: |
+          # Idempotency: publish_if_absent checks npm view before publishing so
+          # a re-run skips already-published versions without swallowing genuine
+          # failures. Never use continue-on-error — it masks partial state. PF-023.
+          VER="${{ github.ref_name }}"
+          VER="${VER#v}"
+          publish_if_absent() {
+            local pkg="$1"
+            if npm view "${pkg}@${VER}" version >/dev/null 2>&1; then
+              echo "::notice::${pkg}@${VER} already published — idempotent re-run, skipping"
+              return 0
+            fi
+            if OUTPUT=$(npm publish -w "${pkg}" --access public 2>&1); then
+              echo "$OUTPUT"
+            else
+              echo "::error::${pkg}@${VER} publish failed"
+              echo "$OUTPUT"
+              exit 1
+            fi
+          }
+          publish_if_absent "@mdscript/mds-napi"
+          publish_if_absent "@mdscript/mds-wasm"
+          publish_if_absent "@mdscript/mds"
+          publish_if_absent "@mdscript/bundler-utils"
+          publish_if_absent "@mdscript/vite-plugin"
+          publish_if_absent "@mdscript/rollup-plugin"
+          publish_if_absent "@mdscript/webpack-loader"
+          publish_if_absent "@mdscript/rspack-loader"
 
   # ---------------------------------------------------------------------------
   # GitHub Release — cut last, after crates + npm succeed.
