@@ -1089,3 +1089,115 @@ describe('AC-16: git not on PATH', () => {
   });
 
 });
+
+// ---------------------------------------------------------------------------
+// security-01 (PF-024): colon-path staged file must not bypass the gate
+// ---------------------------------------------------------------------------
+describe('security-01 PF-024: staged path with colon cannot bypass gate', () => {
+
+  test('staged file named "0:payload.mds" with ESC -> exits 1 (not a false pass)', () => {
+    // PF-024 false-pass: readAllIndexBlobs used `:${path}` syntax for the git
+    // cat-file --batch request. A path like "0:payload.mds" becomes
+    // ":0:payload.mds", which git parses as STAGE-0 REVISION SYNTAX for
+    // "payload.mds", returning a DIFFERENT (clean) blob. The gate exits 0
+    // without ever reading the hostile file.
+    //
+    // Fix (preferred): use the blob SHA captured from git diff --cached --raw
+    // field 3. SHA-based lookup is unambiguous and never subject to revision
+    // syntax interpretation. Defense-in-depth: also reject paths matching
+    // /^[0-3]:/ in getStagedFiles().
+    //
+    // Per ADR-009 / PF-013: this test MUST FAIL against the current code
+    // (confirmed: exits 0 on unpatched code) and pass after the fix.
+    // Report:
+    //   Before fix: r.status = 0  (false pass -- decoy blob returned)
+    //   After fix:  r.status = 1  (ESC detected or suspicious path rejected)
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Plant a clean decoy "payload.mds" -- this is what git revision syntax
+      // :0:payload.mds resolves to, silently replacing the hostile file.
+      writeFileSync(join(dir, 'payload.mds'), 'clean decoy -- no hazard bytes\n');
+      git('add', '--', 'payload.mds');
+      git('commit', '-m', 'add clean decoy');
+
+      // Stage the hostile file named literally "0:payload.mds" containing ESC.
+      // The -- separator prevents git from interpreting the name as revision syntax.
+      const esc = Buffer.from([0x1b]); // ESC -- constructed at runtime (PF-018)
+      writeFileSync(join(dir, '0:payload.mds'), Buffer.concat([Buffer.from('evil '), esc]));
+      execFileSync('git', ['add', '--', '0:payload.mds'],
+        { cwd: dir, encoding: 'utf8', stdio: 'pipe' });
+
+      const r = runScanner(['--staged'], { cwd: dir });
+      // Before fix: exit 0 (false pass -- decoy blob scanned instead of hostile file).
+      // After fix:  exit 1 (ESC detected via SHA lookup, or path rejected defensively).
+      assert.equal(r.status, 1,
+        `staged "0:payload.mds" with ESC must exit 1; ` +
+        `got status ${r.status}. stderr: ${r.stderr}`);
+      assert.ok(
+        r.stderr.includes('U+001B') || r.stderr.includes('0:payload.mds'),
+        `gate must detect ESC or reject the suspicious path; got stderr: ${r.stderr}`,
+      );
+    } finally { cleanup(dir); }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// security-02: full-tree mode from a subdirectory must not silently partial-scan
+// ---------------------------------------------------------------------------
+describe('security-02: full-tree mode from subdirectory exits 1', () => {
+
+  test('running full-tree scan from scripts/ subdirectory exits 1 with root-mismatch error', () => {
+    // security-02: git ls-files -sz is scoped to process.cwd(), so running
+    // from a subdirectory scans only that portion of the tracked tree but
+    // exits 0 with byte-identical wording to a full-tree scan. An engineer
+    // running pre-flight from crates/ gets a clean result for a tree never
+    // fully scanned (avoids PF-016).
+    //
+    // Fix: resolve repo root via git rev-parse --show-toplevel; exit 1 if
+    // cwd differs, and include the scanned root in the pass line.
+    //
+    // Before fix: exit 0 (only scripts/ scanned, ~18 files, same pass line).
+    // After fix:  exit 1 (root mismatch detected and reported).
+    const subdir = join(ROOT, 'scripts'); // a known subdirectory of the real repo
+    const r = runScanner([], { cwd: subdir });
+    assert.equal(r.status, 1,
+      `full-tree mode from scripts/ subdirectory must exit 1; ` +
+      `got status ${r.status}. stderr: ${r.stderr}`);
+    assert.ok(
+      r.stderr.includes('root') || r.stderr.includes('subdirectory') ||
+      r.stderr.includes('toplevel'),
+      `error must explain the root mismatch; got stderr: ${r.stderr}`,
+    );
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// complexity-07: bounds check in readAllIndexBlobs -- fail closed on truncation
+// ---------------------------------------------------------------------------
+describe('complexity-07: readAllIndexBlobs bounds check on blob slice', () => {
+
+  test('multi-file --staged scan parses all blob boundaries correctly (bounds check happy path)', () => {
+    // Regression guard: out.slice(pos, pos + size) had no bounds assertion.
+    // Buffer.slice clamps silently, so a truncated cat-file response would
+    // scan a short-but-valid blob and potentially miss hazards (fail-open).
+    // Fix: assert pos + size <= out.length; exit 2 with discrepancy details.
+    //
+    // This test exercises the positional blob-boundary parse loop across 5
+    // files to confirm the bounds check does not interfere with valid output.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      for (let i = 1; i <= 5; i++) {
+        writeFileSync(join(dir, `file${i}.md`), `clean content ${i}\n`.repeat(10));
+      }
+      git('add', 'file1.md', 'file2.md', 'file3.md', 'file4.md', 'file5.md');
+      const r = runScanner(['--staged'], { cwd: dir });
+      assert.equal(r.status, 0,
+        `multi-file --staged scan must succeed with bounds check in place; stderr: ${r.stderr}`);
+      assert.ok(/Scanned 5 file\(s\)/.test(r.stdout),
+        `must report scanning all 5 files; got: ${r.stdout}`);
+    } finally { cleanup(dir); }
+  });
+
+});

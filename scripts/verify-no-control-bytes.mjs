@@ -326,6 +326,7 @@ function getStagedFiles(cwd) {
     // `:old-mode new-mode old-sha new-sha status`
     const fields = header.slice(1).split(' ');
     const newMode = parseInt(fields[1], 8); // new-mode is octal (e.g. "100644")
+    const newSha = fields[3] || '';          // new blob SHA in index (used by readAllIndexBlobs)
     const status = fields[4] || '';
     i++;
     // Rename (R) and copy (C) entries have two paths: old-path then new-path.
@@ -336,6 +337,17 @@ function getStagedFiles(cwd) {
     const path = parts[i] || '';
     i++;
     if (!path) continue;
+    // PF-024 defense-in-depth: reject paths that look like git revision syntax.
+    // With the SHA-based readAllIndexBlobs approach below, a path like "0:foo"
+    // is looked up by its blob SHA and is safe. This check is a secondary guard
+    // to fail closed if any future code path re-introduces :<path> addressing.
+    if (/^[0-3]:/.test(path)) {
+      console.error(
+        `✖ verify-no-control-bytes: staged path matches git revision syntax ` +
+        `and cannot be scanned safely: "${path}" (PF-024)`,
+      );
+      process.exit(1);
+    }
     // AC-20: skip symlinks (120000) and gitlinks (160000) — identical to
     // full-tree mode. A gitlink's cat-file lookup returns 'missing' (commit
     // object, not a blob) and would otherwise cause a misleading "staged path
@@ -344,7 +356,7 @@ function getStagedFiles(cwd) {
     // theoretically possible and scanning them could produce false-positive gate
     // failures. Skipping keeps the gate focused on source-file content (avoids PF-015).
     const skip = newMode === 0o120000 || newMode === 0o160000;
-    files.push({ path, mode: newMode, skip, staged: true });
+    files.push({ path, mode: newMode, sha: newSha, skip, staged: true });
   }
   return files;
 }
@@ -358,18 +370,22 @@ function getStagedFiles(cwd) {
  *   <content — exactly <size> bytes>
  *   \n   ← one-byte LF terminator after content
  *
- * @param {string[]} paths — repo-relative staged paths
+ * PF-024 FIX: blobs are addressed by SHA (captured from `git diff --cached
+ * --raw` field 3), NOT by `:<path>` revision syntax. A path like "0:foo.mds"
+ * would form `:0:foo.mds` which git interprets as stage-0 revision syntax for
+ * "foo.mds", silently returning a different blob. SHA-based lookup is
+ * unambiguous and immune to this class of path-confusion attack.
+ *
+ * @param {{ path: string, sha: string }[]} entries — staged entries with blob SHAs
  * @param {string}   cwd
  * @returns {Map<string, Buffer>}
  */
-function readAllIndexBlobs(paths, cwd) {
-  if (paths.length === 0) return new Map();
+function readAllIndexBlobs(entries, cwd) {
+  if (entries.length === 0) return new Map();
 
-  // Input: ":<path>\0" for every staged path.
-  // Use NUL as delimiter (matching getStagedFiles' -z output) so that git paths
-  // containing a literal LF do not split into two batch requests and
-  // desynchronize the response parser.
-  const stdin = Buffer.from(paths.map(p => `:${p}\0`).join(''), 'utf8');
+  // Input: "<sha>\0" for every staged blob — SHA-based, never :<path> syntax.
+  // -z flag makes both input and output NUL-delimited (git cat-file --batch -z).
+  const stdin = Buffer.from(entries.map(e => `${e.sha}\0`).join(''), 'utf8');
   // Hard bound: mirrors gitExec's contract. An index lock, network-FS hang, or
   // stuck git subprocess in the pre-commit hook must not block indefinitely.
   // ETIMEDOUT is indeterminate → exit 2, never 0.
@@ -400,7 +416,7 @@ function readAllIndexBlobs(paths, cwd) {
   const results = new Map();
   let pos = 0;
 
-  for (const path of paths) {
+  for (const { path } of entries) {
     if (pos >= out.length) {
       console.error(`✖ verify-no-control-bytes: unexpected end of cat-file output for ${path}`);
       process.exit(2);
@@ -421,16 +437,26 @@ function readAllIndexBlobs(paths, cwd) {
       process.exit(2);
     }
     // Parse "<sha> blob <size>"
-    const parts = header.split(' ');
-    if (parts.length !== 3 || parts[1] !== 'blob') {
+    const hparts = header.split(' ');
+    if (hparts.length !== 3 || hparts[1] !== 'blob') {
       console.error(
         `✖ verify-no-control-bytes: unexpected cat-file response for ${path}: ${header}`,
       );
       process.exit(2);
     }
-    const size = parseInt(parts[2], 10);
+    const size = parseInt(hparts[2], 10);
     if (Number.isNaN(size) || size < 0) {
       console.error(`✖ verify-no-control-bytes: invalid blob size for ${path}: ${header}`);
+      process.exit(2);
+    }
+    // complexity-07: assert bounds before slicing. Buffer.slice clamps silently;
+    // a truncated cat-file response would scan a short-but-valid blob and pass —
+    // a fail-open path on a merge gate. Fail closed instead (exit 2 = indeterminate).
+    if (pos + size > out.length) {
+      console.error(
+        `✖ verify-no-control-bytes: truncated cat-file output for "${path}": ` +
+        `declared ${size} bytes at offset ${pos} but only ${out.length - pos} bytes remain`,
+      );
       process.exit(2);
     }
     results.set(path, out.slice(pos, pos + size));
@@ -545,6 +571,7 @@ function main() {
   // ---- Build file list ----
   let fileEntries;
   let skippedCount = 0;
+  let repoRoot = null; // set in full-tree mode; included in passStats for self-description
 
   if (explicitPaths.length > 0) {
     // Explicit path mode (used by tests with temp repos)
@@ -563,7 +590,34 @@ function main() {
     skippedCount = all.filter(e => e.skip).length;
     fileEntries = all.filter(e => !e.skip).map(e => ({ ...e, absolutePath: null }));
   } else {
-    // Default: full tracked tree
+    // Default: full tracked tree — must run from the repository root.
+    // security-02: git ls-files -sz is scoped to cwd; running from a
+    // subdirectory silently scans only that portion of the tracked tree and
+    // exits 0 with the same unqualified pass line as a full-tree scan.
+    // An engineer running from crates/ gets a clean result for a tree never
+    // fully scanned (avoids PF-016). Fix: require cwd == repo root.
+    const rootResult = gitExec(['rev-parse', '--show-toplevel'], cwd);
+    if (rootResult.status !== 0) {
+      console.error('✖ verify-no-control-bytes: git rev-parse --show-toplevel failed');
+      process.exit(2);
+    }
+    repoRoot = rootResult.stdout.toString('utf8').trim();
+    // Use realpathSync to handle symlinks (e.g. macOS /private/tmp vs /tmp).
+    let rootMismatch;
+    try {
+      rootMismatch = realpathSync(cwd) !== realpathSync(repoRoot);
+    } catch {
+      rootMismatch = resolve(cwd) !== resolve(repoRoot);
+    }
+    if (rootMismatch) {
+      console.error(
+        `✖ verify-no-control-bytes: full-tree mode must be run from the repository root.\n` +
+        `  Current directory: ${cwd}\n` +
+        `  Repository root:   ${repoRoot}\n` +
+        `  Re-run from: ${repoRoot}`,
+      );
+      process.exit(1);
+    }
     const all = getTrackedFiles(cwd);
     skippedCount = all.filter(e => e.skip).length;
     fileEntries = all
@@ -626,7 +680,11 @@ function main() {
   // ---- In --staged mode, pre-fetch all blobs in one subprocess (D-CB8) ----
   // readAllIndexBlobs() collapses N per-file `git cat-file blob` spawns into a
   // single `git cat-file --batch` call (~11 ms/file saved for large staged sets).
-  const blobMap = isStaged ? readAllIndexBlobs(fileEntries.map(e => e.path), cwd) : null;
+  // PF-024 fix: pass {path, sha} entries so readAllIndexBlobs uses SHA-based
+  // lookup rather than :<path> revision syntax (which is unsafe for paths like "0:foo").
+  const blobMap = isStaged
+    ? readAllIndexBlobs(fileEntries.map(e => ({ path: e.path, sha: e.sha })), cwd)
+    : null;
 
   // ---- Scan each file ----
   let totalBytes = 0;
@@ -721,7 +779,10 @@ function main() {
   }
 
   // ---- Report ----
+  // Include scanned root in full-tree mode so the pass line is self-describing
+  // (security-02: an unqualified count is indistinguishable from a partial scan).
   const passStats = `Scanned ${scannedFiles} file(s), ${totalBytes} byte(s)` +
+    (repoRoot ? ` from ${repoRoot}` : '') +
     (skippedCount > 0 ? `, ${skippedCount} symlink/gitlink skipped` : '');
 
   // AC-17: name every allowlist entry that was actually exercised by this run.
