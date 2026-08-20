@@ -12,6 +12,11 @@ license = "MIT"
 repository = "https://github.com/dean0x/mdscript"
 keywords = ["markdown", "template", "llm", "prompt", "compiler"]
 categories = ["wasm", "template-engine"]
+# Not published to crates.io: distribution is an npm/WASM package (@mdscript/mds-wasm).
+# NOTE: license and repository above are explicit (not workspace-inherited) by design —
+# older wasm-pack parsers choke on workspace inheritance for those fields. Do not
+# convert them. See the comment on the license field for context.
+publish = false
 
 [features]
 # Expose the raw Rust panic payload as `err.detail` on mds::internal errors.
@@ -35,14 +40,12 @@ mds = { package = "mds-core", path = "../mds-core", version = "0.3.0" }
 wasm-bindgen-test = { workspace = true }
 
 [package.metadata.wasm-pack.profile.release]
-# -Oz: optimize for size. Rust 1.88+ emits post-MVP WASM features that wasm-opt
-# rejects by default — each must be explicitly enabled.
-# Requires Binaryen: CI uses phi-ag/setup-binaryen; locally `brew install binaryen`.
 wasm-opt = [
   # -Oz: optimize for size. --flatten + second -Oz + --rereloop restructure
   # the code graph for better size reduction. --converge runs until stable
-  # (adds ~2-3x wasm-opt runtime but shrinks by ~446 bytes vs single pass).
-  # --strip-producers drops the producer section (~62 bytes).
+  # (adds ~2-3x wasm-opt runtime but shrinks by ~446 bytes vs single pass,
+  # measured with wasm-opt v117; CI Binaryen v129 is authoritative for release).
+  # --strip-producers drops the producer section (~62 bytes, same provenance).
   # NOTE: --gufa was measured and REGRESSES size by ~+700 bytes — do not add it.
   "-Oz", "--flatten", "--rereloop", "-Oz", "--converge", "--strip-producers",
   # Rust 1.88+ emits post-MVP WASM features; each must be explicitly enabled.

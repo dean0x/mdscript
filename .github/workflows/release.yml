@@ -30,6 +30,9 @@ jobs:
   version-gate:
     name: Version gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read  # needed to call the check-runs API in the CI-history step
     steps:
       - uses: actions/checkout@v6
         with:
@@ -48,6 +51,89 @@ jobs:
         run: node scripts/verify-no-control-bytes.mjs
       - name: "Run positive-control and class-completeness suite"
         run: npm run test:gates
+      # reliability-12: assert the tagged SHA went green in CI before any
+      # irreversible publish starts. Only runs on tag pushes (not workflow_dispatch
+      # dry runs, which have no prior CI record to verify).
+      # Reads required contexts from main branch protection (D-PR2; avoids ADR-009
+      # vacuous-green). Treats CANCELLED/skipped/in_progress as failure (PF-017).
+      # Cannot reuse scripts/verify-pr-checks.mjs here — that script requires a PR
+      # number, and tag pushes reference a commit, not a PR. Uses the check-runs API
+      # directly against github.sha with the same fail-closed semantics.
+      - name: "Assert tagged SHA has green CI history (PF-017)"
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA="${{ github.sha }}"
+          REPO="${{ github.repository }}"
+
+          # Read required contexts from main branch protection (D-PR2). Fail closed
+          # if protection is unreadable or lists zero contexts — an empty required
+          # set is a vacuous pass, not a pass (ADR-009).
+          if ! PROT=$(gh api "/repos/${REPO}/branches/main/protection"); then
+            echo "::error::Cannot read main branch protection (check token permissions)"
+            exit 1
+          fi
+          CONTEXTS_JSON=$(echo "$PROT" | jq '[
+            (.required_status_checks.contexts // []),
+            ((.required_status_checks.checks // [])
+              | map(.context)
+              | map(select(. != null)))
+          ] | flatten | unique')
+          REQ_COUNT=$(echo "$CONTEXTS_JSON" | jq 'length')
+          if [ "$REQ_COUNT" -eq 0 ]; then
+            echo "::error::main protection lists 0 required contexts — indeterminate (ADR-009)"
+            exit 1
+          fi
+          echo "Required contexts from main (${REQ_COUNT}):"
+          echo "$CONTEXTS_JSON" | jq -r '.[]' | sed 's/^/  /'
+
+          # Fetch check-runs for the tagged SHA. Bounded at 3 pages × 100 = 300
+          # runs — far above any expected CI suite size. filter=latest
+          # de-duplicates runs within each check-suite (D-PR4a parity).
+          ALL_RUNS="[]"
+          for _page in 1 2 3; do
+            BATCH=$(gh api \
+              "/repos/${REPO}/commits/${SHA}/check-runs?per_page=100&page=${_page}&filter=latest" \
+              --jq '.check_runs // []') || {
+              echo "::error::check-runs API error (page ${_page})"
+              exit 1
+            }
+            LEN=$(echo "$BATCH" | jq 'length')
+            ALL_RUNS=$(printf '%s\n%s' "$ALL_RUNS" "$BATCH" | jq -sc 'add // []')
+            [ "$LEN" -lt 100 ] && break
+          done
+
+          TOTAL=$(echo "$ALL_RUNS" | jq 'length')
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::Zero check-runs for ${SHA} — no CI record (PF-013: absence is not success)"
+            exit 1
+          fi
+          echo "${TOTAL} check-run(s) found for ${SHA}"
+
+          # Assert each required context is completed+success.
+          # PF-017: CANCELLED / skipped / in_progress / null are all FAIL.
+          FAIL=0
+          while IFS= read -r ctx; do
+            [ -z "$ctx" ] && continue
+            VERDICT=$(echo "$ALL_RUNS" | jq -r --arg c "$ctx" \
+              'map(select(.name == $c)) |
+               if length == 0 then "absent"
+               else .[0] | "\(.status)/\(.conclusion // "null")"
+               end')
+            if [ "$VERDICT" = "absent" ]; then
+              echo "::error::Required '${ctx}' — not found in check-runs (never ran)"
+              FAIL=1
+            elif [ "$VERDICT" = "completed/success" ]; then
+              echo "  ok: '${ctx}'"
+            else
+              echo "::error::Required '${ctx}' — ${VERDICT} (PF-017: only completed/success passes)"
+              FAIL=1
+            fi
+          done < <(echo "$CONTEXTS_JSON" | jq -r '.[]')
+
+          [ "$FAIL" -ne 0 ] && exit 1
+          echo "All ${REQ_COUNT} required context(s) completed+success for ${SHA} — CI-verified"
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
@@ -220,7 +306,8 @@ jobs:
           echo "Polling crates.io for mds-core@${VERSION} (max 20 × 15 s)"
           MAX=20
           for i in $(seq 1 "$MAX"); do
-            if curl -sf "https://crates.io/api/v1/crates/mds-core/${VERSION}" \
+            if curl -sf --max-time 20 --connect-timeout 10 \
+                 "https://crates.io/api/v1/crates/mds-core/${VERSION}" \
                  -H "User-Agent: mds-release-ci/1.0" \
                  | grep -qF "\"num\":\"${VERSION}\""; then
               echo "mds-core@${VERSION} is visible in crates.io (attempt $i/$MAX)"
@@ -271,7 +358,13 @@ jobs:
           node-version: 22
           cache: npm
           registry-url: "https://registry.npmjs.org"
-      - uses: dtolnay/rust-toolchain@stable
+      # performance-01 / PF-021: pin to the same 1.96.0 SHA that ci.yml's wasm
+      # job uses so the compiler that MEASURES size and the compiler that BUILDS
+      # the published artifact are identical. Unpinned @stable lets toolchain
+      # drift silently push the binary past the 850 KB guard between releases.
+      # WHEN BUMPING: update ci.yml's wasm job pin first, re-measure, then
+      # update here to keep both in sync.
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
         with: { targets: wasm32-unknown-unknown }
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-wasm
@@ -295,6 +388,25 @@ jobs:
         run: |
           npm run build -w @mdscript/mds-wasm
           npm run build --workspaces --if-present
+      # performance-01 / PF-021: defence-in-depth size guard on the ACTUAL
+      # published artifact (built above by the pinned 1.96.0 toolchain). Mirrors
+      # ci.yml's 850,000-byte threshold byte-for-byte. Runs BEFORE any irreversible
+      # npm publish so a bloated binary aborts before anything reaches the registry.
+      - name: "Assert WASM binary size < 850,000 bytes (PF-021)"
+        run: |
+          for f in packages/mds-wasm/dist/node/mds_wasm_bg.wasm \
+                   packages/mds-wasm/dist/web/mds_wasm_bg.wasm; do
+            if [ ! -f "$f" ]; then
+              echo "::error::WASM file missing: $f"
+              exit 1
+            fi
+            raw=$(wc -c < "$f" | tr -d ' ')
+            echo "::notice::WASM ${f}: ${raw} bytes"
+            if [ "$raw" -gt 850000 ]; then
+              echo "::error::WASM binary exceeds 850,000 byte threshold: ${f} is ${raw} bytes"
+              exit 1
+            fi
+          done
       - name: Publish platform packages (napi prepublish)
         working-directory: crates/mds-napi
         run: |
