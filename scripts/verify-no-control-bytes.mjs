@@ -156,6 +156,13 @@ export const HAZARD_ALLOWLIST = [
   // { path: 'relative/from/root', codepoints: [0x...], reason: 'explanation' }
 ];
 
+// reliability-01: output caps — one retained hit is already sufficient to exit 1,
+// so truncating output cannot weaken the gate. These caps prevent the 285x memory
+// amplification empirically measured on a 2 MB file of dense hazard bytes (a file
+// of 0x01 bytes produced 569 MB peak RSS and 275 MB of stderr at uncapped output).
+const MAX_HITS_PER_FILE = 20;
+const MAX_HITS_TOTAL = 1000;
+
 // ---------------------------------------------------------------------------
 // Hazard predicate
 // ---------------------------------------------------------------------------
@@ -198,6 +205,32 @@ function hexContext(buf, offset) {
     hex.push(i === offset ? `[${byte}]` : byte);
   }
   return hex.join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// security-12: git version gate
+//
+// `git cat-file --batch -z` requires git >= 2.42 (the -z flag was added then).
+// An older git rejects -z with exit code 129 and no useful message. This gate
+// detects the version mismatch early and emits a named diagnostic. The fail-closed
+// behaviour (exit 2 = indeterminate) is unchanged — this is diagnosability only.
+// Mirrors the MIN_GH_MAJOR/MIN_GH_MINOR pattern from verify-pr-checks.mjs.
+// ---------------------------------------------------------------------------
+
+const MIN_GIT_MAJOR = 2;
+const MIN_GIT_MINOR = 42;
+
+/**
+ * Probe the installed git version. Returns { major, minor } or null on failure.
+ * Short timeout: --version is a local binary probe with no network I/O.
+ */
+function gitVersion() {
+  const r = spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 10_000 });
+  if (r.error || r.status !== 0) return null;
+  // Output: "git version 2.42.0"
+  const m = r.stdout.match(/git version (\d+)\.(\d+)/);
+  if (!m) return null;
+  return { major: parseInt(m[1], 10), minor: parseInt(m[2], 10) };
 }
 
 // ---------------------------------------------------------------------------
@@ -491,13 +524,24 @@ function readAllIndexBlobs(entries, cwd) {
  *   them here would make every HAZARD_ALLOWLIST entry look stale (D-CB6).
  */
 export function scanBuffer(buf, relPath, allowedCps) {
-  // Check for NUL (binary file indicator)
+  // Check for NUL (binary file indicator).
+  // D-CB6b: BINARY_ALLOWLIST entries permit NUL bytes — they do NOT grant a
+  // whole-file opt-out from all other hazard classes (bidi, C1, BOM, etc.).
+  // An early return here would silently disable all 21 hazard classes for the
+  // entire file — semantics the D-CB6 header never documents and that would
+  // arm silently on the first legitimate BINARY_ALLOWLIST entry added.
+  // Fix: treat 0x00 as an allowlisted codepoint and let the decode loop
+  // continue so all other hazard classes still apply.
   if (buf.includes(0x00)) {
     const inBinaryAllowlist = BINARY_ALLOWLIST.some(e => e.path === relPath);
     if (!inBinaryAllowlist) {
       return [{ codepoint: 0x00, byteOffset: buf.indexOf(0x00), binaryError: true }];
     }
-    return []; // Allowed binary file
+    // NUL is permitted for this file. Add 0x00 to the effective allowedCps so
+    // NUL hits in the decode loop are recorded as `allowed: true` (not errors),
+    // while the scan continues to check all other hazard classes.
+    // Do NOT return early — other hazard classes still apply.
+    allowedCps = new Set([...allowedCps, 0x00]);
   }
 
   // Inline UTF-8 decode + hazard scan (no intermediate codepoint array).
@@ -583,6 +627,19 @@ function main() {
       absolutePath: resolve(cwd, p),
     }));
   } else if (isStaged) {
+    // security-12: git cat-file --batch -z (used by readAllIndexBlobs) requires
+    // git >= 2.42. Check here — before any staged-mode git I/O — so an operator
+    // on an older git sees a version diagnostic rather than a bare "exited 129".
+    // Fail-closed exit 2 (indeterminate) is preserved; this is diagnosability only.
+    const ver = gitVersion();
+    if (!ver || ver.major < MIN_GIT_MAJOR || (ver.major === MIN_GIT_MAJOR && ver.minor < MIN_GIT_MINOR)) {
+      const found = ver ? `${ver.major}.${ver.minor}` : 'unknown';
+      console.error(
+        `✖ verify-no-control-bytes: git >= ${MIN_GIT_MAJOR}.${MIN_GIT_MINOR} required for ` +
+        `--staged mode (git cat-file --batch -z); found ${found}`,
+      );
+      process.exit(2);
+    }
     // D-CB8: staged mode — read from git index.
     // getStagedFiles() now provides mode info; skip gitlinks and symlinks
     // exactly as full-tree mode does (AC-20, D-CB5a).
@@ -693,6 +750,8 @@ function main() {
   // AC-30: hexCtx is pre-computed so the file buffer is not retained beyond the
   // scan of a single file. { path, codepoint, byteOffset, hexCtx }
   const hazardHits = [];
+  // reliability-01: track suppressed hits so truncation is visible in output.
+  let totalHitsSuppressed = 0;
 
   for (const entry of fileEntries) {
     let buf;
@@ -716,6 +775,8 @@ function main() {
 
     const allowedCps = hazardAllowMap.get(entry.path) ?? new Set();
     const hits = scanBuffer(buf, entry.path, allowedCps);
+    // reliability-01: per-file cap resets for each file.
+    let hitsThisFile = 0;
 
     for (const hit of hits) {
       if (hit.invalidUtf8) {
@@ -727,13 +788,22 @@ function main() {
         // stale-entry check below does not flag it.
         exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
       } else {
-        // AC-30: compute hex context now so buf is not retained after this iteration.
-        hazardHits.push({
-          path: entry.path,
-          codepoint: hit.codepoint,
-          byteOffset: hit.byteOffset,
-          hexCtx: hexContext(buf, hit.byteOffset),
-        });
+        // reliability-01: cap output to prevent DoS on hazard-dense files.
+        // One retained hit is already sufficient to exit 1, so truncating
+        // output cannot weaken the gate. The pre-commit hook stalls for seconds
+        // to minutes and CI generates hundreds of MB of log when uncapped.
+        if (hitsThisFile < MAX_HITS_PER_FILE && hazardHits.length < MAX_HITS_TOTAL) {
+          // AC-30: compute hex context now so buf is not retained after this iteration.
+          hazardHits.push({
+            path: entry.path,
+            codepoint: hit.codepoint,
+            byteOffset: hit.byteOffset,
+            hexCtx: hexContext(buf, hit.byteOffset),
+          });
+          hitsThisFile++;
+        } else {
+          totalHitsSuppressed++;
+        }
       }
     }
   }
@@ -804,6 +874,14 @@ function main() {
       const cpHex = `U+${hit.codepoint.toString(16).toUpperCase().padStart(4, '0')}`;
       console.error(`✖ ${hit.path}: hazardous codepoint ${cpHex} at byte offset ${hit.byteOffset}`);
       console.error(`  context: ${hit.hexCtx}`);
+    }
+    // reliability-01: emit suppressed-count notice so truncation is visible rather
+    // than silent. The gate still fails closed — one hit is sufficient for exit 1.
+    if (totalHitsSuppressed > 0) {
+      console.error(
+        `  (${totalHitsSuppressed} additional hit(s) suppressed — ` +
+        `output capped at ${MAX_HITS_PER_FILE}/file, ${MAX_HITS_TOTAL} total; exit code is unchanged)`,
+      );
     }
     console.error(`✖ source-hygiene gate FAILED — ${passStats}`);
     process.exit(1);

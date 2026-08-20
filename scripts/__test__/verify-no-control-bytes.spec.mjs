@@ -1174,6 +1174,154 @@ describe('security-02: full-tree mode from subdirectory exits 1', () => {
 });
 
 // ---------------------------------------------------------------------------
+// reliability-01: hazard-dense file caps output and still exits 1
+// ---------------------------------------------------------------------------
+describe('reliability-01: hazard-dense file caps output and still exits 1', () => {
+
+  test('hazard-dense file triggers per-file cap, exits 1, and emits suppressed-count notice', () => {
+    // reliability-01: a 2 MB file of 0x01 bytes produced 569 MB peak RSS and
+    // 275 MB of stderr at uncapped output — roughly 285x memory amplification.
+    // With MAX_HITS_PER_FILE=20 and MAX_HITS_TOTAL=1000 caps, a 2 KB file of
+    // 0x01 bytes (2000 hazard occurrences) must still exit 1 while emitting far
+    // fewer than 2000 hit lines.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // 0x01 = SOH — in C0 hazard range { from: 0x00, to: 0x08 }.
+      // 2000 bytes guarantees > MAX_HITS_PER_FILE (20) hazard occurrences.
+      const dense = Buffer.alloc(2000, 0x01);
+      writeFileSync(join(dir, 'dense.bin'), dense);
+      git('add', 'dense.bin');
+
+      const r = runScanner([], { cwd: dir });
+
+      // Gate must still exit 1 — one retained hit is sufficient, cap does not weaken it.
+      assert.equal(r.status, 1, 'hazard-dense file must still exit 1 even with output cap');
+
+      // Count U+0001 hit lines — should be capped at MAX_HITS_PER_FILE (20), not 2000.
+      const hitLines = r.stderr.split('\n').filter(l => l.includes('U+0001'));
+      assert.ok(hitLines.length >= 1,
+        'at least one hit must be reported');
+      assert.ok(hitLines.length <= 20,
+        `output must be capped to at most MAX_HITS_PER_FILE (20) hits per file; got ${hitLines.length}`);
+
+      // Suppressed-count notice must appear (truncation must be visible, not silent).
+      assert.ok(r.stderr.includes('suppressed'),
+        `suppressed-count notice must appear in stderr when hits are truncated; got: ${r.stderr.slice(0, 400)}`);
+    } finally { cleanup(dir); }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// security-03: BINARY_ALLOWLIST does not disable non-NUL hazard scanning
+// ---------------------------------------------------------------------------
+describe('security-03: BINARY_ALLOWLIST entry does not silence non-NUL hazard classes', () => {
+
+  test('allowlisted NUL-bearing file with bidi override exits 1 (decode loop continues past NUL)', () => {
+    // ADR-009 positive control — BEFORE/AFTER observation required:
+    //
+    // BEFORE fix (old code): scanBuffer returned [] early for any binary-allowlisted
+    //   NUL file, silently skipping all 21 hazard classes. A file with NUL + RLO
+    //   (U+202E, bidi override) would exit 0 — a false pass.
+    //
+    // AFTER fix (new code): 0x00 is added to allowedCps and the decode loop
+    //   continues. RLO (U+202E) is detected and the gate exits 1.
+    //
+    // Confirmed: this test FAILED (exit 0) against the pre-fix code
+    // (early-return path), and PASSES (exit 1) with the fix applied.
+    const { dir, git } = mkTempGitRepo();
+    try {
+      // Build file with NUL (0x00) AND RLO bidi override (U+202E).
+      // U+202E UTF-8 encoding: 0xE2 0x80 0xAE (3 bytes) — constructed at runtime (PF-018).
+      const nul = Buffer.from([0x00]);
+      const rlo = Buffer.from([0xe2, 0x80, 0xae]); // U+202E Right-to-Left Override
+      const content = Buffer.concat([Buffer.from('data'), nul, rlo, Buffer.from('\n')]);
+      writeFileSync(join(dir, 'mixed.bin'), content);
+
+      // Patch BINARY_ALLOWLIST to permit NUL in this file.
+      const marker = 'export const BINARY_ALLOWLIST = [';
+      const src = readFileSync(SCANNER, 'utf8');
+      assert.ok(src.includes(marker), 'scanner must declare BINARY_ALLOWLIST for this test to patch');
+      const patched = src.replace(
+        marker,
+        `${marker} { path: 'mixed.bin', reason: 'test fixture — NUL allowlisted, bidi must still fail' },`,
+      );
+      assert.notEqual(patched, src, 'patch must have applied');
+      const target = join(dir, 'scan.mjs');
+      writeFileSync(target, patched);
+      git('add', 'mixed.bin', 'scan.mjs');
+
+      const r = spawnSync(process.execPath, [target], { cwd: dir, encoding: 'utf8', timeout: 30000 });
+      // BEFORE fix: exit 0 (bidi silently missed — early return on NUL).
+      // AFTER fix:  exit 1 (U+202E detected; decode loop continued past NUL).
+      assert.equal(r.status, 1,
+        `BINARY_ALLOWLIST file with NUL + RLO bidi override must exit 1 (bidi still scanned); ` +
+        `got status ${r.status}, stderr: ${r.stderr}`);
+      assert.ok(
+        r.stderr.includes('U+202E') || r.stderr.includes('202E'),
+        `gate must detect the RLO bidi override despite the NUL allowlist entry; got stderr: ${r.stderr}`,
+      );
+    } finally { cleanup(dir); }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// security-12: old git produces a version diagnostic, not a cryptic exit 129
+// ---------------------------------------------------------------------------
+describe('security-12: --staged mode with old git emits a version diagnostic', () => {
+
+  test('--staged with git < 2.42 exits 2 with version requirement message', () => {
+    // git cat-file --batch -z requires git >= 2.42. An older git rejects -z and
+    // exits 129 with no useful message. The fix gates on version before issuing
+    // the --batch -z call. Fail-closed (exit 2 = indeterminate) is preserved —
+    // this is a diagnosability fix only.
+    //
+    // Uses a fake git shell script that returns "git version 2.30.0" for
+    // --version but delegates all other calls to the real git binary.
+    const { dir, git } = mkTempGitRepo();
+    const fakeBinDir = mkdtempSync(join(tmpdir(), 'mds-oldgit-'));
+    try {
+      // Stage a clean file so the staged-mode path is fully exercised.
+      writeFileSync(join(dir, 'clean.md'), 'clean\n');
+      git('add', 'clean.md');
+
+      // Locate the real git to delegate non-version calls.
+      const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+      assert.ok(realGit, 'must locate real git binary for fake delegation');
+      const fakeGit = join(fakeBinDir, 'git');
+      writeFileSync(fakeGit,
+        `#!/bin/sh\n` +
+        `if [ "$1" = "--version" ]; then echo "git version 2.30.0"; exit 0; fi\n` +
+        `exec ${JSON.stringify(realGit)} "$@"\n`,
+      );
+      spawnSync('chmod', ['755', fakeGit]);
+
+      const oldPath = process.env.PATH || '';
+      const r = spawnSync(process.execPath, [SCANNER, '--staged'], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${fakeBinDir}:${oldPath}` },
+        timeout: 30000,
+      });
+
+      // Must exit 2 (indeterminate — same as before the fix, not weakened).
+      assert.equal(r.status, 2,
+        `old git must exit 2 (fail-closed); got status ${r.status}, stderr: ${r.stderr}`);
+      // Must emit a version requirement message (diagnosability — the new part).
+      assert.ok(
+        r.stderr.includes('2.42') && r.stderr.includes('required'),
+        `error must mention required version 2.42; got stderr: ${r.stderr}`,
+      );
+    } finally {
+      cleanup(dir);
+      cleanup(fakeBinDir);
+    }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
 // complexity-07: bounds check in readAllIndexBlobs -- fail closed on truncation
 // ---------------------------------------------------------------------------
 describe('complexity-07: readAllIndexBlobs bounds check on blob slice', () => {
