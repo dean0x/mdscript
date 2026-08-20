@@ -2339,6 +2339,53 @@ fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
     );
 }
 
+// ── resolve-b2a: single-file --fix --check --format json emits JSON before exit ─
+//
+// Regression: `lint_one_file` called `std::process::exit(1)` inside the
+// `PreviewOutcome::WouldFix` + `check` arm WITHOUT first calling `emit_result`,
+// making the `emit_result` at the end of the preview block unreachable.  On exit,
+// stdout was zero bytes — `JSON.parse("")` throws.  AC-F-14 was satisfied in
+// directory mode (the `any_would_fix` exit emits the envelope first at
+// run_lint_directory) but broken in single-file mode.
+//
+// Fix: call `emit_result(format, &result, quiet, named_source)` immediately before
+// `std::process::exit(1)` in the single-file WouldFix+check arm (mirroring dir mode).
+
+#[test]
+fn file_fix_check_json_emits_parseable_json_before_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    // One fixable file — triggers the WouldFix + check arm.
+    let file = dir.path().join("fixable.mds");
+    fs::copy(fixture("lint_error.mds"), &file).unwrap();
+
+    let out = lint_path(&file, &["--fix", "--check", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // --fix --check exits 1 when fixes are pending.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "single-file --fix --check must exit 1 when fixes are pending; stderr: {stderr}"
+    );
+
+    // stdout must be parseable JSON — not empty.
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "single-file --fix --check --format json must emit parseable JSON before exiting; \
+             parse error: {e}; stdout: '{stdout}'"
+        )
+    });
+    assert_eq!(
+        json["version"], 1,
+        "envelope must have version:1; got: {json}"
+    );
+    assert!(
+        json["files"].is_array(),
+        "envelope must have files[]; got: {json}"
+    );
+}
+
 // ── resolve-w2 #59: stdin --fix --check never writes fixed source ─────────────
 //
 // Regression: `run_lint_stdin` destructured `LintFlags` with `..`, silently
@@ -3201,6 +3248,117 @@ fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
         !stderr.contains("Fixed:"),
         "stderr must not contain 'Fixed:' when the JSON-dir write failed \
          (lint_one_file_accumulating, lint.rs:1535 guard); got: {stderr:?}"
+    );
+}
+
+// ── resolve-b2a (F-14): dir JSON write failure must emit structured error, not stale result ─
+//
+// Regression: `lint_one_file_accumulating` called `accumulate_result_json(&residual, …)`
+// BEFORE `atomic_write_file`.  On write failure the residual (post-fix, zero-diagnostic)
+// result was already pushed to the envelope, so consumers parsed clean-looking JSON
+// while the process exited 2 and stderr said "Permission denied".  AC-F-14 requires the
+// JSON envelope to truthfully reflect what happened.
+//
+// Fix: attempt the write FIRST; on failure push a structured `{"file":…,"error":…}`
+// entry matching the read-failure shape, then return FileTally::Error.
+
+#[cfg(unix)]
+#[test]
+fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // ── Positive control (PF-013/ADR-009): writable dir → clean JSON, no error entry ──
+    //
+    // After a successful fix the residual has zero diagnostics, so accumulate_result_json
+    // adds no file entry and files[] is empty — that is the correct/clean shape.
+    // The critical positive-control signal is: exit 0 + "Fixed:" on stderr + no "error" key.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // Write succeeded → exit 0 (no residual findings).
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "positive control: dir --fix --format json must exit 0 after a successful fix; \
+             stderr: {stderr}"
+        );
+        // "Fixed:" must appear on stderr (proves the write actually happened).
+        assert!(
+            stderr.contains("Fixed:"),
+            "positive control: dir --fix --format json must emit 'Fixed:' when write succeeds \
+             (otherwise the error-entry absence assertion below is vacuous; ADR-009); \
+             got stderr: {stderr:?}"
+        );
+        // stdout must be parseable JSON with no "error" entries.
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "positive control: dir --fix --format json must emit valid JSON; \
+                 err: {e}; stdout: {stdout}"
+            )
+        });
+        let files = json["files"].as_array().expect("files[] must be an array");
+        assert!(
+            !files.iter().any(|f| f.get("error").is_some()),
+            "positive control: files[] must not contain an error entry on success; got: {files:?}"
+        );
+    }
+
+    // ── Negative (failure gate): read-only dir → structured error entry in JSON ──
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("files");
+    fs::create_dir(&inner).unwrap();
+
+    fs::copy(fixture("lint_error.mds"), inner.join("fixable.mds")).unwrap();
+
+    // Make the inner directory read-only so atomic_write_file fails.
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = lint_path(&inner, &["--fix", "--format", "json"]);
+
+    // Restore writability before any assertions so tempdir cleanup can succeed.
+    let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Process must exit non-zero (write error counted as FileTally::Error → exit 2).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "dir --fix --format json with a read-only inner dir must exit non-zero; \
+         stderr: {stderr}"
+    );
+
+    // stdout must still be parseable JSON (AC-F-14).
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "dir --fix --format json must emit parseable JSON even on write failure \
+             (AC-F-14); parse error: {e}; stdout: '{stdout}'"
+        )
+    });
+
+    // The files[] entry for the failed file must have an "error" key (structured
+    // error entry), NOT a "diagnostics" key (which would indicate the stale
+    // clean post-fix result was pushed before the write was attempted).
+    let files = json["files"].as_array().expect("files[] must be an array");
+    assert!(
+        !files.is_empty(),
+        "files[] must be non-empty — the failed file must have an entry; got: {json}"
+    );
+    assert!(
+        files.iter().any(|f| f.get("error").is_some()),
+        "files[] must contain a structured error entry ({{\"file\":…,\"error\":…}}) for the \
+         file whose write failed; got files: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.get("diagnostics").is_some()),
+        "files[] must NOT contain a diagnostics entry for the write-failed file — \
+         the stale post-fix result must not be pushed before the write; got: {files:?}"
     );
 }
 

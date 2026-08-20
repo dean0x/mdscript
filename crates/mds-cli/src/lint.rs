@@ -979,14 +979,16 @@ fn run_lint_file(
                 applied_count,
                 total_count,
             } => {
+                emit_result(format, &residual, quiet, named_source);
+                atomic_write_file(path, &new_source)?;
+                // Print status AFTER write succeeds so "Partially fixed:" never
+                // precedes "error writing" for a file that was never modified.
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         safe_path(path)
                     );
                 }
-                emit_result(format, &residual, quiet, named_source);
-                atomic_write_file(path, &new_source)?;
                 exit_by_severity(&residual);
             }
             FixFileOutcome::Rejected { reason, original } => {
@@ -1028,6 +1030,11 @@ fn run_lint_file(
                     if !quiet {
                         eprintln!("Would fix: {}", safe_path(path));
                     }
+                    // AC-F-14: emit JSON result BEFORE exit so consumers always
+                    // receive parseable output regardless of exit code.  Mirrors
+                    // directory mode (run_lint_directory emits the envelope before
+                    // the any_would_fix exit at line ~1413).
+                    emit_result(format, &result, quiet, named_source);
                     std::process::exit(1);
                 }
             }
@@ -1531,11 +1538,17 @@ fn lint_one_file_accumulating(
                 new_source,
                 residual,
             } => {
-                accumulate_result_json(&residual, json_files);
+                // Write first (AC-F-14): on failure push a structured error entry so
+                // the JSON envelope truthfully reflects what happened rather than
+                // accumulating the clean post-fix result before the write is attempted.
                 if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
+                    json_files.push(serde_json::json!({
+                        "file": file_key,
+                        "error": MdsError::Io { message: format!("{e}") }.serialize()
+                    }));
                     return FileTally::Error;
                 }
+                accumulate_result_json(&residual, json_files);
                 // PF-004: parity with lint_one_file_human — same quiet gate, same text.
                 if !quiet {
                     eprintln!("Fixed: {}", safe_path(file));
@@ -1548,17 +1561,22 @@ fn lint_one_file_accumulating(
                 applied_count,
                 total_count,
             } => {
+                // Write first (AC-F-14 + print-after-write): on failure push a
+                // structured error entry; only accumulate and print on success.
+                if let Err(e) = atomic_write_file(file, &new_source) {
+                    json_files.push(serde_json::json!({
+                        "file": file_key,
+                        "error": MdsError::Io { message: format!("{e}") }.serialize()
+                    }));
+                    return FileTally::Error;
+                }
+                accumulate_result_json(&residual, json_files);
                 // Unified message + quiet guard (#173).
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         safe_path(file)
                     );
-                }
-                accumulate_result_json(&residual, json_files);
-                if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
-                    return FileTally::Error;
                 }
                 tally_from_result(&residual)
             }
@@ -1733,17 +1751,19 @@ fn lint_one_file_human(
                 applied_count,
                 total_count,
             } => {
+                render_result_human(&residual, quiet, named_source);
+                if let Err(e) = atomic_write_file(file, &new_source) {
+                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
+                    return FileTally::Error;
+                }
+                // Print status AFTER write succeeds so "Partially fixed:" never
+                // precedes "error writing" for a file that was never modified.
                 // Unified message + quiet guard (#173).
                 if !quiet {
                     eprintln!(
                         "Partially fixed: {} ({applied_count} of {total_count} fixes applied)",
                         safe_path(file)
                     );
-                }
-                render_result_human(&residual, quiet, named_source);
-                if let Err(e) = atomic_write_file(file, &new_source) {
-                    eprintln!("error writing {}: {}", safe_path(file), safe_inline(&e));
-                    return FileTally::Error;
                 }
                 tally_from_result(&residual)
             }
