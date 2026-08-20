@@ -304,6 +304,82 @@ describe('lint', () => {
     );
   });
 
+  // F-16 / testing-01 (directory-mode separator and ordering): the CLI must emit
+  // forward-slash separators in files[].file on every platform (including Windows,
+  // where the native separator is backslash), and the array must be in byte-wise
+  // ascending order over those normalised strings.
+  //
+  // Uses the lint-dir-order fixture, which contains:
+  //   b.mds            — flat file; display key "b.mds"
+  //   sub/a.mds        — nested file; display key "sub/a.mds"
+  //   sub[after.mds    — flat file with [ in name; display key "sub[after.mds"
+  //
+  // Expected order: "b.mds" < "sub/a.mds" < "sub[after.mds"
+  //   because '/' (0x2F) < '[' (0x5B) — if the native backslash ('\', 0x5C)
+  //   were used instead, "sub[after.mds" would sort BEFORE "sub\a.mds" (0x5B <
+  //   0x5C), reversing the order.  Both assertions (no backslash + correct order)
+  //   would fail on Windows if relative_display regressed to MAIN_SEPARATOR.
+  //
+  // Convention: hard-fail in CI when the CLI binary is absent; warn-and-return
+  // locally (matches U-L11 and U-L12 above).
+  test('U-L13: F-16 directory-mode — files[].file uses forward-slash and is in ascending byte-wise order', () => {
+    const mdsCli = findMdsCli();
+    if (mdsCli == null) {
+      if (process.env.CI) {
+        throw new Error(
+          'U-L13: mds CLI binary is required in CI for F-16 directory-mode coverage. ' +
+            'Set MDS_CLI_BIN or run `cargo build -p mds-cli`.',
+        );
+      }
+      // Local dev without a built CLI: warn and skip (not a hard failure).
+      console.warn(
+        'U-L13: skipping directory-mode separator test — mds binary not found ' +
+          '(run `cargo build -p mds-cli` to enable this check)',
+      );
+      return;
+    }
+
+    const dirFixture = path.join(FIXTURES, 'lint-dir-order');
+    const cliProc = spawnSync(mdsCli, ['lint', dirFixture, '--format', 'json'], {
+      encoding: 'utf-8',
+    });
+    // exit 0 = clean, exit 1 = warn-only (expected — all fixture files have
+    // unused-variable warnings), exit 2 = error-severity finding.
+    assert.ok(
+      cliProc.status === 0 || cliProc.status === 1 || cliProc.status === 2,
+      `U-L13: CLI lint exited unexpected status ${cliProc.status}:\n${cliProc.stderr}`,
+    );
+    const result = JSON.parse(cliProc.stdout);
+    assert.ok(
+      Array.isArray(result.files) && result.files.length >= 2,
+      `U-L13: expected at least 2 files[] entries from lint-dir-order fixture; ` +
+        `got ${result.files?.length ?? 0}: ${JSON.stringify(result.files)}`,
+    );
+
+    const fileKeys = result.files.map((f) => f.file);
+
+    // (1) No backslash in any file key: verifies relative_display uses '/' not '\'.
+    for (const key of fileKeys) {
+      assert.ok(
+        !key.includes('\\'),
+        `U-L13: files[].file must not contain a backslash (native separator); ` +
+          `got '${key}' — relative_display must always emit '/' as the path separator`,
+      );
+    }
+
+    // (2) Ascending byte-wise order: verifies the sort is applied correctly.
+    //   Expected: "b.mds" < "sub/a.mds" < "sub[after.mds"
+    //   '/' (0x2F) < '[' (0x5B): nested paths sort before same-prefix flat files.
+    //   If the backslash (0x5C) were used, "sub[after.mds" < "sub\a.mds" — reversed.
+    const sorted = [...fileKeys].sort();
+    assert.deepEqual(
+      fileKeys,
+      sorted,
+      `U-L13: files[].file must be in byte-wise ascending order; ` +
+        `got [${fileKeys.map((k) => JSON.stringify(k)).join(', ')}]`,
+    );
+  });
+
   // AC-P1-24 cross-surface differential (WASM surface): init() always selects
   // native where the napi addon resolves, so U-L11 exercises napi only and the
   // WASM branch of its "napi or WASM" comment is dead (PF-007). This test forces

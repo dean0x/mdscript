@@ -2083,4 +2083,113 @@ mod tests {
              (AC-P1-10)"
         );
     }
+
+    /// Platform-independent: directory-mode sort must be byte-wise ascending over
+    /// the normalised forward-slash display strings emitted by `relative_display`.
+    ///
+    /// Constructs paths via `PathBuf::join` (platform-agnostic component builder)
+    /// so the test runs unmodified on both Unix and Windows without a `#[cfg]` guard.
+    /// `relative_display` always joins with `/`, so the sort key is identical on both
+    /// platforms.
+    ///
+    /// Critical ordering property: a flat file whose name starts with `sub[` must
+    /// sort AFTER a nested file in directory `sub/`, because `/` (0x2F) < `[` (0x5B).
+    /// If `relative_display` were changed to use the native separator (`\`, 0x5C on
+    /// Windows), the `[` (0x5B) file would sort BEFORE the nested path (0x5B < 0x5C),
+    /// reversing the intended order — and this test would fail on any platform where
+    /// the temporary separator change is in effect (ADR-009 verified by changing
+    /// `join("/")` to `join("\\")` in `relative_display`, confirming the test fails).
+    ///
+    /// The test exercises the same key function used by `run_lint_directory`'s
+    /// `sort_by_cached_key` (F1): `sanitize_control_chars_wire(relative_display(p, dir))`.
+    /// No filesystem access is needed — `relative_display` is a pure path computation.
+    #[test]
+    fn directory_sort_ascending_over_normalized_display_strings() {
+        use super::relative_display;
+        use std::path::PathBuf;
+
+        // Build paths via PathBuf::join — uses native separator internally, but
+        // `relative_display` always emits `/`-joined strings regardless of platform.
+        let root = PathBuf::from("lint-root");
+        let file_a = root.join("a.mds"); // flat: display "a.mds"
+        let file_sub_a = root.join("sub").join("a.mds"); // nested: display "sub/a.mds"
+        let file_sub_bracket = root.join("sub[after.mds"); // flat, [ in name: "sub[after.mds"
+        let file_z = root.join("z.mds"); // flat: display "z.mds"
+
+        // Verify display strings first (documents intent and catches platform drift).
+        let display_a = relative_display(&file_a, &root);
+        let display_sub_a = relative_display(&file_sub_a, &root);
+        let display_sub_bracket = relative_display(&file_sub_bracket, &root);
+        let display_z = relative_display(&file_z, &root);
+
+        assert_eq!(
+            display_a, "a.mds",
+            "flat file must display without separator"
+        );
+        assert_eq!(
+            display_sub_a, "sub/a.mds",
+            "nested file must use forward-slash separator"
+        );
+        assert_eq!(
+            display_sub_bracket, "sub[after.mds",
+            "flat file with [ in name must display as single component"
+        );
+        assert_eq!(
+            display_z, "z.mds",
+            "flat file must display without separator"
+        );
+
+        // Sort by the same key as `run_lint_directory` (F1): sanitized display string.
+        let mut paths = [
+            file_z.clone(),
+            file_sub_bracket.clone(),
+            file_a.clone(),
+            file_sub_a.clone(),
+        ];
+        paths.sort_by_cached_key(|p| {
+            mds::sanitize_control_chars_wire(&relative_display(p, &root)).into_owned()
+        });
+
+        let sorted: Vec<String> = paths.iter().map(|p| relative_display(p, &root)).collect();
+
+        // Expected byte-wise order:
+        //   "a.mds"        — 'a' (0x61)
+        //   "sub/a.mds"    — 's' then '/' (0x2F) at position 3
+        //   "sub[after.mds"— 's' then '[' (0x5B) at position 3  (0x2F < 0x5B)
+        //   "z.mds"        — 'z' (0x7A)
+        //
+        // If relative_display used '\' (0x5C) instead of '/' (0x2F):
+        //   "sub[after.mds" would sort BEFORE "sub\a.mds" (0x5B < 0x5C) — wrong.
+        assert_eq!(
+            sorted,
+            vec!["a.mds", "sub/a.mds", "sub[after.mds", "z.mds"],
+            "directory sort must be byte-wise ascending over normalised forward-slash \
+             display strings; '/' (0x2F) must sort before '[' (0x5B) so nested paths \
+             appear before same-prefix flat files with bracket-containing names"
+        );
+    }
+
+    /// Windows-only: `relative_display` must normalise the native backslash separator
+    /// to a forward slash in the emitted display string.
+    ///
+    /// This test will not execute in CI today (the Rust matrix uses `ubuntu-latest`
+    /// only — adding `windows-latest` is a separate scope decision), but it documents
+    /// the expected behaviour and will start running the moment the matrix is extended.
+    #[cfg(windows)]
+    #[test]
+    fn relative_display_normalizes_windows_separator_to_forward_slash() {
+        use super::relative_display;
+        use std::path::Path;
+
+        // Windows absolute path: C:\proj\sub\c.mds with root C:\proj
+        let path = Path::new(r"C:\proj\sub\c.mds");
+        let root = Path::new(r"C:\proj");
+        let display = relative_display(path, root);
+
+        assert_eq!(
+            display, "sub/c.mds",
+            "relative_display must emit forward-slash separator on Windows; \
+             got {display:?} — native backslash must not appear in the wire key"
+        );
+    }
 }
