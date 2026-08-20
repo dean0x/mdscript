@@ -23,6 +23,7 @@ import {
   main,
   fetchRequiredContexts,
   fetchStatuses,
+  fetchCheckRuns,
   parseGhStderrHttpStatus,
   EXPECTED_CONTEXTS,
 } from '../verify-pr-checks.mjs';
@@ -1334,6 +1335,84 @@ describe('security-11: URL encoding of branch and SHA values', () => {
       protectionCall.includes(encodeURIComponent(specialBranch)),
       `--required-from branch must be URL-encoded; got: ${protectionCall}`,
     );
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// architecture-08: fetchCheckRuns — direct unit tests for the bounded loop
+// and total_count guard (D-PR4a). These tests drive fetchCheckRuns directly
+// without going through main(), so the bound is pinned independently of the
+// PR-fetch and protection-fetch steps.
+//
+// MAX_PAGES is 20 (verify-pr-checks.mjs line ~96). The call-count assertion
+// in the first test pins this: raising MAX_PAGES or removing the cap causes
+// that test to fail immediately.
+// ---------------------------------------------------------------------------
+describe('architecture-08: fetchCheckRuns — bounded loop and total_count guard', () => {
+
+  test('MAX_PAGES=20 bound: exactly 20 page requests are made, then returns exit 2', () => {
+    // Runner always returns a full page with total_count far larger than perPage,
+    // so the loop never terminates naturally. The hard cap must fire after 20 pages.
+    let calls = 0;
+    const fullPage = {
+      total_count: 100_000,
+      check_runs: Array.from({ length: 100 }, (_, i) => ({
+        name: `job-${i}`, status: 'completed', conclusion: 'success',
+      })),
+    };
+    const runner = (_args) => { calls++; return fullPage; };
+    const result = fetchCheckRuns('abc123sha', runner);
+    assert.ok(!result.ok, 'must return ok:false when pagination exceeds MAX_PAGES');
+    assert.equal(result.exitCode, 2, 'pagination cap must produce exit 2 (D-PR4a)');
+    assert.ok(
+      result.message.includes('pagination exceeded') || result.message.includes('20 pages'),
+      `message must describe the page cap; got: ${result.message}`,
+    );
+    // Pinning the call count to 20 ensures this test fails if MAX_PAGES is raised or removed.
+    assert.equal(calls, 20,
+      'must make exactly 20 page requests before bailing (pinned to MAX_PAGES=20; update if the constant changes)');
+  });
+
+  test('total_count guard: collected < declared total_count → exit 2, not a partial verdict', () => {
+    // Single page returns 5 runs but total_count declares 50. The loop breaks
+    // (5 < perPage=100), but collected count does not equal total_count.
+    // fetchCheckRuns must refuse to return a partial result (D-PR4a).
+    const runner = (_args) => ({
+      total_count: 50,
+      check_runs: Array.from({ length: 5 }, (_, i) => ({
+        name: `job-${i}`, status: 'completed', conclusion: 'success',
+      })),
+    });
+    const result = fetchCheckRuns('abc123sha', runner);
+    assert.ok(!result.ok, 'partial total_count must return ok:false');
+    assert.equal(result.exitCode, 2, 'partial total_count must produce exit 2 (D-PR4a)');
+    assert.ok(
+      result.message.includes('total_count') || result.message.includes('partial page set'),
+      `message must mention the partial count; got: ${result.message}`,
+    );
+  });
+
+  test('API error on first page → exit 2 (indeterminate), not a partial verdict', () => {
+    const runner = (_args) => ({ __error: true, status: 1, httpStatus: 500, stderr: 'internal server error' });
+    const result = fetchCheckRuns('abc123sha', runner);
+    assert.ok(!result.ok, 'API error must return ok:false');
+    assert.equal(result.exitCode, 2, 'API error must produce exit 2');
+    assert.ok(
+      result.message.includes('check-runs API error'),
+      `message must describe the error; got: ${result.message}`,
+    );
+  });
+
+  test('single complete page (runs.length < perPage, total_count matches) → ok:true', () => {
+    const expected = [
+      { name: 'job-a', status: 'completed', conclusion: 'success' },
+      { name: 'job-b', status: 'completed', conclusion: 'failure' },
+    ];
+    const runner = (_args) => ({ total_count: 2, check_runs: expected });
+    const result = fetchCheckRuns('abc123sha', runner);
+    assert.ok(result.ok, `must return ok:true for a complete single-page result; got: ${JSON.stringify(result)}`);
+    assert.deepEqual(result.checkRuns, expected, 'must return all check-runs unchanged');
   });
 
 });

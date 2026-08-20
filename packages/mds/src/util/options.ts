@@ -94,8 +94,8 @@ type OptionsFor = {
  *
  * CONSTRAINT: key ORDER within each witness literal is load-bearing — it
  * determines the `recognised keys are: …` list that {@link assertKnownKeys}
- * emits. Do not reorder without updating the expected strings in the
- * byte-comparison tests.
+ * emits. Do not reorder; order changes are caught by the U-OV-14 / U-OV-31
+ * wrapper-vs-napi strictEqual message comparisons (not hardcoded strings).
  *
  * Reconciliation against napi option parsers (`crates/mds-napi/src/lib.rs`):
  * - `compile` / `check`: `basePath` is now in the public types (#180 fix) and in

@@ -61,8 +61,16 @@ crates/mds-python/dist/
 # index.md and every {slug}/KNOWLEDGE.md are tracked and committed; everything else
 # under .devflow/features/ stays local. To stop sharing, re-add `.devflow/features/`
 # to your own .gitignore.
+# Exception: design plans under .devflow/docs/design/ and resolved review summaries
+# under .devflow/docs/reviews/ are deliberately shared — authored context for the
+# team, not local runtime state. All other content under .devflow/docs/ (run reports,
+# ephemeral work products) stays local.
 .devflow/*
 !.devflow/features/
+!.devflow/docs/
+.devflow/docs/*
+!.devflow/docs/design/
+!.devflow/docs/reviews/
 .devflow/features/*
 !.devflow/features/index.md
 !.devflow/features/*/
