@@ -11,7 +11,7 @@ import type {
   MdsBaseBackend,
 } from './types.js';
 import { initWasmBrowser, createWasmBackend } from './backend/wasm.js';
-import { assertKnownKeys } from './util/options.js';
+import { assertKnownKeys, getBasePathError } from './util/options.js';
 
 export { isMdsError, LINT_RULE_NAMES } from './types.js';
 export type {
@@ -137,7 +137,12 @@ export function lintVirtual(
   entry: string,
   options?: LintFileOptions,
 ): LintResult {
-  if (options != null) assertKnownKeys(options, 'lintVirtual');
+  if (options != null) {
+    assertKnownKeys(options, 'lintVirtual');
+    // BASEPATH_REJECTORS: assertKnownKeys skips basePath for this method.
+    const bpErr = getBasePathError(options, 'lintVirtual');
+    if (bpErr != null) throw bpErr;
+  }
   return assertReady().lintVirtual(modules, entry, options);
 }
 

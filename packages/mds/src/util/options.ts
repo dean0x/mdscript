@@ -104,7 +104,11 @@ type OptionsFor = {
  *   passes `basePath` on these methods the wrapper emits a purpose-built rejection via
  *   {@link BASEPATH_REJECTORS}'s error factory — the backend never receives it.
  *   See {@link getBasePathError} and issue #74.
- * - `lint`, `lintFile`, `lintVirtual`: key lists match napi exactly.
+ * - `lint`: key list matches napi exactly.
+ * - `lintFile` / `lintVirtual`: `basePath` is NOT in the key list. When a caller
+ *   passes a non-undefined `basePath`, the wrapper emits a purpose-built rejection via
+ *   {@link BASEPATH_REJECTORS} — the backend never receives it. `undefined` is treated
+ *   as "key absent" for parity with compileFile/checkFile.
  */
 export const METHOD_KEYS: Readonly<Record<MethodName, readonly string[]>> = {
   compile:     keysOf<CompileOptions>({ basePath: true, vars: true, sourceMap: true, sourcesContent: true }),
@@ -137,6 +141,36 @@ function makeFileBasePathError(): Error & { code: string } {
 }
 
 /**
+ * Build the `mds::invalid_options` error for `basePath` on `lintFile`.
+ *
+ * Message is byte-identical to napi `parse_lint_file_opts`
+ * (crates/mds-napi/src/lib.rs:906-908). Keep in lockstep — U-OV-27 enforces parity.
+ */
+function makeLintFileBasePathError(): Error & { code: string } {
+  const err = new Error(
+    'option "basePath" is not valid for lintFile; ' +
+    'the base directory is derived from the file path',
+  ) as Error & { code: string };
+  err.code = 'mds::invalid_options';
+  return err;
+}
+
+/**
+ * Build the `mds::invalid_options` error for `basePath` on `lintVirtual`.
+ *
+ * Message is byte-identical to napi `parse_lint_virtual_opts`
+ * (crates/mds-napi/src/lib.rs:930-933). Keep in lockstep — U-OV-27 enforces parity.
+ */
+function makeLintVirtualBasePathError(): Error & { code: string } {
+  const err = new Error(
+    'option "basePath" is not valid for lintVirtual; ' +
+    'virtual modules have no file path',
+  ) as Error & { code: string };
+  err.code = 'mds::invalid_options';
+  return err;
+}
+
+/**
  * Methods for which `basePath` must be rejected with a purpose-built error rather
  * than the generic "unknown option key" form.
  *
@@ -149,19 +183,12 @@ function makeFileBasePathError(): Error & { code: string } {
  * no backend ever receives a `basePath` on these methods. `assertKnownKeys` skips
  * the generic unknown-key path for `basePath` on these methods because they are
  * absent from METHOD_KEYS for those surfaces.
- *
- * KNOWN RESIDUAL: napi also has purpose-built `basePath` messages for
- * `lintFile` ("not valid for lintFile; …") and `lintVirtual`, but those two methods
- * are deliberately NOT in this map. The wrapper intercepts them first and emits the
- * generic `unknown option key "basePath"; recognised keys are: vars, rules` form, so
- * the wrapper and napi messages diverge for that one input. This is intentional:
- * the generic message still names the offending key and is a hard error either way.
- * Widening this map would change those messages and is deferred rather than bundled
- * into #180/#215/#213.
  */
 const BASEPATH_REJECTORS: ReadonlyMap<MethodName, () => Error & { code: string }> = new Map([
-  ['compileFile', makeFileBasePathError],
-  ['checkFile',   makeFileBasePathError],
+  ['compileFile',  makeFileBasePathError],
+  ['checkFile',    makeFileBasePathError],
+  ['lintFile',     makeLintFileBasePathError],
+  ['lintVirtual',  makeLintVirtualBasePathError],
 ] as const);
 
 /**
@@ -185,7 +212,11 @@ export function getBasePathError(
   const factory = BASEPATH_REJECTORS.get(method);
   if (!factory) return undefined;
   const basePath = (options as Record<string, unknown>)['basePath'];
-  return basePath != null ? factory() : undefined;
+  // Reject any non-undefined value (including explicit null) for parity with
+  // napi's has_named_property gate, which fires for any present key regardless
+  // of value. `undefined` is treated as "key absent" on the wrapper side,
+  // matching the forwardOpts != null drop that prevents napi from seeing it.
+  return basePath !== undefined ? factory() : undefined;
 }
 
 // ── Main validator ─────────────────────────────────────────────────────────────

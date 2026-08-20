@@ -11,7 +11,7 @@ import type {
   LintResult,
   MdsNodeBackend,
 } from '../types.js';
-import { forwardOpts } from '../util/options.js';
+import { forwardOpts, getBasePathError } from '../util/options.js';
 import { assertResultShape, validateBackendMethods, BASE_METHODS, NODE_METHODS } from './contract.js';
 
 /** Options forwarded to the napi addon for source-string compile (accepts basePath). */
@@ -92,12 +92,25 @@ export function createNativeBackend(addon: NapiAddon): MdsNodeBackend {
     },
 
     async compileFile(path: string, options?: FileOptions): Promise<CompileResult> {
+      // Defense in depth (PF-004): the public compileFile wrapper already rejects
+      // basePath, but guard here so a future internal caller obtaining a backend via
+      // createNativeBackend(addon) and bypassing the public wrapper cannot get the
+      // silent-drop semantics of forwardOpts (basePath absent from METHOD_KEYS.compileFile).
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'compileFile');
+        if (bpErr != null) throw bpErr;
+      }
       const result: unknown = await addon.compileFile(path, forwardOpts(options, 'compileFile'));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     async checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult> {
+      // Defense in depth (PF-004): same contract as compileFile above.
+      if (options != null) {
+        const bpErr = getBasePathError(options, 'checkFile');
+        if (bpErr != null) throw bpErr;
+      }
       const result: unknown = await addon.checkFile(path, forwardOpts(options, 'checkFile'));
       assertResultShape(result, 'check');
       return result as CheckResult;

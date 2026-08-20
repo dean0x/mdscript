@@ -320,9 +320,22 @@ export function lint(source: string, options?: LintOptions): LintResult {
   return assertReady().lint(source, options);
 }
 
-/** Lint an MDS file, resolving @import directives relative to the file. Requires init() to have been called and awaited first. */
+/**
+ * Lint an MDS file, resolving @import directives relative to the file.
+ * Requires init() to have been called and awaited first.
+ *
+ * Non-async: basePath validation throws synchronously before any I/O, matching
+ * the contract of compileFile/checkFile. Callers using `try { lintFile(f, opts) }
+ * catch` capture both unknown-key and basePath errors synchronously.
+ */
 export function lintFile(path: string, options?: LintFileOptions): Promise<LintResult> {
-  if (options != null) assertKnownKeys(options, 'lintFile');
+  if (options != null) {
+    assertKnownKeys(options, 'lintFile');
+    // BASEPATH_REJECTORS: assertKnownKeys skips basePath for this method.
+    // Throws synchronously — same channel as assertKnownKeys above.
+    const bpErr = getBasePathError(options, 'lintFile');
+    if (bpErr != null) throw bpErr;
+  }
   return assertReady().lintFile(path, options);
 }
 
@@ -332,7 +345,13 @@ export function lintVirtual(
   entry: string,
   options?: LintFileOptions,
 ): LintResult {
-  if (options != null) assertKnownKeys(options, 'lintVirtual');
+  if (options != null) {
+    assertKnownKeys(options, 'lintVirtual');
+    // BASEPATH_REJECTORS: assertKnownKeys skips basePath for this method.
+    // Throws synchronously — same channel as assertKnownKeys above.
+    const bpErr = getBasePathError(options, 'lintVirtual');
+    if (bpErr != null) throw bpErr;
+  }
   return assertReady().lintVirtual(modules, entry, options);
 }
 

@@ -618,7 +618,7 @@ describe('options-validation', () => {
 
   // ── cross-backend message equality for file basePath (AC-P3-06 / U-OV-27) ─
 
-  test('U-OV-27: compileFile/checkFile basePath rejection message is byte-identical to napi and WASM (AC-P3-06, avoids PF-007)', async () => {
+  test('U-OV-27: basePath rejection message is byte-identical to napi and WASM for all four file-surface methods (AC-P3-06, avoids PF-007)', async () => {
     const addon = requireNativeAddon(); // hard-fail without addon
 
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-'));
@@ -631,51 +631,98 @@ describe('options-validation', () => {
     }
 
     const { execFileSync } = await import('node:child_process');
+    const VIRTUAL_MODS = { 'a.mds': '' };
+    const VIRTUAL_ENTRY = 'a.mds';
 
-    try {
-      for (const method of ['compileFile', 'checkFile']) {
-        // LEG 1 (wrapper vs napi — canonical drift guard): compare the wrapper's
-        // purpose-built rejection against the RAW napi addon's message
-        // (parse_file_opts / parse_check_file_opts in crates/mds-napi/src/lib.rs).
-        // The wrapper fires getBasePathError() in node.ts BEFORE assertReady(), so
-        // napi never receives this input. Without this leg, editing either string
-        // silently diverges the two surfaces.
-        const wrapperMsg = await captureMsg(
-          () => (method === 'compileFile' ? compileFile : checkFile)(file, { basePath: '.' }),
-        );
-        const napiMsg = await captureMsg(
-          () => (method === 'compileFile' ? addon.compileFile : addon.checkFile)(file, { basePath: '.' }),
-        );
-
-        assert.ok(wrapperMsg.length > 0, `wrapper ${method} must throw for basePath`);
-        assert.ok(napiMsg.length > 0, `napi ${method} must throw for basePath`);
-        assert.strictEqual(
-          wrapperMsg,
-          napiMsg,
-          `wrapper must match napi byte-for-byte for ${method} — wrapper: "${wrapperMsg}" | napi: "${napiMsg}"`,
-        );
-
-        // LEG 2 (WASM subprocess — regression barrier per AC-P3-06 / PF-004):
-        // Run under MDS_BACKEND=wasm and assert (a) the throw still occurs and
-        // (b) the message is byte-identical to the wrapper (test-plan item 5:
-        // assert.strictEqual(nativeMsg, wasmMsg)). The guard fires in node.ts
-        // before assertReady(), so MDS_BACKEND has no effect on this input today —
-        // making the byte-equality assertion technically tautological with LEG 1.
-        // But that tautology IS the regression barrier: if the guard is ever
-        // refactored into the backend layer, a WASM-specific divergence is caught
-        // here instead of silently reaching production (avoids PF-004: alternate
-        // code path can silently bypass a guard). The throw is synchronous (before
-        // assertReady()), so init() is not needed in the subprocess.
-        const fnName = method === 'compileFile' ? 'compileFile' : 'checkFile';
-        const wasmScript = [
-          `import { ${fnName} } from './dist/node.js';`,
+    // Per-method cases: wrapperFn, addonFn, and wasmScript cover four surfaces.
+    // lintFile and lintVirtual guards fire synchronously (before assertReady()),
+    // so no init() is needed in the subprocess for any of these cases.
+    const cases = [
+      {
+        name: 'compileFile',
+        wrapperFn: () => compileFile(file, { basePath: '.' }),
+        addonFn:   () => addon.compileFile(file, { basePath: '.' }),
+        wasmScript: [
+          `import { compileFile } from './dist/node.js';`,
           `try {`,
-          `  ${fnName}(${JSON.stringify(file)}, { basePath: '.' });`,
+          `  compileFile(${JSON.stringify(file)}, { basePath: '.' });`,
           `  process.stdout.write('');`,
           `} catch (e) {`,
           `  process.stdout.write(e instanceof Error ? e.message : String(e));`,
           `}`,
-        ].join('\n');
+        ].join('\n'),
+      },
+      {
+        name: 'checkFile',
+        wrapperFn: () => checkFile(file, { basePath: '.' }),
+        addonFn:   () => addon.checkFile(file, { basePath: '.' }),
+        wasmScript: [
+          `import { checkFile } from './dist/node.js';`,
+          `try {`,
+          `  checkFile(${JSON.stringify(file)}, { basePath: '.' });`,
+          `  process.stdout.write('');`,
+          `} catch (e) {`,
+          `  process.stdout.write(e instanceof Error ? e.message : String(e));`,
+          `}`,
+        ].join('\n'),
+      },
+      {
+        name: 'lintFile',
+        wrapperFn: () => lintFile(file, { basePath: '.' }),
+        addonFn:   () => addon.lintFile(file, { basePath: '.' }),
+        wasmScript: [
+          `import { lintFile } from './dist/node.js';`,
+          `try {`,
+          `  lintFile(${JSON.stringify(file)}, { basePath: '.' });`,
+          `  process.stdout.write('');`,
+          `} catch (e) {`,
+          `  process.stdout.write(e instanceof Error ? e.message : String(e));`,
+          `}`,
+        ].join('\n'),
+      },
+      {
+        name: 'lintVirtual',
+        wrapperFn: () => lintVirtual(VIRTUAL_MODS, VIRTUAL_ENTRY, { basePath: '.' }),
+        addonFn:   () => addon.lintVirtual(VIRTUAL_MODS, VIRTUAL_ENTRY, { basePath: '.' }),
+        wasmScript: [
+          `import { lintVirtual } from './dist/node.js';`,
+          `const m = ${JSON.stringify(VIRTUAL_MODS)};`,
+          `try {`,
+          `  lintVirtual(m, ${JSON.stringify(VIRTUAL_ENTRY)}, { basePath: '.' });`,
+          `  process.stdout.write('');`,
+          `} catch (e) {`,
+          `  process.stdout.write(e instanceof Error ? e.message : String(e));`,
+          `}`,
+        ].join('\n'),
+      },
+    ];
+
+    try {
+      for (const { name, wrapperFn, addonFn, wasmScript } of cases) {
+        // LEG 1 (wrapper vs napi — canonical drift guard): compare the wrapper's
+        // purpose-built rejection against the RAW napi addon's message.
+        // The wrapper fires getBasePathError() BEFORE assertReady()/backend dispatch,
+        // so napi never receives this input through the public wrapper.
+        // Without this leg, editing either string silently diverges the two surfaces.
+        const wrapperMsg = await captureMsg(wrapperFn);
+        const napiMsg    = await captureMsg(addonFn);
+
+        assert.ok(wrapperMsg.length > 0, `wrapper ${name} must throw for basePath`);
+        assert.ok(napiMsg.length > 0,    `napi ${name} must throw for basePath`);
+        assert.strictEqual(
+          wrapperMsg,
+          napiMsg,
+          `wrapper must match napi byte-for-byte for ${name} — wrapper: "${wrapperMsg}" | napi: "${napiMsg}"`,
+        );
+
+        // LEG 2 (WASM subprocess — regression barrier per AC-P3-06 / PF-004):
+        // Run under MDS_BACKEND=wasm and assert (a) the throw still occurs and
+        // (b) the message is byte-identical to the wrapper. The guard fires before
+        // assertReady(), so MDS_BACKEND has no effect on this input today —
+        // making the byte-equality assertion technically tautological with LEG 1.
+        // But that tautology IS the regression barrier: if the guard is ever
+        // refactored into the backend layer, a WASM-specific divergence is caught
+        // here instead of silently reaching production (avoids PF-004).
         let wasmMsg = '';
         try {
           wasmMsg = execFileSync(process.execPath, ['--input-type=module'], {
@@ -691,11 +738,80 @@ describe('options-validation', () => {
           // subprocess failures only — capture stdout if available.
           wasmMsg = (typeof e === 'object' && e !== null && typeof e.stdout === 'string') ? e.stdout : '';
         }
-        assert.ok(wasmMsg.length > 0, `WASM subprocess ${method} must throw for basePath`);
+        assert.ok(wasmMsg.length > 0, `WASM subprocess ${name} must throw for basePath`);
         assert.strictEqual(
           wrapperMsg,
           wasmMsg,
-          `WASM path must match wrapper byte-for-byte for ${method} — wrapper: "${wrapperMsg}" | wasm: "${wasmMsg}"`,
+          `WASM path must match wrapper byte-for-byte for ${name} — wrapper: "${wrapperMsg}" | wasm: "${wasmMsg}"`,
+        );
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  // ── {basePath: null} wrapper-vs-napi parity (consistency-19 / U-OV-36) ──────
+
+  test('U-OV-36: {basePath: null} is rejected with purpose-built error byte-identical to napi for all file-surface methods (consistency-19)', async () => {
+    // Hard-fail without addon — a silently-passing skip is exactly how parity
+    // regressions survive undetected (avoids PF-007).
+    const addon = requireNativeAddon();
+
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mds-bp-null-'));
+    const file = path.join(tmp, 'ok.mds');
+    fs.writeFileSync(file, 'Hello\n', 'utf8');
+
+    async function captureMsg(fn) {
+      try { await fn(); } catch (e) { return e instanceof Error ? e.message : String(e); }
+      return '';
+    }
+
+    const VIRTUAL_MODS = { 'a.mds': '' };
+    const VIRTUAL_ENTRY = 'a.mds';
+
+    try {
+      // All four file-surface methods must reject {basePath: null} with the same
+      // purpose-built message as the raw napi addon (consistency-19: napi's
+      // has_named_property fires for null, so the wrapper must also fire).
+      const cases = [
+        {
+          name: 'compileFile',
+          wrapperFn: () => compileFile(file, { basePath: null }),
+          addonFn:   () => addon.compileFile(file, { basePath: null }),
+        },
+        {
+          name: 'checkFile',
+          wrapperFn: () => checkFile(file, { basePath: null }),
+          addonFn:   () => addon.checkFile(file, { basePath: null }),
+        },
+        {
+          name: 'lintFile',
+          wrapperFn: () => lintFile(file, { basePath: null }),
+          addonFn:   () => addon.lintFile(file, { basePath: null }),
+        },
+        {
+          name: 'lintVirtual',
+          wrapperFn: () => lintVirtual(VIRTUAL_MODS, VIRTUAL_ENTRY, { basePath: null }),
+          addonFn:   () => addon.lintVirtual(VIRTUAL_MODS, VIRTUAL_ENTRY, { basePath: null }),
+        },
+      ];
+
+      for (const { name, wrapperFn, addonFn } of cases) {
+        const wrapperMsg = await captureMsg(wrapperFn);
+        const napiMsg    = await captureMsg(addonFn);
+
+        assert.ok(wrapperMsg.length > 0, `wrapper ${name} must throw for {basePath: null}`);
+        assert.ok(napiMsg.length > 0,    `napi ${name} must throw for {basePath: null}`);
+        // Must be the purpose-built message, not the generic unknown-key form.
+        assert.ok(
+          !wrapperMsg.startsWith('unknown option key'),
+          `${name}: {basePath: null} must not emit generic unknown-key message: "${wrapperMsg}"`,
+        );
+        assert.strictEqual(
+          wrapperMsg,
+          napiMsg,
+          `wrapper must match napi byte-for-byte for ${name} {basePath: null} — ` +
+          `wrapper: "${wrapperMsg}" | napi: "${napiMsg}"`,
         );
       }
     } finally {
