@@ -261,6 +261,12 @@ pub struct FixPlan {
 /// Marked `#[non_exhaustive]` so that adding new variants in a future release
 /// does not constitute a semver-breaking change for downstream crates that match
 /// on this enum. External callers must include a `_ => {}` wildcard arm.
+///
+/// **Warning:** a bare `_ => {}` arm silently swallows
+/// [`FixOutcome::PartiallyFixed`], which was added in v0.4.0 and is never
+/// returned by the deprecated [`apply_fixes`]. Code migrated from `apply_fixes`
+/// may carry a wildcard arm that discards partial results without any compiler
+/// signal. Match `PartiallyFixed` explicitly if partial results matter.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FixOutcome {
@@ -277,6 +283,11 @@ pub enum FixOutcome {
     /// least one individual edit passes the reverify gate.  The `source` field holds the
     /// partially-fixed text; `residual` carries the residual diagnostics (from the last
     /// successful per-edit reverify); `rejected` lists every edit that was turned down.
+    ///
+    /// **New in v0.4.0.** The deprecated [`apply_fixes`] never returned this variant, so
+    /// code migrated from it may carry a `_ => {}` wildcard arm that silently discards
+    /// partial results — there is no compiler signal when the arm matches. Match this
+    /// variant explicitly if partial results matter.
     PartiallyFixed {
         /// The partially-fixed source (accepted edits applied, rejected edits untouched).
         source: String,
@@ -689,18 +700,18 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 ///
 /// 3. **Reverify call count**: `apply_fixes` calls `reverify` exactly once;
 ///    `apply_fixes_incremental` calls it up to `plan.edits.len() + 1` times.
-///
-/// ## Why the body was not deleted
-///
-/// `crates/mds-core/src/lint/fix.rs` does not exist at tag `v0.3.0` (the
-/// newest published tag at this commit), so `apply_fixes` has never been
-/// published to crates.io. However, deleting it would silently drop coverage
-/// of six ADR-004 reverify-gate behaviors that are pinned only through this
-/// function, with no equivalent on the `apply_fixes_incremental` path. These
-/// tests must be ported or retired before removal at v0.5.0. The enumerated
-/// list (test names, line numbers, and the behavior each pins) lives in GitHub
-/// issue #304 (v0.5.0 removal tracker for `apply_fixes`).
-///
+//
+// Why the body was not deleted:
+//
+// `crates/mds-core/src/lint/fix.rs` does not exist at tag `v0.3.0` (the
+// newest published tag at this commit), so `apply_fixes` has never been
+// published to crates.io. However, deleting it would silently drop coverage
+// of six ADR-004 reverify-gate behaviors that are pinned only through this
+// function, with no equivalent on the `apply_fixes_incremental` path. These
+// tests must be ported or retired before removal at v0.5.0. The enumerated
+// list (test names, line numbers, and the behavior each pins) lives in GitHub
+// issue #304 (v0.5.0 removal tracker for `apply_fixes`).
+//
 /// # Behavior
 ///
 /// The `reverify` callback is called with the fixed source and must return:
@@ -728,10 +739,15 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 ///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
+// Deprecation template (align other #[deprecated] attributes in this crate to this form):
+// verb "use" | fully-qualified replacement path | one behavioural-difference clause |
+// explicit removal version | terminal period | #[must_use] with reason string.
 #[deprecated(
     since = "0.4.0",
-    note = "use `apply_fixes_incremental`; not a drop-in swap, the reverify closure must \
-            be `Fn`, not `FnOnce`. To be removed in v0.5.0; see the item docs."
+    note = "use `mds::fix::apply_fixes_incremental`; not a drop-in swap — the reverify \
+            closure must be `Fn`, not `FnOnce`, and the replacement can return \
+            `FixOutcome::PartiallyFixed`, which a `_ => {}` wildcard arm silently discards. \
+            To be removed in v0.5.0; see the item docs."
 )]
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
@@ -845,7 +861,9 @@ pub const FALLBACK_MAX_EDITS: usize = 50;
 /// - [`FixOutcome::NothingToFix`] — empty plan with no overlap.
 ///
 /// Unlike [`apply_fixes`] which requires `F: FnOnce`, this function requires `F: Fn` because
-/// `reverify` may be called up to `plan.edits.len() + 1` times.
+/// `reverify` may be called up to `plan.edits.len() + 1` times. It can also return
+/// [`FixOutcome::PartiallyFixed`], which `apply_fixes` never returned — code migrated from
+/// `apply_fixes` may carry a `_ => {}` wildcard arm that silently discards partial results.
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes_incremental<F>(
     source: &str,
