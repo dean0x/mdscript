@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import pathlib
 import subprocess
+from typing import Any
 
 import pytest
 
@@ -346,7 +347,7 @@ def test_ac_p1_24_cross_surface_diagnostic_order_parity(
     # Normalize: strip the "file" key from each files[] entry so the comparison
     # is not skewed by per-surface file-key conventions (AC-P1-06 allows CLI and
     # bindings to differ on "file" for stdin mode; in file mode they match here).
-    def drop_file_key(result: dict) -> list:  # type: ignore[type-arg]
+    def drop_file_key(result: dict[str, Any]) -> list[dict[str, Any]]:
         return [
             {k: v for k, v in f.items() if k != "file"}
             for f in result.get("files", [])
@@ -425,7 +426,7 @@ def test_par5b_live_cli_lint_differential_with_findings(mds_cli: pathlib.Path) -
 
     # Normalize: strip the file key from each files[] entry (it differs by design).
     # Compare the remaining structure — diagnostics[], spans, rule, severity, fixable.
-    def strip_file_key(result: dict) -> list:
+    def strip_file_key(result: dict[str, Any]) -> list[dict[str, Any]]:
         return [{k: v for k, v in entry.items() if k != "file"} for entry in result["files"]]
 
     cli_norm = strip_file_key(cli_result)
@@ -502,7 +503,7 @@ def test_crlf_input_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> Non
     assert cli_result.get("files"), "CLI must produce findings for CRLF fixture"
     assert py_result.get("files"), "Python must produce findings for CRLF fixture"
 
-    def drop_file_key(result: dict) -> list:  # type: ignore[type-arg]
+    def drop_file_key(result: dict[str, Any]) -> list[dict[str, Any]]:
         return [
             {k: v for k, v in f.items() if k != "file"}
             for f in result.get("files", [])
@@ -510,6 +511,12 @@ def test_crlf_input_parity(mds_cli: pathlib.Path, tmp_path: pathlib.Path) -> Non
 
     cli_norm = drop_file_key(cli_result)
     py_norm = drop_file_key(py_result)
+
+    # Non-vacuity guard: at least 2 diagnostics must be present so a files: [{"diagnostics":[]}]
+    # result cannot pass vacuously (PF-013 / matches siblings test_ac_p1_24 and test_par5b).
+    assert sum(len(f.get("diagnostics", [])) for f in cli_norm) >= 2, (
+        "CRLF fixture must produce at least 2 diagnostics for a meaningful ordering check"
+    )
 
     assert cli_norm == py_norm, (
         "CRLF parity: CLI and Python must agree on diagnostics[] when both receive\n"

@@ -255,6 +255,109 @@ def test_lr7_diagnostic_with_span() -> None:
     assert sp.column is None
 
 
+def test_lr7b_span_line_column_via_canonical_json() -> None:
+    """Span.line and Span.column are parsed from canonical JSON with populated values.
+
+    Covers the parsing path at lib.rs:789-798 (s.get("line") / s.get("column")).
+    Coverage proof (ADR-009): if that path were reverted to hardcoded None,
+    sp.line would be None rather than 2 and this assertion would fail with
+    ``AssertionError: None != 2``.
+    """
+    canonical: dict[str, object] = {
+        "version": 1,
+        "files": [
+            {
+                "file": "test.mds",
+                "diagnostics": [
+                    {
+                        "rule": "test-rule",
+                        "severity": "warn",
+                        "message": "test message",
+                        "help": None,
+                        "fixable": False,
+                        "span": {
+                            "offset": 5,
+                            "length": 3,
+                            "line": 2,
+                            "column": 1,
+                        },
+                        "fix_edits": None,
+                    }
+                ],
+            }
+        ],
+        "truncated": False,
+    }
+    result = m.LintResult(canonical)
+    assert result.files, "expected one file report from canonical construction"
+    diag = result.files[0].diagnostics[0]
+    assert isinstance(diag, m.LintDiagnostic)
+    sp = diag.span
+    assert sp is not None, "span must not be None for the constructed diagnostic"
+    assert isinstance(sp, m.Span)
+    # Struct accessor: populated values must survive the JSON → Span parse.
+    assert sp.line == 2, f"span.line must be 2 (parsed from JSON); got: {sp.line!r}"
+    assert sp.column == 1, f"span.column must be 1 (parsed from JSON); got: {sp.column!r}"
+    assert sp.offset == 5
+    assert sp.length == 3
+
+
+def test_lr7c_span_line_column_in_to_json() -> None:
+    """LintDiagnostic.to_json() emits 'line' and 'column' when the span carries them.
+
+    Covers the conditional-emission path at lib.rs:600-621 (as_json() span_map inserts).
+    Coverage proof (ADR-009): if as_json() never emitted line/column (or if the Span
+    always carried None via the hardcoded path), 'line' would be absent from the
+    serialized span and the ``assert "line" in span_json`` assertion would fail.
+    """
+    canonical: dict[str, object] = {
+        "version": 1,
+        "files": [
+            {
+                "file": "test.mds",
+                "diagnostics": [
+                    {
+                        "rule": "test-rule",
+                        "severity": "warn",
+                        "message": "test message",
+                        "help": None,
+                        "fixable": False,
+                        "span": {
+                            "offset": 5,
+                            "length": 3,
+                            "line": 2,
+                            "column": 1,
+                        },
+                        "fix_edits": None,
+                    }
+                ],
+            }
+        ],
+        "truncated": False,
+    }
+    result = m.LintResult(canonical)
+    diag = result.files[0].diagnostics[0]
+    diag_json = json.loads(diag.to_json())
+    span_json = diag_json.get("span")
+    assert span_json is not None, "span must not be null in to_json() output"
+    # Emission path: 'line' and 'column' must appear as keys when non-None.
+    assert "line" in span_json, (
+        f"'line' key must be present in span JSON when span.line is set; got: {span_json}"
+    )
+    assert "column" in span_json, (
+        f"'column' key must be present in span JSON when span.column is set; got: {span_json}"
+    )
+    assert span_json["line"] == 2, (
+        f"span JSON 'line' must be 2; got: {span_json['line']!r}"
+    )
+    assert span_json["column"] == 1, (
+        f"span JSON 'column' must be 1; got: {span_json['column']!r}"
+    )
+    # Sanity: offset and length must also survive round-trip.
+    assert span_json["offset"] == 5
+    assert span_json["length"] == 3
+
+
 def test_lr8_lint_file_report_to_dict() -> None:
     """LintFileReport.to_dict() matches the canonical wire shape for the file entry."""
     r = m.lint_virtual({"main.mds": UNUSED_SOURCE}, "main.mds")

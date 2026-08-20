@@ -565,8 +565,9 @@ impl LintDiagnostic {
     /// to match `to_canonical_json()` exactly and satisfy the cross-surface byte-parity
     /// invariant (PF-007).
     fn as_json(&self) -> serde_json::Value {
-        // Keys are inserted in alphabetical order (serde_json::Map preserves insertion order)
-        // to produce a stable, predictable dict layout for callers that iterate keys.
+        // serde_json::Map is a BTreeMap, so keys serialize alphabetically regardless of
+        // insertion order.  Inserting in alphabetical order keeps the source readable
+        // in wire order.
         let mut map = serde_json::Map::new();
         // Emit fix_edits unconditionally (null when None) to match to_canonical_json exactly.
         let fix_edits_val = self
