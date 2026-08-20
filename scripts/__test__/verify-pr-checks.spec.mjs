@@ -851,14 +851,14 @@ describe('the verifier runs from a spaced / symlinked path', () => {
 // ---------------------------------------------------------------------------
 // Tier B: non-required, non-expected check-runs
 //
-// Tier B FAILs on:  failure, cancelled, timed_out, action_required, stale
-//                   queued, in_progress (non-completed = indeterminate → FAIL)
-// Tier B advises on: skipped, neutral (reported but not fatal)
+// Tier B uses a WHITELIST: only 'success' passes (security-13). All other
+// conclusions (failure, cancelled, timed_out, action_required, stale,
+// skipped, neutral, null, and any future GitHub conclusion) = FAIL.
+// queued, in_progress (non-completed = indeterminate) → FAIL (avoids PF-017).
+// null conclusion (completed but outcome unknown) → FAIL (reliability-10).
 //
-// Coverage requirement (from review finding): explicit tests for each category
-// so `grep -c "Tier B"` on this file is non-zero for every shape, and the
-// positive control (advisory case → PASS) confirms the suite is not
-// unconditionally failing.
+// Coverage requirement: explicit tests for every shape; success (completed)
+// is the positive control that proves the describe block is not failing unconditionally.
 // ---------------------------------------------------------------------------
 describe('Tier B: non-required non-expected check-run states', () => {
 
@@ -870,6 +870,13 @@ describe('Tier B: non-required non-expected check-run states', () => {
       extra,
     ];
   }
+
+  test('success (completed) → PASS (whitelist positive control: suite is not unconditionally failing)', () => {
+    // This is the ONLY conclusion that passes Tier B. Positive control for the whitelist.
+    const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'success' });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'Tier B: completed/success non-required run must not block PASS');
+  });
 
   test('queued (non-completed) → FAIL (avoids PF-017: indeterminate ≠ success)', () => {
     const runs = baseRunsWith({ name: 'Some background job', status: 'queued', conclusion: null });
@@ -888,6 +895,17 @@ describe('Tier B: non-required non-expected check-run states', () => {
     assert.ok(allLines.includes('in_progress'), `must quote observed status; got: ${allLines}`);
   });
 
+  test('null conclusion (completed+null, anomalous) → FAIL, not silently dropped (reliability-10)', () => {
+    // GitHub should never pair completed status with null conclusion, but if it does,
+    // fail closed — do not silently drop an anomalous run (reliability-10).
+    const runs = baseRunsWith({ name: 'Anomalous job', status: 'completed', conclusion: null });
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Tier B: completed+null conclusion must not be silently dropped');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Anomalous job'), `must name the anomalous job; got: ${allLines}`);
+    assert.ok(allLines.includes('null'), `must quote the null conclusion; got: ${allLines}`);
+  });
+
   test('failure (completed) → FAIL', () => {
     const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'failure' });
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
@@ -902,29 +920,29 @@ describe('Tier B: non-required non-expected check-run states', () => {
     assert.equal(result.exitCode, 1, 'Tier B: completed/cancelled non-required run must exit 1');
   });
 
-  test('skipped (completed) → advisory only, PASS (Tier B does not fatal-fail skipped)', () => {
-    // skipped/neutral are ADVISORY in Tier B — the run completed, just not with work.
-    // This positive control proves the describe block is not unconditionally failing.
+  test('skipped (completed) → FAIL (security-13: whitelist — only success passes)', () => {
+    // security-13: Tier B now uses a whitelist. skipped is no longer advisory; it fails closed.
+    // A ci.yml job carrying an `if:` or `paths:` filter can report skipped — fail-open there
+    // would be a security hole on any such future job. Whitelist prevents this.
     const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'skipped' });
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
-    assert.equal(result.exitCode, 0, 'Tier B: skipped is advisory — must not block PASS');
+    assert.equal(result.exitCode, 1, 'Tier B: skipped must fail (whitelist, security-13)');
     const allLines = result.lines.join('\n');
-    assert.ok(allLines.includes('skipped'), `advisory line must name the conclusion; got: ${allLines}`);
+    assert.ok(allLines.includes('skipped'), `failure must name the conclusion; got: ${allLines}`);
+    assert.ok(allLines.includes('Some background job'), `failure must name the job; got: ${allLines}`);
   });
 
-  test('neutral (completed) → advisory only, PASS (Tier B does not fatal-fail neutral)', () => {
+  test('neutral (completed) → FAIL (security-13: whitelist — only success passes)', () => {
+    // security-13: Same rationale as skipped — whitelist rather than blacklist.
     const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'neutral' });
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
-    assert.equal(result.exitCode, 0, 'Tier B: neutral is advisory — must not block PASS');
+    assert.equal(result.exitCode, 1, 'Tier B: neutral must fail (whitelist, security-13)');
     const allLines = result.lines.join('\n');
-    assert.ok(allLines.includes('neutral'), `advisory line must name the conclusion; got: ${allLines}`);
+    assert.ok(allLines.includes('neutral'), `failure must name the conclusion; got: ${allLines}`);
   });
 
-  // Critical finding (parameterized over all five TIER_B_FAIL conclusions):
-  // The original mutation test replaced TIER_B_FAIL = new Set([]) and all tests
-  // still passed, proving the set was unexercised for the remaining 3 conclusions.
-  // These tests close that gap and make any future removal detectable.
-  test('timed_out (completed) → FAIL (all five TIER_B_FAIL conclusions covered)', () => {
+  // Parameterized over all remaining FAIL conclusions to prevent regression:
+  test('timed_out (completed) → FAIL', () => {
     const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'timed_out' });
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'Tier B: completed/timed_out non-required run must exit 1');
@@ -933,7 +951,7 @@ describe('Tier B: non-required non-expected check-run states', () => {
     assert.ok(allLines.includes('Some background job'), `must name the job; got: ${allLines}`);
   });
 
-  test('action_required (completed) → FAIL (all five TIER_B_FAIL conclusions covered)', () => {
+  test('action_required (completed) → FAIL', () => {
     const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'action_required' });
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'Tier B: completed/action_required non-required run must exit 1');
@@ -941,7 +959,7 @@ describe('Tier B: non-required non-expected check-run states', () => {
     assert.ok(allLines.includes('action_required'), `must quote conclusion; got: ${allLines}`);
   });
 
-  test('stale (completed) → FAIL (all five TIER_B_FAIL conclusions covered)', () => {
+  test('stale (completed) → FAIL', () => {
     const runs = baseRunsWith({ name: 'Some background job', status: 'completed', conclusion: 'stale' });
     const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns: runs, statuses: [], headSha: HEAD_113F472 });
     assert.equal(result.exitCode, 1, 'Tier B: completed/stale non-required run must exit 1');
@@ -1079,6 +1097,242 @@ describe('Tier C: pending non-required status is reported as advisory', () => {
     assert.ok(
       allLines.includes('advisory (Tier C)') && allLines.includes('error'),
       `must emit an advisory line for error non-required status; got:\n${allLines}`,
+    );
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// reliability-02: EXPECTED_CONTEXTS absence detection for all 4 non-required jobs
+//
+// The 113f472 fixture includes all 6 Python matrix runs, examples/ gitignore
+// coverage, and Python — wheel install smoke. These tests verify that removing
+// any of the three newly-added expected contexts causes FAIL. Each test runs
+// with the 6 required contexts passing and Source hygiene passing, but the
+// target context absent.
+// ---------------------------------------------------------------------------
+describe('reliability-02: EXPECTED_CONTEXTS covers all 4 non-required CI jobs', () => {
+
+  // Base: only required runs + Source hygiene.
+  function requiredPlusHygiene() {
+    const allRuns = loadCheckRuns('checks-main-113f472.json');
+    // Keep only runs that are required (in REQUIRED set) or Source hygiene.
+    return allRuns.filter(cr => REQUIRED.includes(cr.name) || cr.name === 'Source hygiene')
+      .concat([{ ...SOURCE_HYGIENE_PASS }]);
+  }
+
+  test('Python — build & test: all matrix runs absent → FAIL (reliability-02)', () => {
+    // Only required runs + Source hygiene; all Python matrix runs absent.
+    // Before fix: no EXPECTED_CONTEXTS entry → Tier B has nothing to iterate → PASS.
+    // After fix: Tier A+ detects absence via prefix match → FAIL.
+    const checkRuns = requiredPlusHygiene();
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Python — build & test absent must FAIL (reliability-02)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('Python') && (allLines.includes('not found') || allLines.includes('never ran')),
+      `failure must mention Python absence; got:\n${allLines}`,
+    );
+  });
+
+  test('examples/ gitignore coverage: absent → FAIL (reliability-02)', () => {
+    const checkRuns = loadCheckRuns('checks-main-113f472.json')
+      .filter(cr => cr.name !== 'examples/ gitignore coverage')
+      .concat([{ ...SOURCE_HYGIENE_PASS }]);
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'examples/ gitignore coverage absent must FAIL (reliability-02)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('examples/ gitignore coverage'),
+      `failure must name the absent job; got:\n${allLines}`,
+    );
+  });
+
+  test('Python — wheel install smoke: absent → FAIL (reliability-02)', () => {
+    const checkRuns = loadCheckRuns('checks-main-113f472.json')
+      .filter(cr => cr.name !== 'Python — wheel install smoke')
+      .concat([{ ...SOURCE_HYGIENE_PASS }]);
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'Python — wheel install smoke absent must FAIL (reliability-02)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('Python — wheel install smoke'),
+      `failure must name the absent job; got:\n${allLines}`,
+    );
+  });
+
+  test('Python — build & test: one matrix variant failed → FAIL (prefix match catches it)', () => {
+    const checkRuns = [
+      ...loadCheckRuns('checks-main-113f472.json').map(cr => {
+        // Corrupt one Python matrix run
+        if (cr.name === 'Python — build & test (ubuntu-latest, 3.11)') {
+          return { ...cr, conclusion: 'failure' };
+        }
+        return cr;
+      }),
+      { ...SOURCE_HYGIENE_PASS },
+    ];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 1, 'a failing Python matrix run must FAIL (Tier A+)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('failure'), `must quote the conclusion; got:\n${allLines}`);
+  });
+
+  test('all 4 expected contexts present+success → PASS (full fixture, no double-count)', () => {
+    // The full 113f472 fixture includes all 6 Python matrix runs, examples/ gitignore,
+    // and Python — wheel install smoke. With Source hygiene injected, all 4 EXPECTED_CONTEXTS
+    // are present and passing → exit 0.
+    const checkRuns = [...loadCheckRuns('checks-main-113f472.json'), { ...SOURCE_HYGIENE_PASS }];
+    const result = evaluateChecks({ requiredContexts: REQUIRED, checkRuns, statuses: [], headSha: HEAD_113F472 });
+    assert.equal(result.exitCode, 0, 'all 4 expected contexts present and passing must PASS');
+  });
+
+  test('EXPECTED_CONTEXTS entries each match a job name: in .github/workflows/ci.yml (full set)', () => {
+    // Existing coverage: 'Source hygiene'. This test verifies all 4 EXPECTED_CONTEXTS entries.
+    const ciYml = readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
+    const jobNames = ciYml
+      .split('\n')
+      .filter(line => /^    name: /.test(line))
+      .map(line => line.replace(/^    name:\s+/, '').trim());
+    assert.equal(EXPECTED_CONTEXTS.length, 4, 'EXPECTED_CONTEXTS must have 4 entries (reliability-02)');
+    for (const ctx of EXPECTED_CONTEXTS) {
+      assert.ok(
+        jobNames.includes(ctx),
+        `EXPECTED_CONTEXTS entry "${ctx}" must be a job name: in .github/workflows/ci.yml; ` +
+        `found job names: ${jobNames.join(', ')}`,
+      );
+    }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// complexity-08: argument parsing and merge command PR number
+// ---------------------------------------------------------------------------
+describe('complexity-08: argument parsing and merge command', () => {
+
+  test('--required-from value is not consumed as the PR number', () => {
+    // Before fix: argv.find(/^\d+$/) picked up the --required-from value '123'
+    // when '456' was the intended PR number. After fix: --required-from and its
+    // value are excluded from the PR number search.
+    const calls = [];
+    const runner = (args) => {
+      const url = args[args.length - 1];
+      calls.push(url);
+      if (url.includes('/pulls/456')) return { head: { sha: HEAD_113F472 }, base: { ref: 'main' } };
+      if (url.includes('/pulls/')) return { __error: true, httpStatus: 404, stderr: 'Not Found' };
+      if (url.includes('/protection')) return PROTECTION_OK;
+      if (url.includes('/check-runs')) return CHECKS_OK_WITH_HYGIENE;
+      if (url.includes('/status')) return { statuses: [], total_count: 0 };
+      return { __error: true, httpStatus: 404, stderr: 'no route' };
+    };
+    // '123' is the branch name for --required-from; '456' is the PR number.
+    assert.equal(main(['--required-from', '123', '456'], runner, OK_GH_VERSION), 0,
+      'should succeed verifying PR 456 with --required-from 123');
+    const prCall = calls.find(u => u.includes('/pulls/'));
+    assert.ok(prCall && prCall.includes('/pulls/456'),
+      `PR API call must use /pulls/456; got: ${prCall}`);
+  });
+
+  test('unknown flags are rejected with exit 2 (not silently ignored)', () => {
+    // Before fix: unknown flags were silently dropped; '1' was found by argv.find.
+    // After fix: any unrecognized flag causes exit 2 before API calls.
+    const calls = [];
+    const runner = (args) => { calls.push(args[args.length - 1]); return PR_OK; };
+    assert.equal(main(['1', '--verbose'], runner, OK_GH_VERSION), 2,
+      'unknown flags must cause exit 2');
+    assert.equal(calls.length, 0, 'no API calls must be made when args are rejected');
+  });
+
+  test('merge command includes the explicit PR number (D-PR5 / complexity-08)', () => {
+    // Before fix: emitted 'gh pr merge --squash --admin --match-head-commit <sha>'
+    // with no PR number — relying on gh resolving from current branch. Ambiguous.
+    // After fix: PR number is included so the command is unambiguous.
+    const runs = [...loadCheckRuns('checks-main-113f472.json'), SOURCE_HYGIENE_PASS];
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      prNumber: 314,
+    });
+    assert.equal(result.exitCode, 0);
+    assert.ok(result.mergeCommand, 'PASS must produce a mergeCommand');
+    assert.ok(result.mergeCommand.includes('314'),
+      `merge command must include PR number 314; got: ${result.mergeCommand}`);
+    // Ensure it's a positional argument, not a flag: 'gh pr merge 314 --squash ...'
+    assert.ok(/gh pr merge 314\b/.test(result.mergeCommand),
+      `PR number must be positional in the merge command; got: ${result.mergeCommand}`);
+  });
+
+  test('merge command from live path (main()) includes the PR number', () => {
+    // Drives main() end-to-end and verifies the printed merge command contains the PR number.
+    const lines = [];
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    // Intercept console.log to capture the merge command line.
+    const origLog = console.log;
+    console.log = (...args) => lines.push(args.join(' '));
+    try {
+      const exitCode = main(['1'], runner, OK_GH_VERSION);
+      assert.equal(exitCode, 0);
+    } finally {
+      console.log = origLog;
+    }
+    const mergeLine = lines.find(l => l.includes('gh pr merge'));
+    assert.ok(mergeLine, `output must include a merge command line; got:\n${lines.join('\n')}`);
+    assert.ok(mergeLine.includes('1'),
+      `merge command must include PR number 1; got: ${mergeLine}`);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// security-11: URL encoding of network-derived values
+// ---------------------------------------------------------------------------
+describe('security-11: URL encoding of branch and SHA values', () => {
+
+  test('branch name with special characters is URL-encoded in protection API call', () => {
+    // Branch falls back to baseBranch from the PR API response — network-derived.
+    // Special characters in a branch name must be encoded before URL construction.
+    const specialBranch = 'feat+my branch';
+    const calls = [];
+    const runner = (args) => {
+      calls.push(args[args.length - 1]);
+      return { __error: true, httpStatus: 404, stderr: 'not found' };
+    };
+    fetchRequiredContexts(specialBranch, null, runner);
+    const protectionCall = calls.find(u => u.includes('protection'));
+    assert.ok(protectionCall, 'must have made a protection API call');
+    const encoded = encodeURIComponent(specialBranch);
+    assert.ok(
+      protectionCall.includes(encoded),
+      `branch name must be URL-encoded; expected ${encoded} in: ${protectionCall}`,
+    );
+    assert.ok(
+      !protectionCall.includes('+my branch'),
+      `unencoded branch name must not appear in URL; got: ${protectionCall}`,
+    );
+  });
+
+  test('--required-from branch name is URL-encoded in protection API call', () => {
+    // requiredFrom comes from argv (operator input); still validate encoding.
+    const specialBranch = 'release+2026';
+    const calls = [];
+    const runner = (args) => {
+      calls.push(args[args.length - 1]);
+      return { __error: true, httpStatus: 404, stderr: 'not found' };
+    };
+    fetchRequiredContexts('main', specialBranch, runner);
+    const protectionCall = calls.find(u => u.includes('protection'));
+    assert.ok(protectionCall, 'must have made a protection API call');
+    assert.ok(
+      protectionCall.includes(encodeURIComponent(specialBranch)),
+      `--required-from branch must be URL-encoded; got: ${protectionCall}`,
     );
   });
 

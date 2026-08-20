@@ -7,7 +7,7 @@
  * failure. `gh pr merge --admin` treats a cancelled run as not-failing and
  * merges, bypassing the required-status gate. This tool explicitly checks
  * status=completed AND conclusion=success for every required context, and
- * treats cancelled/skipped/stale/in_progress as NOT passing.
+ * treats cancelled/skipped/neutral/stale/in_progress as NOT passing (Tier B whitelist).
  *
  * D-PR2: Required contexts are read LIVE from branch protection — never
  * hardcoded. On 403 the script exits 2. On 404 (unprotected base) the script
@@ -24,15 +24,21 @@
  *   Tier A  (required):          MUST be completed+success — missing/cancelled/etc = FAIL
  *   Tier A+ (expected, local):   Same semantics as Tier A, but sourced from EXPECTED_CONTEXTS
  *                                rather than branch protection. Absence = FAIL (not advisory).
- *   Tier B  (non-required runs): failure/cancelled/timed_out = FAIL; not-yet-completed = FAIL
+ *   Tier B  (non-required runs): whitelist — only 'success' passes; all other conclusions
+ *                                (failure, cancelled, timed_out, action_required, stale,
+ *                                skipped, neutral, null, any future value) = FAIL.
+ *                                not-yet-completed = FAIL (avoids PF-017).
  *   Tier C  (legacy statuses):   advisory unless the context is required
  *
  * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing even though
- * they are not (yet) in branch protection. Currently: ['Source hygiene'] — the
- * control-byte gate added in #288. Tier B alone cannot make it binding because Tier B
- * only iterates runs that ALREADY EXIST in the check-run list; an absent job has
- * nothing to iterate. Tier A+ fills this gap by asserting presence (applies ADR-009,
- * avoids PF-013: absence is never evidence of success).
+ * they are not (yet) in branch protection. Currently: all four non-required CI jobs —
+ * 'Source hygiene' (control-byte gate, #288), 'Python — build & test',
+ * 'examples/ gitignore coverage', and 'Python — wheel install smoke'. Tier B alone
+ * cannot make them binding because Tier B only iterates runs that ALREADY EXIST;
+ * an absent job has nothing to iterate. Tier A+ fills this gap by asserting presence
+ * (applies ADR-009, avoids PF-013: absence is never evidence of success).
+ * Matrix jobs are matched by prefix: 'Python — build & test' matches any run whose
+ * name starts with 'Python — build & test ('.
  *
  * D-PR4: Non-vacuity guard — zero check-runs = FAIL (the #239 case).
  *        Counts are always printed on every run (avoids PF-013).
@@ -97,15 +103,21 @@ const MIN_GH_MINOR = 31;
  * of whether they appear in branch protection. An absent job is FAIL, not
  * advisory (applies ADR-009, avoids PF-013).
  *
- * 'Source hygiene' is the control-byte gate added in #288. It is not yet a
- * required context in branch protection (Open Decision 1), so Tier B is the
- * only thing making it binding — but Tier B only iterates runs that ALREADY
- * APPEAR in the check-run list. When the job is absent (renamed, deleted, not
- * yet started, or cancelled before reporting), Tier B has nothing to iterate
- * and the verifier would emit a PASS. EXPECTED_CONTEXTS closes this gap by
- * asserting presence, mirroring Tier A semantics.
+ * Each entry is the job-level `name:` field from .github/workflows/ci.yml.
+ * Matrix jobs (e.g. 'Python — build & test') are matched by prefix: any
+ * check-run named '<ctx> (...)' counts as a match for ctx. This allows
+ * detecting the absence of all matrix variants without listing each one.
+ *
+ * Names were copied byte-for-byte from ci.yml (em dashes are U+2014).
+ * Renaming a job in ci.yml must be mirrored here, or the verifier will
+ * report that job as absent at merge time (avoids PF-013).
  */
-export const EXPECTED_CONTEXTS = ['Source hygiene'];
+export const EXPECTED_CONTEXTS = [
+  'Source hygiene',
+  'Python — build & test',       // matrix job; any run named 'Python — build & test (...)'
+  'examples/ gitignore coverage',
+  'Python — wheel install smoke',
+];
 
 // ---------------------------------------------------------------------------
 // gh runner (thin IO shim; injected in tests for offline operation)
@@ -194,6 +206,7 @@ function defaultGhRunner(args) {
  *   checkRuns: CheckRun[];
  *   statuses: CommitStatus[];
  *   headSha: string;
+ *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
  * }} EvaluateInput
  *
@@ -220,6 +233,7 @@ export function evaluateChecks({
   checkRuns,
   statuses,
   headSha,
+  prNumber,
   expectedContexts = EXPECTED_CONTEXTS,
 }) {
   const lines = [];
@@ -325,13 +339,24 @@ export function evaluateChecks({
 
   // ---- Tier A+: locally-expected contexts (Tier A semantics, protection-independent) ----
   // D-PR3b: jobs in EXPECTED_CONTEXTS must be present and passing regardless of
-  // whether they appear in branch protection. 'Source hygiene' is the primary
-  // example: it is not yet a required context (Open Decision 1), so without
-  // this tier, an absent or renamed job would yield exitCode=0. Absence is FAIL,
-  // not advisory — applies ADR-009, avoids PF-013.
+  // whether they appear in branch protection. Absence is FAIL, not advisory —
+  // applies ADR-009, avoids PF-013.
+  //
+  // Matrix jobs: ctx is the base job name (e.g. 'Python — build & test'); the
+  // actual check-run names include matrix parameters (e.g. 'Python — build & test
+  // (ubuntu-latest, 3.11)'). We first try an exact name lookup; on miss we fall
+  // back to a prefix match — any run named '<ctx> (...)' satisfies presence.
   for (const ctx of expectedContexts) {
     if (requiredSet.has(ctx)) continue; // Already enforced in Tier A with full context
-    const crs = checksByName.get(ctx);
+
+    // Exact match first; fall back to matrix-style prefix match.
+    const exactRuns = checksByName.get(ctx);
+    let crs = exactRuns ?? null;
+    if (!crs) {
+      const prefix = ctx + ' (';
+      const prefixRuns = checkRuns.filter(cr => cr.name.startsWith(prefix));
+      if (prefixRuns.length > 0) crs = prefixRuns;
+    }
     const st = statusByContext.get(ctx);
     let found = false;
 
@@ -367,19 +392,18 @@ export function evaluateChecks({
   }
 
   // ---- Tier B: non-required check-runs ----
-  // failure/cancelled/timed_out/action_required/stale = FAIL
-  // not-yet-completed (queued/in_progress) = FAIL: a PASS must not be emitted
-  //   while an active check is still outstanding; the outstanding check might
-  //   later fail, rendering the verified SHA stale and the merge command unsafe.
-  //   avoids PF-017: indeterminate state must never read as success.
-  // skipped/neutral = advisory (reported but not fatal)
-  const TIER_B_FAIL = new Set(['failure', 'timed_out', 'cancelled', 'action_required', 'stale']);
-  const TIER_B_ADVISORY = new Set(['skipped', 'neutral']);
+  // Whitelist: only 'success' is acceptable — security-13.
+  // All other completed conclusions (failure, cancelled, timed_out, action_required,
+  // stale, skipped, neutral, null, any future value) FAIL. Whitelist matches Tier A
+  // semantics and is closed against future GitHub conclusion values.
+  // not-yet-completed (queued/in_progress) = FAIL: avoids PF-017.
+  // null conclusion (completed+null, anomalous) = FAIL: reliability-10.
 
   for (const cr of checkRuns) {
     if (requiredSet.has(cr.name)) continue; // Already handled in Tier A
-    // Also skip if already handled in Tier A+
-    if (expectedContexts.includes(cr.name)) continue;
+    // Skip if already handled by Tier A+ — both exact names and matrix variants
+    // ('ctx (param...)' prefixes) are excluded to avoid double-counting.
+    if (expectedContexts.some(ctx => cr.name === ctx || cr.name.startsWith(ctx + ' ('))) continue;
 
     if (cr.status !== 'completed') {
       // Non-completed non-required run: a queued or in_progress check means the
@@ -393,13 +417,12 @@ export function evaluateChecks({
       pass = false;
       continue;
     }
-    if (cr.conclusion == null) continue;
 
-    if (TIER_B_FAIL.has(cr.conclusion)) {
-      failures.push(`Tier B (non-required): "${cr.name}" — conclusion=${cr.conclusion}`);
+    // Whitelist: only 'success' passes. null conclusion (completed but unknown
+    // outcome) is anomalous — fail closed rather than silently drop (reliability-10).
+    if (cr.conclusion !== 'success') {
+      failures.push(`Tier B (non-required): "${cr.name}" — conclusion=${cr.conclusion ?? 'null'}`);
       pass = false;
-    } else if (TIER_B_ADVISORY.has(cr.conclusion)) {
-      lines.push(`  advisory: "${cr.name}" — conclusion=${cr.conclusion}`);
     }
   }
 
@@ -429,7 +452,10 @@ export function evaluateChecks({
     // code-owner cannot self-approve. Emit it here so the operator can
     // copy the command verbatim without hand-editing (avoids PF-017: a
     // hand-edited command is where --match-head-commit gets dropped).
-    const cmd = `gh pr merge --squash --admin --match-head-commit ${headSha}`;
+    // Include the explicit PR number so the command is unambiguous regardless
+    // of the caller's current branch (complexity-08).
+    const prPrefix = prNumber != null ? `${prNumber} ` : '';
+    const cmd = `gh pr merge ${prPrefix}--squash --admin --match-head-commit ${headSha}`;
     lines.push(`✓ PASS — all ${nRequired} required contexts completed+success`);
     lines.push(`  Verified SHA: ${headSha}`);
     lines.push(`  Merge command: ${cmd}`);
@@ -479,7 +505,8 @@ export function fetchCheckRuns(headSha, runner) {
   // Bounded loop (reliability rule): at most MAX_PAGES iterations, always.
   while (page <= MAX_PAGES) {
     // D-PR4a: filter=latest pinned explicitly to prevent default-change surprises
-    const url = `/repos/{owner}/{repo}/commits/${headSha}/check-runs?per_page=${perPage}&page=${page}&filter=latest`;
+    // security-11: headSha is network-derived data; encode for safe URL construction.
+    const url = `/repos/{owner}/{repo}/commits/${encodeURIComponent(headSha)}/check-runs?per_page=${perPage}&page=${page}&filter=latest`;
     const data = runner(['api', url]);
     if (data.__error) {
       return {
@@ -532,7 +559,8 @@ export function fetchStatuses(headSha, runner) {
   // per_page=100 requests the maximum from the combined-status endpoint so that
   // a context at position 31+ is not silently missed. D-PR4a parity: assert
   // returned count against total_count and fail closed on any shortfall.
-  const url = `/repos/{owner}/{repo}/commits/${headSha}/status?per_page=100`;
+  // security-11: headSha is network-derived data; encode for safe URL construction.
+  const url = `/repos/{owner}/{repo}/commits/${encodeURIComponent(headSha)}/status?per_page=100`;
   const data = runner(['api', url]);
   if (data.__error) {
     return { ok: false, exitCode: 2, message: `commit-status API error: ${data.stderr}` };
@@ -574,7 +602,10 @@ export function fetchStatuses(headSha, runner) {
  */
 export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
   const branch = requiredFrom ?? baseBranch;
-  const url = `/repos/{owner}/{repo}/branches/${branch}/protection`;
+  // security-11: branch may be network-derived (from PR API baseBranch); encode
+  // for safe URL construction. ref names bar most metacharacters but the value
+  // is unvalidated network data.
+  const url = `/repos/{owner}/{repo}/branches/${encodeURIComponent(branch)}/protection`;
   const data = runner(['api', url]);
 
   if (data.__error) {
@@ -636,20 +667,40 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     console.error(`✖ verify-pr-checks: ${message}`);
   };
 
-  // ---- Parse args ----
-  const prArg = argv.find(a => /^\d+$/.test(a));
+  // ---- Parse args (complexity-08 fix) ----
+  // Parse flags before searching for the positional PR number so that a numeric
+  // value consumed by --required-from is never mistaken for the PR number.
+  // Unknown flags are rejected (no silent ignore).
+  let requiredFrom = null;
+  const positional = [];
+  const unknownFlags = [];
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--required-from') {
+      if (i + 1 >= argv.length) {
+        fail(`--required-from requires a branch name\n${USAGE}`);
+        return 2;
+      }
+      requiredFrom = argv[++i]; // consume the next token as the branch name
+    } else if (arg.startsWith('-')) {
+      unknownFlags.push(arg);
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  if (unknownFlags.length > 0) {
+    fail(`unknown flag(s): ${unknownFlags.join(', ')}\n${USAGE}`);
+    return 2;
+  }
+
+  const prArg = positional.find(a => /^\d+$/.test(a));
   if (!prArg) {
     console.error(USAGE);
     return 2;
   }
   const prNumber = parseInt(prArg, 10);
-
-  const rfIdx = argv.indexOf('--required-from');
-  if (rfIdx !== -1 && !argv[rfIdx + 1]) {
-    fail(`--required-from requires a branch name\n${USAGE}`);
-    return 2;
-  }
-  const requiredFrom = rfIdx !== -1 ? argv[rfIdx + 1] : null;
 
   // ---- Check gh version (D-PR5) ----
   const ver = ghVersionFn();
@@ -706,6 +757,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     checkRuns: cr.checkRuns,
     statuses: st.statuses,
     headSha,
+    prNumber,
   });
 
   for (const line of result.lines) {
