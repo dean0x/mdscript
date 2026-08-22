@@ -71,7 +71,7 @@
 //! | `safe_path()` / `safe_file_display()` (mds-cli/src/output.rs) | WIRE | CLI status-line path display (`Clean:`, `Fixed:`, `Would fix:`, `Compiled to`, …) |
 //! | `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time: the `MdsError` `Display` embedded in a reverify-failure reason, so the value is display-safe for every consumer of the published `mds::fix` API (PF-004) |
 //! | `MdsError::serialize()` (error.rs) | WIRE | `message`, `help` — covers all three bindings' error path |
-//! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key |
+//! | `LintResult::to_canonical_json()` (this module) | WIRE | `message`, `help`, `files[].file` key, `fix_edits[].new_text` |
 //! | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings; *distinct method from `LintResult::to_canonical_json`, not a duplicate* |
 //! | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | `message`, `help`, `file` — construction-time, so typed getters read pre-sanitized data (PF-004) |
 //! | `--diff` preview output (mds-cli/src/output.rs) | neutralized, TTY-gated | source excerpts neutralized when stdout is a TTY; byte-faithful when piped, so redirected diffs stay applicable. **`--check` alone emits no preview text** — only status lines, which are unconditionally sanitized via `safe_path`. |
@@ -160,8 +160,12 @@
 //! - napi `err.detail` — populated only under the `debug-panics` Cargo feature,
 //!   which CLAUDE.md forbids shipping
 //!
-//! Fields NOT sanitized: `rule` (fixed identifiers), `span`/`fix_edits` byte offsets
-//! (raw byte accuracy required for fix pipelines and span highlighting).
+//! Fields NOT sanitized: `rule` (fixed identifiers), `span` byte offsets, and
+//! `fix_edits[].start`/`end` byte offsets (raw byte accuracy required for fix pipelines
+//! and span highlighting). `fix_edits[].new_text` IS WIRE-sanitized at the serialization
+//! boundary — it is a display preview of the replacement, not a patch payload; the
+//! functional `--fix` path reads raw bytes directly from `LintDiagnostic.fix_edits` and
+//! never calls `to_canonical_json`.
 //!
 //! Raw byte values are preserved in the stored `LintDiagnostic` struct so that span
 //! offsets and fix-edits remain byte-accurate. Neither sanitizer is called in
@@ -793,7 +797,7 @@ impl LintResult {
                         serde_json::json!({
                             "start": e.start,
                             "end": e.end,
-                            "new_text": e.new_text,
+                            "new_text": sanitize_control_chars_wire(&e.new_text),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -803,8 +807,11 @@ impl LintResult {
             // mode: message and help carry sanitized \uXXXX literals for control,
             // bidi, separator and BOM characters — and for `\n`, so a hostile message
             // cannot forge an extra line in a line-oriented consumer of this JSON.
-            // Spans and fix_edits reference raw byte offsets into the source — left
+            // `span` and `fix_edits[].start`/`end` are raw byte offsets — left
             // untouched so fix pipelines and span highlighting stay accurate.
+            // `fix_edits[].new_text` is WIRE-sanitized below (see the json! call): it is
+            // a display preview of the replacement, not a patch payload; the --fix
+            // functional path reads raw bytes directly from LintDiagnostic.fix_edits.
             let d = serde_json::json!({
                 "rule": diag.rule,
                 "severity": diag.severity.to_string(),
@@ -1873,6 +1880,156 @@ mod tests {
                 "modes must agree on {probe:?}"
             );
         }
+    }
+
+    // ── T-FE: fix_edits[].new_text sanitization in to_canonical_json ────────────
+    //
+    // `fix_edits[].new_text` is a display preview of the replacement; the --fix
+    // functional path reads raw bytes directly from `LintDiagnostic.fix_edits` and
+    // never calls `to_canonical_json`.  These tests pin the JSON wire contract:
+    // hostile bytes must be WIRE-escaped in the serialized `new_text`, while the
+    // stored field value is left raw (T-FE-FIX in fix.rs asserts the latter).
+
+    /// T-FE-1 [ADR-008 / PF-004 / CWE-150]: `to_canonical_json` must WIRE-escape
+    /// every hazardous codepoint in `fix_edits[].new_text`.
+    ///
+    /// Covers one representative from each escape sub-class:
+    /// - C0 (ESC, U+001B)
+    /// - C1 / NEL (U+0085)
+    /// - Bidi override (U+202E, Trojan Source / CVE-2021-42574)
+    /// - Newline (U+000A, WIRE mode must escape `\n`)
+    ///
+    /// Non-vacuity guards: the diagnostics array is non-empty, the expected rule is
+    /// present, and positive assertions require the escaped form to be present.
+    #[test]
+    fn to_canonical_json_sanitizes_new_text_in_fix_edits() {
+        // Build `new_text` programmatically to avoid writing live control bytes into
+        // source (PF-018).
+        let esc = '\u{001B}';
+        let nel = '\u{0085}';
+        let rlo = '\u{202E}';
+        let nl = '\n';
+        let hostile = format!("{{{{{esc}name{nel}{rlo}{nl}}}}}");
+
+        let result = LintResult {
+            diagnostics: vec![LintDiagnostic {
+                rule: "legacy-interpolation".to_string(),
+                severity: Severity::Warn,
+                message: "legacy single-brace syntax".to_string(),
+                help: None,
+                span: Some(crate::error::SerializedSpan {
+                    offset: 0,
+                    length: 10,
+                    line: None,
+                    column: None,
+                }),
+                file: Some("t.mds".to_string()),
+                fix_removals: None,
+                fix_edits: Some(vec![TextEdit {
+                    start: 0,
+                    end: 10,
+                    new_text: hostile.clone(),
+                }]),
+            }],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        let json = result.to_canonical_json();
+
+        // Non-vacuity: the diagnostic array is non-empty and carries the expected rule.
+        let files = json["files"].as_array().expect("files must be an array");
+        assert_eq!(files.len(), 1, "non-vacuity: exactly one file group");
+        let diags = files[0]["diagnostics"].as_array().expect("diagnostics");
+        assert_eq!(diags.len(), 1, "non-vacuity: exactly one diagnostic");
+        assert_eq!(
+            diags[0]["rule"], "legacy-interpolation",
+            "non-vacuity: expected rule must match"
+        );
+
+        // The fix_edits array must be present and have exactly one element.
+        let edits = diags[0]["fix_edits"].as_array().expect(
+            "non-vacuity: fix_edits must be a JSON array — if null, the diagnostic was built \
+             without fix_edits and the test proves nothing",
+        );
+        assert_eq!(edits.len(), 1, "non-vacuity: exactly one edit");
+
+        let new_text = edits[0]["new_text"]
+            .as_str()
+            .expect("new_text must be a string");
+
+        // Negative: no hazardous raw codepoint may survive in the serialized new_text.
+        for (raw_ch, name) in [
+            (esc, "ESC (U+001B)"),
+            (nel, "NEL (U+0085)"),
+            (rlo, "RLO (U+202E)"),
+            (nl, "newline (U+000A)"),
+        ] {
+            assert!(
+                !new_text.contains(raw_ch),
+                "raw {name} must not appear in the JSON new_text; got: {new_text:?}"
+            );
+        }
+
+        // Positive: escaped literals must be present (proves the guard, not an empty string).
+        for (expected, name) in [
+            ("\\u001B", "ESC"),
+            ("\\u0085", "NEL"),
+            ("\\u202E", "RLO"),
+            ("\\u000A", "newline"),
+        ] {
+            assert!(
+                new_text.contains(expected),
+                "escaped {name} literal {expected} must appear in JSON new_text; \
+                 got: {new_text:?}"
+            );
+        }
+
+        // start and end offsets must be byte-accurate (not perturbed by sanitization).
+        assert_eq!(
+            edits[0]["start"], 0,
+            "start offset must be raw byte position"
+        );
+        assert_eq!(edits[0]["end"], 10, "end offset must be raw byte position");
+    }
+
+    /// T-FE-2: clean ASCII `new_text` is byte-identical after serialization
+    /// (the `Cow::Borrowed` fast path produces no allocation and no mutation).
+    ///
+    /// This is the existing regression anchor for `{{name}}` (api_surface.rs:1804);
+    /// having it here in the unit suite makes the fast-path contract explicit.
+    #[test]
+    fn to_canonical_json_leaves_clean_new_text_byte_identical() {
+        let clean = "{{name}}";
+        let result = LintResult {
+            diagnostics: vec![LintDiagnostic {
+                rule: "legacy-interpolation".to_string(),
+                severity: Severity::Warn,
+                message: "legacy brace".to_string(),
+                help: None,
+                span: None,
+                file: Some("t.mds".to_string()),
+                fix_removals: None,
+                fix_edits: Some(vec![TextEdit {
+                    start: 6,
+                    end: 12,
+                    new_text: clean.to_string(),
+                }]),
+            }],
+            truncated: false,
+            is_standalone: false,
+        };
+
+        let json = result.to_canonical_json();
+        let new_text = json["files"][0]["diagnostics"][0]["fix_edits"][0]["new_text"]
+            .as_str()
+            .expect("new_text must be a string");
+
+        assert_eq!(
+            new_text, clean,
+            "clean ASCII new_text must be byte-identical after serialization (Cow::Borrowed \
+             fast path must not mutate clean content)"
+        );
     }
 
     /// T-16i: WIRE mode keeps the [`sanitize_control_chars`] properties — borrowed

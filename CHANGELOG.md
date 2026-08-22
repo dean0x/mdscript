@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — lint JSON wire: `fix_edits[].new_text` is now WIRE-sanitized
+
+`LintDiagnostic.fix_edits[].new_text` in the `"version": 1` JSON envelope is now
+WIRE-escaped (hostile C0/C1/bidi/separator/BOM codepoints replaced with their
+`\uXXXX` literals) across all four surfaces — CLI, napi, WASM, and Python. Previously
+the value was emitted raw, so a template variable name containing a control byte or
+bidi override survived verbatim into the JSON.
+
+`fix_edits[].new_text` is a **display preview** of the replacement text; it MUST NOT
+be used as a patch payload. Applying fixes is `mds lint --fix`, the functional path,
+which reads raw bytes directly from the `LintDiagnostic` struct and is not affected by
+this change.
+
+**A consumer breaks if it** treats `fix_edits[].new_text` as a byte-exact patch and
+relies on hostile bytes surviving in that field. Clean ASCII values (e.g. `"{{name}}"`)
+are byte-identical before and after (the `Cow::Borrowed` fast path; no allocation).
+
 ### **BREAKING** — lint JSON wire contract (#202, #203, #211)
 
 #### Lint JSON wire contract (#202, #203, #211)

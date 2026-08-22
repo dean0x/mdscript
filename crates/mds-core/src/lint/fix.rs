@@ -2560,6 +2560,72 @@ mod tests {
     /// Applies ADR-004: a three-tier safety gate is only as useful as its refusal
     /// reporting — surfacing the real rejection reason is diagnostic infrastructure
     /// for the whole `--fix` feature.
+    /// T-FE-FIX [ADR-008 / Option-B]: the functional `--fix` path reads raw bytes
+    /// directly from `LintDiagnostic.fix_edits` and must never sanitize them.
+    ///
+    /// Option B sanitizes only the JSON display wire (`to_canonical_json`).  The
+    /// `diag_to_edits` → `ByteEdit.replacement` chain must carry the original bytes
+    /// unchanged so that `apply_plan_unchecked` writes them back to disk verbatim.
+    ///
+    /// This is a regression guard: it must stay GREEN before AND after the
+    /// `to_canonical_json` change (only the JSON serializer is modified; `diag_to_edits`
+    /// is untouched).
+    #[test]
+    fn fix_path_preserves_raw_bytes_in_new_text() {
+        // Build `new_text` with hazardous bytes programmatically (PF-018).
+        let esc = '\u{001B}';
+        let rlo = '\u{202E}';
+        let nl = '\n';
+        let hostile = format!("{{{{{esc}name{rlo}{nl}}}}}");
+
+        let source = format!("{{{esc}name{rlo}{nl}}}");
+        let edit_start = 0;
+        let edit_end = source.len();
+
+        // Ensure the byte range is char-boundary valid so diag_to_edits doesn't drop it.
+        assert!(source.is_char_boundary(edit_start));
+        assert!(source.is_char_boundary(edit_end));
+
+        let diag = LintDiagnostic {
+            rule: "legacy-interpolation".to_string(),
+            severity: crate::lint::diagnostic::Severity::Warn,
+            message: "test".to_string(),
+            help: None,
+            span: None,
+            file: Some("t.mds".to_string()),
+            fix_removals: None,
+            fix_edits: Some(vec![crate::lint::diagnostic::TextEdit {
+                start: edit_start,
+                end: edit_end,
+                new_text: hostile.clone(),
+            }]),
+        };
+
+        let edits = diag_to_edits(&diag, &source);
+        assert_eq!(edits.len(), 1, "non-vacuity: one edit must be produced");
+
+        // The replacement must carry the raw bytes — same as stored in new_text.
+        assert_eq!(
+            edits[0].replacement, hostile,
+            "diag_to_edits must clone new_text raw into ByteEdit.replacement; \
+             sanitizing here would corrupt the file written by apply_plan_unchecked"
+        );
+
+        // Confirm the raw hazardous chars ARE in the replacement (non-vacuity).
+        assert!(
+            edits[0].replacement.contains(esc),
+            "raw ESC must survive in ByteEdit.replacement (fix path, not JSON wire)"
+        );
+        assert!(
+            edits[0].replacement.contains(rlo),
+            "raw RLO must survive in ByteEdit.replacement (fix path, not JSON wire)"
+        );
+        assert!(
+            edits[0].replacement.contains(nl),
+            "raw newline must survive in ByteEdit.replacement (fix path, not JSON wire)"
+        );
+    }
+
     #[test]
     fn rejected_reason_includes_per_edit_failure_details() {
         let source = "LineA\n";
