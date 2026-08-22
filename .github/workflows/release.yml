@@ -38,7 +38,34 @@ jobs:
         with:
           ref: ${{ github.ref }}
       - uses: actions/setup-node@v6
-        with: { node-version: 22 }
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      - name: "Verify publish credentials before irreversible steps (security-08)"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # Guard: npm token must be non-empty. A missing or revoked secret interpolates
+          # to an empty string in GitHub Actions — not an error — so this must be checked
+          # explicitly before cargo publish runs and makes crates.io publish irreversible.
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. (security-08)"
+            exit 1
+          fi
+          # Guard: cargo token must be non-empty. A missing token fails before the
+          # irreversible crates.io publish, but catching it here avoids burning the
+          # expensive 7-target cross-compile matrix.
+          if [ -z "$CARGO_REG_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is empty or unset — cargo publish would fail. Set the CARGO_REGISTRY_TOKEN repo secret. (security-08)"
+            exit 1
+          fi
+          # Verify npm authentication: whoami proves the token is accepted by the registry.
+          # NOTE: this verifies authentication only, NOT publish rights to @mdscript scope.
+          # A read-only or wrongly-scoped token passes this check but fails at publish time.
+          WHO=$(npm whoami --registry https://registry.npmjs.org 2>&1) || {
+            echo "::error::npm whoami failed — NPM_TOKEN may be revoked or expired: ${WHO}"
+            exit 1
+          }
+          echo "npm credentials verified: token resolves to npm user '${WHO}'"
       - name: "Assert synchronized versions, no file: refs"
         run: node scripts/verify-versions.mjs
       # #288: Source-hygiene gate — also runs on tag pushes via this job.

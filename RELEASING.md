@@ -87,6 +87,17 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # artifacts. Publishes NOTHING.
 ```
 
+The dry-run workflow runs `version-gate` in full, which now includes the
+**credential probe** (security-08): it calls `npm whoami` against the live
+registry to verify the `NPM_TOKEN` is valid, and guards `CARGO_REGISTRY_TOKEN`
+for non-empty. A revoked or absent token therefore fails the dry run — this
+closes the former gap where a bad npm token was only discovered after
+`cargo publish` had already made an irreversible crates.io release.
+
+**Note:** `npm whoami` verifies authentication, not publish rights to the
+`@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
+fails at publish time.
+
 Confirm the **A3 name-gate** step (`scripts/verify-napi-names.mjs`) passes in that
 run. **This is a hard checkpoint** — if the generated platform package names or
 their `.node` filenames drift from the hand-written `crates/mds-napi/index.js`
