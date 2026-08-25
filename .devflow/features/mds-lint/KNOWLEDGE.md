@@ -526,7 +526,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Python `LintDiagnostic.fix_edits` getter vs `#[pyo3(get)]`**: `Vec<serde_json::Value>` does not implement `IntoPy`. Use the custom `#[getter]` which calls `value_to_py`. Stored internally as `Option<Vec<serde_json::Value>>`.
 
-**Python `LintDiagnostic.to_dict()` always includes `fix_edits`, `help`, and `span` keys**: All three are emitted as Python `None` (JSON `null`) when not set — never absent. This matches `to_canonical_json()` exactly (PF-007 guard). `to_dict()` now conditionally emits `span.line` and `span.column` when present; `LintResult.files[]` parses them from canonical JSON. No built-in rule currently populates them — the only prior test was a negative one that passed identically under the old code. Verify with a positive control (ADR-009).
+**Python `LintDiagnostic.to_dict()` always includes `fix_edits`, `help`, and `span` keys**: All three are emitted as Python `None` (JSON `null`) when not set — never absent. This matches `to_canonical_json()` exactly (PF-007 guard). `to_dict()` now conditionally emits `span.line` and `span.column` when present; `LintResult.files[]` parses them from canonical JSON. No built-in rule currently populates them — the only prior test was a negative one that passed identically under the old code. Verify with a positive control (PF-018).
 
 **Reverify rejection message**: Exact stable text: `"could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"`. Test `A5` in `cli_lint.rs` pins this.
 
