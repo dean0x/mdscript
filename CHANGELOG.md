@@ -19,12 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Whether that edit was merely *late* or lost *permanently* came down to the
   self-heal probe. The probe's first tick rebuilds unconditionally, so on an
   otherwise-idle tree it recovered the edit within one `--poll-interval`. But the
-  tick only fires when the watcher goes idle for a full interval, and its deadline
-  restarts on every message received — so anything producing a steady stream of
-  filesystem events in the watched tree (an editor's own scratch files, a dev server,
-  a sync client) starves the tick indefinitely and the save is lost for good. That
-  starvation is a separate defect, tracked as #319; this entry fixes the window
-  that makes it reachable at startup.
+  tick only fired when the watcher went idle for a full interval, and its deadline
+  restarted on every message received — so anything producing a steady stream of
+  filesystem events in the watched tree starved the tick indefinitely and the save was
+  lost for good. That starvation was a separate defect, tracked as #319 and fixed in
+  its own entry below; this entry fixes the window that makes it reachable at startup.
 
   Both startup paths are reordered so that the watch is armed before the file it
   covers is first read. Directory mode arms the recursive root watch before the tree
@@ -35,20 +34,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content-dedup) all still apply, so arming earlier does not reintroduce spurious
   startup rebuilds.
 
-  **Scope.** Edits made during startup are now safe for everything whose location is
-  known before the compile runs: any file under the watched root in directory mode,
-  and the entry plus the `--vars` file (and anything sharing their directories) in
-  single-file mode. It does **not** cover a dependency outside those directories — an
-  `@import` of `../shared/_x.mds` in single-file mode, or a cross-root import in
-  directory mode. Such a file's existence is only discovered by the compile that reads
-  it, so its directory cannot be armed beforehand, and an edit to it during startup can
-  still be missed. Directory mode has no second line of defence there at all: its
-  self-heal probe reconciles files that appeared or were removed, never file contents.
-  Closing that residual gap needs the dependency graph before the first compile, and is
-  not attempted here.
+  **Scope.** Arming order covers everything whose location is known before the compile
+  runs: any file under the watched root in directory mode, and the entry plus the
+  `--vars` file (and anything sharing their directories) in single-file mode. It cannot
+  cover a dependency outside those directories — an `@import` of `../shared/_x.mds`.
+  Such a file is discovered only by the compile that reads it, so no ordering can arm
+  its directory beforehand and an edit made in that window produces no filesystem event
+  for anyone. That case is closed by the content backstop described in the #321 entry
+  below, which recovers it on the next idle tick in both modes.
 
   Observed on Linux, where the reads performed during startup generate inotify
   activity; macOS FSEvents does not report reads and did not surface it.
+
+- **`mds watch` no longer loses an edit to a cross-root dependency in directory mode
+  (#321).** Editing a file that a watched template `@import`s from outside the watched
+  root — a shared partials directory, say — could leave the importer's output stale for
+  the rest of the session. No error, no rebuild, no further attempt: the save was gone,
+  not late. Reproduced on Linux at roughly one save in five.
+
+  Two independent defects had to line up, and both were present:
+
+  1. **A failed compile discarded the importer's dependency list.** Directory mode
+     recomputes which external directories to watch from that list after every batch,
+     so clearing it also un-tracked the directory the dependency lives in. Every later
+     event from that directory was then rejected as "neither under the root nor in a
+     known external dependency directory", and the next idle tick called `unwatch()` on
+     it. The trigger is mundane: saving with `O_TRUNC` leaves the file momentarily
+     empty, and a watcher that compiles on the truncation rather than on the write
+     compiles against nothing and fails. One such compile blinded the watcher to that
+     dependency for the rest of the session.
+  2. **Nothing ever checked file contents.** Directory mode's idle probe reconciled
+     only files that had *appeared* or been *removed* under the root, so its
+     `(mtime, size)` snapshot was written on every batch and never once read. A
+     cross-root dependency is not in that walk at all, so no diff of it could have
+     reported the change even if one had run.
+
+  Both are fixed. A failed compile now keeps the last known dependency list, which only
+  ever widens what may trigger a rebuild — never narrows it — and a rebuild whose output
+  is unchanged is still suppressed by the existing content dedup. And the idle probe now
+  diffs `(mtime, size)` across every tracked source *and dependency*, so a change that
+  no filesystem event announced is picked up within one `--poll-interval`.
+
+  For that diff to be sound the baseline has to predate the read whose output was
+  published, so both modes now capture it earlier: directory mode before the tree walk,
+  and each dependency the instant the compile that discovered it returns. Taken after
+  the fact instead, the baseline would record the *post*-edit state and the watcher
+  would believe a stale output was current — permanently. Cost is one `stat` per tracked
+  file per tick, which is the price single-file mode has always paid, and is
+  O(sources + dependencies) rather than O(tree).
+
+- **`mds watch`'s self-heal idle tick can no longer be starved by event traffic (#319).**
+  The tick handed `recv_timeout` a fresh `--poll-interval` budget on every message it
+  received, so any stream of filesystem events arriving faster than the interval reset
+  the countdown before it could expire and the tick never fired at all. That is not an
+  exotic condition: inotify reports reads, so the watcher's own compiles produce such a
+  stream, as do an editor's scratch files, a dev server, a sync client, or any tool
+  polling the tree. Because the tick is the only detector for a change no event can
+  announce — the cross-root case above, or a directory recreated as a fresh inode after
+  `rmdir` — starving it turned "recovered on the next tick" into "lost permanently".
+
+  The deadline is now an absolute instant: an incoming message shortens the remaining
+  wait rather than restarting it. Re-arming it from the moment a tick is *observed*
+  bounds the tick from the other side too, so a probe that overruns its own interval
+  cannot queue up catch-up ticks — at most one tick per interval, under any load.
 
 ### Changed — lint JSON wire: `fix_edits[].new_text` is now WIRE-sanitized
 

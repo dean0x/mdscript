@@ -3605,6 +3605,269 @@ fn watch_dir_mode_edit_during_startup_window_is_not_lost() {
     drop(child);
 }
 
+/// Directory mode: an edit to a **cross-root dependency**, made in the window before
+/// that dependency's directory can be armed, must still reach the output (#321).
+///
+/// This is the one window arming order cannot close, and it is not an artefact of the
+/// test harness: a cross-root dependency's directory is discovered by the compile that
+/// reads it, so there is no earlier instant at which to arm it. Whatever the ordering,
+/// some interval exists in which an edit to such a file produces no event for anyone.
+///
+/// So this test deliberately does the opposite of the two #317 tests above. They run
+/// with `--poll-interval 0` to prove inotify carries the edit alone; this one leaves
+/// the probe enabled, because here the idle-tick content backstop is the *only*
+/// mechanism that can carry it. Before the backstop existed, directory mode diffed only
+/// `collect_mds_files(root)` — which never contains a cross-root dependency — so the
+/// edit was not late, it was gone.
+///
+/// Sensitivity, like the #317 tests, comes from the `startup-race-probe` feature: it
+/// widens the publish→arm window to 200ms, which is what makes the edit land inside it
+/// reliably rather than by luck. See the block comment above.
+#[test]
+fn watch_dir_mode_cross_root_edit_during_startup_window_is_not_lost() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    let shared = base.path().join("shared");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    // .git marker so the compiler's project root is `base`, permitting `../shared`.
+    std::fs::write(base.path().join(".git"), "").unwrap();
+
+    let partial = shared.join("_x.mds");
+    std::fs::write(
+        &partial,
+        "@define greet():\nWindow V1\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let importer = root.join("importer.mds");
+    std::fs::write(
+        &importer,
+        "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n",
+    )
+    .unwrap();
+    let out = out_dir.join("importer.md");
+
+    let (child, _tap) = spawn_unsynchronized(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+                // Probe ON: the content backstop is the mechanism under test.
+                "--poll-interval",
+                "100",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // The published startup output IS the start of the window: the external dep dir is
+    // armed only after every source has been compiled and written.
+    assert!(
+        wait_for_file_contains_tight(&out, "Window V1", STARTUP_WINDOW_TIMEOUT),
+        "startup compile should publish 'Window V1'"
+    );
+
+    // Edit the cross-root partial now — inside the window where nothing is watching it.
+    std::fs::write(
+        &partial,
+        "@define greet():\nWindow V2\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+
+    // TICK-DEPENDENT: no filesystem event announces this edit, so recovery is the idle
+    // tick's `(mtime, size)` diff against the baseline captured before the first read.
+    assert!(
+        wait_for_file_contains(&out, "Window V2", TICK_TIMEOUT),
+        "an edit to a cross-root dependency during the startup window must be recovered \
+         by the idle-tick content backstop: its directory cannot be armed before the \
+         compile discovers it, so no event exists to deliver, and diffing only the \
+         in-root file list can never see the change (#321)"
+    );
+
+    drop(child);
+}
+
+/// Single-file mode: the same end-to-end property for a dependency outside the entry's
+/// directory — an edit in the startup window must still reach the output.
+///
+/// **Measured limitation, stated so it cannot be misread as a guard it is not.** This
+/// test does not discriminate *which* mechanism delivers the result, because single-file
+/// mode has two that each suffice alone, and one of them is unconditional:
+/// `liveness_probe_file` returns `recovery || changed` with `recovery` including
+/// `first_tick`, so its first tick rebuilds whatever the baseline says. Measured against
+/// an arm with the dependency baseline moved back to the post-compile snapshot, this test
+/// still passed 10/10 — the first-tick rebuild covered it. It therefore guards the
+/// disjunction "first-tick rebuild *or* a baseline older than the read", not either term.
+///
+/// It is kept because that disjunction is the property a user depends on, and because
+/// removing the unconditional first-tick rebuild — an obvious way to save a redundant
+/// startup compile — would leave the baseline as the only remaining satisfier. It is
+/// **not** evidence that the baseline capture point is correct; nothing here is.
+/// The directory-mode counterpart above *is* discriminating (measured 10/10 RED against
+/// the arm without the content backstop), because directory mode has no unconditional
+/// first-tick rebuild.
+#[test]
+fn watch_file_mode_dep_edit_during_startup_window_is_not_lost() {
+    let base = tempfile::tempdir().unwrap();
+    let entry_dir = base.path().join("tpl");
+    let shared = base.path().join("shared");
+    std::fs::create_dir(&entry_dir).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::write(base.path().join(".git"), "").unwrap();
+
+    let partial = shared.join("_x.mds");
+    std::fs::write(
+        &partial,
+        "@define greet():\nDep V1\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+    let entry = entry_dir.join("entry.mds");
+    std::fs::write(&entry, "@import \"../shared/_x.mds\" as x\n{{x.greet()}}\n").unwrap();
+    let out = entry_dir.join("entry.md");
+
+    let (child, _tap) = spawn_unsynchronized(
+        mds_bin()
+            .args([
+                "watch",
+                entry.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "100",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains_tight(&out, "Dep V1", STARTUP_WINDOW_TIMEOUT),
+        "startup compile should publish 'Dep V1'"
+    );
+
+    std::fs::write(
+        &partial,
+        "@define greet():\nDep V2\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+
+    assert!(
+        wait_for_file_contains(&out, "Dep V2", TICK_TIMEOUT),
+        "an edit to a dependency outside the entry's directory during the startup \
+         window must be recovered by the idle tick: the dependency's baseline has to \
+         predate the edit, which it only does if it is captured when the compile \
+         reports the dep rather than at the end of startup (#321)"
+    );
+
+    drop(child);
+}
+
+// ── #319: the idle tick must not be starvable ────────────────────────────────
+//
+// The backstop above is only worth as much as the tick that runs it. Handing
+// `recv_timeout` a fresh `--poll-interval` budget per message made the tick starvable
+// by any event stream faster than the interval — and the watcher's own compiles, an
+// editor's scratch writes, a dev server, or a sync client all qualify. A starved tick
+// does not delay recovery; it removes it.
+
+/// The idle tick must still fire while filesystem events arrive faster than the
+/// `--poll-interval` (#319).
+///
+/// The change under test is one no event can announce: `remove_dir_all` destroys the
+/// recursive watch descriptor, and the directory recreated in its place is a different
+/// inode that nothing is watching. Only the probe's re-arm and reconcile can recover
+/// it. Meanwhile a reader polls the cross-root dependency 30× faster than the poll
+/// interval, so every one of those reads is an `Access` event on a watch that is still
+/// live — the watcher drops each as irrelevant, which is exactly why a message-driven
+/// countdown never reached zero.
+///
+/// The reader is deliberately outside the deleted root: a flood that stops when the
+/// root does would prove nothing about starvation.
+#[test]
+fn watch_dir_mode_idle_tick_fires_under_event_flood() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    let shared = base.path().join("shared");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::create_dir(&out_dir).unwrap();
+    std::fs::write(base.path().join(".git"), "").unwrap();
+
+    // A cross-root dependency: its directory is armed, so reads of it are delivered as
+    // events for the lifetime of the watcher, independent of the root.
+    let partial = shared.join("_p.mds");
+    std::fs::write(&partial, "@define hi():\nP\n@end\n\n@export hi\n").unwrap();
+    std::fs::write(
+        root.join("a.mds"),
+        "@import \"../shared/_p.mds\" as p\n{{p.hi()}}\n",
+    )
+    .unwrap();
+
+    let (child, _tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "150",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains(&out_dir.join("a.md"), "P", TIMEOUT),
+        "initial compile should produce 'P'"
+    );
+
+    // Flood: read the armed cross-root dependency every 5ms — 30 events per tick.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let stop = Arc::clone(&stop);
+        let partial = partial.clone();
+        std::thread::spawn(move || {
+            // Bounded by the stop flag, which the test always sets before joining.
+            while !stop.load(Ordering::Relaxed) {
+                let _ = std::fs::read(&partial);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+
+    // Destroy the root's watch descriptor, then recreate the directory with new content.
+    std::fs::remove_dir_all(&root).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("new.mds"), "---\nname: N\n---\nFlood {{name}}\n").unwrap();
+
+    let recovered = wait_for_file_contains(&out_dir.join("new.md"), "Flood N", TICK_TIMEOUT);
+
+    stop.store(true, Ordering::Relaxed);
+    flood.join().expect("flood thread panicked");
+
+    assert!(
+        recovered,
+        "the idle tick must fire while events arrive 30x faster than --poll-interval: \
+         nothing but the probe's re-arm can observe a root recreated as a new inode, so \
+         a tick whose deadline restarts on every message loses this change permanently \
+         rather than late (#319)"
+    );
+
+    drop(child);
+}
+
 // ── Ctrl+C during the startup compile ────────────────────────────────────────
 //
 // `watch_ctrl_c_exits_cleanly` and `watch_ctrl_c_prints_stopped_watching` both signal

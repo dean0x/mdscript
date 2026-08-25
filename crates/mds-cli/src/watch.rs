@@ -14,6 +14,21 @@
 //!   own `.md` output (DD2). Cross-root dependencies are watched NonRecursively (DD3).
 //!   Output mirrors the source subtree under `--out-dir` / `mds.json output_dir` (Fix 2).
 //!
+//! # Change detection
+//!
+//! Both modes run two detectors, and neither alone is sufficient:
+//!
+//! 1. **OS watches** (inotify / FSEvents) — the primary path. Armed before the first
+//!    read of anything they cover, so an edit during startup is queued, not dropped.
+//! 2. **The idle-tick content backstop** — a `(mtime, size)` diff over every tracked
+//!    source *and dependency*, run once per `--poll-interval` by `liveness_probe_*`.
+//!    It exists for changes no OS event can announce: a cross-root dependency's
+//!    directory is unknowable until the compile that reads it returns, and a watch
+//!    descriptor destroyed by `rmdir` never announces its own replacement (#321).
+//!
+//! The tick is scheduled against an absolute deadline (`TickClock`), so a stream of
+//! filesystem events cannot postpone the backstop indefinitely (#319).
+//!
 //! # Key invariants
 //!
 //! - All content output → stdout ONLY when output resolves to stdout.
@@ -258,13 +273,20 @@ pub(crate) fn affected_sources(
     result
 }
 
+/// A single path's content fingerprint: `(mtime, size)`.
+///
+/// Each field is `None` when the file does not exist or its metadata is unreadable —
+/// absence is a valid state to track, and is what lets a deletion register as a change.
+pub(crate) type FileStamp = (Option<std::time::SystemTime>, Option<u64>);
+
+/// A `(mtime, size)` baseline keyed by path, as produced by [`snapshot_state`].
+pub(crate) type StampMap = HashMap<PathBuf, FileStamp>;
+
 /// Snapshot `(mtime, size)` for a set of paths (liveness probe state).
 ///
 /// Returns `None` for the mtime or size field when the file doesn't exist or
 /// the metadata call fails — absence is a valid state to track.
-pub(crate) fn snapshot_state(
-    paths: &HashSet<PathBuf>,
-) -> HashMap<PathBuf, (Option<std::time::SystemTime>, Option<u64>)> {
+pub(crate) fn snapshot_state(paths: &HashSet<PathBuf>) -> StampMap {
     let mut map = HashMap::new();
     for p in paths {
         match std::fs::metadata(p) {
@@ -281,23 +303,37 @@ pub(crate) fn snapshot_state(
     map
 }
 
-/// Return `true` if the current `(mtime, size)` of any path in `paths` differs
-/// from its entry in `prev`.
-pub(crate) fn state_differs(
-    paths: &HashSet<PathBuf>,
-    prev: &HashMap<PathBuf, (Option<std::time::SystemTime>, Option<u64>)>,
-) -> bool {
-    for p in paths {
-        let current = match std::fs::metadata(p) {
+/// Record `path`'s current `(mtime, size)` in `snapshot`, keeping any entry already
+/// there.
+///
+/// The keep-existing rule is the point: baselines are merged oldest-wins, because only
+/// a baseline taken before a read can prove the read saw the current content.
+pub(crate) fn baseline_path(path: &Path, snapshot: &mut StampMap) {
+    snapshot
+        .entry(path.to_path_buf())
+        .or_insert_with(|| match std::fs::metadata(path) {
             Ok(m) => (m.modified().ok(), Some(m.len())),
             Err(_) => (None, None),
-        };
-        match prev.get(p) {
-            Some(old) if *old == current => {}
-            _ => return true,
-        }
-    }
-    false
+        });
+}
+
+/// Return `true` if the current `(mtime, size)` of `path` differs from its entry in
+/// `prev`.
+///
+/// A path with no entry in `prev` counts as differing: the baseline has never seen it,
+/// so the watcher cannot claim its content is accounted for.
+pub(crate) fn path_state_differs(path: &Path, prev: &StampMap) -> bool {
+    let current = match std::fs::metadata(path) {
+        Ok(m) => (m.modified().ok(), Some(m.len())),
+        Err(_) => (None, None),
+    };
+    !matches!(prev.get(path), Some(old) if *old == current)
+}
+
+/// Return `true` if the current `(mtime, size)` of any path in `paths` differs
+/// from its entry in `prev`.
+pub(crate) fn state_differs(paths: &HashSet<PathBuf>, prev: &StampMap) -> bool {
+    paths.iter().any(|p| path_state_differs(p, prev))
 }
 
 /// Decide whether a missing/recovered external dep dir should trigger a full
@@ -479,41 +515,77 @@ fn emit_ready_marker() {
     }
 }
 
-/// Receive the next message from the watch channel.
+/// Idle-tick scheduler holding an **absolute** deadline (#319).
 ///
-/// Returns:
-/// - `Ok(Some(msg))` — a message arrived.
-/// - `Ok(None)`      — idle tick (only when `tick` is `Some`).
-/// - `Err(_)`        — channel disconnected; caller should `break`.
-fn recv_next(
-    rx: &mpsc::Receiver<Msg>,
-    tick: Option<Duration>,
-) -> std::result::Result<Option<Msg>, mpsc::RecvTimeoutError> {
-    match tick {
-        Some(t) => rx.recv_timeout(t).map(Some).or_else(|e| match e {
-            mpsc::RecvTimeoutError::Timeout => Ok(None),
-            mpsc::RecvTimeoutError::Disconnected => Err(e),
-        }),
-        None => rx
-            .recv()
-            .map(Some)
-            .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
-    }
+/// The liveness probe is the watcher's only backstop for a change that no filesystem
+/// event ever announced, so how the tick is scheduled decides whether that backstop
+/// is reachable at all.
+///
+/// Handing `recv_timeout` a fresh `--poll-interval` budget on every message made it
+/// starvable: any event stream arriving faster than the interval restarted the
+/// countdown before it could expire, so the tick never fired. That is not a rare
+/// condition — a compile reads its own sources and inotify reports every read, an
+/// editor writes scratch files beside the one being edited, a dev server or sync
+/// client touches the tree continuously, and the watch suite's own 50ms output poll
+/// is 20× faster than the 1000ms default interval. Under any of them a change the
+/// probe was meant to recover was lost permanently rather than delayed.
+///
+/// Keeping the deadline as an `Instant` pins the tick to wall-clock time instead:
+/// an incoming message shortens the remaining wait rather than restarting it, so the
+/// tick comes due on schedule no matter how loaded the channel is.
+///
+/// Re-arming to `now + interval` at the moment a tick is *observed* bounds it from
+/// the other side. The probe — and any recompile it triggers — runs between two
+/// `recv_next` calls, so a probe that overruns its own interval simply arms the next
+/// deadline from when it finished. It can never accumulate overdue ticks and fire
+/// them back-to-back: at most one tick per interval, under every load.
+struct TickClock {
+    /// `None` when `--poll-interval 0` disabled the probe; `recv_next` then blocks.
+    interval: Option<Duration>,
+    /// Instant at which the next idle tick comes due. Unused while `interval` is `None`.
+    next: Instant,
 }
 
-/// Snapshot the `(mtime, size)` of a single path into `last_mtimes`.
-///
-/// Called at every error-settle point: after a compile error or a write error,
-/// the snapshot prevents the liveness tick from re-firing on the same unchanged file.
-fn settle_mtime(
-    path: &Path,
-    last_mtimes: &mut HashMap<PathBuf, (Option<std::time::SystemTime>, Option<u64>)>,
-) {
-    let entry = match std::fs::metadata(path) {
-        Ok(m) => (m.modified().ok(), Some(m.len())),
-        Err(_) => (None, None),
-    };
-    last_mtimes.insert(path.to_path_buf(), entry);
+impl TickClock {
+    fn new(interval: Option<Duration>) -> Self {
+        Self {
+            interval,
+            next: Instant::now() + interval.unwrap_or(Duration::ZERO),
+        }
+    }
+
+    /// Receive the next message from the watch channel.
+    ///
+    /// Returns:
+    /// - `Ok(Some(msg))` — a message arrived before the tick came due.
+    /// - `Ok(None)`      — idle tick (only when a poll interval is configured).
+    /// - `Err(_)`        — channel disconnected; caller should `break`.
+    fn recv_next(
+        &mut self,
+        rx: &mpsc::Receiver<Msg>,
+    ) -> std::result::Result<Option<Msg>, mpsc::RecvTimeoutError> {
+        let Some(interval) = self.interval else {
+            return rx
+                .recv()
+                .map(Some)
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
+        };
+        let now = Instant::now();
+        // Already due: fire before taking another message, so a saturated channel
+        // cannot postpone the probe indefinitely.
+        if now >= self.next {
+            self.next = now + interval;
+            return Ok(None);
+        }
+        match rx.recv_timeout(self.next - now) {
+            Ok(msg) => Ok(Some(msg)),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.next = Instant::now() + interval;
+                Ok(None)
+            }
+            Err(e @ mpsc::RecvTimeoutError::Disconnected) => Err(e),
+        }
+    }
 }
 
 // ── Debounce loop ─────────────────────────────────────────────────────────────
@@ -701,7 +773,7 @@ struct FileWatchState {
     /// Set of paths relevant to the current build (entry + deps + vars).
     foi: HashSet<PathBuf>,
     /// Snapshot of `(mtime, size)` used by the liveness probe (ADR-021).
-    last_mtimes: HashMap<PathBuf, (Option<std::time::SystemTime>, Option<u64>)>,
+    last_mtimes: StampMap,
     /// Content-dedup map keyed by output-path string (or `"<stdout>"`).
     last_written: HashMap<String, String>,
     /// Whether the entry file was missing on the previous liveness tick.
@@ -1064,7 +1136,7 @@ fn run_watch_file(
     // `build_runtime_vars` (reads the vars file) and `compile_and_write` (reads
     // the entry) come after this point, so an edit landing during startup leaves
     // this snapshot strictly older than the file — and the liveness probe sees it.
-    let pre_mtimes = snapshot_state(&files_of_interest(&entry, &[], vars_path.as_deref()));
+    let mut pre_mtimes = snapshot_state(&files_of_interest(&entry, &[], vars_path.as_deref()));
     let entry_was_missing = !entry.exists();
 
     // Initial compile: compile first, derive output path from kind (compile-then-route).
@@ -1111,6 +1183,27 @@ fn run_watch_file(
             (fallback_path, vec![], String::new())
         }
     };
+
+    // Baseline the dependencies the compile just reported, before anything else runs.
+    //
+    // The entry and vars baselines above precede their own reads; a dependency's cannot,
+    // because the compile is what discovers the dependency exists. Taking it here rather
+    // than with the post-compile snapshot below shrinks the window in which an edit to a
+    // dependency is invisible to the baseline from "the rest of startup" to the gap
+    // between the compile returning and this loop. `baseline_path` keeps the older of
+    // any two entries.
+    //
+    // HONEST SCOPE: this is defence in depth and has **no measured observable effect**
+    // today. `liveness_probe_file` returns `recovery || changed` with `recovery`
+    // including `first_tick`, so file mode's first tick rebuilds unconditionally and
+    // recovers such an edit whatever the baseline says — an arm with this loop removed
+    // still passed the covering test 10/10. What it buys is that `last_mtimes` means
+    // what its name says, so the probe stays correct if that unconditional first-tick
+    // rebuild is ever removed. Directory mode has no such fallback, which is why the
+    // equivalent capture there is load-bearing and measured (#321).
+    for dep in &initial_deps {
+        baseline_path(Path::new(dep), &mut pre_mtimes);
+    }
 
     // The startup output is now published — the positive-control injection point.
     startup_race_probe();
@@ -1235,8 +1328,9 @@ fn run_watch_file(
     // ── Watch loop ────────────────────────────────────────────────────────────
     // The outer loop processes one event batch at a time and is bounded:
     // it terminates on Interrupt, Disconnected, or when tick probe fires.
+    let mut clock = TickClock::new(tick);
     loop {
-        match recv_next(&rx, tick) {
+        match clock.recv_next(&rx) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(None) => {
                 // Idle tick — run liveness probe (ADR-021).
@@ -1271,7 +1365,8 @@ struct DirWatchState {
     /// Forward dependency map: canonical source → its canonical (transitive) deps.
     /// Dep values are already canonical from `compile_with_deps`; do not re-canonicalize.
     forward_deps: HashMap<PathBuf, Vec<PathBuf>>,
-    /// Sources whose last compile attempt failed (for error-settle logic).
+    /// Sources whose last compile attempt failed. Re-seeded into every batch that
+    /// carries a real change, so a fix to whatever broke them is picked up.
     errored: HashSet<PathBuf>,
     /// Last-seen collected `.mds` set for reconcile/rename detection.
     known_files: BTreeSet<PathBuf>,
@@ -1280,8 +1375,11 @@ struct DirWatchState {
     /// Parent dirs of dependencies located outside the watched root.
     /// Watched NonRecursive; re-armed by liveness probe.
     external_dep_dirs: BTreeSet<PathBuf>,
-    /// Snapshot of (mtime, size) for known files — used by error-settle gate.
-    last_mtimes: HashMap<PathBuf, (Option<std::time::SystemTime>, Option<u64>)>,
+    /// `(mtime, size)` baseline over [`DirWatchState::tracked_set`] — sources *and*
+    /// dependencies. Read by the idle tick's content backstop and re-written at the end
+    /// of every batch, so the tick reports only what the batch did not already handle
+    /// (#321).
+    last_mtimes: StampMap,
 }
 
 impl DirWatchState {
@@ -1313,19 +1411,46 @@ impl DirWatchState {
         }
     }
 
-    /// Record a compile error for `src`.
+    /// Record a compile error for `src`, **keeping** whatever dep set the last
+    /// successful compile recorded (an empty one when there has never been one).
     ///
-    /// Inserts into `errored`, clears `forward_deps` entry (empty vec), and
-    /// updates `last_mtimes` for error-settle (avoids re-fire on unchanged file).
+    /// Discarding the dep set here is what made a cross-root edit unrecoverable
+    /// (#321). `process_dir_batch_incremental` recomputes `external_dep_dirs` from
+    /// `forward_deps` after every batch, so clearing an importer's deps on a failed
+    /// compile also dropped the external directory those deps live in. The next
+    /// event for that directory was then rejected by `handle_fs_event_dir` as
+    /// "neither under root nor in a known external dep dir", and the liveness probe
+    /// went on to `unwatch()` the directory outright. A single compile against a
+    /// half-written file — an editor's `O_TRUNC` open observed before its `write`
+    /// lands — was enough to blind the watcher to that dependency for the rest of
+    /// the session, with the failed compile as the only trace.
+    ///
+    /// The retained set is used only to decide what to *watch* and what to re-seed —
+    /// never as a substitute for recompiling. It therefore only ever widens what may
+    /// trigger a rebuild, and the cost of a stale edge is one recompile whose output
+    /// the `last_written` dedup then suppresses. ADR-016's freshness rule is about the
+    /// dep set a *rebuild* records, and that still comes from fresh `compile_to_content`
+    /// output on every success; a failed compile produces no fresh set to record.
     fn record_error(&mut self, src: &Path) {
         self.errored.insert(src.to_path_buf());
-        self.forward_deps.insert(src.to_path_buf(), vec![]);
-        settle_mtime(src, &mut self.last_mtimes);
+        self.forward_deps.entry(src.to_path_buf()).or_default();
     }
 
-    /// Collect `known_files` as a `HashSet` for use with `snapshot_state`.
-    fn known_set(&self) -> HashSet<PathBuf> {
-        self.known_files.iter().cloned().collect()
+    /// Every path whose **content** the watcher must react to: all known sources
+    /// plus every dependency they pull in, including cross-root ones outside the
+    /// watched root.
+    ///
+    /// This is the domain of the idle-tick content backstop and of the `last_mtimes`
+    /// baseline that feeds it (#321). `known_files` alone cannot serve: it holds
+    /// exactly what `collect_mds_files(root)` returns, so a cross-root dependency is
+    /// never in it, and a probe diffing only that walk can see such a file appear or
+    /// vanish but never *change*.
+    fn tracked_set(&self) -> HashSet<PathBuf> {
+        let mut tracked: HashSet<PathBuf> = self.known_files.iter().cloned().collect();
+        for deps in self.forward_deps.values() {
+            tracked.extend(deps.iter().cloned());
+        }
+        tracked
     }
 
     /// Remove all state for a deleted source and its output.
@@ -1370,7 +1495,7 @@ struct LivenessState {
 ///
 /// This is the shared kernel for both the `vars_changed` full-recompile loop and the
 /// per-affected-source incremental loop in `process_dir_batch` — collapsing the
-/// 2× duplicated compile→dedup→write→error-settle block inside that function.
+/// 2× duplicated compile→dedup→write block inside that function.
 ///
 /// `write_output_file`: when `true` the compiled content is written (non-partial sources).
 /// When `false` the graph is refreshed but no output file is created (used for partials
@@ -1379,7 +1504,9 @@ struct LivenessState {
 /// # Invariants preserved
 /// - ADR-016: dep set recomputed from fresh `compile_to_content` output.
 /// - PF-004: all reads go through `compile_to_content`.
-/// - Error-settle: `state.last_mtimes` updated on both write error and compile error.
+///
+/// Does **not** touch `state.last_mtimes`: the content backstop's baseline is settled
+/// once per batch by `process_dir_batch`, over the whole tracked set (#321).
 ///
 /// Compile success/failure is already signalled via `state.errored`; the caller uses
 /// that set rather than this function's return value, so the return type is `()`.
@@ -1404,7 +1531,6 @@ fn compile_one_source(
             // Partials (DD2): refresh graph edges but do NOT write output.
             if is_partial(src) {
                 state.record_success(src, dep_paths, root, None, None);
-                settle_mtime(src, &mut state.last_mtimes);
                 return;
             }
 
@@ -1467,14 +1593,12 @@ fn compile_one_source(
                     }
                     Err(e) => {
                         eprint_error(e);
-                        // Error-settle: update mtime so the gate won't re-fire.
                         state.record_error(src);
                     }
                 }
             } else {
-                // Content unchanged — still update graph + known_files + mtime baseline.
+                // Content unchanged — still refresh graph edges + known_files.
                 state.record_success(src, dep_paths, root, None, None);
-                settle_mtime(src, &mut state.last_mtimes);
             }
         }
         Err(e) => {
@@ -1619,56 +1743,76 @@ fn liveness_probe_dir(
     liveness.root_was_missing = !root_now_exists;
     liveness.missing_external_dirs = now_missing_external;
 
+    // 3. Content backstop (#321).
+    //
+    // The reconcile below diffs `collect_mds_files(root)` against `known_files`, which
+    // reports only files that *appeared* or were *removed* under the root. A change to
+    // a file's contents is invisible to it, and a cross-root dependency is not even in
+    // that walk — so until this check existed, `last_mtimes` was written on every batch
+    // in dir mode and never once read, and an edit whose event went undelivered was
+    // lost for good. The events that go undelivered are not hypothetical: a
+    // cross-root dependency is discovered by the compile that reads it, so its
+    // directory cannot be armed until after that first read.
+    //
+    // Cost is one `stat` per tracked path per tick, short-circuited by nothing — the
+    // full set is walked so every changed path joins the same batch. That is the same
+    // price single-file mode has always paid via `state_differs` on its
+    // files-of-interest, and it is O(sources + deps), not O(tree).
+    let tracked = state.tracked_set();
+    let mut batch: BTreeSet<PathBuf> = tracked
+        .iter()
+        .filter(|p| path_state_differs(p, &state.last_mtimes))
+        .cloned()
+        .collect();
+
+    // 4. Full reconcile (appeared/removed), only on a recovery edge.
+    //
+    // `known_files` is replaced with the fresh walk *before* the batch runs, so the
+    // re-baseline at the end of `process_dir_batch` already covers every file the walk
+    // found — including one that appeared and then failed to compile, which
+    // `record_error` deliberately does not add to `known_files`. Replacing afterwards
+    // would leave such a file outside the baseline and cost one redundant compile on
+    // the following tick.
     if recovery {
-        // Full reconcile: re-collect all files and diff vs known_files.
-        let current_files: BTreeSet<PathBuf> =
+        let current: BTreeSet<PathBuf> =
             collect_mds_files(&ctx.root, MAX_COLLECT_DEPTH, ctx.exclude_prefix.as_deref())
                 .into_iter()
                 .map(|p| graph_key(&p))
                 .collect();
-
-        let appeared: BTreeSet<PathBuf> = current_files
-            .difference(&state.known_files)
-            .cloned()
-            .collect();
-        let removed: BTreeSet<PathBuf> = state
-            .known_files
-            .difference(&current_files)
-            .cloned()
-            .collect();
-
-        if !appeared.is_empty() || !removed.is_empty() {
-            // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
-            let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
-                vars: ctx.vars_path.clone(),
-                set_vars: ctx.static_set_vars.clone(),
-                set_string_vars: ctx.static_set_string_vars.clone(),
-            }) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprint_error(e);
-                    state.last_mtimes = snapshot_state(&state.known_set());
-                    return;
-                }
-            };
-            let mut batch: BTreeSet<PathBuf> = appeared.clone();
-            batch.extend(removed.iter().cloned());
-            process_dir_batch(
-                &batch,
-                false, /* vars_changed */
-                &ctx.root,
-                &ctx.output_base,
-                &runtime_vars,
-                ctx.quiet,
-                state,
-            );
-        }
-
-        // Replace known_files with the current snapshot.
-        state.known_files = current_files;
-        // Refresh mtime snapshot.
-        state.last_mtimes = snapshot_state(&state.known_set());
+        batch.extend(current.difference(&state.known_files).cloned());
+        batch.extend(state.known_files.difference(&current).cloned());
+        state.known_files = current;
     }
+
+    if !batch.is_empty() {
+        // Soft-error: vars file may be temporarily absent (AC-W7 / AC-C5).
+        let runtime_vars = match build_runtime_vars(RuntimeVarArgs {
+            vars: ctx.vars_path.clone(),
+            set_vars: ctx.static_set_vars.clone(),
+            set_string_vars: ctx.static_set_string_vars.clone(),
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                eprint_error(e);
+                // Re-baseline so the next tick does not report the same change again
+                // and turn one unreadable vars file into per-tick error spam.
+                state.last_mtimes = snapshot_state(&state.tracked_set());
+                return;
+            }
+        };
+        process_dir_batch(
+            &batch,
+            false, /* vars_changed */
+            &ctx.root,
+            &ctx.output_base,
+            &runtime_vars,
+            ctx.quiet,
+            state,
+        );
+    }
+    // No baseline refresh here: `process_dir_batch` re-baselines `last_mtimes` over the
+    // post-batch tracked set, and an empty batch means nothing appeared, was removed, or
+    // changed — so the existing baseline is by definition still accurate.
 }
 
 /// Outcome returned by `handle_fs_event_dir` to tell the loop what to do next.
@@ -1775,7 +1919,9 @@ fn handle_fs_event_dir(
         Ok(v) => v,
         Err(e) => {
             eprint_error(e);
-            state.last_mtimes = snapshot_state(&state.known_set());
+            // Re-baseline so the idle-tick content backstop does not report the same
+            // change again and turn one unreadable vars file into per-tick error spam.
+            state.last_mtimes = snapshot_state(&state.tracked_set());
             return DirEventOutcome::Done;
         }
     };
@@ -1853,12 +1999,14 @@ fn dir_watch_startup(
     // ── Arm before publish (startup race) ─────────────────────────────────────
     //
     // The recursive root watch is armed BEFORE the tree is walked, before any
-    // source is read, and before any output is written. Directory mode has only
-    // ONE change detector — the liveness probe here reconciles *appeared/removed*
-    // files, never content — so an edit that lands while the root is unarmed is
-    // lost permanently, not merely late. Arming first is the whole fix; every
-    // in-root edit from this point on generates an event that is queued on `rx`
-    // and drained once the event loop starts.
+    // source is read, and before any output is written, so that every in-root edit
+    // from this point on generates an event that is queued on `rx` and drained once
+    // the event loop starts. That is the primary detector and the cheapest one.
+    //
+    // The idle tick's content backstop (#321) is the second detector and covers what
+    // arming order cannot: a dependency whose directory is unknowable until the
+    // compile that reads it returns. Ordering is still what keeps that backstop cheap
+    // — arming first means the backstop almost never has to fire.
     //
     // Arming first also means the watcher observes the startup compile's own
     // reads and writes. Three pre-existing guards absorb that, and all three are
@@ -1929,6 +2077,29 @@ fn dir_watch_startup(
         last_mtimes: HashMap::new(),
     };
 
+    // Capture the content baseline BEFORE the first read of any source, mirroring
+    // single-file mode (#321). What makes the backstop sound is that this snapshot is
+    // strictly older than the reads whose results were published: an edit that lands
+    // anywhere after this point therefore registers as a difference on the first idle
+    // tick, even when no filesystem event announced it.
+    //
+    // Taking it afterwards instead would be worse than useless — it would record the
+    // *post*-edit state as the baseline, so the watcher would believe an output
+    // compiled from the pre-edit content was up to date, and hold that belief forever.
+    //
+    // Keys go through `graph_key`, exactly as `known_files` below does. `tracked_set`
+    // is built from those canonical keys, so a raw key here would never match one of
+    // them — every source would read as "not in the baseline", i.e. changed, and the
+    // first idle tick would recompile the whole tree. `collect_mds_files` walks a root
+    // that is already canonical, but a symlinked subdirectory inside it still resolves
+    // to something else, and the rest of this function does not assume otherwise.
+    let mut pre_mtimes = snapshot_state(
+        &all_files
+            .iter()
+            .map(|p| graph_key(p))
+            .collect::<HashSet<_>>(),
+    );
+
     for source in &all_files {
         let key = graph_key(source);
         match compile_to_content(
@@ -1949,6 +2120,18 @@ fn dir_watch_startup(
                             state.external_dep_dirs.insert(parent.to_path_buf());
                         }
                     }
+                }
+
+                // Baseline each dependency the instant the compile that discovered it
+                // returns, not in one pass after the whole tree is done. A dependency's
+                // existence is unknown until it is read, so its baseline can never
+                // precede its own read — but it can precede everything else, which
+                // shrinks its blind window from "the rest of startup" to the gap
+                // between one read and the next statement. `baseline_path` keeps the
+                // pre-compile value for any dependency that is also an in-root source:
+                // the older of the two is always the safe one.
+                for dep in &dep_paths {
+                    baseline_path(dep, &mut pre_mtimes);
                 }
 
                 state.forward_deps.insert(key.clone(), dep_paths);
@@ -1981,8 +2164,11 @@ fn dir_watch_startup(
 
     // Watch external dep dirs NonRecursive (DD3). Cross-root dependencies are only
     // discovered by the startup compile, so unlike the root they cannot be armed
-    // before the first read — this is the one residual window in dir mode, and it is
-    // what `MDS_WATCH_READY` exists to let tests synchronise against.
+    // before the first read; an edit landing in that window produces no event for
+    // anyone. What closes it is the baseline captured above, which predates the read
+    // — the idle tick's content backstop compares against it and recompiles (#321).
+    // `MDS_WATCH_READY` still marks the instant both detectors cover every path, so
+    // tests can synchronise on arming rather than on a tick.
     for ext_dir in &state.external_dep_dirs {
         if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
             eprint_warning(&format!(
@@ -2029,8 +2215,37 @@ fn dir_watch_startup(
         }
     }
 
-    // Pre-loop mtime snapshot for liveness probe state.
-    state.last_mtimes = snapshot_state(&state.known_set());
+    // Seed the content backstop's baseline (#321).
+    //
+    // The merge DIRECTION is load-bearing, exactly as in single-file mode: the
+    // pre-compile pairs in `pre_mtimes` overwrite the post-compile ones, because only
+    // they predate the reads whose results were published. Inverting the merge — or
+    // switching to one that keeps the value already present — would silently restore
+    // the lost-save bug while every test still passes.
+    let mut last_mtimes = snapshot_state(&state.tracked_set());
+    // Witness for the assertion below, taken before the merge consumes `pre_mtimes`.
+    // Chosen by `min()` rather than by iteration order: a `HashMap` yields an arbitrary
+    // first element, which would make a failure reproduce only sometimes.
+    //
+    // This can only fire when the two snapshots actually differ for the witness path —
+    // i.e. when the file changed during startup, which is the `startup-race-probe`
+    // suite's scenario and no other. It is a canary against a future refactor inverting
+    // the merge, not a runtime guarantee, and it is deliberately `debug_assert`: the
+    // property is a property of the code's shape, not of any input, so a release-time
+    // check would guard nothing a debug run does not already catch.
+    let witness: Option<(PathBuf, FileStamp)> =
+        pre_mtimes.keys().min().map(|p| (p.clone(), pre_mtimes[p]));
+    last_mtimes.extend(pre_mtimes);
+    if let Some((path, pre)) = witness {
+        debug_assert_eq!(
+            last_mtimes.get(&path).copied(),
+            Some(pre),
+            "baseline merge inverted: a pre-compile (mtime, size) must survive the merge \
+             with the post-compile snapshot, or an edit made during startup can never \
+             register as a difference on the idle tick"
+        );
+    }
+    state.last_mtimes = last_mtimes;
 
     // Track which external dep dirs were successfully armed during startup (lines above
     // called watcher.watch() for each; treat all existing dirs as armed, missing ones
@@ -2128,8 +2343,9 @@ fn run_watch_dir(
     )?;
 
     // ── Watch loop ────────────────────────────────────────────────────────────
+    let mut clock = TickClock::new(tick);
     loop {
-        match recv_next(&rx, tick) {
+        match clock.recv_next(&rx) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(None) => {
                 // Idle tick — run liveness probe (ADR-021, DD1).
@@ -2173,6 +2389,16 @@ fn process_dir_batch(
     } else {
         process_dir_batch_incremental(changed, root, output_base, runtime_vars, quiet, state);
     }
+
+    // Re-baseline the content backstop over the post-batch tracked set (#321).
+    //
+    // This is the single settle point for `last_mtimes`, and it has to be here rather
+    // than at each compile site: the batch is what the idle tick must not report again,
+    // and only the batch as a whole knows which paths it covered. Doing it once, over
+    // the whole set, also settles the sources a *failed* compile touched (so an
+    // unchanged broken file does not re-fire every tick) and drops keys for sources the
+    // batch deleted, which `snapshot_state` achieves by replacing the map outright.
+    state.last_mtimes = snapshot_state(&state.tracked_set());
 }
 
 /// Full recompile of all known files triggered by a vars-file change.
@@ -2185,7 +2411,7 @@ fn process_dir_batch(
 /// output `.md` or leave stale `last_written` / `forward_deps` / `errored` entries
 /// (rust.md / reliability issue #3 fix).
 ///
-/// Uses `compile_one_source` for the shared compile→dedup→write→settle sequence.
+/// Uses `compile_one_source` for the shared compile→dedup→write sequence.
 fn process_dir_batch_vars_changed(
     root: &Path,
     output_base: &OutputBase,
@@ -2254,7 +2480,7 @@ fn process_dir_batch_vars_changed(
 /// 4. Compile each affected source that exists and is not an external-only dep.
 /// 5. Delete outputs for removed sources.
 ///
-/// Uses `compile_one_source` for the shared compile→dedup→write→settle sequence.
+/// Uses `compile_one_source` for the shared compile→dedup→write sequence.
 fn process_dir_batch_incremental(
     changed: &BTreeSet<PathBuf>,
     root: &Path,
@@ -2337,13 +2563,12 @@ fn process_dir_batch_incremental(
                 Err(e) => {
                     eprint_error(e);
                     state.errored.insert(src.clone());
-                    settle_mtime(src, &mut state.last_mtimes);
                 }
             }
             continue;
         }
 
-        // In-root source: full compile→dedup→write→settle via shared helper.
+        // In-root source: full compile→dedup→write via shared helper.
         compile_one_source(src, root, output_base, runtime_vars, quiet, state);
     }
 
@@ -2942,6 +3167,249 @@ mod tests {
             clamp_poll_interval(75),
             Some(Duration::from_millis(75)),
             "poll_interval=75 (above floor) must pass through unchanged"
+        );
+    }
+
+    // ── TickClock (#319) ─────────────────────────────────────────────────────
+    //
+    // The probe-starvation defect. These assert the two properties that make the idle
+    // tick a usable backstop rather than a best-effort one: it fires under load, and
+    // it does not fire more often than its interval.
+
+    /// A tick fires when the channel stays silent.
+    #[test]
+    fn tick_clock_fires_when_idle() {
+        let (_tx, rx) = mpsc::channel::<Msg>();
+        let mut clock = TickClock::new(Some(Duration::from_millis(50)));
+        assert!(
+            matches!(clock.recv_next(&rx), Ok(None)),
+            "an idle channel must produce a tick"
+        );
+    }
+
+    /// A tick fires even when messages arrive faster than the interval (#319).
+    ///
+    /// This is the regression test for the starvation bug: the previous
+    /// implementation handed `recv_timeout` a fresh interval per message, so a sender
+    /// running at 20× the tick rate postponed the probe forever. Fifty messages at 5ms
+    /// spans 250ms — five full 50ms intervals — so a correct clock must yield at least
+    /// one tick before they are exhausted.
+    #[test]
+    fn tick_clock_fires_under_message_flood() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let sender = std::thread::spawn(move || {
+            // Bounded: exactly 50 sends, then the thread ends.
+            for _ in 0..50 {
+                if tx.send(Msg::Interrupt).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        let mut clock = TickClock::new(Some(Duration::from_millis(50)));
+        let mut ticks = 0usize;
+        // Bounded: at most 200 receives regardless of what the sender does.
+        for _ in 0..200 {
+            match clock.recv_next(&rx) {
+                Ok(None) => {
+                    ticks += 1;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Err(_) => break,
+            }
+        }
+        sender.join().expect("sender thread panicked");
+        assert!(
+            ticks > 0,
+            "the idle tick must fire while messages are arriving 10x faster than the \
+             poll interval; a starvable tick makes the content backstop unreachable"
+        );
+    }
+
+    /// Two ticks are never closer together than one interval, however loaded the loop.
+    ///
+    /// The counterpart to the test above: making the tick non-starvable must not make
+    /// it free-running. A deadline that advanced from the *previous* deadline rather
+    /// than from the moment the tick was observed would fire a catch-up burst after
+    /// any slow probe.
+    #[test]
+    fn tick_clock_rate_limits_consecutive_ticks() {
+        let (_tx, rx) = mpsc::channel::<Msg>();
+        let interval = Duration::from_millis(50);
+        let mut clock = TickClock::new(Some(interval));
+        assert!(matches!(clock.recv_next(&rx), Ok(None)), "first tick");
+
+        // Simulate a probe that overran its own interval.
+        std::thread::sleep(Duration::from_millis(120));
+        let t0 = Instant::now();
+        assert!(matches!(clock.recv_next(&rx), Ok(None)), "overdue tick");
+        let t1 = Instant::now();
+        assert!(
+            matches!(clock.recv_next(&rx), Ok(None)),
+            "tick after the overdue one"
+        );
+        assert!(
+            t1.duration_since(t0) < Duration::from_millis(20),
+            "an overdue tick must fire immediately, not wait another interval"
+        );
+        assert!(
+            t1.elapsed() >= Duration::from_millis(40),
+            "the tick following an overdue one must wait a full interval, not fire a \
+             catch-up burst; got {:?}",
+            t1.elapsed()
+        );
+    }
+
+    /// `--poll-interval 0` disables the tick entirely: `recv_next` blocks for a message.
+    #[test]
+    fn tick_clock_without_interval_never_ticks() {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let mut clock = TickClock::new(None);
+        tx.send(Msg::Interrupt).expect("send failed");
+        assert!(
+            matches!(clock.recv_next(&rx), Ok(Some(Msg::Interrupt))),
+            "with no poll interval the clock must deliver the message, never a tick"
+        );
+        drop(tx);
+        assert!(
+            matches!(
+                clock.recv_next(&rx),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            "a closed channel must report Disconnected rather than tick forever"
+        );
+    }
+
+    // ── Content backstop domain (#321) ───────────────────────────────────────
+
+    /// `tracked_set` covers cross-root dependencies, which `known_files` never can.
+    ///
+    /// `known_files` holds exactly what `collect_mds_files(root)` returns, so a
+    /// dependency outside the root is absent from it by construction. Baselining only
+    /// that set is what left `last_mtimes` write-only in directory mode.
+    #[test]
+    fn tracked_set_includes_cross_root_dependencies() {
+        let root = PathBuf::from("/w/root");
+        let importer = root.join("importer.mds");
+        let external = PathBuf::from("/w/shared/_x.mds");
+
+        let mut state = DirWatchState {
+            forward_deps: HashMap::new(),
+            errored: HashSet::new(),
+            known_files: BTreeSet::new(),
+            last_written: HashMap::new(),
+            external_dep_dirs: BTreeSet::new(),
+            last_mtimes: HashMap::new(),
+        };
+        state.known_files.insert(importer.clone());
+        state
+            .forward_deps
+            .insert(importer.clone(), vec![external.clone()]);
+
+        let tracked = state.tracked_set();
+        assert!(
+            tracked.contains(&importer),
+            "in-root source must be tracked"
+        );
+        assert!(
+            tracked.contains(&external),
+            "a cross-root dependency must be tracked; it is exactly the path no \
+             collect_mds_files(root) walk can report"
+        );
+    }
+
+    /// A failed compile keeps the dep set the last successful one recorded (#321).
+    ///
+    /// Clearing it dropped the external directory the deps lived in, after which every
+    /// further event for that directory was filtered out as unknown — one compile
+    /// against a half-written file blinded the watcher for the session.
+    #[test]
+    fn record_error_preserves_last_known_deps() {
+        let root = PathBuf::from("/w/root");
+        let importer = root.join("importer.mds");
+        let external = PathBuf::from("/w/shared/_x.mds");
+
+        let mut state = DirWatchState {
+            forward_deps: HashMap::new(),
+            errored: HashSet::new(),
+            known_files: BTreeSet::new(),
+            last_written: HashMap::new(),
+            external_dep_dirs: BTreeSet::new(),
+            last_mtimes: HashMap::new(),
+        };
+        state.record_success(&importer, vec![external.clone()], &root, None, None);
+        assert!(state.external_dep_dirs.contains(Path::new("/w/shared")));
+
+        state.record_error(&importer);
+
+        assert!(state.errored.contains(&importer), "error must be recorded");
+        assert_eq!(
+            state.forward_deps.get(&importer),
+            Some(&vec![external.clone()]),
+            "a failed compile must keep the last known dep set, or the external dep \
+             dir is pruned and its events are filtered out from then on"
+        );
+        assert!(
+            state.tracked_set().contains(&external),
+            "the backstop must still cover a dependency whose importer is broken — \
+             that is precisely when it needs to notice the dependency being fixed"
+        );
+    }
+
+    /// A source that has never compiled successfully gets an empty dep set, not a panic.
+    #[test]
+    fn record_error_on_unknown_source_inserts_empty_deps() {
+        let mut state = DirWatchState {
+            forward_deps: HashMap::new(),
+            errored: HashSet::new(),
+            known_files: BTreeSet::new(),
+            last_written: HashMap::new(),
+            external_dep_dirs: BTreeSet::new(),
+            last_mtimes: HashMap::new(),
+        };
+        let src = PathBuf::from("/w/root/broken.mds");
+        state.record_error(&src);
+        assert_eq!(state.forward_deps.get(&src), Some(&vec![]));
+    }
+
+    /// `baseline_path` keeps the older entry — the merge direction the backstop needs.
+    #[test]
+    fn baseline_path_keeps_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.mds");
+        std::fs::write(&f, "one").unwrap();
+
+        let mut snap = HashMap::new();
+        baseline_path(&f, &mut snap);
+        let first = snap.get(&f).copied();
+
+        std::fs::write(&f, "a much longer second revision").unwrap();
+        baseline_path(&f, &mut snap);
+
+        assert_eq!(
+            snap.get(&f).copied(),
+            first,
+            "baseline_path must not overwrite an existing entry: only the older pair \
+             predates the read whose output was published"
+        );
+        assert!(
+            path_state_differs(&f, &snap),
+            "the retained older baseline must therefore report the file as changed"
+        );
+    }
+
+    /// A path absent from the baseline counts as changed.
+    #[test]
+    fn path_state_differs_reports_unknown_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.mds");
+        std::fs::write(&f, "one").unwrap();
+        let snap = HashMap::new();
+        assert!(
+            path_state_differs(&f, &snap),
+            "a path the baseline has never seen cannot be claimed as accounted for"
         );
     }
 
