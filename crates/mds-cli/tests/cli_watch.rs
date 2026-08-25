@@ -14,11 +14,10 @@
 //! - Absorb FSEvents latency via the 5-second polling cap.
 
 mod common;
-use common::mds_bin;
+use common::{mds_bin, spawn_watch_ready, StderrTap};
 
-use std::io::Read;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -34,13 +33,25 @@ impl Drop for ChildGuard {
 }
 
 impl ChildGuard {
-    #[allow(dead_code)]
     fn id(&self) -> u32 {
         self.0.id()
     }
     fn wait_status(&mut self) -> std::process::ExitStatus {
         self.0.wait().expect("wait failed")
     }
+}
+
+/// Spawn a watcher, block until it reports readiness, and wrap it in a `ChildGuard`.
+///
+/// Every test that edits files under an `mds watch` must go through this: it returns
+/// only once every watch is armed and every `(mtime, size)` baseline captured, so a
+/// subsequent edit cannot land in a window the watcher is blind to.
+///
+/// The returned [`StderrTap`] holds everything the child wrote to stderr, including
+/// the startup lines printed before the readiness marker.
+fn spawn_ready(cmd: &mut Command) -> (ChildGuard, StderrTap) {
+    let (child, tap) = spawn_watch_ready(cmd);
+    (ChildGuard(child), tap)
 }
 
 /// Poll `path` until its content contains `needle`, or `timeout` elapses.
@@ -69,7 +80,20 @@ fn wait_for_file_gone(path: &Path, timeout: Duration) -> bool {
     false
 }
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on how long a *post-readiness* effect may take to appear.
+///
+/// This is a **failure bound, not a synchroniser**. Every spawn goes through
+/// [`spawn_ready`], so by the time a test edits a file the watcher is already armed
+/// and the remaining work is one inotify delivery plus one compile — milliseconds in
+/// practice, even with the suite at full parallelism. The old 10s value dated from
+/// when these waits doubled as the startup synchroniser; keeping it only meant every
+/// genuine regression cost 10s of wall clock per occurrence before reporting.
+///
+/// 2s leaves ~40 poll cycles of headroom over the observed millisecond-scale latency
+/// — ample for a loaded container, still short enough that a real regression surfaces
+/// promptly. Waits that must legitimately span multiple poll-interval ticks use their
+/// own explicit, longer bound at the call site rather than inflating this one.
+const TIMEOUT: Duration = Duration::from_secs(2);
 
 // ── T-I14: Invalid combinations rejected at startup ────────────────────────
 
@@ -118,13 +142,10 @@ fn watch_initial_compile_writes_output() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     let found = wait_for_file_contains(&out, "Hello World!", TIMEOUT);
@@ -141,13 +162,10 @@ fn watch_edit_entry_updates_output() {
     std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -191,13 +209,10 @@ fn watch_edit_imported_dep_updates_entry() {
     .unwrap();
     let out = dir.path().join("entry.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", entry.to_str().unwrap(), "--debounce", "0", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -229,13 +244,10 @@ fn watch_compile_error_keeps_watcher_alive() {
     std::fs::write(&src, "---\nname: Alice\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let mut child = ChildGuard(
+    let (mut child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for successful initial compile.
@@ -285,7 +297,7 @@ fn watch_dir_mode_compiles_all_on_startup() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -296,10 +308,7 @@ fn watch_dir_mode_compiles_all_on_startup() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -340,7 +349,7 @@ fn watch_dir_mode_picks_up_new_files() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -351,10 +360,7 @@ fn watch_dir_mode_picks_up_new_files() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -388,7 +394,7 @@ fn watch_dir_mode_deletes_output_on_source_deletion() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -399,10 +405,7 @@ fn watch_dir_mode_deletes_output_on_source_deletion() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for both outputs to be created.
@@ -444,7 +447,7 @@ fn watch_vars_file_change_triggers_recompile() {
     std::fs::write(&vars, r#"{"name": "Alice"}"#).unwrap();
     let out = dir.path().join("hello.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -455,10 +458,7 @@ fn watch_vars_file_change_triggers_recompile() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -489,24 +489,11 @@ fn watch_clear_non_tty_no_ansi_escape() {
     // Spawn with piped stderr — not a TTY. `clear_terminal` only emits the ANSI
     // sequence on rebuilds (not the initial compile), so we must trigger a rebuild
     // to actually exercise the --clear code path.
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--clear", "--debounce", "0"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Drain stderr on a background thread so the pipe never fills (which would
-    // block the child) and so we capture all bytes the child writes to stderr.
-    let stderr = child.0.stderr.take().expect("piped stderr");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut handle = stderr;
-        let _ = handle.read_to_end(&mut buf);
-        buf
-    });
 
     // Wait for initial compile.
     assert!(
@@ -525,7 +512,7 @@ fn watch_clear_non_tty_no_ansi_escape() {
     // Stop the child and collect everything it wrote to stderr.
     let _ = child.0.kill();
     let _ = child.0.wait();
-    let stderr_bytes = reader.join().expect("stderr reader thread panicked");
+    let stderr_bytes = stderr_tap.bytes();
 
     // AC-F6: the ANSI clear/home sequences emitted by clear_terminal()
     // (\x1b[2J, \x1b[3J, \x1b[H) must be ABSENT when stderr is not a TTY.
@@ -562,7 +549,7 @@ fn watch_output_flag_writes_to_specified_file() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("custom_output.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -573,10 +560,7 @@ fn watch_output_flag_writes_to_specified_file() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -600,7 +584,7 @@ fn watch_set_vars_applied_on_rebuild() {
     std::fs::write(&src, "Hello {{name}}!\n").unwrap();
     let out = dir.path().join("tpl.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -611,10 +595,7 @@ fn watch_set_vars_applied_on_rebuild() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -644,7 +625,7 @@ fn watch_messages_template_produces_json_intrinsically() {
     std::fs::write(&src, "@message user:\nWhat is 2+2?\n@end\n").unwrap();
     let out = dir.path().join("chat.json");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -655,10 +636,7 @@ fn watch_messages_template_produces_json_intrinsically() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -687,7 +665,7 @@ fn watch_stdout_contains_content_when_o_stdout() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
 
     // -o - forces stdout output.
-    let mut child = ChildGuard(
+    let (mut child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -698,13 +676,11 @@ fn watch_stdout_contains_content_when_o_stdout() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::piped()),
     );
 
     // Read from stdout with a timeout.
+    use std::io::Read as _;
     let deadline = Instant::now() + TIMEOUT;
     let mut buf = String::new();
     let mut found = false;
@@ -740,15 +716,12 @@ fn watch_ctrl_c_exits_cleanly() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let child = mds_bin()
-        .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let pid = child.id();
-    let mut guard = ChildGuard(child);
+    let (mut guard, _stderr_tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let pid = guard.id();
 
     // Wait for initial compile so we know the watcher is running.
     assert!(
@@ -790,13 +763,10 @@ fn watch_debounce_final_value_wins_after_rapid_edits() {
     let out = dir.path().join("hello.md");
 
     // Use a 200ms debounce for stability.
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "200"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -879,13 +849,10 @@ fn watch_import_removal_stops_tracking_dep() {
     .unwrap();
     let out = dir.path().join("entry.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", entry.to_str().unwrap(), "--debounce", "0", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile — helper IS tracked.
@@ -962,7 +929,7 @@ fn watch_dir_mode_vars_change_recompiles_all() {
     let vars = src_dir.path().join("vars.json");
     std::fs::write(&vars, r#"{"greeting": "Hello"}"#).unwrap();
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -975,10 +942,7 @@ fn watch_dir_mode_vars_change_recompiles_all() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Both files should compile on startup with initial vars.
@@ -1016,35 +980,11 @@ fn watch_quiet_keeps_errors_visible() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Drain stderr on a background thread to prevent the pipe from filling.
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stderr_buf_clone = stderr_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 256];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stderr_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
 
     // Wait for the initial compile to produce valid output.
     assert!(
@@ -1067,7 +1007,7 @@ fn watch_quiet_keeps_errors_visible() {
 
     // Verify error output appeared on stderr despite -q.
     // Under quiet mode, status messages are suppressed but error diagnostics are not.
-    let bytes_so_far = stderr_buf.lock().unwrap().clone();
+    let bytes_so_far = stderr_tap.bytes();
     assert!(
         !bytes_so_far.is_empty(),
         "stderr must contain the compile error even under -q; got empty stderr"
@@ -1094,36 +1034,12 @@ fn watch_ctrl_c_prints_stopped_watching() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let child = mds_bin()
-        .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let pid = child.id();
-    let mut guard = ChildGuard(child);
-
-    // Drain stderr on a background thread.
-    let stderr_handle = guard.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stderr_buf_clone = stderr_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 256];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stderr_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
+    let (mut guard, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let pid = guard.id();
 
     // Wait for initial compile so the watcher is running.
     assert!(
@@ -1157,7 +1073,7 @@ fn watch_ctrl_c_prints_stopped_watching() {
     // Give the reader thread a moment to flush remaining bytes.
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
     assert!(
         stderr_str.contains("Stopped watching."),
@@ -1179,35 +1095,11 @@ fn watch_debounce_single_rebuild_from_burst() {
     let out = dir.path().join("burst.md");
 
     // Use a 250ms debounce — large enough to reliably swallow the ~10 × 5ms burst.
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "250"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Drain stderr on a background thread.
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stderr_buf_clone = stderr_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stderr_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
 
     // Wait for initial compile.
     assert!(
@@ -1235,7 +1127,7 @@ fn watch_debounce_single_rebuild_from_burst() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // Count "Recompiled " lines (each rebuild emits exactly one such line).
@@ -1271,14 +1163,11 @@ fn watch_no_arg_auto_detects_single_mds_file() {
     .unwrap();
     let out = dir.path().join("only.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", "--debounce", "0", "-q"])
             .current_dir(dir.path()) // cwd = tempdir containing exactly one .mds
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -1331,7 +1220,7 @@ fn watch_startup_no_spurious_recompile() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("nochange.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1342,32 +1231,8 @@ fn watch_startup_no_spurious_recompile() {
                 "0",
                 // No -q: we NEED to observe stderr messages to catch spurious noise.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Drain stderr on a background thread so the pipe never fills.
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stderr_buf_clone = stderr_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stderr_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
 
     // Wait for the initial compile to complete.
     assert!(
@@ -1383,7 +1248,7 @@ fn watch_startup_no_spurious_recompile() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(50));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // There must be exactly ONE "Compiled to" message (the initial compile).
@@ -1416,7 +1281,7 @@ fn watch_stdout_no_duplicate_write_on_startup() {
     // Use a distinctive marker so we can count occurrences.
     std::fs::write(&src, "UNIQUE_MARKER_XYZ\n").unwrap();
 
-    let mut child = ChildGuard(
+    let (mut child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1427,10 +1292,7 @@ fn watch_stdout_no_duplicate_write_on_startup() {
                 "0",
                 // No -q: we want to observe full behavior.
             ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::piped()),
     );
 
     // Drain stdout on a background thread.
@@ -1508,7 +1370,7 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1519,32 +1381,8 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
                 "0",
                 // No -q: we NEED to observe stderr messages to catch spurious noise.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Drain stderr on a background thread so the pipe never fills.
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stderr_buf_clone = stderr_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stderr_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
 
     // Wait for the initial compile to complete (both files compiled on startup).
     assert!(
@@ -1564,7 +1402,7 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(50));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // There must be ZERO "Recompiled" lines — no rebuild without edits.
@@ -1597,6 +1435,17 @@ fn watch_dir_mode_no_spurious_startup_recompile() {
 /// "Compiled to …" AND the loop also emitted "Recompiled …", giving two
 /// status lines per rebuild.  After the fix the loop sets announce=false so
 /// only "Recompiled …" appears for loop rebuilds.
+///
+/// Uses the **default 100ms debounce**, not `--debounce 0`. One `fs::write` is a
+/// truncate followed by a write, which the kernel reports as two separate content
+/// events; under `--debounce 0` — documented as "immediate rebuilds", i.e. opting
+/// out of burst coalescing — the watcher may legitimately rebuild twice, so
+/// `Recompiled == 1` is not a property the product guarantees there. (Measured at
+/// ~6-12% of single edits under load, on both sides of the arm-before-publish
+/// change.) The debounce window is precisely the mechanism that collapses that pair,
+/// so running this assertion with coalescing enabled tests the intended invariant —
+/// one status line per rebuild, and loop rebuilds say "Recompiled", not "Compiled to"
+/// — instead of an incidental timing outcome.
 #[test]
 fn watch_single_status_line_per_rebuild() {
     let dir = tempfile::tempdir().unwrap();
@@ -1604,41 +1453,17 @@ fn watch_single_status_line_per_rebuild() {
     std::fs::write(&src, "---\nname: v0\n---\nStatus {{name}}!\n").unwrap();
     let out = dir.path().join("status.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
                 src.to_str().unwrap(),
                 "--debounce",
-                "0",
-                // No -q: we need to observe status messages.
+                "100", // coalesce the truncate+write pair — see doc comment above
+                       // No -q: we need to observe status messages.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Drain stderr on a background thread.
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let stderr_buf_clone = stderr_buf.clone();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stderr_buf_clone
-                        .lock()
-                        .unwrap()
-                        .extend_from_slice(&tmp[..n]);
-                }
-            }
-        }
-    });
 
     // Wait for the initial compile.
     assert!(
@@ -1663,7 +1488,7 @@ fn watch_single_status_line_per_rebuild() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(50));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // Exactly ONE "Recompiled" line (the real edit).
@@ -1695,7 +1520,7 @@ fn watch_dir_mode_mirrors_subtree_to_out_dir() {
     std::fs::write(sub.join("deep.mds"), "---\nname: D\n---\nDeep {{name}}\n").unwrap();
     let out_dir = dir.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1708,10 +1533,7 @@ fn watch_dir_mode_mirrors_subtree_to_out_dir() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Mirrored path: out/sub/deep.md (not out/deep.md).
@@ -1742,7 +1564,7 @@ fn watch_dir_mode_no_stem_collision_with_mirroring() {
     std::fs::write(b_dir.join("x.mds"), "From B\n").unwrap();
     let out_dir = dir.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1755,10 +1577,7 @@ fn watch_dir_mode_no_stem_collision_with_mirroring() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -1807,7 +1626,7 @@ fn watch_dir_mode_shared_partial_rebuilds_importers() {
 
     let out_dir = dir.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1820,10 +1639,7 @@ fn watch_dir_mode_shared_partial_rebuilds_importers() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -1883,7 +1699,7 @@ fn watch_dir_mode_chain_rebuild() {
 
     let out_dir = dir.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1896,10 +1712,7 @@ fn watch_dir_mode_chain_rebuild() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -1927,7 +1740,7 @@ fn watch_poll_interval_zero_works() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("hello.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -1938,10 +1751,7 @@ fn watch_poll_interval_zero_works() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -1995,7 +1805,7 @@ fn watch_poll_interval_tiny_clamped() {
     let out = dir.path().join("hello.md");
 
     // 1ms should be clamped to 50ms — watcher must still start and compile.
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2006,10 +1816,7 @@ fn watch_poll_interval_tiny_clamped() {
                 "1",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -2030,7 +1837,7 @@ fn watch_file_mode_idle_no_recompile_across_ticks() {
     std::fs::write(&src, "---\nname: World\n---\nIdle {{name}}!\n").unwrap();
     let out = dir.path().join("idle.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2041,26 +1848,8 @@ fn watch_file_mode_idle_no_recompile_across_ticks() {
                 "100",
                 // No -q: we need to observe stderr.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     // Wait for initial compile.
     assert!(
@@ -2083,7 +1872,7 @@ fn watch_file_mode_idle_no_recompile_across_ticks() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -2121,7 +1910,7 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2133,26 +1922,8 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
                 "--poll-interval",
                 "100",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     assert!(
         wait_for_file_contains(&out_dir.join("a.md"), "File A: A", TIMEOUT),
@@ -2175,7 +1946,7 @@ fn watch_dir_mode_idle_no_recompile_across_ticks() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -2216,7 +1987,7 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
     std::fs::write(&src, "---\nname: Before\n---\nEntry {{name}}\n").unwrap();
     let out = src_dir.join("entry.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2227,10 +1998,7 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
                 "100",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -2271,7 +2039,7 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
     let out_dir = base.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2284,10 +2052,7 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
                 "100",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -2328,7 +2093,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     std::fs::write(&src, "---\nname: World\n---\nHello {{name}}!\n").unwrap();
     let out = dir.path().join("entry.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2339,26 +2104,8 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
                 "100",
                 // No -q so we can observe stderr error messages.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     assert!(
         wait_for_file_contains(&out, "Hello World!", TIMEOUT),
@@ -2377,7 +2124,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     // error may appear.
     std::thread::sleep(Duration::from_millis(500));
     let count_w1 = {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         s.matches("file not found").count() + s.matches("No such file").count()
     };
@@ -2386,7 +2133,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     // count frozen.  Any increase proves the watcher is still firing per-tick.
     std::thread::sleep(Duration::from_millis(500));
     let count_w2 = {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         s.matches("file not found").count() + s.matches("No such file").count()
     };
@@ -2413,7 +2160,7 @@ fn watch_file_mode_entry_deleted_settles_then_recovers() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     // Sanity: error count across the FULL test run must still be small — rules out a
@@ -2445,7 +2192,7 @@ fn watch_vars_dir_delete_recreate_rearms() {
     std::fs::write(&vars_file, r#"{"greeting": "Hello"}"#).unwrap();
     let out = src_dir.join("tpl.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2458,26 +2205,8 @@ fn watch_vars_dir_delete_recreate_rearms() {
                 "100",
                 // No -q so we can see debug output.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     assert!(
         wait_for_file_contains(&out, "Hello", TIMEOUT),
@@ -2502,7 +2231,7 @@ fn watch_vars_dir_delete_recreate_rearms() {
     let _ = child.0.kill();
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
     assert!(
         got,
@@ -2545,7 +2274,7 @@ fn watch_dir_mode_cross_root_partial_edit_rebuilds_importer() {
 
     let out_dir = base.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2558,10 +2287,7 @@ fn watch_dir_mode_cross_root_partial_edit_rebuilds_importer() {
                 "100",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -2623,7 +2349,7 @@ fn watch_dir_mode_delete_partial_surfaces_broken_import() {
 
     let out_dir = dir.path().join("out");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2636,26 +2362,8 @@ fn watch_dir_mode_delete_partial_surfaces_broken_import() {
                 "100",
                 // No -q so we can observe errors.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     // Wait for initial compile.
     assert!(
@@ -2676,7 +2384,7 @@ fn watch_dir_mode_delete_partial_surfaces_broken_import() {
     // contains the "file not found" message that the compiler emits for a missing import.
     let deadline = std::time::Instant::now() + TIMEOUT;
     loop {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         if s.contains("file not found") || s.contains("No such file") {
             break;
@@ -2716,7 +2424,7 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
 
     let out_dir = dir.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2729,10 +2437,7 @@ fn watch_dir_mode_create_missing_partial_heals_importer() {
                 "100",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Initial compile must fail (missing partial), so main.md may not appear.
@@ -2774,7 +2479,7 @@ fn watch_dir_mode_dual_role_node_edit_and_delete() {
 
     let out_dir = dir.path().join("out");
 
-    let mut child = ChildGuard(
+    let (mut child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2787,10 +2492,7 @@ fn watch_dir_mode_dual_role_node_edit_and_delete() {
                 "100",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile of both outputs.
@@ -2861,7 +2563,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2874,26 +2576,8 @@ fn watch_dir_mode_persistent_error_bounded_count() {
                 "100",
                 // No -q so we can count errors.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     // Wait for good file to compile (confirms startup completed).
     assert!(
@@ -2909,7 +2593,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     // Window 1 — ≥5 ticks at 100ms (~500ms): initial startup error may appear here.
     std::thread::sleep(Duration::from_millis(500));
     let count_w1 = {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         // Count exactly once per error emission (each miette block contains this phrase once).
         s.matches("undefined variable").count()
@@ -2919,7 +2603,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     // Any increase here proves the watcher is still firing per-tick (the bug).
     std::thread::sleep(Duration::from_millis(500));
     let count_w2 = {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         s.matches("undefined variable").count()
     };
@@ -2935,7 +2619,7 @@ fn watch_dir_mode_persistent_error_bounded_count() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     assert_eq!(
@@ -2965,7 +2649,7 @@ fn watch_dir_mode_mds_json_config_dir_ancestor_mirrors_output() {
     // Expected output: base/out/sub/deep.md (relative to root=src, mirrored under base/out).
     let expected_out = base.path().join("out").join("sub").join("deep.md");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -2977,10 +2661,7 @@ fn watch_dir_mode_mds_json_config_dir_ancestor_mirrors_output() {
                 "-q",
             ])
             .current_dir(base.path()) // mds.json resolution starts from cwd
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     assert!(
@@ -3006,7 +2687,7 @@ fn watch_dir_mode_rename_removes_stale_output() {
     std::fs::write(a_dir.join("x.mds"), "Content from A\n").unwrap();
     let out_dir = dir.path().join("out");
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -3019,10 +2700,7 @@ fn watch_dir_mode_rename_removes_stale_output() {
                 "100",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -3082,7 +2760,7 @@ fn watch_dir_mode_partial_edit_rebuilds_exactly_n_importers() {
     std::fs::write(dir.path().join("independent.mds"), "Independent\n").unwrap();
 
     let out_dir = dir.path().join("out");
-    let mut child = ChildGuard(
+    let (mut child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -3095,10 +2773,7 @@ fn watch_dir_mode_partial_edit_rebuilds_exactly_n_importers() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -3170,7 +2845,7 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
     std::fs::write(&importer, "@import \"./_soak.mds\" as s\n{{s.val()}}\n").unwrap();
 
     let out_dir = dir.path().join("out");
-    let mut child = ChildGuard(
+    let (mut child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -3183,10 +2858,7 @@ fn watch_dir_mode_soak_50_edits_bounded_and_clean_exit() {
                 "50",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for initial compile.
@@ -3253,7 +2925,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     std::fs::write(&src, "V1-before\n").unwrap();
     let out = src_dir.join("tpl.md");
 
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -3264,26 +2936,8 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
                 "150",
                 // No -q: we need to observe stderr errors.
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
 
     // Wait for initial compile.
     assert!(
@@ -3302,7 +2956,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     // Window 1 — ≥6 ticks at 150ms (~900ms): native-event errors may appear here.
     std::thread::sleep(Duration::from_millis(900));
     let count_w1 = {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         s.matches("file not found").count() + s.matches("No such file").count()
     };
@@ -3311,7 +2965,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     // Any increase here proves the watcher is still firing per-tick (the bug).
     std::thread::sleep(Duration::from_millis(900));
     let count_w2 = {
-        let bytes = stderr_buf.lock().unwrap().clone();
+        let bytes = stderr_tap.bytes();
         let s = String::from_utf8_lossy(&bytes);
         s.matches("file not found").count() + s.matches("No such file").count()
     };
@@ -3340,7 +2994,7 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     assert!(
@@ -3398,7 +3052,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
     // giving the liveness probe several real ticks during the idle window.
     // --debounce 0: immediate event processing, no coalesce delay.
     // No -q: we need to observe "Recompiled" in stderr.
-    let mut child = ChildGuard(
+    let (mut child, stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -3410,30 +3064,13 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
                 "--poll-interval",
                 "50",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let buf_clone = stderr_buf.clone();
-    let _reader = std::thread::spawn(move || {
-        use std::io::Read as _;
-        let mut handle = stderr_handle;
-        let mut tmp = [0u8; 512];
-        loop {
-            match handle.read(&mut tmp) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => buf_clone.lock().unwrap().extend_from_slice(&tmp[..n]),
-            }
-        }
-    });
-
-    // Wait for the sentinel output file — dir-mode compiles all files in a single
-    // startup batch before entering the event loop, so the sentinel's appearance
-    // confirms all 500 initial compiles are done.  TIMEOUT (10s) is the bound.
+    // Assert the sentinel output exists — dir-mode compiles all files in a single
+    // startup batch before entering the event loop, and the readiness handshake only
+    // fires after that batch, so all 500 initial compiles are already done here. This
+    // is a content assertion now, not a wait.
     assert!(
         wait_for_file_contains(&sentinel_out, &format!("scale-idle-{FILE_COUNT}"), TIMEOUT,),
         "AC-P5: sentinel file_{FILE_COUNT:04}.md must be written during startup compile \
@@ -3454,7 +3091,7 @@ fn watch_dir_mode_idle_500_files_no_recompile() {
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
 
-    let stderr_bytes = stderr_buf.lock().unwrap().clone();
+    let stderr_bytes = stderr_tap.bytes();
     let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
     let recompiled_count = stderr_str.matches("Recompiled").count();
@@ -3660,7 +3297,7 @@ fn watch_dir_skips_symlinked_source_file() {
     let out_dir = dir.path().join("out");
     std::fs::create_dir(&out_dir).unwrap();
 
-    let child = ChildGuard(
+    let (child, _stderr_tap) = spawn_ready(
         mds_bin()
             .args([
                 "watch",
@@ -3671,10 +3308,7 @@ fn watch_dir_skips_symlinked_source_file() {
                 "0",
                 "-q",
             ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
 
     // Wait for the real file to compile.
@@ -3723,33 +3357,19 @@ fn watch_esc_in_initial_compile_error_is_sanitized() {
     // miette renders it inside the source context frame.
     std::fs::write(&src, b"@define \x1bfoo:\nhello\n").unwrap();
 
-    let mut child = ChildGuard(
+    // The readiness handshake already implies the initial compile ran to completion:
+    // the error is printed on the startup path, and the marker is only emitted after
+    // it. No sleep needed to "give it time".
+    let (child, stderr_tap) = spawn_ready(
         mds_bin()
             .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::null()),
     );
-
-    // Move the stderr handle to a reader thread so the pipe never fills and
-    // so read_to_end completes once the process is killed.
-    let stderr_handle = child.0.stderr.take().expect("piped stderr");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut h = stderr_handle;
-        let _ = std::io::Read::read_to_end(&mut h, &mut buf);
-        buf
-    });
-
-    // Give the synchronous initial compile time to run and write its error.
-    // 500 ms >> typical compile time; no polling of file-system events.
-    std::thread::sleep(Duration::from_millis(500));
 
     // Kill the watch process (ChildGuard.drop → kill + wait) to close the pipe.
     drop(child);
 
-    let stderr_bytes = reader.join().expect("stderr reader thread panicked");
+    let stderr_bytes = stderr_tap.bytes();
 
     // Assertion 1: error IS present (the initial-compile-error path ran).
     assert!(

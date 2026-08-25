@@ -14,6 +14,15 @@ categories = ["command-line-utilities"]
 name = "mds"
 path = "src/main.rs"
 
+[features]
+# TEST-ONLY. Injects a 200ms delay into `mds watch` startup immediately after the
+# initial output is published. It is the positive control for the arm-before-publish
+# ordering in `watch.rs`: with a defective ordering this delay drives the
+# lost-edit-during-startup rate to ~100%; with the correct ordering it has no effect,
+# because the delay no longer sits inside a window where a file is covered by neither
+# the OS watcher nor the mtime baseline. MUST NOT be enabled in a shipped build.
+startup-race-probe = []
+
 [dependencies]
 mds = { package = "mds-core", path = "../mds-core", version = "0.3.0" }
 clap = { workspace = true }

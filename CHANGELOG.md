@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mds watch` no longer silently loses a save made during startup.**
+  Both watch modes published the first compiled output *before* arming change
+  detection. An edit that landed in the gap between "output written" and "watcher
+  armed + baseline captured" was invisible to **both** detectors, permanently — not
+  merely late. The OS watch had not been armed, so no filesystem event was ever
+  generated; and the `(mtime, size)` baseline was snapshotted *after* the edit, so
+  the self-heal probe compared the edited file against itself and reported "no
+  change" on every subsequent tick. A user who hit Ctrl-S while `mds watch` was
+  starting up saw no error, no rebuild, and no output update — until they saved
+  again.
+
+  Both startup paths are reordered so that a file's watch is armed and its baseline
+  captured no later than the first time it is read. Directory mode arms the recursive
+  root watch before the tree is walked; single-file mode arms the entry's directory
+  and snapshots the entry/vars baseline before the first compile, then merges in the
+  dependency baselines the compile discovers. The three self-write guards that made
+  the old ordering safe (`Access`-event filtering, files-of-interest / `.mds`
+  filtering, and content-dedup) all still apply, so arming earlier does not
+  reintroduce spurious startup rebuilds.
+
+  Observed on Linux, where the reads performed during startup generate inotify
+  activity; macOS FSEvents does not report reads and did not surface it.
+
 ### Changed — lint JSON wire: `fix_edits[].new_text` is now WIRE-sanitized
 
 `LintDiagnostic.fix_edits[].new_text` in the `"version": 1` JSON envelope is now

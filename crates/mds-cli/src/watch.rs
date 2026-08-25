@@ -406,6 +406,54 @@ fn stop_watching(quiet: bool) {
     }
 }
 
+/// Test-only delay injected right after the startup output is published.
+///
+/// This is the **positive control** for the arm-before-publish ordering: it widens
+/// the interval between "output written" and "watch fully live" to a size no edit
+/// can miss. Under a defective ordering that interval is a window in which a file
+/// is covered by neither detector, and the injected delay drives the lost-edit rate
+/// to ~100%. Under the correct ordering the OS watch is already armed and the mtime
+/// baseline already captured before the output is written, so the same delay changes
+/// nothing — which is exactly what makes it evidence that the *mechanism* is gone
+/// rather than merely rarer.
+///
+/// Compiled out entirely unless the `startup-race-probe` feature is enabled; that
+/// feature must never ship enabled.
+#[cfg(feature = "startup-race-probe")]
+fn startup_race_probe() {
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+#[cfg(not(feature = "startup-race-probe"))]
+fn startup_race_probe() {}
+
+/// Environment variable that enables the test-only readiness marker.
+const READY_MARKER_ENV: &str = "MDS_TEST_READY";
+
+/// The readiness marker line itself (stderr).
+const READY_MARKER: &str = "MDS_WATCH_READY";
+
+/// Emit the readiness marker on stderr when `MDS_TEST_READY=1` is set.
+///
+/// Called by both watch modes at the single instant where **every** file of
+/// interest is covered by at least one detector: its parent directory is armed
+/// with the OS watcher *and* its `(mtime, size)` baseline has been captured.
+/// An edit that lands after this line is printed is guaranteed to be observed.
+///
+/// This exists because no pre-existing line is a sound readiness signal:
+/// `"Watching {path}"` is printed *before* the startup compile, and
+/// `"Recompiled …"` only ever appears after a successful *rebuild*. Tests that
+/// keyed off either raced the tail of startup.
+///
+/// Deliberately gated on an env var rather than a flag: it adds no CLI surface
+/// and no user-visible output. It bypasses `--quiet` on purpose — the
+/// integration suite runs with `-q` and still needs the handshake.
+fn emit_ready_marker() {
+    if std::env::var(READY_MARKER_ENV).is_ok_and(|v| v == "1") {
+        eprintln!("{READY_MARKER}");
+    }
+}
+
 /// Receive the next message from the watch channel.
 ///
 /// Returns:
@@ -912,6 +960,77 @@ fn run_watch_file(
     let static_set_vars = set_vars;
     let static_set_string_vars = set_string_vars;
 
+    if !quiet {
+        eprintln!("Watching {}", safe_path(&entry));
+    }
+
+    // ── Arm before publish (startup race) ─────────────────────────────────────
+    //
+    // INVARIANT: for every file of interest, its `(mtime, size)` baseline is
+    // captured no later than the moment it is first read, and its directory
+    // watch is armed no later than that.
+    //
+    // The watcher used to be created *after* the initial compile so the dedup
+    // baseline was recorded "before any FSEvents arrive". That ordering left a
+    // window — output written → watcher armed → baseline snapshotted — in which
+    // an edit was invisible to BOTH detectors, permanently: inotify was not yet
+    // armed so no event was ever generated, and the baseline snapshot captured
+    // the already-edited state, so the liveness probe compared the edit against
+    // itself and reported "no change" forever. A user who saved during startup
+    // silently lost that save.
+    //
+    // Arming first means the watcher may observe the compile's own reads and the
+    // startup output write. Three pre-existing guards cover that, and each is
+    // still load-bearing here:
+    //   1. `is_content_event` drops every `Access(_)` event, which is exactly
+    //      what a source-file *read* produces on Linux (IN_OPEN / IN_ACCESS /
+    //      IN_CLOSE_NOWRITE). The startup compile can no longer busy-loop itself.
+    //   2. `event_is_relevant` filters to `files_of_interest` — entry, deps and
+    //      the vars file. The startup output write (and the temp sibling that
+    //      `atomic_write_file` renames over it) is never in that set.
+    //   3. `last_written` content-dedup is seeded below, before the event loop
+    //      begins. Queued events are only *processed* inside the loop, so any
+    //      event that survives guards 1 and 2 recompiles to identical content
+    //      and is suppressed without a write or a status line.
+    // Worst case is therefore one redundant compile that dedups to no write.
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let tx_fs = tx.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx_fs.send(Msg::Fs(res));
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
+
+    // Install Ctrl+C handler (errors here are non-fatal — we'll catch disconnect).
+    let tx_ctrlc = tx.clone();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx_ctrlc.send(Msg::Interrupt);
+    });
+
+    // Arm the directories that are knowable before any read: the entry's parent
+    // and the vars file's parent. Dependency dirs are unknown until the compile
+    // reports them and are armed immediately afterwards.
+    //
+    // Best-effort here — a dir that is missing or fails to arm is re-attempted by
+    // the post-compile loop below, which owns the hard-error contract for the
+    // full dir set. Splitting it this way keeps startup failure messages identical
+    // to the pre-reorder behaviour.
+    let mut watched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
+    for dir in dirs_to_watch(&entry, &[], vars_path.as_deref()) {
+        if dir.exists() && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+            watched_dirs.insert(dir);
+        }
+    }
+
+    // Capture the entry/vars baseline BEFORE the first read of either. Both
+    // `build_runtime_vars` (reads the vars file) and `compile_and_write` (reads
+    // the entry) come after this point, so an edit landing during startup leaves
+    // this snapshot strictly older than the file — and the liveness probe sees it.
+    let pre_mtimes = snapshot_state(&files_of_interest(&entry, &[], vars_path.as_deref()));
+    let entry_was_missing = !entry.exists();
+
     // Initial compile: compile first, derive output path from kind (compile-then-route).
     // For explicit -o / --out-dir the path is determined by the flag.
     // For the default case (no explicit flag), the path depends on the output kind, which
@@ -921,9 +1040,6 @@ fn run_watch_file(
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
-    if !quiet {
-        eprintln!("Watching {}", safe_path(&entry));
-    }
 
     // Load project config (for output_dir) — used if no explicit -o / --out-dir.
     let config = load_config(&entry)?;
@@ -960,37 +1076,24 @@ fn run_watch_file(
         }
     };
 
+    // The startup output is now published — the positive-control injection point.
+    startup_race_probe();
+
     // Key: resolved output path string, or the sentinel "<stdout>" when output_path is None.
     let output_key: String = output_path
         .as_deref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<stdout>".to_string());
 
-    // Set up the watcher AFTER the initial compile so we can record the baseline
-    // content in last_written before any FSEvents arrive.
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_fs = tx.clone();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx_fs.send(Msg::Fs(res));
-        },
-        notify::Config::default(),
-    )
-    .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
-
-    // Install Ctrl+C handler (errors here are non-fatal — we'll catch disconnect).
-    let tx_ctrlc = tx.clone();
-    let _ = ctrlc::set_handler(move || {
-        let _ = tx_ctrlc.send(Msg::Interrupt);
-    });
-
-    // Compute initial watch dirs and register them.
+    // Arm the dependency directories the compile just reported. Dirs already armed
+    // above are skipped; anything still unarmed — including a pre-arm attempt that
+    // failed — is a hard startup error, as it was before the reorder.
     let init_dirs = dirs_to_watch(&entry, &initial_deps, vars_path.as_deref());
-    let mut watched_dirs = BTreeSet::new();
-    for dir in &init_dirs {
-        match watcher.watch(dir, RecursiveMode::NonRecursive) {
+    let unarmed: Vec<PathBuf> = init_dirs.difference(&watched_dirs).cloned().collect();
+    for dir in unarmed {
+        match watcher.watch(&dir, RecursiveMode::NonRecursive) {
             Ok(()) => {
-                watched_dirs.insert(dir.clone());
+                watched_dirs.insert(dir);
             }
             Err(e) => {
                 return Err(miette::miette!(
@@ -1002,8 +1105,8 @@ fn run_watch_file(
         }
     }
 
-    // Record baseline content AFTER setting up watches to suppress the first
-    // synthetic FSEvent from macOS (baseline taken from the same state the watcher sees).
+    // Record the dedup baseline. The event loop has not started, so nothing can
+    // consult this map before it is populated (guard 3 above).
     // Reuse initial_content from the startup compile (issue 3 — no second compile needed).
     let mut last_written: HashMap<String, String> = HashMap::new();
     if !initial_content.is_empty() {
@@ -1022,9 +1125,19 @@ fn run_watch_file(
             .collect::<BTreeSet<_>>();
         desired.into_iter().filter(|d| !d.exists()).collect()
     };
-    let last_mtimes = snapshot_state(&foi);
 
-    let entry_was_missing = !entry.exists();
+    // Merge the two baselines. Dependencies are only discovered by the compile, so
+    // theirs is captured now; the entry/vars entries taken before the compile
+    // overwrite the fresh ones because they are strictly older. That is what makes
+    // an edit landing anywhere inside the startup window still register as a
+    // difference on the first liveness tick.
+    let mut last_mtimes = snapshot_state(&foi);
+    debug_assert!(
+        pre_mtimes.keys().all(|p| foi.contains(p)),
+        "pre-compile baseline must be a subset of the final files of interest"
+    );
+    last_mtimes.extend(pre_mtimes);
+
     let mut state = FileWatchState {
         // armed_dirs mirrors watched_dirs at startup: all dirs that were successfully
         // registered in the loop above are considered armed (ADR-021 idle-O(1) fix).
@@ -1051,6 +1164,9 @@ fn run_watch_file(
         output_path,
         quiet,
     };
+
+    // Every dir is armed and every baseline captured — the watch is now live.
+    emit_ready_marker();
 
     // ── Watch loop ────────────────────────────────────────────────────────────
     // The outer loop processes one event batch at a time and is bounded:
@@ -1659,6 +1775,84 @@ fn dir_watch_startup(
         eprintln!("Watching directory {}", safe_path(&root));
     }
 
+    // Additionally watch the vars file's parent if it is outside root.
+    let vars_dir_extra: Option<PathBuf> = vars_path.as_deref().and_then(|vf| {
+        let parent = vf.parent()?;
+        // Only watch if outside root to avoid redundancy.
+        if !parent.starts_with(&root) {
+            Some(parent.to_path_buf())
+        } else {
+            None
+        }
+    });
+
+    // ── Arm before publish (startup race) ─────────────────────────────────────
+    //
+    // The recursive root watch is armed BEFORE the tree is walked, before any
+    // source is read, and before any output is written. Directory mode has only
+    // ONE change detector — the liveness probe here reconciles *appeared/removed*
+    // files, never content — so an edit that lands while the root is unarmed is
+    // lost permanently, not merely late. Arming first is the whole fix; every
+    // in-root edit from this point on generates an event that is queued on `rx`
+    // and drained once the event loop starts.
+    //
+    // Arming first also means the watcher observes the startup compile's own
+    // reads and writes. Three pre-existing guards absorb that, and all three are
+    // still in force:
+    //   1. `is_content_event` drops `Access(_)` — every read the compile performs.
+    //   2. `handle_fs_event_dir` keeps only paths with a `.mds` extension, so the
+    //      `.md`/`.json` outputs this startup writes can never seed a rebuild.
+    //      This is the guard that covers in-place output (`OutputBase::NextToSource`),
+    //      where outputs land beside their sources inside the watched root.
+    //   3. `last_written` content-dedup in `compile_one_source`.
+    //
+    // When `--out-dir` sits inside the root, arming early widens the window in
+    // which the watcher sees its own outputs, so that case is covered twice:
+    // `exclude_prefix` keeps the out-dir out of `collect_mds_files`, and
+    // `handle_fs_event_dir` drops every event whose path is under an
+    // `OutputBase::Dir` before the extension filter even runs. The out-dir is
+    // created by the first write *after* the recursive watch is armed, so notify
+    // adds it to the watch set — the exclusion is what keeps that harmless.
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let tx_fs = tx.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |res| {
+            let _ = tx_fs.send(Msg::Fs(res));
+        },
+        notify::Config::default(),
+    )
+    .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
+
+    // Install Ctrl+C handler.
+    let tx_ctrlc = tx.clone();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx_ctrlc.send(Msg::Interrupt);
+    });
+
+    // Watch the root recursively.
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|e| {
+            miette::miette!(
+                "failed to watch directory {}: {e}\n\
+                 hint: on Linux you may need to increase fs.inotify.max_user_watches",
+                root.display()
+            )
+        })?;
+
+    // Watch the vars dir if it is outside root — soft warning on failure (mirrors the
+    // external-dep-dir convention and the liveness probe's best-effort re-arm semantics;
+    // a transient failure must not abort the session, applies ADR-021 / consistency fix).
+    if let Some(ref vd) = vars_dir_extra {
+        if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
+            eprint_warning(&format!(
+                "warning: failed to watch vars directory {}: {}",
+                safe_path(vd),
+                safe_inline(&e)
+            ));
+        }
+    }
+
     // Startup compile: compile all .mds files found under root.
     let all_files = collect_mds_files(&root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
     let runtime_vars = build_runtime_vars(RuntimeVarArgs {
@@ -1724,35 +1918,13 @@ fn dir_watch_startup(
         }
     }
 
-    // Set up the watcher.
-    let (tx, rx) = mpsc::channel::<Msg>();
-    let tx_fs = tx.clone();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| {
-            let _ = tx_fs.send(Msg::Fs(res));
-        },
-        notify::Config::default(),
-    )
-    .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
+    // All startup outputs are now published — the positive-control injection point.
+    startup_race_probe();
 
-    // Install Ctrl+C handler.
-    let tx_ctrlc = tx.clone();
-    let _ = ctrlc::set_handler(move || {
-        let _ = tx_ctrlc.send(Msg::Interrupt);
-    });
-
-    // Watch the root recursively.
-    watcher
-        .watch(&root, RecursiveMode::Recursive)
-        .map_err(|e| {
-            miette::miette!(
-                "failed to watch directory {}: {e}\n\
-                 hint: on Linux you may need to increase fs.inotify.max_user_watches",
-                root.display()
-            )
-        })?;
-
-    // Watch external dep dirs NonRecursive (DD3).
+    // Watch external dep dirs NonRecursive (DD3). Cross-root dependencies are only
+    // discovered by the startup compile, so unlike the root they cannot be armed
+    // before the first read — this is the one residual window in dir mode, and it is
+    // what `MDS_WATCH_READY` exists to let tests synchronise against.
     for ext_dir in &state.external_dep_dirs {
         if let Err(e) = watcher.watch(ext_dir, RecursiveMode::NonRecursive) {
             eprint_warning(&format!(
@@ -1763,31 +1935,8 @@ fn dir_watch_startup(
         }
     }
 
-    // Additionally watch the vars file's parent if it is outside root.
-    let vars_dir_extra: Option<PathBuf> = vars_path.as_deref().and_then(|vf| {
-        let parent = vf.parent()?;
-        // Only watch if outside root to avoid redundancy.
-        if !parent.starts_with(&root) {
-            Some(parent.to_path_buf())
-        } else {
-            None
-        }
-    });
-    // Watch the vars dir if it is outside root — soft warning on failure (mirrors the
-    // external-dep-dir convention and the liveness probe's best-effort re-arm semantics;
-    // a transient failure must not abort the session, applies ADR-021 / consistency fix).
-    if let Some(ref vd) = vars_dir_extra {
-        if let Err(e) = watcher.watch(vd, RecursiveMode::NonRecursive) {
-            eprint_warning(&format!(
-                "warning: failed to watch vars directory {}: {}",
-                safe_path(vd),
-                safe_inline(&e)
-            ));
-        }
-    }
-
-    // Build the dedup baseline AFTER the watcher is registered so any OS-queued
-    // synthetic events arrive after the baseline is recorded and are filtered out.
+    // Build the dedup baseline for any source whose startup compile did not record
+    // one (partials are skipped above; a failed write leaves no entry).
     {
         let baseline_vars = build_runtime_vars(RuntimeVarArgs {
             vars: vars_path.clone(),
@@ -1864,6 +2013,9 @@ fn dir_watch_startup(
         debounce_ms,
         quiet,
     };
+
+    // Root, external dep dirs and the vars dir are all armed — the watch is live.
+    emit_ready_marker();
 
     Ok(DirStartup {
         watcher,
