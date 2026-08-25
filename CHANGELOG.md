@@ -9,25 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`mds watch` no longer silently loses a save made during startup.**
+- **`mds watch` no longer silently loses a save made during startup (#317).**
   Both watch modes published the first compiled output *before* arming change
   detection. An edit that landed in the gap between "output written" and "watcher
-  armed + baseline captured" was invisible to **both** detectors, permanently — not
-  merely late. The OS watch had not been armed, so no filesystem event was ever
-  generated; and the `(mtime, size)` baseline was snapshotted *after* the edit, so
-  the self-heal probe compared the edited file against itself and reported "no
-  change" on every subsequent tick. A user who hit Ctrl-S while `mds watch` was
-  starting up saw no error, no rebuild, and no output update — until they saved
-  again.
+  armed" generated no filesystem event at all: the OS watch did not yet exist, so
+  there was nothing to deliver it to. A user who hit Ctrl-S while `mds watch` was
+  starting up saw no error, no rebuild, and no output update.
 
-  Both startup paths are reordered so that a file's watch is armed and its baseline
-  captured no later than the first time it is read. Directory mode arms the recursive
-  root watch before the tree is walked; single-file mode arms the entry's directory
-  and snapshots the entry/vars baseline before the first compile, then merges in the
-  dependency baselines the compile discovers. The three self-write guards that made
-  the old ordering safe (`Access`-event filtering, files-of-interest / `.mds`
-  filtering, and content-dedup) all still apply, so arming earlier does not
-  reintroduce spurious startup rebuilds.
+  Whether that edit was merely *late* or lost *permanently* came down to the
+  self-heal probe. The probe's first tick rebuilds unconditionally, so on an
+  otherwise-idle tree it recovered the edit within one `--poll-interval`. But the
+  tick only fires when the watcher goes idle for a full interval, and its deadline
+  restarts on every message received — so anything producing a steady stream of
+  filesystem events in the watched tree (an editor's own scratch files, a dev server,
+  a sync client) starves the tick indefinitely and the save is lost for good. That
+  starvation is a separate defect, tracked as #319; this entry fixes the window
+  that makes it reachable at startup.
+
+  Both startup paths are reordered so that the watch is armed before the file it
+  covers is first read. Directory mode arms the recursive root watch before the tree
+  is walked; single-file mode arms the entry's and the vars file's directories, and
+  snapshots their baseline, before the first compile, then merges in the dependency
+  baselines the compile discovers. The three self-write guards that made the old
+  ordering safe (`Access`-event filtering, files-of-interest / `.mds` filtering, and
+  content-dedup) all still apply, so arming earlier does not reintroduce spurious
+  startup rebuilds.
+
+  **Scope.** Edits made during startup are now safe for everything whose location is
+  known before the compile runs: any file under the watched root in directory mode,
+  and the entry plus the `--vars` file (and anything sharing their directories) in
+  single-file mode. It does **not** cover a dependency outside those directories — an
+  `@import` of `../shared/_x.mds` in single-file mode, or a cross-root import in
+  directory mode. Such a file's existence is only discovered by the compile that reads
+  it, so its directory cannot be armed beforehand, and an edit to it during startup can
+  still be missed. Directory mode has no second line of defence there at all: its
+  self-heal probe reconciles files that appeared or were removed, never file contents.
+  Closing that residual gap needs the dependency graph before the first compile, and is
+  not attempted here.
 
   Observed on Linux, where the reads performed during startup generate inotify
   activity; macOS FSEvents does not report reads and did not surface it.

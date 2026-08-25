@@ -40,6 +40,53 @@ cargo check -p mds-core -p mds-cli          # on the 1.88 toolchain (MSRV)
 
 Clippy warnings are treated as errors. Keep the build warning-free.
 
+#### `mds watch` startup-race gate
+
+`mds watch` startup has an ordering requirement: every watch must be armed before the
+file it covers is first read. A defective ordering opens a window only microseconds
+wide, so the default test run detects it unreliably — measured against the pre-fix
+ordering, the file-mode test failed 3/3 but the dir-mode one only 1/3. Two things
+exist to make that a gate (#317), and they only work together:
+
+```bash
+cargo test -p mds-cli --test cli_watch --features startup-race-probe
+cargo clippy -p mds-cli --all-targets --features startup-race-probe -- -D warnings
+```
+
+- **`startup-race-probe`** (Cargo feature, `mds-cli`, non-default) injects a 200 ms
+  sleep into `mds watch` immediately after the startup output is published, widening
+  that window enough to hit reliably. It is a **test-only** feature and must never be
+  enabled in a published build — see the gotcha list in `CLAUDE.md`.
+- **`watch_*_edit_during_startup_window_is_not_lost`** are the only tests in the file
+  that do not wait for the readiness handshake. They cannot: the handshake means
+  "startup finished", so a test that waits for it can never act during startup. They
+  synchronise on the startup output appearing instead, and edit immediately.
+
+Run both, on **Linux** — macOS FSEvents does not report file reads and cannot reproduce
+this bug class at all. CI runs this as the `Watch startup race (probe)` job.
+
+#### `MDS_TEST_READY` (test-only)
+
+`mds watch` recognises one undocumented-on-the-CLI environment variable, used only by
+the integration suite:
+
+| Variable | Value | Effect |
+|---|---|---|
+| `MDS_TEST_READY` | absolute path | After every watch is armed and every `(mtime, size)` baseline captured, `mds watch` creates this file containing `MDS_WATCH_READY`. Relative and unset values are ignored. |
+
+It exists because no output line is a sound readiness signal: `Watching {path}` is
+printed *before* the startup compile, and `Recompiled …` only appears after a
+*rebuild*. Tests that keyed off either raced the tail of startup.
+
+The signal travels over a **file, not stderr**, and must stay that way. `mds watch`'s
+stdout and stderr are asserted on byte-for-byte by tests that check a compile error
+survives `--quiet` and that no raw ESC byte leaks into a diagnostic. Anything written
+to those streams unconditionally makes every "stderr is non-empty" assertion in the
+suite pass regardless of what the code does — which is exactly what an earlier
+stderr-based marker did to two of them.
+
+Use `common::spawn_watch_ready` rather than setting the variable by hand.
+
 ### WASM
 
 ```bash

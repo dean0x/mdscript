@@ -1,20 +1,26 @@
 //! Integration tests for `mds watch`.
 //!
 //! Strategy:
+//! - Spawn through `spawn_ready`, which blocks until the watcher is fully armed, so a
+//!   test's first edit cannot land in a window the watcher is blind to.
 //! - Spawn `mds watch … --debounce 0` (immediate rebuild, no debounce delay).
-//! - Poll output file content with a bounded `wait_for_file_contains` (5-second cap).
+//! - Poll output file content with a bounded `wait_for_file_contains`.
 //! - Poll stderr with `wait_for_stderr_contains` when testing error / status messages.
 //! - A RAII `ChildGuard` kills+waits the child on drop so tests never leave orphans.
+//!
+//! Every wait carries one of three bounds, and which one is a claim about the mechanism
+//! that must deliver the result: [`TIMEOUT`] for an inotify event, [`TICK_TIMEOUT`] for
+//! a self-heal idle tick, [`STARTUP_WINDOW_TIMEOUT`] for the deliberately
+//! unsynchronized startup-window tests. See each constant's docs.
 //!
 //! Flakiness mitigations:
 //! - Assert on output FILE content rather than stderr ordering.
 //! - Write dependency files BEFORE adding the `@import` that references them.
 //! - Use `-q` where stderr isn't under test.
 //! - Always kill+wait child in `ChildGuard::drop`.
-//! - Absorb FSEvents latency via the 5-second polling cap.
 
 mod common;
-use common::{mds_bin, spawn_watch_ready, StderrTap};
+use common::{mds_bin, spawn_watch_ready, spawn_watch_unsynchronized, StderrTap};
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -54,6 +60,16 @@ fn spawn_ready(cmd: &mut Command) -> (ChildGuard, StderrTap) {
     (ChildGuard(child), tap)
 }
 
+/// Spawn a watcher WITHOUT the readiness handshake and wrap it in a `ChildGuard`.
+///
+/// Reserved for the tests that exist precisely to exercise startup: a test that
+/// synchronises on "startup finished" can never observe anything that happens
+/// *during* startup. Every other test must use [`spawn_ready`].
+fn spawn_unsynchronized(cmd: &mut Command) -> (ChildGuard, StderrTap) {
+    let (child, tap) = spawn_watch_unsynchronized(cmd);
+    (ChildGuard(child), tap)
+}
+
 /// Poll `path` until its content contains `needle`, or `timeout` elapses.
 fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
@@ -64,6 +80,25 @@ fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) -> bool 
             }
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Like [`wait_for_file_contains`] but polls at 1ms instead of 50ms.
+///
+/// Only for the startup-window tests. There the poll granularity is not just latency,
+/// it is the test's own contribution to how late its edit lands inside the window it is
+/// trying to hit — a 50ms poll spends a quarter of the `startup-race-probe` window
+/// before the edit is even attempted.
+fn wait_for_file_contains_tight(path: &Path, needle: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.contains(needle) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
     false
 }
@@ -80,7 +115,7 @@ fn wait_for_file_gone(path: &Path, timeout: Duration) -> bool {
     false
 }
 
-/// Upper bound on how long a *post-readiness* effect may take to appear.
+/// Upper bound on how long an **inotify-delivered** effect may take to appear.
 ///
 /// This is a **failure bound, not a synchroniser**. Every spawn goes through
 /// [`spawn_ready`], so by the time a test edits a file the watcher is already armed
@@ -91,9 +126,44 @@ fn wait_for_file_gone(path: &Path, timeout: Duration) -> bool {
 ///
 /// 2s leaves ~40 poll cycles of headroom over the observed millisecond-scale latency
 /// — ample for a loaded container, still short enough that a real regression surfaces
-/// promptly. Waits that must legitimately span multiple poll-interval ticks use their
-/// own explicit, longer bound at the call site rather than inflating this one.
+/// promptly.
+///
+/// **This bound is only valid for a wait an OS event can satisfy.** A wait whose
+/// recovery path runs on the self-heal idle tick instead must use [`TICK_TIMEOUT`],
+/// which is expressed in ticks rather than in absolute latency; see its docs for the
+/// enumeration of which waits those are and why.
 const TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound for a wait that only the **self-heal idle tick** can satisfy.
+///
+/// A handful of scenarios destroy the inotify watch descriptor itself, so no OS event
+/// can ever announce the recovery: `rmdir` of a watched directory removes the kernel's
+/// watch, and the directory recreated in its place is a different inode that nothing is
+/// watching. Recovery there is the `liveness_probe_*` re-arm, which runs once per
+/// `--poll-interval`. Such a wait is denominated in **ticks**, and pricing it with
+/// [`TIMEOUT`] — a latency bound — conflates two unrelated quantities and leaves the
+/// headroom silently dependent on whatever `--poll-interval` the test happens to pass.
+///
+/// The tick-dependent waits, all of which use this bound:
+/// - `watch_file_mode_parent_dir_delete_recreate_recovers`
+/// - `watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers`
+/// - `watch_dir_mode_root_delete_recreate_recovers`
+/// - `watch_vars_dir_delete_recreate_rearms`
+///
+/// Every other wait in this file is satisfied by an inotify event on a watch that was
+/// never lost, and keeps [`TIMEOUT`].
+///
+/// 8s is ≥ 50 ticks at the 150ms poll-interval used by the slowest of them, and ≥ 8
+/// ticks even at the 1000ms default, so the bound stays a failure bound under any
+/// `--poll-interval` a test might reasonably choose.
+const TICK_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Upper bound for the deliberately unsynchronized startup-window tests.
+///
+/// Those tests race the watcher's own startup, so their wait spans whatever remains of
+/// the startup compile plus the `startup-race-probe` delay when that feature is on.
+/// Neither is a post-readiness latency, so [`TIMEOUT`] does not apply.
+const STARTUP_WINDOW_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── T-I14: Invalid combinations rejected at startup ────────────────────────
 
@@ -1007,10 +1077,17 @@ fn watch_quiet_keeps_errors_visible() {
 
     // Verify error output appeared on stderr despite -q.
     // Under quiet mode, status messages are suppressed but error diagnostics are not.
-    let bytes_so_far = stderr_tap.bytes();
+    //
+    // Assert on the CONTENT of the diagnostic, not merely that stderr is non-empty.
+    // Non-emptiness is satisfied by any byte from any source, so it stops being a test
+    // of this behaviour the moment anything else writes to the stream — which is
+    // exactly what happened when the readiness handshake was a stderr marker line.
+    // Naming the undefined variable ties the assertion to the error we provoked.
+    let stderr_str = stderr_tap.text();
     assert!(
-        !bytes_so_far.is_empty(),
-        "stderr must contain the compile error even under -q; got empty stderr"
+        stderr_str.contains("__undefined_xyz__"),
+        "stderr must carry the compile error naming the undefined variable even under \
+         -q; got:\n{stderr_str}"
     );
 
     // Fix the error — watcher should recover.
@@ -2017,9 +2094,12 @@ fn watch_file_mode_parent_dir_delete_recreate_recovers() {
     std::fs::create_dir(&src_dir).unwrap();
     std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
 
-    // Watcher should recover within ~1 tick (100ms poll-interval) and recompile.
+    // TICK-DEPENDENT: `remove_dir_all(&src_dir)` destroyed the inotify watch on the old
+    // inode, and the recreated dir is a new inode nothing is watching — so the write
+    // above generates no event the watcher can receive. Only the liveness probe's
+    // re-arm can find it.
     assert!(
-        wait_for_file_contains(&out, "Entry After", TIMEOUT),
+        wait_for_file_contains(&out, "Entry After", TICK_TIMEOUT),
         "watcher must self-heal after parent dir delete+recreate and recompile"
     );
 
@@ -2073,9 +2153,10 @@ fn watch_dir_mode_root_delete_recreate_recovers() {
     )
     .unwrap();
 
-    // The watcher should recover and compile the new file.
+    // TICK-DEPENDENT: the recursive watch died with the old root inode, so the create
+    // above is unobservable; the liveness probe's re-arm + reconcile is the only path.
     assert!(
-        wait_for_file_contains(&out_dir.join("new.md"), "New file N", TIMEOUT),
+        wait_for_file_contains(&out_dir.join("new.md"), "New file N", TICK_TIMEOUT),
         "watcher must recover after root delete+recreate and compile new file"
     );
 
@@ -2226,8 +2307,11 @@ fn watch_vars_dir_delete_recreate_rearms() {
     // Now write new vars — the re-armed watcher should catch this event.
     std::fs::write(&vars_file, r#"{"greeting": "Goodbye"}"#).unwrap();
 
-    // The watcher should detect the vars change and recompile.
-    let got = wait_for_file_contains(&out, "Goodbye", TIMEOUT);
+    // TICK-DEPENDENT: whether the write above is delivered as an event depends on the
+    // probe having already re-armed the recreated vars dir. If it has not, the fallback
+    // is the probe's own `(mtime, size)` comparison — another tick. Either way the
+    // recovery is denominated in ticks, not in event latency.
+    let got = wait_for_file_contains(&out, "Goodbye", TICK_TIMEOUT);
     let _ = child.0.kill();
     let _ = child.0.wait();
     std::thread::sleep(Duration::from_millis(100));
@@ -2981,9 +3065,11 @@ fn watch_file_mode_parent_dir_deleted_bounded_errors_then_recovers() {
     std::fs::create_dir(&src_dir).unwrap();
     std::fs::write(&src, "V2-recovered\n").unwrap();
 
-    // The watcher must recover (AC-W1 preserved) and recompile.
+    // TICK-DEPENDENT: same as AC-W1 — the parent dir was removed, so the watch on it is
+    // gone and the recreated dir is unwatched. Recovery is the vanish→reappear edge in
+    // `liveness_probe_file`, one tick at a time.
     assert!(
-        wait_for_file_contains(&out, "V2-recovered", TIMEOUT),
+        wait_for_file_contains(&out, "V2-recovered", TICK_TIMEOUT),
         "watcher must self-heal after parent dir delete+recreate and recompile with V2 content"
     );
 
@@ -3347,8 +3433,15 @@ fn watch_dir_skips_symlinked_source_file() {
 /// polled, so this test is immune to FSEvents/inotify timing flakiness.
 ///
 /// Assertions:
-///   1. stderr is non-empty (the error IS present — non-vacuous).
+///   1. stderr carries the initial-compile error for THIS file (non-vacuous).
 ///   2. No raw ESC byte (0x1B) appears anywhere in stderr.
+///
+/// Assertion 1 exists solely to keep assertion 2 honest: "no ESC byte in stderr" is
+/// trivially true of an empty stream, so a change that stopped the error being printed
+/// at all would leave assertion 2 passing while testing nothing. It therefore has to
+/// name something ONLY the rendered diagnostic produces. Note that the file's own stem
+/// does not qualify: this watcher runs non-quiet, so `Watching /…/esc_watch.mds` is on
+/// stderr whether or not the error was ever printed.
 #[test]
 fn watch_esc_in_initial_compile_error_is_sanitized() {
     let dir = tempfile::tempdir().unwrap();
@@ -3370,11 +3463,15 @@ fn watch_esc_in_initial_compile_error_is_sanitized() {
     drop(child);
 
     let stderr_bytes = stderr_tap.bytes();
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
 
-    // Assertion 1: error IS present (the initial-compile-error path ran).
+    // Assertion 1: the initial-compile error was rendered (non-vacuous guard for
+    // assertion 2). `syntax error` comes from the diagnostic and from nothing else the
+    // watcher writes — unlike the file stem, which the `Watching …` line also carries.
     assert!(
-        !stderr_bytes.is_empty(),
-        "watch initial-compile-error must emit something to stderr (non-vacuous)"
+        stderr_str.contains("syntax error"),
+        "watch initial-compile-error must render its diagnostic to stderr, otherwise \
+         the ESC assertion below is vacuous; got:\n{stderr_str}"
     );
 
     // Assertion 2: no raw ESC byte (0x1B) anywhere in stderr.
@@ -3385,5 +3482,334 @@ fn watch_esc_in_initial_compile_error_is_sanitized() {
         "raw ESC byte (0x1B) must be sanitized in watch initial-compile-error stderr; \
          got (hex first 512): {:02x?}",
         &stderr_bytes[..stderr_bytes.len().min(512)]
+    );
+}
+
+// ── #317 regression: an edit inside the startup window must not be lost ───────
+//
+// These are the only tests in this file that deliberately do NOT go through
+// `spawn_ready`, and that is the entire point of them.
+//
+// `MDS_TEST_READY` signals "every watch armed and every baseline captured". It is
+// emitted at the end of whatever startup ordering the code happens to have, so it is
+// true by construction in both the fixed and the defective ordering — it just fires at
+// a different wall-clock instant in each. A test that waits for it therefore cannot
+// place an edit inside the window the ordering opens: by the time it is allowed to act,
+// the window is closed by definition. Every handshake-gated test in this file passes
+// against the pre-fix ordering, which is why the arm-before-publish fix shipped with no
+// test that could detect its regression.
+//
+// These two synchronise on the *opening* of the window instead — the moment the startup
+// output is published, which is where the defective ordering armed nothing — and then
+// edit immediately. `--poll-interval 0` disables the self-heal probe so that inotify is
+// the sole detector: with the probe enabled, `liveness_probe_file` rebuilds
+// unconditionally on its first tick regardless of any baseline, which would recover the
+// lost edit and mask the defect (see #319 for why that recovery is itself unreliable).
+//
+// Sensitivity comes from the `startup-race-probe` Cargo feature, which widens the
+// publish→arm window to 200ms. Measured against the pre-fix arming order on Linux:
+//
+//   with the probe        file mode 6/6 red, dir mode 6/6 red
+//   without the probe     file mode 3/3 red, dir mode 1/3 red
+//
+// So the default `cargo test` run detects the file-mode regression but is a coin flip
+// on the dir-mode one, because there the unwidened window is only the few microseconds
+// between the last output write and the `watcher.watch()` syscall. That is why CI runs
+// this file a second time with the feature on. Feature and tests are one mechanism;
+// neither half is a gate on its own.
+
+/// File mode: an edit landing immediately after the first output is published must
+/// still reach the output, with the self-heal probe disabled.
+#[test]
+fn watch_file_mode_edit_during_startup_window_is_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("entry.mds");
+    std::fs::write(&src, "---\nname: Before\n---\nEntry {{name}}\n").unwrap();
+    let out = dir.path().join("entry.md");
+
+    let (child, _tap) = spawn_unsynchronized(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--debounce",
+                "0",
+                // Self-heal probe OFF: inotify must carry this on its own.
+                "--poll-interval",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // The published startup output IS the start of the window.
+    assert!(
+        wait_for_file_contains_tight(&out, "Entry Before", STARTUP_WINDOW_TIMEOUT),
+        "startup compile should publish 'Entry Before'"
+    );
+
+    // Edit now — inside the window under the defective ordering.
+    std::fs::write(&src, "---\nname: After\n---\nEntry {{name}}\n").unwrap();
+
+    assert!(
+        wait_for_file_contains(&out, "Entry After", STARTUP_WINDOW_TIMEOUT),
+        "an edit made immediately after the startup output was published must not be \
+         lost: with --poll-interval 0 the OS watch is the only detector, so this fails \
+         if the watch is armed after the output is written (#317)"
+    );
+
+    drop(child);
+}
+
+/// Directory mode: same property for the recursive root watch.
+#[test]
+fn watch_dir_mode_edit_during_startup_window_is_not_lost() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&root).unwrap();
+    let src = root.join("a.mds");
+    std::fs::write(&src, "---\nname: Before\n---\nDir {{name}}\n").unwrap();
+    let out = out_dir.join("a.md");
+
+    let (child, _tap) = spawn_unsynchronized(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--poll-interval",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    assert!(
+        wait_for_file_contains_tight(&out, "Dir Before", STARTUP_WINDOW_TIMEOUT),
+        "startup compile should publish 'Dir Before'"
+    );
+
+    std::fs::write(&src, "---\nname: After\n---\nDir {{name}}\n").unwrap();
+
+    assert!(
+        wait_for_file_contains(&out, "Dir After", STARTUP_WINDOW_TIMEOUT),
+        "an edit made immediately after the startup output was published must not be \
+         lost in dir mode: the recursive root watch must be armed before the tree walk, \
+         not after the outputs are written (#317)"
+    );
+
+    drop(child);
+}
+
+// ── Ctrl+C during the startup compile ────────────────────────────────────────
+//
+// `watch_ctrl_c_exits_cleanly` and `watch_ctrl_c_prints_stopped_watching` both signal
+// only after `spawn_ready` returns, so they cover Ctrl+C during the *event loop* and
+// say nothing about Ctrl+C during startup. Those are different code paths with
+// different handlers in force, and only the second one scales with the size of the
+// user's tree.
+//
+// Installing `ctrlc::set_handler` converts SIGINT from "terminate" into "enqueue
+// `Msg::Interrupt`", and that message is read only by the event loop. Install it above
+// the startup compile and Ctrl+C is inert for the compile's whole duration: the tool
+// keeps writing outputs, ignores every further press, and finally exits 0. The
+// user-visible defect is that Ctrl+C does nothing and the tool writes files the user
+// was trying to stop it writing.
+
+/// Directory mode: SIGINT delivered while the startup compile is still running must
+/// terminate the process, not be queued until the compile finishes.
+#[test]
+#[cfg(unix)]
+fn watch_dir_mode_ctrl_c_during_startup_compile_terminates() {
+    use std::os::unix::process::ExitStatusExt;
+
+    // Large enough that the compile is still far from finished when the first outputs
+    // appear, small enough to stay a fast test. Dir-mode startup makes two full passes
+    // over this set, so the window is roughly twice what the first pass suggests.
+    const SOURCES: usize = 1200;
+    /// Number of published outputs that proves the startup compile is under way.
+    /// Deliberately tiny relative to SOURCES so the signal lands with the overwhelming
+    /// majority of the work still ahead.
+    const OBSERVE_AT: usize = 10;
+
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    let out_dir = base.path().join("out");
+    std::fs::create_dir(&root).unwrap();
+    for i in 0..SOURCES {
+        std::fs::write(
+            root.join(format!("s{i:04}.mds")),
+            "---\nname: S\n---\nSource {{name}}\n",
+        )
+        .unwrap();
+    }
+
+    let count_outputs = |dir: &Path| -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    };
+
+    let (mut guard, _tap) = spawn_unsynchronized(
+        mds_bin()
+            .args([
+                "watch",
+                root.to_str().unwrap(),
+                "--out-dir",
+                out_dir.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "-q",
+            ])
+            .stdout(Stdio::null()),
+    );
+    let pid = guard.id();
+
+    // Gate on the artifact rather than on a guessed sleep: wait until the startup
+    // compile has demonstrably begun (some outputs) and demonstrably not finished
+    // (nowhere near all of them).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut observed = 0usize;
+    while Instant::now() < deadline {
+        observed = count_outputs(&out_dir);
+        if observed >= OBSERVE_AT {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        (OBSERVE_AT..SOURCES / 2).contains(&observed),
+        "test precondition: SIGINT must be sent while the startup compile is in \
+         flight; saw {observed} of {SOURCES} outputs (want {OBSERVE_AT}..{})",
+        SOURCES / 2
+    );
+
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+
+    let signalled_at = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if guard.0.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let elapsed = signalled_at.elapsed();
+    let written = count_outputs(&out_dir);
+    assert!(
+        exited,
+        "process must exit after SIGINT during startup compile"
+    );
+
+    let status = guard.wait_status();
+
+    // The discriminator. Before the event loop exists there is nothing to service a
+    // queued `Msg::Interrupt`, so the correct behaviour is the default disposition:
+    // death by SIGINT. A clean `code() == Some(0)` here means a handler was installed
+    // above the startup compile, swallowed the signal, and let startup run to
+    // completion — the #317 follow-up defect.
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "SIGINT during the startup compile must terminate the process; instead it \
+         exited with {status:?} after {elapsed:?}, having written {written} of \
+         {SOURCES} outputs — the signal was swallowed until the event loop started"
+    );
+
+    // The user-visible half of the same property, asserted independently of how the
+    // process died: it must stop producing output promptly.
+    assert!(
+        written < SOURCES / 2,
+        "after Ctrl+C during startup the watcher must stop writing outputs; it wrote \
+         {written} of {SOURCES}"
+    );
+}
+
+/// File mode: same property. The gate is the `Watching …` line, which `run_watch_file`
+/// prints before it creates the watcher and therefore before the startup compile; the
+/// entry imports enough partials that the compile is still running when SIGINT lands.
+#[test]
+#[cfg(unix)]
+fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
+    use std::os::unix::process::ExitStatusExt;
+
+    const PARTIALS: usize = 400;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut entry = String::new();
+    for i in 0..PARTIALS {
+        let name = format!("_p{i:04}");
+        std::fs::write(
+            dir.path().join(format!("{name}.mds")),
+            format!("@define v{i}():\nP{i}\n@end\n\n@export v{i}\n"),
+        )
+        .unwrap();
+        entry.push_str(&format!("@import \"./{name}.mds\" as p{i}\n"));
+    }
+    entry.push_str("done\n");
+    let src = dir.path().join("entry.mds");
+    std::fs::write(&src, &entry).unwrap();
+
+    let (mut guard, tap) = spawn_unsynchronized(
+        // No -q: the `Watching …` line is the startup gate.
+        mds_bin()
+            .args(["watch", src.to_str().unwrap(), "--debounce", "0"])
+            .stdout(Stdio::null()),
+    );
+    let pid = guard.id();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut saw_watching = false;
+    while Instant::now() < deadline {
+        if tap.text().contains("Watching ") {
+            saw_watching = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        saw_watching,
+        "expected the `Watching …` startup line; stderr:\n{}",
+        tap.text()
+    );
+    // `Watching …` is printed before the watcher is even created, so the startup
+    // compile of a 400-import entry is still ahead.
+    assert!(
+        !dir.path().join("entry.md").exists(),
+        "test precondition: the startup compile must not have published its output yet"
+    );
+
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if guard.0.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        exited,
+        "process must exit after SIGINT during startup compile"
+    );
+
+    let status = guard.wait_status();
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGINT),
+        "SIGINT during the startup compile must terminate the process; instead it \
+         exited with {status:?} — the signal was swallowed until the event loop started"
     );
 }

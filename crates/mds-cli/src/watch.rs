@@ -427,30 +427,55 @@ fn startup_race_probe() {
 #[cfg(not(feature = "startup-race-probe"))]
 fn startup_race_probe() {}
 
-/// Environment variable that enables the test-only readiness marker.
+/// Environment variable that enables the test-only readiness handshake.
+///
+/// Its value is the **absolute path of a file** to create once the watch is armed.
+/// Test-only: `mds` never sets it itself and it adds no CLI surface.
 const READY_MARKER_ENV: &str = "MDS_TEST_READY";
 
-/// The readiness marker line itself (stderr).
+/// Contents written to the readiness file named by [`READY_MARKER_ENV`].
 const READY_MARKER: &str = "MDS_WATCH_READY";
 
-/// Emit the readiness marker on stderr when `MDS_TEST_READY=1` is set.
+/// Signal readiness by creating the file named by `MDS_TEST_READY`.
 ///
 /// Called by both watch modes at the single instant where **every** file of
 /// interest is covered by at least one detector: its parent directory is armed
 /// with the OS watcher *and* its `(mtime, size)` baseline has been captured.
-/// An edit that lands after this line is printed is guaranteed to be observed.
+/// An edit made after this file appears is guaranteed to be observed.
 ///
-/// This exists because no pre-existing line is a sound readiness signal:
+/// This exists because no pre-existing output line is a sound readiness signal:
 /// `"Watching {path}"` is printed *before* the startup compile, and
 /// `"Recompiled …"` only ever appears after a successful *rebuild*. Tests that
 /// keyed off either raced the tail of startup.
 ///
-/// Deliberately gated on an env var rather than a flag: it adds no CLI surface
-/// and no user-visible output. It bypasses `--quiet` on purpose — the
-/// integration suite runs with `-q` and still needs the handshake.
+/// # Why a file and not stderr
+///
+/// The handshake must not perturb the streams the suite asserts on. A marker line
+/// on stderr would have to bypass `--quiet` (the suite runs with `-q`), which puts
+/// bytes into the exact stream two tests inspect for *emptiness* — that stderr
+/// carries a compile error through `-q`, and that the initial-compile-error path
+/// emits something at all. Both assertions silently become unfalsifiable the moment
+/// anything else is written there unconditionally. A side channel has no such
+/// coupling: stdout and stderr stay byte-for-byte what a real user would see.
+///
+/// Write-then-rename so a test polling for the path can never observe a partially
+/// written marker. Failures are ignored: this is a test affordance, and a watcher
+/// that cannot create the file must still watch.
 fn emit_ready_marker() {
-    if std::env::var(READY_MARKER_ENV).is_ok_and(|v| v == "1") {
-        eprintln!("{READY_MARKER}");
+    let Some(raw) = std::env::var_os(READY_MARKER_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(raw);
+    // Absolute paths only. A relative value would resolve against the watcher's cwd
+    // — which under `cargo test` is the crate root — and litter the source tree.
+    if !path.is_absolute() {
+        return;
+    }
+    let mut tmp = path.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, READY_MARKER).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -966,18 +991,35 @@ fn run_watch_file(
 
     // ── Arm before publish (startup race) ─────────────────────────────────────
     //
-    // INVARIANT: for every file of interest, its `(mtime, size)` baseline is
-    // captured no later than the moment it is first read, and its directory
-    // watch is armed no later than that.
+    // GUARANTEED for the entry and the vars file: the directory watch is armed and
+    // the `(mtime, size)` baseline captured strictly BEFORE either is first read.
+    // Both are knowable from the command line, so both happen below, ahead of
+    // `build_runtime_vars` (reads vars) and `compile_and_write` (reads the entry).
+    //
+    // NOT guaranteed for dependencies. A dep only becomes known when the compile
+    // reports it, so a dep whose directory is not the entry's or the vars file's is
+    // armed — and has its baseline taken — only *after* the compile has already read
+    // it (see the post-compile arming loop and the baseline merge further down). An
+    // edit to such a dep inside that window is still invisible to both detectors.
+    // Deps that happen to sit in an already-armed directory are covered by the OS
+    // watch from the start; cross-directory deps are the residual, and are what
+    // `MDS_TEST_READY` exists to let the integration suite synchronise past.
     //
     // The watcher used to be created *after* the initial compile so the dedup
     // baseline was recorded "before any FSEvents arrive". That ordering left a
-    // window — output written → watcher armed → baseline snapshotted — in which
-    // an edit was invisible to BOTH detectors, permanently: inotify was not yet
-    // armed so no event was ever generated, and the baseline snapshot captured
-    // the already-edited state, so the liveness probe compared the edit against
-    // itself and reported "no change" forever. A user who saved during startup
-    // silently lost that save.
+    // window — output written → watcher armed → baseline snapshotted — in which an
+    // edit generated no event at all: inotify was not yet armed, so there was
+    // nothing to deliver it to. A user who saved during startup saw no rebuild.
+    //
+    // Whether that was *late* or *permanent* was decided by the liveness probe, and
+    // NOT by the poisoned baseline: `liveness_probe_file` returns `recovery ||
+    // changed`, and `recovery` is true on `first_tick` unconditionally — so on an
+    // idle tree the first tick rebuilt and the edit was recovered regardless of what
+    // the baseline held. What made it permanent is that the tick may never arrive:
+    // `recv_timeout` restarts its deadline on every message, so a steady stream of
+    // irrelevant events in the watched tree starves the probe indefinitely. That
+    // starvation is tracked separately as #319; closing this window is what stops it
+    // being reachable from a normal startup.
     //
     // Arming first means the watcher may observe the compile's own reads and the
     // startup output write. Three pre-existing guards cover that, and each is
@@ -1002,12 +1044,6 @@ fn run_watch_file(
         notify::Config::default(),
     )
     .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
-
-    // Install Ctrl+C handler (errors here are non-fatal — we'll catch disconnect).
-    let tx_ctrlc = tx.clone();
-    let _ = ctrlc::set_handler(move || {
-        let _ = tx_ctrlc.send(Msg::Interrupt);
-    });
 
     // Arm the directories that are knowable before any read: the entry's parent
     // and the vars file's parent. Dependency dirs are unknown until the compile
@@ -1132,11 +1168,24 @@ fn run_watch_file(
     // an edit landing anywhere inside the startup window still register as a
     // difference on the first liveness tick.
     let mut last_mtimes = snapshot_state(&foi);
-    debug_assert!(
-        pre_mtimes.keys().all(|p| foi.contains(p)),
-        "pre-compile baseline must be a subset of the final files of interest"
-    );
+    // Witness for the assertion below. The merge DIRECTION is the load-bearing part:
+    // only the pre-compile pair predates an edit that landed during startup, so
+    // inverting the merge (or switching to an `or_insert`-style one that keeps the
+    // value already present) silently restores the lost-save bug while every test
+    // still passes. `entry` is inserted verbatim by `files_of_interest`, so this
+    // lookup hits. The previous assertion here compared the key sets of
+    // `files_of_interest(entry, &[], vars)` and `files_of_interest(entry, &deps, vars)`
+    // — a subset relation those two calls guarantee by construction, so it could
+    // never fail and guarded nothing.
+    let entry_pre = pre_mtimes.get(&entry).copied();
     last_mtimes.extend(pre_mtimes);
+    debug_assert_eq!(
+        last_mtimes.get(&entry).copied(),
+        entry_pre,
+        "baseline merge inverted: the entry's pre-compile (mtime, size) must survive \
+         the merge with the post-compile snapshot, or an edit made during startup can \
+         never register as a difference"
+    );
 
     let mut state = FileWatchState {
         // armed_dirs mirrors watched_dirs at startup: all dirs that were successfully
@@ -1164,6 +1213,21 @@ fn run_watch_file(
         output_path,
         quiet,
     };
+
+    // ── Ctrl+C: install LAST, immediately before the loop that can service it ──
+    //
+    // Installing a handler converts SIGINT from "terminate now" into "enqueue
+    // `Msg::Interrupt`", and that message is only ever read by the event loop below.
+    // So every instruction between `set_handler` and the loop is a stretch of
+    // startup during which Ctrl+C does nothing at all — the process keeps compiling
+    // and keeps writing output, then exits 0 as if the user had never pressed it.
+    // Repeat presses do not help; only SIGKILL does. The cost scales with the size
+    // of the startup compile, so this must stay below it. Nothing above needs the
+    // handler: arming the watcher only needs `tx`, which is cloned here just as well.
+    let tx_ctrlc = tx.clone();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx_ctrlc.send(Msg::Interrupt);
+    });
 
     // Every dir is armed and every baseline captured — the watch is now live.
     emit_ready_marker();
@@ -1823,12 +1887,6 @@ fn dir_watch_startup(
     )
     .map_err(|e| miette::miette!("failed to initialize file watcher: {e}"))?;
 
-    // Install Ctrl+C handler.
-    let tx_ctrlc = tx.clone();
-    let _ = ctrlc::set_handler(move || {
-        let _ = tx_ctrlc.send(Msg::Interrupt);
-    });
-
     // Watch the root recursively.
     watcher
         .watch(&root, RecursiveMode::Recursive)
@@ -2013,6 +2071,20 @@ fn dir_watch_startup(
         debounce_ms,
         quiet,
     };
+
+    // ── Ctrl+C: install LAST, once the loop that can service it is about to run ──
+    //
+    // See the matching note in `run_watch_file`. Dir mode is the worse case: an
+    // installed handler only enqueues `Msg::Interrupt`, which nothing reads until
+    // `run_watch_dir`'s loop starts, and startup here makes TWO full passes over
+    // every source in the tree (the compile-and-write pass above, then the
+    // dedup-baseline pass). Installing before those passes means Ctrl+C during a
+    // large-tree startup is swallowed for their whole duration, and the tool writes
+    // the remaining outputs and exits 0. Nothing above needs the handler.
+    let tx_ctrlc = tx.clone();
+    let _ = ctrlc::set_handler(move || {
+        let _ = tx_ctrlc.send(Msg::Interrupt);
+    });
 
     // Root, external dep dirs and the vars dir are all armed — the watch is live.
     emit_ready_marker();

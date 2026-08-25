@@ -235,15 +235,6 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "Returns one of exactly two `&'static str` literals (`build.rs::kind_label`); \
          it is a compile-time label for an `OutputKind`, not user data.",
     ),
-    (
-        "watch.rs",
-        "READY_MARKER",
-        "`const READY_MARKER: &str = \"MDS_WATCH_READY\"` — a fixed ASCII literal, the \
-         test-only watch readiness marker emitted by `emit_ready_marker` when \
-         `MDS_TEST_READY=1`. No runtime value is interpolated: the whole format \
-         argument IS the constant, so there is nothing for a hostile input to reach. \
-         Escaping it would corrupt the marker the test harness matches on.",
-    ),
     // ── Integer counters — a `usize`/`u128` cannot carry a control byte ───────
     (
         "build.rs",
