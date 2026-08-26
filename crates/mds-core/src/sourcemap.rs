@@ -19,6 +19,82 @@
 //! property that later phases rely on when embedding source maps inside
 //! HTML comments (`<!--# sourceMappingURL=... -->`). Do **not** change the
 //! alphabet.
+//!
+//! # S-tag provenance legend
+//!
+//! Several comments in this file and in three sibling files carry
+//! `S`-prefixed tags marking which workstream phase introduced or
+//! governs each code path.  These are informal planning labels, not
+//! formal identifiers.  This legend derives each meaning from the
+//! call sites in tracked source only.
+//!
+//! **S3** — call-site-only recording via suppression.  When a
+//! `@define` function body has no known `Origin`, `MapBuilder`
+//! increments `suppress` for the body's duration; individual body
+//! nodes are not recorded.  Only the `Interpolation` point for the
+//! call site in the parent output is mapped.
+//!
+//! **S6** — `@include` fragment splice carrying foreign source
+//! indices.  `push_fragment_segment` on `MapBuilder` inserts rebased
+//! `FragmentMap` segments from the included module using that
+//! module's own source index rather than `current_src`.
+//!
+//! **S7** — `Origin` provenance stamping.  An `Origin` value (file
+//! display name + raw source bytes) is built once per module that
+//! contains `@define` blocks and stored on each `FunctionDef` so
+//! that source-map recording can attribute body nodes to the
+//! *defining* file rather than the call site.
+//!
+//! *B1 extends S7*: a change referenced as B1 in `resolver.rs` and
+//! `evaluator.rs` removed the `source_map_mode` gate that formerly
+//! guarded `Origin` construction, so `Origin` is now populated
+//! unconditionally whenever `@define` blocks are present — regardless
+//! of whether source-map mode is enabled.
+//!
+//! **S8** — fine-grained function-body descent; mutually exclusive
+//! with S3 on any given call.  When a `FunctionDef` carries an
+//! `Origin`, `invoke_function` switches `MapBuilder::current_src` to
+//! the defining file, records body nodes individually, and calls
+//! `rebase_trim` to adjust the segments after `.trim()`.
+//!
+//! ## S5 is not Stage 5
+//!
+//! This file separately numbers a finalization pipeline Stage 1
+//! through Stage 5 (the functions `expand_per_line`, `compensate_cr`,
+//! `clamp_trailing_trim`, `shift_frontmatter`, and `encode_vlq`).
+//! The `S`-tag numbering and the `Stage` numbering are two independent
+//! schemes that collide visually.
+//!
+//! `crates/mds-core/tests/source_map_vfs.rs` pairs the S-tag `S5`
+//! with two different Stage labels — test cases `S5/stage-2` and
+//! `S5/stage-4` — proving that `S5` is not `Stage 5`.  What `S5`
+//! positively means is recorded only in a local planning document
+//! that is not tracked in this repository; that document is not
+//! authoritative, so no positive meaning is stated here.
+//!
+//! ## S9 is struck
+//!
+//! `S9` has zero occurrences in `crates/mds-core/src/` in the working
+//! tree and in all of git history.  Verified with a working-tree grep
+//! (empty output) and `git log -S 'S9' -- crates/mds-core/src/`
+//! (zero commits returned).  Its only surviving definition is word
+//! order in a git-ignored local file, which is not authoritative.
+//!
+//! The resource-bound work `S9` would plausibly have named —
+//! `MapBuilder::segments_dropped`, `MapBuilder::no_sources_content`,
+//! `MAX_SOURCEMAP_SEGMENTS`, and `MAX_SOURCES_CONTENT_BYTES` — shipped
+//! untagged and is documented at each item individually.
+//!
+//! ## Scope of this legend
+//!
+//! This legend covers `S`-prefixed source-map provenance tags in four
+//! files: `sourcemap.rs` (this file), `resolver.rs`, `evaluator.rs`,
+//! and `scope.rs`.  It does **not** cover `PF-*` pitfall IDs,
+//! `ADR-*` architectural decisions, or `AC-*` acceptance criteria.
+//!
+//! `S1`, `S2`, and `S14` appearing elsewhere in this repository are
+//! unrelated slice labels from other workstreams, not part of this
+//! scheme.
 
 use std::sync::Arc;
 
