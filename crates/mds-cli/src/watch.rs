@@ -50,8 +50,9 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use mds::MdsError;
 
 use crate::build::{
-    auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content, load_config,
-    resolve_output_path_for_kind, write_output, OutputKind, RuntimeVarArgs,
+    auto_detect_mds_file, build_runtime_vars, compile_and_write, compile_to_content,
+    emit_duplicate_var_warnings, load_config, resolve_output_path_for_kind, write_output,
+    OutputKind, RuntimeVarArgs,
 };
 use crate::output::{
     canonicalize_out_dir, collect_mds_files, eprint_error, eprint_warning, is_partial,
@@ -937,7 +938,8 @@ fn rebuild_file(
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
-        Ok(v) => v,
+        // Flags are fixed for the session; warned once at startup — discard here.
+        Ok(v) => v.vars,
         Err(e) => {
             eprint_error(e);
             state.last_mtimes = snapshot_state(&state.foi);
@@ -1143,11 +1145,13 @@ fn run_watch_file(
     // For explicit -o / --out-dir the path is determined by the flag.
     // For the default case (no explicit flag), the path depends on the output kind, which
     // is only known after compilation — so we compile first, then derive.
-    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+    let resolved = build_runtime_vars(RuntimeVarArgs {
         vars: vars_path.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
+    emit_duplicate_var_warnings(&resolved, quiet);
+    let runtime_vars = resolved.vars;
 
     // Load project config (for output_dir) — used if no explicit -o / --out-dir.
     let config = load_config(&entry)?;
@@ -1791,7 +1795,8 @@ fn liveness_probe_dir(
             set_vars: ctx.static_set_vars.clone(),
             set_string_vars: ctx.static_set_string_vars.clone(),
         }) {
-            Ok(v) => v,
+            // Flags are fixed for the session; warned once at startup — discard here.
+            Ok(v) => v.vars,
             Err(e) => {
                 eprint_error(e);
                 // Re-baseline so the next tick does not report the same change again
@@ -1916,7 +1921,8 @@ fn handle_fs_event_dir(
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
     }) {
-        Ok(v) => v,
+        // Flags are fixed for the session; warned once at startup — discard here.
+        Ok(v) => v.vars,
         Err(e) => {
             eprint_error(e);
             // Re-baseline so the idle-tick content backstop does not report the same
@@ -2061,11 +2067,13 @@ fn dir_watch_startup(
 
     // Startup compile: compile all .mds files found under root.
     let all_files = collect_mds_files(&root, MAX_COLLECT_DEPTH, exclude_prefix.as_deref());
-    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+    let resolved = build_runtime_vars(RuntimeVarArgs {
         vars: vars_path.clone(),
         set_vars: static_set_vars.clone(),
         set_string_vars: static_set_string_vars.clone(),
     })?;
+    emit_duplicate_var_warnings(&resolved, quiet);
+    let runtime_vars = resolved.vars;
 
     // Build the dependency graph and compile all files at startup.
     let mut state = DirWatchState {
@@ -2181,12 +2189,17 @@ fn dir_watch_startup(
 
     // Build the dedup baseline for any source whose startup compile did not record
     // one (partials are skipped above; a failed write leaves no entry).
+    // dir_watch_startup calls build_runtime_vars twice: once above (emit) and once
+    // here (discard) — emitting at both sites would double-print the warning on
+    // directory-watch startup. Test I9 is the sole mechanical guard on this.
     {
-        let baseline_vars = build_runtime_vars(RuntimeVarArgs {
+        let baseline_resolved = build_runtime_vars(RuntimeVarArgs {
             vars: vars_path.clone(),
             set_vars: static_set_vars.clone(),
             set_string_vars: static_set_string_vars.clone(),
         })?;
+        // Flags are fixed for the session; warned once above at startup — discard here.
+        let baseline_vars = baseline_resolved.vars;
         for source in &all_files {
             let key = graph_key(source);
             if is_partial(source) {

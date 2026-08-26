@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`mds build`, `mds check`, `mds lint`, and `mds watch` now warn when a
+  variable key is repeated within a single `--set` or `--set-string` group
+  (#200).** The last value still wins (unchanged), but a warning is emitted to
+  stderr so the collision is visible. Example:
+  ```
+  warning: variable 'name' is set more than once by --set; the last value wins
+  ```
+  The warning is suppressed by `--quiet`. Repeating the same key across `--set`
+  and `--set-string` in the same invocation remains a hard error (unchanged).
+
 ### Fixed
 
 - **`mds watch` no longer silently loses a save made during startup (#317).**

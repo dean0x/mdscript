@@ -870,8 +870,8 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. Rejected for directory input. Warns if the extension contradicts the template kind. |
 | `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. |
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
-| `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
-| `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
+| `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. Repeating a key emits a warning; the last value wins. |
+| `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). Repeating a key emits a warning; the last value wins. |
 | `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
 
 **Output path resolution** (precedence order, highest first):
@@ -947,8 +947,8 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--diff` | With `--fix`: print unified diff of pending changes without writing. |
 | `--format <FORMAT>` | Output format: `human` (default, stderr) or `json` (stdout). |
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
-| `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
-| `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
+| `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. Repeating a key emits a warning; the last value wins. |
+| `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. Repeating a key emits a warning; the last value wins. |
 | `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. (The directory-depth warning — fires on trees deeper than MAX_DEPTH=64 — is emitted regardless of `--quiet`.) |
 
 **Directory mode** (`mds lint <dir>`):

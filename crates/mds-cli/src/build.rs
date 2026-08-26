@@ -519,20 +519,49 @@ pub(crate) fn load_optional_vars_file(
         .transpose()
 }
 
+/// Result of [`build_runtime_vars`]: the resolved map plus intra-flag duplicate-key
+/// lists for warning emission via [`emit_duplicate_var_warnings`].
+#[derive(Debug)]
+pub(crate) struct RuntimeVars {
+    /// The merged variable map (`None` when no vars were given at all).
+    pub(crate) vars: Option<HashMap<String, mds::Value>>,
+    /// Keys that appeared more than once inside `--set` (first-occurrence order,
+    /// one entry per key regardless of how many times it repeated).
+    pub(crate) duplicate_set_keys: Vec<String>,
+    /// Keys that appeared more than once inside `--set-string` (same contract).
+    pub(crate) duplicate_set_string_keys: Vec<String>,
+}
+
+/// Collect keys that appear more than once in `pairs`, in first-occurrence order,
+/// one entry per key regardless of repetition count.
+fn duplicate_keys(pairs: &[(String, String)]) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut dupes: Vec<String> = Vec::new();
+    for (k, _) in pairs {
+        if !seen.insert(k.as_str()) && !dupes.iter().any(|d: &String| d == k) {
+            dupes.push(k.clone());
+        }
+    }
+    dupes
+}
+
 /// Merge a `--vars` file with `--set` and `--set-string` overrides into a single map.
 ///
 /// Processing order: file vars < `--set`/`--set-string` overrides.
 /// Within each flag group, later flags win (last-wins). Cross-flag duplicate keys
 /// (a key present in both `--set` and `--set-string`) are rejected with an error.
-pub(crate) fn build_runtime_vars(
-    args: RuntimeVarArgs,
-) -> Result<Option<HashMap<String, mds::Value>>> {
+///
+/// Intra-flag duplicates (a key repeated within `--set` or within `--set-string`)
+/// are allowed; the last value wins, and the caller is responsible for warning via
+/// [`emit_duplicate_var_warnings`].
+pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
     let RuntimeVarArgs {
         vars,
         set_vars,
         set_string_vars,
     } = args;
 
+    // Cross-flag hard error must come BEFORE duplicate detection (test U5).
     // Collect unique keys used by --set for cross-flag duplicate detection.
     let set_keys: HashSet<&str> = set_vars.iter().map(|(k, _)| k.as_str()).collect();
 
@@ -545,6 +574,10 @@ pub(crate) fn build_runtime_vars(
         }
     }
 
+    // Detect intra-flag duplicates AFTER the cross-flag check.
+    let duplicate_set_keys = duplicate_keys(&set_vars);
+    let duplicate_set_string_keys = duplicate_keys(&set_string_vars);
+
     let mut runtime_vars = load_optional_vars_file(vars)?;
     for (key, val) in set_vars {
         runtime_vars
@@ -556,7 +589,38 @@ pub(crate) fn build_runtime_vars(
             .get_or_insert_with(HashMap::new)
             .insert(key, mds::Value::String(val));
     }
-    Ok(runtime_vars)
+    Ok(RuntimeVars {
+        vars: runtime_vars,
+        duplicate_set_keys,
+        duplicate_set_string_keys,
+    })
+}
+
+/// Emit `warning: variable '…' is set more than once by --set/--set-string` lines
+/// for any duplicate keys found by [`build_runtime_vars`].
+///
+/// AD-224-3: every untrusted value interpolated into `eprint_warning` must be wrapped
+/// in `safe_inline(…)` **at the interpolation site** — not hoisted into a `let` binding
+/// first.  The call is repeated rather than bound so the print-discipline guard can see
+/// it.  See `build.rs:318-320` for the same pattern.
+///
+/// AD-224-5: no-op when `quiet` is true.
+pub(crate) fn emit_duplicate_var_warnings(resolved: &RuntimeVars, quiet: bool) {
+    if quiet {
+        return;
+    }
+    for key in &resolved.duplicate_set_keys {
+        crate::output::eprint_warning(&format!(
+            "warning: variable '{}' is set more than once by --set; the last value wins",
+            crate::output::safe_inline(key)
+        ));
+    }
+    for key in &resolved.duplicate_set_string_keys {
+        crate::output::eprint_warning(&format!(
+            "warning: variable '{}' is set more than once by --set-string; the last value wins",
+            crate::output::safe_inline(key)
+        ));
+    }
 }
 
 /// Read from stdin and return the source string along with the current working directory.
@@ -1092,11 +1156,13 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
         inline,
         embed_sources: flag_embed_sources,
     } = args;
-    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+    let resolved = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
         set_string_vars,
     })?;
+    emit_duplicate_var_warnings(&resolved, quiet);
+    let runtime_vars = resolved.vars;
 
     // Resolve the input: explicit path, or auto-detect from cwd.
     // When auto-detected, print a "Building {path}" banner so users know which file was selected.
@@ -1981,7 +2047,7 @@ mod tests {
     #[test]
     fn build_runtime_vars_same_flag_last_wins() {
         // Within a single flag group, the last occurrence wins (no error).
-        let result = build_runtime_vars(RuntimeVarArgs {
+        let resolved = build_runtime_vars(RuntimeVarArgs {
             vars: None,
             set_vars: vec![
                 ("x".to_string(), "1".to_string()),
@@ -1990,18 +2056,28 @@ mod tests {
             set_string_vars: vec![],
         })
         .expect("same-flag last-wins must not error");
-        let map = result.expect("non-empty vars");
+        let map = resolved.vars.expect("non-empty vars");
         assert_eq!(
             map.get("x"),
             Some(&mds::Value::Number(2.0)),
             "last --set wins within the same flag"
+        );
+        // U1: the duplicate key is reported in the struct.
+        assert_eq!(
+            resolved.duplicate_set_keys,
+            vec!["x".to_string()],
+            "duplicate_set_keys must list 'x'"
+        );
+        assert!(
+            resolved.duplicate_set_string_keys.is_empty(),
+            "duplicate_set_string_keys must be empty"
         );
     }
 
     #[test]
     fn build_runtime_vars_same_flag_string_last_wins() {
         // Within --set-string, the last occurrence also wins (no error).
-        let result = build_runtime_vars(RuntimeVarArgs {
+        let resolved = build_runtime_vars(RuntimeVarArgs {
             vars: None,
             set_vars: vec![],
             set_string_vars: vec![
@@ -2010,11 +2086,97 @@ mod tests {
             ],
         })
         .expect("same-flag last-wins in --set-string must not error");
-        let map = result.expect("non-empty vars");
+        let map = resolved.vars.expect("non-empty vars");
         assert_eq!(
             map.get("id"),
             Some(&mds::Value::String("009".to_string())),
             "last --set-string wins within the same flag"
+        );
+        // U2: the duplicate key is reported in the struct.
+        assert_eq!(
+            resolved.duplicate_set_string_keys,
+            vec!["id".to_string()],
+            "duplicate_set_string_keys must list 'id'"
+        );
+        assert!(
+            resolved.duplicate_set_keys.is_empty(),
+            "duplicate_set_keys must be empty"
+        );
+    }
+
+    // ── U3: a key repeated 3+ times is reported exactly once ─────────────────
+
+    #[test]
+    fn build_runtime_vars_triple_repeat_reported_once() {
+        // RED: duplicate_set_keys should list "x" exactly once, not twice or three times.
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![
+                ("x".to_string(), "1".to_string()),
+                ("x".to_string(), "2".to_string()),
+                ("x".to_string(), "3".to_string()),
+            ],
+            set_string_vars: vec![],
+        })
+        .expect("triple repeat must not error");
+        assert_eq!(
+            resolved.duplicate_set_keys,
+            vec!["x".to_string()],
+            "a key repeated 3 times must appear exactly once in duplicate_set_keys; \
+             got: {:?}",
+            resolved.duplicate_set_keys
+        );
+    }
+
+    // ── U4: distinct keys produce no duplicates (negative control) ────────────
+
+    #[test]
+    fn build_runtime_vars_distinct_keys_no_duplicates() {
+        // RED: duplicate lists must be empty when every key appears exactly once.
+        let resolved = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+            ],
+            set_string_vars: vec![("c".to_string(), "three".to_string())],
+        })
+        .expect("distinct keys must not error");
+        assert!(
+            resolved.duplicate_set_keys.is_empty(),
+            "distinct --set keys must produce no duplicates; got: {:?}",
+            resolved.duplicate_set_keys
+        );
+        assert!(
+            resolved.duplicate_set_string_keys.is_empty(),
+            "distinct --set-string keys must produce no duplicates; got: {:?}",
+            resolved.duplicate_set_string_keys
+        );
+    }
+
+    // ── U5: cross-flag hard error precedes duplicate detection ───────────────
+
+    #[test]
+    fn build_runtime_vars_cross_flag_wins_over_intra_flag_duplicate() {
+        // U5: a case that is BOTH a cross-flag collision AND an intra-flag duplicate
+        // (x in --set twice, x in --set-string once) must return the cross-flag ERROR,
+        // not a warning about the intra-flag duplicate.
+        let result = build_runtime_vars(RuntimeVarArgs {
+            vars: None,
+            set_vars: vec![
+                ("x".to_string(), "1".to_string()),
+                ("x".to_string(), "2".to_string()),
+            ],
+            set_string_vars: vec![("x".to_string(), "three".to_string())],
+        });
+        assert!(
+            result.is_err(),
+            "cross-flag collision must be a hard error even when --set also has a duplicate"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("variable 'x' is set by both --set and --set-string"),
+            "error must identify the cross-flag collision; got: {msg}"
         );
     }
 
@@ -2058,13 +2220,13 @@ mod tests {
     #[test]
     fn build_runtime_vars_distinct_keys_no_error() {
         // Using --set and --set-string for DIFFERENT keys must succeed.
-        let result = build_runtime_vars(RuntimeVarArgs {
+        let resolved = build_runtime_vars(RuntimeVarArgs {
             vars: None,
             set_vars: vec![("num".to_string(), "42".to_string())],
             set_string_vars: vec![("id".to_string(), "007".to_string())],
         })
         .expect("distinct keys across flags must not error");
-        let map = result.expect("non-empty vars");
+        let map = resolved.vars.expect("non-empty vars");
         assert_eq!(map.get("num"), Some(&mds::Value::Number(42.0)));
         assert_eq!(map.get("id"), Some(&mds::Value::String("007".to_string())));
     }

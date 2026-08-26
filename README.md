@@ -93,7 +93,9 @@ Build/Watch options:
                               dir-mode watch: mirrors source subtree)
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
+                              Repeating a key warns; the last value wins.
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
+                              Repeating a key warns; the last value wins.
   --source-map                Write a Source Map v3 sidecar (<output-file>.map, e.g. -o out.md → out.md.map); output is
                               byte-identical to a no-flag build. Ignored for messages-mode
                               templates (no renderable output). See ⚠ privacy note below.
