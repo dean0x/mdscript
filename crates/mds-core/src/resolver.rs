@@ -857,11 +857,12 @@ impl ModuleCache {
             } else {
                 // `final_body` is spliced from base-skeleton nodes (base-relative
                 // offsets) and child block overrides (child-relative offsets), so no
-                // single source can attribute every node's offset. Pass empty file/source
-                // so `build_type_mismatch` degrades a `type_mismatch` to spanless rather
-                // than anchoring a base-relative offset against the child source (ADR-005
-                // "degrade rather than mis-attribute"). The source-map branch above keeps
-                // spans correct by evaluating per-region with each region's own origin (#114).
+                // single source can attribute every node's offset (#114). Pass empty
+                // file/source so `build_type_mismatch` degrades a `type_mismatch` to
+                // spanless rather than anchoring a base-relative offset against the
+                // child source (ADR-005 "degrade rather than mis-attribute"). The
+                // source-map branch above keeps spans correct by evaluating per-region
+                // with each region's own origin.
                 (evaluate(&final_body, &mut scope, warnings, "", "")?, None)
             };
 

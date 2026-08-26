@@ -74,11 +74,14 @@
 //!
 //! ## S9 is struck
 //!
-//! `S9` has zero occurrences in `crates/mds-core/src/` in the working
-//! tree and in all of git history.  Verified with a working-tree grep
-//! (empty output) and `git log -S 'S9' -- crates/mds-core/src/`
-//! (zero commits returned).  Its only surviving definition is word
-//! order in a git-ignored local file, which is not authoritative.
+//! Outside this legend text, `S9` has zero occurrences in
+//! `crates/mds-core/src/`.  Verified as of `6d41777` (immediately
+//! before this legend was added): working-tree grep returned empty
+//! output and `git log -S 'S9' -- crates/mds-core/src/` returned
+//! zero commits.  The legend text itself (commit `99fa56d`) is the
+//! sole introduction of `S9` into this tree.  Its only surviving
+//! definition is word order in a git-ignored local file, which is
+//! not authoritative.
 //!
 //! The resource-bound work `S9` would plausibly have named —
 //! `MapBuilder::segments_dropped`, `MapBuilder::no_sources_content`,
