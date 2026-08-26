@@ -86,3 +86,4 @@ crates/mds-python/dist/
 !.devflow/features/*/
 .devflow/features/*/*
 !.devflow/features/*/KNOWLEDGE.md
+!.devflow/conventions.md
