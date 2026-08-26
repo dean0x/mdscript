@@ -1056,8 +1056,10 @@ where
         }
 
         // Sort keys alphabetically for deterministic output.
+        // SAFE to use unstable sort: `map` comes from `Value::Object` (a HashMap) —
+        // keys are unique by construction so no two elements compare equal (tie-free).
         let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
         for (key, val) in entries {
             ctx.total_iterations += 1;

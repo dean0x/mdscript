@@ -128,12 +128,19 @@ fn format_source_named(
 // ── stdin mode ───────────────────────────────────────────────────────────────
 
 fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
+    use crate::output::STDIN_DISPLAY_LABEL;
+
     let FmtFlags { check, diff, quiet } = flags;
     let (source, cwd) = read_stdin()?;
-    let result = format_source_named(&source, Some(&cwd), "<stdin>")?;
+    // AD-211-3: one definition of the stdin sentinel, shared with lint/check/build.
+    let result = format_source_named(&source, Some(&cwd), STDIN_DISPLAY_LABEL)?;
 
     if diff {
-        print_diff(&render_unified_diff(&source, &result.formatted, "<stdin>"))?;
+        print_diff(&render_unified_diff(
+            &source,
+            &result.formatted,
+            STDIN_DISPLAY_LABEL,
+        ))?;
     } else if !check {
         // Plain filter mode: formatted content is the output.
         write_stdout(&result.formatted)?;
@@ -141,7 +148,7 @@ fn run_fmt_stdin(flags: FmtFlags) -> Result<()> {
 
     if check && result.changed {
         if !quiet {
-            eprintln!("Would reformat: <stdin>");
+            eprintln!("Would reformat: {STDIN_DISPLAY_LABEL}");
         }
         std::process::exit(1);
     }

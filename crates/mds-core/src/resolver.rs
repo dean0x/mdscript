@@ -196,7 +196,16 @@ const MAX_IMPORT_DEPTH: usize = 64;
 /// Used as `ctx.file_str` (shown in diagnostics) and as the cycle-detection key
 /// pushed onto `self.resolving` in `resolve_source`/`resolve_source_intrinsic`.
 /// The value `"<source>"` surfaces in miette diagnostic output (e.g. `<source>:3:1`).
-const SOURCE_LABEL: &str = "<source>";
+///
+/// `pub(crate)` so sibling modules can reference the single definition and stay in
+/// sync automatically — no per-module copy needed.  Two consumers inside `mds-core`:
+///
+/// - `sourcemap::map_source_label` — compares against this constant directly.
+/// - `error::MdsError::is_string_source` — wraps the comparison in a public
+///   predicate; downstream crates (`mds-cli`) call that method rather than
+///   hardcoding `"<source>"`, which would have no compile-time link to this
+///   definition.  CLI callers MUST use `is_string_source()`, not this constant.
+pub(crate) const SOURCE_LABEL: &str = "<source>";
 
 /// Warning emitted when `source_map: true` is used with a messages-mode template.
 ///
@@ -351,7 +360,7 @@ impl ModuleCache {
         self.resolve_intrinsic_by_key(&key, runtime_vars, warnings)
     }
 
-    /// Like [`resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// Like [`Self::resolve_path_intrinsic`] but accepts [`crate::CompileOptions`] and
     /// returns `(CompiledOutput, Option<SourceMap>)`.
     pub fn resolve_path_intrinsic_opts(
         &mut self,
@@ -532,7 +541,7 @@ impl ModuleCache {
         self.resolve_intrinsic_by_key(entry, runtime_vars, warnings)
     }
 
-    /// Like [`resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// Like [`Self::resolve_virtual_intrinsic`] but accepts [`crate::CompileOptions`] and
     /// returns `(CompiledOutput, Option<SourceMap>)`.
     pub fn resolve_virtual_intrinsic_opts(
         &mut self,
@@ -600,7 +609,7 @@ impl ModuleCache {
 
     /// Resolve a module from an in-memory source string, dispatching on output shape.
     ///
-    /// Like [`resolve_source`] but dispatches on `has_message_block`, returning a
+    /// Like [`Self::resolve_source`] but dispatches on `has_message_block`, returning a
     /// [`crate::CompiledOutput`] (Markdown or Messages) instead of a rendered string.
     pub fn resolve_source_intrinsic(
         &mut self,
@@ -624,7 +633,7 @@ impl ModuleCache {
         Self::check_lifo_pop(result, popped, SOURCE_LABEL)
     }
 
-    /// Like [`resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
+    /// Like [`Self::resolve_source_intrinsic`] but accepts [`crate::CompileOptions`] and
     /// returns `(CompiledOutput, Option<SourceMap>)`.
     pub fn resolve_source_intrinsic_opts(
         &mut self,
@@ -1924,6 +1933,7 @@ impl ModuleCache {
                 names,
                 path,
                 offset,
+                ..
             } => self.resolve_selective_import(names, path, *offset, scope, ctx, warnings),
         }
     }

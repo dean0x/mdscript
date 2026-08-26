@@ -1,6 +1,6 @@
 # Linting demo
 
-`mds lint` runs nine static-analysis rules over a template *without executing it*,
+`mds lint` runs ten static-analysis rules over a template *without executing it*,
 catching correctness and style problems that `mds check` does not. This directory
 demonstrates the rules, the JSON output, the auto-fixer, and per-rule severity
 configuration via `mds.json`.
@@ -51,19 +51,18 @@ Human-readable diagnostics go to **stderr**; each message ends with a period.
 
 ```console
 $ mds lint examples/linting/demo.mds
-mds::lint::redundant-else
+mds::lint::unused-variable
 
-  ⚠ [redundant-else] The @else body is identical to the @if body — the
-  │ conditional produces the same output regardless of the condition.
-    ╭─[demo.mds:16:1]
- 15 │
- 16 │ @if audience == "developers":
-    · ─┬─
-    ·  ╰── The @else body is identical to the @if body — the conditional produces the same output regardless of the condition.
- 17 │ Thanks for reading, {{audience}}.
-    ╰────
-  help: Remove the @else branch or make its content different from the @if
-        body.
+  ⚠ [unused-variable] Variable 'retries' is defined in frontmatter but never
+  │ referenced in the body.
+   ╭─[demo.mds:3:1]
+ 2 │ audience: developers
+ 3 │ retries: 3
+   · ───┬───
+   ·    ╰── Variable 'retries' is defined in frontmatter but never referenced in the body.
+ 4 │ ---
+   ╰────
+  help: Remove the frontmatter key or reference it in the template body.
 
 mds::lint::duplicate-import
 
@@ -79,19 +78,6 @@ mds::lint::duplicate-import
   help: Remove the duplicate import. If different forms are needed (alias vs
         merge), consolidate into one import directive.
 
-mds::lint::unused-variable
-
-  ⚠ [unused-variable] Variable 'retries' is defined in frontmatter but never
-  │ referenced in the body.
-   ╭─[demo.mds:3:1]
- 2 │ audience: developers
- 3 │ retries: 3
-   · ───┬───
-   ·    ╰── Variable 'retries' is defined in frontmatter but never referenced in the body.
- 4 │ ---
-   ╰────
-  help: Remove the frontmatter key or reference it in the template body.
-
 mds::lint::unused-import
 
   ⚠ [unused-import] Import alias 'extra' from './_shared.mds' is never used.
@@ -104,6 +90,20 @@ mds::lint::unused-import
    ╰────
   help: Remove the @import or use the alias with @include or as a qualified
         call (`alias.func(...)`).
+
+mds::lint::redundant-else
+
+  ⚠ [redundant-else] The @else body is identical to the @if body — the
+  │ conditional produces the same output regardless of the condition.
+    ╭─[demo.mds:16:1]
+ 15 │
+ 16 │ @if audience == "developers":
+    · ─┬─
+    ·  ╰── The @else body is identical to the @if body — the conditional produces the same output regardless of the condition.
+ 17 │ Thanks for reading, {{audience}}.
+    ╰────
+  help: Remove the @else branch or make its content different from the @if
+        body.
 ```
 
 ## JSON output
@@ -116,7 +116,7 @@ $ mds lint --format json examples/linting/demo.mds
 ```
 
 ```json
-{"files":[{"diagnostics":[{"fixable":false,"help":"Remove the @else branch or make its content different from the @if body.","message":"The @else body is identical to the @if body — the conditional produces the same output regardless of the condition.","rule":"redundant-else","severity":"warn","span":{"length":3,"offset":465}},{"fixable":true,"help":"Remove the duplicate import. If different forms are needed (alias vs merge), consolidate into one import directive.","message":"Duplicate import: './_shared.mds' is imported more than once.","rule":"duplicate-import","severity":"error","span":{"length":7,"offset":74}},{"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.","message":"Variable 'retries' is defined in frontmatter but never referenced in the body.","rule":"unused-variable","severity":"warn","span":{"length":7,"offset":25}},{"fixable":false,"help":"Remove the @import or use the alias with @include or as a qualified call (`alias.func(...)`).","message":"Import alias 'extra' from './_shared.mds' is never used.","rule":"unused-import","severity":"warn","span":{"length":7,"offset":74}}],"file":"demo.mds"}],"truncated":false,"version":1}
+{"files":[{"diagnostics":[{"fix_edits":null,"fixable":false,"help":"Remove the frontmatter key or reference it in the template body.","message":"Variable 'retries' is defined in frontmatter but never referenced in the body.","rule":"unused-variable","severity":"warn","span":{"length":7,"offset":25}},{"fix_edits":null,"fixable":true,"help":"Remove the duplicate import. If different forms are needed (alias vs merge), consolidate into one import directive.","message":"Duplicate import: './_shared.mds' is imported more than once.","rule":"duplicate-import","severity":"error","span":{"length":7,"offset":74}},{"fix_edits":null,"fixable":false,"help":"Remove the @import or use the alias with @include or as a qualified call (`alias.func(...)`).","message":"Import alias 'extra' from './_shared.mds' is never used.","rule":"unused-import","severity":"warn","span":{"length":7,"offset":74}},{"fix_edits":null,"fixable":false,"help":"Remove the @else branch or make its content different from the @if body.","message":"The @else body is identical to the @if body — the conditional produces the same output regardless of the condition.","rule":"redundant-else","severity":"warn","span":{"length":3,"offset":465}}],"file":"demo.mds"}],"truncated":false,"version":1}
 ```
 
 In directory mode the `file` keys are paths relative to the directory you passed
@@ -186,8 +186,13 @@ surfaces `shadow-variable` as **info** (☞) and `unused-variable` as an **error
 > Files outside `config-demo/` find no `mds.json` and use built-in defaults.
 
 Config errors are strict: an unknown severity value or malformed JSON fails the run
-with exit `2`; an unknown *rule name* prints a `warning: unknown lint rule …` and is
-ignored (forward-compatible).
+with exit `2`. An unknown *rule name* is handled more leniently by `mds lint`: a
+`warning: unknown lint rule …` is printed to stderr, the config still loads, lint
+continues, and the unknown rule is not enforced — it is skipped
+(forward-compatible: a config naming a rule from a newer release warns instead of
+failing on an older binary). Pass `--quiet` to suppress it. Other commands
+(`mds build`, `mds check`, `mds fmt`, `mds watch`) also read `mds.json` but do
+not emit the unknown-rule warning.
 
 ## Exit codes
 

@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "__test__/types"
+  },
+  "include": ["__test__/types/**/*.ts"]
+}

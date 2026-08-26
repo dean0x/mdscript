@@ -21,7 +21,7 @@ use crate::lint::config::LintConfig;
 use crate::lint::diagnostic::{LintDiagnostic, LintResultBuilder, Severity};
 use crate::lint::TextEdit;
 
-const RULE: &str = "legacy-interpolation";
+pub(crate) const RULE: &str = "legacy-interpolation";
 
 /// Check for legacy single-brace interpolation syntax in the token stream.
 pub(crate) fn check(

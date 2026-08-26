@@ -63,10 +63,14 @@ Source-map options are **not accepted** — check does not generate output.
 ### `lint(source, opts?)` / `lintFile(path, opts?)` / `lintVirtual(modules, entry, opts?)`
 
 Static analysis. Returns the canonical lint JSON:
-`{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
+`{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help: string | null, fixable, fix_edits: ... | null, span: LintSpan | null},...]},...], truncated: bool, lint_warnings?: string[] }`
+
+`help`, `span`, and `fix_edits` are always-present keys in the JSON object; their value is `null` when the rule emits no hint, produces no source span, or carries no fix edits respectively.
 
 Options: `basePath` (lint only — lintFile derives the base from the file path; lintVirtual resolves against the module map), `vars`, `rules` (`Record<string, "off"|"info"|"warn"|"error">`).
-Unknown rule names in `rules` are silently accepted (a typo has no effect); unknown severity values throw `mds::invalid_options`.
+Unknown rule names in `rules` emit a warning and lint continues — the unknown name has no effect but `result.lint_warnings` (a `string[]` field, absent when empty) is populated so callers can surface the issue; unknown severity values throw `mds::invalid_options`.
+
+**`files[].file` key:** `lint()` sets this to `"input.mds"` (string-source); `lintFile()` sets it to the file's path; `lintVirtual()` sets it to the caller-supplied entry key. The CLI additionally relabels stdin input as `"<stdin>"` — this asymmetry does not apply to the napi binding.
 
 See `index.d.ts` for the full typed surface.
 

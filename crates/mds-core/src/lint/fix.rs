@@ -60,7 +60,7 @@
 //!
 //! ## Containment deduplication (AC-F-26)
 //!
-//! Before overlap detection, [`dedup_contained_or_identical`] removes any edit
+//! Before overlap detection, `dedup_contained_or_identical` removes any edit
 //! whose byte range is fully contained within an earlier retained edit. This handles
 //! the common case where two rules fire on the same block (e.g. `unreachable-branch`
 //! and `empty-block` both targeting the same `@if`): the wider edit subsumes the
@@ -235,9 +235,9 @@ fn reverify_failure_reason(err: &MdsError) -> String {
 /// A plan of fix edits for a single file's source.
 ///
 /// Obtain via [`plan_fixes`] or [`plan_fixes_with_options`], then pass to
-/// [`apply_fixes`] or [`apply_fixes_incremental`]. External crates that need an
-/// empty plan can use `FixPlan::default()`; its fields are `pub`, so they remain
-/// directly readable and writable.
+/// [`apply_fixes_incremental`]. External crates that need an empty plan can
+/// use `FixPlan::default()`; its fields are `pub`, so they remain directly
+/// readable and writable.
 ///
 /// This type is `#[non_exhaustive]`: new fields may be added in minor releases;
 /// do not use a struct literal in external crates.
@@ -261,6 +261,12 @@ pub struct FixPlan {
 /// Marked `#[non_exhaustive]` so that adding new variants in a future release
 /// does not constitute a semver-breaking change for downstream crates that match
 /// on this enum. External callers must include a `_ => {}` wildcard arm.
+///
+/// **Warning:** a bare `_ => {}` arm silently swallows
+/// [`FixOutcome::PartiallyFixed`], which was added in v0.4.0 and is never
+/// returned by the deprecated [`apply_fixes`]. Code migrated from `apply_fixes`
+/// may carry a wildcard arm that discards partial results without any compiler
+/// signal. Match `PartiallyFixed` explicitly if partial results matter.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FixOutcome {
@@ -277,6 +283,11 @@ pub enum FixOutcome {
     /// least one individual edit passes the reverify gate.  The `source` field holds the
     /// partially-fixed text; `residual` carries the residual diagnostics (from the last
     /// successful per-edit reverify); `rejected` lists every edit that was turned down.
+    ///
+    /// **New in v0.4.0.** The deprecated [`apply_fixes`] never returned this variant, so
+    /// code migrated from it may carry a `_ => {}` wildcard arm that silently discards
+    /// partial results — there is no compiler signal when the arm matches. Match this
+    /// variant explicitly if partial results matter.
     PartiallyFixed {
         /// The partially-fixed source (accepted edits applied, rejected edits untouched).
         source: String,
@@ -582,22 +593,22 @@ fn regressed_rules(
 /// single pass, so earlier edits' offsets remain valid after later edits are
 /// applied.
 ///
-/// # `_unchecked` suffix — ADR-001
+/// # `_unchecked` suffix — ADR-004
 ///
-/// This function bypasses the ADR-001 reverify gate (compile-equivalence
-/// check) — it applies edits without recompiling or verifying that the fixed
-/// source produces identical compiled output. Production code that writes back
-/// to disk **must** use [`apply_fixes`] instead, which gates on the reverify
-/// callback before returning `FixOutcome::Fixed`. `apply_plan_unchecked` is
-/// provided for the `--fix --diff` / `--fix --check` diff-preview path (which
-/// computes the delta without writing it) and for unit tests. Calling it on a
-/// write path without a subsequent reverify is an anti-pattern — the reverify
-/// gate is the only guard against a fix that accidentally changes compiled
-/// semantics.
+/// This function bypasses the ADR-004 reverify gate — it applies edits without
+/// recompiling or verifying that the fixed source produces identical compiled
+/// output. Production code that writes back to disk **must** use
+/// [`apply_fixes_incremental`] instead, which gates on the reverify callback
+/// before returning `FixOutcome::Fixed` or `FixOutcome::PartiallyFixed`.
+/// `apply_plan_unchecked` is provided for the `--fix --diff` / `--fix --check`
+/// diff-preview path (which computes the delta without writing it) and for unit
+/// tests. Calling it on a write path without a subsequent reverify is an
+/// anti-pattern — the reverify gate is the only guard against a fix that
+/// accidentally changes compiled semantics.
 ///
 /// The caller must pass `plan` with `overlap_rejected == false`; if true,
-/// calling this function is a logic error (use [`apply_fixes`] which checks
-/// this).
+/// calling this function is a logic error (use [`apply_fixes_incremental`] which
+/// checks this).
 ///
 /// # Panics
 ///
@@ -662,6 +673,47 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 
 /// Apply a `FixPlan` with a reverify callback.
 ///
+/// # Deprecated (AD-209-1)
+///
+/// Use [`apply_fixes_incremental`] instead. (applies ADR-004)
+///
+/// `apply_fixes` implements the ADR-004 three-tier reverify gate as a single
+/// all-or-nothing call: `reverify` runs once and either the whole batch is
+/// accepted or the whole batch is refused. `apply_fixes_incremental` provides
+/// the same safety contract with a batch-first attempt plus a bounded per-edit
+/// fallback (capped at `FALLBACK_MAX_EDITS = 50`), which salvages the safe
+/// subset rather than refusing wholesale. That is why the deprecation is
+/// correct rather than arbitrary (applies ADR-004).
+///
+/// ## Migration deltas (not a drop-in replacement)
+///
+/// 1. **Closure bound change**: `apply_fixes` takes `F: FnOnce`;
+///    `apply_fixes_incremental` requires `F: Fn` because `reverify` may be
+///    called more than once. A move-once closure cannot migrate mechanically.
+///
+/// 2. **New reachable outcome**: `apply_fixes_incremental` can return
+///    `FixOutcome::PartiallyFixed` (some edits accepted, some refused).
+///    `apply_fixes` never returns `PartiallyFixed`. `FixOutcome` is
+///    `#[non_exhaustive]`, so existing wildcard arms still compile, but a
+///    wildcard that swallows `PartiallyFixed` silently discards partial
+///    results.
+///
+/// 3. **Reverify call count**: `apply_fixes` calls `reverify` exactly once;
+///    `apply_fixes_incremental` calls it up to `plan.edits.len() + 1` times.
+//
+// Why the body was not deleted:
+//
+// `crates/mds-core/src/lint/fix.rs` does not exist at tag `v0.3.0` (the
+// newest published tag at this commit), so `apply_fixes` has never been
+// published to crates.io. However, deleting it would silently drop coverage
+// of six ADR-004 reverify-gate behaviors that are pinned only through this
+// function, with no equivalent on the `apply_fixes_incremental` path. These
+// tests must be ported or retired before removal at v0.5.0. The enumerated
+// list (test names, line numbers, and the behavior each pins) lives in GitHub
+// issue #304 (v0.5.0 removal tracker for `apply_fixes`).
+//
+/// # Behavior
+///
 /// The `reverify` callback is called with the fixed source and must return:
 /// - `Ok(LintResult)`: the lint result of the fixed source (may be empty).
 /// - `Err(MdsError)`: the fixed source failed the check gate.
@@ -687,6 +739,16 @@ pub fn apply_plan_unchecked(source: &str, plan: &FixPlan) -> String {
 ///   did (i.e. the edit introduced a new, non-fixed problem).
 ///
 /// Returns `FixOutcome::Fixed`, `FixOutcome::Rejected`, or `FixOutcome::NothingToFix`.
+// Deprecation template (align other #[deprecated] attributes in this crate to this form):
+// verb "use" | fully-qualified replacement path | one behavioural-difference clause |
+// explicit removal version | terminal period | #[must_use] with reason string.
+#[deprecated(
+    since = "0.4.0",
+    note = "use `mds::fix::apply_fixes_incremental`; not a drop-in swap — the reverify \
+            closure must be `Fn`, not `FnOnce`, and the replacement can return \
+            `FixOutcome::PartiallyFixed`, which a `_ => {}` wildcard arm silently discards. \
+            To be removed in v0.5.0; see the item docs."
+)]
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes<F>(source: &str, plan: FixPlan, original: &LintResult, reverify: F) -> FixOutcome
 where
@@ -799,7 +861,9 @@ pub const FALLBACK_MAX_EDITS: usize = 50;
 /// - [`FixOutcome::NothingToFix`] — empty plan with no overlap.
 ///
 /// Unlike [`apply_fixes`] which requires `F: FnOnce`, this function requires `F: Fn` because
-/// `reverify` may be called up to `plan.edits.len() + 1` times.
+/// `reverify` may be called up to `plan.edits.len() + 1` times. It can also return
+/// [`FixOutcome::PartiallyFixed`], which `apply_fixes` never returned — code migrated from
+/// `apply_fixes` may carry a `_ => {}` wildcard arm that silently discards partial results.
 #[must_use = "a dropped FixOutcome silently discards the fix result"]
 pub fn apply_fixes_incremental<F>(
     source: &str,
@@ -1388,6 +1452,10 @@ mod tests {
     /// `dedup_contained_or_identical`: B.end=18 > max_end(12) → B is not contained,
     /// both edits are retained.
     /// `has_overlapping_edits`: A.end=12 > B.start=6 → partial overlap → rejected.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn a4_partial_overlap_still_rejected_after_dedup() {
         let source = "line0\nline1\nline2\n";
@@ -1650,6 +1718,10 @@ mod tests {
 
     // ── L-FIX-REV1: Reverify gate ────────────────────────────────────────────
 
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn l_fix_rev1_reverify_failure_rejects_fix() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1677,6 +1749,10 @@ mod tests {
     ///
     /// The embedded `{err}` is asserted non-empty, confirming that a real error
     /// was propagated rather than a blank placeholder.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1735,6 +1811,10 @@ mod tests {
 
     /// T-REASON-1 [security-11 / CWE-117 / PF-013 / #176]: the reverify failure reason
     /// produced by `apply_fixes` escapes the embedded `MdsError` Display.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn apply_fixes_rejection_reason_escapes_embedded_error_display() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\n";
@@ -1829,6 +1909,10 @@ mod tests {
     /// The source has the second `@import` starting at byte 23
     /// (`"@import \"./a.mds\" as a\n"` = 23 bytes), which is a valid char
     /// boundary, so `diag_to_edit` succeeds and the plan is non-empty.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn reverify_success_returns_fixed() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1865,6 +1949,10 @@ mod tests {
     /// `unused-variable` that coexists with a fixable `duplicate-import`) survives the
     /// reverify but must NOT cause the fix to be refused — residual findings are
     /// expected to remain and determine the exit code.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn reverify_preexisting_untargeted_survives_and_fix_applies() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1886,6 +1974,10 @@ mod tests {
 
     /// A genuinely NEW untargeted diagnostic introduced by the edit IS a regression
     /// and must refuse the fix.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn reverify_new_untargeted_diagnostic_is_rejected() {
         let source = "@import \"./a.mds\" as a\n@import \"./a.mds\" as b\nHello!\n";
@@ -1953,6 +2045,10 @@ mod tests {
     /// so `unused-import` cannot fire on a standalone file. `unused-function` fires
     /// when `has_explicit_exports && !exported && !called` — achieved here with an
     /// explicit `@export greet` plus an unexported, uncalled `@define dead():`.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn tier_b_unused_function_standalone_apply_succeeds() {
         // Standalone source: no @import, no @extends, has explicit @export.
@@ -2020,6 +2116,10 @@ mod tests {
     ///
     /// This verifies the mechanism the CLI relies on: when the reverify closure
     /// returns `Err` due to an output delta, the entire fix batch is refused.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn l_fix_rev1_output_delta_causes_rejection() {
         let source = "Hello World!\n";
@@ -2367,6 +2467,10 @@ mod tests {
 
     /// PF-005 regression: `apply_fixes` with unsorted edits must return
     /// `FixOutcome::Rejected`, NOT silently corrupt the source.
+    #[expect(
+        deprecated,
+        reason = "AD-209-1: exercises deprecated apply_fixes path pending v0.5.0 removal"
+    )]
     #[test]
     fn pf005_unsorted_edits_rejected_in_apply_fixes() {
         let source = "LineA\nLineB\n";
@@ -2456,6 +2560,72 @@ mod tests {
     /// Applies ADR-004: a three-tier safety gate is only as useful as its refusal
     /// reporting — surfacing the real rejection reason is diagnostic infrastructure
     /// for the whole `--fix` feature.
+    /// T-FE-FIX [ADR-008 / Option-B]: the functional `--fix` path reads raw bytes
+    /// directly from `LintDiagnostic.fix_edits` and must never sanitize them.
+    ///
+    /// Option B sanitizes only the JSON display wire (`to_canonical_json`).  The
+    /// `diag_to_edits` → `ByteEdit.replacement` chain must carry the original bytes
+    /// unchanged so that `apply_plan_unchecked` writes them back to disk verbatim.
+    ///
+    /// This is a regression guard: it must stay GREEN before AND after the
+    /// `to_canonical_json` change (only the JSON serializer is modified; `diag_to_edits`
+    /// is untouched).
+    #[test]
+    fn fix_path_preserves_raw_bytes_in_new_text() {
+        // Build `new_text` with hazardous bytes programmatically (PF-018).
+        let esc = '\u{001B}';
+        let rlo = '\u{202E}';
+        let nl = '\n';
+        let hostile = format!("{{{{{esc}name{rlo}{nl}}}}}");
+
+        let source = format!("{{{esc}name{rlo}{nl}}}");
+        let edit_start = 0;
+        let edit_end = source.len();
+
+        // Ensure the byte range is char-boundary valid so diag_to_edits doesn't drop it.
+        assert!(source.is_char_boundary(edit_start));
+        assert!(source.is_char_boundary(edit_end));
+
+        let diag = LintDiagnostic {
+            rule: "legacy-interpolation".to_string(),
+            severity: crate::lint::diagnostic::Severity::Warn,
+            message: "test".to_string(),
+            help: None,
+            span: None,
+            file: Some("t.mds".to_string()),
+            fix_removals: None,
+            fix_edits: Some(vec![crate::lint::diagnostic::TextEdit {
+                start: edit_start,
+                end: edit_end,
+                new_text: hostile.clone(),
+            }]),
+        };
+
+        let edits = diag_to_edits(&diag, &source);
+        assert_eq!(edits.len(), 1, "non-vacuity: one edit must be produced");
+
+        // The replacement must carry the raw bytes — same as stored in new_text.
+        assert_eq!(
+            edits[0].replacement, hostile,
+            "diag_to_edits must clone new_text raw into ByteEdit.replacement; \
+             sanitizing here would corrupt the file written by apply_plan_unchecked"
+        );
+
+        // Confirm the raw hazardous chars ARE in the replacement (non-vacuity).
+        assert!(
+            edits[0].replacement.contains(esc),
+            "raw ESC must survive in ByteEdit.replacement (fix path, not JSON wire)"
+        );
+        assert!(
+            edits[0].replacement.contains(rlo),
+            "raw RLO must survive in ByteEdit.replacement (fix path, not JSON wire)"
+        );
+        assert!(
+            edits[0].replacement.contains(nl),
+            "raw newline must survive in ByteEdit.replacement (fix path, not JSON wire)"
+        );
+    }
+
     #[test]
     fn rejected_reason_includes_per_edit_failure_details() {
         let source = "LineA\n";

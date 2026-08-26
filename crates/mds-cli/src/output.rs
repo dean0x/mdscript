@@ -24,6 +24,161 @@ use miette::Result;
 
 use crate::build::{MdsConfig, OutputKind};
 
+// ── Stdin display sentinel ────────────────────────────────────────────────────
+
+/// AD-211-1 / AD-211-3: the single stdin source-identity sentinel used by every
+/// CLI diagnostic context.
+///
+/// Every user-visible emission of stdin's source identity — human diagnostics, JSON
+/// `files[].file`, fix-preview status lines, diff headers, source-map `sources[]`,
+/// and the analysis-failure envelope — uses this exact string.  The remap is applied
+/// at the CLI output boundary; `crates/mds-core` continues to carry `"input.mds"`
+/// (STRING_SOURCE_MAP_LABEL) as the internal VFS entry key, which is NOT changed.
+///
+/// Centralised here so the CLI has exactly one definition of the sentinel (AD-211-3),
+/// replacing the previously scattered literals — including the hardcoded `"<stdin>"`
+/// in `apply_source_map_file_label`, the `OK: <stdin>` status line in `main.rs`, and
+/// the `fmt` stdin label.
+pub(crate) const STDIN_DISPLAY_LABEL: &str = "<stdin>";
+
+// ── Stdin source-identity relabel (AD-211-5) ─────────────────────────────────
+
+/// Render-boundary wrapper that replaces the source identity embedded in an
+/// [`mds::MdsError`] with [`STDIN_DISPLAY_LABEL`].
+///
+/// `resolve_source_intrinsic` sets `ctx.file_str = "<source>"`, so every error a
+/// string-source (stdin) analysis produces carries `NamedSource::new("<source>", …)`
+/// and renders as `<source>:L:C`. Replacing it here — not in `crates/mds-core` —
+/// keeps the core constant intact for the non-stdin paths that legitimately use it
+/// (`resolver_tests.rs` locks `SOURCE_LABEL`) and matches the "relabel at the CLI
+/// output boundary" discipline of AD-211-1.
+///
+/// It also matches PF-014: the swap happens on the miette **input** (the
+/// `NamedSource` handed to the renderer), never on already-rendered output.
+///
+/// Delegates every `Diagnostic` method to `inner` except `source_code`, which
+/// returns the pre-built replacement (or `None` when the inner error carried no
+/// embedded source, so miette skips code-frame rendering rather than trying to
+/// resolve spans against a source that is not there).
+///
+/// # Exit codes
+///
+/// This type is transparent to [`crate::build::exit_code`], which unwraps it before
+/// classifying the error. A wrapped `MdsError::FileNotFound` must still exit 2, not
+/// 1 — see the downcast ladder there.
+pub(crate) struct StdinRelabeledError {
+    inner: mds::MdsError,
+    /// `Some(named)` when the inner error's embedded source is the stdin sentinel
+    /// `"<source>"` — replaced with a `NamedSource` labelled `"<stdin>"`.
+    ///
+    /// `None` in two cases:
+    /// - The inner error had no embedded source at all (e.g. `MdsError::Io`).
+    /// - The inner error's embedded source belongs to an **imported file** — its
+    ///   real path must be preserved so miette renders the caret at the correct
+    ///   location.  `source_code()` delegates to `inner` in both sub-cases.
+    source: Option<miette::NamedSource<String>>,
+}
+
+impl StdinRelabeledError {
+    /// The error this wrapper renders. Used by `exit_code` so wrapping cannot
+    /// change a process exit status.
+    pub(crate) fn inner(&self) -> &mds::MdsError {
+        &self.inner
+    }
+}
+
+impl std::fmt::Display for StdinRelabeledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::fmt::Debug for StdinRelabeledError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for StdinRelabeledError {}
+
+impl miette::Diagnostic for StdinRelabeledError {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        miette::Diagnostic::code(&self.inner)
+    }
+    fn severity(&self) -> Option<miette::Severity> {
+        miette::Diagnostic::severity(&self.inner)
+    }
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        miette::Diagnostic::help(&self.inner)
+    }
+    fn url<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        miette::Diagnostic::url(&self.inner)
+    }
+    fn labels<'a>(&'a self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + 'a>> {
+        miette::Diagnostic::labels(&self.inner)
+    }
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        match &self.source {
+            Some(ns) => Some(ns as &dyn miette::SourceCode),
+            // When `source` is None the relabel decided NOT to replace: either the
+            // inner error carries no source at all (MdsError::Io) or it carries a
+            // real imported-file source that must be preserved intact.  Delegate so
+            // miette still renders the imported-file code frame correctly.
+            None => miette::Diagnostic::source_code(&self.inner),
+        }
+    }
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
+        miette::Diagnostic::related(&self.inner)
+    }
+    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
+        miette::Diagnostic::diagnostic_source(&self.inner)
+    }
+}
+
+/// AD-211-5: build a report whose embedded source identity reads
+/// [`STDIN_DISPLAY_LABEL`] instead of the core's `"<source>"`.
+///
+/// This is a **conditional** label swap: the replacement only happens when the
+/// inner error's embedded `NamedSource` carries the stdin sentinel `"<source>"`
+/// set by `resolve_source_intrinsic`.  Errors whose embedded source belongs to an
+/// **imported file** carry the real file path and are left untouched — replacing
+/// them would render the caret against stdin text at the wrong location, which is
+/// exactly the PF-012 in-bounds-but-wrong class this PR set out to avoid.
+/// AD-211-5 only authorised relabelling stdin's OWN source identity.
+///
+/// The source text used for span rendering, the message, the code, the help and
+/// the labels are all untouched.  `miette`'s own
+/// [`miette::Report::with_source_code`] cannot do this: its `WithSourceCode`
+/// wrapper returns `self.error.source_code().or(Some(&self.source_code))`, so an
+/// inner diagnostic that already carries a `NamedSource` (which these do) wins
+/// and the replacement is ignored.
+///
+/// Call sites (symbolic references; prefer these over line numbers to avoid stale citations):
+/// - `mds check -`: `run_check` in `crates/mds-cli/src/main.rs`
+/// - `mds build -` (single-file path): `compile_to_content` in `crates/mds-cli/src/build.rs`
+/// - `mds build -` (directory stdin path): `run_build` in `crates/mds-cli/src/build.rs`
+/// - `mds lint -`: `run_lint_stdin` in `crates/mds-cli/src/lint.rs` (direct call)
+///   and `run_lint_file` via `emit_analysis_failure_json_or_stderr` (indirect)
+///
+/// Any new CLI boundary that renders a stdin analysis failure must call this
+/// function; skipping it renders `<source>` and breaks the uniform-sentinel rule.
+pub(crate) fn relabel_stdin_error(e: &mds::MdsError, source: &str) -> miette::Report {
+    // Only replace the embedded source when the inner error's source name is the
+    // stdin sentinel set by `resolve_source_intrinsic` — checked via
+    // `e.is_string_source()`, which keeps the sentinel comparison inside mds-core.
+    // Errors from imported files carry the real file path; replacing them would
+    // render the caret against stdin text at the wrong location (PF-012 / AD-211-5 scope).
+    miette::Report::new(StdinRelabeledError {
+        source: if e.is_string_source() {
+            miette::Diagnostic::source_code(e)
+                .map(|_| mds::named_source_for_render(STDIN_DISPLAY_LABEL, source))
+        } else {
+            None
+        },
+        inner: e.clone(),
+    })
+}
+
 // ── Output base for directory mode ────────────────────────────────────────────
 
 /// Describes where directory-mode output files are written.

@@ -6,7 +6,7 @@ import pathlib
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 # ── E1/E2: MdsError type + structured fields ────────────────────────────────────
 

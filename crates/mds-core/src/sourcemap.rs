@@ -67,9 +67,9 @@ impl std::fmt::Debug for Origin {
 
 /// Canonical `sources[]` label for in-memory (string-source) compilations.
 ///
-/// All paths that produce a [`MapBuilder`] for string-source input converge
-/// on [`MapBuilder::new`] or [`MapBuilder::source_index`].  Both choke-points
-/// apply [`map_source_label`] so the diagnostic sentinel `"<source>"` can
+/// All paths that produce a `MapBuilder` for string-source input converge
+/// on `MapBuilder::new` or `MapBuilder::source_index`.  Both choke-points
+/// apply `map_source_label` so the diagnostic sentinel `"<source>"` can
 /// never appear in `sources[]`.
 ///
 /// All binding surfaces (WASM, napi, Python, CLI) that handle string-source
@@ -91,12 +91,11 @@ pub const STRING_SOURCE_MAP_LABEL: &str = "input.mds";
 ///   and `"input.mds"` can never coexist as two distinct `sources[]` entries
 ///   even if S8 or spliced-region paths pass the sentinel separately).
 ///
-/// The literal `"<source>"` is used here rather than `SOURCE_LABEL` from
-/// `resolver.rs` to avoid a cross-module dependency.  If the sentinel ever
-/// changes, update this function first.
+/// References `crate::resolver::SOURCE_LABEL` (now `pub(crate)`) so that a change
+/// to the sentinel value is caught at compile time rather than silently drifting.
 #[inline]
 pub(crate) fn map_source_label(name: &str) -> &str {
-    if name == "<source>" {
+    if name == crate::resolver::SOURCE_LABEL {
         STRING_SOURCE_MAP_LABEL
     } else {
         name
@@ -174,9 +173,9 @@ impl SourceMap {
     /// Points whose `out_byte_offset` does not land on a UTF-8 char boundary
     /// are silently dropped (graceful degradation — never panics).
     ///
-    /// This function builds a [`LineTable`] over `body`, resolves each
+    /// This function builds a `LineTable` over `body`, resolves each
     /// byte offset to a `(line, utf16_col)` pair, then calls
-    /// [`encode_mappings`] on the resolved points.
+    /// `encode_mappings` on the resolved points.
     pub fn from_points(
         body: &str,
         sources: Vec<String>,
@@ -445,7 +444,7 @@ pub(crate) fn encode_mappings(mut points: Vec<(u32, u32, u32, u32, u32)>) -> Str
 pub struct CompileOptions {
     /// Generate a [`SourceMap`] and attach it to [`crate::CompileResult::source_map`].
     ///
-    /// When `false` (the default) no [`MapBuilder`] is allocated — zero overhead
+    /// When `false` (the default) no `MapBuilder` is allocated — zero overhead
     /// for callers that do not need mapping data (AC-PERF-01).
     pub source_map: bool,
     /// Include source file contents in the `sourcesContent` array.

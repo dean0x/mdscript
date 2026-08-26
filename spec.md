@@ -858,7 +858,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 - Output extension per file is intrinsic (`.md` or `.json`).
 - With `--out-dir <out>`, mirrors the source subtree under `<out>/`; without it, writes next to source.
 - `-o` is rejected for a directory input.
-- Continue-on-error: all compilable files are attempted; a summary and non-zero exit are produced if any file failed.
+- Continue-on-error: all compilable files are attempted; a summary (`N built, N failed`) is printed when any file fails or when `--quiet` is not passed; non-zero exit when any failed. Under `--quiet`, the summary is suppressed on a fully-successful run and emitted when any file fails, so the non-zero exit is never unexplained.
 - When the directory contains no `.mds` files, exits 0 with a "no files found" message.
 - **Stale-flip cleanup**: when a file's kind changes (e.g., markdown → messages), the old-extension sibling (`.md` or `.json`) is removed automatically.
 - stdin (`mds build -`) with `--out-dir`: the fallback output name is `output.md` (markdown) or `output.json` (messages).
@@ -872,7 +872,7 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
-| `-q, --quiet` | Suppress status messages and warnings on stderr. |
+| `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
 
 **Output path resolution** (precedence order, highest first):
 
@@ -895,7 +895,7 @@ echo "@if flag:" | mds check -             # Validate from stdin
 mds check src/                             # Validate every non-partial .mds in the tree
 ```
 
-Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files.
+Exits 0 if all templates are valid, non-zero on any error. Same `--vars`/`--set`/`--set-string`/`--quiet` options as `mds build`. Directory mode follows the same semantics as `mds build <dir>` (partial skipping, symlink rejection, continue-on-error) but does not write any output files. In directory mode the summary line is `N passed, N failed`, emitted under the same `--quiet` rule as `mds build <dir>` (§7.2): suppressed on a fully-successful run, emitted when any file fails.
 
 ### 7.4 `mds fmt`
 
@@ -915,6 +915,7 @@ Every rewrite is **safety-gated**: the formatter re-compiles both the original a
 |--------|-------------|
 | `--check` | Exit non-zero without writing if any file would change. |
 | `--diff` | Print a unified diff of proposed changes without writing. |
+| `-q, --quiet` | Suppress per-file status messages and the directory summary on a successful run. The summary is still emitted when any file fails to format. Exception: under `--check`, a run where files would reformat but none failed exits 1 with no summary — the would-reformat count is treated as status output and is suppressed by `--quiet` (mirrors the same rule for `mds lint --fix --check`). (Two notices bypass `--quiet`: the directory-depth warning and the all-files-excluded diagnostic.) |
 
 ### 7.5 `mds lint`
 
@@ -934,6 +935,7 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 **Channel discipline:**
 - Human-readable diagnostics → **stderr** (via miette).
 - `--format json` output → **stdout** (single JSON object, one trailing newline).
+- Directory-mode summary → **stderr** (in both human and JSON format modes; stdout remains a single clean JSON document in JSON mode, except under `--fix --diff` which also writes the unified diff to stdout).
 - `--quiet` suppresses warning-severity and info human diagnostics, NOT errors.
 
 **Options:**
@@ -947,7 +949,42 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
 | `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
-| `-q, --quiet` | Suppress warning/info human diagnostics; errors still print. |
+| `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. (The directory-depth warning — fires on trees deeper than MAX_DEPTH=64 — is emitted regardless of `--quiet`.) |
+
+**Directory mode** (`mds lint <dir>`):
+
+- Lints every `.mds` file recursively (including `_`-prefixed partials).
+- Accumulate-and-continue: per-file errors do not abort the run.
+- After processing all files, emits one summary line to stderr:
+  `N clean, N with warnings, N with errors, N resource-limited`
+  Each file falls in exactly one bucket, so the four counts always sum to the number of
+  `.mds` files the walker collected.
+  - "Clean" — no findings.
+  - "With warnings" — warning-severity findings only.
+  - "With errors" — error-severity lint findings **or** a per-file analysis failure
+    (source read, config load, or lint call failure). These two populations are
+    deliberately merged, matching the way `mds build`'s "failed" count merges them.
+  - "Resource-limited" — files where `mds::lint` returned `MdsError::ResourceLimit`
+    (for example, exceeding `MAX_BLOCKS_PER_MODULE`). These are counted here, never
+    under "with errors".
+- Under `--quiet`, the summary is suppressed when the worst outcome is warnings only
+  (mirrors `mds fmt`'s contract).  When any file is in the error or resource-limited
+  bucket, the summary is always emitted so the non-zero exit is never unexplained.
+  **Exception:** `mds lint --fix --check --quiet <dir>` exits 1 with zero
+  stderr bytes when pending fixes exist but no file is in the error or
+  resource-limited bucket — the `--fix --check` pending-fix signal is treated as
+  status output and is suppressed by `--quiet` alongside the summary line.
+- The JSON stdout envelope (`{"files":…,"truncated":…,"version":1}`) is unchanged
+  regardless of `--quiet` or directory mode — no `"summary"` key is added.
+
+**`--quiet` and `--fix` status messages:** `fix rejected: <reason>`, `Partially fixed:`,
+`Would fix:`, and the `diagnostic cap (N) reached` notice are status output gated by
+`--quiet` in **all three input modes** (directory, single file, stdin). `Fixed: <path>` is
+gated by `--quiet` in single-file and directory modes (both `--format human` and `--format
+json`); stdin writes fixed source to stdout rather than writing back to a file, so no
+path-bearing `Fixed:` line appears there. All of these status messages go to **stderr**
+regardless of `--format`; the JSON stdout envelope is unaffected. Error-severity diagnostics
+and the exit code are unaffected by `--quiet`.
 
 **Exit codes** (lint-specific; differ from `mds build`/`mds check`):
 
@@ -976,6 +1013,7 @@ mode, which uses a single config located from the directory argument.
     {
       "diagnostics": [
         {
+          "fix_edits": null,
           "fixable": false,
           "help": "Remove the frontmatter key or reference it in the template body.",
           "message": "Variable 'foo' is defined in frontmatter but never referenced in the body.",
@@ -992,7 +1030,11 @@ mode, which uses a single config located from the directory argument.
 }
 ```
 
-Keys are in alphabetical order (BTreeMap serialization). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is absent for diagnostics that lack a source location.
+Keys are in alphabetical order (BTreeMap serialization). Within each `files[].diagnostics` array, diagnostics are ordered by ascending `span.offset`; span-less diagnostics sort last; equal-offset ties preserve rule-execution order (stable sort). (The CLI and binding surfaces always produce results through `LintResultBuilder`; a `LintResult` assembled directly via `LintResult::new` preserves caller-supplied order instead.) In directory mode, `files[].file` is the forward-slash-separated path relative to the lint root (e.g. `src/template.mds`), and the `files[]` array is ordered by the byte-wise string comparison of that relative display path (e.g. `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'` (0x2F)). `"truncated": true` when the result set was capped by the per-file diagnostic cap of 1,000. `"span"` is JSON `null` for diagnostics that lack a source location. When linting from stdin (`mds lint -`), `files[].file` is `"<stdin>"`.
+
+**`lint_warnings` field (binding surfaces only):** The napi, WASM, and Python binding surfaces include an optional top-level `"lint_warnings"` key in the returned result object when non-fatal warnings were produced during linting (for example, unknown rule names in `mds.json`). In the JSON wire form (napi, WASM, and Python `to_dict()` / `to_json()`) the key is absent (not `null`, not `[]`) when no warnings occurred; on the Python live-object surface, `LintResult.lint_warnings` is a property that always exists and returns an empty list when no warnings occurred. In alphabetical key order `"lint_warnings"` sorts between `"files"` and `"truncated"`. The CLI does **not** include `"lint_warnings"` in its `--format json` stdout envelope — it writes warnings to stderr so the JSON stdout remains valid and parseable without modification.
+
+A file that produces a per-file analysis failure in directory mode (malformed config, I/O error) emits a `{"file":"…","error":{"code":"…","message":"…","help":"…","span":…}}` entry without a `"diagnostics"` key and contributes to exit code 2. When a stdin source fails the check gate before linting begins, the CLI emits an analysis-failure envelope to stdout: `{"version":1,"error":{"code":"…","message":"…","help":"…","span":…}}`. This envelope carries no `"files"` or `"truncated"` key, and no `"file"` key (unlike the success envelope above). A JSON consumer MUST handle both the success envelope and the analysis-failure envelope and MUST NOT assume a `"file"` key is present in error results.
 
 #### Sanitization invariant (v1)
 
@@ -1020,12 +1062,14 @@ escaped, in either mode.
 | `message`, `help` | Every codepoint in the escaped class above is replaced with its six-character `\uXXXX` literal before serialization. |
 | `file` | Sanitized on the same pass as `message`/`help`. Hostile filenames cannot inject control, bidi, or separator characters into this JSON output. A filename occupying one of the **diagnostic** `file` fields — this JSON key, a CLI status line, or a `[file:line:col]` frame header — is escaped with the **full** class including `\n` on each of those, human surfaces included, because it is always rendered on a single line and POSIX permits a newline inside a filename. Two path positions are outside that rule and are **not** escaped: a path interpolated into a diagnostic *message body*, which is prose (see "Residual" below), and a path in a source map or in `CompileResult.dependencies`, which is a functional reference (see "Carve-out" below). |
 | `rule` | Fixed ASCII identifier; never contains control bytes by construction. Not sanitized. |
-| `span`, `fix_edits` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
+| `lint_warnings` | Binding-surface-only field (absent from the CLI's `--format json` stdout). Each element is a human-readable warning string whose interpolated user-supplied values (rule names from the caller's `rules` option) are WIRE-escaped via the full escaped class during construction, before the string is formed. The surrounding template text is static ASCII and contains no codepoints in the escaped class. |
+| `span`, `fix_edits[].start`/`end` | **Raw byte offsets** into the unmodified source — deliberately not sanitized. These are numeric position values and must reflect the original source exactly. |
+| `fix_edits[].new_text` | WIRE-sanitized. This field is a **display preview** of the replacement text; consumers MUST NOT apply it as a patch payload. Applying fixes is `mds lint --fix`, the functional path, which reads raw bytes directly from the internal `LintDiagnostic` struct and never serializes via this JSON field. |
 
 This invariant applies across all surfaces that emit `"version": 1` JSON: CLI
 (`mds lint --format json`), napi (`lintVirtual` / `lint` / `lintFile`), WASM
 (`lintVirtual` / `lint`), and Python (`lint_virtual` / `lint` / `lint_file`).
-All four surfaces emit byte-identical values.
+All four surfaces emit byte-identical values on the fields they share, with two exceptions. First, `"lint_warnings"` is a binding-surface-only key: it is absent from the CLI's `--format json` output (the CLI writes unknown-rule warnings to stderr instead). Second, the `"file"` key takes different values by surface and input method: `mds lint -` (CLI) relabels `"input.mds"` to `"<stdin>"` at the output boundary; the string-source `lint()` entrypoint on napi, WASM, and Python retains `"input.mds"`; `lintVirtual` (napi/WASM) and `lint_virtual` (Python) emit the caller-supplied entry key instead. The fields `message`, `help`, `rule`, `severity`, `span`, and `fix_edits` share the same Rust serializer across all surfaces and are designed to be byte-identical, but no live cross-surface differential test currently compares these fields between the CLI and binding surfaces on a source that produces findings — the existing parity test uses a clean source with no diagnostics. For source maps, the same stdin-relabeling asymmetry applies: `mds build -` (CLI) replaces the internal `"input.mds"` entry with `"<stdin>"` in `sources[]`; binding surface string-source compiles always carry `"input.mds"` in `sources[0]`, and virtual-FS compiles carry the caller-supplied entry key.
 
 ##### Mode is chosen per field, not per surface
 
@@ -1064,9 +1108,9 @@ Applied, that means:
 |-------|------|---------|
 | `message`, `help`, warning bodies, `LabeledSpan` text | HUMAN on terminal surfaces, WIRE on the JSON wire | Prose; legitimately multi-line in a rendered frame |
 | A filename or path in a diagnostic `file` **field**: the JSON `file` key, a CLI status line, a `[file:line:col]` frame header | WIRE on every surface that renders one | Single-line by construction; POSIX permits `\n` in a filename and the user never types it |
-| `mds.json` rule names and config values, `--format` arguments | WIRE on every surface that renders one | Single-line identifiers read from the working tree or the command line |
+| `mds.json` rule names and config values, `--format` arguments | WIRE on every surface that renders one | Single-line identifiers. WIRE applies in all rendering contexts — including when a rule name appears inside a warning body (e.g., the unknown-rule-names warning), the name is WIRE-escaped, not HUMAN. This row takes precedence over the residual row below for `mds.json`-sourced values. |
 | `io::Error` / `MdsError` causes interpolated into a CLI status or warning line | WIRE on every surface that renders one | Single-line, and they embed paths of their own |
-| A path, identifier or cause interpolated into a diagnostic **message body** | HUMAN on terminal surfaces, WIRE on the JSON wire | Follows the message row above — it is part of prose. This is the **residual** below: it is not covered by the WIRE rows |
+| A path, identifier or cause interpolated into a diagnostic **message body** | HUMAN on terminal surfaces, WIRE on the JSON wire | Follows the message row above — it is part of prose. This is the **residual** below: it is not covered by the WIRE rows. Exception: `mds.json` rule names and config values that appear inside a warning body are governed by the WIRE row above, not this residual — the more specific row takes precedence. |
 | Compiled template output (`mds build -o -`) | not escaped | It is the command's product, not a diagnostic; redirects must stay byte-faithful |
 | Source-map `file` / `sources` / `sourcesContent`, and `CompileResult.dependencies` | not escaped | Functional references, not display text; escaping would break resolution. This is the **carve-out** below |
 
@@ -1212,7 +1256,7 @@ Place `mds.json` in the project root (or any ancestor directory). The compiler w
 | Field | Type | Description |
 |-------|------|-------------|
 | `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
-| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. Unknown rule names are warn-and-ignored (forward compat). |
+| `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr and is suppressed by `--quiet`; `mds build`, `mds check`, `mds fmt`, and `mds watch` also read this file but do not emit the unknown-rule warning. On the `lint` API surfaces it is returned in `lint_warnings`. |
 
 Maximum config file size: 1 MB.
 

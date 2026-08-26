@@ -448,11 +448,16 @@ fn parse_options(options: JsValue) -> Result<ParsedOptions, JsValue> {
 /// Parsed options for the `lint` and `lint_virtual` functions.
 ///
 /// Extends the standard options with a `rules` field — absent in `compile`/`check`.
+///
+/// `lint_warnings` is populated (non-empty) when unknown rule names are found;
+/// callers add it to the returned JSON as `lint_warnings: string[]` (D8 binding channel).
 struct ParsedLintOptions {
     /// Standard options (filename, extra_modules, vars).
     opts: ParsedOptions,
     /// Per-rule severity overrides parsed from `options.rules`.
     lint_config: mds::LintConfig,
+    /// Warning message for unknown rule names, if any (AC-224-1 D8 channel).
+    lint_warnings: Option<String>,
 }
 
 /// Extract and validate the `rules` field from a lint options object.
@@ -461,10 +466,13 @@ struct ParsedLintOptions {
 /// names and values are severity strings (`"off"` | `"info"` | `"warn"` | `"error"`).
 /// An absent or null/undefined `rules` key returns the default config (all rules at
 /// built-in defaults). An unknown severity VALUE is a hard error (closed enum).
-fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
+///
+/// D8 (AC-224-1): unknown rule NAMES are detected and returned as warning strings.
+/// Callers surface them via `lint_warnings` in the returned JSON object.
+fn extract_rules(obj: &js_sys::Object) -> Result<(mds::LintConfig, Option<String>), JsValue> {
     let val = get_prop_js(obj, "rules");
     if val.is_undefined() || val.is_null() {
-        return Ok(mds::LintConfig::default());
+        return Ok((mds::LintConfig::default(), None));
     }
     // Deserialize the rules sub-object via serde_wasm_bindgen.
     let rules_json: serde_json::Value = serde_wasm_bindgen::from_value(val)
@@ -493,7 +501,13 @@ fn extract_rules(obj: &js_sys::Object) -> Result<mds::LintConfig, JsValue> {
         })?;
         rules.insert(key, severity);
     }
-    Ok(mds::LintConfig::from_rules(rules))
+    // D8: detect unknown rule names and build config in one step via
+    // from_rules_checked. The return type structurally forces the caller
+    // to handle the unknowns report — a fifth caller cannot accidentally
+    // omit the detection step (review finding: config.rs:104).
+    let (lint_config, unknown) = mds::LintConfig::from_rules_checked(rules);
+    let lint_warnings = unknown.map(|u| mds::format_unknown_rule_names_warning(&u));
+    Ok((lint_config, lint_warnings))
 }
 
 /// Parse the JS options for `lint` and `lint_virtual`.
@@ -507,6 +521,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
         return Ok(ParsedLintOptions {
             opts: ParsedOptions::default(),
             lint_config: mds::LintConfig::default(),
+            lint_warnings: None,
         });
     }
 
@@ -523,7 +538,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
     let filename = extract_filename(&obj)?;
     let extra_modules = extract_modules(&obj)?;
     let vars = extract_vars(&obj)?;
-    let lint_config = extract_rules(&obj)?;
+    let (lint_config, lint_warnings) = extract_rules(&obj)?;
 
     Ok(ParsedLintOptions {
         opts: ParsedOptions {
@@ -534,6 +549,7 @@ fn parse_lint_options(options: JsValue) -> Result<ParsedLintOptions, JsValue> {
             include_sources_content: false,
         },
         lint_config,
+        lint_warnings,
     })
 }
 
@@ -583,6 +599,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
         return Ok(ParsedLintOptions {
             opts: ParsedOptions::default(),
             lint_config: mds::LintConfig::default(),
+            lint_warnings: None,
         });
     }
 
@@ -596,7 +613,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
     reject_unknown_wasm_keys(&obj, &["vars", "rules"])?;
 
     let vars = extract_vars(&obj)?;
-    let lint_config = extract_rules(&obj)?;
+    let (lint_config, lint_warnings) = extract_rules(&obj)?;
 
     Ok(ParsedLintOptions {
         opts: ParsedOptions {
@@ -607,6 +624,7 @@ fn parse_lint_virtual_options(options: JsValue) -> Result<ParsedLintOptions, JsV
             include_sources_content: false,
         },
         lint_config,
+        lint_warnings,
     })
 }
 
@@ -796,7 +814,11 @@ pub fn check(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
 /// ## Returns
 ///
 /// On success, the canonical lint JSON object:
-/// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span?},...]},...], truncated: bool }`
+/// `{ version: 1, files: [{file, diagnostics: [{rule, severity, message, help, fixable, span, fix_edits},...]},...], truncated: bool }`
+///
+/// `help`, `span`, and `fix_edits` are always present JSON keys; their value
+/// is JSON `null` when the rule emits no hint, produces no source span, or
+/// carries no fix edits respectively.  (`span` is `null`, not an absent key.)
 ///
 /// On failure (parse or validation error), throws a JS `Error` with the same
 /// structure as [`compile`].
@@ -834,7 +856,14 @@ pub fn lint(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
         )
         .map_err(mds_error_to_js)?;
 
-        to_js(&result.to_canonical_json())
+        let mut json = result.to_canonical_json();
+        // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+        mds::attach_lint_warnings(
+            json.as_object_mut()
+                .expect("LintResult::to_canonical_json always returns a JSON object"),
+            lint_opts.lint_warnings,
+        );
+        to_js(&json)
     }))
 }
 
@@ -893,7 +922,14 @@ pub fn lint_virtual(modules: JsValue, entry: &str, options: JsValue) -> Result<J
         )
         .map_err(mds_error_to_js)?;
 
-        to_js(&result.to_canonical_json())
+        let mut json = result.to_canonical_json();
+        // LintResult::to_canonical_json is contractually guaranteed to return a JSON object.
+        mds::attach_lint_warnings(
+            json.as_object_mut()
+                .expect("LintResult::to_canonical_json always returns a JSON object"),
+            lint_opts.lint_warnings,
+        );
+        to_js(&json)
     }))
 }
 

@@ -22,6 +22,45 @@
 //! - L-CLI-DIR2: directory --format json files[] order is deterministic (TEST-6)
 //! - I-24: unreachable-branch (always-true @if) --fix applied; file changed, exit 0
 //! - I-26: shadow-variable Info severity emits diagnostic and exits 0 (Info never affects exit)
+//! - AC-224-10: unknown rule name → JSON wire shape unchanged (lint continues)
+//! - AC-224-11: unknown rule warning goes to stderr, not stdout
+//! - AC-224-14: D2(a) asymmetry — build/check/fmt do NOT warn (see cli_build.rs)
+//! - AC-224-19: directory with N files emits exactly ONE unknown-rule warning
+//! - AC-224-21: stdout JSON remains valid when unknown rule name is present
+//! - AC-224-22: --quiet suppresses the unknown-rule warning
+//! - AC-Q06 (#216): clean directory prints exact summary line, nothing else
+//! - AC-Q07 (#216): mixed-severity directory yields exact per-bucket counts
+//! - AC-Q08 (#216): counters partition the file set with no drops or double-counts
+//! - AC-Q09 (#216): resource-limited bucket is genuinely exercised
+//! - AC-Q10 (#216): quiet warn-only lint is silent (with positive control)
+//! - AC-Q11 (#216): quiet lint with error-severity findings still prints summary
+//! - AC-Q12 (#216): quiet lint with resource-limit still prints summary
+//! - AC-Q13 (#216): --fix --check exit path does not skip the summary
+//! - AC-Q14 (#216): warn-only and --fix --check --quiet are silent (D1-a)
+//! - AC-Q15 (#216): JSON directory mode keeps stdout clean; summary on stderr only
+//! - AC-Q16 (#216): JSON envelope key contract is exactly {"files","truncated","version"}
+//! - AC-Q18 (#216): single-file lint prints no directory summary
+//! - AC-Q19 (#216): stdin lint prints no directory summary
+//! - AC-Q20 (#216): bare `mds lint` cannot reach directory mode
+//! - AC-Q21 (#216): empty directory prints no summary
+//! - AC-Q22 (#216): all-excluded quiet lint still emits diagnostic and no summary
+//! - AC-Q25 (#216): hostile filename cannot forge a summary line (with positive control)
+//! - AC-Q26 (#216): help text documents quiet summary contract (machine-verified)
+//! - AC-Q30 (#216): --quiet works in both argument positions for lint
+//! - D4 (#216, PF-004): `fix rejected:` honours --quiet in directory (human + JSON),
+//!   single-file, and stdin mode — four separate emitters, each with its own positive control
+//! - D4 (#216, PF-004): diagnostic-cap notice honours --quiet in all four input modes
+//!   (directory-human, directory-JSON, single-file, stdin) with paired positive controls
+//!   (ADR-009/PF-013)
+//! - D3-a (#216): config-load failure is counted in the "with errors" bucket (not "clean")
+//! - D3-a (#216): config-load failure forces the summary under --quiet (positive control)
+//! - D3-a (#216, unix): chmod-000 source-read failure counted in the "with errors" bucket
+//! - D3-a (#216, unix): chmod-000 source-read failure forces summary under --quiet
+//! - D4 (#216, PF-004): `Fixed:` honours --quiet in dir-mode JSON emitter (positive + negative)
+//! - D4 (#216, PF-004): `Fixed:` honours --quiet in dir-mode human emitter (positive + negative)
+//! - D4 (#216, PF-004): `Would fix:` honours --quiet in dir-mode JSON emitter (positive + negative)
+//! - D4 (#216, PF-004, unix): write failure in dir-JSON mode must not print `Fixed:` (positive + negative)
+//! - D1-a (#216): `--fix --diff --format json` diff precedes JSON envelope on stdout
 
 mod common;
 use common::{assert_no_control_chars, fixture, mds_bin};
@@ -1010,6 +1049,64 @@ fn dir_fix_json_residuals_keyed_by_relative_path_not_input_mds() {
     }
 }
 
+// ── Test (b2): --fix --format json single-file residuals keyed by basename ────
+//
+// Pins that after --fix in SINGLE-FILE mode, residual diagnostics in the JSON
+// output are keyed by the file's basename, NOT by "input.mds".
+//
+// The plan_and_apply_fixes reverify closure calls lint_str_with, which sets
+// diag.file to STRING_SOURCE_MAP_LABEL ("input.mds").  Without set_diag_display_path
+// in the single-file Fixed/PartiallyFixed arms, `mds lint --fix --format json <file>`
+// emitted "input.mds" instead of the real basename.  Directory mode already had the
+// correct relabel (`run_lint_file` in lint.rs); this test pins the single-file parity.
+//
+// Fixture: a file with duplicate-export (Tier A, auto-fixed) + unused-variable
+// (Tier C, residual after fix).  After --fix, the residual must appear under
+// the actual filename, not "input.mds".
+
+#[test]
+fn file_fix_json_residuals_keyed_by_filename_not_input_mds() {
+    let dir = tempfile::tempdir().unwrap();
+    // Use the same fixture shape as dir_fix_json_residuals_keyed_by_relative_path_not_input_mds:
+    // duplicate-export (fixable) + unused-variable (residual after fix).
+    let mixed = "---\ngreeting: Hello\nunused_key: not referenced\n---\n\n\
+                  @define greet(name):\n  Hello {{name}}!\n@end\n\n\
+                  @export greet\n@export greet\n";
+    let target = dir.path().join("mixed.mds");
+    fs::write(&target, mixed).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}; stderr: {stderr}")
+    });
+
+    // After fixing duplicate-export, unused-variable residual remains → exit 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "residual unused-variable must produce exit 1; stderr: {stderr}"
+    );
+
+    let files = json["files"].as_array().expect("must have files[]");
+    assert!(!files.is_empty(), "files[] must be non-empty after fix");
+
+    // Every file key must be the real basename, not "input.mds".
+    for entry in files {
+        let file_key = entry["file"].as_str().unwrap_or("");
+        assert!(
+            !file_key.contains("input.mds"),
+            "file key must NOT be 'input.mds'; got: {file_key}"
+        );
+        assert_eq!(
+            file_key, "mixed.mds",
+            "file key must be the real filename basename; got: {file_key}"
+        );
+    }
+}
+
 // ── Test (c): --fix --check on overlap-fix fixture → "Would fix" after coalescing ──
 //
 // Pins bug-5 / PF-004 fix for the check path: preview_fixes returns a
@@ -1274,10 +1371,19 @@ fn stdin_lint_diagnostic_includes_code_frame() {
         "diagnostic must appear in stdin report-only mode; got: {stderr}"
     );
 
-    // "input.mds" must appear: miette renders it as the file reference in the span header.
+    // "<stdin>" must appear: AD-211-1 relabels the span header from the internal
+    // STRING_SOURCE_MAP_LABEL ("input.mds") to the uniform CLI sentinel.
     assert!(
-        stderr.contains("input.mds"),
-        "stdin mode must show 'input.mds' in the code frame; got: {stderr}"
+        stderr.contains("<stdin>"),
+        "stdin mode must show '<stdin>' in the code frame; got: {stderr}"
+    );
+
+    // PF-013 negative half: the internal VFS key must NOT appear in the human output.
+    // Symmetric with the JSON sibling (stdin_json_wire_file_key_is_stdin_sentinel) which
+    // also asserts absence of "input.mds" alongside the presence assertion for "<stdin>".
+    assert!(
+        !stderr.contains("input.mds"),
+        "stdin human output must not expose the internal VFS key 'input.mds'; got: {stderr}"
     );
 
     // At least one token from the source must appear in the code frame context.
@@ -1285,6 +1391,843 @@ fn stdin_lint_diagnostic_includes_code_frame() {
     assert!(
         stderr.contains("@export"),
         "code frame must include the offending source line '@export greet'; got: {stderr}"
+    );
+}
+
+// ── AC-P1-01: stdin JSON wire `files[].file` emits "<stdin>" ─────────────────
+//
+// Pins issue #211: every stdin lint path must emit `"<stdin>"` in the JSON
+// `files[].file` key, not the internal VFS sentinel `"input.mds"`.
+//
+// Covers: run_lint_stdin report-only mode with --format json.
+
+#[test]
+fn stdin_json_wire_file_key_is_stdin_sentinel() {
+    // Source with a known lint finding that needs no file imports so lint_str_with
+    // succeeds and emits a regular diagnostic JSON (not an analysis-failure envelope).
+    // duplicate-export fires without any resolver look-ups.
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    let out = lint_stdin(source, &["--format", "json"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    let files = v["files"].as_array().expect("JSON must have 'files' array");
+    assert!(
+        !files.is_empty(),
+        "stdin JSON must have at least one file group (duplicate-export fires); got: {stdout}"
+    );
+    for entry in files {
+        let file_key = entry["file"]
+            .as_str()
+            .expect("each file entry must have a 'file' string");
+        assert_eq!(
+            file_key, "<stdin>",
+            "AC-P1-01: JSON files[].file must be '<stdin>' for stdin input, not '{file_key}'"
+        );
+    }
+    // AC-P1-01/AC-P1-27, negative half: the internal VFS key must not leak anywhere
+    // in the document, not just in the key this test read.
+    assert!(
+        !stdout.contains("input.mds"),
+        "AC-P1-27: 'input.mds' must not appear anywhere in CLI stdout for a stdin \
+         lint; got: {stdout}"
+    );
+}
+
+// ── AC-P1-08/#202: JSON wire diagnostics sorted by byte offset ───────────────
+//
+// Pins issue #202: within a file group, diagnostics must appear in ascending
+// byte-offset order regardless of the order the rules were applied in.
+
+/// Fixture whose OFFSET order is the reverse of its RULE-EXECUTION order.
+///
+/// `run_rules` (crates/mds-core/src/lint/mod.rs) dispatches `duplicate_export`
+/// fifth and `legacy_interpolation` tenth — so without a sort, `duplicate-export`
+/// (the LATER offset) is emitted first. `{name}` on line 2 is a legacy
+/// single-brace interpolation at a low offset; the repeated `@export greet` at the
+/// end is a duplicate export at a high offset.
+///
+/// A fixture whose diagnostics are already ascending cannot detect the sort being
+/// removed — the assertion would hold either way.
+const OUT_OF_ORDER_FIXTURE: &str =
+    "@define greet(name):\n  Hello {name}!\n@end\n\n@export greet\n@export greet\n";
+
+fn stdin_json_diagnostics(source: &str) -> Vec<serde_json::Value> {
+    let out = lint_stdin(source, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be JSON: {e}\n{stdout}"));
+    let files = v["files"].as_array().expect("JSON must have 'files' array");
+    assert_eq!(
+        files.len(),
+        1,
+        "stdin lint must emit exactly one file group"
+    );
+    files[0]["diagnostics"]
+        .as_array()
+        .expect("must have 'diagnostics'")
+        .clone()
+}
+
+#[test]
+fn stdin_json_diagnostics_sorted_by_offset() {
+    let diags = stdin_json_diagnostics(OUT_OF_ORDER_FIXTURE);
+
+    let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
+    let offsets: Vec<i64> = diags
+        .iter()
+        .filter_map(|d| d["span"]["offset"].as_i64())
+        .collect();
+
+    // Non-vacuity guard: this assertion is meaningless on a single diagnostic, and
+    // meaningless if the two land on the same offset.
+    assert_eq!(
+        offsets.len(),
+        diags.len(),
+        "every diagnostic in this fixture must carry a span; got: {diags:?}"
+    );
+    assert!(
+        offsets.len() >= 2 && offsets[0] != offsets[offsets.len() - 1],
+        "AC-P1-08 needs at least two diagnostics at DISTINCT offsets to be a real \
+         check; got rules {rules:?} at offsets {offsets:?}"
+    );
+
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        offsets, sorted,
+        "AC-P1-08: diagnostics must be in ascending byte-offset order; \
+         got rules {rules:?} at offsets {offsets:?}"
+    );
+
+    // The positive control: `duplicate_export` runs BEFORE `legacy_interpolation`
+    // in run_rules but fires at the LATER offset, so it must appear LATER in the
+    // array. Delete the sort in LintResultBuilder::build and this flips.
+    let legacy = rules
+        .iter()
+        .position(|r| *r == "legacy-interpolation")
+        .expect("fixture must produce a legacy-interpolation diagnostic");
+    let dup = rules
+        .iter()
+        .position(|r| *r == "duplicate-export")
+        .expect("fixture must produce a duplicate-export diagnostic");
+    assert!(
+        legacy < dup,
+        "AC-P1-08: emitted order must follow byte offset, not rule-dispatch order \
+         (duplicate_export is dispatched first but fires later in the file); \
+         got rules {rules:?} at offsets {offsets:?}"
+    );
+}
+
+/// AC-P1-09: the human renderer must present diagnostics in the same order as the
+/// JSON renderer — proving the sort lives on `LintResult.diagnostics` and not in
+/// one renderer (PF-007: a per-surface assertion could not show this).
+#[test]
+fn stdin_human_and_json_diagnostic_order_match() {
+    let json_rules: Vec<String> = stdin_json_diagnostics(OUT_OF_ORDER_FIXTURE)
+        .iter()
+        .filter_map(|d| d["rule"].as_str().map(str::to_string))
+        .collect();
+    // Non-vacuity guard: two empty sequences compare equal and prove nothing.
+    assert!(
+        json_rules.len() >= 2,
+        "AC-P1-09 needs at least two diagnostics to compare an ORDER; got {json_rules:?}"
+    );
+
+    let out = lint_stdin(OUT_OF_ORDER_FIXTURE, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Rule names appear in the miette `code` line of each rendered diagnostic.
+    let human_rules: Vec<String> = stderr
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            json_rules
+                .iter()
+                .find(|r| t == format!("mds::lint::{r}") || t == **r)
+                .cloned()
+        })
+        .collect();
+
+    assert_eq!(
+        human_rules, json_rules,
+        "AC-P1-09: human and JSON surfaces must agree on diagnostic order.\n\
+         json: {json_rules:?}\nhuman: {human_rules:?}\nstderr:\n{stderr}"
+    );
+}
+
+/// AC-P1-11: repeated lints of identical input are byte-identical.
+#[test]
+fn stdin_json_output_is_byte_identical_across_runs() {
+    let first = lint_stdin(OUT_OF_ORDER_FIXTURE, &["--format", "json"]).stdout;
+    for run in 2..=5 {
+        let next = lint_stdin(OUT_OF_ORDER_FIXTURE, &["--format", "json"]).stdout;
+        assert_eq!(
+            first,
+            next,
+            "AC-P1-11: run {run} differed from run 1.\nrun1: {}\nrun{run}: {}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&next)
+        );
+    }
+}
+
+// ── AC-P1-07 / AD-211-5: the analysis-failure envelope labels stdin `<stdin>` ──
+
+/// Pull the source identity out of a miette code-frame header, e.g. the
+/// `<stdin>` in `[<stdin>:1:1]`.
+///
+/// Returning `Option` and requiring the caller to unwrap keeps this from passing
+/// vacuously: a rendering that emitted no frame at all yields `None` and fails,
+/// rather than silently satisfying a "does not contain `<source>`" assertion
+/// (PF-013).
+fn frame_source_identity(rendered: &str) -> Option<String> {
+    let start = rendered.find('[')?;
+    let rest = &rendered[start + 1..];
+    let end = rest.find(']')?;
+    let inner = &rest[..end];
+    // `<label>:LINE:COL` — strip the trailing two numeric fields.
+    let mut parts: Vec<&str> = inner.rsplitn(3, ':').collect();
+    parts.reverse();
+    (parts.len() == 3 && parts[1].chars().all(|c| c.is_ascii_digit())).then(|| parts[0].to_string())
+}
+
+#[test]
+fn stdin_analysis_failure_labels_source_as_stdin() {
+    // A source that fails the check gate: `@if` without a condition is a hard
+    // syntax error, so lint_str_with returns Err and takes the
+    // emit_analysis_failure_json_or_stderr path.
+    let source = "@if\nbroken\n";
+
+    // Human channel: the miette frame header must name <stdin>.
+    let human = lint_stdin(source, &[]);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
+        panic!("expected a miette code frame with a `[label:line:col]` header; got:\n{stderr}")
+    });
+    assert_eq!(
+        identity, "<stdin>",
+        "AC-P1-07: the analysis-failure frame must name '<stdin>'; got '{identity}'.\n{stderr}"
+    );
+    assert_eq!(
+        human.status.code(),
+        Some(2),
+        "an analysis failure must still exit 2; stderr:\n{stderr}"
+    );
+
+    // JSON channel: the analysis-failure envelope is `{"version":1,"error":{...}}`.
+    //
+    // The `error` object carries `code`, `message`, `help`, and `span` — there is
+    // NO top-level `file` key and NO `file` key inside `error`.  A JSON consumer
+    // MUST NOT look for `files[].file` in this envelope; it is only present on
+    // the success envelope (`{"version":1,"files":[...],"truncated":...}`).
+    // This contract is documented in the CHANGELOG "Lint JSON wire contract" block
+    // (AC-P1-07 / AD-211-5) and pinned here so it cannot regress silently.
+    let json = lint_stdin(source, &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("analysis-failure JSON must parse");
+    assert!(
+        v["error"].is_object(),
+        "JSON analysis failure must use the error envelope; got: {stdout}"
+    );
+    // AC-P1-07 / AD-211-5: the error envelope has no `file` key at the top level —
+    // a stdin source identity never appears here.  Asserting null explicitly so a
+    // regression that adds `"file": "<stdin>"` to this envelope is caught.
+    assert!(
+        v.get("file").is_none() || v["file"].is_null(),
+        "AC-P1-07: analysis-failure JSON envelope must have NO top-level 'file' key; \
+         got: {stdout}"
+    );
+    // Also confirm `files` (the success envelope's array) is absent — both keys
+    // would indicate a confused merge of the two envelope shapes.
+    assert!(
+        v.get("files").is_none() || v["files"].is_null(),
+        "AC-P1-07: analysis-failure JSON envelope must have NO 'files' array; got: {stdout}"
+    );
+    let message = v["error"]["message"]
+        .as_str()
+        .expect("error.message must be a string");
+
+    // Non-vacuity guard: the message must be non-empty so the absence checks below
+    // are not trivially satisfied by an empty string.
+    assert!(
+        !message.is_empty(),
+        "AC-P1-07: error.message must not be empty"
+    );
+
+    // ADR-009 / PF-013 positive controls: apply the SAME extraction pipeline
+    // (`serde_json::from_str` → `v["error"]["message"].as_str()` → `.contains()`)
+    // to a SYNTHETIC JSON document that embeds each forbidden value.
+    //
+    // **Why synthetic rather than a binary built at 113f472?**  Spawning a
+    // historical CLI binary inside a cargo test is impractical — it requires
+    // a pre-built artifact committed to the repo or a build-time download,
+    // neither of which is feasible here.  A synthetic envelope is the
+    // next-best option: it validates that the serde path (`v["error"]["message"]
+    // .as_str()`) can detect the forbidden values when they ARE present,
+    // which is exactly the failure mode a regression would introduce (the key
+    // moves or the value is `null`).  The tradeoff is that the control cannot
+    // prove the live CLI would emit the forbidden value if the fix regressed.
+    //
+    // **Near-vacuous JSON-channel absence assertions:** analysis (2026-08-14)
+    // shows that no `MdsError` Display template interpolates `ctx.file_str` (the
+    // resolved file path) into the rendered message, so `"<source>"` structurally
+    // cannot reach `error.message` through any current code path.  The absence
+    // checks are therefore largely structural rather than behavioral; the
+    // non-vacuous coverage rests on the human-channel `frame_source_identity`
+    // assertion below, which is genuinely sound because it exercises the miette
+    // rendering path end-to-end.
+    //
+    // A tautology over a string literal — e.g. `"<source>".contains("<source>")` —
+    // proves only that `str::contains` is implemented; it never exercises the serde
+    // deserialization step, so it would still pass even if `v["error"]["message"]`
+    // silently returned `None` (e.g. because `MdsError::serialize` moved the value
+    // to a different key).  These controls catch that narrower regression.
+    {
+        let ctrl_stdout = r#"{"version":1,"error":{"code":"parse_error","message":"<source>:1:1","help":null,"span":null}}"#;
+        let ctrl_v: serde_json::Value = serde_json::from_str(ctrl_stdout).unwrap();
+        let ctrl_msg = ctrl_v["error"]["message"]
+            .as_str()
+            .expect("control: synthetic envelope must yield a message string");
+        assert!(
+            ctrl_msg.contains("<source>"),
+            "control (ADR-009/PF-013): extraction path v[\"error\"][\"message\"].as_str() \
+             detects '<source>' in error.message — if this fails the real check below is broken"
+        );
+        assert!(
+            ctrl_stdout.contains("<source>"),
+            "control (ADR-009/PF-013): raw stdout scan detects '<source>' — \
+             if this fails the stdout scan below is broken"
+        );
+    }
+    {
+        let ctrl_stdout = r#"{"version":1,"error":{"code":"io_error","message":"failed to read input.mds","help":null,"span":null}}"#;
+        let ctrl_v: serde_json::Value = serde_json::from_str(ctrl_stdout).unwrap();
+        let ctrl_msg = ctrl_v["error"]["message"]
+            .as_str()
+            .expect("control: synthetic envelope must yield a message string");
+        assert!(
+            ctrl_msg.contains("input.mds"),
+            "control (ADR-009/PF-013): extraction path v[\"error\"][\"message\"].as_str() \
+             detects 'input.mds' in error.message — if this fails the real check below is broken"
+        );
+        assert!(
+            ctrl_stdout.contains("input.mds"),
+            "control (ADR-009/PF-013): raw stdout scan detects 'input.mds' — \
+             if this fails the stdout scan below is broken"
+        );
+    }
+
+    assert!(
+        !message.contains("<source>"),
+        "AC-P1-07: error.message must not embed '<source>'; got: {message}"
+    );
+    assert!(
+        !message.contains("input.mds"),
+        "AC-P1-07: error.message must not embed 'input.mds'; got: {message}"
+    );
+    assert!(
+        !stdout.contains("<source>"),
+        "AC-P1-27: '<source>' must not appear in stdout; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("input.mds"),
+        "AC-P1-27: 'input.mds' must not appear in stdout; got: {stdout}"
+    );
+}
+
+/// AC-P1-04: `lint`, `check`, `build`, and `fmt` all name a stdin source with the
+/// SAME sentinel per the §0a ruling.
+///
+/// This test has three parts because the subcommands have different output shapes:
+///
+/// **Error-frame part** (`lint`, `check`, `build`): a broken source triggers a
+/// miette code frame and `frame_source_identity` extracts the label.  `mds build -`
+/// reaches the check gate at `build.rs` (`run_check` → `check_stdin`), not the
+/// compile-to-content stdin site; the assertion still holds — it is the same
+/// AD-211-5 relabel that applies on that path.
+///
+/// **Status-line part** (`fmt --check`): a valid but reformattable source causes
+/// `mds fmt --check -` to print `"Would reformat: <stdin>"` — a different output
+/// shape, covered separately after the loop.
+///
+/// **Success-line part** (`check`): a valid source causes `mds check -` to print
+/// `"OK: <stdin>"`.  This is the third distinct output shape: the
+/// `output::STDIN_DISPLAY_LABEL` constant at `main.rs` is shared with
+/// `fmt.rs`; a regression pointing the constant at the wrong value must be
+/// caught here, not by the print-discipline allowlist (which pins the sanitizer
+/// exemption, not the emitted text).
+///
+/// Before the relabels landed, `mds check -` and `mds build -` rendered
+/// `[<source>:1:1]` and `mds lint -` rendered `[input.mds:1:1]`.  `mds fmt -`
+/// already used `<stdin>` (AD-211-3 extended the same constant).
+#[test]
+fn stdin_source_identity_is_uniform_across_subcommands() {
+    // Part 1 — error path: a parse-failing source forces a miette frame.
+    // All three subcommands below reach their respective analysis-failure paths,
+    // each of which applies the AD-211-5 / AD-211-3 <stdin> relabel.
+    let broken = "@if\nbroken\n";
+    for subcommand in ["lint", "check", "build"] {
+        let out = run_mds_stdin(subcommand, broken);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
+            panic!("`mds {subcommand} -` must render a code frame; got:\n{stderr}")
+        });
+        assert_eq!(
+            identity, "<stdin>",
+            "AC-P1-04: `mds {subcommand} -` must name the source '<stdin>'; \
+             got '{identity}'.\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("<source>"),
+            "AC-P1-04: `mds {subcommand} -` must not emit '<source>'; got:\n{stderr}"
+        );
+    }
+
+    // Part 2 — fmt status line: `mds fmt --check -` emits "Would reformat: <stdin>"
+    // when a source needs reformatting (not a code frame).  A directive with
+    // trailing whitespace triggers the formatter's R4 strip rule.
+    {
+        use std::io::Write;
+        // Three trailing spaces after the @define directive are stripped by the
+        // formatter (R4: directive trailing-whitespace strip), so --check reports
+        // that a reformat would occur.
+        let fmt_source = "@define greet(name):   \nHello {{name}}!\n@end\n";
+        let mut child = mds_bin()
+            .arg("fmt")
+            .arg("--check")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(fmt_source.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        let fmt_stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            fmt_stderr.contains("Would reformat: <stdin>"),
+            "AC-P1-04: `mds fmt --check -` must emit 'Would reformat: <stdin>'; \
+             got:\n{fmt_stderr}"
+        );
+        assert!(
+            !fmt_stderr.contains("input.mds") && !fmt_stderr.contains("<source>"),
+            "AC-P1-04: `mds fmt --check -` must not emit old source labels; \
+             got:\n{fmt_stderr}"
+        );
+    }
+
+    // Part 3 — check success line: `mds check -` emits "OK: <stdin>" when stdin
+    // passes validation (AD-211-3 / AC-P1-04).  This pins the `main.rs`
+    // `output::STDIN_DISPLAY_LABEL` usage at the `OK:` status line; a regression
+    // that swapped the constant back to a bare literal would be caught here.
+    {
+        // Plain valid MDS source — no syntax errors, no undefined variables.
+        let valid_source = "Hello!\n";
+        let out = run_mds_stdin("check", valid_source);
+        let check_stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "AC-P1-04: `mds check -` must succeed for valid stdin; \
+             got:\n{check_stderr}"
+        );
+        assert!(
+            check_stderr.contains("OK: <stdin>"),
+            "AC-P1-04: `mds check -` must emit 'OK: <stdin>' on success; \
+             got:\n{check_stderr}"
+        );
+        assert!(
+            !check_stderr.contains("input.mds") && !check_stderr.contains("<source>"),
+            "AC-P1-04: `mds check -` must not emit old source labels; \
+             got:\n{check_stderr}"
+        );
+    }
+}
+
+// ── PF-012 guard: imported-file errors must not be relabelled as <stdin> ───────
+
+/// Pins the conditional guard inside `relabel_stdin_error` (output.rs).
+///
+/// The guard — `e.is_string_source()` — prevents relabelling errors whose
+/// embedded source belongs to an IMPORTED file.  When
+/// stdin imports a file that fails to parse (broken lib.mds), the `MdsError`
+/// carries the imported file's real path as its source name.  Because that path
+/// is not the sentinel `"<source>"`, the guard is false and `StdinRelabeledError`
+/// is constructed with `source: None`, which makes `source_code()` delegate to
+/// the inner error — preserving lib.mds's path in the miette code frame.
+///
+/// **Why the existing tests do not cover this path:** every prior stdin test
+/// passes an import-free broken source (`@if\nbroken\n`) so the error always
+/// originates in the stdin source itself and always carries `"<source>"` — the
+/// guard is always true and the mutation of removing it does not change the
+/// observable output.
+///
+/// **Proven necessary by mutation:** removing the guard (making the relabel
+/// unconditional) lets all 681 prior tests pass while silently mis-anchoring
+/// the miette caret.  The relabelled report uses stdin text as source content
+/// but the span is lib.mds's byte offset — exactly the PF-012
+/// in-bounds-but-wrong-source class the guard was added to prevent.
+///
+/// PF-013 positive control: asserts that "lib.mds" IS in the frame identity
+/// before asserting that "<stdin>" is NOT, so neither assertion can pass
+/// vacuously.
+#[test]
+fn stdin_import_error_frame_names_imported_file_not_stdin() {
+    use std::io::Write;
+
+    // A syntactically broken imported file: @if without a condition is a hard
+    // parse error.  The resolver embeds lib.mds's canonical path in the error's
+    // NamedSource (MdsError::Syntax { src: Some(NamedSource::new(key, …)) }),
+    // so source_name() returns the real path, not "<source>", and the guard is
+    // false.  attach_import_span passes MdsError::Syntax through unchanged, so
+    // the source identity is preserved end-to-end.
+    let dir = tempfile::tempdir().unwrap();
+    let lib = dir.path().join("lib.mds");
+    fs::write(&lib, "@if\n").unwrap();
+
+    // The stdin source itself is syntactically valid (@import is well-formed).
+    // The analysis failure originates entirely inside lib.mds, not in stdin.
+    let stdin_src = "@import { x } from \"./lib.mds\"\n";
+
+    for subcommand in ["lint", "check"] {
+        let mut child = mds_bin()
+            .arg(subcommand)
+            .arg("-")
+            .current_dir(dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Ignore BrokenPipe — process may exit before reading stdin.
+        let _ = child.stdin.take().unwrap().write_all(stdin_src.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // Non-vacuity: a miette code frame must be rendered at all.
+        let identity = frame_source_identity(&stderr).unwrap_or_else(|| {
+            panic!(
+                "PF-012: `mds {subcommand} -` (stdin importing broken lib.mds) must \
+                 render a miette code frame; got:\n{stderr}"
+            )
+        });
+
+        // PF-013 positive control: the frame must identify lib.mds so the
+        // absence check below cannot pass vacuously on an empty or wrong identity.
+        assert!(
+            identity.contains("lib.mds"),
+            "PF-012: `mds {subcommand} -` frame must name 'lib.mds', not '<stdin>'; \
+             got '{identity}'.\n{stderr}"
+        );
+
+        // Guard assertion: imported-file errors must NOT be relabelled to <stdin>.
+        // If the guard in relabel_stdin_error is removed, the frame shows
+        // "<stdin>" instead of the real lib.mds path — this assertion catches that.
+        assert_ne!(
+            identity, "<stdin>",
+            "PF-012: `mds {subcommand} -` must not relabel an imported-file error \
+             as '<stdin>'; the relabel_stdin_error guard is broken.\n{stderr}"
+        );
+    }
+}
+
+// ── AC-P1-10: `files[]` array ordering is part of the wire contract ──────────
+
+/// Directory mode path-sorts `files[]` by byte-wise (lexicographic) string order
+/// on the relative display path; single-file and stdin emit exactly one entry.
+/// Both halves are frozen here because a published contract has to pin the order
+/// of the outer array too, not only the diagnostics inside each entry.
+///
+/// **Non-vacuity (PF-013):** the fixture intentionally includes `api-utils.mds`
+/// (flat) alongside `api/x.mds` (in a subdirectory).  Under `Path::Ord`
+/// (component-wise), `api/x.mds` sorts before `api-utils.mds` because the first
+/// component `"api"` is shorter than `"api-utils.mds"`.  Under byte-wise string
+/// order, `api-utils.mds` sorts before `api/x.mds` because `'-'` (0x2D) < `'/'`
+/// (0x2F).  The oracle (`sorted.sort_unstable()` on strings) expects byte-wise
+/// order, so a regression that reverts to `Path::Ord` produces a different
+/// sequence and the assertion fails.
+#[test]
+fn json_files_array_is_path_sorted_in_directory_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("api")).unwrap();
+    // Written in an order that is neither the expected string-sorted order nor
+    // the Path::Ord order, so passing cannot be an accident of enumeration order.
+    let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    for rel in ["b.mds", "api/x.mds", "api-utils.mds"] {
+        fs::write(dir.path().join(rel), dupe).unwrap();
+    }
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    let files: Vec<&str> = v["files"]
+        .as_array()
+        .expect("JSON must have 'files' array")
+        .iter()
+        .filter_map(|f| f["file"].as_str())
+        .collect();
+
+    assert_eq!(
+        files.len(),
+        3,
+        "all three files must report findings; got: {files:?}"
+    );
+    // Oracle: byte-wise string sort. Expected: ["api-utils.mds", "api/x.mds", "b.mds"].
+    // Under Path::Ord (component-wise) the order would be ["api/x.mds", "api-utils.mds",
+    // "b.mds"], so a Path::Ord regression would fail this assertion (PF-013 positive
+    // control).
+    let mut sorted = files.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        files, sorted,
+        "AC-P1-10: files[] must be in ascending byte-wise path order; got: {files:?}"
+    );
+
+    // Single-file mode: exactly one entry.
+    let single = lint_path(&dir.path().join("b.mds"), &["--format", "json"]);
+    let single_stdout = String::from_utf8_lossy(&single.stdout);
+    let sv: serde_json::Value = serde_json::from_str(&single_stdout).unwrap();
+    assert_eq!(
+        sv["files"].as_array().map(Vec::len),
+        Some(1),
+        "AC-P1-10: single-file mode must emit exactly one files[] entry; got: {single_stdout}"
+    );
+}
+
+// ── AC-P1-20: WIRE sanitization of files[].file survives the relabel ─────────
+
+/// POSITIVE CONTROL (PF-013 / ADR-009). This PR rewrites `diag.file` wholesale in
+/// stdin mode, and `files[].file` is the exact key that #176 / CWE-150 escaping
+/// protects. An assertion that merely finds `<stdin>` proves nothing about the
+/// escape contract — `<stdin>` contains no character in the hostile class, so it
+/// is a no-op for it.
+///
+/// So: lint a directory containing a file whose PATH carries a control byte, and
+/// assert the emitted key carries the escaped `\uXXXX` literal and no raw byte.
+/// The control arm runs the SAME extraction over the raw path and shows it does
+/// detect the raw byte when one is present — without it, "no raw byte found"
+/// would be indistinguishable from "the check matched nothing".
+///
+/// The byte is constructed at runtime from a numeric escape and never typed as a
+/// literal into this file (PF-018 — the editing tooling decodes such escapes into
+/// real bytes in tracked source, and the `Source hygiene` CI job rejects them).
+#[cfg(unix)]
+#[test]
+fn directory_json_file_key_escapes_control_bytes_in_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    const BEL: u8 = 0x07;
+    let dir = tempfile::tempdir().unwrap();
+    let mut raw = b"be".to_vec();
+    raw.push(BEL);
+    raw.extend_from_slice(b"l.mds");
+    let name = OsString::from_vec(raw.clone());
+    let target = dir.path().join(&name);
+
+    let dupe = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    if fs::write(&target, dupe).is_err() {
+        // Both CI filesystems (ext4 / APFS) accept 0x07 in filenames, so
+        // this branch is unreachable in CI.  Panic rather than silently
+        // returning — cargo nextest captures stdout/stderr and only surfaces
+        // them on failure, so an eprintln!/return here would be invisible
+        // and would never reveal a genuine skip.  Windows has no
+        // `OsStringExt` analogue, so there is no #[cfg(windows)] sibling
+        // test; the Windows coverage gap is tracked at #147/#148.
+        panic!(
+            "directory_json_file_key_escapes_control_bytes_in_paths: \
+             control-byte filename rejected by filesystem — unexpected on this platform \
+             (PF-013 / ADR-009)"
+        );
+    }
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    /// The extraction under test: does `s` contain a raw C0 control byte?
+    fn has_raw_control(s: &str) -> bool {
+        s.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+    }
+
+    // CONTROL ARM — the same predicate, applied to the unsanitized path, must
+    // return true. If this fails, the assertion below is incapable of failing.
+    let raw_path = String::from_utf8_lossy(&raw).into_owned();
+    assert!(
+        has_raw_control(&raw_path),
+        "control arm: the predicate must detect the raw byte when it is present, \
+         otherwise the assertion below proves nothing (PF-013)"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    let file_key = v["files"]
+        .as_array()
+        .and_then(|f| f.first())
+        .and_then(|f| f["file"].as_str())
+        .unwrap_or_else(|| panic!("expected one files[] entry; got: {stdout}"));
+
+    assert!(
+        !has_raw_control(file_key),
+        "AC-P1-20: files[].file must not carry a raw control byte; got: {file_key:?}"
+    );
+    assert!(
+        file_key.contains("\\u0007"),
+        "AC-P1-20: files[].file must carry the escaped literal form of the control \
+         byte; got: {file_key:?}"
+    );
+}
+
+/// Run `mds <subcommand> -` with `input` on stdin.
+fn run_mds_stdin(subcommand: &str, input: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .arg(subcommand)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+// ── AC-P1-03: fix-preview status lines use the bracketed sentinel ────────────
+
+/// The bare `stdin` convention (`Would fix: stdin`) is gone: every fix-path
+/// message names the source with the same bracketed sentinel as the diagnostics.
+#[test]
+fn stdin_fix_preview_messages_use_bracketed_sentinel() {
+    // legacy-interpolation is Tier A and auto-fixable on a standalone source.
+    // The interpolation sits inside a `@define` body so `name` is a parameter in
+    // scope — otherwise the fix-safety gate rejects the rewrite ("undefined
+    // variable") and no status line is printed at all.
+    let source = "@define greet(name):\n  Hello {name}!\n@end\n";
+
+    // (a) --fix --check → "Would fix: <stdin>", exit 1.
+    let out = lint_stdin(source, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Would fix: <stdin>"),
+        "AC-P1-03: expected 'Would fix: <stdin>'; got:\n{stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check must exit 1 when a fix would apply; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Would fix: stdin"),
+        "AC-P1-03: the bare `stdin` convention must be gone; got:\n{stderr}"
+    );
+
+    // (b) --fix --diff → the unified-diff header names <stdin>.
+    let out = lint_stdin(source, &["--fix", "--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("<stdin>"),
+        "AC-P1-03: the diff header must reference '<stdin>'; got:\n{stdout}"
+    );
+    // The diff header lines are `--- <name>` / `+++ <name>`; neither may carry the
+    // unbracketed token.
+    for line in stdout
+        .lines()
+        .filter(|l| l.starts_with("---") || l.starts_with("+++"))
+    {
+        assert!(
+            !line.split_whitespace().any(|w| w == "stdin"),
+            "AC-P1-03: diff header must not use bare `stdin`; got: {line}"
+        );
+    }
+}
+
+// ── AC-P1-26: zero-diagnostic stdin JSON scope-out ───────────────────────────
+//
+// When stdin produces no diagnostics the JSON envelope correctly emits
+// `files: []` — there is no file entry at all, so no `file` key to check.
+// This is intentional and consistent with how directory-mode lint omits
+// zero-diagnostic files.  Asserting "files[0].file == <stdin>" would be
+// undefined for a clean source; the correct assertion is that `files` is empty
+// and that no VFS key or source-identity sentinel leaks into the document.
+
+/// AC-P1-26 zero-diagnostic carve-out: clean stdin produces `files:[]`
+/// (no file entry), `truncated:false`, `version:1`.  The `<stdin>` sentinel
+/// appears in `files[0].file` only when at least one diagnostic is emitted.
+/// Per AC-P1-06 the binding surfaces also produce `files:[]` for clean
+/// string-source input, making the JSON identical across CLI and bindings
+/// in the zero-diagnostic case.  See CHANGELOG for the documented wire contract.
+#[test]
+fn stdin_json_clean_source_emits_empty_files_array() {
+    let out = lint_stdin("Hello World!\n", &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("clean stdin JSON must parse");
+    assert_eq!(
+        v["files"],
+        serde_json::json!([]),
+        "AC-P1-26: clean stdin must emit files:[] (no file entry); got: {stdout}"
+    );
+    assert_eq!(v["truncated"], false, "truncated must be false");
+    assert_eq!(v["version"], 1, "version must be 1");
+    // No VFS key or source sentinel may leak even for zero-diagnostic output.
+    assert!(
+        !stdout.contains("input.mds"),
+        "AC-P1-26: 'input.mds' must not appear in clean-stdin JSON; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("<stdin>"),
+        "AC-P1-26: '<stdin>' must not appear in clean-stdin JSON (files is empty); \
+         got: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean source must exit 0; stdout: {stdout}"
+    );
+}
+
+// ── AC-P1-03(c): Partially fixed: <stdin> ────────────────────────────────────
+//
+// The partial-fix write path must emit "Partially fixed: <stdin>" (not
+// "Partially fixed: stdin") when some fixes are applied but others are
+// rejected by the reverify gate.
+//
+// Fixture (inline): empty @define with orphaned @export (empty-block fix
+// rejected — removing the define leaves an unreferenced @export) plus a
+// duplicate @export (applied successfully).  This is the same scenario as
+// the file-mode partial-fix fixture; the stdin variant confirms the sentinel
+// is STDIN_DISPLAY_LABEL, not a file path (AD-211-2).
+
+/// AC-P1-03(c): the "Partially fixed:" status line uses the bracketed sentinel.
+#[test]
+fn stdin_partial_fix_message_uses_bracketed_sentinel() {
+    // Source: empty @define (empty-block, Tier A) + duplicate export.
+    // The empty-block fix is rejected (orphaned @export after removal);
+    // the duplicate-export fix succeeds.  1 of 2 fixes applied.
+    let source = "\
+@define empty_fn():
+
+@end
+
+@export empty_fn
+
+@define greet(name):
+  Hello {{name}}!
+@end
+
+@export greet
+@export greet
+";
+    let out = lint_stdin(source, &["--fix"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Partially fixed: <stdin>"),
+        "AC-P1-03: 'Partially fixed: <stdin>' must appear in stderr; got:\n{stderr}"
+    );
+    // Must not leak bare `stdin` without angle brackets.
+    assert!(
+        !stderr.contains("Partially fixed: stdin\n")
+            && !stderr.starts_with("Partially fixed: stdin "),
+        "AC-P1-03: must not use bare 'stdin' in partial-fix message; got:\n{stderr}"
     );
 }
 
@@ -1383,6 +2326,53 @@ fn dir_fix_check_json_emits_parseable_json_before_exit_1() {
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!(
             "--fix --check --format json must emit parseable JSON before exiting; \
+             parse error: {e}; stdout: '{stdout}'"
+        )
+    });
+    assert_eq!(
+        json["version"], 1,
+        "envelope must have version:1; got: {json}"
+    );
+    assert!(
+        json["files"].is_array(),
+        "envelope must have files[]; got: {json}"
+    );
+}
+
+// ── resolve-b2a: single-file --fix --check --format json emits JSON before exit ─
+//
+// Regression: `lint_one_file` called `std::process::exit(1)` inside the
+// `PreviewOutcome::WouldFix` + `check` arm WITHOUT first calling `emit_result`,
+// making the `emit_result` at the end of the preview block unreachable.  On exit,
+// stdout was zero bytes — `JSON.parse("")` throws.  AC-F-14 was satisfied in
+// directory mode (the `any_would_fix` exit emits the envelope first at
+// run_lint_directory) but broken in single-file mode.
+//
+// Fix: call `emit_result(format, &result, quiet, named_source)` immediately before
+// `std::process::exit(1)` in the single-file WouldFix+check arm (mirroring dir mode).
+
+#[test]
+fn file_fix_check_json_emits_parseable_json_before_exit_1() {
+    let dir = tempfile::tempdir().unwrap();
+    // One fixable file — triggers the WouldFix + check arm.
+    let file = dir.path().join("fixable.mds");
+    fs::copy(fixture("lint_error.mds"), &file).unwrap();
+
+    let out = lint_path(&file, &["--fix", "--check", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // --fix --check exits 1 when fixes are pending.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "single-file --fix --check must exit 1 when fixes are pending; stderr: {stderr}"
+    );
+
+    // stdout must be parseable JSON — not empty.
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "single-file --fix --check --format json must emit parseable JSON before exiting; \
              parse error: {e}; stdout: '{stdout}'"
         )
     });
@@ -1734,7 +2724,7 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
 /// T-9 [AC-C3]: `mds lint --format json` on a source whose `duplicate-import`
 /// diagnostic message embeds a raw C1 control character (U+0085 NEL) must emit
 /// valid JSON with no raw control bytes anywhere — in particular the embedded
-/// path must be escaped to the 6-char literal ``.
+/// path must be escaped to its 6-character JSON escape (backslash, u, 0, 0, 8, 5).
 ///
 /// ## Why this vector?
 ///
@@ -1750,7 +2740,7 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
 /// imported twice and embeds the raw import path in its message.  A module
 /// whose file *name* contains U+0085 therefore injects that byte into the
 /// diagnostic message.  When `to_canonical_json` serializes the result, it
-/// must sanitize U+0085 → `` (6-char ASCII literal); if that
+/// must sanitize U+0085 into its 6-character ASCII JSON escape; if that
 /// sanitization is removed the raw 0xC2 0x85 bytes appear in the JSON wire.
 ///
 /// ## Failure mode (regression guard)
@@ -1760,7 +2750,8 @@ fn lint_del_and_c1_in_diagnostic_frame_is_sanitized() {
 ///   - Gate 2 FAILS: `assert_no_control_chars` finds U+0085 (a C1 char) in
 ///     the JSON wire output
 ///   - Gate 3 FAILS: the per-message check finds U+0085 in the diagnostic message
-///   - The positive assertion FAILS: `` is not present when raw bytes leak
+///   - The positive assertion FAILS: the 6-character escape is not present when
+///     raw bytes leak
 #[test]
 fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1834,13 +2825,13 @@ fn lint_json_hostile_source_output_contains_no_raw_control_bytes() {
         assert_no_control_chars(msg, "T-9 diagnostic message");
     }
 
-    // Positive assertion (non-vacuous, PF-013): the sanitized literal ``
+    // Positive assertion (non-vacuous, PF-013): the sanitized escape for U+0085
     // must appear in at least one message.  If sanitization is removed the raw
     // U+0085 character leaks and this assertion fails because the 6-char literal
     // is absent while the raw codepoint (caught by Gate 2/3) is present.
     //
-    // After JSON deserialisation by serde_json the string value is ``
-    // (6 chars: backslash, u, 0, 0, 8, 5).
+    // After JSON deserialisation by serde_json the string value is the
+    // 6-character sequence: backslash, u, 0, 0, 8, 5.
     let has_sanitized_nel = all_diags.iter().any(|d| {
         d["message"]
             .as_str()
@@ -2197,6 +3188,180 @@ fn lint_fix_write_failure_does_not_print_fixed_label_directory() {
     );
 }
 
+/// Regression gate (directory JSON mode): when `atomic_write_file` fails in
+/// `lint_one_file_accumulating`, stderr must NOT contain "Fixed: <file>" — mirrors
+/// the human-mode check above for the `lint_one_file_human` code path.
+///
+/// Code ordering is correct: `lint_one_file_accumulating` returns `FileTally::Error`
+/// at lint.rs:1537 before reaching the `eprintln!("Fixed: …")` at lint.rs:1541.
+/// This test provides the coverage that the code ordering is verified.
+///
+/// Positive control (PF-013/ADR-009): a writable directory run confirms "Fixed:"
+/// DOES appear so the absence assertion below cannot be vacuous.
+#[cfg(unix)]
+#[test]
+fn lint_fix_write_failure_json_dir_does_not_print_fixed_label() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // ── Positive control (PF-013): in a writable directory, "Fixed:" must appear ──
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Fixed:"),
+            "positive control: dir --fix --format json must emit 'Fixed:' when the write \
+             succeeds (otherwise the absence assertion below is vacuous; ADR-009); \
+             got stderr: {stderr:?}"
+        );
+        // PR1 contract: stdout carries ONLY the JSON document.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "stdout must be valid JSON in dir --fix --format json; err: {e}; stdout: {stdout}"
+            )
+        });
+    }
+
+    // ── Negative (failure gate): in a read-only directory, "Fixed:" must be absent ──
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("files");
+    fs::create_dir(&inner).unwrap();
+
+    let target = inner.join("no_fixed_label_json.mds");
+    fs::copy(fixture("lint_error.mds"), &target).unwrap();
+
+    // Make the inner directory read-only so temp-file creation fails on write.
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Run lint --fix --format json on the directory (routes through lint_one_file_accumulating).
+    let out = lint_path(&inner, &["--fix", "--format", "json"]);
+
+    let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // "Fixed:" must NOT appear — the early return at lint.rs:1535 must prevent it.
+    assert!(
+        !stderr.contains("Fixed:"),
+        "stderr must not contain 'Fixed:' when the JSON-dir write failed \
+         (lint_one_file_accumulating, lint.rs:1535 guard); got: {stderr:?}"
+    );
+}
+
+// ── resolve-b2a (F-14): dir JSON write failure must emit structured error, not stale result ─
+//
+// Regression: `lint_one_file_accumulating` called `accumulate_result_json(&residual, …)`
+// BEFORE `atomic_write_file`.  On write failure the residual (post-fix, zero-diagnostic)
+// result was already pushed to the envelope, so consumers parsed clean-looking JSON
+// while the process exited 2 and stderr said "Permission denied".  AC-F-14 requires the
+// JSON envelope to truthfully reflect what happened.
+//
+// Fix: attempt the write FIRST; on failure push a structured `{"file":…,"error":…}`
+// entry matching the read-failure shape, then return FileTally::Error.
+
+#[cfg(unix)]
+#[test]
+fn file_fix_json_dir_write_failure_emits_structured_error_not_stale_result() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // ── Positive control (PF-013/ADR-009): writable dir → clean JSON, no error entry ──
+    //
+    // After a successful fix the residual has zero diagnostics, so accumulate_result_json
+    // adds no file entry and files[] is empty — that is the correct/clean shape.
+    // The critical positive-control signal is: exit 0 + "Fixed:" on stderr + no "error" key.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // Write succeeded → exit 0 (no residual findings).
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "positive control: dir --fix --format json must exit 0 after a successful fix; \
+             stderr: {stderr}"
+        );
+        // "Fixed:" must appear on stderr (proves the write actually happened).
+        assert!(
+            stderr.contains("Fixed:"),
+            "positive control: dir --fix --format json must emit 'Fixed:' when write succeeds \
+             (otherwise the error-entry absence assertion below is vacuous; ADR-009); \
+             got stderr: {stderr:?}"
+        );
+        // stdout must be parseable JSON with no "error" entries.
+        let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!(
+                "positive control: dir --fix --format json must emit valid JSON; \
+                 err: {e}; stdout: {stdout}"
+            )
+        });
+        let files = json["files"].as_array().expect("files[] must be an array");
+        assert!(
+            !files.iter().any(|f| f.get("error").is_some()),
+            "positive control: files[] must not contain an error entry on success; got: {files:?}"
+        );
+    }
+
+    // ── Negative (failure gate): read-only dir → structured error entry in JSON ──
+    let outer = tempfile::tempdir().unwrap();
+    let inner = outer.path().join("files");
+    fs::create_dir(&inner).unwrap();
+
+    fs::copy(fixture("lint_error.mds"), inner.join("fixable.mds")).unwrap();
+
+    // Make the inner directory read-only so atomic_write_file fails.
+    fs::set_permissions(&inner, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = lint_path(&inner, &["--fix", "--format", "json"]);
+
+    // Restore writability before any assertions so tempdir cleanup can succeed.
+    let _ = fs::set_permissions(&inner, fs::Permissions::from_mode(0o755));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Process must exit non-zero (write error counted as FileTally::Error → exit 2).
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "dir --fix --format json with a read-only inner dir must exit non-zero; \
+         stderr: {stderr}"
+    );
+
+    // stdout must still be parseable JSON (AC-F-14).
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "dir --fix --format json must emit parseable JSON even on write failure \
+             (AC-F-14); parse error: {e}; stdout: '{stdout}'"
+        )
+    });
+
+    // The files[] entry for the failed file must have an "error" key (structured
+    // error entry), NOT a "diagnostics" key (which would indicate the stale
+    // clean post-fix result was pushed before the write was attempted).
+    let files = json["files"].as_array().expect("files[] must be an array");
+    assert!(
+        !files.is_empty(),
+        "files[] must be non-empty — the failed file must have an entry; got: {json}"
+    );
+    assert!(
+        files.iter().any(|f| f.get("error").is_some()),
+        "files[] must contain a structured error entry ({{\"file\":…,\"error\":…}}) for the \
+         file whose write failed; got files: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.get("diagnostics").is_some()),
+        "files[] must NOT contain a diagnostics entry for the write-failed file — \
+         the stale post-fix result must not be pushed before the write; got: {files:?}"
+    );
+}
+
 /// Regression gate: `mds lint <dir>` (directory mode) must not emit raw ESC bytes to
 /// stderr when a source file embeds a raw ESC byte (U+001B) in content that reaches
 /// `MdsError::Syntax`.
@@ -2358,5 +3523,2809 @@ fn lint_dir_nested_malformed_config_per_file_error() {
     assert!(
         combined.contains("mds.json") || combined.contains("config") || combined.contains("bad"),
         "output must reference the malformed config source; got: {combined}"
+    );
+}
+
+// ── AC-224-10/11/21/22/19: unknown rule-name warn-and-continue ───────────────
+//
+// An unknown rule name in `mds.json` must:
+//   AC-224-10: not alter the JSON wire shape on stdout (lint continues as normal)
+//   AC-224-11: emit the warning on stderr (never stdout)
+//   AC-224-21: preserve valid JSON on stdout in --format json mode
+//   AC-224-22: be suppressed by --quiet
+//   AC-224-19: emit exactly ONE warning per mds lint invocation, not one per file
+
+/// Write a `mds.json` with an unknown rule name into `dir`.
+fn write_unknown_rule_config(dir: &std::path::Path) {
+    let config = serde_json::json!({
+        "lint": {
+            "rules": {
+                "no-such-rule-xyzzy": "warn"
+            }
+        }
+    });
+    std::fs::write(
+        dir.join("mds.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+}
+
+/// AC-224-21 / AC-224-11: warning goes to stderr; stdout JSON is unaffected.
+///
+/// In `--format json` mode the stdout JSON must be valid and not contain the
+/// warning text; the warning must appear on stderr instead.
+#[test]
+fn unknown_rule_warning_to_stderr_not_stdout_in_json_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("clean.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-21: stdout must still be valid JSON (the warning must NOT land there).
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "AC-224-21: stdout must be valid JSON even when unknown rules are present; \
+             parse error: {e}; stdout: {stdout}"
+        )
+    });
+    assert_eq!(
+        parsed["version"].as_u64(),
+        Some(1),
+        "AC-224-21: JSON must have version:1; got: {parsed}"
+    );
+    assert!(
+        !stdout.contains("unknown"),
+        "AC-224-21: 'unknown' warning text must not appear in stdout JSON; got: {stdout}"
+    );
+
+    // AC-224-11: the warning must appear on stderr and name the rule.
+    // Both substrings required (&&, not ||) so neither half alone can satisfy the
+    // positive control — aligns with the stronger form in
+    // `unknown_rule_json_stdout_contains_no_warning_text` (avoids PF-013 asymmetry).
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-11: the unknown-rule warning must go to stderr and name the rule; \
+         got stderr: {stderr}"
+    );
+}
+
+/// AC-224-10: the JSON wire shape is unchanged when lint continues past an unknown rule.
+///
+/// The `files` array and `truncated` / `version` fields must be present with their
+/// normal shape. No extra top-level error key must appear.
+#[test]
+fn unknown_rule_json_wire_shape_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+
+    // AC-224-10: standard fields are present; no error envelope.
+    assert!(
+        parsed.get("files").is_some(),
+        "AC-224-10: 'files' key must be present in the JSON output; got: {parsed}"
+    );
+    assert!(
+        parsed.get("truncated").is_some(),
+        "AC-224-10: 'truncated' key must be present in the JSON output; got: {parsed}"
+    );
+    assert!(
+        parsed.get("error").is_none(),
+        "AC-224-10: no 'error' key must appear for a lint-continues result; got: {parsed}"
+    );
+
+    // Exit code must be 0 (clean file, no real diagnostics).
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "AC-224-10: exit code must be 0 when the only unknown element is a rule name; \
+         got stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// AC-224-22: `--quiet` suppresses the unknown-rule warning on stderr.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--quiet")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-22: --quiet must suppress the unknown-rule warning.
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22: --quiet must suppress the unknown-rule warning; got stderr: {stderr}"
+    );
+
+    // Exit code is still 0 (clean file).
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "AC-224-22: exit code must be 0; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-19: a directory tree whose files span multiple subdirectories emits exactly
+/// ONE unknown-rule warning, not one per file or one per subdirectory.
+///
+/// A flat-directory test (all files in one dir) would be vacuous because the
+/// base_dir cache already coalesces them — the caching claim under review is about
+/// SUBDIRECTORIES that all resolve to the same root `mds.json`. This test uses a
+/// nested tree (root + subdirs a/, b/, c/d/) so that each unique base_dir produces a
+/// distinct cache lookup. Without the config_dir-keyed deduplication in
+/// `LintDirCtx::config_for`, each distinct base_dir would re-load the config and
+/// re-emit the warning, yielding N warnings for N subdirs (the AC-224-19 bug).
+#[test]
+fn unknown_rule_one_warning_per_invocation_not_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // Files in different subdirectories — each has a distinct base_dir. All are
+    // governed by the single root mds.json, exercising the config_dir deduplication.
+    for subdir in ["a", "b", "c", "c/d"] {
+        let sub = dir.path().join(subdir);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("file.mds"), "Hello!\n").unwrap();
+    }
+    // One file at the root level so the base_dir == config_dir case is also covered.
+    std::fs::write(dir.path().join("root.mds"), "Hello!\n").unwrap();
+    // Single mds.json at the root governs every file in the tree.
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-19: the warning must appear at least once (positive control, PF-013).
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-19: warning must appear on stderr; got stderr: {stderr}"
+    );
+
+    // AC-224-19: exactly one warning per invocation, regardless of how many
+    // subdirectories contributed distinct base_dir lookups. A warning_count > 1 here
+    // means config_for is keying on base_dir rather than config_dir and emitting a
+    // duplicate for each subdir that resolves to the same root mds.json.
+    let warning_count = stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .count();
+    assert_eq!(
+        warning_count, 1,
+        "AC-224-19: warning must appear exactly once per distinct config directory \
+         (got {warning_count} — one per subdir instead of one per config); \
+         got stderr:\n{stderr}"
+    );
+}
+
+/// AC-224-2 (plural branch): when two or more rule names are unknown the plural form
+/// of the warning is emitted and the names appear in lexicographic sorted order.
+///
+/// Test-plan entry 2: CLI config `{"zzz-bad":"warn","aaa-bad":"error"}` yields
+/// exactly one warning line naming both unknown rules with `aaa-bad` before `zzz-bad`.
+///
+/// Non-vacuity (PF-013/ADR-009): the test also confirms the positive control —
+/// `recognised rules are` appears — and the negative control — a known rule in the
+/// same config does NOT trigger the plural path for itself.
+#[test]
+fn unknown_rule_plural_sorted_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+    // zzz-bad and aaa-bad are both unknown; unused-variable is real so it does NOT
+    // count toward the unknown list.  The inserted order is zzz first to confirm
+    // lexicographic sorting, not insertion order.
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({
+            "zzz-bad":        "warn",
+            "aaa-bad":        "error",
+            "unused-variable": "off"
+        }),
+    );
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // AC-224-2: both unknown names are reported.
+    assert!(
+        stderr.contains("aaa-bad"),
+        "AC-224-2: 'aaa-bad' must appear in the plural warning; got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("zzz-bad"),
+        "AC-224-2: 'zzz-bad' must appear in the plural warning; got stderr: {stderr}"
+    );
+    // AC-224-2: plural form is used (not singular).
+    assert!(
+        stderr.contains("unknown lint rules"),
+        "AC-224-2: plural form must be used for two unknown names; got stderr: {stderr}"
+    );
+    // AC-224-2: aaa-bad sorts before zzz-bad.
+    let aaa_pos = stderr
+        .find("aaa-bad")
+        .expect("aaa-bad must appear in stderr");
+    let zzz_pos = stderr
+        .find("zzz-bad")
+        .expect("zzz-bad must appear in stderr");
+    assert!(
+        aaa_pos < zzz_pos,
+        "AC-224-2: 'aaa-bad' must appear before 'zzz-bad' (lexicographic order); \
+         got stderr: {stderr}"
+    );
+    // Positive control: recognised-rules list is present (AC-224-2 completeness).
+    assert!(
+        stderr.contains("recognised rules are"),
+        "recognised-rules list must be included in the plural warning; got stderr: {stderr}"
+    );
+    // Negative control: unused-variable is a known rule and must NOT appear
+    // QUOTED (as an unknown name) in the warning — it does appear unquoted in
+    // the "recognised rules are: …" part, which is expected.  The unknown-names
+    // list uses single-quote delimiters ('NAME'), so checking for the quoted
+    // form distinguishes the two positions.
+    let warning_line = stderr
+        .lines()
+        .find(|l| l.contains("unknown lint rules"))
+        .unwrap_or_else(|| panic!("no plural unknown-rule warning line; got stderr: {stderr}"));
+    assert!(
+        !warning_line.contains("'unused-variable'"),
+        "a recognised rule name must not appear quoted in the unknown-names list; \
+         got warning line: {warning_line}"
+    );
+}
+
+/// AC-224-2 / AC-224-3 golden (singular and plural): pins the EXACT rendered warning
+/// text for both the one-offender and two-offender paths on the CLI.
+///
+/// Test-plan entries 2 and 3 require exact rendering, not just `contains` checks, so
+/// that future edits to the message format fail loudly here rather than silently
+/// diverging from the CHANGELOG and spec.md documentation.
+///
+/// PF-007: these goldens cover the CLI surface only; the binding surfaces are pinned
+/// by their own per-surface tests.
+#[test]
+fn unknown_rule_cli_exact_golden() {
+    // We cannot import mds:: directly from an integration test; hard-code the
+    // current ten names in alphabetical order (the same value KNOWN_LINT_RULES
+    // holds, verified by AC-224-7).  If the registry grows this golden must be
+    // updated alongside the registry — the test will fail loudly.
+    #[rustfmt::skip]
+    let recognised = concat!(
+        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
+        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
+        "unused-import, unused-variable"
+    );
+
+    // ── Singular golden ────────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_singular = format!(
+            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rule"))
+            .unwrap_or_else(|| {
+                panic!("no singular unknown-rule warning line; got stderr: {stderr}")
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_singular,
+            "AC-224-2/AC-224-3 singular golden mismatch"
+        );
+    }
+
+    // ── Plural golden ──────────────────────────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mds"), "Hello!\n").unwrap();
+        // Insert zzz-bad before aaa-bad to confirm lexicographic sorting, not
+        // insertion order.
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "zzz-bad": "warn", "aaa-bad": "error" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_plural = format!(
+            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rules"))
+            .unwrap_or_else(|| panic!("no plural unknown-rule warning line; got stderr: {stderr}"));
+        assert_eq!(
+            warning_line.trim(),
+            expected_plural,
+            "AC-224-2/AC-224-3 plural golden mismatch"
+        );
+    }
+}
+
+/// AC-224-2 / AC-224-3 golden for the SINGLE-FILE target path.
+///
+/// `unknown_rule_cli_exact_golden` exercises `mds lint <dir>`, which goes through
+/// `LintDirCtx::config_for`. This test exercises `mds lint <file>`, which goes
+/// through `load_lint_config` — a distinct code path. By pinning the EXACT warning
+/// string for both paths we ensure that a future edit to either emitter fails
+/// loudly here rather than diverging silently (the duplication that existed before
+/// the `emit_unknown_rule_warning` extraction was introduced in this PR).
+///
+/// PF-007: covers the CLI single-file surface only.
+#[test]
+fn unknown_rule_cli_exact_golden_single_file() {
+    #[rustfmt::skip]
+    let recognised = concat!(
+        "duplicate-export, duplicate-import, empty-block, legacy-interpolation, ",
+        "redundant-else, shadow-variable, unreachable-branch, unused-function, ",
+        "unused-import, unused-variable"
+    );
+
+    // ── Singular golden (single-file path) ────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_singular = format!(
+            "warning: in mds.json: unknown lint rule 'no-such-rule-xyzzy'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rule"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC-224-2/AC-224-3 single-file: no singular unknown-rule warning; \
+                     got stderr: {stderr}"
+                )
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_singular,
+            "AC-224-2/AC-224-3 single-file singular golden mismatch"
+        );
+    }
+
+    // ── Plural golden (single-file path) ──────────────────────────────────────
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.mds");
+        std::fs::write(&file, "Hello!\n").unwrap();
+        write_rules_config(
+            dir.path(),
+            serde_json::json!({ "zzz-bad": "warn", "aaa-bad": "error" }),
+        );
+
+        let out = mds_bin()
+            .arg("lint")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let expected_plural = format!(
+            "warning: in mds.json: unknown lint rules: 'aaa-bad', 'zzz-bad'; \
+             recognised rules are: {recognised}; ignoring"
+        );
+        let warning_line = stderr
+            .lines()
+            .find(|l| l.contains("unknown lint rules"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC-224-2/AC-224-3 single-file: no plural unknown-rule warning; \
+                     got stderr: {stderr}"
+                )
+            });
+        assert_eq!(
+            warning_line.trim(),
+            expected_plural,
+            "AC-224-2/AC-224-3 single-file plural golden mismatch"
+        );
+    }
+}
+
+/// Populate `dir` with a fixed three-file tree — one clean, two with real findings —
+/// so the JSON envelope under test carries actual `files[]` entries rather than an
+/// empty array (an all-clean tree would make the comparison below near-vacuous).
+fn write_mixed_lint_tree(dir: &std::path::Path) {
+    std::fs::write(dir.join("clean.mds"), "Hello!\n").unwrap();
+    std::fs::write(
+        dir.join("unused.mds"),
+        "---\nunused_key: value\n---\nHello!\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("dup.mds"),
+        "---\nanother_unused: v\n---\nHi there!\n",
+    )
+    .unwrap();
+}
+
+/// Write an `mds.json` naming `rules` verbatim.
+fn write_rules_config(dir: &std::path::Path, rules: serde_json::Value) {
+    let config = serde_json::json!({ "lint": { "rules": rules } });
+    std::fs::write(
+        dir.join("mds.json"),
+        serde_json::to_string(&config).unwrap(),
+    )
+    .unwrap();
+}
+
+/// AC-224-10 (NEGATIVE, envelope frozen): an unknown rule name changes the `--format json`
+/// stdout by **zero bytes**.
+///
+/// The two runs differ only by the presence of `no-such-rule-xyzzy` in `mds.json`. Their
+/// stdout buffers are compared byte-for-byte, and the top-level key set is compared as an
+/// EXACT set (not `contains`), so a new top-level key or a `files[]` entry lacking
+/// `diagnostics` fails. Exit codes must match too.
+///
+/// Non-vacuity (PF-013 / ADR-009): the same run asserts the warning IS on stderr and that
+/// the envelope actually carries `files[]` entries — a byte-identical comparison of two
+/// empty or two error envelopes would prove nothing.
+#[test]
+fn unknown_rule_json_stdout_is_byte_identical_to_run_without_it() {
+    let with_dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(with_dir.path());
+    write_rules_config(
+        with_dir.path(),
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+
+    let without_dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(without_dir.path());
+    write_rules_config(
+        without_dir.path(),
+        serde_json::json!({ "unused-variable": "warn" }),
+    );
+
+    let run = |dir: &std::path::Path| {
+        mds_bin()
+            .arg("lint")
+            .arg(dir)
+            .arg("--format")
+            .arg("json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+    let with = run(with_dir.path());
+    let without = run(without_dir.path());
+
+    // Non-vacuity: the warning fired in the first run and not in the second.
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+    assert!(
+        with_stderr.contains("unknown lint rule") && with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the unknown-rule warning must fire on stderr; got: {with_stderr}"
+    );
+    let without_stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(
+        !without_stderr.contains("unknown lint rule"),
+        "control run must not warn; got: {without_stderr}"
+    );
+
+    // AC-224-10: stdout is byte-identical, and the exit code does not move.
+    assert_eq!(
+        with.stdout,
+        without.stdout,
+        "AC-224-10: stdout must be byte-identical with and without the unknown rule name;\n\
+         with:    {}\nwithout: {}",
+        String::from_utf8_lossy(&with.stdout),
+        String::from_utf8_lossy(&without.stdout)
+    );
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13: the exit code must not move because of an unknown rule name"
+    );
+
+    // AC-224-10: exact top-level key set — not `contains`.
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&with.stdout).trim())
+            .expect("stdout must be valid JSON");
+    let obj = parsed.as_object().expect("envelope must be a JSON object");
+    let mut top_keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    top_keys.sort_unstable();
+    assert_eq!(
+        top_keys,
+        ["files", "truncated", "version"],
+        "AC-224-10: the top-level key set must be exactly {{files, truncated, version}}; \
+         got: {parsed}"
+    );
+    assert_eq!(parsed["version"].as_u64(), Some(1));
+
+    // Non-vacuity: the envelope really does carry file entries, and each has the
+    // `diagnostics` key with no `error` key.
+    let files = parsed["files"].as_array().expect("files must be an array");
+    assert!(
+        !files.is_empty(),
+        "non-vacuity: the fixture tree must produce at least one files[] entry; got: {parsed}"
+    );
+    for entry in files {
+        let e = entry.as_object().expect("files[] entry must be an object");
+        assert!(
+            e.contains_key("diagnostics"),
+            "AC-224-10: every files[] entry must carry a diagnostics key; got: {entry}"
+        );
+        assert!(
+            !e.contains_key("error"),
+            "AC-224-10: no files[] entry may carry an error key; got: {entry}"
+        );
+    }
+}
+
+/// AC-224-21: `--format json` stdout carries no warning text at all — including the
+/// literal substring `warning`, which the bare `!stdout.contains("unknown")` check above
+/// would not catch. Paired positive control: the warning IS on stderr in the same run.
+#[test]
+fn unknown_rule_json_stdout_contains_no_warning_text() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+    );
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control first: without this, every negative below is vacuous.
+    assert!(
+        stderr.contains("no-such-rule-xyzzy") && stderr.contains("recognised rules are"),
+        "positive control: the warning must be on stderr; got: {stderr}"
+    );
+
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21: stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+    serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .expect("AC-224-21: stdout must parse as a single JSON document");
+}
+
+/// AC-224-21 (single-file target): `--format json` stdout is clean when the unknown-
+/// rule warning fires.
+///
+/// `run_lint_file` is a separate emitter from `run_lint_directory`; this test covers
+/// it independently (AC-224-21 gap identified in the code review). Paired positive
+/// control (PF-013 / ADR-009): the warning IS on stderr, so a clean-stdout assertion
+/// cannot pass vacuously on a run where the warning never fired.
+#[test]
+fn unknown_rule_json_stdout_clean_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("clean.mds");
+    std::fs::write(&file, "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .arg("--format")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control: warning fired on stderr.
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-21 (file): warning must fire on stderr; got: {stderr}"
+    );
+
+    // AC-224-21: stdout must be valid JSON and contain no warning text.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC-224-21 (file): stdout must be valid JSON; error: {e}; got: {stdout}")
+    });
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21 (file): stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+}
+
+/// AC-224-21 (stdin target): `--format json` stdout is clean when the unknown-rule
+/// warning fires.
+///
+/// `run_lint_stdin` is a separate emitter from `run_lint_directory` and
+/// `run_lint_file`; this test covers it independently (AC-224-21 gap). `current_dir`
+/// is set to a tempdir containing `mds.json` so `run_lint_stdin` picks up the unknown
+/// rule. Paired positive control (PF-013 / ADR-009).
+#[test]
+fn unknown_rule_json_stdout_clean_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    write_unknown_rule_config(dir.path());
+
+    let mut child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .arg("--format")
+        .arg("json")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe — child may exit before reading all of stdin.
+    let _ = child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let out = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Positive control: warning fired on stderr.
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-21 (stdin): warning must fire on stderr; got: {stderr}"
+    );
+
+    // AC-224-21: stdout must be valid JSON and contain no warning text.
+    serde_json::from_str::<serde_json::Value>(stdout.trim()).unwrap_or_else(|e| {
+        panic!("AC-224-21 (stdin): stdout must be valid JSON; error: {e}; got: {stdout}")
+    });
+    for needle in [
+        "no-such-rule-xyzzy",
+        "recognised rules are",
+        "warning",
+        "ignoring",
+    ] {
+        assert!(
+            !stdout.contains(needle),
+            "AC-224-21 (stdin): stdout must not contain {needle:?}; got: {stdout}"
+        );
+    }
+}
+
+/// AC-224-22: the pre-subcommand global form `mds --quiet lint <dir>` suppresses the
+/// warning exactly like `mds lint --quiet <dir>`, and neither moves the exit code.
+///
+/// Paired positive control (PF-013): the same tree without `--quiet` DOES warn.
+#[test]
+fn unknown_rule_warning_suppressed_by_global_quiet_form() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "no-such-rule-xyzzy": "warn" }),
+    );
+
+    let loud = mds_bin()
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: the non-quiet run must warn"
+    );
+
+    for args in [vec!["lint", "--quiet"], vec!["--quiet", "lint"]] {
+        let mut cmd = mds_bin();
+        for a in &args {
+            cmd.arg(a);
+        }
+        let out = cmd
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+            "AC-224-22: `mds {}` must suppress the unknown-rule warning; got: {stderr}",
+            args.join(" ")
+        );
+        assert_eq!(
+            out.status.code(),
+            loud.status.code(),
+            "AC-224-22: --quiet must not move the exit code (form: {})",
+            args.join(" ")
+        );
+    }
+}
+
+/// AC-224-22 (single-file target): `--quiet` suppresses the unknown-rule warning when
+/// targeting a single file.
+///
+/// `load_lint_config` (the `run_lint_file` / `run_lint_stdin` code path) has a quiet gate
+/// inside `emit_unknown_rule_warning`; this test covers the single-file path independently
+/// from the directory target covered by `unknown_rule_warning_suppressed_by_quiet`, which
+/// exercises the `config_for` emitter instead.
+///
+/// Paired positive control (PF-013 / ADR-009): the same invocation WITHOUT `--quiet` DOES
+/// emit the warning, so the absence assertion cannot pass vacuously.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet_single_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("clean.mds");
+    std::fs::write(&file, "Hello!\n").unwrap();
+    write_unknown_rule_config(dir.path());
+
+    // Positive control: without --quiet the warning fires on the single-file path.
+    let loud = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: single-file mode without --quiet must warn; got: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // AC-224-22: --quiet must suppress the warning.
+    let out = mds_bin()
+        .arg("lint")
+        .arg(&file)
+        .arg("--quiet")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22 (single-file): --quiet must suppress the unknown-rule warning; got: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        loud.status.code(),
+        "AC-224-22 (single-file): --quiet must not move the exit code; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-22 (stdin target): `--quiet` suppresses the unknown-rule warning when reading
+/// from stdin.
+///
+/// `load_lint_config` (the `run_lint_stdin` code path) has a quiet gate inside
+/// `emit_unknown_rule_warning`; this test covers the stdin path independently from the
+/// directory target covered by `unknown_rule_warning_suppressed_by_quiet`, which exercises
+/// the `config_for` emitter instead.
+///
+/// `current_dir` is set to a tempdir containing `mds.json` so `run_lint_stdin` picks up
+/// the unknown rule.  Paired positive control (PF-013 / ADR-009): the same invocation
+/// WITHOUT `--quiet` DOES emit the warning.
+#[test]
+fn unknown_rule_warning_suppressed_by_quiet_stdin() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    write_unknown_rule_config(dir.path());
+
+    // Positive control: without --quiet the warning fires on the stdin path.
+    let mut loud_child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe -- child may exit before reading all of stdin.
+    let _ = loud_child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let loud = loud_child.wait_with_output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unknown lint rule"),
+        "positive control: stdin mode without --quiet must warn; got: {}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    // AC-224-22: --quiet must suppress the warning on the stdin path.
+    let mut child = mds_bin()
+        .arg("lint")
+        .arg("-")
+        .arg("--quiet")
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe -- child may exit before reading all of stdin.
+    let _ = child.stdin.take().unwrap().write_all(b"Hello!\n");
+    let out = child.wait_with_output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("unknown lint rule") && !stderr.contains("no-such-rule-xyzzy"),
+        "AC-224-22 (stdin): --quiet must suppress the unknown-rule warning; got: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        loud.status.code(),
+        "AC-224-22 (stdin): --quiet must not move the exit code; got stderr: {stderr}"
+    );
+}
+
+/// AC-224-12 (NEGATIVE / fix behaviour unchanged): an unknown rule name changes nothing
+/// about `--fix`, `--fix --check` or `--fix --diff`.
+///
+/// Two identical trees are built; only one names `no-such-rule-xyzzy` alongside the same
+/// valid rules. For each of the three invocations the exit code, the post-run file bytes
+/// and the stdout are compared between the trees.
+///
+/// Non-vacuity (PF-013): the run asserts a fix was ACTUALLY applied (the file bytes moved)
+/// and that the warning fired in the unknown-rule tree — a parity assertion between two
+/// trees where nothing happened would prove nothing.
+#[test]
+fn unknown_rule_does_not_change_fix_behaviour() {
+    /// Build a tree with one auto-fixable (Tier A) duplicate-export violation.
+    fn build_tree(rules: serde_json::Value) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("lint_error.mds");
+        fs::copy(fixture("lint_error.mds"), &target).unwrap();
+        write_rules_config(dir.path(), rules);
+        (dir, target)
+    }
+
+    let valid_rules = serde_json::json!({ "duplicate-export": "error" });
+    let mut with_rules = valid_rules.clone();
+    with_rules["no-such-rule-xyzzy"] = serde_json::json!("warn");
+
+    // ── --fix --check: must not write, must report pending fixes ────────────
+    let (with_dir, with_target) = build_tree(with_rules.clone());
+    let (without_dir, without_target) = build_tree(valid_rules.clone());
+    let with_before = fs::read(&with_target).unwrap();
+
+    let with_check = lint_path(with_dir.path(), &["--fix", "--check"]);
+    let without_check = lint_path(without_dir.path(), &["--fix", "--check"]);
+    assert!(
+        String::from_utf8_lossy(&with_check.stderr).contains("unknown lint rule"),
+        "non-vacuity: the unknown-rule tree must warn"
+    );
+    assert_eq!(
+        with_check.status.code(),
+        without_check.status.code(),
+        "AC-224-12: --fix --check exit code must not move"
+    );
+    assert_eq!(
+        fs::read(&with_target).unwrap(),
+        with_before,
+        "AC-224-12: --fix --check must not write"
+    );
+
+    // ── --fix --diff: identical diff output, still no write ─────────────────
+    //
+    // The `---`/`+++` headers name the absolute file path, which necessarily differs
+    // between the two tempdirs. Normalise each tree's own root to a placeholder so the
+    // comparison is about the diff CONTENT — the only thing an unknown rule name could
+    // plausibly change — rather than about tempdir naming.
+    let with_diff = lint_path(with_dir.path(), &["--fix", "--diff"]);
+    let without_diff = lint_path(without_dir.path(), &["--fix", "--diff"]);
+    let normalize = |bytes: &[u8], root: &std::path::Path| {
+        String::from_utf8_lossy(bytes).replace(root.to_string_lossy().as_ref(), "<DIR>")
+    };
+    let with_diff_text = normalize(&with_diff.stdout, with_dir.path());
+    let without_diff_text = normalize(&without_diff.stdout, without_dir.path());
+    assert!(
+        with_diff_text.contains("@export greet"),
+        "non-vacuity: --fix --diff must actually render a hunk; got: {with_diff_text}"
+    );
+    assert_eq!(
+        with_diff_text, without_diff_text,
+        "AC-224-12: --fix --diff output must be identical once the tempdir root is normalised"
+    );
+    assert_eq!(
+        with_diff.status.code(),
+        without_diff.status.code(),
+        "AC-224-12: --fix --diff exit code must not move"
+    );
+    assert_eq!(
+        fs::read(&with_target).unwrap(),
+        with_before,
+        "AC-224-12: --fix --diff must not write"
+    );
+
+    // ── --fix: identical result bytes and exit code, and a fix really happened ──
+    let with_fix = lint_path(with_dir.path(), &["--fix"]);
+    let without_fix = lint_path(without_dir.path(), &["--fix"]);
+    assert_eq!(
+        with_fix.status.code(),
+        without_fix.status.code(),
+        "AC-224-12: --fix exit code must not move"
+    );
+    let with_after = fs::read(&with_target).unwrap();
+    let without_after = fs::read(&without_target).unwrap();
+    assert_eq!(
+        with_after, without_after,
+        "AC-224-12: the fixed file bytes must be identical with and without the unknown rule"
+    );
+    assert_ne!(
+        with_after, with_before,
+        "non-vacuity: a fix must actually have been applied, or the parity above is empty"
+    );
+
+    // No stray artefacts left behind in either tree.
+    for dir in [with_dir.path(), without_dir.path()] {
+        for entry in fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                name == "lint_error.mds" || name == "mds.json",
+                "AC-224-12: --fix must leave no temp or backup artefact; found {name}"
+            );
+        }
+    }
+}
+
+/// AC-224-11 (HUMAN format): stdout stays empty, and the warning is the ONLY delta on
+/// stderr — every file is still linted and reported exactly as it was.
+///
+/// The JSON arm is pinned by `unknown_rule_json_stdout_is_byte_identical_to_run_without_it`.
+/// Human format routes diagnostics through a completely different renderer
+/// (`render_result_human` → `eprint_error` → miette, on stderr) and writes nothing to
+/// stdout, so a JSON-only assertion proves nothing here — this arm has to be asserted
+/// separately (PF-007 reasoning applied within one surface: two output formats are two
+/// renderers).
+///
+/// The SAME tempdir is reused for both runs, with only `mds.json` rewritten between
+/// them, so the display paths are byte-identical and the stderr comparison is about
+/// content rather than tempdir naming.
+///
+/// Non-vacuity (PF-013 / ADR-009): the run asserts the warning IS present in the first
+/// run and ABSENT in the second, and that the control run's stderr actually carries
+/// per-file diagnostics — comparing two empty buffers would prove nothing.
+#[test]
+fn unknown_rule_human_stdout_empty_and_per_file_output_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    write_mixed_lint_tree(dir.path());
+
+    let run = || {
+        mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    // Run 1: config names an unknown rule alongside a valid one.
+    write_rules_config(
+        dir.path(),
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+    let with = run();
+    // Run 2: identical tree and identical paths, unknown entry deleted.
+    write_rules_config(dir.path(), serde_json::json!({ "unused-variable": "warn" }));
+    let without = run();
+
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+    let without_stderr = String::from_utf8_lossy(&without.stderr);
+
+    // Positive control: the warning fired in run 1 and not in run 2.
+    assert!(
+        with_stderr.contains("unknown lint rule") && with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the unknown-rule warning must fire on stderr in human mode; \
+         got: {with_stderr}"
+    );
+    assert!(
+        !without_stderr.contains("unknown lint rule"),
+        "control run must not warn; got: {without_stderr}"
+    );
+    // Non-vacuity: the control run really does carry per-file lint output, so the
+    // equality assertion below is comparing real diagnostics, not two empty buffers.
+    assert!(
+        without_stderr.contains("unused-variable"),
+        "non-vacuity: the fixture tree must produce per-file diagnostics on stderr; \
+         got: {without_stderr}"
+    );
+
+    // AC-224-11: human format writes NOTHING to stdout, with or without the unknown rule.
+    assert!(
+        with.stdout.is_empty(),
+        "AC-224-11: human-format stdout must be empty on the unknown-rule path; got: {}",
+        String::from_utf8_lossy(&with.stdout)
+    );
+    assert!(
+        without.stdout.is_empty(),
+        "AC-224-11: human-format stdout must be empty in the control run; got: {}",
+        String::from_utf8_lossy(&without.stdout)
+    );
+
+    // AC-224-11: the added warning line is the ONLY difference on stderr — no file is
+    // skipped and no per-file result changes.
+    let with_minus_warning: String = with_stderr
+        .lines()
+        .filter(|l| !l.contains("unknown lint rule"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let without_normalized: String = without_stderr.lines().map(|l| format!("{l}\n")).collect();
+    assert_eq!(
+        with_minus_warning, without_normalized,
+        "AC-224-11: apart from the added warning line, human-mode stderr must be \
+         identical with and without the unknown rule name;\nwith:\n{with_stderr}\n\
+         without:\n{without_stderr}"
+    );
+
+    // AC-224-13: the exit code does not move because of the unknown rule name.
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13: the exit code must not move because of an unknown rule name in human mode"
+    );
+}
+
+/// AC-224-10 / AC-224-19 (nested config): the `mds.json` lives in a SUBDIRECTORY and the
+/// lint root itself has none.
+///
+/// This is a distinct `LintDirCtx::config_for` branch from the other unknown-rule tests:
+/// the root's `base_dir` resolves to `None` (default config, cached under `base_dir` only)
+/// while the subdirectory resolves to `Some((config, config_dir))`. Both branches are
+/// exercised in one invocation, so a regression that emitted the warning from the `None`
+/// arm, or that failed to reach the `Some` arm at all, is caught here.
+///
+/// Non-vacuity (PF-013 / ADR-009): the run asserts the warning fires exactly once AND
+/// that both files were actually linted (the root file is reported too), so neither the
+/// count nor the JSON comparison can pass because nothing ran.
+#[test]
+fn unknown_rule_nested_config_warns_once_and_envelope_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Root file: governed by NO config (the lint root has no mds.json).
+    std::fs::write(
+        dir.path().join("root.mds"),
+        "---\nroot_unused: v\n---\nHi!\n",
+    )
+    .unwrap();
+    // Subdirectory file: governed by sub/mds.json, which names the unknown rule.
+    std::fs::write(sub.join("nested.mds"), "---\nsub_unused: v\n---\nHo!\n").unwrap();
+
+    let run = || {
+        mds_bin()
+            .arg("lint")
+            .arg(dir.path())
+            .arg("--format")
+            .arg("json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    write_rules_config(
+        &sub,
+        serde_json::json!({ "unused-variable": "warn", "no-such-rule-xyzzy": "warn" }),
+    );
+    let with = run();
+    write_rules_config(&sub, serde_json::json!({ "unused-variable": "warn" }));
+    let without = run();
+
+    let with_stderr = String::from_utf8_lossy(&with.stderr);
+
+    // AC-224-19: exactly one warning, emitted from the subdirectory's config only.
+    let warning_count = with_stderr
+        .lines()
+        .filter(|l| l.contains("unknown lint rule"))
+        .count();
+    assert_eq!(
+        warning_count, 1,
+        "AC-224-19 (nested): the subdirectory config must warn exactly once; got stderr:\n\
+         {with_stderr}"
+    );
+    assert!(
+        with_stderr.contains("no-such-rule-xyzzy"),
+        "non-vacuity: the warning must name the unknown rule; got: {with_stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&without.stderr).contains("unknown lint rule"),
+        "control run must not warn; got: {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+
+    // AC-224-10: the stdout envelope is byte-identical across the two runs.
+    assert_eq!(
+        with.stdout,
+        without.stdout,
+        "AC-224-10 (nested): stdout must be byte-identical with and without the unknown \
+         rule name;\nwith:    {}\nwithout: {}",
+        String::from_utf8_lossy(&with.stdout),
+        String::from_utf8_lossy(&without.stdout)
+    );
+    assert_eq!(
+        with.status.code(),
+        without.status.code(),
+        "AC-224-13 (nested): the exit code must not move"
+    );
+
+    // Non-vacuity: BOTH files were linted — the root file (default config, no warning)
+    // and the nested file (subdir config). A byte-identical comparison of two envelopes
+    // that never reached the nested directory would prove nothing.
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&with.stdout).trim())
+            .expect("stdout must be valid JSON");
+    let files: Vec<String> = parsed["files"]
+        .as_array()
+        .expect("files must be an array")
+        .iter()
+        .map(|f| f["file"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        files.iter().any(|f| f == "root.mds"),
+        "non-vacuity: the root file must still be linted; got files: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f == "sub/nested.mds"),
+        "non-vacuity: the nested file must still be linted; got files: {files:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// #216 — CLI quiet-mode and directory-summary contract
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── AC-Q06: clean directory prints exactly one summary line ──────────────────
+//
+// Verified: directory mode emits NO per-file `Clean:` line (those live at
+// lint.rs::835 and ::881, single-file/stdin only).  After this change, the
+// summary IS the only stderr line for a clean directory run, so we can assert
+// exact string equality rather than substring containment (ADR-009).
+
+#[test]
+fn lint_directory_prints_summary_when_clean() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in &["a.mds", "b.mds", "c.mds"] {
+        fs::copy(fixture("lint_clean.mds"), dir.path().join(name)).unwrap();
+    }
+
+    let out = lint_path(dir.path(), &[]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean directory must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.is_empty(),
+        "stdout must be empty in human mode; got: {stdout:?}"
+    );
+
+    // Exact equality — proved correct because dir mode never emits per-file Clean: lines.
+    let stderr_trimmed = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    assert_eq!(
+        stderr_trimmed, "3 clean, 0 with warnings, 0 with errors, 0 resource-limited",
+        "AC-Q06: trimmed stderr must equal the exact summary string"
+    );
+}
+
+// ── AC-Q07: mixed-severity tree yields exact per-bucket counts ────────────────
+// AC-Q08: the four counters partition the file set (no drops, no double-counts).
+
+#[test]
+fn lint_directory_summary_counts_each_severity_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    // 2 clean, 1 warn-only (unused-variable), 1 error (duplicate-export)
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean1.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean2.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("warn.mds")).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "directory with an error file must exit 2; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("2 clean, 1 with warnings, 1 with errors, 0 resource-limited"),
+        "AC-Q07: summary must contain '2 clean, 1 with warnings, 1 with errors, 0 resource-limited'; \
+         got: {stderr:?}"
+    );
+
+    // AC-Q08: parse the four integers and assert they partition the 4-file set.
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts,
+        [2, 1, 1, 0],
+        "AC-Q08: counters must partition the 4-file set (clean+warn+error+limit == 4)"
+    );
+}
+
+/// Parse [clean, warn, error, limit] from a directory summary line.
+/// Returns [0,0,0,0] on parse failure (test will then fail on the equality check).
+fn parse_summary_counts(stderr: &str) -> [usize; 4] {
+    fn leading_usize(s: &str) -> Option<usize> {
+        s.split_whitespace().next()?.parse().ok()
+    }
+    // Pattern: "N clean, N with warnings, N with errors, N resource-limited"
+    for line in stderr.lines() {
+        if let Some(rest) = line.strip_suffix(" resource-limited") {
+            let parts: Vec<&str> = rest.split(", ").collect();
+            if parts.len() == 4 {
+                if let (Some(c), Some(w), Some(e), Some(l)) = (
+                    leading_usize(parts[0]),
+                    leading_usize(parts[1]),
+                    leading_usize(parts[2]),
+                    leading_usize(parts[3]),
+                ) {
+                    return [c, w, e, l];
+                }
+            }
+        }
+    }
+    [0, 0, 0, 0]
+}
+
+/// Build content that triggers `MdsError::ResourceLimit` (257 `@block` declarations;
+/// `MAX_BLOCKS_PER_MODULE` is 256).  Shared by AC-Q09 and AC-Q12.
+fn make_resource_limit_content() -> String {
+    (0..257)
+        .map(|i| format!("@block block_{i}:\n@end\n"))
+        .collect()
+}
+
+// ── AC-Q09: resource-limited bucket is genuinely exercised ───────────────────
+//
+// `tally_from_result` can NEVER return FileTally::ResourceLimit — it maps exit codes.
+// ResourceLimit arrives only via the mds::lint() Err arm (MdsError::ResourceLimit).
+// This test proves the fourth counter is not a permanently-zero constant.
+
+#[test]
+fn lint_directory_summary_counts_resource_limited() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // One clean file and one that triggers ResourceLimit.
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+    fs::write(
+        dir.path().join("too_many_blocks.mds"),
+        make_resource_limit_content(),
+    )
+    .unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "directory with a resource-limited file must exit 3; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 0 with errors, 1 resource-limited"),
+        "AC-Q09: summary must show '1 clean, 0 with warnings, 0 with errors, 1 resource-limited'; \
+         got: {stderr:?}"
+    );
+
+    // AC-Q08 invariant: 1+0+0+1 == 2 files
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        2,
+        "AC-Q08: counters must partition the 2-file set"
+    );
+}
+
+// ── AC-Q10: quiet warn-only lint is silent (with positive control) ────────────
+//
+// PF-013/ADR-009: absence assertion + paired positive control.
+// D1-a decision: warn-only --quiet exits 1 with no output (mirrors fmt precedent).
+
+#[test]
+fn lint_directory_quiet_suppresses_summary_when_only_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("b.mds")).unwrap();
+
+    let quiet = lint_path(dir.path(), &["--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(1),
+        "warn-only directory under --quiet must exit 1; stderr: {quiet_stderr:?}"
+    );
+    assert!(
+        !quiet_stderr.contains("clean,"),
+        "AC-Q10: --quiet warn-only must NOT emit the summary; got: {quiet_stderr:?}"
+    );
+
+    // Positive control: same tree without --quiet MUST emit the summary.
+    let control = lint_path(dir.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        control_stderr.contains("clean,"),
+        "positive control: non-quiet run must emit the summary so the quiet absence \
+         assertion is non-vacuous; got: {control_stderr:?}"
+    );
+}
+
+// ── AC-Q11: quiet lint with error-severity findings still prints summary ──────
+//
+// ADR-009/PF-013: both directions of the quiet gate are pinned in one test.
+// A warn-only file (lint_warn_only.mds) is included so the test can assert:
+//   - error-severity diagnostic body DOES appear under --quiet
+//   - warn-severity diagnostic body does NOT appear under --quiet
+// Without these body assertions the test could pass under the mutation
+// `if quiet` (dropping the Severity filter), which would silence all diagnostic
+// bodies while still printing the summary via the error_file_count > 0 gate.
+
+#[test]
+fn lint_directory_quiet_still_prints_summary_on_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+    fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+    // Add a warn-severity file so both directions of the quiet gate can be pinned:
+    // error diagnostics must survive --quiet; warn diagnostics must be suppressed.
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("warn.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "directory with error file under --quiet must exit 2; stderr: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("1 clean, 1 with warnings, 1 with errors, 0 resource-limited"),
+        "AC-Q11: --quiet with error files must still print summary; got: {stderr:?}"
+    );
+    // Error-severity diagnostic body must not be silenced by --quiet.
+    // (render_diag_human suppresses only Info|Warn, never Error.)
+    assert!(
+        stderr.contains("duplicate-export"),
+        "AC-Q11: error-severity diagnostic body must survive --quiet; got: {stderr:?}"
+    );
+    // Warn-severity diagnostic body must be suppressed.
+    // Positive control: non-quiet run must show unused-variable to prove this is
+    // non-vacuous (PF-013 / ADR-009).
+    let control = lint_path(dir.path(), &[]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        control_stderr.contains("unused-variable"),
+        "positive control: non-quiet run must print 'unused-variable' warn diagnostic \
+         so the absence assertion below is non-vacuous; got: {control_stderr:?}"
+    );
+    assert!(
+        !stderr.contains("unused-variable"),
+        "AC-Q11: warn-severity 'unused-variable' diagnostic body must be suppressed \
+         under --quiet; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q12: quiet lint with resource-limit still prints summary ───────────────
+
+#[test]
+fn lint_directory_quiet_still_prints_summary_on_resource_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+    fs::write(
+        dir.path().join("too_many_blocks.mds"),
+        make_resource_limit_content(),
+    )
+    .unwrap();
+
+    let out = lint_path(dir.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "directory with resource-limited file under --quiet must exit 3; stderr: {stderr:?}"
+    );
+    // "1 resource-limited" implies "resource-limited" — one assertion covers both.
+    assert!(
+        stderr.contains("1 resource-limited"),
+        "AC-Q12: --quiet with resource-limited file must still print summary with count; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q13: --fix --check exit path does not skip the summary ─────────────────
+//
+// AD-216-7: summary is emitted BEFORE the --fix --check process::exit(1).
+
+#[test]
+fn lint_directory_check_exit_still_prints_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("fix_me.mds");
+    // lint_partial_fix.mds has auto-fixable issues (Tier A empty-block + duplicate-export).
+    fs::copy(fixture("lint_partial_fix.mds"), &target).unwrap();
+
+    let content_before = fs::read_to_string(&target).unwrap();
+    let out = lint_path(dir.path(), &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check with pending fixes must exit 1; stderr: {stderr}"
+    );
+    // Assert the WHOLE summary line, not a disjunction of two weak substrings: a
+    // disjunction would still pass if the line were emitted in a corrupted form.
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        1,
+        "AC-Q08/AC-Q13: the summary must be emitted on the --fix --check exit path and its \
+         four counters must partition the 1-file tree; got stderr: {stderr:?}"
+    );
+    // --check must never write (file byte-unchanged).
+    let content_after = fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        content_before, content_after,
+        "--fix --check must never modify files"
+    );
+}
+
+// ── AC-Q14: D1-a contract: warn-only and --fix --check --quiet are silent ────
+//
+// D1-a decision (mirrors fmt.rs precedent): warnings are status output (main.rs:30)
+// and are suppressed under --quiet.  Exit codes are unaffected (AD-216-2).
+// This test pins the chosen behaviour so a future plan change is visible as a test failure.
+
+#[test]
+fn lint_directory_quiet_check_exit_matches_d1a_contract() {
+    // Uses lint_fixable_warn.mds: contains a single `{name}` legacy-interpolation
+    // occurrence that triggers `legacy-interpolation` (Severity::Warn, auto-fixable).
+    // No error-severity findings, so D1-a applies: summary suppressed under --quiet.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("fix_me.mds");
+    fs::copy(fixture("lint_fixable_warn.mds"), &target).unwrap();
+
+    // --fix --check --quiet on a tree with pending fixes.
+    // D1-a: silent (warn-only pending fix → status output → suppressed under --quiet).
+    let out = lint_path(dir.path(), &["--fix", "--check", "--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "--fix --check --quiet with pending fixes must still exit 1 (exit codes unaffected); \
+         stderr: {stderr:?}"
+    );
+    // The residual tally is WarnOnly (legacy-interpolation is Severity::Warn).
+    // D1-a gate: !quiet || error_file_count > 0 || limit_file_count > 0 = false → no summary.
+    assert!(
+        !stderr.contains("clean,"),
+        "D1-a: --fix --check --quiet with warn-only residual must not print summary; \
+         got: {stderr:?}"
+    );
+    // 'Would fix:' is a status message (lint.rs: `if check && !quiet`) and must also
+    // be suppressed under --quiet, distinguishing the --fix --check pending-fix code
+    // path from the ordinary warn-only exit 1 (lint.rs severity exit).  Without this
+    // assertion the test cannot tell those two paths apart if legacy-interpolation ever
+    // loses auto-fixability or the fixture drifts.
+    assert!(
+        !stderr.contains("Would fix:"),
+        "D1-a: --fix --check --quiet must not print 'Would fix:'; got: {stderr:?}"
+    );
+
+    // PF-013 / ADR-009 — PAIRED POSITIVE CONTROL, in this test, on THIS tree.
+    //
+    // Without it the absence assertion above passes vacuously: deleting the summary
+    // emit outright leaves this test green (verified by mutation — removing the
+    // `eprintln!` in `run_lint_directory` failed 8 of the #216 tests but NOT this one).
+    // A cross-test control in `lint_directory_check_exit_still_prints_summary` does not
+    // count: it uses a different fixture, so it cannot prove that THIS tree's summary is
+    // suppressed by `--quiet` rather than never produced at all.
+    let control = lint_path(dir.path(), &["--fix", "--check"]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert_eq!(
+        control.status.code(),
+        Some(1),
+        "positive control: the same tree without --quiet must also exit 1; \
+         got stderr: {control_stderr:?}"
+    );
+    assert!(
+        control_stderr.contains("clean,"),
+        "positive control: the same tree WITHOUT --quiet must print the summary, proving the \
+         --quiet absence assertion above is non-vacuous; got: {control_stderr:?}"
+    );
+    // Paired positive control for the 'Would fix:' absence assertion: confirm the
+    // --fix --check path really was engaged (i.e. the fixture is still auto-fixable).
+    assert!(
+        control_stderr.contains("Would fix:"),
+        "positive control: --fix --check without --quiet must print 'Would fix:', confirming \
+         the test exercises the --fix --check code path and not just an ordinary warn exit; \
+         got: {control_stderr:?}"
+    );
+}
+
+// ── AC-Q15: JSON directory mode keeps stdout a single clean JSON object ────────
+//
+// The summary MUST appear on stderr and stdout MUST NOT contain the summary text.
+// Positive control: stderr DOES contain the summary (so the stdout-absence check
+// can't pass vacuously on a broken empty-stdout test).
+
+#[test]
+fn lint_directory_json_summary_goes_to_stderr_only() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("warn.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Stdout must be a single parseable JSON object.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_ok(),
+        "AC-Q15: stdout must be a parseable JSON object; got: {stdout:?}"
+    );
+    // Stdout must NOT contain the summary text.
+    assert!(
+        !stdout.contains("clean,"),
+        "AC-Q15: stdout must NOT contain the summary text in JSON mode; got: {stdout:?}"
+    );
+    // Positive control: stderr DOES contain the summary.
+    assert!(
+        stderr.contains("clean,"),
+        "AC-Q15 positive control: stderr must contain the summary; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q16: JSON envelope key contract is unchanged (D2-B: freeze the envelope) ─
+//
+// D2-B decision: no `summary` key is added to the JSON stdout.  The envelope
+// remains {"files":…,"truncated":…,"version":1}.
+
+#[test]
+fn lint_directory_json_envelope_key_contract_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_warn_only.mds"), dir.path().join("b.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+
+    let keys: Vec<&str> = json
+        .as_object()
+        .expect("top-level must be an object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+
+    // D2-B: envelope is exactly {files, truncated, version} — no summary key.
+    assert_eq!(
+        keys,
+        vec!["files", "truncated", "version"],
+        "AC-Q16 (D2-B): JSON envelope keys must remain exactly [files, truncated, version]; \
+         got: {keys:?}"
+    );
+    assert_eq!(
+        json["version"], 1,
+        "AC-Q16: version must remain the integer 1"
+    );
+}
+
+// ── AC-Q18: single-file lint prints no directory summary ──────────────────────
+
+#[test]
+fn lint_single_file_prints_no_directory_summary() {
+    let out = lint_path(&fixture("lint_clean.mds"), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(0), "clean single file must exit 0");
+    assert!(
+        stderr.contains("Clean:"),
+        "single-file clean lint must still print 'Clean:' line; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "AC-Q18: single-file lint must NOT print a directory summary; got: {stderr:?}"
+    );
+
+    // PF-013 / ADR-009: the absence assertion above is only meaningful if "clean," is
+    // the exact substring a real directory summary contains.  A typo in the needle would
+    // make the assertion pass on any output at all.  Prove the needle by running the same
+    // source through directory mode, where the summary IS expected.
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+    let control = lint_path(dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: the same source in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+// ── AC-Q19: stdin lint prints no directory summary ────────────────────────────
+
+#[test]
+fn lint_stdin_prints_no_directory_summary() {
+    let content = fs::read_to_string(fixture("lint_clean.mds")).unwrap();
+    let out = lint_stdin(&content, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "clean stdin lint must exit 0; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "AC-Q19: stdin lint must NOT print a directory summary; got: {stderr:?}"
+    );
+
+    // PF-013 / ADR-009: the absence assertion above is only meaningful if `"clean,"` is
+    // the string a real summary would actually contain. A typo in the needle would make
+    // it pass on any output at all. Prove the needle by feeding the SAME source through
+    // directory mode, where the summary IS expected.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.mds"), &content).unwrap();
+    let control = lint_path(dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: the same source in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+// ── D4 cross-mode parity: status messages honour --quiet in ALL four input modes ──
+//
+// PF-004 — an alternate output path can silently bypass a guard. Directory mode
+// has TWO separate emitters (lint_one_file_human for --format human, and
+// lint_one_file_accumulating for --format json), plus single-file mode and stdin mode.
+// That is eight `fix rejected:` call sites in lint.rs (cited by function + match arm
+// so the reference survives future line-number shifts):
+//   run_lint_stdin             apply  — FixFileOutcome::Rejected arm
+//   run_lint_stdin             preview — PreviewOutcome::Rejected arm
+//   run_lint_file              apply  — FixFileOutcome::Rejected arm
+//   run_lint_file              preview — PreviewOutcome::Rejected arm
+//   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm
+//   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm
+//   lint_one_file_human        apply  — FixFileOutcome::Rejected arm
+//   lint_one_file_human        preview — PreviewOutcome::Rejected arm
+// This test covers all four modes, each with its own paired positive control, so no
+// assertion can pass because the fix was never attempted rather than suppressed.
+
+/// Source with a single Tier A fix that the reverify gate rejects whole-file:
+/// removing the empty `@define` would orphan the `@export`, so `FixFileOutcome`
+/// is `Rejected` (not `PartiallyFixed`) and `fix rejected:` is emitted.
+const FIX_REJECTED_SOURCE: &str = "\
+@define empty_fn():
+
+@end
+
+@export empty_fn
+";
+
+#[test]
+fn fix_rejected_message_honours_quiet_in_all_four_modes() {
+    let needle = "fix rejected";
+
+    // ── Mode 1: single file ──────────────────────────────────────────────────
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("r.mds");
+    fs::write(&target, FIX_REJECTED_SOURCE).unwrap();
+
+    let loud = lint_path(&target, &["--fix"]);
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains(needle),
+        "positive control (single file): without --quiet the rejection MUST be reported, \
+         otherwise the quiet assertion below is vacuous; got: {loud_stderr:?}"
+    );
+
+    let quiet = lint_path(&target, &["--fix", "--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains(needle),
+        "single-file --fix --quiet must suppress 'fix rejected:' (D4/PF-004); got: {quiet_stderr:?}"
+    );
+    assert_eq!(
+        quiet.status.code(),
+        loud.status.code(),
+        "single file: --quiet must not move the exit code"
+    );
+
+    // ── Mode 2: stdin ────────────────────────────────────────────────────────
+    let loud_stdin = lint_stdin(FIX_REJECTED_SOURCE, &["--fix"]);
+    let loud_stdin_stderr = String::from_utf8_lossy(&loud_stdin.stderr);
+    assert!(
+        loud_stdin_stderr.contains(needle),
+        "positive control (stdin): without --quiet the rejection MUST be reported; \
+         got: {loud_stdin_stderr:?}"
+    );
+
+    let quiet_stdin = lint_stdin(FIX_REJECTED_SOURCE, &["--fix", "--quiet"]);
+    let quiet_stdin_stderr = String::from_utf8_lossy(&quiet_stdin.stderr);
+    assert!(
+        !quiet_stdin_stderr.contains(needle),
+        "stdin --fix --quiet must suppress 'fix rejected:' (D4/PF-004); got: {quiet_stdin_stderr:?}"
+    );
+    assert_eq!(
+        quiet_stdin.status.code(),
+        loud_stdin.status.code(),
+        "stdin: --quiet must not move the exit code"
+    );
+
+    // ── Mode 3: directory ────────────────────────────────────────────────────
+    let loud_dir = lint_path(dir.path(), &["--fix"]);
+    let loud_dir_stderr = String::from_utf8_lossy(&loud_dir.stderr);
+    assert!(
+        loud_dir_stderr.contains(needle),
+        "positive control (directory): without --quiet the rejection MUST be reported; \
+         got: {loud_dir_stderr:?}"
+    );
+
+    let quiet_dir = lint_path(dir.path(), &["--fix", "--quiet"]);
+    let quiet_dir_stderr = String::from_utf8_lossy(&quiet_dir.stderr);
+    assert!(
+        !quiet_dir_stderr.contains(needle),
+        "directory --fix --quiet must suppress 'fix rejected:' (D4/PF-004); got: {quiet_dir_stderr:?}"
+    );
+    assert_eq!(
+        quiet_dir.status.code(),
+        loud_dir.status.code(),
+        "directory: --quiet must not move the exit code"
+    );
+
+    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
+    // PF-004: --format json routes directory files through lint_one_file_accumulating,
+    // a separate emitter from lint_one_file_human (Mode 3).  This covers the two
+    // gated sites in that emitter:
+    //   lint_one_file_accumulating apply  — FixFileOutcome::Rejected arm  (--fix)
+    //   lint_one_file_accumulating preview — PreviewOutcome::Rejected arm (--fix --check)
+
+    // Apply path (lint_one_file_accumulating, FixFileOutcome::Rejected): --fix --format json.
+    let loud_json = lint_path(dir.path(), &["--fix", "--format", "json"]);
+    let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
+    assert!(
+        loud_json_stderr.contains(needle),
+        "positive control (dir --fix --format json): without --quiet the rejection MUST be \
+         reported in stderr; got: {loud_json_stderr:?}"
+    );
+
+    let quiet_json = lint_path(dir.path(), &["--fix", "--format", "json", "--quiet"]);
+    let quiet_json_stderr = String::from_utf8_lossy(&quiet_json.stderr);
+    assert!(
+        !quiet_json_stderr.contains(needle),
+        "dir --fix --format json --quiet must suppress 'fix rejected:' \
+         (D4/PF-004 lint_one_file_accumulating FixFileOutcome::Rejected); \
+         got: {quiet_json_stderr:?}"
+    );
+    assert_eq!(
+        quiet_json.status.code(),
+        loud_json.status.code(),
+        "dir --format json --fix: --quiet must not move the exit code"
+    );
+
+    // Preview path (lint_one_file_accumulating, PreviewOutcome::Rejected): --fix --check --format json.
+    let loud_json_check = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+    let loud_json_check_stderr = String::from_utf8_lossy(&loud_json_check.stderr);
+    assert!(
+        loud_json_check_stderr.contains(needle),
+        "positive control (dir --fix --check --format json): without --quiet the rejection MUST \
+         be reported in stderr; got: {loud_json_check_stderr:?}"
+    );
+
+    let quiet_json_check = lint_path(
+        dir.path(),
+        &["--fix", "--check", "--format", "json", "--quiet"],
+    );
+    let quiet_json_check_stderr = String::from_utf8_lossy(&quiet_json_check.stderr);
+    assert!(
+        !quiet_json_check_stderr.contains(needle),
+        "dir --fix --check --format json --quiet must suppress 'fix rejected:' \
+         (D4/PF-004 lint_one_file_accumulating PreviewOutcome::Rejected); \
+         got: {quiet_json_check_stderr:?}"
+    );
+    assert_eq!(
+        quiet_json_check.status.code(),
+        loud_json_check.status.code(),
+        "dir --format json --fix --check: --quiet must not move the exit code"
+    );
+
+    // The rejection leaves the file unmodified in every mode.
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        FIX_REJECTED_SOURCE,
+        "a rejected fix must never rewrite the source file"
+    );
+}
+
+// ── D4 cross-mode parity: diagnostic-cap notice honours --quiet in all four modes ──
+//
+// PF-004: the cap notice is emitted from four separate call sites:
+//   run_lint_stdin          (stdin mode)
+//   run_lint_file           (single-file mode)
+//   lint_one_file_human     (directory --format human, the default)
+//   lint_one_file_accumulating (directory --format json)
+// Each mode must gate on !quiet independently — PF-004 (avoids #43/#173 divergence class).
+// PF-013 / ADR-009: each mode carries a paired positive control so the quiet
+// assertion cannot pass vacuously on an uncovered path.
+//
+// Source: 1001 legacy-interpolation instances (one per line) exceed MAX_DIAGNOSTICS
+// (1000) so LintResult.truncated = true.  --fix --check is used so no file is
+// modified between the positive-control run and the quiet run.
+
+/// Build a source that triggers exactly 1001 legacy-interpolation diagnostics
+/// (one `{var_N}` per line).  1001 > MAX_DIAGNOSTICS (1000) forces truncation.
+fn make_cap_source() -> String {
+    (0..=1000)
+        .map(|i| format!("{{var_{i}}}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The diagnostic-cap notice is suppressed by `--quiet` in all four input modes.
+///
+/// D4 (AD-216-11): the cap notice is a *status* message — gated on `!quiet`
+/// at every emitter.  PF-004: directory-human, directory-JSON, single-file, and stdin
+/// are SEPARATE emitters; a gate on one is not inherited by the others
+/// (the #43/#173 divergence class).
+#[test]
+fn cap_notice_honours_quiet_in_all_four_modes() {
+    let needle = "diagnostic cap";
+    let source = make_cap_source();
+
+    // ── Mode 1: single file ──────────────────────────────────────────────────
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("cap.mds");
+    fs::write(&target, &source).unwrap();
+
+    // Positive control: without --quiet the cap notice MUST appear.
+    let loud = lint_path(&target, &["--fix", "--check"]);
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains(needle),
+        "positive control (single file): without --quiet the cap notice MUST be reported \
+         (otherwise the quiet assertion is vacuous; ADR-009); got: {loud_stderr:?}"
+    );
+
+    let quiet = lint_path(&target, &["--fix", "--check", "--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains(needle),
+        "single-file --fix --check --quiet must suppress the cap notice (D4/PF-004); \
+         got: {quiet_stderr:?}"
+    );
+    assert_eq!(
+        quiet.status.code(),
+        loud.status.code(),
+        "single file: --quiet must not move the exit code"
+    );
+
+    // ── Mode 2: stdin ────────────────────────────────────────────────────────
+    let loud_stdin = lint_stdin(&source, &["--fix", "--check"]);
+    let loud_stdin_stderr = String::from_utf8_lossy(&loud_stdin.stderr);
+    assert!(
+        loud_stdin_stderr.contains(needle),
+        "positive control (stdin): without --quiet the cap notice MUST be reported; \
+         got: {loud_stdin_stderr:?}"
+    );
+
+    let quiet_stdin = lint_stdin(&source, &["--fix", "--check", "--quiet"]);
+    let quiet_stdin_stderr = String::from_utf8_lossy(&quiet_stdin.stderr);
+    assert!(
+        !quiet_stdin_stderr.contains(needle),
+        "stdin --fix --check --quiet must suppress the cap notice (D4/PF-004); \
+         got: {quiet_stdin_stderr:?}"
+    );
+    assert_eq!(
+        quiet_stdin.status.code(),
+        loud_stdin.status.code(),
+        "stdin: --quiet must not move the exit code"
+    );
+
+    // ── Mode 3: directory ────────────────────────────────────────────────────
+    let loud_dir = lint_path(dir.path(), &["--fix", "--check"]);
+    let loud_dir_stderr = String::from_utf8_lossy(&loud_dir.stderr);
+    assert!(
+        loud_dir_stderr.contains(needle),
+        "positive control (directory): without --quiet the cap notice MUST be reported; \
+         got: {loud_dir_stderr:?}"
+    );
+
+    let quiet_dir = lint_path(dir.path(), &["--fix", "--check", "--quiet"]);
+    let quiet_dir_stderr = String::from_utf8_lossy(&quiet_dir.stderr);
+    assert!(
+        !quiet_dir_stderr.contains(needle),
+        "directory --fix --check --quiet must suppress the cap notice (D4/PF-004); \
+         got: {quiet_dir_stderr:?}"
+    );
+    assert_eq!(
+        quiet_dir.status.code(),
+        loud_dir.status.code(),
+        "directory: --quiet must not move the exit code"
+    );
+
+    // ── Mode 4: directory, --format json (lint_one_file_accumulating) ───────────
+    // PF-004: --format json routes directory files through lint_one_file_accumulating,
+    // a SEPARATE emitter from lint_one_file_human (Mode 3).  The cap-notice gate
+    // (`if fix && !quiet`) inside lint_one_file_accumulating must also be tested;
+    // a regression that leaves it unguarded would pass Modes 1–3 and escape CI.
+    // The same temp `dir` / `cap.mds` file is reused (not modified by --fix --check).
+
+    // Positive control: without --quiet the cap notice MUST appear.
+    let loud_json = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+    let loud_json_stderr = String::from_utf8_lossy(&loud_json.stderr);
+    assert!(
+        loud_json_stderr.contains(needle),
+        "positive control (dir --format json): without --quiet the cap notice MUST be reported \
+         (otherwise the quiet assertion is vacuous; ADR-009); got: {loud_json_stderr:?}"
+    );
+
+    let quiet_json = lint_path(
+        dir.path(),
+        &["--fix", "--check", "--format", "json", "--quiet"],
+    );
+    let quiet_json_stderr = String::from_utf8_lossy(&quiet_json.stderr);
+    assert!(
+        !quiet_json_stderr.contains(needle),
+        "directory --fix --check --format json --quiet must suppress the cap notice \
+         (D4/PF-004 lint_one_file_accumulating cap-notice gate); got: {quiet_json_stderr:?}"
+    );
+    assert_eq!(
+        quiet_json.status.code(),
+        loud_json.status.code(),
+        "dir --format json: --quiet must not move the exit code"
+    );
+}
+
+// ── AC-Q20: bare `mds lint` cannot reach directory mode ───────────────────────
+//
+// `auto_detect_mds_file` filters on path.is_file(), so a directory auto-detect
+// never resolves to a directory.  Pin this so a future auto-detect change that
+// starts returning `.` cannot silently attach a summary to the most common invocation.
+
+#[test]
+fn bare_lint_never_enters_directory_mode() {
+    // Single-file case: bare `mds lint` auto-detects the one file.
+    let dir1 = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir1.path().join("template.mds")).unwrap();
+
+    let out1 = mds_bin()
+        .arg("lint")
+        .current_dir(dir1.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr1 = String::from_utf8_lossy(&out1.stderr);
+
+    assert_eq!(
+        out1.status.code(),
+        Some(0),
+        "bare lint in single-file dir must exit 0; stderr: {stderr1}"
+    );
+    assert!(
+        stderr1.contains("Clean:"),
+        "bare lint must print 'Clean:' (single-file); got: {stderr1:?}"
+    );
+    assert!(
+        !stderr1.contains("clean,"),
+        "AC-Q20: bare lint must NOT enter directory mode; got: {stderr1:?}"
+    );
+
+    // Two-file case: bare `mds lint` must error with "multiple .mds files found".
+    let dir2 = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir2.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir2.path().join("b.mds")).unwrap();
+
+    let out2 = mds_bin()
+        .arg("lint")
+        .current_dir(dir2.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr2 = String::from_utf8_lossy(&out2.stderr);
+
+    assert!(
+        !out2.status.success(),
+        "bare lint with two files must fail; stderr: {stderr2}"
+    );
+    assert!(
+        !stderr2.contains("clean,"),
+        "AC-Q20: bare lint with two files must NOT emit a directory summary; got: {stderr2:?}"
+    );
+
+    // PF-013 / ADR-009: prove "clean," is the exact substring a real directory summary
+    // contains, so both absence assertions above are not vacuous.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
+    let control = lint_path(control_dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: a clean file in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+// ── AC-Q21: empty and all-excluded directory print no summary ─────────────────
+
+#[test]
+fn lint_directory_empty_prints_no_summary() {
+    // Empty directory.
+    let dir = tempfile::tempdir().unwrap();
+
+    let non_quiet = lint_path(dir.path(), &[]);
+    let stderr_nq = String::from_utf8_lossy(&non_quiet.stderr);
+
+    assert_eq!(
+        non_quiet.status.code(),
+        Some(0),
+        "empty directory lint must exit 0; stderr: {stderr_nq}"
+    );
+    assert!(
+        stderr_nq.contains("No .mds files found"),
+        "empty directory must print 'No .mds files found'; got: {stderr_nq:?}"
+    );
+    assert!(
+        !stderr_nq.contains("clean,"),
+        "AC-Q21: empty directory must NOT print a summary; got: {stderr_nq:?}"
+    );
+
+    let quiet = lint_path(dir.path(), &["--quiet"]);
+    let stderr_q = String::from_utf8_lossy(&quiet.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(0),
+        "empty directory lint --quiet must exit 0; stderr: {stderr_q}"
+    );
+    assert!(
+        stderr_q.is_empty(),
+        "AC-Q21: empty directory under --quiet must produce no stderr; got: {stderr_q:?}"
+    );
+}
+
+// ── AC-Q22: all-excluded quiet still shouts, and gains no summary ─────────────
+//
+// Runs the existing dir_lint_all_excluded_quiet_still_emits_diagnostic scenario
+// and adds the no-summary assertion.
+
+#[test]
+fn lint_directory_all_excluded_quiet_no_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let hidden = dir.path().join(".github");
+    fs::create_dir(&hidden).unwrap();
+    fs::write(hidden.join("template.mds"), "Hello!\n").unwrap();
+
+    let out = lint_path(dir.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        !out.status.success(),
+        "all-excluded under --quiet must exit non-zero; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("excluded") || stderr.contains("default-excluded"),
+        "AC-Q22: all-excluded diagnostic must appear under --quiet; got: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("clean,"),
+        "AC-Q22: all-excluded must NOT emit a summary line; got: {stderr:?}"
+    );
+
+    // PF-013 / ADR-009: prove "clean," is the exact substring a real directory summary
+    // contains.  This scenario fires the all-excluded early return, so no summary is
+    // emitted even without --quiet.  The positive control must therefore use a separate
+    // directory that reaches the full summary path.
+    let control_dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), control_dir.path().join("a.mds")).unwrap();
+    let control = lint_path(control_dir.path(), &[]);
+    assert!(
+        String::from_utf8_lossy(&control.stderr).contains("clean,"),
+        "positive control: a clean file in directory mode must produce a summary \
+         containing the exact needle \"clean,\"; got: {:?}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+}
+
+// ── AC-Q25: hostile filename cannot forge a summary line ─────────────────────
+//
+// PF-018: construct the hostile byte at RUNTIME, never as a source literal.
+// PF-013/ADR-009: positive control — assert the escaped form IS in stderr,
+// proving the hostile filename was reached and neutralised.
+
+#[cfg(unix)]
+#[test]
+fn lint_directory_summary_is_not_forgeable() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // PF-018: construct the ESC byte (0x1b) at runtime, never as a source literal.
+    let esc_byte: u8 = 0x1b;
+    // Build the hostile filename with an embedded ESC byte.
+    // If an attacker could control a filename, they could try to embed
+    // "3 clean, 0 with warnings, 0 with errors, 0 resource-limited" to forge a summary.
+    let forged_suffix = b"3 clean, 0 with warnings, 0 with errors, 0 resource-limited";
+    let mut hostile_name_bytes = vec![esc_byte];
+    hostile_name_bytes.extend_from_slice(forged_suffix);
+    hostile_name_bytes.extend_from_slice(b".mds");
+    let hostile_os = std::ffi::OsStr::from_bytes(&hostile_name_bytes);
+    let hostile_path = dir.path().join(hostile_os);
+
+    // Use error-severity content so the file is lint-processed and its path
+    // appears in the output (duplicate-export from lint_error.mds content).
+    let error_content = fs::read(fixture("lint_error.mds")).unwrap();
+    fs::write(&hostile_path, &error_content).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+    let stderr_bytes = &out.stderr;
+    let stderr = String::from_utf8_lossy(stderr_bytes);
+
+    // Primary assertion: no raw 0x1b (ESC) byte in stderr.
+    assert!(
+        !stderr_bytes.contains(&esc_byte),
+        "AC-Q25: raw ESC byte must not appear in stderr; got: {stderr:?}"
+    );
+
+    // Positive control: the escaped form of 0x1b MUST appear in stderr,
+    // proving the hostile filename was reached and processed, not silently skipped.
+    // The sanitizer emits control bytes as \uXXXX with UPPERCASE hex digits (e.g. \u001B).
+    // Check both cases defensively; the canonical form confirmed in error_tests.rs is \u001B.
+    assert!(
+        stderr.contains("\\u001B")
+            || stderr.contains("\\u001b")
+            || stderr.contains("\\x1B")
+            || stderr.contains("\\x1b"),
+        "AC-Q25 positive control: escaped form of ESC must appear in stderr, \
+         confirming the hostile file was processed; got: {stderr:?}"
+    );
+
+    // The forged summary text must NOT appear as a standalone summary line.
+    // The genuine summary will have a different count (1 with errors, not 3 clean).
+    // Note: the hostile FILENAME embeds the forged text so it DOES appear inside the
+    // diagnostic frame line ("╭─[\u001B3 clean...mds:6:1]").  We must check for an
+    // exact line match, not a substring match, to distinguish the two cases.
+    let forged_line = "3 clean, 0 with warnings, 0 with errors, 0 resource-limited";
+    assert!(
+        !stderr.lines().any(|l| l.trim() == forged_line),
+        "AC-Q25: forged summary text must not appear as a standalone summary line; \
+         got: {stderr:?}"
+    );
+
+    // AC-Q25 also requires the GENUINE summary appears exactly once, confirming the
+    // directory summary path was reached and a real count was emitted (not suppressed or
+    // omitted).  The directory contains exactly 1 error-severity file, so the genuine
+    // summary is the line below.
+    let genuine_summary = "0 clean, 0 with warnings, 1 with errors, 0 resource-limited";
+    let genuine_count = stderr
+        .lines()
+        .filter(|l| l.trim() == genuine_summary)
+        .count();
+    assert_eq!(
+        genuine_count, 1,
+        "AC-Q25: genuine summary must appear exactly once in stderr; got: {stderr:?}"
+    );
+}
+
+// ── AC-Q26: help text is machine-verified, not eyeballed ─────────────────────
+
+#[test]
+fn help_documents_quiet_summary_contract() {
+    // mds lint --help must document the directory summary and --quiet behaviour.
+    let lint_help = mds_bin()
+        .arg("lint")
+        .arg("--help")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let help_text = String::from_utf8_lossy(&lint_help.stdout);
+
+    // Pin the two documentation sites independently. A bare `contains("summary")` is
+    // satisfied by EITHER site alone, so removing the long_about paragraph would leave
+    // this test green on the strength of the after_help example line (and vice versa).
+    assert!(
+        help_text.contains("summary line to stderr"),
+        "AC-Q26: mds lint --help long_about must document the directory summary line; \
+         got: {help_text:?}"
+    );
+    assert!(
+        help_text.contains("N clean, N with warnings, N with errors, N resource-limited"),
+        "AC-Q26: mds lint --help must show the literal summary format string so the shipped \
+         format and the documented format cannot drift; got: {help_text:?}"
+    );
+    assert!(
+        help_text.contains("mds lint --quiet ."),
+        "AC-Q26: mds lint --help must carry the `mds lint --quiet .` directory example; \
+         got: {help_text:?}"
+    );
+
+    // mds --help must contain the global --quiet description.
+    let global_help = mds_bin()
+        .arg("--help")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let global_text = String::from_utf8_lossy(&global_help.stdout);
+
+    assert!(
+        global_text.contains("Suppress status"),
+        "AC-Q26: mds --help must contain the --quiet description; got: {global_text:?}"
+    );
+}
+
+// ── AC-Q30 (lint half): --quiet in both argument positions ────────────────────
+//
+// --quiet is `global = true` (main.rs:31); both orderings must be identical.
+
+#[test]
+fn lint_directory_quiet_works_in_pre_subcommand_position() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("a.mds")).unwrap();
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("b.mds")).unwrap();
+
+    // Post-subcommand.
+    let post = lint_path(dir.path(), &["--quiet"]);
+
+    // Pre-subcommand (global position).
+    let pre = mds_bin()
+        .arg("--quiet")
+        .arg("lint")
+        .arg(dir.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        pre.status.code(),
+        post.status.code(),
+        "AC-Q30: pre-subcommand --quiet must produce the same exit code as post-subcommand"
+    );
+    assert_eq!(
+        pre.stderr, post.stderr,
+        "AC-Q30: pre-subcommand --quiet must produce identical stderr to post-subcommand"
+    );
+
+    // ANCHOR (PF-013): equality alone is vacuous — it holds just as well when BOTH
+    // orderings are broken. Verified by mutation: with the summary gate removed
+    // entirely, the two `assert_eq!`s above still passed. Pin the absolute value so
+    // the test fails if `--quiet` stops suppressing, in either position.
+    assert!(
+        post.stderr.is_empty(),
+        "AC-Q30 anchor: a clean tree under --quiet must produce empty stderr in BOTH \
+         orderings, not merely equal stderr; got: {:?}",
+        String::from_utf8_lossy(&post.stderr)
+    );
+
+    // Paired positive control: the same tree without --quiet DOES print the summary,
+    // proving the emptiness assertion above is a real suppression, not a dead code path.
+    let control = lint_path(dir.path(), &[]);
+    assert_eq!(
+        String::from_utf8_lossy(&control.stderr).trim(),
+        "2 clean, 0 with warnings, 0 with errors, 0 resource-limited",
+        "positive control: the same tree without --quiet must print the summary"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// D3-a: per-file analysis failures are counted in the "with errors" bucket
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// spec.md §7.5 "With errors" bullet (lines 964-966): "error-severity lint findings
+// OR a per-file analysis failure (source read, config load, or lint call failure)".
+// Every prior #216 test populates the error bucket via lint findings (lint_error.mds).
+// The tests below exercise the analysis-failure half, which has separate code paths
+// in lint.rs (config-discovery error arms, source-read IO error arms) and must be
+// covered independently (D3-a bucket-membership claim).
+
+// ── D3-a: config-load failure counted in "with errors" (not "clean") ──────────
+
+/// Config-load failure must land in the "with errors" bucket of the directory summary,
+/// not the "clean" bucket.  A malformed `mds.json` in a subdirectory triggers a
+/// config-load error for files in that subtree; the test verifies bucket membership
+/// and that the four counters partition the full file set (AC-Q08).
+#[test]
+fn lint_directory_config_failure_counted_in_error_bucket() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // One clean file at root — no mds.json present, defaults apply.
+    fs::copy(fixture("lint_clean.mds"), root.join("clean.mds")).unwrap();
+
+    // Subdirectory with an unparseable mds.json; the file inside it triggers a
+    // config-load failure (not a lint finding — different code path in lint.rs).
+    let bad = root.join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
+    fs::copy(fixture("lint_clean.mds"), bad.join("bad.mds")).unwrap();
+
+    let out = lint_path(root, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "config-load failure must cause exit 2; stderr: {stderr}"
+    );
+    // D3-a: the file whose config load failed must be counted in "with errors".
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 1 with errors, 0 resource-limited"),
+        "D3-a: config-load failure must be counted as 'with errors' in the summary; \
+         got: {stderr:?}"
+    );
+    // AC-Q08: the four counters must partition the 2-file tree with no drops.
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts,
+        [1, 0, 1, 0],
+        "D3-a/AC-Q08: 1 clean + 0 warn + 1 error + 0 limit must sum to 2 files; \
+         got counts: {counts:?}"
+    );
+}
+
+// ── D3-a: config-load failure forces summary under --quiet ────────────────────
+//
+// The quiet gate is: !quiet || error_file_count > 0 || limit_file_count > 0.
+// A config-load failure increments error_file_count, so the summary must be
+// forced even under --quiet.
+//
+// PF-013 / ADR-009: the positive control (non-quiet run) confirms that "with errors"
+// appears on the same tree, making the with-quiet assertion non-vacuous.
+
+#[test]
+fn lint_directory_config_failure_forces_summary_under_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::copy(fixture("lint_clean.mds"), root.join("clean.mds")).unwrap();
+    let bad = root.join("bad");
+    fs::create_dir(&bad).unwrap();
+    fs::write(bad.join("mds.json"), "{ INVALID JSON").unwrap();
+    fs::copy(fixture("lint_clean.mds"), bad.join("bad.mds")).unwrap();
+
+    let quiet = lint_path(root, &["--quiet"]);
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(2),
+        "config-load failure under --quiet must still exit 2; stderr: {quiet_stderr:?}"
+    );
+    // D3-a: error_file_count > 0 forces the summary even under --quiet.
+    assert!(
+        quiet_stderr.contains("with errors"),
+        "D3-a: config-load failure must force the summary under --quiet \
+         (error_file_count > 0 gate); got: {quiet_stderr:?}"
+    );
+
+    // PF-013 / ADR-009 — paired positive control on the same tree.
+    let control = lint_path(root, &[]);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+    assert!(
+        control_stderr.contains("with errors"),
+        "positive control: non-quiet run with config-load failure must also emit the \
+         summary with 'with errors', proving the --quiet assertion is non-vacuous; \
+         got: {control_stderr:?}"
+    );
+}
+
+// ── D3-a: chmod-000 source-read failure counted in "with errors" (unix only) ──
+//
+// A chmod-000 file causes a source-read IO error in the lint engine, which must be
+// counted as FileTally::Error (not FileTally::Clean).  This is the source-read
+// population of the "with errors" disjunction (spec.md §7.5 lines 964-966).
+//
+// Not run on Windows where permission enforcement uses ACLs, not Unix mode bits.
+// Running as root bypasses Unix permission checks: the chmod-000 file is readable,
+// so the tree lints clean and `assert_eq!(status, Some(2))` fails loudly rather
+// than passing vacuously.  CI does not run as root.
+
+#[cfg(unix)]
+#[test]
+fn lint_directory_unreadable_file_counted_in_error_bucket() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // One clean, readable file.
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+
+    // One file made unreadable via chmod 000.
+    let unreadable = dir.path().join("unreadable.mds");
+    fs::copy(fixture("lint_clean.mds"), &unreadable).unwrap();
+    fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = lint_path(dir.path(), &[]);
+
+    // Restore permissions before any assertion so a test-failure panic cannot
+    // leave a 000-mode file that confuses temporary-directory cleanup.
+    let _ = fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "chmod-000 file must cause exit 2; stderr: {stderr}"
+    );
+    // D3-a: the source-read failure must land in "with errors", not "clean".
+    assert!(
+        stderr.contains("1 clean, 0 with warnings, 1 with errors, 0 resource-limited"),
+        "D3-a: source-read failure must be counted as 'with errors' in the summary; \
+         got: {stderr:?}"
+    );
+    let counts = parse_summary_counts(&stderr);
+    assert_eq!(
+        counts,
+        [1, 0, 1, 0],
+        "D3-a/AC-Q08: 1 clean + 0 warn + 1 error + 0 limit must sum to 2 files; \
+         got counts: {counts:?}"
+    );
+}
+
+// ── D3-a: chmod-000 source-read failure forces summary under --quiet (unix only)
+//
+// PF-013 / ADR-009: both the --quiet run and the positive control are captured
+// while the file is still unreadable, then permissions are restored before
+// asserting, so a panic during assertion cannot leave a bad-permission file.
+
+#[cfg(unix)]
+#[test]
+fn lint_directory_unreadable_file_forces_summary_under_quiet() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    fs::copy(fixture("lint_clean.mds"), dir.path().join("clean.mds")).unwrap();
+
+    let unreadable = dir.path().join("unreadable.mds");
+    fs::copy(fixture("lint_clean.mds"), &unreadable).unwrap();
+    fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Capture both runs while the file is still unreadable (positive control must
+    // see the same tree state as the --quiet run).
+    let quiet = lint_path(dir.path(), &["--quiet"]);
+    let control = lint_path(dir.path(), &[]);
+
+    // Restore permissions before any assertion.
+    let _ = fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644));
+
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    let control_stderr = String::from_utf8_lossy(&control.stderr);
+
+    assert_eq!(
+        quiet.status.code(),
+        Some(2),
+        "chmod-000 file under --quiet must still exit 2; stderr: {quiet_stderr:?}"
+    );
+    // D3-a: error_file_count > 0 forces the summary even under --quiet.
+    assert!(
+        quiet_stderr.contains("with errors"),
+        "D3-a: source-read failure must force the summary under --quiet; \
+         got: {quiet_stderr:?}"
+    );
+
+    // PF-013 / ADR-009 — paired positive control on the same (unreadable) tree.
+    assert!(
+        control_stderr.contains("with errors"),
+        "positive control: non-quiet run with unreadable file must also show 'with errors', \
+         proving the --quiet assertion is non-vacuous; got: {control_stderr:?}"
+    );
+}
+
+// ── D4 (PF-004): Fixed: and Would fix: honour --quiet in dir-mode JSON emitter ─
+//
+// Finding: lint_one_file_accumulating (JSON) was missing Fixed: and Would fix:
+// messages, creating a divergence from lint_one_file_human (PF-004 class).
+// These tests verify: (a) the messages appear without --quiet (positive control per
+// PF-013/ADR-009), and (b) --quiet suppresses them.
+
+/// D4/PF-004: dir-mode `--fix --format json` emits `Fixed:` to stderr (positive),
+/// and `--quiet` suppresses it (negative).  Both arms per PF-013.
+#[test]
+fn dir_json_fix_emits_fixed_and_quiet_suppresses_it() {
+    // Case A (positive control — ADR-009/PF-013): Fixed: must appear without --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix --format json must emit 'Fixed:' without --quiet; \
+             got stderr: {stderr}"
+        );
+        // Stdout must remain parseable JSON (PR1 contract: stdout carries ONLY the JSON).
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}"));
+    }
+
+    // Case B (quiet gate): Fixed: must be suppressed by --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--format", "json", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix --format json --quiet must suppress 'Fixed:'; \
+             got stderr: {stderr}"
+        );
+        // Stdout must still be parseable JSON even under --quiet.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("stdout must remain valid JSON under --quiet; err: {e}; stdout: {stdout}")
+        });
+    }
+}
+
+/// D4/PF-004: dir-mode `--fix --check --format json` emits `Would fix:` to stderr
+/// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013.
+#[test]
+fn dir_json_fix_check_emits_would_fix_and_quiet_suppresses_it() {
+    // Case A (positive control — ADR-009/PF-013): Would fix: must appear without --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        // Use a fresh copy so any prior --fix write in this run doesn't affect us.
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Would fix:"),
+            "D4/PF-004: dir --fix --check --format json must emit 'Would fix:' without \
+             --quiet; got stderr: {stderr}"
+        );
+        // Stdout must remain parseable JSON (PR1 contract).
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout must be valid JSON; err: {e}; stdout: {stdout}"));
+    }
+
+    // Case B (quiet gate): Would fix: must be suppressed by --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(
+            dir.path(),
+            &["--fix", "--check", "--format", "json", "--quiet"],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Would fix:"),
+            "D4/PF-004: dir --fix --check --format json --quiet must suppress 'Would fix:'; \
+             got stderr: {stderr}"
+        );
+        // Stdout must still be parseable JSON.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("stdout must remain valid JSON under --quiet; err: {e}; stdout: {stdout}")
+        });
+    }
+}
+
+// ── D4 (PF-004): Fixed: honours --quiet in dir-mode HUMAN emitter ─────────────
+//
+// PF-007: per-surface assertions cannot prove cross-surface parity.
+// The JSON-side test (dir_json_fix_emits_fixed_and_quiet_suppresses_it) cannot
+// substitute for this test — lint_one_file_human is a separate emitter from
+// lint_one_file_accumulating.
+// Mutation-verified: without this test, changing the human-mode gate at
+// lint.rs:1723 from `!quiet` to `true` leaves all prior tests passing.
+
+/// D4/PF-004: dir-mode `--fix` (human format, the default) emits `Fixed:` to stderr
+/// (positive), and `--quiet` suppresses it (negative).  Both arms per PF-013/ADR-009.
+///
+/// PF-007: this is a separate emitter (`lint_one_file_human`) from the JSON-mode
+/// equivalent (`lint_one_file_accumulating`); a gate on one is not inherited by the
+/// other.  The JSON-mode equivalent is `dir_json_fix_emits_fixed_and_quiet_suppresses_it`.
+#[test]
+fn dir_human_fix_emits_fixed_and_quiet_suppresses_it() {
+    // Case A (positive control — ADR-009/PF-013): Fixed: must appear without --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix (human format) must emit 'Fixed:' when a file is \
+             successfully fixed (lint_one_file_human gate, lint.rs:1723); got stderr: {stderr}"
+        );
+        // Stdout must remain empty in human format mode.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.is_empty(),
+            "D4: dir --fix human format must not write to stdout; got: {stdout:?}"
+        );
+    }
+
+    // Case B (quiet gate): Fixed: must be suppressed by --quiet.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        fs::copy(fixture("lint_error.mds"), dir.path().join("err.mds")).unwrap();
+
+        let out = lint_path(dir.path(), &["--fix", "--quiet"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Fixed:"),
+            "D4/PF-004: dir --fix --quiet (human format) must suppress 'Fixed:' \
+             (lint_one_file_human gate, lint.rs:1723); got stderr: {stderr}"
+        );
+    }
+}
+
+// ── D1-a exception: --fix --diff --format json writes diff then JSON envelope ──
+//
+// spec.md:938 and lint.rs:1231-1233 document that `--fix --diff --format json`
+// writes the unified diff to stdout before the JSON envelope, making stdout
+// non-JSON-parseable as a whole by design.  This test pins the wire contract so
+// rerouting the diff to stderr (silently 'fixing' the exception) is caught.
+
+/// D1-a: `mds lint --fix --diff --format json <dir>` writes the unified diff to
+/// stdout before the JSON envelope.  The final stdout line must parse as JSON;
+/// stdout as a whole must NOT parse as JSON (the diff header breaks it).
+///
+/// Pins spec.md:938 and the D2-decision comment at lint.rs:1231-1233.  Without
+/// this test, rerouting the diff to stderr would silently remove the documented
+/// exception with no test failure.
+#[test]
+fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
+    let dir = tempfile::tempdir().unwrap();
+    // lint_error.mds has a Tier A auto-fixable issue (duplicate @export greet),
+    // so --fix --diff produces a non-empty unified diff.
+    fs::copy(fixture("lint_error.mds"), dir.path().join("fixable.mds")).unwrap();
+
+    let out = lint_path(dir.path(), &["--fix", "--diff", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        !lines.is_empty(),
+        "--fix --diff --format json must produce output on stdout; got empty"
+    );
+
+    // The final stdout line must parse as JSON (the envelope).
+    let last = lines[lines.len() - 1];
+    let _: serde_json::Value = serde_json::from_str(last).unwrap_or_else(|e| {
+        panic!(
+            "D1-a: final stdout line must parse as JSON (the envelope follows the diff); \
+             err: {e}; last line: {last:?}; full stdout: {stdout:?}"
+        )
+    });
+
+    // At least one line preceding the envelope must be a unified-diff marker.
+    let diff_present = lines[..lines.len().saturating_sub(1)]
+        .iter()
+        .any(|l| l.starts_with("@@") || l.starts_with("--- ") || l.starts_with("+++ "));
+    assert!(
+        diff_present,
+        "D1-a: unified diff must precede the JSON envelope on stdout (spec.md:938, \
+         lint.rs:1231-1233); full stdout: {stdout:?}"
+    );
+
+    // Stdout as a whole must NOT parse as JSON — the diff header breaks the shape.
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
+        "D1-a: stdout as a whole must not parse as JSON under --fix --diff --format json; \
+         this is the documented exception (spec.md:938); stdout: {stdout:?}"
     );
 }

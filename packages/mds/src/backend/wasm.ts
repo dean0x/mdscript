@@ -2,9 +2,9 @@ import type {
   BackendType,
   CheckOptions,
   CheckResult,
+  CompileFileOptions,
   CompileOptions,
   CompileResult,
-  FileOptions,
   InitOptions,
   LintFileOptions,
   LintOptions,
@@ -12,7 +12,7 @@ import type {
   MdsBaseBackend,
 } from '../types.js';
 import { assertResultShape, validateBackendMethods, WASM_EXPORTS } from './contract.js';
-import { compileOpt } from '../util/options.js';
+import { forwardOpts } from '../util/options.js';
 
 /**
  * Shape of the WASM module exports (built with wasm-pack).
@@ -333,16 +333,18 @@ const DEFAULT_COMPILE_OPTS = Object.freeze({
 /**
  * Extended options accepted by the internal WASM `compile` entry point.
  *
- * The public `CompileOptions` type omits `filename` and `modules` because
- * callers of the high-level `compile(source, options)` wrapper do not need
- * them — the WASM module uses sensible defaults for the string-compile path.
+ * Extends `Omit<CompileOptions, 'basePath'>`, not `CompileOptions`
+ * directly. After `CompileOptions` gained `basePath` (fix #180), inheriting it
+ * here would silently widen the internal WASM input type. The WASM module has no
+ * filesystem access, so `basePath` is explicitly excluded from this internal type.
+ * The basePath guard in `createWasmBackend.compile/check/lint` fires BEFORE this
+ * type is used, so no runtime leak is possible (avoids PF-004).
  *
- * This internal extension is used by `compileOpts()` so that callers who go
- * through `createWasmBackend` directly (e.g. `wrapWithFileOps`, CF-SM1 test)
- * and supply `filename`/`modules` explicitly get the expected WASM behaviour.
- * The public API contract is unchanged: no public method accepts these keys.
+ * `filename` and `modules` are WASM-internal: callers who go through
+ * `createWasmBackend` directly (e.g. `wrapWithFileOps`, CF-SM1 test) and supply
+ * these keys explicitly get the expected WASM behaviour. No public method accepts them.
  */
-interface _WasmCompileInput extends CompileOptions {
+interface _WasmCompileInput extends Omit<CompileOptions, 'basePath'> {
   filename?: string;
   modules?: Record<string, string>;
 }
@@ -357,7 +359,15 @@ function compileOpts(
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
-  const extra = compileOpt(options);
+  // Forward compile-surface keys via METHOD_KEYS.compile, which is derived
+  // from CompileOptions. METHOD_KEYS.compile includes basePath, but forwardOpts only
+  // forwards keys whose value is != null; the caller (throwWasmBasePathError) already
+  // threw when basePath was non-null, so it is never present in the forwarded object.
+  // Using 'compile' (not 'compileFile') keeps the key list tied to CompileOptions so
+  // a future key added to that interface automatically propagates here — eliminating
+  // the PF-004 / #180 topology where this function forwarded via the file-surface list
+  // and silently dropped a string-surface-only key (avoids PF-004).
+  const extra = forwardOpts(options, 'compile');
   const filename = options?.filename ?? DEFAULT_COMPILE_OPTS.filename;
   const modules = options?.modules ?? DEFAULT_COMPILE_OPTS.modules;
   if (extra == null && filename === DEFAULT_COMPILE_OPTS.filename && modules === DEFAULT_COMPILE_OPTS.modules) {
@@ -370,9 +380,12 @@ function compileOpts(
 function checkOpts(
   options?: CheckOptions,
 ): { filename: string; modules: Record<string, string>; vars?: Record<string, unknown> } {
-  const vars = options?.vars;
-  return vars != null
-    ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, vars }
+  // Uses METHOD_KEYS.check (not 'checkFile') — same rationale as compileOpts above:
+  // the key list stays tied to CheckOptions so a future field propagates automatically.
+  // basePath is excluded by forwardOpts's != null filter (caller already threw).
+  const extra = forwardOpts(options, 'check');
+  return extra != null
+    ? { filename: DEFAULT_COMPILE_OPTS.filename, modules: DEFAULT_COMPILE_OPTS.modules, ...extra }
     : DEFAULT_COMPILE_OPTS;
 }
 
@@ -380,7 +393,7 @@ function checkOpts(
 export function fileOpts(
   entryFilename: string,
   modules: Record<string, string>,
-  options?: FileOptions,
+  options?: CompileFileOptions,
 ): {
   filename: string;
   modules: Record<string, string>;
@@ -388,10 +401,34 @@ export function fileOpts(
   sourceMap?: boolean;
   sourcesContent?: boolean;
 } {
-  const extra = compileOpt(options);
+  // Use forwardOpts for the user-visible keys (vars, sourceMap, sourcesContent)
+  // so METHOD_KEYS.compileFile is the single authoritative source for what is forwarded.
+  const extra = forwardOpts(options, 'compileFile');
   return extra != null
     ? { filename: entryFilename, modules, ...extra }
     : { filename: entryFilename, modules };
+}
+
+/**
+ * Throw `mds::invalid_options` when a caller passes `basePath` to a WASM-backend
+ * string-surface method (compile, check, lint).
+ *
+ * The WASM backend has no filesystem access, so a non-null `basePath` cannot
+ * be honoured. Throwing instead of silently ignoring surfaces the misconfiguration
+ * rather than linting / compiling a partially-resolved module graph (avoids PF-004).
+ *
+ * The error message MUST NOT contain "filename" or "modules" (internal WASM
+ * keys the public API never exposes). Verified by a PF-013-controlled negative
+ * assertion: the raw wasmModule.compile call DOES contain those strings,
+ * proving the negative assertion can detect the leak if the guard is removed.
+ */
+function throwWasmBasePathError(): never {
+  const err = new Error(
+    'option "basePath" is not supported by the WASM backend (no filesystem access); ' +
+    'set MDS_BACKEND=native to use the native backend',
+  ) as Error & { code: string };
+  err.code = 'mds::invalid_options';
+  throw err;
 }
 
 /**
@@ -406,29 +443,29 @@ export function fileOpts(
 export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
   return {
     compile(source: string, options?: CompileOptions): CompileResult {
-      const result: unknown = wasmModule.compile(source, compileOpts(options as _WasmCompileInput));
+      // Reject basePath rather than silently ignoring it (avoids PF-004).
+      if (options?.basePath != null) throwWasmBasePathError();
+      const result: unknown = wasmModule.compile(source, compileOpts(options));
       assertResultShape(result, 'compile');
       return result as CompileResult;
     },
 
     check(source: string, options?: CheckOptions): CheckResult {
+      // Reject basePath rather than silently ignoring it (avoids PF-004).
+      if (options?.basePath != null) throwWasmBasePathError();
       const result: unknown = wasmModule.check(source, checkOpts(options));
       assertResultShape(result, 'check');
       return result as CheckResult;
     },
 
     lint(source: string, options?: LintOptions): LintResult {
-      // WASM backend does not support basePath (no filesystem access).
-      // vars and rules are forwarded; basePath is silently ignored.
-      const opts: {
-        vars?: Record<string, unknown>;
-        rules?: Record<string, string>;
-      } = {};
-      if (options?.vars != null) opts.vars = options.vars;
-      if (options?.rules != null) opts.rules = options.rules;
+      // Reject basePath rather than silently ignoring it (avoids PF-004).
+      if (options?.basePath != null) throwWasmBasePathError();
+      // forwardOpts uses METHOD_KEYS.lint (vars, rules only after the guard above
+      // ensures basePath is null/undefined and thus excluded by != null check).
       const result: unknown = wasmModule.lint(
         source,
-        Object.keys(opts).length > 0 ? opts : undefined,
+        forwardOpts(options, 'lint'),
       );
       assertResultShape(result, 'lint');
       return result as LintResult;
@@ -439,16 +476,11 @@ export function createWasmBackend(wasmModule: WasmModule): MdsBaseBackend {
       entry: string,
       options?: LintFileOptions,
     ): LintResult {
-      const opts: {
-        vars?: Record<string, unknown>;
-        rules?: Record<string, string>;
-      } = {};
-      if (options?.vars != null) opts.vars = options.vars;
-      if (options?.rules != null) opts.rules = options.rules;
+      // forwardOpts uses METHOD_KEYS.lintVirtual (vars, rules).
       const result: unknown = wasmModule.lintVirtual(
         modules,
         entry,
-        Object.keys(opts).length > 0 ? opts : undefined,
+        forwardOpts(options, 'lintVirtual'),
       );
       assertResultShape(result, 'lint');
       return result as LintResult;

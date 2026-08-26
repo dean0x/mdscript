@@ -32,7 +32,10 @@ pub(crate) struct MdsConfig {
     /// Per-rule severity overrides for `mds lint` (AC-F-17).
     ///
     /// Unknown severity VALUES fail config loading loudly (closed enum).
-    /// Unknown rule NAMES are preserved for forward compat (CLI warns and ignores).
+    /// Unknown rule NAMES: only `mds lint` warns on stderr and continues — single-file
+    /// mode via `load_lint_config`, directory mode via `LintDirCtx::config_for`.
+    /// `mds build`, `check`, `fmt`, and `watch` load this field but do not emit the
+    /// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
     #[serde(default)]
     pub(crate) lint: LintCliConfig,
 }
@@ -44,7 +47,10 @@ pub(crate) struct MdsConfig {
 ///
 /// Unknown severity VALUES (e.g. `"banana"`) cause a hard parse error (exit 2)
 /// because `Severity` is a closed enum with no sensible fallback. Unknown rule
-/// NAMES are warn-and-ignored at the CLI layer (forward compat).
+/// NAMES: only `mds lint` warns on stderr and continues — single-file mode via
+/// `load_lint_config`, directory mode via `LintDirCtx::config_for`. `mds build`,
+/// `check`, `fmt`, and `watch` deserialize this struct but do not emit the
+/// warning — an accepted asymmetry, not an oversight (see CHANGELOG).
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct LintCliConfig {
     #[serde(default)]
@@ -52,9 +58,21 @@ pub(crate) struct LintCliConfig {
 }
 
 impl LintCliConfig {
-    /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions.
-    pub(crate) fn into_core_config(self) -> mds::LintConfig {
-        mds::LintConfig::from_rules(self.rules)
+    /// Convert to the core `LintConfig` consumed by `mds::lint_*` functions,
+    /// returning any unknown rule names alongside it.
+    ///
+    /// Uses [`mds::LintConfig::from_rules_checked`] so the caller receives both
+    /// the config and the unknowns report in one step, rather than building the
+    /// config and optionally invoking a separate check. This closes the gap
+    /// identified in the review finding for config.rs:104 — a consumer could
+    /// previously skip detection silently by not invoking the separate check.
+    /// Note: `#[must_use]` on `from_rules_checked` fires only when the entire
+    /// return value is dropped; `let (config, _) = …` silently discards the
+    /// `Option<mds::UnknownRuleNames>` and is the caller's own choice (as
+    /// config.rs:249 states: the `#[must_use]` only warns "if the return value
+    /// is discarded entirely").
+    pub(crate) fn into_core_config(self) -> (mds::LintConfig, Option<mds::UnknownRuleNames>) {
+        mds::LintConfig::from_rules_checked(self.rules)
     }
 }
 
@@ -431,7 +449,15 @@ pub(crate) fn parse_cli_value(val: String) -> mds::Value {
 /// and correctly fall through to exit code 1. Only `MdsError` values converted via
 /// `.map_err(miette::Error::from)` are categorized.
 pub(crate) fn exit_code(err: &miette::Error) -> i32 {
-    if let Some(mds_err) = err.downcast_ref::<MdsError>() {
+    // AD-211-5: `StdinRelabeledError` is a render-only wrapper around an `MdsError`.
+    // It must be unwrapped here or wrapping an error to fix its DISPLAY label would
+    // silently change its EXIT CODE (a wrapped FileNotFound would fall through to 1
+    // instead of 2). The label swap is not allowed to have behavioural side effects.
+    let mds_err = err.downcast_ref::<MdsError>().or_else(|| {
+        err.downcast_ref::<crate::output::StdinRelabeledError>()
+            .map(crate::output::StdinRelabeledError::inner)
+    });
+    if let Some(mds_err) = mds_err {
         match mds_err {
             MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
@@ -699,8 +725,11 @@ pub(crate) fn compile_to_content(
         // Stdin: compile from source string using cwd as base_dir.
         // read_stdin enforces MAX_FILE_SIZE (PF-004).
         let (source, cwd) = read_stdin()?;
+        // AD-211-1 / AD-211-5: a string-source compile labels its errors `<source>`
+        // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
+        // boundary that knows the input was stdin.
         mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
-            .map_err(miette::Error::from)?
+            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?
     } else {
         // File path: compile_with_deps_opts routes through the resolver which enforces
         // MAX_FILE_SIZE and check_symlink (PF-004 compliance).
@@ -990,7 +1019,8 @@ pub(crate) fn apply_source_map_file_label(
     if stdin_label {
         for src in &mut sm.sources {
             if src == STRING_SOURCE_MAP_LABEL {
-                *src = "<stdin>".to_string();
+                // AD-211-3: use the centralised sentinel from output.rs.
+                *src = crate::output::STDIN_DISPLAY_LABEL.to_string();
             }
         }
     }
@@ -1159,8 +1189,9 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
             .with_source_map_base(source_map_base);
 
         let (source, cwd) = read_stdin()?;
+        // AD-211-1 / AD-211-5: same stdin relabel as `compile_to_content`.
         let result = mds::compile_str_with_deps_opts(&source, Some(&cwd), runtime_vars, opts)
-            .map_err(miette::Error::from)?;
+            .map_err(|e| crate::output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &result.warnings {
                 crate::output::eprint_warning(w);
@@ -1387,8 +1418,22 @@ pub(crate) fn run_build(args: BuildArgs) -> Result<()> {
 /// (AC-PERF-02: peak RSS ≈ O(largest single file), not O(total)).
 ///
 /// Continue-on-error: a per-file compile error does NOT abort the run.
-/// All valid files are written; a summary is printed; non-zero exit when any failed
-/// (AC-FUNC-18).
+/// All valid files are written; a summary is printed (unless `--quiet` and the run
+/// succeeded); non-zero exit when any failed (AC-FUNC-18).
+///
+/// **Summary / quiet contract (AD-216-1):** the summary line is suppressed under
+/// `--quiet` on a fully-successful run (`fail_count == 0`).  When any file fails,
+/// the summary is always emitted so the non-zero exit is never unexplained.
+/// This mirrors the gate used by `mds check` (`main.rs`) and `mds fmt` (`fmt.rs`).
+///
+/// **Documented limitation (AC-Q05):** two warning writers reachable from this
+/// function do not accept a `quiet` parameter — `output.rs::collect_mds_files_inner`
+/// (depth-limit warning, fires on trees deeper than MAX_DEPTH=64) and
+/// `output.rs::probe_and_remove_stale` (stale-unlink failure warning).  Both emit
+/// to stderr regardless of `--quiet`.  The normative documentation (spec.md §7.2
+/// and README) uses the form "no output on a successful build" rather than "no output
+/// under any condition" (PF-015); the global `--quiet` flag description at `main.rs:30`
+/// uses a briefer phrasing that does not enumerate this limitation explicitly.
 ///
 /// Subtree mirroring: with `--out-dir`, mirrors the source subtree into the out-dir
 /// with the intrinsic extension per file (AC-FUNC-16). Without `--out-dir`, each
@@ -1593,7 +1638,13 @@ fn run_build_directory(
         }
     }
 
-    eprintln!("{ok_count} built, {fail_count} failed");
+    // AD-216-1: mirror the gate used by `mds check` (main.rs) and `mds fmt` (fmt.rs):
+    // suppress the summary under --quiet when every file succeeded, so a quiet CI job
+    // produces no output on a clean run.  AD-216-2: exit codes are untouched — a
+    // --quiet build with failures still exits 1 with the summary explaining why.
+    if !quiet || fail_count > 0 {
+        eprintln!("{ok_count} built, {fail_count} failed");
+    }
 
     if fail_count > 0 {
         std::process::exit(1);

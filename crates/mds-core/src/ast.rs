@@ -357,6 +357,17 @@ pub enum ImportDirective {
         names: Vec<String>,
         path: String,
         offset: usize,
+        /// Byte offset of each name within the source file (parallel to `names`).
+        ///
+        /// **AD-203-1 / PF-012:** computed by `parse_import_directive` in a single
+        /// pass alongside name collection so the two vectors never desync.  Used by
+        /// the `unused-import` rule to anchor the diagnostic span at the unused name
+        /// rather than at the `@import` keyword.
+        ///
+        /// This field is intentionally excluded from structural equality (see
+        /// `structural_eq.rs` — `Selective` uses `..` pattern) because it is a
+        /// span annotation, not part of the semantic content of the directive.
+        name_offsets: Vec<usize>,
     },
 }
 

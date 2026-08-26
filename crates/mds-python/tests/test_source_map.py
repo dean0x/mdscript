@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 from conftest import FIXTURES
 
 # Base64 alphabet used by VLQ mappings (excludes <, >, - per security constraint).
@@ -253,7 +253,9 @@ def test_sm_py9_live_cli_source_map_parity(
     """
     src = _SIMPLE_SRC
     src_file = tmp_path / "parity.mds"
-    src_file.write_text(src, encoding="utf-8")
+    # PF-020: write_bytes avoids platform newline translation (CRLF on Windows);
+    # the byte-equality assertion on mappings would silently diverge otherwise.
+    src_file.write_bytes(src.encode("utf-8"))
 
     out_file = tmp_path / "parity_out.md"
     map_file = tmp_path / "parity_out.md.map"

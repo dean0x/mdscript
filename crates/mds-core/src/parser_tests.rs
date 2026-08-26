@@ -1,6 +1,5 @@
 //! Parser unit and integration tests, extracted from parser.rs.
 
-use super::helpers::*;
 use super::*;
 use crate::ast::{Arg, Condition, ExportDirective, Expr, ImportDirective, Node};
 use crate::lexer::tokenize;
@@ -91,6 +90,31 @@ fn parse_import_selective() {
     } else {
         panic!("expected Selective import");
     }
+}
+
+/// AD-203-1: `parse_import_directive` computes the name-offset delta from the
+/// LEADING edge only, so a directive string carrying trailing whitespace still
+/// produces unshifted offsets.
+///
+/// This calls the helper directly and on purpose. Going through `parse_with_ctx`
+/// cannot exercise it: `parse_directive` trims the token on both ends first, so
+/// the trailing run never reaches `parse_import_directive` and a both-ends `trim()`
+/// in the delta would look identical to the correct `trim_start()`. Driving the
+/// helper with an untrimmed directive is the only way to tell them apart, and it
+/// pins the helper's own contract rather than its current caller's behaviour.
+#[test]
+fn parse_import_directive_delta_ignores_trailing_whitespace() {
+    let directive = "@import { a, b } from \"./l.mds\"   ";
+    let node = parse_import_directive(directive, 0).unwrap();
+    let Node::Import(ImportDirective::Selective { name_offsets, .. }) = node else {
+        panic!("expected Selective import");
+    };
+    assert_eq!(
+        name_offsets,
+        vec!["@import { ".len(), "@import { a, ".len()],
+        "trailing whitespace on the directive must not shift name offsets; a \
+         both-ends trim in the delta computation pushes both offsets right by 3"
+    );
 }
 
 // D2 canary tests: ExportDirective variants carry the byte offset of the @export token.

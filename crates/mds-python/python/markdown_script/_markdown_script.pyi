@@ -1,4 +1,4 @@
-"""Type stubs for the native ``mdscript._mdscript`` extension module.
+"""Type stubs for the native ``markdown_script._markdown_script`` extension module.
 
 The runtime objects are implemented in Rust (PyO3). These stubs describe the public
 surface for ``mypy``/``pyright``. Result classes are frozen — their attributes are
@@ -165,8 +165,12 @@ class LintFileReport:
 class LintResult:
     """The result of :func:`lint`, :func:`lint_file`, or :func:`lint_virtual`.
 
-    Canonical JSON shape: ``{"files":[...],"truncated":false,"version":1}``.
-    Keys are in BTreeMap (alphabetical) order — byte-identical across all surfaces.
+    Core JSON shape: ``{"files":[...],"truncated":false,"version":1}``.
+    When non-fatal warnings occur (e.g. unknown rule names),
+    ``"lint_warnings"`` also appears in alphabetical key order between
+    ``"files"`` and ``"truncated"``. Keys are in BTreeMap (alphabetical)
+    order. The CLI surface writes warnings to stderr rather than including
+    them in its JSON stdout.
 
     ``files`` is a list of typed :class:`LintFileReport` objects. Each report
     exposes ``.file`` (str) and ``.diagnostics`` (list[:class:`LintDiagnostic`]).
@@ -178,6 +182,14 @@ class LintResult:
     def truncated(self) -> bool: ...
     @property
     def files(self) -> list[LintFileReport]: ...
+    @property
+    def lint_warnings(self) -> list[str]:
+        """Non-fatal warnings raised while configuring the lint run.
+
+        An unknown rule name in the ``rules`` mapping produces one entry here:
+        the rule is not enforced (it does not exist) but the call still
+        succeeds. Empty in the common case.
+        """
     def __new__(cls, canonical: Mapping[str, Any]) -> LintResult: ...
     def to_dict(self) -> dict[str, Any]: ...
     def to_json(self) -> str: ...

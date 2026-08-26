@@ -930,7 +930,7 @@ fn wasm_del_in_error_message_is_escaped() {
 fn wasm_lint_virtual_nel_in_module_name_sanitizes_message() {
     // T-15/F6-C1: U+0085 (NEL/C1) in lintVirtual module name — same lint-path pattern
     // as F6 with a C1 control character. NEL passes serde_yaml_ng (unlike ESC/DEL),
-    // making it a reachable C1 vector. Verifies the sanitized  literal appears.
+    // making it a reachable C1 vector. Verifies the sanitized U+0085 literal appears.
     let nel = '\u{0085}';
     let module_name = format!("fo{nel}o.mds");
     let main_src = format!("@import \"./{module_name}\"\n@import \"./{module_name}\"\n");
@@ -1158,5 +1158,234 @@ fn wasm_lint_virtual_newline_in_frontmatter_key_is_escaped_on_the_wire() {
             .iter()
             .any(|m| m.contains("error[mds::forged]")),
         "T-15/F6-NL: message body must be preserved verbatim; got: {all_messages:?}"
+    );
+}
+
+// ── AC-224 D8: unknown rule name warning channel on WASM ─────────────────────
+//
+// An unknown rule name in the `rules` option produces a `lint_warnings` array
+// in the result rather than hard-failing (D8 / AC-224-1). Known rule names
+// produce no `lint_warnings` field (common-case cleanliness).
+//
+// The deliberate asymmetry: unknown severity VALUES remain a hard error
+// (`mds::invalid_options`). Severities are a closed enum; rule names grow every
+// release. Both arms are pinned here so the asymmetry is asserted on the surface
+// this PR touches (PF-007 — per-surface goldens prove nothing cross-surface).
+
+#[wasm_bindgen_test]
+fn wasm_lint_unknown_rule_name_returns_lint_warnings() {
+    // W-WARN-1 (AC-224-1/D8): lint() with an unknown rule name returns lint_warnings.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "no-such-rule-xyzzy": "warn" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-1: lint must succeed");
+
+    let version = get_prop(&result, "version")
+        .as_f64()
+        .expect("W-WARN-1: version must be a number") as u32;
+    assert_eq!(version, 1, "W-WARN-1: version must be 1");
+
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        !lint_warnings.is_undefined() && !lint_warnings.is_null(),
+        "W-WARN-1: lint_warnings must be present for an unknown rule name"
+    );
+    let warnings_arr = js_sys::Array::from(&lint_warnings);
+    assert!(
+        warnings_arr.length() > 0,
+        "W-WARN-1: lint_warnings must be non-empty for an unknown rule name"
+    );
+    let w0 = warnings_arr
+        .get(0)
+        .as_string()
+        .expect("W-WARN-1: lint_warnings[0] must be a string");
+    assert!(
+        w0.contains("no-such-rule-xyzzy"),
+        "W-WARN-1: lint_warnings[0] must name the unknown rule; got: {w0}"
+    );
+    assert!(
+        w0.contains("recognised rules are") || w0.contains("recognized rules are"),
+        "W-WARN-1: lint_warnings[0] must list recognised rules; got: {w0}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_known_rule_names_no_lint_warnings() {
+    // W-WARN-2 (AC-224-1/D8): lint() with only known rule names has no lint_warnings.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "unused-variable": "off" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-2: lint must succeed");
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        lint_warnings.is_undefined(),
+        "W-WARN-2: lint_warnings must be absent for known rule names; got: {lint_warnings:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_unknown_rule_name_returns_lint_warnings() {
+    // W-WARN-3 (AC-224-1/D8): lintVirtual() with an unknown rule name returns lint_warnings.
+    let modules_val = to_js_object(&serde_json::json!({ "main.mds": "Hello!\n" }));
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "no-such-rule-xyzzy": "error" }
+    }));
+    let result = mds_wasm::lint_virtual(modules_val, "main.mds", opts)
+        .expect("W-WARN-3: lintVirtual must succeed");
+
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        !lint_warnings.is_undefined() && !lint_warnings.is_null(),
+        "W-WARN-3: lint_warnings must be present for an unknown rule name"
+    );
+    let warnings_arr = js_sys::Array::from(&lint_warnings);
+    assert!(
+        warnings_arr.length() > 0,
+        "W-WARN-3: lint_warnings must be non-empty for an unknown rule name"
+    );
+    let w0 = warnings_arr
+        .get(0)
+        .as_string()
+        .expect("W-WARN-3: lint_warnings[0] must be a string");
+    assert!(
+        w0.contains("no-such-rule-xyzzy"),
+        "W-WARN-3: lint_warnings[0] must name the unknown rule; got: {w0}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_continues_with_unknown_rule_name() {
+    // W-WARN-4 (AC-224-1/D8): lint continues — files[] and truncated are present.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "no-such-rule-xyzzy": "warn" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts).expect("W-WARN-4: lint must succeed");
+
+    // files[] must be present and be a genuine JS array. `js_sys::Array::from` coerces
+    // almost anything, so asserting on its length would pass vacuously — check
+    // `Array::is_array` on the raw value instead.
+    let files = get_prop(&result, "files");
+    assert!(
+        js_sys::Array::is_array(&files),
+        "W-WARN-4: files must be a JS array even when the rule name is unknown"
+    );
+    assert_eq!(
+        js_sys::Array::from(&files).length(),
+        0,
+        "W-WARN-4: a clean source yields no file entries; the unknown rule name must not \
+         add one"
+    );
+
+    // truncated must be present and false.
+    let truncated = get_prop(&result, "truncated").as_bool().unwrap_or(true);
+    assert!(
+        !truncated,
+        "W-WARN-4: truncated must be false for a clean source"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_unknown_rule_no_lint_warnings_absent_on_clean() {
+    // W-WARN-2b (AC-224-1/D8): no options → no lint_warnings field at all.
+    let result =
+        mds_wasm::lint("Hello!\n", JsValue::NULL).expect("W-WARN-2b: lint(NULL) must succeed");
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        lint_warnings.is_undefined(),
+        "W-WARN-2b: lint_warnings must be absent when no rules are passed; got: {lint_warnings:?}"
+    );
+}
+
+/// W-WARN-ESC (ADR-008 per-surface): a hostile rule name containing U+001B must not
+/// deliver a raw control byte through `lint_warnings` to the JS consumer.
+///
+/// The mds-core unit test `warning_wire_escapes_hostile_rule_name` proves the
+/// formatter escapes before building the string. This test proves the string that
+/// actually crosses the WASM FFI boundary carries no raw control byte (negative) and
+/// DOES carry the six-character ASCII sequence backslash-u-0-0-1-B (positive control,
+/// PF-013/ADR-009).
+///
+/// PF-018: hostile bytes are built from Rust `\u{..}` escapes — never authored as
+/// literal bytes in this source file.
+#[wasm_bindgen_test]
+fn wasm_lint_hostile_rule_name_escapes_control_bytes_in_lint_warnings() {
+    // Construct the hostile rule name at runtime using Rust char escapes (PF-018).
+    let hostile_rule = "\u{1b}[31mhostile-rule\u{1b}[0m".to_string();
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { hostile_rule: "warn" }
+    }));
+    let result = mds_wasm::lint("Hello!\n", opts)
+        .expect("W-WARN-ESC: lint must succeed with hostile rule name");
+
+    // The warning must be present (D8 / AC-224-1) — call succeeds, lint_warnings is non-empty.
+    let lint_warnings = get_prop(&result, "lint_warnings");
+    assert!(
+        !lint_warnings.is_undefined() && !lint_warnings.is_null(),
+        "W-WARN-ESC: lint_warnings must be present for a hostile unknown rule name"
+    );
+    let warnings_arr = js_sys::Array::from(&lint_warnings);
+    assert!(
+        warnings_arr.length() > 0,
+        "W-WARN-ESC: lint_warnings must be non-empty"
+    );
+    let w0 = warnings_arr
+        .get(0)
+        .as_string()
+        .expect("W-WARN-ESC: lint_warnings[0] must be a string");
+
+    // Negative: no raw control byte (C0 excl. \t \n, DEL, C1) may survive (ADR-008).
+    for (i, ch) in w0.char_indices() {
+        let code = ch as u32;
+        let is_c0 = code < 0x20 && code != 0x09 && code != 0x0a;
+        let is_del = code == 0x7f;
+        let is_c1 = (0x80..=0x9f).contains(&code);
+        assert!(
+            !is_c0 && !is_del && !is_c1,
+            "W-WARN-ESC: raw hostile char U+{code:04X} at byte {i} must not appear \
+             in lint_warnings[0]; got: {w0:?}"
+        );
+    }
+
+    // Positive control (PF-013/ADR-009): the sanitized literal must be present so
+    // the negative above cannot pass merely because the name never reached the message.
+    assert!(
+        w0.contains("\\u001B"),
+        "W-WARN-ESC: sanitized \\u001B literal must appear in lint_warnings[0]; got: {w0:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_unknown_severity_value_throws_invalid_options() {
+    // W-SEVER-1 (AC-224-1 — paired throw arm, lint path): unknown severity
+    // VALUES remain a hard error on the WASM surface. napi pins this in L-N-6;
+    // Python in test_l5_lint_rules_unknown_severity_raises. Per PF-007 those
+    // prove nothing about WASM — this test pins the throw arm here.
+    //
+    // Severities are a closed enum; "verbose" is not a valid severity string.
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "unused-variable": "verbose" }
+    }));
+    let err = mds_wasm::lint("Hello!\n", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::invalid_options",
+        "W-SEVER-1: unknown severity value must throw mds::invalid_options; got: {code}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn wasm_lint_virtual_unknown_severity_value_throws_invalid_options() {
+    // W-SEVER-2 (AC-224-1 — paired throw arm, lint_virtual path): mirrors
+    // W-SEVER-1 for lintVirtual(). Both entry points route through
+    // extract_rules(), so both paths are pinned (PF-007).
+    let modules_val = to_js_object(&serde_json::json!({ "main.mds": "Hello!\n" }));
+    let opts = to_js_object(&serde_json::json!({
+        "rules": { "unused-variable": "verbose" }
+    }));
+    let err = mds_wasm::lint_virtual(modules_val, "main.mds", opts).unwrap_err();
+    let code = get_str(&err, "code");
+    assert_eq!(
+        code, "mds::invalid_options",
+        "W-SEVER-2: lint_virtual unknown severity value must throw mds::invalid_options; got: {code}"
     );
 }

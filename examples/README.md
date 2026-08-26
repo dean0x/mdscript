@@ -15,7 +15,7 @@ Four capabilities shipped with v0.4.0 — each has a dedicated example:
 # Safety-gated formatter — rewrites directive lines only, never body text
 mds fmt --check examples/
 
-# Static analysis — 9 rules, human and JSON output, --fix --diff preview
+# Static analysis — 10 rules, human and JSON output, --fix --diff preview
 mds lint examples/linting/
 
 # Source Map v3 — sidecar .map file, --inline data-URI, or --embed-sources
@@ -48,7 +48,7 @@ mds lint examples/linting/config-demo/loop-shadow.mds
 | [`linting/`](linting/) | A deliberately-messy template that trips four lint rules; shows `mds lint` human and JSON output, `--fix` tiers (A auto-applies, B standalone-only, C report-only), `--diff` preview, exit-code semantics, and per-rule severity overrides via `mds.json` (`config-demo/` — enables `shadow-variable`, promotes `unused-variable` to error, silences `redundant-else`) |
 | [`source-maps/`](source-maps/) | Source Map v3 generation via `mds build --source-map` — sidecar map, `--inline` data-URI embed, and `--embed-sources` self-contained variant |
 | [`formatting/`](formatting/) | Auto-formatter demo (`mds fmt`) — write, `--check`, `--diff`, and stdin filter modes; what fmt normalizes (directive trailing whitespace, line endings, final newline) vs. preserves byte-for-byte (body text, `@message`/`@define` bodies); the safety gate that refuses any rewrite changing compiled output; exit codes |
-| [`python/`](python/) | Native Python bindings (`mdscript`, built with PyO3) — compile strings and files with `mdscript.compile`/`compile_file`, generate Source Map v3 with `source_map=True`, handle `MdsError` (`.code`, `.help`, `.span`), and lint with `mdscript.lint`; requires a virtualenv + `maturin develop` (`source .venv/bin/activate`) |
+| [`python/`](python/) | Native Python bindings (`markdown_script`, built with PyO3) — compile strings and files with `markdown_script.compile`/`compile_file`, generate Source Map v3 with `source_map=True`, handle `MdsError` (`.code`, `.help`, `.span`), and lint with `markdown_script.lint`; requires a virtualenv + `maturin develop` (`source .venv/bin/activate`) |
 
 Some examples take runtime variables — pass the accompanying `vars.json`:
 

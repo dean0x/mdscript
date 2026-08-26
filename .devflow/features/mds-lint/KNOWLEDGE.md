@@ -1,7 +1,7 @@
 ---
 feature: mds-lint
 name: mds lint — Static Analysis Engine and Tiered --fix
-description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, preview_text_for, print_discipline, reverify_failure_reason, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176."
+description: "Use when adding or modifying lint rules, extending the --fix pipeline, changing the JSON wire format, wiring lint into a binding layer, debugging unexpected exit codes and reverify gate refusals, or working on the ESC/bidi/newline injection defences. Keywords: mds lint, LintDiagnostic, fix_removals, fix_edits, TextEdit, FixLineSpan, diag_to_edits, LintResult, LintConfig, to_canonical_json, fix tier, reverify gate, FixOutcome, PartiallyFixed, apply_fixes_incremental, preview_fixes, PreviewOutcome, set_diag_display_path, AnalysisContext, ElseifBranch, end_offset, DefineFact, assertKnownKeys, CheckOptions, unreachable-branch, unused-variable, duplicate-import, empty-block, legacy-interpolation, is_output_neutral, all_output_neutral, Tier A Tier B Tier C, structural-standalone, compile-clean, is_standalone, sanitize_control_chars, sanitize_control_chars_wire, named_source_for_render, neutralize_source_for_render, SanitizedReport, SanitizedNode, MAX_AUX_DEPTH, EscapeMode, HUMAN WIRE, eprint_warning, safe_path, safe_inline, safe_file_display, preview_text_for, print_discipline, reverify_failure_reason, LintDirCtx, config_cache, dedup_contained_or_identical, EXIT 0 1 2 3, render_error_sanitized, eprint_error, display_sanitized, MdsError::display_sanitized, ESC-injection, CWE-150, CWE-117, bidi, Trojan-Source, CVE-2021-42574, U+061C, U+202E, U+FEFF, U+2028, U+2029, PF-014, PF-005, construction-time sanitization, per-field rule, Cow, #176, ADR-008, ResultSink, from_rules_checked, relative_display, write_bytes, PF-020, #309, emit-ordering."
 category: domain-knowledge
 directories:
   - crates/mds-core/src/lint
@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-07-26
+updated: 2026-08-21
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -107,10 +107,17 @@ The `fixable` flag in the canonical JSON output is computed as `(fix_removals.is
 { "lint": { "rules": { "unused-variable": "off", "shadow-variable": "warn" } } }
 ```
 
-**Unknown rule NAMEs** → warn-and-ignore at CLI (forward compat).  
+**Unknown rule NAMEs** → warned about on every surface, then ignored; the config still
+loads and lint continues, and the exit code does not move (forward compat: a config naming
+a rule from a newer release must not break an older binary). The CLI writes the warning to
+stderr (suppressed by `--quiet`); napi/WASM/Python return it in `lint_warnings`.
+The registry is `mds::KNOWN_LINT_RULES`, derived from each rule module's own `RULE` const;
+detection is `mds::find_unknown_rule_names`. (#224)  
 **Unknown severity VALUES** → hard parse error → exit 2 (closed enum, no sensible fallback).
 
 `LintConfig` lives in `mds-core` (not mds-cli). The CLI `LintCliConfig` from `build.rs` converts to it via `into_core_config()`.
+
+`LintConfig::from_rules` was **deleted** in PR #308 — it shipped deprecated-since-birth and was never published. All callers use `from_rules_checked`. This also removed the `#[expect(deprecated)]` scaffolding from `crates/mds-core/tests/api_surface.rs`.
 
 ## Technical Implementation Patterns
 
@@ -195,6 +202,8 @@ The output-equality sub-check (3) is **skipped** when the plan contains any edit
 
 **CLI's `plan_and_apply_fixes`** (in lint.rs): The short-circuit for `NothingToFix` guards on `plan.edits.is_empty() && !plan.overlap_rejected`. When overlap was detected, `plan.edits` is cleared but `plan.overlap_rejected = true` — so the function falls through to `apply_fixes_incremental`, which immediately returns `Rejected`.
 
+**Emit-before-exit ordering rule** (`lint.rs` output-contract, PF-004 recurring defect class — 7 realized defects across ~33 emitter sites): The invariant is **emit the envelope before any early exit; write first, then print/accumulate**. Two defects fixed in PR #308: (1) `lint <file> --fix --check --format json` called `process::exit(1)` before `emit_result`, emitting zero stdout bytes (AC-F-14 held for `<dir>` but not `<file>`); (2) JSON write-failure arms pushed the post-fix result before the write, so a failed write emitted `{"files":[],…}` (reads as a clean tree) with exit 2. The `Fixed:` arms were already correct; `PartiallyFixed` arms were not. The `ResultSink` redesign that makes `--quiet` structurally unbypassable is deferred to issue **#309**.
+
 **Atomic write** (`atomic_write_file` in `output.rs`, imported by both `lint.rs` and `fmt.rs`): TOCTOU guard + permissions restore + `sync_all()` + `persist()` (intra-filesystem rename). Temp prefix `.mds-tmp-`. `Fixed:` is printed only AFTER a successful write.
 
 ### CLI Preview Pipeline (`preview_fixes`)
@@ -235,6 +244,8 @@ A config-load failure for a nested `mds.json` is a per-file error: it emits the 
 - `fix_edits` is a custom `#[getter]` (not `#[pyo3(get)]`) because `Vec<serde_json::Value>` does not implement `IntoPy`. Returns `list[dict] | None`. Pickle round-trips `fix_edits` as a JSON string (`fix_edits_json: Option<String>`) via `__reduce__`/`__new__`.
 - `LintDiagnostic.as_json()` inserts keys in alphabetical order explicitly (serde_json::Map with insertion order): `fix_edits`, `fixable`, `help`, `message`, `rule`, `severity`, `span` — emitting `fix_edits`, `help`, and `span` unconditionally as `null` when `None` (PF-007 parity).
 - `LintFileReport`: `#[pyclass(frozen)]` per-file findings group with `.file` and `.diagnostics`.
+- **`serde_json::Map` is `BTreeMap`** when `preserve_order` is not enabled (it is not enabled in this codebase). Keys serialize alphabetically by construction regardless of insertion order.
+- **Parity fixtures must use `write_bytes`, not `write_text`** (PF-020): `write_text` applies newline translation on Windows, breaking byte-equality comparisons with the canonical JSON emitted by `to_canonical_json()`.
 
 ### WASM Surface
 
@@ -270,6 +281,8 @@ A config-load failure for a nested `mds.json` is a per-file error: it emits the 
 **SPAN-1**: `span.line` and `span.column` are NOT part of the stable wire format. All 10 lint rules pass `None` for `line`/`column`.
 
 **`fix_edits` field**: emitted unconditionally on every diagnostic — `null` when the rule uses `fix_removals` or has no fix, `[{start,end,new_text}]` when populated. Because `to_canonical_json()` builds its map via `serde_json::json!` and serde_json's `Map` defaults to `BTreeMap`, keys are sorted alphabetically: `fix_edits` appears before `fixable`. File ordering in `files` is deterministic (BTreeMap sorted by filename). `fixable` is NOT stored on the diagnostic struct.
+
+**Error-only entries and `fix_edits[].new_text` sanitization (ADR-008 resolved — Option B)**: Analysis-failure entries (no diagnostics, only an `"error"` key) bypass `to_canonical_json` entirely; their `file` key is sanitized at the push site via `file_key = sanitize_control_chars_wire(&display_path)`. Both normal and error-only entries therefore carry identically-sanitized `file` values. **`fix_edits[].new_text` IS NOW WIRE-sanitized** in `to_canonical_json` (`sanitize_control_chars_wire(&e.new_text)`) — ADR-008 closed as Option B: sanitize the display wire, leave the functional `--fix` path raw. The stored `LintDiagnostic.fix_edits` field is NOT sanitized so the `--fix` path (`diag_to_edits` → `ByteEdit.replacement`) reads original bytes unchanged; `to_canonical_json` applies the WIRE sanitizer before building the `serde_json::json!` value, which is upstream of all four surfaces (CLI, napi, WASM, Python).
 
 **Per-file cap**: `MAX_DIAGNOSTICS = 1000` (`crates/mds-core/src/limits.rs`). **File-less key**: `"<unknown>"`. **Analysis failure envelope** (JSON mode only): `{ "version": 1, "error": { "code": "...", "message": "...", "help": "...", "span": {...} } }`. **`--fix --format json --stdin` is a usage error** — exits 2 with a plain stderr message (AC-F-22b).
 
@@ -345,7 +358,7 @@ The auxiliary diagnostic graph (`source` cause chain, `related`, `diagnostic_sou
 | `render_diag_human` (lint.rs) | HUMAN | message/help (filename and source go through `named_source_for_render`) |
 | `fix::FixOutcome::Rejected.reason` (fix.rs) | WIRE | construction-time via `reverify_failure_reason(err)` — the CLI prints `fix rejected: {reason}` as a bare status line |
 | `MdsError::serialize()` (error.rs) | WIRE | message, help — covers all three bindings' error path |
-| `LintResult::to_canonical_json()` (diagnostic.rs) | WIRE | message, help, `files[].file` key |
+| `LintResult::to_canonical_json()` (diagnostic.rs) | WIRE | message, help, `files[].file` key; error-only entries bypass this — their `file` key is sanitized at the push site via `sanitize_control_chars_wire` |
 | `CompileResult::to_canonical_json()` (lib.rs) | WIRE | warning strings (distinct method, not a duplicate) |
 | `emit_warnings()` (lib.rs) | HUMAN for prose; WIRE at construction for identifiers interpolated in `resolver.rs`/`evaluator.rs` | warnings printed to stderr |
 | Python `LintResult::new()` via `sanitize_lint_value()` | WIRE | message, help, file — construction-time, so typed getters read pre-sanitized data (closes PF-004 parallel-path) |
@@ -459,7 +472,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 - **Resting a security invariant on `debug_assert!`** (PF-005): `debug_assert!` is compiled out of release. The old `SanitizedReport` returned `None` for `source()`/`related()` behind a `debug_assert!` that no CLI error populates the aux graph — real in tests, absent in the shipped binary. Enforce invariants with data transformation, not assertions.
 
-- **Calling `apply_plan_unchecked()` on a production write path**: Production code that writes back to disk MUST use `apply_fixes()` or `apply_fixes_incremental()`. The `_unchecked` suffix makes the bypass explicit at every call site.
+- **Calling `apply_plan_unchecked()` on a production write path**: Production code that writes back to disk MUST use `apply_fixes_incremental()`. The `_unchecked` suffix makes the bypass explicit at every call site.
 
 - **Adding a ModuleCache "optimization"**: Per-file fresh resolve is intentional. A shared cache would be unsafe because runtime vars are per-call.
 
@@ -474,6 +487,8 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - **Omitting `set_diag_display_path` in directory mode**: Without it, every file in a directory lint run maps its diagnostics under the same basename key in JSON.
 
 - **Setting `fix_removals` on `unused-import`**: Partial-name removal from an import list is structurally ambiguous and unsafe. `unused-import` always leaves `fix_removals: None`.
+
+- **Emitting the result envelope after an early exit** (`lint.rs` output-contract): In the CLI `--fix` path, any early `process::exit` or error return must come AFTER `emit_result` has written the JSON envelope. `PartiallyFixed` arms must write first, then accumulate status lines. Violating this emits zero stdout bytes on `--format json` or emits a stale clean envelope on write failure (both realized in PR #308). `ResultSink` redesign deferred to #309.
 
 ## Gotchas
 
@@ -497,7 +512,9 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **shadow-variable is info AND default-off**: Only fires when explicitly configured. `Info` findings never contribute to the exit code.
 
-**Unknown rule NAMES vs unknown severity VALUES behave differently**: An unknown rule name in `mds.json` is warned about and ignored. An unknown severity value fails loudly with a serde deserialization error (exits 2).
+**Unknown rule NAMES vs unknown severity VALUES behave differently**: An unknown rule name is warned about and then ignored — on every surface, not just the CLI — and the run continues with an unchanged exit code and an unchanged JSON envelope. An unknown severity value fails loudly with a serde deserialization error (exits 2). The asymmetry is deliberate: severities are a closed set, rule names grow every release.
+
+**`.devflow/features/*/KNOWLEDGE.md` is TRACKED, not gitignored**: `.gitignore` ignores `.devflow/*` but re-includes `!.devflow/features/*/KNOWLEDGE.md` (lines 64-70). A doc sweep that excludes `.devflow` wholesale will miss this file, and the source-hygiene gate does scan it.
 
 **D2 mechanical ripple in resolver.rs**: The `..` in the three `ExportDirective` match arms in `resolver.rs` is intentional — it acknowledges the new `offset` field without reading it.
 
@@ -509,7 +526,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 
 **Python `LintDiagnostic.fix_edits` getter vs `#[pyo3(get)]`**: `Vec<serde_json::Value>` does not implement `IntoPy`. Use the custom `#[getter]` which calls `value_to_py`. Stored internally as `Option<Vec<serde_json::Value>>`.
 
-**Python `LintDiagnostic.to_dict()` always includes `fix_edits`, `help`, and `span` keys**: All three are emitted as Python `None` (JSON `null`) when not set — never absent. This matches `to_canonical_json()` exactly (PF-007 guard).
+**Python `LintDiagnostic.to_dict()` always includes `fix_edits`, `help`, and `span` keys**: All three are emitted as Python `None` (JSON `null`) when not set — never absent. This matches `to_canonical_json()` exactly (PF-007 guard). `to_dict()` now conditionally emits `span.line` and `span.column` when present; `LintResult.files[]` parses them from canonical JSON. No built-in rule currently populates them — the only prior test was a negative one that passed identically under the old code. Verify with a positive control (PF-018).
 
 **Reverify rejection message**: Exact stable text: `"could not verify fix — the edited source did not re-parse cleanly ({err}); leaving the file unchanged"`. Test `A5` in `cli_lint.rs` pins this.
 
@@ -524,6 +541,12 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 **napi build script is `build:native`, NOT `build`**: Running `npm run build -w @mdscript/mds-napi` silently does nothing useful. Use `npm run build:native -w @mdscript/mds-napi`.
 
 **`packages/mds` prefers the dev WASM artifact**: `packages/mds/src/backend/wasm.ts` resolves to `crates/mds-wasm/pkg/` (the `wasm-pack` dev output) rather than `packages/mds-wasm/dist/node/`. Rebuilding only the `packages/mds-wasm` npm package leaves a STALE backend active, and the cross-surface differential test fails with convincing-looking divergence that isn't a real bug. Always rebuild via `wasm-pack build crates/mds-wasm` when working on WASM output.
+
+**Directory ordering is byte-wise over `/`-normalized paths**: `relative_display` normalizes path separators to `/` via `components().join("/")` before sorting. The fix was declared BREAKING with zero Windows CI executions; it is now covered by a platform-independent ordering test on Ubuntu and a directory case in `packages/mds/__test__/lint.spec.mjs` (runs on windows-latest). The ordering fixture is separator-sensitive by construction (`/` = 0x2F < `[` = 0x5B < `\` = 0x5C) — any separator regression breaks the fixture on Windows.
+
+**`FixOutcome::PartiallyFixed` is silently discarded by `_ => {}`**: `PartiallyFixed` is returned only by `apply_fixes_incremental`. A `_ => {}` wildcard arm compiles clean and discards it without warning. `#[must_use]` does NOT catch this — it fires on a dropped value, not a wildcard arm. Always match `PartiallyFixed` explicitly.
+
+**Clippy stale cache can report a pass on dirty code**: Deleting `LintConfig::from_rules` (PR #308) surfaced an unused `use super::helpers::*;` in `crates/mds-core/src/parser_tests.rs`. A `cargo clippy --workspace --all-targets` run immediately after reported a stale cached pass. Touch the file to force a real re-check before trusting a `clippy` clean result after a deletion.
 
 ## Related Follow-ups / Known Limitations
 
@@ -546,7 +569,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/src/lint/config.rs` — `LintConfig` (lives in mds-core; CLI converts to it)
 - `crates/mds-core/src/ast.rs` — `ElseifBranch { offset }`, `IfBlock { else_offset, end_offset }`, `ForBlock/DefineBlock { end_offset }`
 - `crates/mds-core/src/lint/rules/` — 10 rule modules + `structural_eq.rs`
-- `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`, `KNOWN_RULES`
+- `crates/mds-cli/src/lint.rs` — CLI subcommand; `render_diag_human` (HUMAN for message/help; filename+source via `named_source_for_render`; all status lines via `safe_path`); `set_diag_display_path`, `LintDirCtx`; the rule-name list lives in `mds::KNOWN_LINT_RULES`, not in this crate (#224)
 - `crates/mds-cli/src/output.rs` — `atomic_write_file`; `eprint_error` (single CLI stderr choke-point, wraps in `SanitizedReport`); `SanitizedReport` / `SanitizedNode` / `MAX_AUX_DEPTH`; `render_error_sanitized` (private, plain `format!("{report:?}")` on sanitized wrapper); `eprint_warning` (HUMAN, new); `safe_path` / `safe_file_display` / `safe_inline` (all WIRE, new); `preview_text_for` (TTY-gated source neutralization for `--diff`); `render_unified_diff` / `colorize_unified_diff`
 - `crates/mds-cli/src/build.rs` — `LintCliConfig` struct, `into_core_config()`, `MdsConfig.lint` field
 - `crates/mds-cli/src/watch.rs` — all 11 error prints route through `eprint_error`; lifecycle status lines route through `safe_path` / `safe_inline` / `eprint_warning`
@@ -567,7 +590,7 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - **PF-007** (cross-surface goldens can't catch divergence): `fix_edits` is emitted unconditionally (null when None) across all surfaces; differential tests cover cross-surface parity.
 - **PF-013** (vacuous negative security tests): Every ESC-injection test now pairs a NEGATIVE assertion (raw byte absent) with a POSITIVE one (escaped form present) and a non-vacuity guard (diagnostics non-empty, expected rule matched). T-9 was rewritten from a vacuous YAML-rejection vector to a reachable duplicate-import + U+0085 NEL vector.
 - **PF-014** (sanitize inputs, not rendered artifacts): The `SanitizedReport` design — pre-sanitize message/help/labels before miette renders — is the PF-014-correct boundary. Post-processing the rendered frame corrupts miette's own ANSI SGR codes; CI uses `NO_COLOR=1` and pipes stderr so the failure would stay green. T-ESC-6 pins this on the colour path.
-- **ADR-001** (span-guided rewrite + compile-equivalence gate): All `--fix` edits are span-guided byte rewrites. `TextEdit` ranges are validated fail-closed. `apply_plan_unchecked` is explicitly named to make ADR-001 bypass visible.
+- **ADR-001** (span-guided rewrite + compile-equivalence gate): All `--fix` edits are span-guided byte rewrites. `TextEdit` ranges are validated fail-closed. `apply_plan_unchecked` is explicitly named to make ADR-004 reverify-gate bypass visible.
 - **ADR-004** (three-tier --fix safety model, reverify gate): `apply_fixes_incremental`'s batch-first strategy with bounded per-edit fallback is the AC-F-20 implementation.
 - **ADR-002** (v0.4.0 whitespace contract, interior-verbatim): The `empty-block` rule's "whitespace-only-Text body" definition is directly downstream of this contract.
 - **ADR-003** (@extends FM emission): The `unused-variable` rule is suppressed on `@extends` children.
@@ -575,3 +598,22 @@ LintDiagnostic.fix_removals (FixLineSpan)  OR  .fix_edits (TextEdit)
 - `crates/mds-core/tests/api_surface.rs` — pins the public lint API signatures.
 - `.devflow/features/mds-fmt/KNOWLEDGE.md` — `mds fmt` knowledge base; `atomic_write_file` is shared between both subcommands via `output.rs`.
 - `.devflow/features/source-map-security/KNOWLEDGE.md` — source map path-containment choke-point.
+
+## v0.5.0 Removal Tracker: apply_fixes
+
+`mds::fix::apply_fixes` is deprecated as of v0.4.0. The six ADR-004 reverify-gate
+tests that must be ported or retired before removal are enumerated below by name —
+**test names are the durable key; line numbers drift as `fix.rs` evolves**. GitHub
+issue #304 carries behavioral context (which ADR-004 behavior each test pins); its
+line numbers predate the `#[expect(...)]` insertions made by PR #303 (issue #209) and
+have since drifted.
+
+Six tests to port or retire (use `grep -n 'fn <name>' crates/mds-core/src/lint/fix.rs`
+to locate current lines — test names are the durable key):
+
+- `a4_partial_overlap_still_rejected_after_dedup`
+- `l_fix_rev1_a5_rejection_message_pins_stable_prefix_and_suffix`
+- `reverify_preexisting_untargeted_survives_and_fix_applies`
+- `reverify_new_untargeted_diagnostic_is_rejected`
+- `tier_b_unused_function_standalone_apply_succeeds`
+- `l_fix_rev1_output_delta_causes_rejection`

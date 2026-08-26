@@ -1,5 +1,8 @@
 {
   "private": true,
   "workspaces": ["packages/*", "crates/mds-napi"],
-  "engines": { "node": ">=22.0.0" }
+  "engines": { "node": ">=22.0.0" },
+  "scripts": {
+    "test:gates": "count=$(ls scripts/__test__/*.spec.mjs 2>/dev/null | wc -l | tr -d '[:space:]'); [ \"$count\" -ge 3 ] || { echo 'expected >=3 spec files, found '$count' -- refusing a vacuous pass (ADR-009/PF-013)' >&2; exit 1; }; node --test scripts/__test__/*.spec.mjs"
+  }
 }

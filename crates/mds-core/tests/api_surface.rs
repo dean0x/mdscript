@@ -207,6 +207,82 @@ fn mds_error_trait_impls() {
     let _ = diagnostic.code();
 }
 
+/// Pin `MdsError::source_name()` — the neutral domain accessor for the embedded
+/// `NamedSource` name (ADR-010).
+#[test]
+fn mds_error_source_name_accessor() {
+    use std::sync::Arc;
+
+    // Errors with an embedded source carry its name.
+    let with_src = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "myfile.mds",
+            "content".to_string(),
+        ))),
+    };
+    assert_eq!(with_src.source_name(), Some("myfile.mds"));
+
+    // Errors without an embedded source return None.
+    let without_src = MdsError::Io {
+        message: "test".to_string(),
+    };
+    assert_eq!(without_src.source_name(), None);
+}
+
+/// Pin `MdsError::is_string_source()` — the compile-time-coupled sentinel predicate
+/// (ADR-010).  This predicate keeps the `pub(crate)` sentinel comparison inside
+/// `mds-core`; downstream crates (e.g. `mds-cli`) use it instead of hardcoding the
+/// literal `"<source>"`, which would have no compile-time link to the definition.
+///
+/// Positive control: an error whose embedded source name is the internal sentinel
+/// `"<source>"` must return `true`.
+/// Negative controls: a non-sentinel source name and a source-less error must return
+/// `false`.  (PF-013: absence alone proves nothing; positive control is mandatory.)
+#[test]
+fn mds_error_is_string_source() {
+    use std::sync::Arc;
+
+    // Positive control: the internal sentinel value "<source>" — as set by
+    // `resolve_source_intrinsic`.
+    let sentinel_err = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "<source>",
+            "content".to_string(),
+        ))),
+    };
+    assert!(
+        sentinel_err.is_string_source(),
+        "is_string_source() must return true for the internal sentinel"
+    );
+
+    // Negative control: a real file path must not match.
+    let file_err = MdsError::Syntax {
+        message: "test".to_string(),
+        span: None,
+        src: Some(Arc::new(miette::NamedSource::new(
+            "real_file.mds",
+            "content".to_string(),
+        ))),
+    };
+    assert!(
+        !file_err.is_string_source(),
+        "is_string_source() must return false for a real file path"
+    );
+
+    // Negative control: an error without an embedded source.
+    let no_src_err = MdsError::Io {
+        message: "test".to_string(),
+    };
+    assert!(
+        !no_src_err.is_string_source(),
+        "is_string_source() must return false when there is no embedded source"
+    );
+}
+
 #[test]
 fn constants_have_expected_values() {
     assert_eq!(MAX_FILE_SIZE, 10 * 1024 * 1024);
@@ -1018,7 +1094,7 @@ fn lint_types_exist() {
     let _err = Severity::Error;
 
     // LintConfig has a `rules` field (HashMap<String, Severity>).
-    let config = LintConfig::from_rules(HashMap::from([(
+    let (config, _) = LintConfig::from_rules_checked(HashMap::from([(
         "unused-variable".to_string(),
         Severity::Off,
     )]));
@@ -1052,6 +1128,159 @@ fn lint_types_exist() {
     let result = LintResult::new(vec![diag]);
     assert_eq!(result.diagnostics.len(), 1);
     assert!(!result.truncated);
+}
+
+/// AC-224-7 / AC-224-8: KNOWN_LINT_RULES and UnknownRuleNames honour ADR-010.
+///
+/// - `KNOWN_LINT_RULES` is publicly reachable from an external crate.
+/// - It contains exactly the ten registered rule names.
+/// - Every entry in the registry is accepted by `LintConfig::from_rules_checked` without
+///   unknowns.
+/// - `find_unknown_rule_names` returns `None` for all-known maps and `Some` for
+///   maps containing unknown names.
+/// - `UnknownRuleNames` exposes names via accessor, not a public field, and is
+///   only constructible through the library.
+#[test]
+fn known_lint_rules_and_unknown_detection() {
+    use mds::{find_unknown_rule_names, KNOWN_LINT_RULES};
+
+    // AC-224-7: exactly 10 rules.
+    assert_eq!(
+        KNOWN_LINT_RULES.len(),
+        10,
+        "KNOWN_LINT_RULES must have exactly 10 entries"
+    );
+
+    // AC-224-7: exact sorted contents.
+    let expected = [
+        "duplicate-export",
+        "duplicate-import",
+        "empty-block",
+        "legacy-interpolation",
+        "redundant-else",
+        "shadow-variable",
+        "unreachable-branch",
+        "unused-function",
+        "unused-import",
+        "unused-variable",
+    ];
+    assert_eq!(
+        KNOWN_LINT_RULES, &expected,
+        "KNOWN_LINT_RULES must match the expected sorted list"
+    );
+
+    // AC-224-8: every known rule is accepted by from_rules_checked without unknowns.
+    let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
+        .iter()
+        .map(|&n| (n.to_string(), Severity::Warn))
+        .collect();
+    let (_config, _u) = LintConfig::from_rules_checked(all_known.clone());
+    assert!(
+        find_unknown_rule_names(&all_known).is_none(),
+        "all-known rules map must produce no unknowns"
+    );
+
+    // AC-224-8: empty rules map produces no unknowns.
+    let empty: HashMap<String, Severity> = HashMap::new();
+    assert!(
+        find_unknown_rule_names(&empty).is_none(),
+        "empty rules map must produce no unknowns"
+    );
+
+    // AC-224-7: UnknownRuleNames is only obtainable via the library API.
+    let mixed: HashMap<String, Severity> = HashMap::from([
+        ("unused-variable".to_string(), Severity::Off),
+        ("no-such-rule".to_string(), Severity::Warn),
+        ("another-bad".to_string(), Severity::Error),
+    ]);
+    let unknown = find_unknown_rule_names(&mixed).expect("should detect two unknown rules");
+    // Accessor returns names; struct literal construction is impossible (#[non_exhaustive]).
+    let names = unknown.names();
+    assert_eq!(
+        names,
+        &["another-bad".to_string(), "no-such-rule".to_string()],
+        "names must be sorted lexicographically"
+    );
+    assert_eq!(names.len(), 2);
+
+    // Positive control (PF-013 / ADR-009): find_unknown_rule_names does NOT return None
+    // for a single-unknown map.
+    let one_bad: HashMap<String, Severity> =
+        HashMap::from([("no-such-rule".to_string(), Severity::Warn)]);
+    assert!(
+        find_unknown_rule_names(&one_bad).is_some(),
+        "single-unknown map must produce Some"
+    );
+}
+
+/// Review finding (config.rs:104) — `from_rules_checked` is the structurally-safe
+/// construction path.
+///
+/// - An all-known map returns `(config, None)`.
+/// - A map with unknowns returns `(config, Some(UnknownRuleNames))`.
+/// - Both arms return a usable `LintConfig` (lint always continues).
+/// - `from_rules_checked` is `#[must_use]`: the compiler warns if the caller
+///   discards the return value entirely, making it structurally harder to miss
+///   the detection step.
+#[test]
+fn from_rules_checked_structurally_returns_unknowns() {
+    use mds::{LintConfig, KNOWN_LINT_RULES};
+
+    // All-known map: config is usable, unknowns is None.
+    let all_known: HashMap<String, Severity> = KNOWN_LINT_RULES
+        .iter()
+        .map(|&n| (n.to_string(), Severity::Warn))
+        .collect();
+    let (config, unknown) = LintConfig::from_rules_checked(all_known);
+    assert!(
+        unknown.is_none(),
+        "all-known map must return None for unknowns"
+    );
+    assert_eq!(
+        config.severity_for("unused-variable"),
+        Some(&Severity::Warn),
+        "config must still be usable after from_rules_checked"
+    );
+
+    // Empty map: config is usable, unknowns is None.
+    let (empty_config, empty_unknown) = LintConfig::from_rules_checked(HashMap::new());
+    assert!(
+        empty_unknown.is_none(),
+        "empty map must return None for unknowns"
+    );
+    assert!(
+        empty_config.severity_for("unused-variable").is_none(),
+        "empty config must have no overrides"
+    );
+
+    // Map with unknown names: config still loads, unknowns is Some.
+    let mixed: HashMap<String, Severity> = HashMap::from([
+        ("unused-variable".to_string(), Severity::Off),
+        ("no-such-rule".to_string(), Severity::Warn),
+        ("another-bad".to_string(), Severity::Error),
+    ]);
+    let (config2, unknown2) = LintConfig::from_rules_checked(mixed);
+    let u = unknown2.expect("from_rules_checked must detect two unknown rules");
+    // Accessor returns sorted names.
+    assert_eq!(
+        u.names(),
+        &["another-bad".to_string(), "no-such-rule".to_string()],
+        "names must be sorted lexicographically"
+    );
+    // The config still loads — the unknown rules have no effect but the valid one does.
+    assert_eq!(
+        config2.severity_for("unused-variable"),
+        Some(&Severity::Off),
+        "valid rule must still be present in config after detection"
+    );
+
+    // Positive control (PF-013): a single-unknown map produces Some, not None.
+    let (_, one_bad_unknown) =
+        LintConfig::from_rules_checked(HashMap::from([("bad-rule".to_string(), Severity::Warn)]));
+    assert!(
+        one_bad_unknown.is_some(),
+        "single-unknown map must produce Some from from_rules_checked"
+    );
 }
 
 /// L-API-4: MdsError enum is unchanged — lint findings are LintDiagnostic, not MdsError variants.
@@ -1417,6 +1646,61 @@ fn fix_api_incremental_exists() {
     );
 }
 
+/// F-API-3: `apply_fixes` remains reachable on the public API surface while deprecated.
+/// This test pins the function signature and the empty-plan early-return path (the
+/// reverify closure is never invoked when `plan.edits.is_empty()`). Remove at v0.5.0
+/// with the function (AD-209-1).
+///
+/// AD-209-2: `#[expect(deprecated)]` was chosen over a `trybuild` compile-fail fixture
+/// because: (a) trybuild only asserts that the deprecation warning fires; it does not
+/// verify the function's signature or return value; (b) this test asserts the runtime
+/// behavior (NothingToFix for an empty plan -- the `plan.edits.is_empty()` early-return),
+/// giving a stronger pin than a compile-fail fixture alone; and
+/// (c) `#[expect(deprecated)]` fires `unfulfilled_lint_expectations` when the
+/// `#[deprecated]` attribute is removed from `apply_fixes`. The mutation control
+/// (applies ADR-009): removing the attribute leaves the lib rlib compiling clean, so
+/// both the lib-test (fix.rs `#[cfg(test)]`) and integration-test (api_surface) targets
+/// are affected. A single command is insufficient: `cargo clippy --workspace --all-targets
+/// -- -D warnings` emits 10 errors (all in fix.rs) and then cargo aborts compilation of
+/// the lib-test target; the integration-test (`api_surface`) target is never reached in
+/// that invocation. Run `cargo clippy --workspace --all-targets -- -D warnings` to verify.
+/// Total: exactly 10 unfulfilled_lint_expectations, all in fix.rs — one per deprecated
+/// `apply_fixes` call. All expectations are distinct; none is over-broad.
+///
+/// All values constructed via named constructors, never struct literals (applies ADR-010).
+#[expect(
+    deprecated,
+    reason = "AD-209-2: F-API-3 pins the deprecated apply_fixes public API surface; see fix.rs rustdoc"
+)]
+#[test]
+fn fix_api_apply_fixes_exists() {
+    use mds::fix::{apply_fixes, plan_fixes, FixOutcome};
+
+    // Construct via named constructors; never struct literals (applies ADR-010).
+    let source = "Hello!\n";
+    let original = LintResult::new(vec![]);
+    let plan = plan_fixes(&original, source);
+    // The closure moves out of a captured `String`, so it implements `FnOnce` but
+    // NOT `Fn`/`FnMut`. That makes this a real compile-time pin on the `F: FnOnce`
+    // bound: tightening `apply_fixes` to `F: Fn` (the `apply_fixes_incremental`
+    // bound) would break this test's compilation rather than pass silently.
+    let move_once = String::from("consumed-by-value");
+    let outcome = apply_fixes(
+        source,
+        plan,
+        &original,
+        move |_s| -> Result<LintResult, MdsError> {
+            drop(move_once);
+            Ok(LintResult::new(vec![]))
+        },
+    );
+    // Empty source with no diagnostics must return NothingToFix (no reverify called).
+    assert!(
+        matches!(outcome, FixOutcome::NothingToFix),
+        "trivial source with no diagnostics must return NothingToFix; got: {outcome:?}"
+    );
+}
+
 /// Regression gate (issue #9): `STRING_SOURCE_MAP_LABEL` must be reachable from
 /// the public `mds` API so every surface can import it rather than redeclaring
 /// the literal (avoids PF-007 per-surface re-declaration defeating cross-surface
@@ -1431,6 +1715,44 @@ fn string_source_map_label_is_in_public_api() {
         "STRING_SOURCE_MAP_LABEL must equal \"input.mds\"; changing it requires \
          updating every surface that uses it"
     );
+}
+
+/// AC-P1-27 positive control (PF-013 / ADR-009): the core library still uses
+/// `STRING_SOURCE_MAP_LABEL` ("input.mds") as the `file` key for string-source
+/// lint results.
+///
+/// This test confirms that the CLI's output-boundary relabel (`set_diag_display_path`
+/// in `mds-cli/src/lint.rs`) is doing real work and is not dead code — without the
+/// relabel, `"input.mds"` would appear in the `files[].file` key of the CLI JSON
+/// output.  The 113f472 baseline would fail AC-P1-01 on this exact property: the
+/// core has always used `STRING_SOURCE_MAP_LABEL` and the PR's relabel is the only
+/// thing that makes the CLI emit `"<stdin>"` instead.
+#[test]
+fn lint_str_uses_string_source_map_label_as_file_key() {
+    // Source that triggers `duplicate-export` — no imports needed, so lint_str
+    // succeeds without a filesystem base directory.
+    let source = "@define greet(name):\n  Hello {{name}}!\n@end\n\n@export greet\n@export greet\n";
+    let result = mds::lint_str(source).expect("lint_str must succeed for this source");
+    // AC-P1-27: every diagnostic must carry STRING_SOURCE_MAP_LABEL as the file key.
+    // The CLI relabels this at the output boundary; the core must not.
+    let all_files: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.file.as_deref())
+        .collect();
+    assert!(
+        !all_files.is_empty(),
+        "AC-P1-27: duplicate-export must fire and produce at least one diagnostic"
+    );
+    for file_key in &all_files {
+        assert_eq!(
+            *file_key,
+            mds::STRING_SOURCE_MAP_LABEL,
+            "AC-P1-27: core must use STRING_SOURCE_MAP_LABEL ('input.mds') as the \
+             file key for string-source lint — got '{file_key}' instead; \
+             the CLI relabel happens at the output boundary, not in core"
+        );
+    }
 }
 
 /// F-API-2: TextEdit is publicly nameable and LintDiagnostic::with_fix_edits wires through.

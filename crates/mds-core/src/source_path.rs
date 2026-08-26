@@ -27,7 +27,7 @@ use std::path::Path;
 ///
 /// # Parameters
 ///
-/// - `source` — raw source key from [`crate::sourcemap::MapBuilder`]
+/// - `source` — raw source key from `MapBuilder`
 ///   (`sources[i]`), typically an absolute canonical path on native or a
 ///   virtual key string on WASM.
 /// - `base` — directory that the source map file will be written to (the

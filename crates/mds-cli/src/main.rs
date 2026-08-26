@@ -129,8 +129,21 @@ enum Commands {
     ///
     /// Exit codes: 0 = clean, 1 = warnings only, 2 = errors or analysis failure,
     /// 3 = resource limit.
+    ///
+    /// Directory mode prints one summary line to stderr after processing all files:
+    /// N clean, N with warnings, N with errors, N resource-limited
+    ///
+    /// Under --quiet the summary is suppressed on a warn-only or clean run, but is
+    /// always printed when error- or resource-limited files are present. --quiet also
+    /// suppresses the `fix rejected:` and `diagnostic cap reached` notices in every
+    /// input mode. Two cases produce exit 1 with zero stderr bytes under --quiet:
+    /// (a) --fix --check: pending fixes exist but no error-severity findings are
+    /// present — the pending-fix signal is status output and is suppressed by --quiet;
+    /// (b) directory mode, warn-only run: files have warnings but no errors — the
+    /// summary is suppressed, mirroring `mds fmt --check --quiet` which also exits 1
+    /// silently when only formatting changes are present.
     #[command(
-        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet template.mds       Suppress output; exits 1 on warnings, 2 on errors\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
+        after_help = "Examples:\n  mds lint template.mds               Lint a single file\n  mds lint .                          Lint all .mds files recursively\n  mds lint --fix template.mds         Fix auto-fixable issues in place\n  mds lint --fix --check template.mds Preview fixes (exit 1 if any would apply)\n  mds lint --fix --diff template.mds  Show diff of pending fixes\n  mds lint --format json template.mds Machine-readable JSON output\n  mds lint --quiet .                  Directory lint: silent on clean/warn-only; summary prints on errors or resource limits\n  mds lint --quiet template.mds       Suppress output; exits 1 on warnings, 2 on errors\n  cat template.mds | mds lint -       Lint from stdin\n  cat template.mds | mds lint --fix - Fix from stdin, write fixed source to stdout"
     )]
     Lint {
         /// Input .mds file, directory, or `-` for stdin (omit to auto-detect)
@@ -243,6 +256,7 @@ fn run_check(
     quiet: bool,
 ) -> Result<()> {
     use build::read_stdin;
+    use output::STDIN_DISPLAY_LABEL;
     let runtime_vars = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
@@ -272,13 +286,17 @@ fn run_check(
     // Single-file / stdin path.
     if input == std::path::Path::new("-") {
         let (source, cwd) = read_stdin()?;
+        // AD-211-1 / AD-211-5: a string-source check labels its errors `<source>`
+        // (resolver's SOURCE_LABEL). Relabel to the uniform CLI sentinel here, at the
+        // boundary that knows the input was stdin.
         let ((), warnings) = mds::check_str_collecting_warnings(&source, Some(&cwd), runtime_vars)
-            .map_err(miette::Error::from)?;
+            .map_err(|e| output::relabel_stdin_error(&e, &source))?;
         if !quiet {
             for w in &warnings {
                 output::eprint_warning(w);
             }
-            eprintln!("OK: <stdin>");
+            // AD-211-3: one definition of the sentinel, shared with lint/build/fmt.
+            eprintln!("OK: {STDIN_DISPLAY_LABEL}");
         }
     } else {
         let ((), warnings) =

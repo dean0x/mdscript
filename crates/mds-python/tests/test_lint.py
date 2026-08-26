@@ -7,7 +7,7 @@ import pathlib
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 # ── Helpers ──────────────────────────────────────────────────────────────────────
 
@@ -255,6 +255,109 @@ def test_lr7_diagnostic_with_span() -> None:
     assert sp.column is None
 
 
+def test_lr7b_span_line_column_via_canonical_json() -> None:
+    """Span.line and Span.column are parsed from canonical JSON with populated values.
+
+    Covers the parsing path at lib.rs:789-798 (s.get("line") / s.get("column")).
+    Coverage proof (ADR-009): if that path were reverted to hardcoded None,
+    sp.line would be None rather than 2 and this assertion would fail with
+    ``AssertionError: None != 2``.
+    """
+    canonical: dict[str, object] = {
+        "version": 1,
+        "files": [
+            {
+                "file": "test.mds",
+                "diagnostics": [
+                    {
+                        "rule": "test-rule",
+                        "severity": "warn",
+                        "message": "test message",
+                        "help": None,
+                        "fixable": False,
+                        "span": {
+                            "offset": 5,
+                            "length": 3,
+                            "line": 2,
+                            "column": 1,
+                        },
+                        "fix_edits": None,
+                    }
+                ],
+            }
+        ],
+        "truncated": False,
+    }
+    result = m.LintResult(canonical)
+    assert result.files, "expected one file report from canonical construction"
+    diag = result.files[0].diagnostics[0]
+    assert isinstance(diag, m.LintDiagnostic)
+    sp = diag.span
+    assert sp is not None, "span must not be None for the constructed diagnostic"
+    assert isinstance(sp, m.Span)
+    # Struct accessor: populated values must survive the JSON → Span parse.
+    assert sp.line == 2, f"span.line must be 2 (parsed from JSON); got: {sp.line!r}"
+    assert sp.column == 1, f"span.column must be 1 (parsed from JSON); got: {sp.column!r}"
+    assert sp.offset == 5
+    assert sp.length == 3
+
+
+def test_lr7c_span_line_column_in_to_json() -> None:
+    """LintDiagnostic.to_json() emits 'line' and 'column' when the span carries them.
+
+    Covers the conditional-emission path at lib.rs:600-621 (as_json() span_map inserts).
+    Coverage proof (ADR-009): if as_json() never emitted line/column (or if the Span
+    always carried None via the hardcoded path), 'line' would be absent from the
+    serialized span and the ``assert "line" in span_json`` assertion would fail.
+    """
+    canonical: dict[str, object] = {
+        "version": 1,
+        "files": [
+            {
+                "file": "test.mds",
+                "diagnostics": [
+                    {
+                        "rule": "test-rule",
+                        "severity": "warn",
+                        "message": "test message",
+                        "help": None,
+                        "fixable": False,
+                        "span": {
+                            "offset": 5,
+                            "length": 3,
+                            "line": 2,
+                            "column": 1,
+                        },
+                        "fix_edits": None,
+                    }
+                ],
+            }
+        ],
+        "truncated": False,
+    }
+    result = m.LintResult(canonical)
+    diag = result.files[0].diagnostics[0]
+    diag_json = json.loads(diag.to_json())
+    span_json = diag_json.get("span")
+    assert span_json is not None, "span must not be null in to_json() output"
+    # Emission path: 'line' and 'column' must appear as keys when non-None.
+    assert "line" in span_json, (
+        f"'line' key must be present in span JSON when span.line is set; got: {span_json}"
+    )
+    assert "column" in span_json, (
+        f"'column' key must be present in span JSON when span.column is set; got: {span_json}"
+    )
+    assert span_json["line"] == 2, (
+        f"span JSON 'line' must be 2; got: {span_json['line']!r}"
+    )
+    assert span_json["column"] == 1, (
+        f"span JSON 'column' must be 1; got: {span_json['column']!r}"
+    )
+    # Sanity: offset and length must also survive round-trip.
+    assert span_json["offset"] == 5
+    assert span_json["length"] == 3
+
+
 def test_lr8_lint_file_report_to_dict() -> None:
     """LintFileReport.to_dict() matches the canonical wire shape for the file entry."""
     r = m.lint_virtual({"main.mds": UNUSED_SOURCE}, "main.mds")
@@ -357,3 +460,202 @@ def test_compile_to_dict_sourcemap_present_when_requested() -> None:
     d = r.to_dict()
     assert "sourceMap" in d
     assert isinstance(d["sourceMap"], dict), "sourceMap must be a dict when generated"
+
+
+# ── AC-224 D8: unknown rule name warning channel (Python) ────────────────────
+#
+# An unknown rule name in the `rules` kwarg produces `lint_warnings` in the
+# LintResult (D8 / AC-224-1). Known rule names produce no lint_warnings.
+# Python surface: lint_warnings() is a property getter that returns list[str].
+
+
+def test_py_warn_l1_unknown_rule_name_returns_lint_warnings() -> None:
+    """lint() with unknown rule name → lint_warnings non-empty (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"no-such-rule-xyzzy": "warn"})
+    assert r.version == 1
+    warnings = r.lint_warnings
+    assert isinstance(warnings, list), f"lint_warnings must be a list; got: {type(warnings)}"
+    assert len(warnings) > 0, "lint_warnings must be non-empty for an unknown rule name"
+    assert "no-such-rule-xyzzy" in warnings[0], (
+        f"lint_warnings[0] must name the unknown rule; got: {warnings[0]}"
+    )
+    assert "recognised rules are" in warnings[0] or "recognized rules are" in warnings[0], (
+        f"lint_warnings[0] must list recognised rules; got: {warnings[0]}"
+    )
+
+
+def test_py_warn_l2_known_rule_names_no_lint_warnings() -> None:
+    """lint() with only known rule names → lint_warnings empty (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"unused-variable": "off"})
+    assert r.version == 1
+    assert r.lint_warnings == [], (
+        f"lint_warnings must be empty for known rule names; got: {r.lint_warnings}"
+    )
+
+
+def test_py_warn_lf1_lint_file_unknown_rule_returns_warnings(fixtures: pathlib.Path) -> None:
+    """lint_file() with unknown rule name → lint_warnings non-empty (AC-224-1/D8)."""
+    r = m.lint_file(fixtures / "simple.mds", rules={"no-such-rule-xyzzy": "error"})
+    assert r.version == 1
+    warnings = r.lint_warnings
+    assert len(warnings) > 0, "lint_warnings must be non-empty for an unknown rule name"
+    assert "no-such-rule-xyzzy" in warnings[0], (
+        f"lint_warnings[0] must name the unknown rule; got: {warnings[0]}"
+    )
+
+
+def test_py_warn_lv1_lint_virtual_unknown_rule_returns_warnings() -> None:
+    """lint_virtual() with unknown rule name → lint_warnings non-empty (AC-224-1/D8)."""
+    modules = {"main.mds": CLEAN_SOURCE}
+    r = m.lint_virtual(modules, "main.mds", rules={"no-such-rule-xyzzy": "warn"})
+    assert r.version == 1
+    warnings = r.lint_warnings
+    assert len(warnings) > 0, "lint_warnings must be non-empty for an unknown rule name"
+    assert "no-such-rule-xyzzy" in warnings[0], (
+        f"lint_warnings[0] must name the unknown rule; got: {warnings[0]}"
+    )
+
+
+def test_py_warn_l3_lint_continues_with_unknown_rule() -> None:
+    """lint() with unknown rule name still returns files[] and truncated (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"no-such-rule-xyzzy": "warn"})
+    d = r.to_dict()
+    assert "files" in d, "files key must be present even when unknown rule name is given"
+    assert "truncated" in d, "truncated key must be present even when unknown rule name is given"
+    assert d["truncated"] is False
+
+
+def test_py_warn_l4_to_dict_includes_lint_warnings() -> None:
+    """lint() with unknown rule name → to_dict() includes 'lint_warnings' key (AC-224-1/D8)."""
+    r = m.lint(CLEAN_SOURCE, rules={"no-such-rule-xyzzy": "warn"})
+    d = r.to_dict()
+    assert "lint_warnings" in d, (
+        f"to_dict() must include 'lint_warnings' when unknown rule names are present; got: {d}"
+    )
+    assert isinstance(d["lint_warnings"], list)
+    assert len(d["lint_warnings"]) > 0
+
+
+def test_py_warn_l5_multiple_unknown_rules() -> None:
+    """lint() with multiple unknown rule names → both appear sorted lexicographically (AC-224-3).
+
+    Names are deliberately supplied in reverse lexicographic order ('zzz-bad' before
+    'aaa-bad') to verify that UnknownRuleNames::new sorts the offender list rather
+    than emitting it in HashMap iteration order (AC-224-3).
+    """
+    r = m.lint(
+        CLEAN_SOURCE,
+        rules={"zzz-bad": "warn", "aaa-bad": "error"},
+    )
+    warnings = r.lint_warnings
+    assert len(warnings) > 0, "lint_warnings must be non-empty"
+    combined = " ".join(warnings)
+    assert "zzz-bad" in combined, (
+        f"all unknown rule names must appear in lint_warnings; got: {warnings}"
+    )
+    assert "aaa-bad" in combined, (
+        f"all unknown rule names must appear in lint_warnings; got: {warnings}"
+    )
+    # AC-224-3: offenders MUST be sorted lexicographically (not HashMap iteration order).
+    # 'aaa-bad' < 'zzz-bad', so 'aaa-bad' must appear first in the combined warning text.
+    idx_aaa = combined.index("aaa-bad")
+    idx_zzz = combined.index("zzz-bad")
+    assert idx_aaa < idx_zzz, (
+        f"offenders must be sorted lexicographically: 'aaa-bad' must precede 'zzz-bad' "
+        f"(AC-224-3); got: {warnings}"
+    )
+
+
+def test_py_warn_l2b_known_rule_to_dict_omits_lint_warnings_key() -> None:
+    """lint() with only known rules → to_dict() omits 'lint_warnings' key entirely.
+
+    Pins the absent-when-empty convention: r.lint_warnings == [] and
+    'lint_warnings' not in r.to_dict() both describe the same "no warnings" state.
+    Positive control: test_py_warn_l4 asserts the key IS present when warnings fired,
+    so this absence assertion is not vacuous (ADR-009 / PF-013).
+    """
+    r = m.lint(CLEAN_SOURCE, rules={"unused-variable": "off"})
+    assert r.lint_warnings == [], "lint_warnings attribute must be empty for known rules"
+    d = r.to_dict()
+    assert "lint_warnings" not in d, (
+        "to_dict() must omit 'lint_warnings' when no warnings occurred "
+        f"(absent-when-empty convention); got keys: {list(d.keys())}"
+    )
+
+
+def test_py_warn_canonical_sanitizes_lint_warnings() -> None:
+    """LintResult(canonical) sanitizes hostile control bytes in lint_warnings (PF-004).
+
+    The live lint path is safe because format_unknown_rule_names_warning WIRE-escapes
+    strings before injection. The LintResult(canonical) / pickle path must also sanitize
+    lint_warnings because callers may supply untrusted canonical data.
+
+    Positive control: construct an ESC byte at runtime (not as a literal, per PF-018)
+    and confirm the getter does NOT return the raw byte after construction.
+    """
+    esc = chr(0x1B)  # ESC — constructed at runtime, not written as a literal (PF-018)
+    raw_warning = f"unknown rule {esc}[31mhostile{esc}[0m"
+    canonical = {
+        "version": 1,
+        "files": [],
+        "truncated": False,
+        "lint_warnings": [raw_warning],
+    }
+    result = m.LintResult(canonical)
+    warnings = result.lint_warnings
+    assert len(warnings) == 1, f"expected one warning entry; got: {warnings}"
+    assert esc not in warnings[0], (
+        f"ESC byte must be sanitized in lint_warnings via LintResult(canonical); "
+        f"got: {warnings[0]!r}"
+    )
+    # The sanitized form must be non-empty: hostile bytes are replaced, not dropped.
+    assert len(warnings[0]) > 0, "sanitized warning must be non-empty"
+    # WIRE-escaping must replace raw ESC with its JSON escape sequence (6 ASCII chars).
+    # Construct the expected string at runtime to avoid authoring a literal control byte
+    # inside a string constant (PF-018: the tooling decodes backslash-u + 4 hex to real bytes).
+    expected_escape = "\\u001B"  # backslash + u + 0 + 0 + 1 + B — six ASCII characters
+    assert expected_escape in warnings[0], (
+        f"ESC must appear as the escaped literal \\u001B; got: {warnings[0]!r}"
+    )
+
+
+def test_py_warn_live_lint_escapes_hostile_rule_name() -> None:
+    """live lint() path: a hostile rule name (ESC byte) must not reach lint_warnings raw.
+
+    ADR-008 per-surface: the mds-core unit test warning_wire_escapes_hostile_rule_name
+    proves the formatter escapes before building the string. This test proves the string
+    that actually reaches Python through the PyO3 binding carries no raw control byte
+    (negative) and DOES carry the sanitized literal (positive control, PF-013/ADR-009).
+
+    PF-018: the ESC byte is constructed at runtime via chr() — never authored as a literal.
+    """
+    esc = chr(0x1B)  # U+001B — runtime construction only (PF-018)
+    hostile_rule = esc + "[31mhostile-rule" + esc + "[0m"
+    r = m.lint(CLEAN_SOURCE, rules={hostile_rule: "warn"})
+
+    # The call must succeed and expose the warning through lint_warnings (D8 / AC-224-1).
+    warnings = r.lint_warnings
+    assert isinstance(warnings, list), f"lint_warnings must be a list; got: {type(warnings)}"
+    assert len(warnings) > 0, "lint_warnings must be non-empty for a hostile unknown rule name"
+
+    w0 = warnings[0]
+    assert isinstance(w0, str), f"lint_warnings[0] must be a str; got: {type(w0)}"
+
+    # Negative: no raw C0 (excl. \t \n), DEL, or C1 byte may survive (ADR-008).
+    for i, ch in enumerate(w0):
+        code = ord(ch)
+        is_c0 = code < 0x20 and code not in (0x09, 0x0A)
+        is_del = code == 0x7F
+        is_c1 = 0x80 <= code <= 0x9F
+        assert not (is_c0 or is_del or is_c1), (
+            f"raw hostile char U+{code:04X} at index {i} must not appear in "
+            f"lint_warnings[0]; got: {w0!r}"
+        )
+
+    # Positive control (PF-013/ADR-009): the sanitized literal must be present so
+    # the negative above cannot pass merely because the name never reached the message.
+    # Construct the expected 6-char string at runtime (PF-018).
+    expected_escape = "\\u001B"  # backslash + u + 0 + 0 + 1 + B
+    assert expected_escape in w0, (
+        f"sanitized \\u001B literal must appear in lint_warnings[0]; got: {w0!r}"
+    )

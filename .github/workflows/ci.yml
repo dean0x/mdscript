@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
         with:
           components: rustfmt, clippy
       # mds-python (pyo3, abi3-py311) is compiled by `clippy --all-targets` and
@@ -38,6 +38,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # Intra-doc link gate (AC-209-11 / OD-209-G): broken intra-doc links in
+      # mds-core degrade silently to literal text without this check.
+      # --no-deps excludes dependency crates; -p mds-core scopes the check to mds-core.
+      - name: Rustdoc (warnings are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps
 
   msrv:
     name: MSRV (Rust 1.88)
@@ -47,7 +52,7 @@ jobs:
       # rust-version = 1.88 is declared workspace-wide; verify the published
       # crates still compile on it. napi/wasm bindings are checked on stable
       # in their own jobs since their toolchain needs can differ.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@2eae45db285e407f22119950686d47e1101e071b  # 1.88
       # mds-python is added to the MSRV gate: its pyo3/abi3 build must compile on
       # the workspace floor (Rust 1.88 ≥ pyo3 0.28 MSRV 1.83). setup-python gives
       # the pyo3 build script a 3.11+ interpreter.
@@ -62,7 +67,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to 1.96.0 (released 2026-05-28, >30-day soak per project convention).
+      # RATIONALE: unpinned `stable` lets compiler drift silently change the wasm-opt
+      # output size independently of any source change, making the 850 KB guard measure
+      # a different thing each week.  Previous guard raises were partly caused by this.
+      # Scoped to this job only (not repo-wide rust-toolchain.toml) to limit blast radius.
+      # WHEN BUMPING: rebuild, re-measure with the new compiler, and update the
+      # budget-history ledger comment above with the new baseline before changing the pin.
+      - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -87,8 +99,8 @@ jobs:
         run: |
           for f in crates/mds-wasm/pkg/mds_wasm_bg.wasm crates/mds-wasm/pkg-web/mds_wasm_bg.wasm; do
             if [ ! -f "$f" ]; then
-              echo "::warning::WASM file missing: $f"
-              continue
+              echo "::error::WASM file missing: $f"
+              exit 1
             fi
             raw=$(wc -c < "$f" | tr -d ' ')
             gz=$(gzip -c "$f" | wc -c | tr -d ' ')
@@ -109,8 +121,30 @@ jobs:
             #   signature help pushed optimized binary to ~808K locally (wasm-opt v117
             #   bundled + release profile); +headroom for CI toolchain variance (CI uses
             #   Binaryen v129 which may differ).
-            # Follow-up: pin the wasm build toolchain to make the size deterministic
-            # and re-tighten this guard.
+            #   PR #294 (2026-08-14, ticket/pr1-lint-json-wire-contract): sort + stdin-label +
+            #   name-span-anchor added +11,840 bytes; wave/v0.4.0-wave1 baseline 821,662,
+            #   post-change 833,502 (wasm-pack 0.15.0 bundled wasm-opt, measured at HEAD
+            #   after removing redundant to_canonical_json re-sort in 56424f7).
+            #   Guard NOT raised: 16,498 bytes (1.94%) headroom. CI uses
+            #   Binaryen v129 (distinct toolchain from local). (AC-P1-23)
+            #   ticket/pr2-unknown-rule-names (2026-08-14, #224): unknown-rule-name warning
+            #   engine (find_unknown_rule_names, format_unknown_rule_names_warning,
+            #   attach_lint_warnings; three duplicated binding copies deleted) plus CLI
+            #   warning body unification (ba117a6) added net +10,670 bytes from PR1
+            #   baseline; PR1 baseline 833,502, post-change 844,172 (wasm-pack 0.15.0
+            #   bundled wasm-opt, nodejs target, measured locally at HEAD ba117a6).
+            #   Guard NOT raised: 5,828 bytes (0.69%) headroom. CI uses Binaryen v129
+            #   (distinct toolchain from local). Three more wave PRs still to land. (AC-224-18)
+            #   ticket/wasm-size-optimization (2026-08-16): wasm-opt flag tuning
+            #   (-Oz --flatten --rereloop -Oz --converge --strip-producers) plus
+            #   sort_unstable at four tie-free sites (value.rs, evaluator.rs,
+            #   builtins.rs x2). PR2 baseline 844,172. CI-measured post-change:
+            #   836,126 bytes (Binaryen v129, CI run 31946611856). Local wasm-opt
+            #   v117 (bundled by wasm-pack) reads roughly 2-3 KB higher (841,937
+            #   was the local pre-commit estimate; CI number is authoritative).
+            #   Net CI savings vs PR2 baseline: -8,046 bytes.
+            #   Guard NOT raised: 13,874 bytes (1.63%) headroom.
+            #   Toolchain now pinned to 1.96.0 in the wasm job (see companion commit).
             if [ "$raw" -gt 850000 ]; then
               echo "::error::WASM binary exceeds 850,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
@@ -127,6 +161,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      # DELIBERATE: @stable is intentionally not pinned to a SHA here. This is the
+      # only job that builds the native addon (ubuntu/macOS/Windows) against the
+      # stable compiler — providing the sole CI coverage of the compiler that actually
+      # ships in releases. Pinning to a fixed version (like the wasm job's 1.96.0)
+      # would silently remove coverage of the released compiler channel.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v6
@@ -157,11 +196,11 @@ jobs:
       # (avoids PF-007: CLI surface must actually run in CI, not skip silently).
       - name: Build mds CLI (CF-SM2 parity producer)
         run: cargo build -p mds-cli
-      # Install Python + the mdscript binding so CF-SM2 can compare the Python
+      # Install Python + the markdown_script binding so CF-SM2 can compare the Python
       # output as the fourth parity surface (avoids PF-007).  pip uses the
       # maturin PEP 517 build backend declared in crates/mds-python/pyproject.toml;
       # no pre-installed maturin needed.  MDS_PYTHON_BIN is set to the exact
-      # executable that owns the installed module so findPythonForMdscript()
+      # executable that owns the installed module so findPythonForMarkdownScript()
       # picks it up cross-platform (bin/ on Unix, Scripts/ on Windows).
       - uses: actions/setup-python@v5
         with:
@@ -189,7 +228,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -230,7 +269,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
       - uses: Swatinem/rust-cache@v2
       - name: Build mds CLI
         run: cargo build -p mds-cli
@@ -280,7 +319,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -293,8 +332,8 @@ jobs:
         run: ls dist/ && ls dist/ | grep -q 'cp311-abi3' || (echo "expected a cp311-abi3 wheel" && exit 1)
       - name: Install the built wheel (not editable) + import smoke
         run: |
-          python -m pip install --find-links dist --no-index mdscript
-          python -c "import mdscript; r = mdscript.compile('Hello {n}!', vars={'n': 'CI'}); print(r.kind, r.output)"
+          python -m pip install --find-links dist --no-index markdown-script
+          python -c "import markdown_script as m; r = m.compile('Hello {{n}}!', vars={'n': 'CI'}); assert r.kind == 'markdown', r.kind; assert r.output == 'Hello CI!\n', repr(r.output); print('smoke ok:', r.output)"
       # Run the suite against the INSTALLED wheel (mypy/pyright deselected — they
       # are covered in the develop job; parity CLI is built for the live check).
       - name: Build mds CLI (parity producer)
@@ -306,3 +345,26 @@ jobs:
       - name: pytest against the installed wheel (perf, advisory)
         continue-on-error: true
         run: pytest crates/mds-python/tests -q -m perf
+
+  # -------------------------------------------------------------------------
+  # #288: Source-hygiene gate — rejects hazardous codepoints (control bytes,
+  # bidi overrides, BOM) from tracked source. Scans the full tracked tree via
+  # `git ls-files`, reads content at codepoint level (pure Node; no grep -P
+  # which BSD grep lacks). Positive-control suite proves the check is live.
+  #
+  # D-CB7: BSD grep lacks -P and exits 2 with empty output, making the absence
+  # of hazard bytes indistinguishable from a broken invocation (avoids PF-013).
+  # D-CB5: Zero-files-scanned is exit 1, not exit 0 (avoids PF-016).
+  # -------------------------------------------------------------------------
+  source-hygiene:
+    name: Source hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Scan tracked source for hazardous codepoints
+        run: node scripts/verify-no-control-bytes.mjs
+      - name: Run positive-control and class-completeness suite
+        run: npm run test:gates

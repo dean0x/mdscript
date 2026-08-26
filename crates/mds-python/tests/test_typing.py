@@ -11,7 +11,7 @@ import pytest
 
 SAMPLE = Path(__file__).parent / "typecheck_sample.py"
 # Pyright project root: the mds-python package directory (contains pyrightconfig.json
-# with extraPaths pointing to ./python so "import mdscript" resolves).
+# with extraPaths pointing to ./python so "import markdown_script" resolves).
 _PYRIGHT_PROJECT = Path(__file__).parent.parent
 
 # Known, structurally-justified stub/runtime diffs `stubtest` cannot resolve
@@ -21,19 +21,19 @@ _PYRIGHT_PROJECT = Path(__file__).parent.parent
 # (src/lib.rs `mds_err_to_py`/`coded_error`), never as class-level descriptors, so
 # static introspection of the class object can never see them.
 _KNOWN_STUBTEST_DIFFS = (
-    "mdscript.MdsError.code",
-    "mdscript.MdsError.message",
-    "mdscript.MdsError.help",
-    "mdscript.MdsError.span",
+    "markdown_script.MdsError.code",
+    "markdown_script.MdsError.message",
+    "markdown_script.MdsError.help",
+    "markdown_script.MdsError.span",
 )
 
 
 def test_c6_py_typed_and_stubs_installed() -> None:
-    import mdscript
+    import markdown_script
 
-    pkg = Path(mdscript.__file__).parent
+    pkg = Path(markdown_script.__file__).parent
     assert (pkg / "py.typed").is_file(), "py.typed marker must ship in the package"
-    assert (pkg / "_mdscript.pyi").is_file(), "extension stub must ship"
+    assert (pkg / "_markdown_script.pyi").is_file(), "extension stub must ship"
     assert (pkg / "__init__.pyi").is_file(), "package stub must ship"
 
 
@@ -74,7 +74,7 @@ def test_c6_stubtest_matches_runtime() -> None:
             sys.executable,
             "-m",
             "mypy.stubtest",
-            "mdscript",
+            "markdown_script",
             "--ignore-missing-stub",  # runtime-only dunders (__repr__, __reduce__, …)
         ],
         capture_output=True,

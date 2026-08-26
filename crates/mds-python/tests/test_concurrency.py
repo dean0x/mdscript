@@ -25,7 +25,7 @@ import time
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 # A moderately expensive, deterministic compile (a few ms each).
 LOOP_SRC = "@for i in items:\nItem {{i}}: lorem ipsum dolor sit amet consectetur adipiscing\n@end\n"

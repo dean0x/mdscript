@@ -84,18 +84,38 @@ export interface CheckResult {
 
 /**
  * Options for check-only operations (no source-map generation).
- * Accepted by {@link MdsBaseBackend.check} and {@link MdsNodeBackend.checkFile}.
+ * Accepted by {@link MdsBaseBackend.check}.
+ *
+ * `basePath` is added here so that {@link CompileOptions} inherits it
+ * via `extends CheckOptions`. Both compile and check resolve `@import` directives
+ * against this directory when the source string is not backed by a file path.
+ * The WASM backend rejects a non-null `basePath` at runtime (no filesystem access);
+ * set `MDS_BACKEND=native` to use the native backend with import resolution.
  */
 export interface CheckOptions {
   /** Runtime variables made available for interpolation in the template. */
   vars?: Record<string, unknown>;
+  /**
+   * Base directory for resolving `@import` directives in the source string.
+   * Defaults to the process cwd when omitted.
+   *
+   * **Caution:** omitting `basePath` resolves imports against the process cwd,
+   * which succeeds silently but resolves against the wrong directory if the
+   * source string was not loaded from cwd. Provide an explicit path when the
+   * source contains `@import` or `@extends`.
+   *
+   * **WASM backend:** rejected at runtime with `mds::invalid_options` -- the WASM
+   * backend has no filesystem access. Set `MDS_BACKEND=native` to force the native
+   * backend.
+   */
+  basePath?: string;
 }
 
 /**
  * Options for compile operations.
  *
  * Extends {@link CheckOptions}: check accepts a strict subset of compile's options.
- * The `vars` field is inherited from {@link CheckOptions}.
+ * The `vars` and `basePath` fields are inherited from {@link CheckOptions}.
  */
 export interface CompileOptions extends CheckOptions {
   /**
@@ -119,11 +139,56 @@ export interface CompileOptions extends CheckOptions {
 /**
  * Options for file-based compile operations.
  *
- * Structurally identical to {@link CompileOptions} (inherits `vars`, `sourceMap`,
- * `sourcesContent`). Kept as a distinct named type so `compileFile` and
- * `checkFile` can evolve their option sets independently.
+ * `CompileFileOptions` deliberately does NOT extend `CompileOptions`. After
+ * `CompileOptions` gained `basePath`, inheriting it here would silently add a
+ * field that is not valid for file-surface operations (the base directory is
+ * derived from the file path). The fields are declared directly so that adding
+ * a new string-surface option never implicitly appears on the file surface.
  */
-export interface FileOptions extends CompileOptions {}
+export interface CompileFileOptions {
+  /** Runtime variables made available for interpolation in the template. */
+  vars?: Record<string, unknown>;
+  /** When `true`, appends a Source Map v3 document to the result. */
+  sourceMap?: boolean;
+  /**
+   * When `true`, embeds the original source text in `sourceMap.sourcesContent`.
+   * Requires `sourceMap: true`.
+   *
+   * **Privacy warning**: embeds the full template source. Only use in trusted environments.
+   */
+  sourcesContent?: boolean;
+  /**
+   * Not accepted on file operations: the base directory is derived from the file
+   * path. Passing a non-null value throws `mds::invalid_options`.
+   */
+  basePath?: never;
+}
+
+/**
+ * @deprecated Renamed to {@link CompileFileOptions} for consistency with
+ * {@link CheckFileOptions} and {@link LintFileOptions}. This alias is preserved
+ * for backward compatibility and will be removed in a future major version.
+ */
+export type FileOptions = CompileFileOptions;
+
+/**
+ * Options for file-based check-only operations.
+ *
+ * `basePath` is not accepted on file operations: the base directory is derived
+ * from the file path. The `basePath?: never` declaration rejects assignment from
+ * any variable whose inferred type carries `basePath` (e.g. a `CheckOptions`
+ * value), producing a compile-time error rather than a runtime surprise.
+ * Only `vars` is forwarded to the backend.
+ */
+export interface CheckFileOptions {
+  /** Runtime variables made available for interpolation in the template. */
+  vars?: Record<string, unknown>;
+  /**
+   * Not accepted on file operations: the base directory is derived from the file
+   * path. Passing a non-null value throws `mds::invalid_options`.
+   */
+  basePath?: never;
+}
 
 // ---------------------------------------------------------------------------
 // Lint types
@@ -145,12 +210,15 @@ export interface LintDiagnostic {
   severity: 'error' | 'warn' | 'info';
   /** Human-readable description of the finding. */
   message: string;
-  /** Optional guidance on how to resolve the finding. */
-  help?: string;
+  /** Optional guidance on how to resolve the finding. `null` when the rule emits no hint. */
+  help?: string | null;
   /** Whether the lint engine can auto-fix this diagnostic (`--fix`). */
   fixable: boolean;
-  /** Source location of the finding, if available. */
-  span?: LintSpan;
+  /**
+   * Source location of the finding. May be absent (`undefined`) or `null` when
+   * the rule produces no source span.
+   */
+  span?: LintSpan | null;
   /**
    * Byte-range replacement edits the fix engine would apply, if available.
    * Each edit is `{ start, end, new_text }` with byte offsets into the source.
@@ -166,6 +234,52 @@ export interface LintDiagnostic {
  */
 export type RuleSeverity = 'error' | 'warn' | 'info' | 'off';
 
+/**
+ * Union of all recognised lint rule names.
+ *
+ * D-224-1 (2026-08-12 ruling): passing a key outside this set is NOT an error.
+ * The engine emits a warning (see {@link LintResult.lint_warnings}) and lint
+ * continues — the unknown rule is not enforced, but the caller is told. The
+ * asymmetry with unknown severity values (which are hard errors) is deliberate:
+ * severity is a closed set, but rule names grow every release, so hard-failing
+ * would break configs that name a rule added in a newer binary.
+ */
+export type LintRuleName =
+  | 'duplicate-export'
+  | 'duplicate-import'
+  | 'empty-block'
+  | 'legacy-interpolation'
+  | 'redundant-else'
+  | 'shadow-variable'
+  | 'unreachable-branch'
+  | 'unused-function'
+  | 'unused-import'
+  | 'unused-variable';
+
+/**
+ * All recognised lint rule names, sorted alphabetically.
+ *
+ * D-224-2: this array is a manual mirror of the Rust `KNOWN_LINT_RULES`
+ * registry (composed from each rule module's own `RULE` const). The TS mirror
+ * is guarded in one direction only — a new rule must be added here manually
+ * after landing in `mds-core`. Drift is a named residual (avoids PF-015).
+ *
+ * `rules` keys not found here emit a warning (see {@link LintResult.lint_warnings})
+ * and lint continues — unknown names are ignored by the engine after the warning.
+ */
+export const LINT_RULE_NAMES: readonly LintRuleName[] = [
+  'duplicate-export',
+  'duplicate-import',
+  'empty-block',
+  'legacy-interpolation',
+  'redundant-else',
+  'shadow-variable',
+  'unreachable-branch',
+  'unused-function',
+  'unused-import',
+  'unused-variable',
+] as const;
+
 /** All diagnostics for a single file in a lint result. */
 export interface LintFileReport {
   /** Path or name of the linted file. */
@@ -175,9 +289,12 @@ export interface LintFileReport {
 }
 
 /**
- * Canonical lint result returned by all lint surfaces (CLI `--format json`,
- * napi, WASM, Python). All surfaces produce byte-identical JSON for the same
- * input and rules configuration.
+ * Lint result returned by the napi, WASM, and Python binding surfaces, and
+ * by the CLI `--format json` surface. The `files`, `truncated`, and `version`
+ * fields are present on every surface. The optional `lint_warnings` field is
+ * included in the binding-surface JSON when non-fatal warnings occurred; the
+ * CLI writes those warnings to stderr so its JSON stdout remains parseable
+ * without modification.
  */
 export interface LintResult {
   /** Schema version; always 1 in this release. */
@@ -189,18 +306,41 @@ export interface LintResult {
    * earlier diagnostics were dropped. Re-run after fixing to surface the rest.
    */
   truncated: boolean;
+  /**
+   * Non-fatal warnings produced during linting — for example, unknown rule
+   * names passed in the `rules` option. Absent (not `[]`) when no warnings
+   * occurred. On the CLI surface, these warnings go to stderr instead.
+   */
+  lint_warnings?: string[];
 }
 
 /** Options for source-string lint operations. */
 export interface LintOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
-  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  /**
+   * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
+   *
+   * Keys should be {@link LintRuleName} values. An unrecognised key emits a
+   * warning in {@link LintResult.lint_warnings} and lint continues — the
+   * unknown rule is not enforced by the engine. `Record<string, …>` is
+   * accepted for forward compatibility with future rule names.
+   */
   rules?: Record<string, RuleSeverity>;
   /**
    * Base directory for resolving `@import` directives in the source string.
-   * Required when the source contains `@import` or `@extends`.
-   * Ignored by the WASM backend (which cannot access the filesystem).
+   * Defaults to the process cwd when omitted.
+   *
+   * **Caution:** omitting `basePath` resolves imports against the process cwd,
+   * which succeeds silently but resolves against the wrong directory if the
+   * source string was not loaded from cwd. Provide an explicit path when the
+   * source contains `@import` or `@extends`.
+   *
+   * The WASM backend **rejects** a non-null `basePath` with
+   * `mds::invalid_options` rather than silently ignoring it. This surfaces the
+   * misconfiguration instead of linting a partially-resolved module graph.
+   * Set `MDS_BACKEND=native` to force the native backend, or use
+   * {@link MdsBaseBackend.lintVirtual} with pre-resolved modules.
    */
   basePath?: string;
 }
@@ -209,8 +349,21 @@ export interface LintOptions {
 export interface LintFileOptions {
   /** Runtime variables injected into the check gate (not the lint rules). */
   vars?: Record<string, unknown>;
-  /** Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`. */
+  /**
+   * Per-rule severity overrides, e.g. `{ 'shadow-variable': 'warn' }`.
+   *
+   * Keys should be {@link LintRuleName} values. An unrecognised key emits a
+   * warning in {@link LintResult.lint_warnings} and lint continues — the
+   * unknown rule is not enforced by the engine. `Record<string, …>` is
+   * accepted for forward compatibility with future rule names.
+   */
   rules?: Record<string, RuleSeverity>;
+  /**
+   * Not accepted: `lintFile` derives the base directory from the file path;
+   * `lintVirtual` resolves imports against the caller-supplied module map.
+   * Passing a non-null value throws `mds::invalid_options`.
+   */
+  basePath?: never;
 }
 
 /** Source location of a compiler error. */
@@ -252,6 +405,11 @@ export interface InitOptions {
 /**
  * Browser-safe backend interface — compile/check/lint/lintVirtual/getBackend.
  * Does not include file operations (which require node:fs).
+ *
+ * All string-surface methods accept `basePath` via their options type
+ * (`CompileOptions` / `CheckOptions` / `LintOptions`). The WASM implementation's
+ * runtime contract for `basePath`: a non-null value throws `mds::invalid_options`
+ * instead of silently ignoring it.
  */
 export interface MdsBaseBackend {
   compile(source: string, options?: CompileOptions): CompileResult;
@@ -274,21 +432,16 @@ export interface MdsBaseBackend {
  * Extends MdsBaseBackend with file-based compile/check/lint operations.
  */
 export interface MdsNodeBackend extends MdsBaseBackend {
-  compileFile(path: string, options?: FileOptions): Promise<CompileResult>;
+  compileFile(path: string, options?: CompileFileOptions): Promise<CompileResult>;
   /**
    * Validate an MDS file without rendering. Only `vars` is forwarded;
-   * source-map options are not applicable to check operations.
+   * source-map options and `basePath` are not applicable to file-path operations
+   * (the base directory is derived from the file path).
    */
-  checkFile(path: string, options?: CheckOptions): Promise<CheckResult>;
+  checkFile(path: string, options?: CheckFileOptions): Promise<CheckResult>;
   /** Lint an MDS file, resolving @import directives relative to the file. */
   lintFile(path: string, options?: LintFileOptions): Promise<LintResult>;
 }
-
-/**
- * Backward-compatible alias. New code should prefer MdsNodeBackend.
- * @deprecated Use MdsNodeBackend directly.
- */
-export type MdsBackend = MdsNodeBackend;
 
 /**
  * Type guard that identifies errors thrown by the MDS compiler.

@@ -34,7 +34,6 @@ These are **not** automated and must be done before the first release:
    `mds-core` and `mds-cli` on crates.io.
 4. **Enable GitHub private vulnerability reporting** (Settings → Code security →
    Private vulnerability reporting) so the SECURITY.md flow works.
-5. Add **`CODE_OF_CONDUCT.md`** (tracked in #38) if not already present.
 
 ## Pre-flight (before tagging)
 
@@ -57,6 +56,20 @@ npm run build -w @mdscript/mds-wasm
 npm run build --workspaces --if-present
 npm test --workspaces --if-present
 node scripts/verify-versions.mjs
+# Verify #[deprecated(since = ...)] attributes match the release version.
+# bump-version.mjs rewrites manifests and CHANGELOG only -- never .rs files.
+# Every hit's version must be <= X.Y.Z. A deprecation introduced in THIS release
+# must equal X.Y.Z; pre-existing ones keep their original version.
+# PF-018: if the grep returns no hits, plant a temporary `since = "x.y.z"` in any
+# .rs file, confirm the grep finds it, then remove it before proceeding.
+grep -rn 'since = ' crates/ --include='*.rs'
+
+# Source hygiene and pre-merge check gates
+node scripts/verify-no-control-bytes.mjs
+npm run test:gates                           # positive-control spec suite
+# Before any --admin merge (PF-017 guard — cancelled runs read as green):
+PR_NUMBER=NNN  # replace NNN with the bump PR number
+node scripts/verify-pr-checks.mjs "$PR_NUMBER"
 
 # Packaging spot-check (inspect tarball contents)
 npm pack -w @mdscript/mds --dry-run
@@ -74,6 +87,17 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # artifacts. Publishes NOTHING.
 ```
 
+The dry-run workflow runs `version-gate` in full, which now includes the
+**credential probe** (security-08): it calls `npm whoami` against the live
+registry to verify the `NPM_TOKEN` is valid, and guards `CARGO_REGISTRY_TOKEN`
+for non-empty. A revoked or absent token therefore fails the dry run — this
+closes the former gap where a bad npm token was only discovered after
+`cargo publish` had already made an irreversible crates.io release.
+
+**Note:** `npm whoami` verifies authentication, not publish rights to the
+`@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
+fails at publish time.
+
 Confirm the **A3 name-gate** step (`scripts/verify-napi-names.mjs`) passes in that
 run. **This is a hard checkpoint** — if the generated platform package names or
 their `.node` filenames drift from the hand-written `crates/mds-napi/index.js`
@@ -88,9 +112,20 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 
 1. **Bump versions:** `node scripts/bump-version.mjs X.Y.Z` (updates all
    manifests and stamps the CHANGELOG, opening a fresh `[Unreleased]`).
-2. **Land the bump on `main`:** open a PR (CI-gated). `main` is protected and the
-   sole code-owner can't self-approve, so the merge needs an admin override
-   (`enforce_admins=false` permits it). Squash-merge to keep linear history.
+2. **Land the bump on `main`:** open a PR (CI-gated). Once CI is green, run the
+   pre-merge check verifier before merging — a cancelled run reads as green under
+   `--admin` (PF-017):
+   ```bash
+   node scripts/verify-pr-checks.mjs <pr-number>
+   ```
+   On exit 0 the script prints the exact merge command — copy and run it verbatim:
+   ```bash
+   gh pr merge --squash --admin --match-head-commit <headSha>
+   ```
+   (`--admin` is required because `main` is protected and the sole code-owner
+   cannot self-approve. `--match-head-commit` closes the TOCTOU window between
+   verification and merge. Both flags are emitted by the script — copy the
+   printed command without modification.)
 3. **Tag the merged commit and push:**
    ```bash
    git tag -a vX.Y.Z -m vX.Y.Z

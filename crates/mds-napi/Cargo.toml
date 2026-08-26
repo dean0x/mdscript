@@ -9,6 +9,10 @@ readme.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories = ["api-bindings"]
+# Not published to crates.io: distribution is an npm package (@mdscript/mds-napi)
+# built and staged by napi-rs in release.yml. An accidental `cargo publish --workspace`
+# must not push this crate to the irreversible crates.io registry.
+publish = false
 
 [features]
 # Expose the raw Rust panic payload as `err.detail` on mds::internal errors.

@@ -61,8 +61,26 @@ crates/mds-python/dist/
 # index.md and every {slug}/KNOWLEDGE.md are tracked and committed; everything else
 # under .devflow/features/ stays local. To stop sharing, re-add `.devflow/features/`
 # to your own .gitignore.
+#
+# Exception (narrow — compliance-07): three design-plan files are deliberately shared;
+# no broader .devflow/docs/ subtree is exposed. .devflow/docs/reviews/ has no
+# exception and stays fully ignored. git cannot re-include a child of an excluded
+# directory without first un-ignoring the parent, so the ladder of alternating
+# ignore/negation patterns below is required. The effective scope is exactly the three
+# files listed; everything else under .devflow/docs/ remains local-only.
 .devflow/*
 !.devflow/features/
+!.devflow/docs/
+.devflow/docs/*
+!.devflow/docs/design/
+.devflow/docs/design/*
+!.devflow/docs/design/149-154-v0.4.0-breaking-fixes.2026-07-08_1400.md
+!.devflow/docs/design/v040-wave1/
+.devflow/docs/design/v040-wave1/*
+!.devflow/docs/design/v040-wave1/20260812_0046/
+.devflow/docs/design/v040-wave1/20260812_0046/*
+!.devflow/docs/design/v040-wave1/20260812_0046/pr1-lint-json-plan.md
+!.devflow/docs/design/v040-wave1/20260812_0046/pr5-deprecate-apply-fixes-plan.md
 .devflow/features/*
 !.devflow/features/index.md
 !.devflow/features/*/

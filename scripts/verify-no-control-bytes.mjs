@@ -1,0 +1,897 @@
+#!/usr/bin/env node
+/**
+ * D-CB1: Source-hygiene gate — scans tracked git source for hazardous codepoints.
+ *
+ * The hazard class is derived from crates/mds-cli/tests/common/mod.rs:38-62
+ * (`assert_no_control_chars`), with ONE documented divergence:
+ *
+ * D-CB3 DIVERGENCE: CR (U+000D) is permitted when immediately followed by LF
+ * (i.e., CRLF line endings are allowed). The Rust helper flags all CR
+ * unconditionally. This carve-out preserves the 17 CRLF pairs in the two
+ * `mds fmt` fixture files. A future `.gitattributes text=auto` would normalize
+ * those fixtures and may break the fmt tests — documented here so that change
+ * is deliberate, not accidental.
+ *
+ * D-CB2: No hazard codepoint appears as a literal or backslash-u escape in
+ * this file. All are written as numeric values. The edit tooling decodes
+ * \uXXXX (4-hex) patterns into live bytes — this file's self-scan guards
+ * against that vector (avoids PF-018).
+ *
+ * D-CB7: Pure Node codepoint iteration — no grep. BSD grep (macOS default)
+ * lacks -P and exits 2 with empty output, making the absence of hazard bytes
+ * indistinguishable from a grep invocation that cannot run (avoids PF-013).
+ *
+ * D-CB5: Fails closed. In full-tree mode, zero-files-scanned is exit 1, not
+ * exit 0 (avoids PF-016 — an empty scan masquerades as clean). In --staged
+ * mode, an empty ACMRT-filtered set is a legitimate state (deletion-only
+ * commits, amend with no content changes) and exits 0 with an explicit
+ * message; the full-tree scan is the authoritative non-vacuity gate.
+ *
+ * AC-6 AMENDMENT (--staged mode): AC-6 requires exit 1 when the scanned
+ * file set is empty. --staged mode intentionally exits 0 for a legitimately-
+ * empty content-bearing set (deletion-only commits via `git rm`, `git commit
+ * --amend -m`, `git commit --allow-empty`). Exiting 1 there would train
+ * contributors toward `--no-verify`, which disables the gate for ALL commits
+ * — the opposite of the security goal. No bypass exists: any staged file with
+ * hazardous content appears under the ACMRT filter. This amendment is
+ * deliberate, tested (see spec test "D-CB5 --staged carve-out from AC-6"),
+ * and leaves the full-tree CI scan as the authoritative AC-6 gate.
+ *
+ * D-CB6a: allowlist STALENESS is adjudicated in full-tree mode only. Staleness
+ * is a claim about the whole tracked tree, and --staged / explicit-path modes
+ * scan a subset that cannot support it. Hazard SUPPRESSION by an allowlist
+ * entry still applies in every mode. See the stale-allowlist block in main().
+ *
+ * D-CB8: --staged mode reads file content from the git index via a single
+ * `git cat-file --batch` subprocess (all staged blobs at once), never from
+ * the working tree. Staging a clean file then modifying the working copy
+ * does not bypass the hook.
+ *
+ * Usage:
+ *   node scripts/verify-no-control-bytes.mjs              # full tree scan
+ *   node scripts/verify-no-control-bytes.mjs --staged      # pre-commit (index)
+ *   node scripts/verify-no-control-bytes.mjs <path> ...   # explicit paths
+ *
+ * Exit codes:
+ *   0 — no hazards found (prints file count and byte count for non-vacuity)
+ *   1 — hazard found, zero files scanned, invalid UTF-8, un-allowlisted NUL,
+ *       unreadable tracked path, stale/unmatched allowlist entry, git missing
+ *       from PATH, or not inside a git work tree (all fail-closed)
+ *   2 — indeterminate: a git subcommand (ls-files / diff --cached / cat-file)
+ *       failed unexpectedly
+ */
+'use strict';
+
+import { spawnSync } from 'node:child_process';
+import { readFileSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+/**
+ * True when this module is the process entry point.
+ *
+ * Two traps make the obvious `import.meta.url === 'file://' + process.argv[1]`
+ * wrong, and both fail SILENTLY: main() never runs, the process exits 0, and a
+ * gate that scanned nothing is indistinguishable from a clean tree.
+ *   1. Percent-encoding — any path containing a space never matches.
+ *   2. Symlinks — Node resolves import.meta.url through realpath, while
+ *      process.argv[1] keeps the path as typed (on macOS /tmp and
+ *      /var/folders are symlinks, so this is the common case, not a corner).
+ * Comparing realpaths handles both (applies ADR-009, avoids PF-013).
+ *
+ * @param {string} metaUrl — the caller's import.meta.url
+ * @returns {boolean}
+ */
+function isMainModule(metaUrl) {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const modulePath = fileURLToPath(metaUrl);
+  try {
+    return realpathSync(entry) === realpathSync(modulePath);
+  } catch {
+    return pathToFileURL(resolve(entry)).href === metaUrl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// D-CB1: Hazard class definition.
+//
+// Exported so tests can import and assert completeness (D-CB1a: golden-set
+// test prevents silent narrowing).
+//
+// Entry forms:
+//   { from, to }                   — inclusive codepoint range
+//   { cp, crlfException: true }    — single codepoint with CRLF exception
+//   number                         — single codepoint
+// ---------------------------------------------------------------------------
+export const HAZARD_RANGES = [
+  // C0 control characters (0x00-0x1F), excluding TAB (0x09) and LF (0x0A).
+  // D-CB3: CR (0x0D) has a CRLF exception — see entry below.
+  { from: 0x00, to: 0x08 },         //  1. C0: NUL..BS (below TAB)
+  { from: 0x0b, to: 0x0c },         //  2. C0: VT, FF (between LF and CR)
+  { cp: 0x0d, crlfException: true }, //  3. CR — lone CR fails; CRLF passes (D-CB3)
+  { from: 0x0e, to: 0x1f },         //  4. C0: SO..US (above CR)
+  { from: 0x7f, to: 0x7f },         //  5. DEL
+  { from: 0x80, to: 0x9f },         //  6. C1 (at codepoint level — catches 0xC2 0x80-0x9F
+                                    //        in UTF-8; continuation bytes are NOT matched
+                                    //        because a 0x80-0x9F byte following a start byte
+                                    //        is decoded to a codepoint >= 0x100 that falls
+                                    //        outside this range)
+  // Twelve Unicode Bidi_Control=Yes codepoints (Trojan Source, CVE-2021-42574).
+  0x061c,   //  7. U+061C  Arabic Letter Mark
+  0x200e,   //  8. U+200E  Left-to-Right Mark
+  0x200f,   //  9. U+200F  Right-to-Left Mark
+  0x202a,   // 10. U+202A  Left-to-Right Embedding
+  0x202b,   // 11. U+202B  Right-to-Left Embedding
+  0x202c,   // 12. U+202C  Pop Directional Formatting
+  0x202d,   // 13. U+202D  Left-to-Right Override
+  0x202e,   // 14. U+202E  Right-to-Left Override
+  0x2066,   // 15. U+2066  Left-to-Right Isolate
+  0x2067,   // 16. U+2067  Right-to-Left Isolate
+  0x2068,   // 17. U+2068  First Strong Isolate
+  0x2069,   // 18. U+2069  Pop Directional Isolate
+  // JavaScript line/paragraph terminators (outside Bidi_Control, still hazardous
+  // because JS parsers treat them as line endings inside string literals).
+  0x2028,   // 19. U+2028  Line Separator
+  0x2029,   // 20. U+2029  Paragraph Separator
+  // Byte-Order Mark / Zero-Width No-Break Space.
+  0xfeff,   // 21. U+FEFF  BOM / ZWNBSP
+];
+// HAZARD_RANGES has 21 entries. AC-12 lists the same class; the test asserts
+// this exact count and composition (D-CB1a: golden-set completeness guard).
+
+// ---------------------------------------------------------------------------
+// D-CB6: Two enumerated allowlists, both empty. Every entry carries a written
+// `reason`. A stale entry (path absent or declared codepoints no longer
+// present) is itself an exit 1.
+//
+// BINARY_ALLOWLIST: files containing NUL bytes (intentional binary content).
+// HAZARD_ALLOWLIST: files with specific hazardous codepoints for test fixtures.
+// ---------------------------------------------------------------------------
+export const BINARY_ALLOWLIST = [
+  // { path: 'relative/from/root', reason: 'explanation' }
+];
+
+export const HAZARD_ALLOWLIST = [
+  // { path: 'relative/from/root', codepoints: [0x...], reason: 'explanation' }
+];
+
+// reliability-01: output caps — one retained hit is already sufficient to exit 1,
+// so truncating output cannot weaken the gate. These caps prevent the 285x memory
+// amplification empirically measured on a 2 MB file of dense hazard bytes (a file
+// of 0x01 bytes produced 569 MB peak RSS and 275 MB of stderr at uncapped output).
+const MAX_HITS_PER_FILE = 20;
+const MAX_HITS_TOTAL = 1000;
+
+// ---------------------------------------------------------------------------
+// Hazard predicate
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {number} cp    — Unicode codepoint being tested
+ * @param {number|null} nextCp — codepoint immediately following cp (for CRLF)
+ * @returns {boolean}
+ */
+export function isHazardous(cp, nextCp) {
+  for (const entry of HAZARD_RANGES) {
+    if (typeof entry === 'number') {
+      if (cp === entry) return true;
+    } else if (entry.crlfException) {
+      // D-CB3: CR (0x0D) is only hazardous when the NEXT char is NOT LF.
+      if (cp === entry.cp && nextCp !== 0x0a) return true;
+    } else {
+      if (cp >= entry.from && cp <= entry.to) return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Hexdump context helper (D-CB7: readable failure output)
+// ---------------------------------------------------------------------------
+
+/**
+ * Return ±8-byte hex context around `offset` in `buf`.
+ * @param {Buffer} buf
+ * @param {number} offset
+ * @returns {string}
+ */
+function hexContext(buf, offset) {
+  const start = Math.max(0, offset - 8);
+  const end = Math.min(buf.length, offset + 10);
+  const hex = [];
+  for (let i = start; i < end; i++) {
+    const byte = buf[i].toString(16).padStart(2, '0');
+    hex.push(i === offset ? `[${byte}]` : byte);
+  }
+  return hex.join(' ');
+}
+
+// ---------------------------------------------------------------------------
+// security-12: git version gate
+//
+// `git cat-file --batch -z` requires git >= 2.42 (the -z flag was added then).
+// An older git rejects -z with exit code 129 and no useful message. This gate
+// detects the version mismatch early and emits a named diagnostic. The fail-closed
+// behaviour (exit 2 = indeterminate) is unchanged — this is diagnosability only.
+// Mirrors the MIN_GH_MAJOR/MIN_GH_MINOR pattern from verify-pr-checks.mjs.
+// ---------------------------------------------------------------------------
+
+const MIN_GIT_MAJOR = 2;
+const MIN_GIT_MINOR = 42;
+
+/**
+ * Probe the installed git version. Returns { major, minor } or null on failure.
+ * Short timeout: --version is a local binary probe with no network I/O.
+ */
+function gitVersion() {
+  const r = spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 10_000 });
+  if (r.error || r.status !== 0) return null;
+  // Output: "git version 2.42.0"
+  const m = r.stdout.match(/git version (\d+)\.(\d+)/);
+  if (!m) return null;
+  return { major: parseInt(m[1], 10), minor: parseInt(m[2], 10) };
+}
+
+// ---------------------------------------------------------------------------
+// git helpers
+// ---------------------------------------------------------------------------
+
+function gitExec(args, cwd = process.cwd()) {
+  // Hard per-call bound: an index lock or credential prompt must not hang the
+  // pre-commit hook indefinitely. ETIMEDOUT is indeterminate → exit 2, never 0.
+  const result = spawnSync('git', args, {
+    cwd,
+    encoding: 'buffer',
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  if (result.error) {
+    if (result.error.code === 'ENOENT') {
+      // AC-16: fail-closed (exit 1) — "git missing" is a known, named failure,
+      // not an indeterminate tool error.
+      console.error('✖ verify-no-control-bytes: git is not on PATH');
+      process.exit(1);
+    } else if (result.error.code === 'ETIMEDOUT') {
+      // Timeout is indeterminate — a hung git call is not evidence of a clean tree.
+      console.error('✖ verify-no-control-bytes: git timed out after 30 s — indeterminate, not clean');
+      process.exit(2);
+    } else {
+      console.error(`✖ verify-no-control-bytes: git error: ${result.error.message}`);
+      process.exit(2);
+    }
+  }
+  return result;
+}
+
+/** Verify we are inside a git work tree (exit 1 if not — AC-16: fail-closed). */
+function assertGitRepo(cwd) {
+  const r = gitExec(['rev-parse', '--is-inside-work-tree'], cwd);
+  if (r.status !== 0) {
+    // AC-16: fail-closed (exit 1) — "not a git repo" is a known, named failure,
+    // not an indeterminate tool error.
+    console.error('✖ verify-no-control-bytes: not inside a git work tree');
+    process.exit(1);
+  }
+}
+
+/**
+ * Get file list in default mode via `git ls-files -sz`.
+ * Returns array of { path, mode } objects.
+ * D-CB5a: skips git modes 120000 (symlink) and 160000 (gitlink).
+ *
+ * `git ls-files -sz` output format (each entry NUL-terminated):
+ *   <mode> <sha> <stage>\t<path>\0...
+ * The TAB separates the staging info from the file path within ONE NUL record.
+ */
+function getTrackedFiles(cwd) {
+  const r = gitExec(['ls-files', '-sz'], cwd);
+  if (r.status !== 0) {
+    console.error('✖ verify-no-control-bytes: git ls-files failed');
+    process.exit(2);
+  }
+  // Each NUL-terminated entry is "<mode> <sha> <stage>\t<path>"
+  const entries = r.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
+  const files = [];
+  for (const entry of entries) {
+    const tabIdx = entry.indexOf('\t');
+    if (tabIdx === -1) continue; // Malformed entry — skip
+    const meta = entry.slice(0, tabIdx);
+    const path = entry.slice(tabIdx + 1);
+    // meta format: "<mode> <sha> <stage>"
+    const mode = parseInt(meta.split(' ')[0], 8);
+    if (mode === 0o120000 || mode === 0o160000) {
+      files.push({ path, mode, skip: true });
+    } else {
+      files.push({ path, mode, skip: false });
+    }
+  }
+  return files;
+}
+
+/**
+ * Get staged file list for --staged mode.
+ * Uses `git diff --cached --raw -z --diff-filter=ACMRT` to obtain both paths
+ * and git mode information so that gitlinks (160000) and symlinks (120000) can
+ * be skipped consistently with full-tree mode's AC-20 behavior.
+ * D-CB8: content is fetched later in batch via readAllIndexBlobs().
+ *
+ * D-CB5a: mode-aware skip for staged mode. Unlike `git diff --cached
+ * --name-only`, the `--raw` format carries the new-file mode (octal) for each
+ * staged entry. Entries with new-mode 120000 (symlink) or 160000 (gitlink) are
+ * marked skip:true — identical to full-tree mode's AC-20 treatment. This
+ * resolves the pre-fix divergence where gitlinks reaching readAllIndexBlobs()
+ * would trigger a misleading "staged path not in index" error because
+ * `git cat-file --batch` returns 'missing' for a commit-typed index entry.
+ *
+ * D-CB5b: include T (type-change) in the diff-filter so a tracked symlink
+ * (120000) replaced by a regular file (100644) containing a hazard codepoint
+ * is not silently excluded. The raw format carries the new mode, so a T-change
+ * landing on mode 100644 is scanned; one landing on 120000 or 160000 is
+ * skipped. A T-change landing on 160000 would previously have caused a
+ * misleading error — it is now skipped cleanly.
+ *
+ * Raw diff format (git diff --cached --raw -z), per entry:
+ *   :<old-mode> <new-mode> <old-sha> <new-sha> <status>\0<path>\0
+ * Rename/copy (status starts with R or C):
+ *   :<old-mode> <new-mode> <old-sha> <new-sha> Rscore\0<old-path>\0<new-path>\0
+ */
+function getStagedFiles(cwd) {
+  const r = gitExec(['diff', '--cached', '--raw', '-z', '--diff-filter=ACMRT'], cwd);
+  if (r.status !== 0) {
+    // D-CB5: fail closed — a non-zero status is a real tool failure (corrupt
+    // index, unreadable object). Treating it as "no staged files" would let the
+    // pre-commit hook report success on a scan that never happened.
+    console.error(
+      `✖ verify-no-control-bytes: git diff --cached failed (status ${r.status}): ` +
+      `${r.stderr.toString('utf8').trim()}`,
+    );
+    process.exit(2);
+  }
+
+  const parts = r.stdout.toString('utf8').split('\0');
+  const files = [];
+  let i = 0;
+  while (i < parts.length) {
+    const header = parts[i];
+    // Raw diff headers start with ':'. Skip empty parts and non-header tokens.
+    if (!header || !header.startsWith(':')) { i++; continue; }
+    // `:old-mode new-mode old-sha new-sha status`
+    const fields = header.slice(1).split(' ');
+    const newMode = parseInt(fields[1], 8); // new-mode is octal (e.g. "100644")
+    const newSha = fields[3] || '';          // new blob SHA in index (used by readAllIndexBlobs)
+    const status = fields[4] || '';
+    i++;
+    // Rename (R) and copy (C) entries have two paths: old-path then new-path.
+    // Advance past old-path and use new-path (the content we care about).
+    if (status.startsWith('R') || status.startsWith('C')) {
+      i++; // skip old-path
+    }
+    const path = parts[i] || '';
+    i++;
+    if (!path) continue;
+    // PF-024 defense-in-depth: reject paths that look like git revision syntax.
+    // With the SHA-based readAllIndexBlobs approach below, a path like "0:foo"
+    // is looked up by its blob SHA and is safe. This check is a secondary guard
+    // to fail closed if any future code path re-introduces :<path> addressing.
+    if (/^[0-3]:/.test(path)) {
+      console.error(
+        `✖ verify-no-control-bytes: staged path matches git revision syntax ` +
+        `and cannot be scanned safely: "${path}" (PF-024)`,
+      );
+      process.exit(1);
+    }
+    // AC-20: skip symlinks (120000) and gitlinks (160000) — identical to
+    // full-tree mode. A gitlink's cat-file lookup returns 'missing' (commit
+    // object, not a blob) and would otherwise cause a misleading "staged path
+    // not in index" error. Symlink blobs contain the target path; POSIX permits
+    // any byte except NUL and '/' in symlink targets, so control bytes are
+    // theoretically possible and scanning them could produce false-positive gate
+    // failures. Skipping keeps the gate focused on source-file content (avoids PF-015).
+    const skip = newMode === 0o120000 || newMode === 0o160000;
+    files.push({ path, mode: newMode, sha: newSha, skip, staged: true });
+  }
+  return files;
+}
+
+/**
+ * Read all staged blobs in one `git cat-file --batch` subprocess.
+ * D-CB8: collapses N per-file spawns into one, never reads the working tree.
+ *
+ * `git cat-file --batch` output for each valid blob:
+ *   <sha> blob <size>\n
+ *   <content — exactly <size> bytes>
+ *   \n   ← one-byte LF terminator after content
+ *
+ * PF-024 FIX: blobs are addressed by SHA (captured from `git diff --cached
+ * --raw` field 3), NOT by `:<path>` revision syntax. A path like "0:foo.mds"
+ * would form `:0:foo.mds` which git interprets as stage-0 revision syntax for
+ * "foo.mds", silently returning a different blob. SHA-based lookup is
+ * unambiguous and immune to this class of path-confusion attack.
+ *
+ * @param {{ path: string, sha: string }[]} entries — staged entries with blob SHAs
+ * @param {string}   cwd
+ * @returns {Map<string, Buffer>}
+ */
+function readAllIndexBlobs(entries, cwd) {
+  if (entries.length === 0) return new Map();
+
+  // Input: "<sha>\0" for every staged blob — SHA-based, never :<path> syntax.
+  // -z flag makes both input and output NUL-delimited (git cat-file --batch -z).
+  const stdin = Buffer.from(entries.map(e => `${e.sha}\0`).join(''), 'utf8');
+  // Hard bound: mirrors gitExec's contract. An index lock, network-FS hang, or
+  // stuck git subprocess in the pre-commit hook must not block indefinitely.
+  // ETIMEDOUT is indeterminate → exit 2, never 0.
+  const r = spawnSync('git', ['cat-file', '--batch', '-z'], {
+    cwd,
+    input: stdin,
+    encoding: 'buffer',
+    maxBuffer: 256 * 1024 * 1024,
+    timeout: 30_000,
+  });
+  if (r.error) {
+    if (r.error.code === 'ETIMEDOUT') {
+      console.error('✖ verify-no-control-bytes: git cat-file --batch timed out after 30 s — indeterminate, not clean');
+    } else {
+      console.error(`✖ verify-no-control-bytes: git cat-file --batch: ${r.error.message}`);
+    }
+    process.exit(2);
+  }
+  if (r.status !== 0) {
+    console.error(
+      `✖ verify-no-control-bytes: git cat-file --batch exited ${r.status}: ` +
+      `${r.stderr.toString('utf8').trim()}`,
+    );
+    process.exit(2);
+  }
+
+  const out = r.stdout;
+  const results = new Map();
+  let pos = 0;
+
+  for (const { path } of entries) {
+    if (pos >= out.length) {
+      console.error(`✖ verify-no-control-bytes: unexpected end of cat-file output for ${path}`);
+      process.exit(2);
+    }
+    // Find header line (terminated by LF)
+    let nlPos = pos;
+    while (nlPos < out.length && out[nlPos] !== 0x0a) nlPos++;
+    if (nlPos >= out.length) {
+      console.error(`✖ verify-no-control-bytes: malformed cat-file header for ${path}`);
+      process.exit(2);
+    }
+    const header = out.slice(pos, nlPos).toString('utf8');
+    pos = nlPos + 1; // advance past header LF
+
+    // Check for "missing" response (no content follows)
+    if (header.endsWith(' missing')) {
+      console.error(`✖ verify-no-control-bytes: staged path not in index: ${path}`);
+      process.exit(2);
+    }
+    // Parse "<sha> blob <size>"
+    const hparts = header.split(' ');
+    if (hparts.length !== 3 || hparts[1] !== 'blob') {
+      console.error(
+        `✖ verify-no-control-bytes: unexpected cat-file response for ${path}: ${header}`,
+      );
+      process.exit(2);
+    }
+    const size = parseInt(hparts[2], 10);
+    if (Number.isNaN(size) || size < 0) {
+      console.error(`✖ verify-no-control-bytes: invalid blob size for ${path}: ${header}`);
+      process.exit(2);
+    }
+    // complexity-07: assert bounds before slicing. Buffer.slice clamps silently;
+    // a truncated cat-file response would scan a short-but-valid blob and pass —
+    // a fail-open path on a merge gate. Fail closed instead (exit 2 = indeterminate).
+    if (pos + size > out.length) {
+      console.error(
+        `✖ verify-no-control-bytes: truncated cat-file output for "${path}": ` +
+        `declared ${size} bytes at offset ${pos} but only ${out.length - pos} bytes remain`,
+      );
+      process.exit(2);
+    }
+    results.set(path, out.slice(pos, pos + size));
+    pos += size + 1; // advance past content + terminator LF
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Scanner core
+// ---------------------------------------------------------------------------
+
+/**
+ * Scan a single file buffer for hazardous codepoints.
+ *
+ * The UTF-8 decode and hazard check are fused into one inline pass — no
+ * intermediate {cp, byteOffset} array is allocated. Only hit records are
+ * retained. This eliminates the ~53x heap amplification of the former
+ * decodeUtf8() materialisation (AC-30).
+ *
+ * nextCp look-ahead: isHazardous() uses nextCp only to check `nextCp !== 0x0A`
+ * (CRLF exception for CR). LF is ASCII, so `buf[nextStart] === 0x0A` iff the
+ * next codepoint is LF — passing the raw lead byte is correct here.
+ *
+ * @param {Buffer} buf    — raw file bytes
+ * @param {string} relPath — repo-relative path (for error messages)
+ * @param {Set<number>} allowedCps — codepoints explicitly allowlisted for this file
+ * @returns {{ codepoint: number, byteOffset: number, allowed?: boolean }[]}
+ *   Every hazard occurrence, including allowlisted ones. Allowlisted hits carry
+ *   `allowed: true` so the caller can record the entry as exercised — dropping
+ *   them here would make every HAZARD_ALLOWLIST entry look stale (D-CB6).
+ */
+export function scanBuffer(buf, relPath, allowedCps) {
+  // Check for NUL (binary file indicator).
+  // D-CB6b: BINARY_ALLOWLIST entries permit NUL bytes — they do NOT grant a
+  // whole-file opt-out from all other hazard classes (bidi, C1, BOM, etc.).
+  // An early return here would silently disable all 21 hazard classes for the
+  // entire file — semantics the D-CB6 header never documents and that would
+  // arm silently on the first legitimate BINARY_ALLOWLIST entry added.
+  // Fix: treat 0x00 as an allowlisted codepoint and let the decode loop
+  // continue so all other hazard classes still apply.
+  if (buf.includes(0x00)) {
+    const inBinaryAllowlist = BINARY_ALLOWLIST.some(e => e.path === relPath);
+    if (!inBinaryAllowlist) {
+      return [{ codepoint: 0x00, byteOffset: buf.indexOf(0x00), binaryError: true }];
+    }
+    // NUL is permitted for this file. Add 0x00 to the effective allowedCps so
+    // NUL hits in the decode loop are recorded as `allowed: true` (not errors),
+    // while the scan continues to check all other hazard classes.
+    // Do NOT return early — other hazard classes still apply.
+    allowedCps = new Set([...allowedCps, 0x00]);
+  }
+
+  // Inline UTF-8 decode + hazard scan (no intermediate codepoint array).
+  const hits = [];
+  let i = 0;
+  while (i < buf.length) {
+    const b0 = buf[i];
+    let cp, len;
+
+    if (b0 <= 0x7f) {
+      cp = b0;
+      len = 1;
+    } else if ((b0 & 0xe0) === 0xc0) {
+      if (i + 1 >= buf.length || (buf[i + 1] & 0xc0) !== 0x80) {
+        return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }];
+      }
+      cp = ((b0 & 0x1f) << 6) | (buf[i + 1] & 0x3f);
+      len = 2;
+    } else if ((b0 & 0xf0) === 0xe0) {
+      if (i + 2 >= buf.length || (buf[i + 1] & 0xc0) !== 0x80 || (buf[i + 2] & 0xc0) !== 0x80) {
+        return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }];
+      }
+      cp = ((b0 & 0x0f) << 12) | ((buf[i + 1] & 0x3f) << 6) | (buf[i + 2] & 0x3f);
+      len = 3;
+    } else if ((b0 & 0xf8) === 0xf0) {
+      if (i + 3 >= buf.length ||
+          (buf[i + 1] & 0xc0) !== 0x80 ||
+          (buf[i + 2] & 0xc0) !== 0x80 ||
+          (buf[i + 3] & 0xc0) !== 0x80) {
+        return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }];
+      }
+      cp = ((b0 & 0x07) << 18) |
+           ((buf[i + 1] & 0x3f) << 12) |
+           ((buf[i + 2] & 0x3f) << 6) |
+           (buf[i + 3] & 0x3f);
+      len = 4;
+    } else {
+      return [{ codepoint: -1, byteOffset: i, invalidUtf8: true }]; // Invalid lead byte
+    }
+
+    // Peek first byte of next sequence for CRLF look-ahead (see JSDoc above).
+    const nextStart = i + len;
+    const nextCp = nextStart < buf.length ? buf[nextStart] : null;
+    if (isHazardous(cp, nextCp)) {
+      hits.push({ codepoint: cp, byteOffset: i, allowed: allowedCps.has(cp) });
+    }
+    i += len;
+  }
+  return hits;
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+function main() {
+  const args = process.argv.slice(2);
+  const isStaged = args.includes('--staged');
+  const explicitPaths = args.filter(a => a !== '--staged');
+
+  const cwd = process.cwd();
+
+  // Full-tree mode is the only mode in which `fileEntries` is the COMPLETE
+  // tracked set. --staged and explicit-path modes scan a subset, which changes
+  // what the allowlist staleness check below can legitimately conclude.
+  const isFullTree = explicitPaths.length === 0 && !isStaged;
+
+  // Verify git is accessible and we are in a repo (D-CB5)
+  assertGitRepo(cwd);
+
+  // ---- Build file list ----
+  let fileEntries;
+  let skippedCount = 0;
+  let repoRoot = null; // set in full-tree mode; included in passStats for self-description
+
+  if (explicitPaths.length > 0) {
+    // Explicit path mode (used by tests with temp repos)
+    fileEntries = explicitPaths.map(p => ({
+      path: p,
+      mode: 0o100644,
+      skip: false,
+      staged: false,
+      absolutePath: resolve(cwd, p),
+    }));
+  } else if (isStaged) {
+    // security-12: git cat-file --batch -z (used by readAllIndexBlobs) requires
+    // git >= 2.42. Check here — before any staged-mode git I/O — so an operator
+    // on an older git sees a version diagnostic rather than a bare "exited 129".
+    // Fail-closed exit 2 (indeterminate) is preserved; this is diagnosability only.
+    const ver = gitVersion();
+    if (!ver || ver.major < MIN_GIT_MAJOR || (ver.major === MIN_GIT_MAJOR && ver.minor < MIN_GIT_MINOR)) {
+      const found = ver ? `${ver.major}.${ver.minor}` : 'unknown';
+      console.error(
+        `✖ verify-no-control-bytes: git >= ${MIN_GIT_MAJOR}.${MIN_GIT_MINOR} required for ` +
+        `--staged mode (git cat-file --batch -z); found ${found}`,
+      );
+      process.exit(2);
+    }
+    // D-CB8: staged mode — read from git index.
+    // getStagedFiles() now provides mode info; skip gitlinks and symlinks
+    // exactly as full-tree mode does (AC-20, D-CB5a).
+    const all = getStagedFiles(cwd);
+    skippedCount = all.filter(e => e.skip).length;
+    fileEntries = all.filter(e => !e.skip).map(e => ({ ...e, absolutePath: null }));
+  } else {
+    // Default: full tracked tree — must run from the repository root.
+    // security-02: git ls-files -sz is scoped to cwd; running from a
+    // subdirectory silently scans only that portion of the tracked tree and
+    // exits 0 with the same unqualified pass line as a full-tree scan.
+    // An engineer running from crates/ gets a clean result for a tree never
+    // fully scanned (avoids PF-016). Fix: require cwd == repo root.
+    const rootResult = gitExec(['rev-parse', '--show-toplevel'], cwd);
+    if (rootResult.status !== 0) {
+      console.error('✖ verify-no-control-bytes: git rev-parse --show-toplevel failed');
+      process.exit(2);
+    }
+    repoRoot = rootResult.stdout.toString('utf8').trim();
+    // Use realpathSync to handle symlinks (e.g. macOS /private/tmp vs /tmp).
+    let rootMismatch;
+    try {
+      rootMismatch = realpathSync(cwd) !== realpathSync(repoRoot);
+    } catch {
+      rootMismatch = resolve(cwd) !== resolve(repoRoot);
+    }
+    if (rootMismatch) {
+      console.error(
+        `✖ verify-no-control-bytes: full-tree mode must be run from the repository root.\n` +
+        `  Current directory: ${cwd}\n` +
+        `  Repository root:   ${repoRoot}\n` +
+        `  Re-run from: ${repoRoot}`,
+      );
+      process.exit(1);
+    }
+    const all = getTrackedFiles(cwd);
+    skippedCount = all.filter(e => e.skip).length;
+    fileEntries = all
+      .filter(e => !e.skip)
+      .map(e => ({ ...e, absolutePath: resolve(cwd, e.path) }));
+  }
+
+  // ---- D-CB5: Non-vacuity guard (AC-6) ----
+  // Full-tree mode: zero tracked files means path discovery broke — fail closed.
+  // --staged mode: an empty ACMRT-filtered set is a LEGITIMATE state:
+  //   • deletion-only commit (git rm): ACMRT excludes deletions; files ARE staged.
+  //   • amend with no content changes: index equals HEAD; diff is empty.
+  // In both cases exit 0 with an explicit message. The full-tree scan is the
+  // authoritative non-vacuity gate; the hook must not block valid commits.
+  if (fileEntries.length === 0) {
+    if (!isStaged) {
+      console.error('✖ verify-no-control-bytes: zero files scanned (D-CB5: empty scan is not a pass)');
+      console.error('  If this is a new repo with no commits, run `git add` first.');
+      process.exit(1);
+    }
+    // --staged: query actual deletions via --diff-filter=D rather than
+    // inferring from the unfiltered diff.  Using the unfiltered set is wrong
+    // when a T (type-change) is the only staged path: ACMRT already captures
+    // T-type content-bearing blobs, so if we arrive here the staged set truly
+    // contains only deletions (D) or nothing at all.
+    const rDel = gitExec(['diff', '--cached', '--name-only', '-z', '--diff-filter=D'], cwd);
+    if (rDel.status !== 0) {
+      console.error(
+        `✖ verify-no-control-bytes: git diff --cached (deletions) failed: ` +
+        `${rDel.stderr.toString('utf8').trim()}`,
+      );
+      process.exit(2);
+    }
+    const deletionPaths = rDel.stdout.toString('utf8').split('\0').filter(s => s.length > 0);
+    if (deletionPaths.length > 0) {
+      // Staged changes exist but are all deletions — nothing for the content scanner to do.
+      console.log(
+        `✓ source-hygiene gate: 0 content-bearing staged paths` +
+        ` (${deletionPaths.length} deletion(s)) — nothing to scan`,
+      );
+    } else {
+      // Index equals HEAD (amend --no-edit, reword, --allow-empty, etc.).
+      console.log('✓ source-hygiene gate: no staged content — nothing to scan');
+    }
+    process.exit(0);
+  }
+
+  // ---- Validate allowlists upfront (D-CB6) ----
+  const errors = [];
+
+  // Build allowlist lookup: path -> Set<codepoint>
+  const hazardAllowMap = new Map(); // relPath -> Set<cp>
+  for (const entry of HAZARD_ALLOWLIST) {
+    if (!hazardAllowMap.has(entry.path)) hazardAllowMap.set(entry.path, new Set());
+    for (const cp of entry.codepoints) {
+      hazardAllowMap.get(entry.path).add(cp);
+    }
+  }
+
+  // ---- In --staged mode, pre-fetch all blobs in one subprocess (D-CB8) ----
+  // readAllIndexBlobs() collapses N per-file `git cat-file blob` spawns into a
+  // single `git cat-file --batch` call (~11 ms/file saved for large staged sets).
+  // PF-024 fix: pass {path, sha} entries so readAllIndexBlobs uses SHA-based
+  // lookup rather than :<path> revision syntax (which is unsafe for paths like "0:foo").
+  const blobMap = isStaged
+    ? readAllIndexBlobs(fileEntries.map(e => ({ path: e.path, sha: e.sha })), cwd)
+    : null;
+
+  // ---- Scan each file ----
+  let totalBytes = 0;
+  let scannedFiles = 0;
+  const exercisedAllowlist = new Set(); // tracks which allowlist entries are hit
+  // AC-30: hexCtx is pre-computed so the file buffer is not retained beyond the
+  // scan of a single file. { path, codepoint, byteOffset, hexCtx }
+  const hazardHits = [];
+  // reliability-01: track suppressed hits so truncation is visible in output.
+  let totalHitsSuppressed = 0;
+
+  for (const entry of fileEntries) {
+    let buf;
+    try {
+      if (isStaged) {
+        buf = blobMap.get(entry.path);
+        if (buf === undefined) {
+          errors.push(`Cannot read staged blob for ${entry.path}: not in batch output`);
+          continue;
+        }
+      } else {
+        buf = readFileSync(entry.absolutePath || resolve(cwd, entry.path));
+      }
+    } catch (err) {
+      errors.push(`Cannot read ${entry.path}: ${err.message}`);
+      continue;
+    }
+
+    totalBytes += buf.length;
+    scannedFiles++;
+
+    const allowedCps = hazardAllowMap.get(entry.path) ?? new Set();
+    const hits = scanBuffer(buf, entry.path, allowedCps);
+    // reliability-01: per-file cap resets for each file.
+    let hitsThisFile = 0;
+
+    for (const hit of hits) {
+      if (hit.invalidUtf8) {
+        errors.push(`${entry.path}: invalid UTF-8 content (not a text file?)`);
+      } else if (hit.binaryError) {
+        errors.push(`${entry.path}: contains NUL bytes — add to BINARY_ALLOWLIST with a reason`);
+      } else if (hit.allowed) {
+        // D-CB6: the allowlist entry is genuinely exercised — record it so the
+        // stale-entry check below does not flag it.
+        exercisedAllowlist.add(`${entry.path}:${hit.codepoint}`);
+      } else {
+        // reliability-01: cap output to prevent DoS on hazard-dense files.
+        // One retained hit is already sufficient to exit 1, so truncating
+        // output cannot weaken the gate. The pre-commit hook stalls for seconds
+        // to minutes and CI generates hundreds of MB of log when uncapped.
+        if (hitsThisFile < MAX_HITS_PER_FILE && hazardHits.length < MAX_HITS_TOTAL) {
+          // AC-30: compute hex context now so buf is not retained after this iteration.
+          hazardHits.push({
+            path: entry.path,
+            codepoint: hit.codepoint,
+            byteOffset: hit.byteOffset,
+            hexCtx: hexContext(buf, hit.byteOffset),
+          });
+          hitsThisFile++;
+        } else {
+          totalHitsSuppressed++;
+        }
+      }
+    }
+  }
+
+  // ---- Stale allowlist check (D-CB6) ----
+  //
+  // D-CB6a: FULL-TREE MODE ONLY. Staleness is a claim about the whole tracked
+  // tree ("this entry no longer corresponds to anything"), and only full-tree
+  // mode holds the evidence for it. In --staged and explicit-path modes
+  // `fileEntries` is a SUBSET, so every allowlist entry outside that subset
+  // would be reported as "no longer tracked" — a factually false message that
+  // fails every commit not touching the allowlisted file. That turns the
+  // pre-commit hook into a wall the moment a first legitimate entry is added,
+  // and trains contributors toward `--no-verify`, which disables the gate for
+  // ALL commits — the same reasoning that drives the AC-6 --staged carve-out
+  // above. The full-tree CI scan is the authoritative allowlist validator, and
+  // it runs on every pull_request and on every tag push.
+  //
+  // Hazard SUPPRESSION is unaffected and still applies in every mode:
+  // hazardAllowMap is keyed by path, so an allowlisted file staged with its
+  // declared codepoints still passes. Only the staleness verdict is deferred.
+  if (isFullTree) {
+    for (const entry of BINARY_ALLOWLIST) {
+      const exists = fileEntries.some(e => e.path === entry.path);
+      if (!exists) {
+        errors.push(`BINARY_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+      }
+    }
+    for (const entry of HAZARD_ALLOWLIST) {
+      const exists = fileEntries.some(e => e.path === entry.path);
+      if (!exists) {
+        errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" — file is no longer tracked`);
+      } else {
+        // Verify the declared codepoints actually occur in the file
+        for (const cp of entry.codepoints) {
+          const key = `${entry.path}:${cp}`;
+          if (!exercisedAllowlist.has(key)) {
+            errors.push(`HAZARD_ALLOWLIST: stale entry "${entry.path}" cp U+${cp.toString(16).toUpperCase().padStart(4, '0')} — codepoint not found in file`);
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Report ----
+  // Include scanned root in full-tree mode so the pass line is self-describing
+  // (security-02: an unqualified count is indistinguishable from a partial scan).
+  const passStats = `Scanned ${scannedFiles} file(s), ${totalBytes} byte(s)` +
+    (repoRoot ? ` from ${repoRoot}` : '') +
+    (skippedCount > 0 ? `, ${skippedCount} symlink/gitlink skipped` : '');
+
+  // AC-17: name every allowlist entry that was actually exercised by this run.
+  for (const entry of HAZARD_ALLOWLIST) {
+    const exercisedCps = entry.codepoints.filter(cp => exercisedAllowlist.has(`${entry.path}:${cp}`));
+    if (exercisedCps.length > 0) {
+      const cpList = exercisedCps
+        .map(cp => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`)
+        .join(', ');
+      console.log(`  allowlist exercised: ${entry.path} [${cpList}] (reason: ${entry.reason})`);
+    }
+  }
+
+  if (hazardHits.length > 0 || errors.length > 0) {
+    for (const e of errors) {
+      console.error(`✖ ${e}`);
+    }
+    for (const hit of hazardHits) {
+      const cpHex = `U+${hit.codepoint.toString(16).toUpperCase().padStart(4, '0')}`;
+      console.error(`✖ ${hit.path}: hazardous codepoint ${cpHex} at byte offset ${hit.byteOffset}`);
+      console.error(`  context: ${hit.hexCtx}`);
+    }
+    // reliability-01: emit suppressed-count notice so truncation is visible rather
+    // than silent. The gate still fails closed — one hit is sufficient for exit 1.
+    if (totalHitsSuppressed > 0) {
+      console.error(
+        `  (${totalHitsSuppressed} additional hit(s) suppressed — ` +
+        `output capped at ${MAX_HITS_PER_FILE}/file, ${MAX_HITS_TOTAL} total; exit code is unchanged)`,
+      );
+    }
+    console.error(`✖ source-hygiene gate FAILED — ${passStats}`);
+    process.exit(1);
+  }
+
+  console.log(`✓ source-hygiene gate: ${passStats}`);
+  process.exit(0);
+}
+
+// Run only when executed directly (not imported by tests). See isMainModule.
+if (isMainModule(import.meta.url)) {
+  main();
+}

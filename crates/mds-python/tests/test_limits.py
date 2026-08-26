@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 MAX = 10 * 1024 * 1024  # MAX_SOURCE_SIZE (10 MiB)
 

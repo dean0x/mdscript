@@ -1,0 +1,20 @@
+{
+  "required_status_checks": {
+    "contexts": [
+      "Rust — fmt, clippy, test",
+      "MSRV (Rust 1.88)",
+      "WASM — build & test",
+      "JS packages — build & test (ubuntu-latest)",
+      "JS packages — build & test (macos-latest)",
+      "JS packages — build & test (windows-latest)"
+    ],
+    "checks": [
+      {"context": "Rust — fmt, clippy, test", "app_id": 15368},
+      {"context": "MSRV (Rust 1.88)", "app_id": 15368},
+      {"context": "WASM — build & test", "app_id": 15368},
+      {"context": "JS packages — build & test (ubuntu-latest)", "app_id": 15368},
+      {"context": "JS packages — build & test (macos-latest)", "app_id": 15368},
+      {"context": "JS packages — build & test (windows-latest)", "app_id": 15368}
+    ]
+  }
+}

@@ -80,7 +80,7 @@ mds build [FILE|DIR] [OPTIONS]  Compile an MDS template or directory to Markdown
 mds watch [FILE|DIR] [OPTIONS]  Watch and auto-recompile on save
 mds check [FILE|DIR] [OPTIONS]  Validate without rendering
 mds fmt [FILE|DIR] [OPTIONS]    Reformat MDS file(s) in place (opinionated, safety-gated)
-mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (9 rules; --fix, --format json)
+mds lint [FILE|DIR] [OPTIONS]   Static-analysis lint (10 rules; --fix, --format json)
 mds init [FILENAME]             Create a starter MDS file
 
 Global options:
@@ -128,7 +128,7 @@ Exit codes:
   3   Resource limit exceeded
 ```
 
-**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary is printed and the exit code is non-zero if any file fails. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) still exits 0 with a "No .mds files found" message. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
+**Directory mode** (`mds build <dir>` / `mds check <dir>`): every non-partial `.mds` file under the directory is compiled, with two automatic exclusions: directories whose name starts with `.` (e.g. `.git`, `.github`, `.claude`, `.cursor`) and `node_modules` are skipped during traversal. `_`-prefixed files are partials — tracked as dependencies but never emitted to their own output. Output mirrors the source subtree (e.g. `src/a/b/foo.mds` → `dist/a/b/foo.md`). Symlinks are rejected. Errors are per-file and do not abort the run; a summary (`N built, N failed`; `N passed, N failed` for `check`) is printed on a successful run or when any file fails; the exit code is non-zero if any file fails. Under `--quiet`, the summary is suppressed on a fully-successful run but is always emitted when any file fails, so the non-zero exit is never unexplained. If **every** `.mds` file is under a default-excluded directory, the command exits non-zero and prints a diagnostic carrying the skip count — even under `--quiet` — because this is the silent CI green-pass failure mode for prompt-template libraries stored under `.github/prompts/`, `.claude/`, or `.cursor/rules/`. A genuinely empty directory (no `.mds` files anywhere) still exits 0 with a "No .mds files found" message. Stale output files (compiled outputs with no corresponding source) are cleaned up automatically. The output extension is intrinsic: `.md` for Markdown templates, `.json` for templates with `@message` blocks.
 
 `mds fmt <dir>` follows the same directory-mode conventions (recursive, symlinks rejected, continue-on-error, non-zero exit summary) with one deliberate difference: it formats `_`-prefixed **partials too** — formatting rewrites source, not compiled output, and a partial's source is just as much a candidate for reformatting as any other file.
 
@@ -212,7 +212,7 @@ any formatting behavior yet; frontmatter key sorting is deferred to a future ver
 
 ### Static analysis with `mds lint`
 
-A 9-rule static analyzer that catches common template authoring issues:
+A 10-rule static analyzer that catches common template authoring issues:
 
 ```bash
 mds lint template.mds           # lint a single file
@@ -220,7 +220,20 @@ mds lint .                      # lint all .mds files recursively (partials incl
 mds lint --fix template.mds     # auto-fix fixable issues in place
 mds lint --format json .        # machine-readable JSON output (stdout)
 mds lint --quiet template.mds   # suppress output; exits 1 on warnings, 2 on errors
+mds lint --quiet .              # directory lint: silent on clean/warn-only; summary prints on errors or resource limits
 ```
+
+Directory mode (`mds lint <dir>`) lints every `.mds` file recursively (partials included) and
+prints one summary line to stderr after processing all files:
+`N clean, N with warnings, N with errors, N resource-limited`.
+Under `--quiet`, the summary is suppressed when the worst outcome is warnings or clean; it is
+always printed when any file has errors or hits a resource limit, so the non-zero exit is never
+unexplained in those cases. Two exits are deliberately left unexplained under `--quiet`, because
+in both the signal is status output rather than an error: a warn-only run (`mds lint --quiet
+<dir>`) exits 1 with no diagnostics or summary on stderr, and `mds lint --fix --check --quiet
+<dir>` with pending fixes exits 1 with zero stderr bytes. One known limitation: the depth-limit
+warning for directory trees deeper than 64 levels is emitted regardless of `--quiet`. The JSON
+stdout envelope is unchanged in directory mode (no `"summary"` key added).
 
 Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 
@@ -231,12 +244,13 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 | `unused-function` | warn | `@define` function that is never called (Tier B: auto-fixed only for standalone files) |
 | `shadow-variable` | off/info | Inner-scope variable shadows an outer-scope variable (must be enabled via `mds.json`) |
 | `empty-block` | warn | `@if`/`@elseif`/`@else`/`@for`/`@define`/`@message` body is empty or whitespace-only (auto-fixable) |
+| `legacy-interpolation` | warn | Single-brace `{x}` syntax from MDS v0.x; migrates to `{{x}}` automatically (auto-fixable) |
 | `redundant-else` | warn | `@else` body is structurally identical to the `@if`/`@elseif` then-body |
 | `unreachable-branch` | **error** | Branch condition is always-true or always-false (auto-fixable) |
 | `duplicate-import` | **error** | Same file imported more than once (auto-fixable) |
 | `duplicate-export` | **error** | Same export name defined more than once (auto-fixable) |
 
-Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, output is suppressed but exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
+Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, diagnostics and status output are suppressed (the directory summary still prints when any file has errors or hits a resource limit); exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
 
 ## Bundler Integration
@@ -326,7 +340,8 @@ See [spec.md](spec.md) for the full MDS v0.4.0 language specification.
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for the local
-workflow and quality gates.
+workflow and quality gates. By participating you agree to the
+[Contributor Covenant 2.1](CODE_OF_CONDUCT.md).
 
 ## Security
 

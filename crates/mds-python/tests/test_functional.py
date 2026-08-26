@@ -6,7 +6,7 @@ import pathlib
 
 import pytest
 
-import mdscript as m
+import markdown_script as m
 
 # ── compile: markdown vs messages, vars, base_path (F1–F4) ──────────────────────
 

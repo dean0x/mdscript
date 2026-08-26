@@ -19,10 +19,13 @@ import {
   check,
   getBackend,
   isMdsError,
+  lint,
+  lintVirtual,
   _resetForTesting as browserReset,
   _initWithModuleForTesting,
 } from '../dist/browser.js';
 import { initWasmNode, _resetForTesting as wasmReset } from '../dist/backend/wasm.js';
+import { lint as nodeLint, init as nodeInit, getBackend as nodeGetBackend } from '../dist/node.js';
 
 // Mirror of MAX_INIT_RETRIES from src/backend/wasm.ts.
 // If this value drifts, U-BR11 will surface the mismatch via a test failure.
@@ -30,9 +33,11 @@ const MAX_INIT_RETRIES = 3;
 
 // Load the WASM module once at file scope using the Node.js loader.
 // All browser tests that need a live backend inject it via _initWithModuleForTesting().
+// nodeInit() is also called here to satisfy the cross-surface parity test (U-BR-PARITY).
 let sharedWasmModule;
 before(async () => {
   sharedWasmModule = await initWasmNode();
+  await nodeInit();
 });
 
 // ---------------------------------------------------------------------------
@@ -42,6 +47,34 @@ before(async () => {
 describe('browser entry — pre-init', () => {
   // Ensure we start in a clean state before each test in this block.
   before(() => browserReset());
+
+  test('U-BR20: lint throws before init() with message mentioning init() (AC-P3-15)', () => {
+    assert.throws(
+      () => lint('Hello!\n'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('init()'),
+          `expected init() in message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  test('U-BR21: lintVirtual throws before init() with message mentioning init() (AC-P3-15)', () => {
+    assert.throws(
+      () => lintVirtual({ 'a.mds': 'Hello\n' }, 'a.mds'),
+      (err) => {
+        assert.ok(err instanceof Error);
+        assert.ok(
+          err.message.includes('init()'),
+          `expected init() in message, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
 
   test('U-BR1: compile throws before init()', () => {
     assert.throws(
@@ -75,6 +108,31 @@ describe('browser entry — pre-init', () => {
     assert.equal(getBackend(), 'wasm');
   });
 
+  test('U-BR14: lint and lintVirtual are exported from browser entry (AC-P3-12)', () => {
+    assert.equal(typeof lint, 'function', 'lint must be a function');
+    assert.equal(typeof lintVirtual, 'function', 'lintVirtual must be a function');
+  });
+
+  test('U-BR15: lintFile is NOT exported from browser entry (AC-P3-13)', async () => {
+    const moduleExports = Object.keys(await import('../dist/browser.js'));
+    // ADR-009 / avoids PF-013: positive control — if the module resolved to an empty
+    // export map, all three absence assertions below would pass vacuously. Asserting
+    // that 'lint' (added by #215) IS present proves the module was loaded correctly
+    // and that the absence assertions are meaningful.
+    assert.ok(
+      moduleExports.includes('lint'),
+      `lint must be exported from browser entry (positive control); found: ${moduleExports.join(', ')}`,
+    );
+    assert.equal(
+      moduleExports.includes('lintFile'),
+      false,
+      `lintFile must not be exported from browser entry; found: ${moduleExports.join(', ')}`,
+    );
+    // Also verify compileFile and checkFile remain absent.
+    assert.equal(moduleExports.includes('compileFile'), false, 'compileFile must not be exported');
+    assert.equal(moduleExports.includes('checkFile'),   false, 'checkFile must not be exported');
+  });
+
   test('U-BR12: compileFile is NOT a property of browser module', async () => {
     // Browser entry no longer exports compileFile — it requires node:fs which is
     // not available in browser environments.
@@ -106,6 +164,171 @@ describe('browser entry — post-init', () => {
   before(() => {
     browserReset();
     _initWithModuleForTesting(sharedWasmModule);
+  });
+
+  test('U-BR16: browser lint returns a LintResult with version/files/truncated (AC-P3-12)', () => {
+    // Use a source with an unused frontmatter variable so we get at least one finding.
+    const src = '---\ngreeting: Hello\nunused_key: this key is never referenced\n---\n\n{{greeting}}, world!\n';
+    const result = lint(src);
+    assert.equal(result.version, 1, 'version must be 1');
+    assert.ok(Array.isArray(result.files), 'files must be an array');
+    assert.equal(result.truncated, false, 'truncated must be false');
+    // At least one diagnostic (unused-variable for unused_key).
+    assert.ok(result.files.length > 0, 'expected at least one file report for unused frontmatter');
+  });
+
+  test('U-BR17: browser lintVirtual returns findings keyed by entry (AC-P3-12)', () => {
+    // Use a self-contained module map so no cross-module import is needed.
+    // The entry has an unused frontmatter variable to produce at least one diagnostic.
+    const modules = {
+      'main.mds': '---\ngreeting: Hello\nunused_key: never used\n---\n{{greeting}}, world!\n',
+    };
+    const result = lintVirtual(modules, 'main.mds');
+    assert.equal(result.version, 1);
+    assert.ok(Array.isArray(result.files));
+    assert.equal(result.truncated, false);
+    // The entry key must appear in the report, and it must carry a real finding
+    // (the unused frontmatter variable). `files.length >= 0` would be a tautology —
+    // it holds for an empty array and so cannot distinguish a working lintVirtual
+    // from one that silently returns no findings.
+    const fileNames = result.files.map((f) => f.file);
+    assert.ok(
+      fileNames.includes('main.mds'),
+      `expected entry 'main.mds' in report; got: [${fileNames.join(', ')}]`,
+    );
+    const entryReport = result.files.find((f) => f.file === 'main.mds');
+    assert.ok(
+      entryReport.diagnostics.length > 0,
+      'expected at least one diagnostic for the unused frontmatter variable',
+    );
+    assert.ok(
+      entryReport.diagnostics.some((d) => d.rule === 'unused-variable'),
+      `expected an unused-variable diagnostic; got rules: [${entryReport.diagnostics.map((d) => d.rule).join(', ')}]`,
+    );
+  });
+
+  test('U-BR18: browser compile/check/lint reject non-null basePath on the WASM backend (AC-P3-09, AC-P3-10)', () => {
+    // OD-1: the WASM backend has no filesystem, so a non-null basePath must be
+    // rejected loudly by the browser entry (avoids PF-004). This proves the guard
+    // in createWasmBackend is reachable through the public browser API surface
+    // (avoids PF-007: a test on the wasm-backend internals alone cannot prove the
+    // browser entry carries the guard through to consumers).
+    //
+    // AC-P3-10 negative assertions: the error message MUST NOT contain the internal
+    // WASM keys 'filename' or 'modules' — those appear only if basePath bypasses the
+    // JS guard and reaches reject_unknown_wasm_keys in the Rust layer.
+    //
+    // PF-013 positive control (at bottom of this test): call the raw WasmModule
+    // directly to confirm that 'filename'/'modules' WOULD appear in the error without
+    // the guard, making the negative assertions above meaningful rather than vacuous.
+    for (const [label, fn] of [
+      ['compile', () => compile('Hello\n', { basePath: '/dir' })],
+      ['check',   () => check('Hello\n',   { basePath: '/dir' })],
+      ['lint',    () => lint('Hello\n',    { basePath: '/dir' })],
+    ]) {
+      assert.throws(
+        fn,
+        (err) => {
+          assert.ok(isMdsError(err), `U-BR18 ${label}: expected isMdsError, got: ${err}`);
+          assert.equal(err.code, 'mds::invalid_options', `U-BR18 ${label}: wrong error code`);
+          assert.ok(
+            err.message.includes('basePath'),
+            `U-BR18 ${label}: message must name 'basePath'; got: ${err.message}`,
+          );
+          assert.ok(
+            !err.message.includes('filename'),
+            `U-BR18 ${label}: message must not contain internal key 'filename'; got: ${err.message}`,
+          );
+          assert.ok(
+            !err.message.includes('modules'),
+            `U-BR18 ${label}: message must not contain internal key 'modules'; got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    }
+    // PF-013 positive control: the raw WasmModule DOES expose 'filename'/'modules'
+    // in its error when basePath is passed, proving the JS guard above is what
+    // prevents those internal keys from leaking to callers of the public API.
+    let rawErr;
+    try { sharedWasmModule.compile('Hello\n', { basePath: '/dir' }); } catch (e) { rawErr = e; }
+    assert.ok(rawErr instanceof Error, 'U-BR18 positive control: raw WasmModule must throw for unknown basePath');
+    const rawMsg = rawErr.message ?? '';
+    assert.ok(
+      rawMsg.includes('filename') || rawMsg.includes('modules'),
+      `U-BR18 positive control: raw WASM error must contain internal keys 'filename'/'modules'; got: "${rawMsg}"`,
+    );
+  });
+
+  test('U-BR-PARITY: browser lint result equals node lint result at runtime (AC-P3-12, amendment 4, avoids PF-007)', () => {
+    // PF-007: per-surface goldens each lock in their OWN value and cannot prove
+    // cross-surface parity. Compare browser (WASM) and node surfaces at RUNTIME for
+    // the same input with deepStrictEqual — no pinned golden, no local assertion.
+    // Same fixture as U-BR16 so the result is non-trivial (unused-variable diagnostic).
+    //
+    // Guard (avoids PF-007 / PF-013): node.ts:244 falls back to WASM when the native
+    // addon is unavailable. Without this assertion, the test would silently degrade to
+    // a WASM-vs-WASM self-comparison — a vacuous pass that proves nothing about
+    // cross-backend parity. Every sibling native-dependent test hard-fails via
+    // requireNativeAddon(); this assertion is the equivalent sentinel for U-BR-PARITY.
+    assert.equal(
+      nodeGetBackend(),
+      'native',
+      'U-BR-PARITY requires the native backend on the node side; ' +
+        'without it the test compares WASM against itself (PF-007 shape). ' +
+        'Ensure @mdscript/mds-napi is built before running this suite.',
+    );
+    const src = '---\ngreeting: Hello\nunused_key: this key is never referenced\n---\n\n{{greeting}}, world!\n';
+    const browserResult = lint(src);
+    const nodeResult = nodeLint(src);
+    assert.deepStrictEqual(
+      browserResult,
+      nodeResult,
+      'browser (WASM) and node lint must return byte-identical results for the same source',
+    );
+  });
+
+  test('U-BR-WARN: browser lintVirtual with unknown rule name produces lint_warnings, not an error (plan amendment 5, avoids PF-007)', () => {
+    // Plan amendment 5: D-224-1 ruled that an unrecognised rule name is WARNED via
+    // LintResult.lint_warnings, not rejected. U-LG4 (lint.spec.mjs:625) already
+    // covers this behavior on the node/native surface. PF-007: that proof says
+    // nothing about the WASM (browser) surface — a separate browser-entry assertion
+    // is required to close the coverage gap.
+    const mods = { 'main.mds': '---\ngreeting: Hello\n---\n{{greeting}}, world!\n' };
+    const result = lintVirtual(mods, 'main.mds', { rules: { 'no-such-rule-xyzzy': 'warn' } });
+    assert.equal(result.version, 1, 'U-BR-WARN: version must be 1');
+    assert.ok(Array.isArray(result.lint_warnings), `U-BR-WARN: lint_warnings must be an array; got ${JSON.stringify(result.lint_warnings)}`);
+    assert.ok(
+      result.lint_warnings.length > 0,
+      `U-BR-WARN: lint_warnings must be non-empty for unknown rule name; got ${JSON.stringify(result.lint_warnings)}`,
+    );
+    const joined = result.lint_warnings.join(' ');
+    assert.ok(
+      joined.includes('no-such-rule-xyzzy'),
+      `U-BR-WARN: lint_warnings must name the unknown rule 'no-such-rule-xyzzy'; got: ${joined}`,
+    );
+  });
+
+  test('U-BR19: browser lint/lintVirtual reject unknown option keys (AC-P3-14)', () => {
+    // Proves the browser path runs assertKnownKeys.
+    assert.throws(
+      () => lint('Hello\n', { basePathh: '.' }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('"basePathh"'), `key in message: ${err.message}`);
+        return true;
+      },
+    );
+    assert.throws(
+      () => lintVirtual({ 'a.mds': '' }, 'a.mds', { ruless: {} }),
+      (err) => {
+        assert.ok(isMdsError(err), `expected isMdsError, got: ${err}`);
+        assert.equal(err.code, 'mds::invalid_options');
+        assert.ok(err.message.includes('"ruless"'), `key in message: ${err.message}`);
+        return true;
+      },
+    );
   });
 
   test('U-BR6: concurrent init() cannot double-init an already-initialized backend', () => {

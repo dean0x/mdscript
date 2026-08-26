@@ -56,7 +56,7 @@ function findMdsCli() {
 }
 
 /**
- * Return the path to a Python interpreter that can import `mdscript`, or null.
+ * Return the path to a Python interpreter that can import `markdown_script`, or null.
  *
  * Resolution order:
  *   1. MDS_PYTHON_BIN env var (set by CI to the pip-managed interpreter).
@@ -66,7 +66,7 @@ function findMdsCli() {
  * Returns null only when none of the above is found.  In CI (process.env.CI)
  * the caller must treat null as a hard failure — see PF-007.
  */
-function findPythonForMdscript() {
+function findPythonForMarkdownScript() {
   const envBin = process.env.MDS_PYTHON_BIN;
   if (envBin) {
     if (!existsSync(envBin)) throw new Error(`MDS_PYTHON_BIN=${envBin} does not exist`);
@@ -265,8 +265,8 @@ describe('source maps (U-SM)', () => {
   // ── U-SM6: valid option combinations ──────────────────────────────────
   //
   // Unknown key rejection at the binding level is tested in the napi spec
-  // (F-SM6). At the universal package level the adapter's compileOpt()
-  // filters to known keys, so TypeScript type checking is the guard.
+  // (F-SM6). At the universal package level assertKnownKeys() rejects
+  // unknown option keys, with TypeScript type checking as the primary guard.
 
   test('U-SM6: sourceMap:true, sourcesContent:false is accepted', () => {
     const result = compile('Hello!\n', { sourceMap: true, sourcesContent: false });
@@ -758,18 +758,18 @@ describe('source maps — compileFile differential (CF-SM)', () => {
       const cliSources = cliMap.sources;
 
       // -- Surface 4: Python binding compile_file -------------------------------
-      // Use the repo-local venv Python which has the mdscript module installed
+      // Use the repo-local venv Python which has the markdown_script module installed
       // by `maturin develop`, or the interpreter exported by MDS_PYTHON_BIN (CI).
       // In CI all four surfaces must run — a missing surface is a hard failure
       // (avoids PF-007: a gate that silently skips a surface reads as green).
       // Locally, a missing interpreter warns and skips the Python leg only.
-      const python = findPythonForMdscript();
+      const python = findPythonForMarkdownScript();
       let pySources = null;
       if (python == null) {
         if (process.env.CI) {
           throw new Error(
             'CF-SM2: Python surface is required in CI but no interpreter was found. ' +
-            'Set MDS_PYTHON_BIN to an interpreter that can import mdscript, or ' +
+            'Set MDS_PYTHON_BIN to an interpreter that can import markdown_script, or ' +
             'install the binding with `pip install ./crates/mds-python`. ' +
             'A missing surface silently breaks the PF-007 cross-surface parity gate.',
           );
@@ -779,18 +779,18 @@ describe('source maps — compileFile differential (CF-SM)', () => {
           '(run `maturin develop` inside .venv to enable)',
         );
       } else {
-        // Import mdscript from the Python environment directly (site-packages).
+        // Import markdown_script from the Python environment directly (site-packages).
         // Do NOT insert the source tree into sys.path: with `pip install`, the
-        // compiled extension (_mdscript.so) lands in site-packages, not in the
+        // compiled extension (_markdown_script.so) lands in site-packages, not in the
         // source crates/mds-python/python/ directory, so prepending the source
-        // path causes `from ._mdscript import` to fail (it finds __init__.py in
+        // path causes `from ._markdown_script import` to fail (it finds __init__.py in
         // the source tree but the .so is elsewhere).  Importing from site-packages
         // works for both `pip install ./crates/mds-python` (CI) and
-        // `maturin develop` (local), since both make `mdscript` importable from
+        // `maturin develop` (local), since both make `markdown_script` importable from
         // the standard path.  Pass entryPath as argv so no shell escaping is needed.
         const pyScript = [
           'import json, sys',
-          'import mdscript as m',
+          'import markdown_script as m',
           'result = m.compile_file(sys.argv[1], source_map=True)',
           'print(json.dumps(result.source_map["sources"]))',
         ].join('\n');

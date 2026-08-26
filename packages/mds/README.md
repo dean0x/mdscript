@@ -35,20 +35,22 @@ console.log(getBackend()); // 'native' | 'wasm'
 
 ## Browser usage
 
-The browser entry requires an explicit `init()` call before any compile/check
+The browser entry requires an explicit `init()` call before any compile/check/lint
 operations. `init()` is idempotent and safe to call multiple times.
 
 ```ts
-import { init, compile, check, isMdsError } from '@mdscript/mds';
+import { init, compile, check, lint, lintVirtual, isMdsError } from '@mdscript/mds';
 
 await init();
 // or with a custom WASM URL:
 await init({ wasmUrl: '/assets/mds_bg.wasm' });
 
 const result = compile('# {{title}}', { vars: { title: 'Hello' } });
+const lintResult = lint('# {{title}}', { vars: { title: 'Hello' } });
+const virtualResult = lintVirtual({ 'entry.mds': '# {{title}}' }, 'entry.mds');
 ```
 
-> `compileFile` and `checkFile` are not available in browser environments.
+> `compileFile`, `checkFile`, and `lintFile` are not available in browser environments.
 
 ## Backend selection (`MDS_BACKEND`)
 
@@ -102,35 +104,83 @@ try {
 
 ### Options
 
+#### Option matrix
+
+Each cell names the accepted option type. `basePath` is a string-surface option only;
+file-path methods derive the base directory from the file argument.
+
+|           | String source                | File path          |
+|-----------|------------------------------|--------------------|
+| `compile` | `CompileOptions`             | `FileOptions`      |
+| `check`   | `CheckOptions`               | `CheckFileOptions` |
+| `lint`    | `LintOptions`                | `LintFileOptions`  |
+
+#### Option types
+
 ```ts
-// CompileOptions — accepted by compile() and compileFile()
-interface CompileOptions {
+// CheckOptions — accepted by check() (string source)
+// basePath: defaults to process cwd when omitted. Caution: omitting it resolves
+// imports against cwd, which may be the wrong directory. Provide an explicit
+// path when the source contains @import or @extends.
+// WASM backend: basePath throws mds::invalid_options (no filesystem access);
+// set MDS_BACKEND=native to use the native backend with import resolution.
+// {basePath: undefined} is treated as absent on both backends.
+// {basePath: ''} (empty string) is rejected — omit the key rather than passing an empty string.
+interface CheckOptions {
   vars?: Record<string, unknown>;
+  basePath?: string;
+}
+
+// CompileOptions — accepted by compile() (string source)
+// Extends CheckOptions: inherits vars and basePath.
+// basePath behaves the same as for CheckOptions (see above).
+interface CompileOptions extends CheckOptions {
   sourceMap?: boolean;      // generate Source Map v3; result gains a `sourceMap` field
   sourcesContent?: boolean; // embed source text in map (requires sourceMap: true)
                             // ⚠ Privacy: embeds the full template source
 }
 
-// CheckOptions — accepted by check() and checkFile() only
-// Source-map options are NOT accepted; passing them throws mds::invalid_options
-interface CheckOptions {
+// FileOptions — accepted by compileFile()
+// basePath is NOT accepted: the base directory is derived from the file path.
+// basePath?: never blocks assigning a CompileOptions variable to this type (TS2322).
+interface FileOptions {
   vars?: Record<string, unknown>;
+  sourceMap?: boolean;
+  sourcesContent?: boolean;
+  basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
+}
+
+// CheckFileOptions — accepted by checkFile()
+// basePath is NOT accepted (base directory from file path).
+// basePath?: never blocks assigning a CheckOptions variable to this type (TS2322).
+// Source-map options are NOT accepted; passing them throws mds::invalid_options.
+interface CheckFileOptions {
+  vars?: Record<string, unknown>;
+  basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // LintOptions — accepted by lint() (string-source)
+// basePath: defaults to process cwd when omitted. Caution: omitting it resolves
+// imports against cwd, which may be the wrong directory. Provide an explicit
+// path when the source contains @import or @extends.
+// WASM backend: basePath throws mds::invalid_options — rejects instead of
+// silently ignoring so misconfigured callers see an actionable error.
+// Set MDS_BACKEND=native to use the native backend, or use lintVirtual with
+// pre-resolved modules.
 interface LintOptions {
   vars?: Record<string, unknown>;
   rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
-  basePath?: string; // base directory for @import resolution; required when the source
-                     // contains @import or @extends. Ignored by the WASM backend.
+  basePath?: string;
 }
 
 // LintFileOptions — accepted by lintFile() and lintVirtual()
 // basePath is NOT accepted: lintFile derives the base directory from the file path;
 // lintVirtual resolves imports against the caller-supplied module map, not the filesystem.
+// basePath?: never blocks assigning a LintOptions variable to this type (TS2322).
 interface LintFileOptions {
   vars?: Record<string, unknown>;
   rules?: Record<string, 'off' | 'info' | 'warn' | 'error'>;
+  basePath?: never; // not accepted; present to produce a compile-time error when a string-surface variable is passed
 }
 
 // InitOptions
@@ -139,19 +189,29 @@ interface InitOptions {
 }
 ```
 
-**Strict unknown-option rejection:** passing any key not listed above throws
-`Error { code: 'mds::invalid_options' }` immediately, before calling the backend.
-This applies to `compile`, `compileFile`, `check`, `checkFile`, `lint`, `lintFile`,
-and `lintVirtual`.
+**Unknown-option rejection:** passing an unrecognised key to a public method throws
+`Error { code: 'mds::invalid_options' }` before calling the backend; the error names
+the offending key(s) and lists the accepted keys. **All option-validation errors throw
+synchronously** before any I/O begins — this includes unknown-key rejection from every
+method and the `basePath`-rejection guard on `compileFile`/`checkFile`. For the
+Promise-returning file-path methods (`compileFile`, `checkFile`, `lintFile`), `.catch()`
+on the returned promise does **not** capture option-validation errors — use `try/catch`
+around the call.
 
 **Source maps:** for string-source compiles (`compile`) `sources[0]` in the generated
 map is `"input.mds"`. For stdin builds via the CLI it is `"<stdin>"`.
 
-**Lint `rules` map:** unknown rule names are silently accepted (a typo has no effect);
-unknown severity values throw `mds::invalid_options`.
+**Lint `rules` map:** unknown rule names emit a warning and lint continues — the unknown
+name has no effect but `result.lint_warnings` (a `string[]` field, absent when empty)
+is populated so callers can surface the issue. Unknown severity values throw
+`mds::invalid_options`. On the CLI surface the warning goes to stderr; in binding
+surfaces it appears in `lint_warnings`.
 
 **Lint result shape:**
 ```ts
-{ version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean }
-// LintDiagnostic: { rule, severity, message, help?, fixable, span? }
+{ version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean, lint_warnings?: string[] }
+// LintDiagnostic: { rule, severity, message, help?: string | null, fixable, fix_edits?: ... | null, span?: LintSpan | null }
+// help, span, and fix_edits are always-present keys in the JSON wire format; their value is null when absent.
 ```
+
+**`files[].file` key:** `lint()` sets this to `"input.mds"` (string-source); `lintFile()` sets it to the file's path; `lintVirtual()` sets it to the caller-supplied entry key. The CLI additionally relabels stdin input as `"<stdin>"` — this asymmetry does not apply to the binding surfaces.

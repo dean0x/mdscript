@@ -281,6 +281,27 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
     ),
     (
         "lint.rs",
+        "STDIN_DISPLAY_LABEL",
+        "`&'static str` compile-time constant defined in `output.rs` as `\"<stdin>\"`. \
+         It is the uniform stdin source-identity sentinel (AD-211-3 / issue #211); \
+         it contains only ASCII printable characters and cannot carry hostile bytes.",
+    ),
+    (
+        "fmt.rs",
+        "STDIN_DISPLAY_LABEL",
+        "Same `output.rs` constant as the `lint.rs` entry above — `mds fmt -`'s \
+         `Would reformat:` status line names the source with the shared sentinel \
+         instead of its own literal (AD-211-3).",
+    ),
+    (
+        "main.rs",
+        "STDIN_DISPLAY_LABEL",
+        "Same `output.rs` constant as the `lint.rs` entry above — `mds check -`'s \
+         `OK:` status line names the source with the shared sentinel instead of its \
+         own literal (AD-211-3).",
+    ),
+    (
+        "lint.rs",
         "applied_count",
         "`usize` tally of lint fixes actually applied, in the `Partially fixed:` line.",
     ),
@@ -324,6 +345,32 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "watch.rs",
         "elapsed",
         "`u128` elapsed milliseconds from `Instant::elapsed().as_millis()` — pure arithmetic.",
+    ),
+    // AD-216-3/5/10: four counters for the `mds lint <dir>` summary line.
+    // AD-216-10: names are file-unique (limit 2, :106-110) — none collide with
+    // existing lint.rs entries; no future variable silently inherits an exemption
+    // by reusing an already-listed name.
+    (
+        "lint.rs",
+        "clean_count",
+        "`usize` tally of files with no lint findings in the `mds lint <dir>` summary line.",
+    ),
+    (
+        "lint.rs",
+        "warn_file_count",
+        "`usize` tally of files with warning-severity findings in the `mds lint <dir>` summary line.",
+    ),
+    (
+        "lint.rs",
+        "error_file_count",
+        "`usize` tally of files with error-severity findings or analysis failures \
+         in the `mds lint <dir>` summary line.",
+    ),
+    (
+        "lint.rs",
+        "limit_file_count",
+        "`usize` tally of files that aborted with `MdsError::ResourceLimit` \
+         in the `mds lint <dir>` summary line.",
     ),
 ];
 
