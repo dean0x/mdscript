@@ -342,6 +342,7 @@ MDS supports three import styles:
 - Without alias (merge): exports enter current scope (name collision → compilation error)
 - Selective: only listed names are brought into scope
 - Circular imports → compilation error
+- Resolved import paths stay inside the project root (see §5 Project Root); a path that escapes it is a compilation error
 - Import resolution is recursive (imports can import)
 
 ---
@@ -779,6 +780,25 @@ For the base skeleton:
 | 3. Validate | Check all references, types, arity | Undefined var/function, type mismatch, wrong arg count |
 | 4. Evaluate | Execute directives (expand loops, resolve conditions, call functions) | Iterate non-array, recursion detected |
 | 5. Render | Flatten evaluated tree → final Markdown string | (none expected) |
+
+### Project Root
+
+The compiler establishes a project root once per compilation. The root is used for two purposes: enforcing import containment (a resolved path that escapes it is a compilation error) and computing relative paths in Source Map v3 `sources[]` entries (see §7.5).
+
+**Discovery.** Starting from a base directory, the compiler walks upward, examining each ancestor level for the presence of a `.git` or `.mdsroot` marker. The nearest ancestor directory that holds either marker becomes the project root.
+
+Two base directories are possible:
+
+- For a file compile, the walk starts from the directory containing the compiled file.
+- For a string compile that provides an explicit base directory (the `basePath` option in the JavaScript API; the `base_path` parameter in the Python binding), the walk starts from that base directory.
+
+**`.git` and `.mdsroot` are not ordered relative to each other.** The rule is nearest-ancestor: whichever marker appears in the closest ancestor wins. A consequence: placing a `.mdsroot` in a subdirectory that is nearer to the input than an existing `.git` narrows the containment boundary — files above that `.mdsroot` but still inside the repository are then outside the project root, and imports to them are rejected.
+
+**Marker, not configuration.** The contents of `.mdsroot` are never read. An empty file works; a directory named `.mdsroot` also works.
+
+**Depth limit.** The walk ascends at most 256 directory levels. If no marker is found within that range, the starting directory itself becomes the project root, silently.
+
+**`mds.json` discovery is a separate, independent walk** (see §7.8). It shares only the 256-level depth limit. Finding (or not finding) `mds.json` has no effect on the project root, and project-root resolution has no effect on `mds.json` discovery.
 
 ### Frontmatter Preservation
 
@@ -1237,7 +1257,7 @@ When no `FILE` argument is given to `mds build` or `mds check`, the compiler sca
 
 ### 7.8 `mds.json` Project Config
 
-Place `mds.json` in the project root (or any ancestor directory). The compiler walks up from the input file to find it.
+Place `mds.json` in the repository root or any ancestor directory of the input file. The CLI discovers it by walking upward from the input — this discovery walk is independent of the project-root resolution described in §5, and the two walks do not influence each other. Relative paths inside `mds.json` (such as `build.output_dir`) resolve against the directory that contains `mds.json`, not against the project root.
 
 ```json
 {
