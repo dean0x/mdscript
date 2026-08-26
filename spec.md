@@ -1406,9 +1406,9 @@ You have 2 items.
 
 ---
 
-## 9. Editor Integration
+## 10. Editor Integration
 
-### 9.1 File Association
+### 10.1 File Association
 
 MDS files use the `.mds` extension. To get Markdown syntax highlighting immediately, configure your editor to treat `.mds` as Markdown:
 
@@ -1451,7 +1451,7 @@ file-types = ["md", "markdown", "mds"]
 
 **JetBrains IDEs** (IntelliJ, WebStorm, PyCharm): Settings → Editor → File Types → Markdown → add `*.mds` pattern.
 
-### 9.2 Frontmatter Detection
+### 10.2 Frontmatter Detection
 
 The MDS compiler also accepts `.md` files that contain MDS directives. To explicitly mark a `.md` file as MDS, add `type: mds` to the frontmatter:
 
@@ -1469,7 +1469,7 @@ The compiler uses this detection order:
 2. `.md` extension + `type: mds` frontmatter → treated as MDS
 3. `.md` extension without `type: mds` → rejected (not compiled)
 
-### 9.3 MDS-Specific Highlighting (Roadmap)
+### 10.3 MDS-Specific Highlighting (Roadmap)
 
 File association gives standard Markdown highlighting, but `@` directives and `{{var}}` interpolation appear as plain text. Full MDS highlighting requires dedicated editor support:
 
@@ -1489,7 +1489,7 @@ A language server (Rust) providing diagnostics, completions, go-to-definition fo
 
 ---
 
-## 10. What's NOT in v0.2
+## 11. What's NOT in v0.2
 
 These are intentionally deferred to keep the language simple and the compiler focused:
 
@@ -1505,7 +1505,7 @@ These are intentionally deferred to keep the language simple and the compiler fo
 
 ---
 
-## 11. Grammar Summary
+## 12. Grammar Summary
 
 ```
 file            := frontmatter? extends? (directive | text)*
@@ -1564,7 +1564,7 @@ quoted_path     := "\"" path_chars "\""
 
 ---
 
-## 12. Status
+## 13. Status
 
 v0.4.0 - Breaking change release. **Interpolation syntax changed from `{x}` to `{{x}}`** — single `{`/`}` are now always literal text, and `\{{` is the escape for a literal `{{`; run `mds lint --fix` to auto-migrate legacy templates (the `legacy-interpolation` lint rule). `@message {{role}}:` dynamic role syntax updated to use double braces; new `fix_edits` field on `LintDiagnostic` across all binding surfaces. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Interior whitespace in block bodies and `mds fmt` output now follows the **interior-verbatim with trailing-edge normalization** contract — leading blank lines and interior blank runs are preserved verbatim; only the trailing edge normalizes to one final newline. (`@message` and `@define` bodies still edge-trim via `.trim()` — they strip leading and trailing blank lines.) The `mds fmt` blank-line collapsing rule (R3) has been removed (#150, #151). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion; using a key in both `--set` and `--set-string` is now a hard error (#152). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154).
 
