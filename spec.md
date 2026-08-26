@@ -865,6 +865,7 @@ mds build template.mds --out-dir dist      # Markdown → dist/template.md; mess
 mds build template.mds --vars vars.json    # With variable overrides from JSON file
 mds build template.mds --set name=Alice    # Set a single variable
 mds build template.mds --set name=Alice --set count=3  # Multiple variables
+mds build template.mds --source-map        # Generate a source-map sidecar (.md.map)
 echo "Hello {{name}}!" | mds build -         # Compile from stdin → stdout
 mds build src/                             # Compile every non-partial .mds in the tree (next to source)
 mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dist/a/b.md (or .json)
@@ -892,6 +893,10 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. Repeating a key emits a warning; the last value wins. |
 | `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). Repeating a key emits a warning; the last value wins. |
+| `--source-map` | Generate a source-map sidecar (`<output>.map`, e.g. `-o out.md` → `out.md.map`). Ignored for messages-mode templates (a warning is emitted and no source map is produced). Conflicts with `--no-source-map`. Also enabled globally via `build.source_map = true` in `mds.json`. |
+| `--no-source-map` | Disable source-map generation. Overrides `build.source_map = true` in `mds.json`. Conflicts with `--source-map`. |
+| `--inline` | Embed the source map as a data-URI comment in the compiled output instead of a sidecar. Requires `--source-map`. |
+| `--embed-sources` | Embed source file contents in `sourcesContent[]`. Ships full source text — use with care. Requires `--source-map`. |
 | `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
 
 **Output path resolution** (precedence order, highest first):
@@ -1276,6 +1281,8 @@ Place `mds.json` in the repository root or any ancestor directory of the input f
 | Field | Type | Description |
 |-------|------|-------------|
 | `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
+| `build.source_map` | bool | Enable source-map generation for all builds (equivalent to `--source-map`). Ignored for messages-mode templates. Default: `false`. |
+| `build.embed_sources` | bool | Embed source file contents in `sourcesContent[]` (equivalent to `--embed-sources`). Has no effect when `build.source_map` is `false`. Default: `false`. |
 | `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr and is suppressed by `--quiet`; `mds build`, `mds check`, `mds fmt`, and `mds watch` also read this file but do not emit the unknown-rule warning. On the `lint` API surfaces it is returned in `lint_warnings`. |
 
 Maximum config file size: 1 MB.
@@ -1490,7 +1497,6 @@ These are intentionally deferred to keep the language simple and the compiler fo
 - Unbounded recursion: direct recursion is rejected; indirect chains are capped at depth 128 (see §4.5)
 - Macros, async functions, streaming
 - URL-based imports (remote modules)
-- Source maps
 - Function calls in `@if` conditions (e.g. `@if length(items) == 0:`) — not supported
 - Function calls in `@for` iterables (e.g. `@for item in split(csv, ","):`) — not supported
 - Parenthesized sub-expressions in conditions (e.g. `@if (a || b) && c:`) — not supported
