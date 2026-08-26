@@ -90,3 +90,6 @@ for report in lr.files:          # list[LintFileReport]
   positions, so `source_map` is `None` and a warning is added to `.warnings`.
 - **cross-surface parity** — for the same input, the `mappings` string and
   `sources` list are byte-identical to the CLI, napi, and WASM surfaces.
+
+See also [Project root](../../README.md#project-root) for how the `.git` / `.mdsroot`
+marker governs root-relative `sources[]` paths in file compiles.

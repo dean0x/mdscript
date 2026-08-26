@@ -87,3 +87,6 @@ map self-contained (no access to the `.mds` files needed to inspect sources).
 > including any comments and internal prompt engineering — inside the map.
 > Do not distribute such maps with output you consider the templates
 > confidential to. The default (no `--embed-sources`) omits `sourcesContent`.
+
+See also [Project root](../../README.md#project-root) for how the `.git` / `.mdsroot`
+marker determines the root-relative path anchor used by binding surfaces for `sources[]`.
