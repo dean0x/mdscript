@@ -1071,17 +1071,12 @@ directly via `ModuleCache::with_fs`.
   the v0.5.0 tag (see #304 for the enumerated list with line numbers and the behavior
   each test pins).
 
-- **`mds::LintConfig::from_rules` is deprecated in favor of `LintConfig::from_rules_checked` (#224).**
-  The replacement returns both the config and an unknowns report in a single `#[must_use]`
-  call, making it structurally impossible to silently skip unknown-rule detection.
-  `from_rules` still accepts any rule name without error; unknown names have no effect.
-
-  Migration: change `LintConfig::from_rules(map)` to `LintConfig::from_rules_checked(map)`
-  and handle the `Option<UnknownRuleNames>` second return value. No removal is scheduled
-  before v1.0.0; this function will remain available throughout the v0.x series (contrast
-  `apply_fixes` above, which is scheduled for removal at v0.5.0).
-
 ### Removed
+
+- **`mds::LintConfig::from_rules` removed (#308).** This function was not present in
+  any published release: `crates/mds-core/src/lint/config.rs` did not exist at `v0.3.0`.
+  `LintConfig::from_rules_checked` (#224) is the current API for building a `LintConfig`
+  from a rule name map.
 
 - **`packages/mds/src/index.ts` removed.** This file was not listed in the package
   `exports` map (which resolves only `./dist/node.js` and `./dist/browser.js`), so no
