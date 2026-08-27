@@ -1489,7 +1489,7 @@ A language server (Rust) providing diagnostics, completions, go-to-definition fo
 
 ---
 
-## 11. What's NOT in v0.2
+## 11. Out of Scope
 
 These are intentionally deferred to keep the language simple and the compiler focused:
 
