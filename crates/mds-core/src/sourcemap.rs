@@ -1067,7 +1067,7 @@ pub(crate) fn compensate_cr(
 /// whose `out` offset (after CR compensation) is ≥ `body_clean_len` maps into
 /// the stripped suffix and must be dropped.
 ///
-/// `body_clean_len = final_body.len() - fm_prefix_len` is computed by the caller
+/// `body_clean_len = final_body.len().saturating_sub(fm_prefix_len)` is computed by the caller
 /// before calling this function.
 ///
 /// Input/output format: `(out, src_index, src_line, src_col)` — all 0-based.
