@@ -1,5 +1,5 @@
 mod common;
-use common::{fixture, mds_bin};
+use common::{assert_no_control_chars, fixture, mds_bin};
 
 #[test]
 fn check_collecting_warnings_returns_warnings_for_empty_include() {
@@ -136,4 +136,300 @@ fn include_empty_body_emits_warning() {
         stderr.contains("warning") && stderr.contains("fns"),
         "expected warning about empty @include on stderr, got: {stderr}"
     );
+}
+
+// ── I1-I7: duplicate --set / --set-string warnings (issue #200) ──────────────
+
+/// Helper: count non-overlapping occurrences of `needle` in `haystack`.
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
+}
+
+// Pinned warning strings — a USER-FACING CONTRACT.
+const DUP_SET_WARNING: &str =
+    "warning: variable 'x' is set more than once by --set; the last value wins";
+const DUP_SET_STRING_WARNING: &str =
+    "warning: variable 'x' is set more than once by --set-string; the last value wins";
+
+#[test]
+fn i1_set_duplicate_warns_exactly_once_on_stderr() {
+    // I1: mds build with --set x=1 --set x=2 must produce the warning exactly once.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set",
+            "x=1",
+            "--set",
+            "x=2",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "build with duplicate --set must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let count = count_occurrences(&stderr, DUP_SET_WARNING);
+    assert_eq!(
+        count, 1,
+        "I1: expected warning exactly once, found {count} times; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i2_set_string_duplicate_warns_exactly_once_on_stderr() {
+    // I2: mds build with --set-string x=a --set-string x=b must produce the warning
+    // exactly once.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set-string",
+            "x=a",
+            "--set-string",
+            "x=b",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "build with duplicate --set-string must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let count = count_occurrences(&stderr, DUP_SET_STRING_WARNING);
+    assert_eq!(
+        count, 1,
+        "I2: expected warning exactly once, found {count} times; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i3_quiet_suppresses_duplicate_warning() {
+    // I3: --quiet must suppress the duplicate-key warning.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set",
+            "x=1",
+            "--set",
+            "x=2",
+            "--quiet",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "quiet build must succeed");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains(DUP_SET_WARNING),
+        "I3: --quiet must suppress duplicate-key warning; got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i4_check_parity_with_build() {
+    // I4: mds check must emit the same duplicate-key warning as mds build.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "check",
+            src.to_str().unwrap(),
+            "--set",
+            "x=1",
+            "--set",
+            "x=2",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "check with duplicate --set must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let count = count_occurrences(&stderr, DUP_SET_WARNING);
+    assert_eq!(
+        count, 1,
+        "I4: check must warn exactly once; found {count} times; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i5_lint_parity_with_build() {
+    // I5: mds lint must emit the same duplicate-key warning as mds build.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "lint",
+            src.to_str().unwrap(),
+            "--set",
+            "x=1",
+            "--set",
+            "x=2",
+        ])
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    // lint exits 0 when no lint findings (content has no issues).
+    assert!(
+        output.status.success(),
+        "lint with duplicate --set must succeed (no lint errors); stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let count = count_occurrences(&stderr, DUP_SET_WARNING);
+    assert_eq!(
+        count, 1,
+        "I5: lint must warn exactly once; found {count} times; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i6_triple_repeat_warns_exactly_once() {
+    // I6: three repetitions of the same key must still produce exactly one warning.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set",
+            "x=1",
+            "--set",
+            "x=2",
+            "--set",
+            "x=3",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "build with triple --set must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let count = count_occurrences(&stderr, DUP_SET_WARNING);
+    assert_eq!(
+        count, 1,
+        "I6: triple repeat must still produce exactly one warning; found {count}; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn i7_hostile_key_is_wire_escaped_in_warning() {
+    // I7: a key containing an ESC byte (U+001B) and an RLO (U+202E) must appear in
+    // the warning with those codepoints replaced by their \uXXXX escape sequences,
+    // never as raw control bytes.
+    //
+    // PF-018: authoring control-character strings with an LLM agent silently decodes
+    // \uXXXX 4-hex sequences to live bytes.  Use Rust braced escapes (\u{1b},
+    // \u{202e}) — the editor layer does NOT decode those.
+    //
+    // The hostile key is: ESC (U+001B) followed by "[31m" followed by RLO (U+202E).
+    // Built from char literals to avoid any tool-layer decoding.
+    let esc: char = '\u{1b}';
+    let rlo: char = '\u{202e}';
+    let hostile_key = format!("{esc}[31m{rlo}");
+
+    // The expected ESCAPED forms as literal backslash sequences in the warning.
+    // Written as escaped-backslash Rust string literals so the tool layer has no
+    // 4-hex sequence to decode.
+    let expected_esc_form = "\\u001B"; // six-char: backslash + u001B
+    let expected_rlo_form = "\\u202E"; // six-char: backslash + u202E
+
+    let arg_set_first = format!("{hostile_key}=1");
+    let arg_set_second = format!("{hostile_key}=2");
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "Hello world").unwrap();
+
+    let output = mds_bin()
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            "-",
+            "--set",
+            &arg_set_first,
+            "--set",
+            &arg_set_second,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "build with hostile key must succeed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    // PF-013 NON-VACUITY FIRST: assert the escaped form IS present before asserting
+    // absence of raw control bytes.  A test that only asserts absence passes trivially
+    // if the feature never ran.
+    assert!(
+        stderr.contains(expected_esc_form),
+        "I7: expected escaped ESC form '{}' in stderr; got:\n{:?}",
+        expected_esc_form,
+        stderr
+    );
+    assert!(
+        stderr.contains(expected_rlo_form),
+        "I7: expected escaped RLO form '{}' in stderr; got:\n{:?}",
+        expected_rlo_form,
+        stderr
+    );
+
+    // Now assert the raw control bytes are absent.
+    assert_no_control_chars(&stderr, "I7 stderr");
 }

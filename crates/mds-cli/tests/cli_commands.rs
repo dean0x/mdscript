@@ -327,6 +327,13 @@ fn set_flag_duplicate_key_last_wins() {
         !stdout.contains("Hello First!"),
         "first --set value should be overridden by second, got: {stdout}"
     );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "warning: variable 'name' is set more than once by --set; the last value wins"
+        ),
+        "duplicate --set key should produce a warning on stderr, got: {stderr}"
+    );
 }
 
 // ── --set-string e2e tests (#152) ─────────────────────────────────────────────

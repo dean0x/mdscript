@@ -58,7 +58,9 @@ Use extended thinking for complex tasks.
 ```
 
 See [`examples/prompt-library/`](examples/prompt-library/) for a complete reusable
-prompt library using `@export`/`@import` (personas, formatting, guardrails).
+prompt library using `@export`/`@import` (personas, formatting, guardrails). If
+imports from cross-directory libraries are rejected with a containment error, see
+[Project root](#project-root).
 
 Unlike general-purpose template engines, MDS is Markdown-native: no delimiters to escape, no runtime to configure. The compiler catches undefined variables, import cycles, and arity mismatches at build time, not in production.
 
@@ -93,7 +95,9 @@ Build/Watch options:
                               dir-mode watch: mirrors source subtree)
   --vars <FILE>               JSON file with variable overrides (reloaded each rebuild)
   --set KEY=VALUE             Set a single variable (repeatable); value coerced to number/bool/null/array when possible
+                              Repeating a key warns; the last value wins.
   --set-string KEY=VALUE      Set a single variable as a string, bypassing type coercion (repeatable)
+                              Repeating a key warns; the last value wins.
   --source-map                Write a Source Map v3 sidecar (<output-file>.map, e.g. -o out.md → out.md.map); output is
                               byte-identical to a no-flag build. Ignored for messages-mode
                               templates (no renderable output). See ⚠ privacy note below.
@@ -252,6 +256,30 @@ Rules (configure via `mds.json` `lint.rules`; severities differ per rule):
 
 Exit codes: `0` = clean, `1` = warnings only, `2` = errors or analysis failure, `3` = resource limit. With `--quiet`, diagnostics and status output are suppressed (the directory summary still prints when any file has errors or hits a resource limit); exit codes are unaffected. `info`-severity findings (e.g. `shadow-variable`) never raise the exit code regardless of `--quiet`.
 JSON output shape: `{"files":[{"file":"…","diagnostics":[…]}],"truncated":false,"version":1}`.
+
+## Project root
+
+The compiler enforces import containment: every resolved import path must stay inside
+the **project root**. The root is discovered by walking upward from the template's
+directory until a `.git` or `.mdsroot` marker is found. In most repositories the
+`.git` directory already serves as the marker.
+
+**When imports are rejected with a containment error**, the likely cause is that the
+inferred root is too narrow. This happens when your template sits in a subdirectory
+that has its own marker closer to it than the repository's `.git`. To pin the root to
+a specific directory, create a `.mdsroot` marker there:
+
+```bash
+touch .mdsroot
+```
+
+An empty file works. A common pattern is to place `.mdsroot` at the root of a prompt
+library that lives inside a larger monorepo, so that templates can freely import from
+any directory in the library.
+
+The nearest-ancestor marker wins, regardless of which kind it is — placing `.mdsroot`
+in a subdirectory narrows the boundary rather than widening it. If you need a wider
+boundary, place `.mdsroot` higher up.
 
 ## Bundler Integration
 

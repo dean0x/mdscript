@@ -33,7 +33,12 @@ input. The compiler enforces several defense-in-depth controls:
 ### Filesystem boundary (`crates/mds-core/src/fs.rs`, `resolver.rs`)
 
 - **Path-traversal prevention**: import paths and the `output_dir` config value
-  are rejected if they escape the project root (`..` traversal).
+  are rejected if they escape the project root (`..` traversal). The project root
+  is the nearest ancestor directory containing a `.git` or `.mdsroot` marker,
+  found by walking upward from the compiled file's directory. Placing a `.mdsroot`
+  file is therefore a security-relevant decision: it sets the containment boundary
+  for all imports, and placing it closer to the input narrows that boundary while
+  placing it farther away widens it.
 - **Symlink rejection**: symlinked import paths are refused. Resolution is
   written to be TOCTOU-safe (the resolved target is validated, not just the
   pre-resolution path).

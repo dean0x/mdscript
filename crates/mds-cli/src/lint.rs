@@ -56,8 +56,8 @@ use mds::{effective_parent, FileSystem, MdsError, NativeFs, Severity};
 use miette::Result;
 
 use crate::build::{
-    build_runtime_vars, ensure_existing_mds_file, load_config, read_stdin, resolve_input,
-    RuntimeVarArgs,
+    build_runtime_vars, emit_duplicate_var_warnings, ensure_existing_mds_file, load_config,
+    read_stdin, resolve_input, RuntimeVarArgs,
 };
 use crate::output::{
     atomic_write_file, collect_mds_files_detailed, eprint_error, eprint_warning,
@@ -138,11 +138,13 @@ fn do_lint(args: LintArgs) -> Result<()> {
         format,
     };
 
-    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+    let resolved = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
         set_string_vars,
     })?;
+    emit_duplicate_var_warnings(&resolved, quiet);
+    let runtime_vars = resolved.vars;
 
     let (input, _auto_detected) = resolve_input(input, "lint")?;
 

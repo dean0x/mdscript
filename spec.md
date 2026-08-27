@@ -342,6 +342,7 @@ MDS supports three import styles:
 - Without alias (merge): exports enter current scope (name collision → compilation error)
 - Selective: only listed names are brought into scope
 - Circular imports → compilation error
+- Resolved import paths stay inside the project root (see §5 Project Root); a path that escapes it is a compilation error
 - Import resolution is recursive (imports can import)
 
 ---
@@ -780,6 +781,25 @@ For the base skeleton:
 | 4. Evaluate | Execute directives (expand loops, resolve conditions, call functions) | Iterate non-array, recursion detected |
 | 5. Render | Flatten evaluated tree → final Markdown string | (none expected) |
 
+### Project Root
+
+The compiler establishes a project root once per compilation. The root is used for two purposes: enforcing import containment (a resolved path that escapes it is a compilation error) and computing relative paths in Source Map v3 `sources[]` entries (see §7.5).
+
+**Discovery.** Starting from a base directory, the compiler walks upward, examining each ancestor level for the presence of a `.git` or `.mdsroot` marker. The nearest ancestor directory that holds either marker becomes the project root.
+
+Two base directories are possible:
+
+- For a file compile, the walk starts from the directory containing the compiled file.
+- For a string compile that provides an explicit base directory (the `basePath` option in the JavaScript API; the `base_path` parameter in the Python binding), the walk starts from that base directory.
+
+**`.git` and `.mdsroot` are not ordered relative to each other.** The rule is nearest-ancestor: whichever marker appears in the closest ancestor wins. A consequence: placing a `.mdsroot` in a subdirectory that is nearer to the input than an existing `.git` narrows the containment boundary — files above that `.mdsroot` but still inside the repository are then outside the project root, and imports to them are rejected.
+
+**Marker, not configuration.** The contents of `.mdsroot` are never read. An empty file works; a directory named `.mdsroot` also works.
+
+**Depth limit.** The walk ascends at most 256 directory levels. If no marker is found within that range, the starting directory itself becomes the project root, silently.
+
+**`mds.json` discovery is a separate, independent walk** (see §7.8). It shares only the 256-level depth limit. Finding (or not finding) `mds.json` has no effect on the project root, and project-root resolution has no effect on `mds.json` discovery.
+
 ### Frontmatter Preservation
 
 When the input file has YAML frontmatter, the compiled output preserves it:
@@ -845,6 +865,7 @@ mds build template.mds --out-dir dist      # Markdown → dist/template.md; mess
 mds build template.mds --vars vars.json    # With variable overrides from JSON file
 mds build template.mds --set name=Alice    # Set a single variable
 mds build template.mds --set name=Alice --set count=3  # Multiple variables
+mds build template.mds --source-map        # Generate a source-map sidecar (.md.map)
 echo "Hello {{name}}!" | mds build -         # Compile from stdin → stdout
 mds build src/                             # Compile every non-partial .mds in the tree (next to source)
 mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dist/a/b.md (or .json)
@@ -870,8 +891,12 @@ mds build src/ --out-dir dist              # Mirror subtree: src/a/b.mds → dis
 | `-o, --output <PATH>` | Output file path, or `-` for stdout. Mutually exclusive with `--out-dir`. Rejected for directory input. Warns if the extension contradicts the template kind. |
 | `--out-dir <DIR>` | Output directory. Mirrors subtree (dir mode) or writes `<stem>.<ext>` inside it (file mode). Created if absent. |
 | `--vars <FILE>` | JSON file with runtime variable overrides. |
-| `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. |
-| `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). |
+| `--set KEY=VALUE` | Set a single variable. Repeatable. Values are coerced to boolean, number, null, or array when possible. Repeating a key emits a warning; the last value wins. |
+| `--set-string KEY=VALUE` | Set a single variable as a **string**, bypassing type coercion. Repeatable. Use when the value must remain a string (e.g. a numeric-looking ID). Repeating a key emits a warning; the last value wins. |
+| `--source-map` | Generate a source-map sidecar (`<output>.map`, e.g. `-o out.md` → `out.md.map`). Ignored for messages-mode templates (a warning is emitted and no source map is produced). Conflicts with `--no-source-map`. Also enabled globally via `build.source_map = true` in `mds.json`. |
+| `--no-source-map` | Disable source-map generation. Overrides `build.source_map = true` in `mds.json`. Conflicts with `--source-map`. |
+| `--inline` | Embed the source map as a data-URI comment in the compiled output instead of a sidecar. Requires `--source-map`. |
+| `--embed-sources` | Embed source file contents in `sourcesContent[]`. Ships full source text — use with care. Requires `--source-map`. |
 | `-q, --quiet` | Suppress status messages on stderr on a successful run. The directory-mode summary is suppressed on a fully-successful run; it is still emitted when any file fails. (Two warning-severity notices — the directory-depth warning and the stale-sibling-unlink failure warning — are emitted regardless of `--quiet`.) |
 
 **Output path resolution** (precedence order, highest first):
@@ -947,8 +972,8 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | `--diff` | With `--fix`: print unified diff of pending changes without writing. |
 | `--format <FORMAT>` | Output format: `human` (default, stderr) or `json` (stdout). |
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
-| `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. |
-| `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. |
+| `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. Repeating a key emits a warning; the last value wins. |
+| `--set-string KEY=VALUE` | Set a single variable as a string, bypassing type coercion. Repeatable. Repeating a key emits a warning; the last value wins. |
 | `-q, --quiet` | Suppress warning/info human diagnostics and the directory summary on clean/warn-only runs; errors still print and the summary still appears when error- or resource-limited files are present. (The directory-depth warning — fires on trees deeper than MAX_DEPTH=64 — is emitted regardless of `--quiet`.) |
 
 **Directory mode** (`mds lint <dir>`):
@@ -1237,7 +1262,7 @@ When no `FILE` argument is given to `mds build` or `mds check`, the compiler sca
 
 ### 7.8 `mds.json` Project Config
 
-Place `mds.json` in the project root (or any ancestor directory). The compiler walks up from the input file to find it.
+Place `mds.json` in the repository root or any ancestor directory of the input file. The CLI discovers it by walking upward from the input — this discovery walk is independent of the project-root resolution described in §5, and the two walks do not influence each other. Relative paths inside `mds.json` (such as `build.output_dir`) resolve against the directory that contains `mds.json`, not against the project root.
 
 ```json
 {
@@ -1256,6 +1281,8 @@ Place `mds.json` in the project root (or any ancestor directory). The compiler w
 | Field | Type | Description |
 |-------|------|-------------|
 | `build.output_dir` | string | Relative path to output directory. Must not contain `..` components. |
+| `build.source_map` | bool | Enable source-map generation for all builds (equivalent to `--source-map`). Ignored for messages-mode templates. Default: `false`. |
+| `build.embed_sources` | bool | Embed source file contents in `sourcesContent[]` (equivalent to `--embed-sources`). Has no effect when `build.source_map` is `false`. Default: `false`. |
 | `lint.rules` | object | Per-rule severity overrides for `mds lint`. Keys are rule names; values are `"warn"`, `"error"`, or `"off"`. Unknown severity values cause a hard config-load error. An unknown rule name emits a warning naming it and listing the rules this build recognises, the config still loads, and lint continues — the unknown rule is not enforced (forward compat: a config naming a rule added in a newer release warns instead of failing on an older binary). Under `mds lint`, the warning goes to stderr and is suppressed by `--quiet`; `mds build`, `mds check`, `mds fmt`, and `mds watch` also read this file but do not emit the unknown-rule warning. On the `lint` API surfaces it is returned in `lint_warnings`. |
 
 Maximum config file size: 1 MB.
@@ -1379,9 +1406,9 @@ You have 2 items.
 
 ---
 
-## 9. Editor Integration
+## 10. Editor Integration
 
-### 9.1 File Association
+### 10.1 File Association
 
 MDS files use the `.mds` extension. To get Markdown syntax highlighting immediately, configure your editor to treat `.mds` as Markdown:
 
@@ -1424,7 +1451,7 @@ file-types = ["md", "markdown", "mds"]
 
 **JetBrains IDEs** (IntelliJ, WebStorm, PyCharm): Settings → Editor → File Types → Markdown → add `*.mds` pattern.
 
-### 9.2 Frontmatter Detection
+### 10.2 Frontmatter Detection
 
 The MDS compiler also accepts `.md` files that contain MDS directives. To explicitly mark a `.md` file as MDS, add `type: mds` to the frontmatter:
 
@@ -1442,7 +1469,7 @@ The compiler uses this detection order:
 2. `.md` extension + `type: mds` frontmatter → treated as MDS
 3. `.md` extension without `type: mds` → rejected (not compiled)
 
-### 9.3 MDS-Specific Highlighting (Roadmap)
+### 10.3 MDS-Specific Highlighting (Roadmap)
 
 File association gives standard Markdown highlighting, but `@` directives and `{{var}}` interpolation appear as plain text. Full MDS highlighting requires dedicated editor support:
 
@@ -1462,7 +1489,7 @@ A language server (Rust) providing diagnostics, completions, go-to-definition fo
 
 ---
 
-## 10. What's NOT in v0.2
+## 11. Out of Scope
 
 These are intentionally deferred to keep the language simple and the compiler focused:
 
@@ -1470,7 +1497,6 @@ These are intentionally deferred to keep the language simple and the compiler fo
 - Unbounded recursion: direct recursion is rejected; indirect chains are capped at depth 128 (see §4.5)
 - Macros, async functions, streaming
 - URL-based imports (remote modules)
-- Source maps
 - Function calls in `@if` conditions (e.g. `@if length(items) == 0:`) — not supported
 - Function calls in `@for` iterables (e.g. `@for item in split(csv, ","):`) — not supported
 - Parenthesized sub-expressions in conditions (e.g. `@if (a || b) && c:`) — not supported
@@ -1479,7 +1505,7 @@ These are intentionally deferred to keep the language simple and the compiler fo
 
 ---
 
-## 11. Grammar Summary
+## 12. Grammar Summary
 
 ```
 file            := frontmatter? extends? (directive | text)*
@@ -1538,7 +1564,7 @@ quoted_path     := "\"" path_chars "\""
 
 ---
 
-## 12. Status
+## 13. Status
 
 v0.4.0 - Breaking change release. **Interpolation syntax changed from `{x}` to `{{x}}`** — single `{`/`}` are now always literal text, and `\{{` is the escape for a literal `{{`; run `mds lint --fix` to auto-migrate legacy templates (the `legacy-interpolation` lint rule). `@message {{role}}:` dynamic role syntax updated to use double braces; new `fix_edits` field on `LintDiagnostic` across all binding surfaces. Code fences now correctly recognize tilde fences (`~~~`), indented fences, and blockquoted fences (e.g. `> ``` ...`) as passthrough regions — interpolation and directives are not parsed inside them (#149). Interior whitespace in block bodies and `mds fmt` output now follows the **interior-verbatim with trailing-edge normalization** contract — leading blank lines and interior blank runs are preserved verbatim; only the trailing edge normalizes to one final newline. (`@message` and `@define` bodies still edge-trim via `.trim()` — they strip leading and trailing blank lines.) The `mds fmt` blank-line collapsing rule (R3) has been removed (#150, #151). Cross-type equality comparisons (`string == number`, `boolean != null`, etc.) are now a runtime error (`mds::type_mismatch`) instead of silently returning `false`/`true` — both sides must be the same type (#152). A new `--set-string` CLI flag forces a variable to remain a string regardless of its value, bypassing type coercion; using a key in both `--set` and `--set-string` is now a hard error (#152). `@extends` children now emit the **deep-merged** frontmatter (base < child, reserved keys excluded) instead of only the child's raw frontmatter — base-only keys appear in the compiled output (#154).
 

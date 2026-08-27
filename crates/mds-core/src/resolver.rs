@@ -120,7 +120,7 @@ pub struct ResolvedModule {
     ///
     /// Populated by `process_module` when `ModuleCache::source_map_mode` is
     /// true and the module exports a non-empty `prompt` (S6).  `None` for
-    /// skeleton entries, `@extends` modules (S8 will add those), and all
+    /// skeleton entries, `@extends` modules (tracked as #114), and all
     /// non-source-map compilations (zero-cost AC-PERF-01).
     pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
     pub(crate) raw_frontmatter: Option<String>,
@@ -857,11 +857,12 @@ impl ModuleCache {
             } else {
                 // `final_body` is spliced from base-skeleton nodes (base-relative
                 // offsets) and child block overrides (child-relative offsets), so no
-                // single source can attribute every node's offset. Pass empty file/source
-                // so `build_type_mismatch` degrades a `type_mismatch` to spanless rather
-                // than anchoring a base-relative offset against the child source (ADR-005
-                // "degrade rather than mis-attribute"). The source-map branch above keeps
-                // spans correct by evaluating per-region with each region's own origin.
+                // single source can attribute every node's offset (#114). Pass empty
+                // file/source so `build_type_mismatch` degrades a `type_mismatch` to
+                // spanless rather than anchoring a base-relative offset against the
+                // child source (ADR-005 "degrade rather than mis-attribute"). The
+                // source-map branch above keeps spans correct by evaluating per-region
+                // with each region's own origin.
                 (evaluate(&final_body, &mut scope, warnings, "", "")?, None)
             };
 
@@ -1396,7 +1397,7 @@ impl ModuleCache {
         // both. Pass empty file/source so a `type_mismatch` in an inherited condition
         // degrades to spanless instead of mis-attributing a base-relative offset onto the
         // child source (ADR-005 "degrade rather than mis-attribute"). Per-region source
-        // attribution for `@extends` is deferred to S8; spanless is the safe interim.
+        // attribution for `@extends` is tracked as #114; spanless is the safe interim.
         let prompt_body = evaluate(&final_body, &mut scope, warnings, "", "")?;
         let prompt_body = (!prompt_body.trim().is_empty()).then_some(prompt_body);
 
@@ -1404,7 +1405,7 @@ impl ModuleCache {
             functions,
             prompt_body,
             // @extends modules do not carry a FragmentMap in S6; multi-source
-            // region attribution for extending modules is deferred to S8.
+            // region attribution for extending modules is tracked as #114.
             prompt_map: None,
             // #154: emit deep-merged frontmatter (base < child, reserved keys excluded)
             // rather than the child's raw frontmatter.

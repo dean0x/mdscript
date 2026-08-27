@@ -11,8 +11,8 @@ mod output;
 mod watch;
 
 use build::{
-    build_runtime_vars, exit_code, parse_key_value, resolve_input, run_build, BuildArgs,
-    RuntimeVarArgs,
+    build_runtime_vars, emit_duplicate_var_warnings, exit_code, parse_key_value, resolve_input,
+    run_build, BuildArgs, RuntimeVarArgs,
 };
 
 // ── CLI entry point ───────────────────────────────────────────────────────────
@@ -59,10 +59,10 @@ enum Commands {
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
-        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3; repeating a key warns, last value wins)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
-        /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3")
+        /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3"; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
         /// Generate a source map alongside the compiled output (sidecar: <output-file>.map, e.g. -o out.md → out.md.map).
@@ -92,10 +92,10 @@ enum Commands {
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
-        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3; repeating a key warns, last value wins)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
-        /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3")
+        /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3"; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
     },
@@ -163,10 +163,10 @@ enum Commands {
         /// JSON file with runtime variable overrides
         #[arg(long)]
         vars: Option<PathBuf>,
-        /// Set a runtime variable (repeatable, e.g. --set name=Alice)
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice; repeating a key warns, last value wins)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
-        /// Set a runtime variable as a string (repeatable, no type coercion)
+        /// Set a runtime variable as a string (repeatable, no type coercion; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
     },
@@ -211,10 +211,10 @@ enum Commands {
         /// JSON file with runtime variable overrides (reloaded on each rebuild)
         #[arg(long)]
         vars: Option<PathBuf>,
-        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3)
+        /// Set a runtime variable (repeatable, e.g. --set name=Alice --set count=3; repeating a key warns, last value wins)
         #[arg(long = "set", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_vars: Vec<(String, String)>,
-        /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3")
+        /// Set a runtime variable as a string (repeatable, no type coercion; e.g. --set-string count=3 sets count to the string "3"; repeating a key warns, last value wins)
         #[arg(long = "set-string", value_name = "KEY=VALUE", value_parser = parse_key_value)]
         set_string_vars: Vec<(String, String)>,
         /// Clear the terminal before each rebuild (only when stderr is a TTY)
@@ -257,11 +257,13 @@ fn run_check(
 ) -> Result<()> {
     use build::read_stdin;
     use output::STDIN_DISPLAY_LABEL;
-    let runtime_vars = build_runtime_vars(RuntimeVarArgs {
+    let resolved = build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
         set_string_vars,
     })?;
+    emit_duplicate_var_warnings(&resolved, quiet);
+    let runtime_vars = resolved.vars;
 
     // Resolve the input: explicit path/stdin, or auto-detect from cwd.
     // run_check does not print a banner on auto-detect — check is a silent validation.

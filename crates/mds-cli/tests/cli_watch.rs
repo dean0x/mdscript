@@ -4076,3 +4076,165 @@ fn watch_file_mode_ctrl_c_during_startup_compile_terminates() {
          exited with {status:?} — the signal was swallowed until the event loop started"
     );
 }
+
+// ── I8: file-watch mode warns exactly ONCE across two edits (#200) ──────────
+
+/// Count non-overlapping occurrences of `needle` in `haystack`.
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count += 1;
+        start += pos + needle.len();
+    }
+    count
+}
+
+/// Pinned --set duplicate-key warning string (issue #200, spec §7.2).
+const DUP_SET_WARNING: &str =
+    "warning: variable 'x' is set more than once by --set; the last value wins";
+
+/// Wait until the stderr tap contains the given needle, or timeout elapses.
+///
+/// Polls the shared StderrTap at 20ms intervals; returns the final contents.
+fn wait_for_stderr_contains_str(tap: &StderrTap, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let text = tap.text();
+        if text.contains(needle) || Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn i8_file_watch_duplicate_set_warns_exactly_once_across_two_edits() {
+    // I8: mds watch (file mode) with --set x=1 --set x=2 must print the
+    // duplicate-key warning exactly once — at startup — not on every rebuild.
+    //
+    // Negative controls (manually verified during development — see commit body):
+    //   - Adding emit to watch.rs:935 → count rises to ≥ 3 across two edits.
+    //   - Adding emit to watch.rs:1914 → count grows per event batch.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let out = dir.path().join("t.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                src.to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--set",
+                "x=1",
+                "--set",
+                "x=2",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Wait for the startup warning to appear.
+    let stderr_after_start = wait_for_stderr_contains_str(&stderr_tap, DUP_SET_WARNING, TIMEOUT);
+    let count_at_start = count_occurrences(&stderr_after_start, DUP_SET_WARNING);
+    assert_eq!(
+        count_at_start, 1,
+        "I8: expected exactly 1 warning at startup, got {}; stderr:\n{}",
+        count_at_start, stderr_after_start
+    );
+
+    // Edit 1: trigger a rebuild.
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I8: rebuild after edit 1 must complete"
+    );
+
+    // Edit 2: trigger another rebuild.
+    std::fs::write(&src, "version 3").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 3", TIMEOUT),
+        "I8: rebuild after edit 2 must complete"
+    );
+
+    // After two rebuilds, the warning count must still be 1 (negative control:
+    // emitting at the rebuild sites would raise it).
+    let final_stderr = stderr_tap.text();
+    let final_count = count_occurrences(&final_stderr, DUP_SET_WARNING);
+    assert_eq!(
+        final_count, 1,
+        "I8: after two edits the warning must still appear exactly once; \
+         got {}; stderr:\n{}",
+        final_count, final_stderr
+    );
+
+    drop(child);
+}
+
+// ── I9: dir-watch mode warns exactly ONCE — guards the :2185 double-print ────
+
+#[test]
+fn i9_dir_watch_duplicate_set_warns_exactly_once_at_startup() {
+    // I9: mds watch (dir mode) with --set x=1 --set x=2 must print the
+    // duplicate-key warning exactly once — at startup — and NOT again on rebuilds.
+    //
+    // dir_watch_startup calls build_runtime_vars twice (once at :2064 to emit,
+    // once at :2185 for the dedup baseline to discard).  This test is the SOLE
+    // mechanical guard that:
+    //   - the second call at :2185 does NOT also emit (double-print on startup), AND
+    //   - rebuild calls at :1914 do NOT emit (per-event growth).
+    //
+    // Negative controls (manually verified during development — see commit body):
+    //   - Adding emit at watch.rs:2185 → count becomes 2 with no edits at all.
+    //   - Adding emit at watch.rs:1914 → count grows to ≥ 2 after the rebuild below.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("t.mds");
+    std::fs::write(&src, "version 1").unwrap();
+    let out = dir.path().join("t.md");
+
+    let (child, stderr_tap) = spawn_ready(
+        mds_bin()
+            .args([
+                "watch",
+                dir.path().to_str().unwrap(),
+                "--debounce",
+                "0",
+                "--set",
+                "x=1",
+                "--set",
+                "x=2",
+            ])
+            .stdout(Stdio::null()),
+    );
+
+    // Wait for the startup warning.
+    let stderr_startup = wait_for_stderr_contains_str(&stderr_tap, DUP_SET_WARNING, TIMEOUT);
+    let count_at_startup = count_occurrences(&stderr_startup, DUP_SET_WARNING);
+    assert_eq!(
+        count_at_startup, 1,
+        "I9: dir-watch startup must emit the warning exactly once (guards :2185); \
+         got {}; stderr:\n{}",
+        count_at_startup, stderr_startup
+    );
+
+    // Trigger a rebuild to exercise the :1914 path (handle_dir_event).
+    std::fs::write(&src, "version 2").unwrap();
+    assert!(
+        wait_for_file_contains(&out, "version 2", TIMEOUT),
+        "I9: rebuild after edit must complete"
+    );
+
+    // After the rebuild, the count must still be 1 (guards :1914 per-event growth).
+    let stderr_after_edit = stderr_tap.text();
+    let count_after_edit = count_occurrences(&stderr_after_edit, DUP_SET_WARNING);
+    assert_eq!(
+        count_after_edit, 1,
+        "I9: after one rebuild, warning must still appear exactly once (guards :1914); \
+         got {}; stderr:\n{}",
+        count_after_edit, stderr_after_edit
+    );
+
+    drop(child);
+}
