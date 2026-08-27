@@ -820,7 +820,7 @@ impl MapBuilder {
         fm_prefix_len: usize,
         file: Option<String>,
     ) -> SourceMap {
-        let body_clean_len = final_body.len() - fm_prefix_len;
+        let body_clean_len = final_body.len().saturating_sub(fm_prefix_len);
 
         // Destructure to allow independent moves/borrows of each field.
         let MapBuilder {
