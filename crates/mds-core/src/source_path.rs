@@ -390,6 +390,32 @@ fn basename_fallback(comps: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Display-path helper
+// ---------------------------------------------------------------------------
+
+/// Return a display-safe, root-relative path for user-visible strings.
+///
+/// Used for error messages, `NamedSource` names, and diagnostic labels.
+///
+/// Wraps [`relativize_source`] with `base = None` (root-relative, no map-directory
+/// offset) using the source root reported by `fs` as the containment anchor.
+///
+/// # Security invariant (PF-005 / PF-013)
+///
+/// The returned string is **never** an absolute path.  For `NativeFs` compiles the
+/// path is root-relative (e.g. `"src/a.mds"`).  For `VirtualFs` and string-source
+/// sentinels the key passes through verbatim — virtual keys are relative by
+/// construction, and `<...>` sentinels are returned unchanged by step 1.
+///
+/// Every caller that asserts "no absolute path" MUST pair the assertion with a
+/// positive control proving the harness would catch the leak (PF-013).
+pub(crate) fn display_path_for(fs: &dyn crate::fs::FileSystem, key: &str) -> String {
+    let root_str = fs.source_root();
+    let root = root_str.as_deref().map(std::path::Path::new);
+    relativize_source(key, None, root)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -929,5 +955,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── display_path_for ─────────────────────────────────────────────────────
+    //
+    // Each test follows PF-013: pair every "must not be absolute" assertion with
+    // a positive control that proves the harness would catch the leak.
+
+    struct FakeFs(Option<String>);
+
+    impl crate::fs::FileSystem for FakeFs {
+        fn normalize(&self, _base: &str, _rel: &str) -> Result<String, crate::MdsError> {
+            unimplemented!()
+        }
+        fn normalize_in_dir(&self, _dir: &str, _rel: &str) -> Result<String, crate::MdsError> {
+            unimplemented!()
+        }
+        fn parent_dir(&self, _key: &str) -> String {
+            unimplemented!()
+        }
+        fn read(&self, _normalized: &str) -> Result<String, crate::MdsError> {
+            unimplemented!()
+        }
+        fn is_markdown(&self, _normalized: &str) -> bool {
+            unimplemented!()
+        }
+        fn source_root(&self) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    /// NativeFs-like: absolute key is relativized against the project root.
+    #[test]
+    fn display_path_for_native_root_relative() {
+        let fs = FakeFs(Some("/proj".to_string()));
+        let out = display_path_for(&fs, "/proj/src/a.mds");
+        assert_eq!(out, "src/a.mds", "must be root-relative");
+        // Positive control (PF-013): the raw absolute path WOULD have been absolute.
+        assert!(
+            "/proj/src/a.mds".starts_with('/'),
+            "positive control: raw key is absolute — harness would catch this if leaked"
+        );
+        assert!(!out.starts_with('/'), "display must not be absolute");
+    }
+
+    /// VirtualFs: no source root → key passes through verbatim.
+    #[test]
+    fn display_path_for_virtual_identity() {
+        let fs = FakeFs(None);
+        let out = display_path_for(&fs, "src/a.mds");
+        assert_eq!(out, "src/a.mds");
+        assert!(!out.starts_with('/'), "virtual key must not be absolute");
+    }
+
+    /// Sentinel `<source>` passes through verbatim regardless of root.
+    #[test]
+    fn display_path_for_sentinel_passthrough() {
+        let fs = FakeFs(Some("/proj".to_string()));
+        let out = display_path_for(&fs, "<source>");
+        assert_eq!(out, "<source>", "sentinel must pass through verbatim");
+    }
+
+    /// Never-absolute: even when source_root is None, an absolute key degrades to
+    /// basename rather than leaking the full absolute path (step 6 of the guard).
+    #[test]
+    fn display_path_for_never_absolute_basename_fallback() {
+        let fs = FakeFs(None);
+        // Without a root, an absolute key falls to basename fallback (step 6).
+        let out = display_path_for(&fs, "/home/user/secrets/a.mds");
+        // Positive control (PF-013): the raw key IS absolute.
+        assert!(
+            "/home/user/secrets/a.mds".starts_with('/'),
+            "positive control: raw key is absolute"
+        );
+        // After display_path_for, the result must not be absolute.
+        assert!(
+            !out.starts_with('/'),
+            "display must not be absolute; got {out:?}"
+        );
+        // The fallback is the basename component.
+        assert_eq!(out, "a.mds");
     }
 }

@@ -125,8 +125,20 @@ use serde::Serialize;
 /// bytes must not appear in panic messages or debug output).
 #[derive(Clone)]
 pub(crate) struct Origin {
-    /// Display name of the file (shown in error messages / source labels).
+    /// Canonical key of the file (used for source-map interning in `MapBuilder::source_index`).
+    ///
+    /// For `NativeFs` compiles this is the absolute canonical path returned by
+    /// `fs.normalize()`.  For `VirtualFs` / string-source compiles it is the virtual key
+    /// or the `SOURCE_LABEL` sentinel.
+    ///
+    /// **Never** use this for user-visible strings — use `display` instead (R3 / CWE-209).
     pub(crate) file: Arc<str>,
+    /// Display-safe (root-relative) path for error messages, `NamedSource` names, and
+    /// diagnostic labels.
+    ///
+    /// Populated at construction time from `display_path_for(fs, key)` so that no
+    /// absolute path can reach a user-visible surface (R3 / CWE-209 / PF-013).
+    pub(crate) display: Arc<str>,
     /// Raw source bytes; AST node offsets are relative to this string.
     pub(crate) source: Arc<str>,
 }
@@ -135,6 +147,7 @@ impl std::fmt::Debug for Origin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Origin")
             .field("file", &self.file)
+            .field("display", &self.display)
             .field("source_len", &self.source.len())
             .finish()
     }
@@ -684,8 +697,20 @@ pub(crate) struct MapBuilder {
     pub(crate) suppress: u32,
     /// Index of the source file currently being recorded (0-based into `sources`).
     pub(crate) current_src: u32,
-    /// Source file names, in registration order (parallel to `sources_content`).
+    /// Source file canonical keys, in registration order (parallel to `sources_content`
+    /// and `display_names`).
+    ///
+    /// Used for Source Map v3 `sources[]` entries — these may be absolute paths; they
+    /// are relativized by the caller's `finalize` + `relativize_source` step (ADR-005).
+    /// Never use these for user-visible diagnostic strings — use `display_names` instead.
     pub(crate) sources: Vec<String>,
+    /// Display-safe (root-relative) paths, parallel to `sources` (R3 / CWE-209).
+    ///
+    /// Populated at registration time from `display_path_for(fs, key)`.  Read by
+    /// `evaluate_with_map` at line ~180 to seed `EvalContext::file` for diagnostics.
+    /// The `debug_assert_eq!` in `source_index` enforces strict length parity with
+    /// `sources` so any registration mismatch is caught in debug builds.
+    pub(crate) display_names: Vec<String>,
     /// Source file contents, parallel to `sources` (for `sourcesContent`).
     pub(crate) sources_content: Vec<String>,
     /// True when at least one segment was silently dropped due to the
@@ -705,10 +730,16 @@ pub(crate) struct MapBuilder {
 impl MapBuilder {
     /// Create a builder seeded with a single source file.
     ///
+    /// - `source_name` — canonical key (absolute path on `NativeFs`, virtual key or
+    ///   sentinel on `VirtualFs`); stored in `sources[]` for Source Map v3 emission.
+    /// - `display_name` — display-safe (root-relative) path from `display_path_for`;
+    ///   stored in `display_names[]` for diagnostic use only (R3 / CWE-209).
+    /// - `source_content` — raw source bytes for `sourcesContent[]`.
+    ///
     /// The source file at index 0 is used for all segments until
     /// [`source_index`] registers additional sources (e.g. for `@extends`
     /// base templates in CP3+).
-    pub(crate) fn new(source_name: String, source_content: String) -> Self {
+    pub(crate) fn new(source_name: String, display_name: String, source_content: String) -> Self {
         // Canonicalize the label at the choke-point: "<source>" (the diagnostic
         // sentinel for string-source compiles) becomes STRING_SOURCE_MAP_LABEL.
         let canonical = map_source_label(&source_name).to_string();
@@ -718,6 +749,7 @@ impl MapBuilder {
             suppress: 0,
             current_src: 0,
             sources: vec![canonical],
+            display_names: vec![display_name],
             sources_content: vec![source_content],
             segments_dropped: false,
             no_sources_content: false,
@@ -726,20 +758,36 @@ impl MapBuilder {
 
     /// Return the index for `file`, registering it as a new source if needed.
     ///
+    /// - `file` — canonical key; used for dedup and stored in `sources[]`.
+    /// - `display` — display-safe path stored in `display_names[]`; only relevant
+    ///   for newly registered entries (dedup returns the existing index unchanged).
+    /// - `content` — raw source bytes for `sources_content[]`.
+    ///
     /// Scans linearly (sources vecs are small — typically 1-3 entries per
     /// single-file compilation).
-    pub(crate) fn source_index(&mut self, file: &str, content: &str) -> u32 {
+    pub(crate) fn source_index(&mut self, file: &str, display: &str, content: &str) -> u32 {
         // Apply the canonical label BEFORE the dedup compare so that "<source>"
         // and "input.mds" can never coexist as two distinct entries (e.g. when
         // S8 function-body attribution passes the sentinel after the seed is
         // already "input.mds").
         let canonical = map_source_label(file);
         if let Some(pos) = self.sources.iter().position(|s| s == canonical) {
+            debug_assert_eq!(
+                self.display_names.len(),
+                self.sources.len(),
+                "display_names and sources must always be the same length"
+            );
             return pos as u32;
         }
         let idx = self.sources.len() as u32;
         self.sources.push(canonical.to_string());
+        self.display_names.push(display.to_string());
         self.sources_content.push(content.to_string());
+        debug_assert_eq!(
+            self.display_names.len(),
+            self.sources.len(),
+            "display_names and sources must always be the same length"
+        );
         idx
     }
 
@@ -1719,8 +1767,13 @@ mod tests {
 
     #[test]
     fn map_builder_new_seeds_source_at_index_zero() {
-        let b = MapBuilder::new("a.mds".to_string(), "source".to_string());
+        let b = MapBuilder::new(
+            "a.mds".to_string(),
+            "a.mds".to_string(),
+            "source".to_string(),
+        );
         assert_eq!(b.sources, vec!["a.mds"]);
+        assert_eq!(b.display_names, vec!["a.mds"]);
         assert_eq!(b.sources_content, vec!["source"]);
         assert_eq!(b.current_src, 0);
         assert_eq!(b.cursor, 0);
@@ -1730,18 +1783,23 @@ mod tests {
 
     #[test]
     fn map_builder_source_index_deduplicates() {
-        let mut b = MapBuilder::new("a.mds".to_string(), "content-a".to_string());
-        assert_eq!(b.source_index("a.mds", "content-a"), 0);
-        assert_eq!(b.source_index("b.mds", "content-b"), 1);
-        assert_eq!(b.source_index("a.mds", "content-a"), 0); // dedup
-        assert_eq!(b.source_index("b.mds", "content-b"), 1); // dedup
+        let mut b = MapBuilder::new(
+            "a.mds".to_string(),
+            "a.mds".to_string(),
+            "content-a".to_string(),
+        );
+        assert_eq!(b.source_index("a.mds", "a.mds", "content-a"), 0);
+        assert_eq!(b.source_index("b.mds", "b.mds", "content-b"), 1);
+        assert_eq!(b.source_index("a.mds", "a.mds", "content-a"), 0); // dedup
+        assert_eq!(b.source_index("b.mds", "b.mds", "content-b"), 1); // dedup
         assert_eq!(b.sources.len(), 2);
+        assert_eq!(b.display_names.len(), 2);
     }
 
     #[test]
     fn map_builder_push_segment_caps_at_limit() {
         use crate::limits::MAX_SOURCEMAP_SEGMENTS;
-        let mut b = MapBuilder::new("a.mds".to_string(), String::new());
+        let mut b = MapBuilder::new("a.mds".to_string(), "a.mds".to_string(), String::new());
         for i in 0..=(MAX_SOURCEMAP_SEGMENTS + 5) as u32 {
             b.push_segment(i, i, 1);
         }
@@ -1928,7 +1986,11 @@ mod tests {
         // clean_output: same (no trailing whitespace change)
         // Segments: Text("Hello ") at src_off=0, len=6; Interpolation at src_off=6, inner-len=4
         // Source: "Hello {{name}}!\n" — `{{` starts at byte 6, inner `name` is 4 bytes
-        let mut b = MapBuilder::new("t.mds".to_string(), "Hello {{name}}!\n".to_string());
+        let mut b = MapBuilder::new(
+            "t.mds".to_string(),
+            "t.mds".to_string(),
+            "Hello {{name}}!\n".to_string(),
+        );
         b.push_segment(0, 0, 6); // "Hello " maps to src byte 0
         b.push_segment(6, 6, 4); // {{name}}: offset=6, inner-len=4 (name is 4 chars)
 
@@ -1957,7 +2019,11 @@ mod tests {
     #[test]
     fn finalize_empty_body_yields_empty_mappings() {
         // Raw output is whitespace-only; clean_output produces "".
-        let mut b = MapBuilder::new("t.mds".to_string(), "  \n  ".to_string());
+        let mut b = MapBuilder::new(
+            "t.mds".to_string(),
+            "t.mds".to_string(),
+            "  \n  ".to_string(),
+        );
         b.push_segment(0, 0, 5);
 
         let body_raw = "  \n  ";
@@ -1971,7 +2037,11 @@ mod tests {
     fn finalize_with_frontmatter_shifts_points() {
         // "---\nfm: v\n---\nHello\n" — frontmatter prefix = 14 bytes
         // Segment at out=0 in raw output → out=14 in final output after shift
-        let mut b = MapBuilder::new("t.mds".to_string(), "Hello\n".to_string());
+        let mut b = MapBuilder::new(
+            "t.mds".to_string(),
+            "t.mds".to_string(),
+            "Hello\n".to_string(),
+        );
         b.push_segment(0, 0, 5);
 
         let body_raw = "Hello\n";
@@ -1997,7 +2067,7 @@ mod tests {
         // "Hello\r\nWorld\r\n" → clean: "Hello\nWorld\n"
         // Segment at raw out=7 ("\r\n" takes bytes 5-6, "World" starts at 7)
         // → compensated: 7 - 1 cr before 7 = 6 (correct position in clean output)
-        let mut b = MapBuilder::new("t.mds".to_string(), "src".to_string());
+        let mut b = MapBuilder::new("t.mds".to_string(), "t.mds".to_string(), "src".to_string());
         b.push_segment(0, 0, 5); // "Hello" in raw output
         b.push_segment(7, 0, 5); // "World" in raw output (byte 7 after \r\n)
 
@@ -2108,7 +2178,11 @@ mod tests {
     #[test]
     fn map_builder_segments_dropped_flag() {
         use crate::limits::MAX_SOURCEMAP_SEGMENTS;
-        let mut b = MapBuilder::new("test.mds".to_string(), "source".to_string());
+        let mut b = MapBuilder::new(
+            "test.mds".to_string(),
+            "test.mds".to_string(),
+            "source".to_string(),
+        );
         // Fill to one below cap.
         for i in 0..MAX_SOURCEMAP_SEGMENTS {
             b.push_segment(i as u32, i as u32, 1);
@@ -2133,8 +2207,12 @@ mod tests {
     /// `sources_content_bytes()` returns the sum of all registered source sizes.
     #[test]
     fn map_builder_sources_content_bytes() {
-        let mut b = MapBuilder::new("a.mds".to_string(), "hello".to_string()); // 5 bytes
-        let _ = b.source_index("b.mds", "world!"); // 6 bytes
+        let mut b = MapBuilder::new(
+            "a.mds".to_string(),
+            "a.mds".to_string(),
+            "hello".to_string(),
+        ); // 5 bytes
+        let _ = b.source_index("b.mds", "b.mds", "world!"); // 6 bytes
         assert_eq!(
             b.sources_content_bytes(),
             11,

@@ -335,36 +335,21 @@ impl NativeFs {
     /// if the final path component is a symlink. This makes it a drop-in replacement
     /// for `std::fs::canonicalize` at security boundaries (PF-004).
     ///
+    /// Error messages use `path.display()` so callers that pass an already-safe
+    /// path (e.g. a CLI-provided absolute path) get a useful diagnostic.  For
+    /// import-path resolution use [`NativeFs::check_symlink_named`] instead, which
+    /// accepts a separate `shown` string to avoid leaking the absolute joined path.
+    ///
     /// # Errors
     ///
     /// - `MdsError::ImportError` — the final path component is a symlink.
     /// - `MdsError::FileNotFound` — the path does not exist or the parent cannot
     ///   be resolved.
     pub fn check_symlink(path: &Path) -> Result<PathBuf, MdsError> {
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| MdsError::file_not_found(path.display().to_string()))?;
-
-        // Use effective_parent: path.parent() returns Some("") for bare filenames
-        // (not None), so "".canonicalize() would fail on every bare-filename call.
-        // effective_parent maps empty parents to "." (PF-006).
-        let parent = effective_parent(path);
-        let canonical_parent = parent
-            .canonicalize()
-            .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
-        let canonical_without_following_last = canonical_parent.join(file_name);
-
-        let canonical = canonical_without_following_last
-            .canonicalize()
-            .map_err(|_| MdsError::file_not_found(path.display().to_string()))?;
-
-        if canonical != canonical_without_following_last {
-            return Err(MdsError::import_error(format!(
-                "symlinks are not allowed in imports: {}",
-                path.display()
-            )));
-        }
-        Ok(canonical)
+        // Delegate to the named variant using path.display() as the shown string.
+        // External callers (CLI lint/fmt/watch/output) pass absolute paths where
+        // showing the full path in error messages is appropriate.
+        Self::check_symlink_named(path, &path.display().to_string())
     }
 
     /// Walk up from a directory to find the project root.
@@ -386,17 +371,60 @@ impl NativeFs {
         start.to_path_buf()
     }
 
+    /// Return a display-safe path for `path` relative to the established project root.
+    ///
+    /// Uses [`crate::source_path::relativize_source`] so the result is never an
+    /// absolute path (R3 / CWE-209).  Falls back to the basename when the root has
+    /// not been established yet (e.g. before the first `normalize` call).
+    fn display_of(&self, path: &Path) -> String {
+        let path_str = path.display().to_string();
+        let root_str = self.source_root();
+        let root = root_str.as_deref().map(Path::new);
+        crate::source_path::relativize_source(&path_str, None, root)
+    }
+
     /// Check that `canonical` stays within the established root directory.
-    fn check_path_traversal(&self, canonical: &Path) -> Result<(), MdsError> {
+    ///
+    /// `shown` is the user-supplied import path string; it appears in the error
+    /// message so the user sees what they typed, not an absolute resolved path
+    /// (matches the `VirtualFs` sibling message format / R3 CWE-209).
+    fn check_path_traversal(&self, canonical: &Path, shown: &str) -> Result<(), MdsError> {
         if let Some(root) = self.root_dir.get() {
             if !canonical.starts_with(root) {
                 return Err(MdsError::import_error(format!(
-                    "import path escapes project directory: {}",
-                    canonical.display()
+                    "import path escapes project directory: \"{shown}\""
                 )));
             }
         }
         Ok(())
+    }
+
+    /// Symlink check that uses a caller-supplied `shown` name in error messages.
+    ///
+    /// Separates the path used for OS calls from the string shown to the user,
+    /// so import errors report the relative import string rather than the
+    /// absolute joined path (R3 / CWE-209).
+    fn check_symlink_named(path: &Path, shown: &str) -> Result<PathBuf, MdsError> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| MdsError::file_not_found(shown.to_string()))?;
+
+        let parent = effective_parent(path);
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|_| MdsError::file_not_found(shown.to_string()))?;
+        let canonical_without_following_last = canonical_parent.join(file_name);
+
+        let canonical = canonical_without_following_last
+            .canonicalize()
+            .map_err(|_| MdsError::file_not_found(shown.to_string()))?;
+
+        if canonical != canonical_without_following_last {
+            return Err(MdsError::import_error(format!(
+                "symlinks are not allowed in imports: {shown}"
+            )));
+        }
+        Ok(canonical)
     }
 
     /// Resolve `relative` within `dir` (given as a `&Path`) using the established
@@ -412,8 +440,10 @@ impl NativeFs {
     fn normalize_in_dir_impl(&self, dir: &Path, relative: &str) -> Result<String, MdsError> {
         validate_relative_import(relative)?;
         let path = dir.join(relative);
-        let canonical = Self::check_symlink(&path)?;
-        self.check_path_traversal(&canonical)?;
+        // Use check_symlink_named so the error message shows the relative import
+        // string (what the user typed) rather than the absolute joined path (R3 / CWE-209).
+        let canonical = Self::check_symlink_named(&path, relative)?;
+        self.check_path_traversal(&canonical, relative)?;
         Ok(canonical.display().to_string())
     }
 
@@ -441,12 +471,15 @@ impl FileSystem for NativeFs {
 
         if base.is_empty() {
             // Root entry point: treat `relative` as a filesystem path.
+            // Use check_symlink (shows path.display()) here — at the root entry point
+            // `relative` is the user-supplied path and path.display() == relative, so
+            // there is no leakage risk.
             let canonical = Self::check_symlink(Path::new(relative))?;
             // Anchor the security root on first entry-point resolution.
             // effective_parent is safe even if canonical is somehow relative — avoids PF-006.
             let entry_dir = effective_parent(&canonical);
             self.init_root(entry_dir);
-            self.check_path_traversal(&canonical)?;
+            self.check_path_traversal(&canonical, relative)?;
             Ok(canonical.display().to_string())
         } else {
             // Import from within a resolved module: resolve against the parent
@@ -471,20 +504,23 @@ impl FileSystem for NativeFs {
 
     fn read(&self, normalized: &str) -> Result<String, MdsError> {
         let path = Path::new(normalized);
+        // Compute a display-safe (root-relative) path before any IO so errors
+        // always show a relative path rather than the canonical absolute key (R3 / CWE-209).
+        let display = self.display_of(path);
         // Read bytes first, then check size — this is the TOCTOU-safe pattern.
         // A metadata() pre-check would introduce a race window between the size
         // check and the actual read. Read first, reject after.
-        let bytes = std::fs::read(path)
-            .map_err(|e| MdsError::io(format!("cannot read {normalized}: {e}")))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| MdsError::io(format!("cannot read {display}: {e}")))?;
         if bytes.len() as u64 > MAX_FILE_SIZE {
             return Err(MdsError::resource_limit(format!(
-                "file too large ({} bytes, max {} bytes): {normalized}",
+                "file too large ({} bytes, max {} bytes): {display}",
                 bytes.len(),
                 MAX_FILE_SIZE,
             )));
         }
         String::from_utf8(bytes)
-            .map_err(|e| MdsError::io(format!("invalid UTF-8 in {normalized}: {e}")))
+            .map_err(|e| MdsError::io(format!("invalid UTF-8 in {display}: {e}")))
     }
 
     fn is_markdown(&self, normalized: &str) -> bool {
