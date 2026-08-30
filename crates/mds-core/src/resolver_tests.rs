@@ -1002,14 +1002,24 @@ fn e6_depth_limit_exceeded() {
 
 #[test]
 fn e10_missing_base_file_not_found() {
+    // R6 audit: VirtualFs now emits mds::module_not_found (not mds::file_not_found)
+    // when a key is absent from the in-memory module map.  mds::file_not_found is
+    // reserved for NativeFs.  The @extends resolver attaches a span via
+    // attach_import_span, so the final error may keep the module_not_found code
+    // with a span (attach_import_span path) or be wrapped as ImportError for the
+    // frontmatter path — either is correct; what must NOT occur is file_not_found.
     let child = "@extends \"./missing.mds\"\n";
     let files = [("child.mds", child)];
     let err = compile_virtual(&files, "child.mds")
-        .expect_err("E10: missing base should produce file-not-found");
+        .expect_err("E10: missing base should produce module-not-found");
     let serialized = err.serialize();
-    assert_eq!(
+    assert!(
+        serialized.code == "mds::module_not_found" || serialized.code == "mds::import",
+        "E10: expected module_not_found or import, got: {serialized:?}"
+    );
+    assert_ne!(
         serialized.code, "mds::file_not_found",
-        "E10: should be file_not_found: {serialized:?}"
+        "E10: VirtualFs missing base must not produce file_not_found: {serialized:?}"
     );
 }
 
