@@ -268,7 +268,7 @@ impl FileSystem for VirtualFs {
         let content = self
             .modules
             .get(normalized)
-            .ok_or_else(|| MdsError::file_not_found(normalized.to_string()))?;
+            .ok_or_else(|| MdsError::module_not_found(normalized.to_string()))?;
         if content.len() as u64 > MAX_FILE_SIZE {
             return Err(MdsError::resource_limit(format!(
                 "file too large ({} bytes, max {} bytes): {normalized}",
@@ -654,12 +654,13 @@ mod tests {
     }
 
     #[test]
-    fn vfs_read_missing_key_file_not_found() {
+    fn vfs_read_missing_key_module_not_found() {
+        // R6: VirtualFs::read on a missing key produces ModuleNotFound, not FileNotFound.
         let fs = VirtualFs::new(HashMap::new());
         let err = fs.read("missing.mds").unwrap_err();
         assert!(
-            matches!(err, MdsError::FileNotFound { .. }),
-            "expected FileNotFound, got {err:?}"
+            matches!(err, MdsError::ModuleNotFound { .. }),
+            "expected ModuleNotFound, got {err:?}"
         );
     }
 

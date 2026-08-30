@@ -2494,6 +2494,9 @@ fn attach_import_span(
         MdsError::FileNotFound { span: None, .. } => {
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)
         }
+        MdsError::ModuleNotFound { key, span: None, .. } => {
+            MdsError::module_not_found_at(key, file_str, source, offset, line_len)
+        }
         MdsError::CircularImport {
             cycle, span: None, ..
         } => MdsError::circular_import_at(cycle, file_str, source, offset, line_len),
@@ -2511,6 +2514,11 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
             path, span: None, ..
         } => MdsError::import_error(format!(
             "file not found: \"{path}\" (in frontmatter imports[{i}])"
+        )),
+        MdsError::ModuleNotFound {
+            key, span: None, ..
+        } => MdsError::import_error(format!(
+            "module not found: \"{key}\" (in frontmatter imports[{i}])"
         )),
         MdsError::CircularImport {
             cycle, span: None, ..

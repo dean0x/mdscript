@@ -238,18 +238,17 @@ fn wildcard_reexport() {
 
 #[test]
 fn module_not_found() {
+    // R6: VirtualFs missing-key is ModuleNotFound (possibly wrapped as ImportError
+    // after span attachment), NOT the NativeFs FileNotFound variant.
     let mut modules = HashMap::new();
     modules.insert(
         "main.mds".to_string(),
         "@import \"./missing.mds\"\nHello!\n".to_string(),
     );
-    let err = compile_vfs(modules, "main.mds").expect_err("should fail: file not found");
+    let err = compile_vfs(modules, "main.mds").expect_err("should fail: module not found");
     assert!(
-        matches!(
-            err,
-            MdsError::FileNotFound { .. } | MdsError::ImportError { .. }
-        ),
-        "expected FileNotFound or ImportError, got {err:?}"
+        matches!(err, MdsError::ModuleNotFound { .. } | MdsError::ImportError { .. }),
+        "expected ModuleNotFound or ImportError, got {err:?}"
     );
 }
 
@@ -1916,4 +1915,96 @@ fn b2_unknown_directive_carries_span() {
         "B2: span must point to @unknown directive offset"
     );
     assert!(span.length > 0, "B2: span.length must be > 0");
+}
+
+// ── R6: VirtualFs emits ModuleNotFound, not FileNotFound ─────────────────────
+
+/// R6-A: VirtualFs::read on a missing key — compile path must emit ModuleNotFound
+/// (possibly wrapped as ImportError), NOT FileNotFound.
+#[test]
+fn r6_a_virtual_fs_compile_missing_module_not_found() {
+    let modules: HashMap<String, String> = HashMap::from([(
+        "main.mds".to_string(),
+        "@import \"./missing.mds\"\nHello!\n".to_string(),
+    )]);
+    let err = compile_vfs_err(modules, "main.mds");
+    // After attach_import_span, ModuleNotFound becomes ImportError (with span text).
+    // Either ModuleNotFound (no span yet) or ImportError (span attached) is valid.
+    assert!(
+        matches!(err, MdsError::ModuleNotFound { .. }) || matches!(err, MdsError::ImportError { .. }),
+        "R6-A: expected ModuleNotFound or ImportError (span-wrapped), got {err:?}"
+    );
+    // Must NOT be the NativeFs FileNotFound variant.
+    assert!(
+        !matches!(err, MdsError::FileNotFound { .. }),
+        "R6-A: VirtualFs missing key must not produce FileNotFound"
+    );
+}
+
+/// R6-B: Error code is `mds::module_not_found` on the direct lint_virtual path.
+#[test]
+fn r6_b_virtual_fs_module_not_found_code() {
+    let modules: HashMap<String, String> = HashMap::from([(
+        "main.mds".to_string(),
+        "Hello!\n".to_string(),
+    )]);
+    let err = mds::lint_virtual(modules, "missing.mds", None, &mds::LintConfig::default())
+        .expect_err("expected ModuleNotFound for missing entry");
+    let s = err.serialize();
+    assert_eq!(
+        s.code, "mds::module_not_found",
+        "R6-B: expected code mds::module_not_found, got: {}",
+        s.code
+    );
+}
+
+/// R6-C: Error message mentions the key and virtual module map.
+#[test]
+fn r6_c_virtual_fs_module_not_found_message() {
+    let modules: HashMap<String, String> = HashMap::new();
+    let err = mds::lint_virtual(modules, "no_such.mds", None, &mds::LintConfig::default())
+        .expect_err("expected ModuleNotFound");
+    let s = err.serialize();
+    assert!(
+        s.message.contains("no_such.mds"),
+        "R6-C: message must contain the key; got: {}",
+        s.message
+    );
+    assert!(
+        s.message.contains("virtual module map"),
+        "R6-C: message must mention 'virtual module map'; got: {}",
+        s.message
+    );
+}
+
+/// R6-D: Span attachment — compile of a missing virtual key via @import should
+/// produce an ImportError or ModuleNotFound with serialize code indicating the
+/// module-not-found path (not native file-not-found).
+#[test]
+fn r6_d_virtual_fs_module_not_found_attach() {
+    let modules: HashMap<String, String> = HashMap::from([(
+        "main.mds".to_string(),
+        "@import \"gone.mds\"\nHello!\n".to_string(),
+    )]);
+    let err = compile_vfs_err(modules, "main.mds");
+    let s = err.serialize();
+    assert!(
+        s.code == "mds::module_not_found" || s.code == "mds::import",
+        "R6-D: expected module_not_found or import code, got: {}",
+        s.code
+    );
+}
+
+/// R6-E: VirtualFs::read directly must not emit FileNotFound for missing key.
+#[test]
+fn r6_e_vfs_read_missing_key_not_file_not_found() {
+    let modules: HashMap<String, String> = HashMap::from([(
+        "main.mds".to_string(),
+        "@import \"no_such.mds\"\n".to_string(),
+    )]);
+    let err = compile_vfs_err(modules, "main.mds");
+    assert!(
+        !matches!(err, MdsError::FileNotFound { .. }),
+        "R6-E: VirtualFs missing key must not produce FileNotFound, got {err:?}"
+    );
 }

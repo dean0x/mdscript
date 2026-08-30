@@ -1026,6 +1026,25 @@ describe('lintVirtual', () => {
       },
     );
   });
+
+  // R6: missing virtual module emits mds::module_not_found, not mds::file_not_found.
+  test('R6-NV: lintVirtual on missing entry emits mds::module_not_found', () => {
+    assert.throws(
+      () => lintVirtual({ 'other.mds': 'Hello!\n' }, 'main.mds'),
+      (err) => {
+        assert.equal(
+          err.code,
+          'mds::module_not_found',
+          `R6-NV: expected mds::module_not_found, got: ${err.code}`,
+        );
+        assert.ok(
+          err.message.includes('main.mds'),
+          `R6-NV: message must contain the key; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
 });
 
 // ── Lint parity guard: lint + lintFile produce canonical JSON ─────────────────

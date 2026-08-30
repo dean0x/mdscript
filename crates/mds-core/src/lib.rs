@@ -1289,9 +1289,10 @@ pub fn lint_virtual(
 ) -> Result<LintResult, MdsError> {
     let vars = runtime_vars.unwrap_or_default();
     // Get the entry source before moving `modules` into the check gate.
+    // R6: VirtualFs missing keys are ModuleNotFound, not FileNotFound.
     let source = modules
         .get(entry)
-        .ok_or_else(|| MdsError::file_not_found(entry))?
+        .ok_or_else(|| MdsError::module_not_found(entry))?
         .clone();
     // Step 1: check gate — resolve+validate ONCE (AC-PERF-01).
     {
