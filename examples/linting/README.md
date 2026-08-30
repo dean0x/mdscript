@@ -146,11 +146,15 @@ $ mds lint --fix --diff examples/linting/demo.mds
 ```
 
 `--fix --diff` (and `--fix --check`) never write, and both route through the same
-re-verify gate as a real `--fix`, so the preview is honest. Running plain `--fix`
-removes the duplicate import line (which also clears the unused-import warning) and
-leaves the two remaining warnings for you to resolve by hand. When several fixes are
-planned and one is declined by the gate, `--fix` applies the rest and reports
-`N of M fixes applied`, writing the best state it could reach.
+re-verify gate as a real `--fix`, so the printed preview matches what `--fix` would
+write. The preview exit code is `max(1, residual severity)`: 1 signals that fixes
+are pending, rising to 2 when findings the fix cannot remove would still be
+error-severity afterwards — a preview never exits lower than the `--fix` run it
+predicts. Running plain `--fix` removes the duplicate import line (which also
+clears the unused-import warning) and leaves the two remaining warnings for you to
+resolve by hand. When several fixes are planned and one is declined by the gate,
+`--fix` applies the rest and reports `N of M fixes applied`, writing the best state
+it could reach.
 
 ## rules-tour (`rules-tour.mds`)
 
