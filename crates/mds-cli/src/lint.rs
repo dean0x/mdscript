@@ -460,6 +460,19 @@ fn exit_by_severity(result: &mds::LintResult) {
     }
 }
 
+/// Exit code for a preview (`--fix --check` / `--fix --diff`) that WOULD change
+/// the file: `max(1, residual severity)` (R1, binding rule).
+///
+/// The floor of 1 signals "fixes pending" (the `--check` CI contract); residual
+/// error-severity findings that `--fix` could not remove raise it to 2, so the
+/// preview never reports success-shaped exit codes for a tree the real `--fix`
+/// would leave failing.  The residual can never EXCEED the pre-fix severity —
+/// the reverify gate refuses edits that add findings — so the pre-fix body the
+/// preview emits and the residual-derived exit cannot contradict each other.
+fn preview_exit_code(residual: &mds::LintResult) -> i32 {
+    result_exit_code(residual).max(1)
+}
+
 // ── Fix pipeline helpers ──────────────────────────────────────────────────────
 
 /// Outcome of the `--fix` pipeline for one file.
@@ -633,8 +646,13 @@ fn plan_and_apply_fixes(
 /// (PF-004: preview must use the same gated pipeline as apply and be equally honest
 /// about outcomes).
 enum PreviewOutcome {
-    /// At least one edit would be applied; contains the would-be fixed source.
-    WouldFix(String),
+    /// At least one edit would be applied.  Carries the would-be fixed source
+    /// (for `--diff` rendering) and the residual post-fix [`mds::LintResult`]
+    /// (for the R1 preview exit code — `preview_exit_code(&residual)`).
+    WouldFix {
+        fixed: String,
+        residual: mds::LintResult,
+    },
     /// Every edit was refused by the reverify gate (overlap or recompile failure);
     /// contains the human-readable rejection reason.
     Rejected(String),
@@ -646,20 +664,30 @@ enum PreviewOutcome {
 ///
 /// Routes through the same gated pipeline as the write path — plan, reverify, and
 /// apply — but does NOT write to disk.  Returns [`PreviewOutcome::WouldFix`] with
-/// the would-be fixed source when at least one edit would be applied;
-/// [`PreviewOutcome::Rejected`] with the rejection reason when the reverify gate
-/// refused every edit; [`PreviewOutcome::NothingToFix`] when the plan is empty.
+/// the would-be fixed source AND the residual post-fix result when at least one
+/// edit would be applied; [`PreviewOutcome::Rejected`] with the rejection reason
+/// when the reverify gate refused every edit; [`PreviewOutcome::NothingToFix`]
+/// when the plan is empty.
+///
+/// `display_label` mirrors the `plan_and_apply_fixes` contract: it is written
+/// into every residual `diag.file` via `set_diag_display_path` so the residual
+/// carries the same display path as the write path's residual would (R1) —
+/// without it the residual would leak the basename / `STRING_SOURCE_MAP_LABEL`
+/// that `mds::lint_str_with` sets internally.
 ///
 /// ADR-004 / PF-004: preview must use the same gated pipeline as apply so that
-/// `--diff` shows exactly what `--fix` would write, and `--check` exits 1 iff
-/// `--fix` would change the file.  The `Rejected` variant gives `--fix --check`
-/// the same honesty as `--fix` (which prints "fix rejected: …" on refusal).
+/// `--diff` shows exactly what `--fix` would write, and the preview exit code
+/// reflects what a real `--fix` run would leave behind (R1:
+/// `max(1 if fixes pending, residual severity)` — see [`preview_exit_code`]).
+/// The `Rejected` variant gives `--fix --check` the same honesty as `--fix`
+/// (which prints "fix rejected: …" on refusal).
 fn preview_fixes(
     result: &mds::LintResult,
     source: &str,
     base_dir: &Path,
     runtime_vars: Option<std::collections::HashMap<String, mds::Value>>,
     config: &mds::LintConfig,
+    display_label: &str,
 ) -> PreviewOutcome {
     let is_standalone = result.is_standalone;
     let plan = mds::fix::plan_fixes_with_options(result, source, is_standalone);
@@ -715,11 +743,20 @@ fn preview_fixes(
 
     match outcome {
         mds::fix::FixOutcome::Fixed {
-            source: new_source, ..
+            source: new_source,
+            mut residual,
         }
         | mds::fix::FixOutcome::PartiallyFixed {
-            source: new_source, ..
-        } => PreviewOutcome::WouldFix(new_source),
+            source: new_source,
+            mut residual,
+            ..
+        } => {
+            set_diag_display_path(&mut residual, display_label);
+            PreviewOutcome::WouldFix {
+                fixed: new_source,
+                residual,
+            }
+        }
         mds::fix::FixOutcome::Rejected { reason, .. } => PreviewOutcome::Rejected(reason),
         mds::fix::FixOutcome::NothingToFix => PreviewOutcome::NothingToFix,
         // FixOutcome is #[non_exhaustive]: wildcard required from outside mds-core.
@@ -794,19 +831,40 @@ fn run_lint_stdin(
         // Mirrors run_lint_file's preview path so stdin honours --check / --diff the
         // same way file targets do (PF-004: same gated pipeline as the write path).
         if check || diff {
-            let preview = preview_fixes(&result, &source, &cwd, runtime_vars.clone(), &config);
+            let preview = preview_fixes(
+                &result,
+                &source,
+                &cwd,
+                runtime_vars.clone(),
+                &config,
+                STDIN_DISPLAY_LABEL,
+            );
+            // AD-211-1: pass STDIN_DISPLAY_LABEL so span context renders "<stdin>", not
+            // the internal STRING_SOURCE_MAP_LABEL ("input.mds").
+            let named_source = if format == LintFormat::Human {
+                Some((STDIN_DISPLAY_LABEL, source.as_str()))
+            } else {
+                None
+            };
             match preview {
-                PreviewOutcome::WouldFix(ref fixed) => {
+                // ONE arm for both --check and --diff (R1): the emitted body stays
+                // PRE-fix — the preview reports what is wrong NOW — and the exit
+                // code comes from the residual, floored at 1 because a fix is
+                // pending.  Emit-before-exit: diagnostics render before the exit
+                // (the old --check arm exited without rendering them).
+                PreviewOutcome::WouldFix {
+                    ref fixed,
+                    ref residual,
+                } => {
                     if diff {
                         let diff_str = render_unified_diff(&source, fixed, STDIN_DISPLAY_LABEL);
                         let _ = write_stdout(&diff_str);
                     }
-                    if check {
-                        if !quiet {
-                            eprintln!("Would fix: {STDIN_DISPLAY_LABEL}");
-                        }
-                        std::process::exit(1);
+                    if check && !quiet {
+                        eprintln!("Would fix: {STDIN_DISPLAY_LABEL}");
                     }
+                    emit_result(format, &result, quiet, named_source);
+                    std::process::exit(preview_exit_code(residual));
                 }
                 PreviewOutcome::Rejected(ref reason) => {
                     if !quiet {
@@ -815,15 +873,8 @@ fn run_lint_stdin(
                 }
                 PreviewOutcome::NothingToFix => {}
             }
-            // After diff-only preview, or when nothing would change / fix rejected:
-            // render diagnostics of the original result and exit by severity.
-            // AD-211-1: pass STDIN_DISPLAY_LABEL so span context renders "<stdin>", not
-            // the internal STRING_SOURCE_MAP_LABEL ("input.mds").
-            let named_source = if format == LintFormat::Human {
-                Some((STDIN_DISPLAY_LABEL, source.as_str()))
-            } else {
-                None
-            };
+            // When nothing would change / fix rejected: render diagnostics of the
+            // original result and exit by severity.
             emit_result(format, &result, quiet, named_source);
             exit_by_severity(&result);
             return Ok(());
@@ -1027,25 +1078,29 @@ fn run_lint_file(
     // Previously called apply_plan_unchecked directly, bypassing the reverify gate —
     // a diff or check result could misrepresent what --fix would actually do.
     if fix && (check || diff) {
-        let preview = preview_fixes(&result, &source, base_dir, runtime_vars, &config);
+        let preview = preview_fixes(&result, &source, base_dir, runtime_vars, &config, filename);
         match preview {
-            PreviewOutcome::WouldFix(ref fixed) => {
+            // ONE arm for both --check and --diff (R1): the emitted body stays
+            // PRE-fix — the preview reports what is wrong NOW — and the exit code
+            // comes from the residual, floored at 1 because a fix is pending.
+            PreviewOutcome::WouldFix {
+                ref fixed,
+                ref residual,
+            } => {
                 if diff {
                     let label = safe_path(path);
                     let diff_str = render_unified_diff(&source, fixed, &label);
                     let _ = write_stdout(&diff_str);
                 }
-                if check {
-                    if !quiet {
-                        eprintln!("Would fix: {}", safe_path(path));
-                    }
-                    // AC-F-14: emit JSON result BEFORE exit so consumers always
-                    // receive parseable output regardless of exit code.  Mirrors
-                    // directory mode (run_lint_directory emits the envelope before
-                    // the any_would_fix exit at line ~1413).
-                    emit_result(format, &result, quiet, named_source);
-                    std::process::exit(1);
+                if check && !quiet {
+                    eprintln!("Would fix: {}", safe_path(path));
                 }
+                // AC-F-14 emit-before-exit: emit the (pre-fix) result BEFORE the
+                // exit so consumers always receive parseable output regardless of
+                // exit code.  Mirrors directory mode, which emits the envelope
+                // before its preview-floor exit.
+                emit_result(format, &result, quiet, named_source);
+                std::process::exit(preview_exit_code(residual));
             }
             PreviewOutcome::Rejected(ref reason) => {
                 // Surface the rejection reason so --fix --check is as honest as --fix.
@@ -1055,8 +1110,8 @@ fn run_lint_file(
             }
             PreviewOutcome::NothingToFix => {}
         }
-        // After diff-only preview (or when nothing would change / fix rejected),
-        // render diagnostics and exit by severity.
+        // When nothing would change / fix rejected: render diagnostics and exit
+        // by severity.
         emit_result(format, &result, quiet, named_source);
         exit_by_severity(&result);
         return Ok(());
@@ -1426,14 +1481,20 @@ fn run_lint_directory(
         );
     }
 
-    // --fix --check: exit 1 if any file would have been modified (accumulate-and-continue,
-    // so every file is checked before exiting).
-    if flags.check && any_would_fix {
-        std::process::exit(1);
+    // R1 preview exit rule: exit = max(residual severity across files, 1 if any
+    // file would fix).  In preview mode (--fix --check / --fix --diff) the
+    // per-file tallies feeding max_tally are RESIDUAL-derived (see the preview
+    // arms in lint_one_file_accumulating / lint_one_file_human), so a tree whose
+    // fixes would leave error-severity findings behind exits 2 even though every
+    // file "would fix".  The former `if flags.check && any_would_fix { exit(1) }`
+    // early exit SHADOWED max_tally — residual errors exited 1.
+    // `any_would_fix` can only be set in preview mode, so no mode guard is needed.
+    let mut exit = max_tally.exit_code();
+    if any_would_fix {
+        exit = exit.max(1);
     }
-
-    if max_tally.exit_code() != 0 {
-        std::process::exit(max_tally.exit_code());
+    if exit != 0 {
+        std::process::exit(exit);
     }
     Ok(())
 }
@@ -1623,14 +1684,21 @@ fn lint_one_file_accumulating(
                 return FileTally::Error;
             }
         };
-        match preview_fixes(
+        // R1: in the WouldFix arm the per-file tally comes from the RESIDUAL
+        // (what a real --fix would leave behind); the JSON body stays PRE-fix.
+        // run_lint_directory floors the aggregate exit at 1 via any_would_fix.
+        let tally = match preview_fixes(
             &result,
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
+            &display_path,
         ) {
-            PreviewOutcome::WouldFix(ref fixed) => {
+            PreviewOutcome::WouldFix {
+                ref fixed,
+                ref residual,
+            } => {
                 *any_would_fix = true;
                 if diff {
                     let label = safe_path(file);
@@ -1641,17 +1709,19 @@ fn lint_one_file_accumulating(
                 if check && !quiet {
                     eprintln!("Would fix: {}", safe_path(file));
                 }
+                tally_from_result(residual)
             }
             PreviewOutcome::Rejected(ref reason) => {
                 // D4 (AD-216-11): status message — suppress under --quiet.
                 if !quiet {
                     eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
                 }
+                tally_from_result(&result)
             }
-            PreviewOutcome::NothingToFix => {}
-        }
+            PreviewOutcome::NothingToFix => tally_from_result(&result),
+        };
         accumulate_result_json(&result, json_files);
-        tally_from_result(&result)
+        tally
     } else {
         accumulate_result_json(&result, json_files);
         tally_from_result(&result)
@@ -1799,14 +1869,22 @@ fn lint_one_file_human(
         }
     } else if fix && (check || diff) {
         // Directory-mode preview — route through gated pipeline.
-        match preview_fixes(
+        // R1: in the WouldFix arm the per-file tally comes from the RESIDUAL
+        // (what a real --fix would leave behind); the rendered body stays
+        // PRE-fix.  run_lint_directory floors the aggregate exit at 1 via
+        // any_would_fix.
+        let tally = match preview_fixes(
             &result,
             &source,
             base_dir,
             ctx.runtime_vars.clone(),
             &config,
+            &display_path,
         ) {
-            PreviewOutcome::WouldFix(ref fixed) => {
+            PreviewOutcome::WouldFix {
+                ref fixed,
+                ref residual,
+            } => {
                 *any_would_fix = true;
                 if diff {
                     let label = safe_path(file);
@@ -1816,16 +1894,18 @@ fn lint_one_file_human(
                 if check && !quiet {
                     eprintln!("Would fix: {}", safe_path(file));
                 }
+                tally_from_result(residual)
             }
             PreviewOutcome::Rejected(ref reason) => {
                 if !quiet {
                     eprintln!("{}: fix rejected: {}", safe_path(file), safe_inline(reason));
                 }
+                tally_from_result(&result)
             }
-            PreviewOutcome::NothingToFix => {}
-        }
+            PreviewOutcome::NothingToFix => tally_from_result(&result),
+        };
         render_result_human(&result, quiet, named_source);
-        tally_from_result(&result)
+        tally
     } else {
         render_result_human(&result, quiet, named_source);
         tally_from_result(&result)
@@ -1970,6 +2050,7 @@ mod tests {
             Path::new("."),
             None,
             &mds::LintConfig::default(),
+            "overlap.mds",
         );
 
         assert!(
@@ -1977,6 +2058,68 @@ mod tests {
             "preview_fixes must return Rejected for an overlap_rejected plan, \
              not NothingToFix or WouldFix (PF-004 — preview must be as honest as apply)"
         );
+    }
+
+    /// R1: the residual carried by `PreviewOutcome::WouldFix` must have every
+    /// diagnostic's `file` field relabelled to the caller-supplied display label,
+    /// mirroring the `plan_and_apply_fixes` contract.  Without the relabel the
+    /// residual leaks the internal `STRING_SOURCE_MAP_LABEL` basename that
+    /// `mds::lint_str_with` sets inside the reverify closure.
+    ///
+    /// The source carries one FIXABLE finding (empty-block on the bare `@if`) and
+    /// one NON-fixable finding that survives the fix (unused-variable on the
+    /// unreferenced frontmatter key), so the residual is non-empty — the label
+    /// assertion cannot pass vacuously (PF-013), and a non-vacuity guard asserts
+    /// the expected rule survived.
+    #[test]
+    fn preview_fixes_would_fix_relabels_residual_display_path() {
+        let source = "---\nunused_key: value\n---\n\n@if \"a\" == \"a\":\n@end\n\nHello\n";
+        let config = mds::LintConfig::default();
+        let result = mds::lint_str_with(source, Some(Path::new(".")), None, &config)
+            .expect("fixture source must lint");
+
+        let outcome = preview_fixes(
+            &result,
+            source,
+            Path::new("."),
+            None,
+            &config,
+            "custom-label.mds",
+        );
+
+        match outcome {
+            PreviewOutcome::WouldFix { ref residual, .. } => {
+                assert!(
+                    !residual.diagnostics.is_empty(),
+                    "non-vacuity (PF-013): the unused-variable finding must survive the fix"
+                );
+                assert!(
+                    residual
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.rule == "unused-variable"),
+                    "non-vacuity (PF-013): expected the surviving rule to be unused-variable; \
+                     got: {:?}",
+                    residual
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.rule.as_str())
+                        .collect::<Vec<_>>()
+                );
+                for diag in &residual.diagnostics {
+                    assert_eq!(
+                        diag.file.as_deref(),
+                        Some("custom-label.mds"),
+                        "R1: every residual diagnostic must carry the caller-supplied \
+                         display label"
+                    );
+                }
+            }
+            _ => panic!(
+                "preview_fixes must return WouldFix for a source with a fixable \
+                 empty-block finding"
+            ),
+        }
     }
 
     /// Regression: `relative_display` must NOT treat a literal backslash in a
