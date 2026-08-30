@@ -138,11 +138,30 @@ fn do_lint(args: LintArgs) -> Result<()> {
         format,
     };
 
-    let resolved = build_runtime_vars(RuntimeVarArgs {
+    let resolved = match build_runtime_vars(RuntimeVarArgs {
         vars,
         set_vars,
         set_string_vars,
-    })?;
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            // R4 carve-out — scope: EXACTLY this one variant, nothing wider.
+            // A --set/--set-string collision is a usage error over runtime
+            // VARIABLES, not an analysis failure: build/check/watch exit 1 for
+            // it via `exit_code()`, so lint must not blanket-exit 2 for the
+            // same mistake.  Downcast BEFORE any render call (`eprint_error`
+            // consumes the report).  Routing through
+            // emit_analysis_failure_json_or_stderr also gives --format json
+            // consumers the structured `mds::var_conflict` envelope (AC-F-14).
+            // Every OTHER setup error deliberately keeps the blanket exit 2
+            // in run_lint's catch.
+            if let Some(mds_err @ MdsError::VarConflict { .. }) = e.downcast_ref::<MdsError>() {
+                emit_analysis_failure_json_or_stderr(mds_err, format, None);
+                std::process::exit(1);
+            }
+            return Err(e);
+        }
+    };
     emit_duplicate_var_warnings(&resolved, quiet);
     let runtime_vars = resolved.vars;
 

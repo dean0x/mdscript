@@ -461,6 +461,11 @@ pub(crate) fn exit_code(err: &miette::Error) -> i32 {
         match mds_err {
             MdsError::Io { .. } | MdsError::FileNotFound { .. } | MdsError::NotMdsFile { .. } => 2,
             MdsError::ResourceLimit { .. } => 3,
+            // R4: --set/--set-string collision is a usage error over runtime
+            // VARIABLES — the logical/content error class (exit 1).  Explicit
+            // arm so the classification is a decision, not an accident of the
+            // fall-through below.
+            MdsError::VarConflict { .. } => 1,
             _ => 1,
         }
     } else {
@@ -566,11 +571,15 @@ pub(crate) fn build_runtime_vars(args: RuntimeVarArgs) -> Result<RuntimeVars> {
     let set_keys: HashSet<&str> = set_vars.iter().map(|(k, _)| k.as_str()).collect();
 
     // Reject any key that appears in both --set and --set-string.
+    // R4: typed as MdsError::VarConflict (code mds::var_conflict, exit 1 on every
+    // subcommand — see exit_code() and the lint carve-out in lint.rs::do_lint).
+    // Struct-literal construction; the key is sanitized at serialize/render time,
+    // not here (ADR-008 — one-place sanitization).
     for (key, _) in &set_string_vars {
         if set_keys.contains(key.as_str()) {
-            return Err(miette::miette!(
-                "variable '{key}' is set by both --set and --set-string; use only one"
-            ));
+            return Err(miette::Error::from(MdsError::VarConflict {
+                key: key.clone(),
+            }));
         }
     }
 
