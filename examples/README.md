@@ -18,11 +18,12 @@ mds fmt --check examples/
 # Static analysis — 10 rules, human and JSON output, --fix --diff preview
 mds lint examples/linting/
 
-# Source Map v3 — sidecar .map file, --inline data-URI, or --embed-sources
+# Source Map v3 — sidecar .map file (gitignored via examples/**/*.md.map),
+# --inline data-URI, or --embed-sources self-contained variant
 mds build examples/source-maps/annotated-prompt.mds --source-map -o /tmp/out.md
 
 # String variables without type coercion (e.g. preserve leading zeros)
-mds build template.mds --set-string zip_code=02134
+mds build examples/edge-cases/30_set_string_cli.mds --set-string id=007 -o -
 
 # Decode a Source Map v3 and trace output lines back to their source
 node examples/source-maps/consume-map.mjs
@@ -43,12 +44,13 @@ mds lint examples/linting/config-demo/loop-shadow.mds
 | [`blog-generator/`](blog-generator/) | A blog post template driven by frontmatter variables |
 | [`prompt-library/`](prompt-library/) | A reusable prompt library using `@export`/`@import` (personas, formatting, guardrails) |
 | [`inheritance/`](inheritance/) | Template inheritance with `@extends`/`@block` — one base agent skeleton specialized into a data analyst and a code reviewer |
-| [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports; v0.4.0 adds interior blank-line preservation, typed comparisons, and `@extends` frontmatter merge; `30_set_string_cli.mds` demos `--set` (coerces to number, may raise `mds::type_mismatch`) vs `--set-string` (keeps string bytes byte-for-byte), and both flags on the same key as a hard error; `31_wide_and_nested_fences.mds` shows a 4-backtick fence wrapping a 3-backtick block verbatim, and mismatched ``` / ~~~ markers that never cross-close |
+| [`edge-cases/`](edge-cases/) | Numbered walkthrough of language features — loops, conditionals, imports, escaping, re-exports, runtime vars, built-in functions, default args, logical operators, expression directives, frontmatter imports; v0.4.0 adds interior blank-line preservation, typed comparisons, and `@extends` frontmatter merge; `30_set_string_cli.mds` demos `--set` (coerces to number, may raise `mds::type_mismatch`) vs `--set-string` (keeps string bytes byte-for-byte), and both flags on the same key as a hard error; `31_wide_and_nested_fences.mds` shows a 4-backtick fence wrapping a 3-backtick block verbatim; `32_dynamic_message_role.mds` shows `@message {{role}}:` with the role driven by a frontmatter variable |
 | [`stress-test/`](stress-test/) | A large, deeply-composed template tree exercising the resolver and evaluator |
-| [`linting/`](linting/) | A deliberately-messy template that trips four lint rules; shows `mds lint` human and JSON output, `--fix` tiers (A auto-applies, B standalone-only, C report-only), `--diff` preview, exit-code semantics, and per-rule severity overrides via `mds.json` (`config-demo/` — enables `shadow-variable`, promotes `unused-variable` to error, silences `redundant-else`) |
-| [`source-maps/`](source-maps/) | Source Map v3 generation via `mds build --source-map` — sidecar map, `--inline` data-URI embed, and `--embed-sources` self-contained variant |
-| [`formatting/`](formatting/) | Auto-formatter demo (`mds fmt`) — write, `--check`, `--diff`, and stdin filter modes; what fmt normalizes (directive trailing whitespace, line endings, final newline) vs. preserves byte-for-byte (body text, `@message`/`@define` bodies); the safety gate that refuses any rewrite changing compiled output; exit codes |
-| [`python/`](python/) | Native Python bindings (`markdown_script`, built with PyO3) — compile strings and files with `markdown_script.compile`/`compile_file`, generate Source Map v3 with `source_map=True`, handle `MdsError` (`.code`, `.help`, `.span`), and lint with `markdown_script.lint`; requires a virtualenv + `maturin develop` (`source .venv/bin/activate`) |
+| [`linting/`](linting/) | Two lint fixtures: `demo.mds` trips four rules (duplicate-import, unused-import, unused-variable, redundant-else); `rules-tour.mds` covers the other five (duplicate-export, unreachable-branch, empty-block, unused-function, legacy-interpolation). Shows `mds lint` human and JSON output, `--fix` tiers (A auto-applies, B standalone-only, C report-only), `--diff` preview, exit-code semantics, and per-rule severity overrides via `mds.json` (`config-demo/`) |
+| [`source-maps/`](source-maps/) | Source Map v3 generation — sidecar `.map` file, `--inline` data-URI, `--embed-sources` (fills `sourcesContent[]`), combined `--inline --embed-sources`; `config-demo/mds.json` enables `build.source_map = true` project-wide; `--no-source-map` overrides config; messages-mode templates emit a warning and no map; sidecar files are gitignored via `examples/**/*.md.map` |
+| [`formatting/`](formatting/) | Auto-formatter demo (`mds fmt`) — write, `--check`, `--diff`, and stdin filter modes; what fmt normalizes (directive trailing whitespace, line endings, final newline) vs. preserves byte-for-byte (body text, `@message`/`@define` bodies); the safety gate that refuses any rewrite changing compiled output; exit codes. `needs-formatting/` is a deliberately-unformatted fixture: `mds fmt --check examples/formatting/needs-formatting/` exits `1` by design |
+| [`watch/`](watch/) | Live-recompile demo (`mds watch`) — single-file and directory modes, streaming to stdout or a file, partial-edit propagation via the reverse-dependency graph, runtime variable reload with `--vars`, debounce and poll-interval tuning, `--clear` for TTY display |
+| [`python/`](python/) | Native Python bindings (`markdown_script`, built with PyO3) — `compile`/`compile_file`/`compile_virtual`, source maps with `source_map=True`/`sources_content=True`, `check`/`check_file`/`check_virtual`, `scan_imports`, `lint`/`lint_file`/`lint_virtual`, `lint_warnings` (unknown rule names), frozen + picklable result classes; requires a virtualenv + `maturin develop` (`source .venv/bin/activate`) |
 
 Some examples take runtime variables — pass the accompanying `vars.json`:
 
@@ -81,7 +83,7 @@ mds build examples/ --out-dir dist/
 mds check examples/
 ```
 
-Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design because `examples/linting/demo.mds` and `examples/linting/config-demo/loop-shadow.mds` both deliberately trigger error-level findings.
+Note: `examples/stress-test/errors/` contains five intentionally-failing fixtures (`bad-arity`, `bad-circular-a/b`, `bad-type`, `bad-undefined`), so `mds build examples/ --out-dir dist/` and `mds check examples/` exit non-zero by design. Likewise, `mds lint examples/` exits 2 by design — it reports `83 clean, 1 with warnings, 8 with errors`. The 8 error-severity files are three deliberate lint demos (`linting/demo.mds`, `linting/rules-tour.mds`, `linting/config-demo/loop-shadow.mds`) and the five `stress-test/errors/` fixtures, which fail analysis (`mds::arity`, `mds::circular_import` ×2, `mds::type_error`, `mds::undefined_var`) rather than tripping lint rules. `mds fmt --check examples/` also exits 1 by design because `examples/formatting/needs-formatting/unformatted.mds` is intentionally left unformatted.
 
 `@message` detection is **static**: a `@message` block anywhere in the template
 (even inside `@if false:`) makes it a messages template. **Mixed content** —

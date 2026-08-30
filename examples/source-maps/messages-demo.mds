@@ -1,0 +1,7 @@
+@message system:
+You are a release review assistant.
+@end
+
+@message user:
+Review the release notes and flag any issues.
+@end

@@ -24,6 +24,23 @@ mds build examples/edge-cases/30_set_string_cli.mds --set id=1 --set-string id=0
 
 Rendered id: {{id}}
 
+~~~bash
+# (5) duplicate --set key — a warning is emitted on stderr and the last value
+#     wins. Here id=99 (number); the id == "007" branch then type-mismatches
+#     (exit 1). Warning text: "variable 'id' is set more than once by --set;
+#     the last value wins"
+mds build examples/edge-cases/30_set_string_cli.mds --set id=42 --set id=99 -o -
+
+# (6) --quiet suppresses the warning (stderr is silent) but not the error.
+#     The type_mismatch error and exit 1 remain.
+mds build examples/edge-cases/30_set_string_cli.mds --set id=42 --set id=99 --quiet -o -
+~~~
+
+Note: the duplicate-key warning (a non-fatal advisory) is distinct from the
+hard error in invocation (4), where a key appears in BOTH `--set` and
+`--set-string`. The warning fires for repeated `--set`, repeated `--set-string`,
+or both; `--quiet` silences the warning in all three cases.
+
 @if number(id) == 7:
 - `number(id) == 7` — bridging to a number yields 7 in every mode; leading zeros are gone.
 @end

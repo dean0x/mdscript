@@ -30,3 +30,30 @@ CLI note: `--set zip_code=02134` coerces the value to the number 2134;
 use `--set-string zip_code=02134` to keep the string "02134" byte-for-byte.
 Supplying the same key via both `--set` and `--set-string` in one
 invocation is a hard error.
+
+Breaking-change demonstration: in v0.3 `--set zip_code=02134` set `zip_code`
+to the number 2134 and the `zip_code == "02134"` branch silently returned
+false. In v0.4.0 that cross-type comparison raises `mds::type_mismatch`
+(exit 1). Run to reproduce (exit 1 is expected; path in error reflects your CWD):
+
+~~~bash
+mds build examples/edge-cases/28_typed_comparisons.mds --set zip_code=02134 -o -
+~~~
+
+Actual error output (verified):
+
+~~~
+mds::type_mismatch
+
+  × type mismatch: cannot compare number with string
+    ╭─[examples/edge-cases/28_typed_comparisons.mds:19:1]
+ 18 │ @end
+ 19 │ @if zip_code == "02134":
+    · ────────────┬───────────
+    ·             ╰── cross-type comparison
+ 20 │ - string == string: zip_code stays "02134" — the leading zero matters
+    ╰────
+  help: left side is number, right side is string; compare against a number
+        literal, use '@if x:' for truthiness, or pass a string with '--set-
+        string KEY=VALUE'
+~~~

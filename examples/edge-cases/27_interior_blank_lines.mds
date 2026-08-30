@@ -38,3 +38,17 @@ block-end — the two blank lines above are verbatim.
 Edge rule: `@define` and `@message` bodies edge-trim (leading and trailing
 blank lines of the body are stripped), but interior runs are never collapsed.
 `@block` bodies and ordinary text keep even their edge blank lines.
+
+### Proving edge-trim: @define body with leading and trailing blank lines
+
+@define edge_trim_demo():
+
+edge-trim-start — the blank line above this line is stripped from the output.
+edge-trim-end — the blank line below this line is stripped from the output.
+
+@end
+
+BEFORE-CALL
+{{edge_trim_demo()}}
+AFTER-CALL — no blank line between "BEFORE-CALL" and "edge-trim-start", and
+none between "edge-trim-end" and "AFTER-CALL".

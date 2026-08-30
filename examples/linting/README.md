@@ -11,6 +11,13 @@ trips four lint rules: **duplicate-import** (error, auto-fixable), **unused-impo
 module it imports twice. `config-demo/` is a self-contained sub-example showing
 `mds.json` rule overrides (see [Config demo](#config-demo-config-demo)).
 
+`rules-tour.mds` is a second fixture that covers the five rules not demonstrated by
+`demo.mds`: **duplicate-export** (error), **unreachable-branch** (error), **empty-block**
+(warn), **unused-function** (warn), and **legacy-interpolation** (warn). Because it trips
+two error-severity rules, `mds lint rules-tour.mds` exits **`2`** by design. It also
+demonstrates `fix_edits` in a non-null state — visible in the JSON output for the
+`legacy-interpolation` finding (see [rules-tour.mds](#rules-tour-rules-tourmds)).
+
 All commands below are run from the repository root.
 
 ## The ten rules
@@ -145,6 +152,139 @@ leaves the two remaining warnings for you to resolve by hand. When several fixes
 planned and one is declined by the gate, `--fix` applies the rest and reports
 `N of M fixes applied`, writing the best state it could reach.
 
+## rules-tour (`rules-tour.mds`)
+
+`rules-tour.mds` deliberately trips the five rules that `demo.mds` does not exercise.
+It compiles cleanly (`mds build` exit `0`) and passes `mds fmt --check` (exit `0`).
+
+### Human output
+
+```console
+$ mds lint examples/linting/rules-tour.mds
+mds::lint::unused-function
+
+  ⚠ [unused-function] Function 'helper' is defined but never exported or
+  │ called.
+    ╭─[rules-tour.mds:9:1]
+  8 │
+  9 │ @define helper():
+    · ───────┬──────
+    ·        ╰── Function 'helper' is defined but never exported or called.
+ 10 │ This function is defined but never exported or called.
+    ╰────
+  help: Export the function with @export or call it somewhere, or remove the
+        definition.
+
+mds::lint::duplicate-export
+
+  × [duplicate-export] Duplicate export: 'greet' is exported more than once.
+    ╭─[rules-tour.mds:14:1]
+ 13 │ @export greet
+ 14 │ @export greet
+    · ───┬───
+    ·    ╰── Duplicate export: 'greet' is exported more than once.
+ 15 │
+    ╰────
+  help: Remove the duplicate @export directive.
+
+mds::lint::unreachable-branch
+
+  × [unreachable-branch] @if condition is always false — the then-body is dead
+  │ code.
+    ╭─[rules-tour.mds:23:1]
+ 22 │
+ 23 │ @if "x" == "y":
+    · ─┬─
+    ·  ╰── @if condition is always false — the then-body is dead code.
+ 24 │ This branch is always-false dead code — unreachable-branch fires (error).
+    ╰────
+  help: Replace the constant condition with a variable or remove the dead
+        branch.
+
+mds::lint::empty-block
+
+  ⚠ [empty-block] @if then-body is empty.
+    ╭─[rules-tour.mds:27:1]
+ 26 │
+ 27 │ @if active:
+    · ─┬─
+    ·  ╰── @if then-body is empty.
+ 28 │ @end
+    ╰────
+  help: Add content inside the @if block or remove it.
+
+mds::lint::legacy-interpolation
+
+  ⚠ [legacy-interpolation] legacy single-brace interpolation `{name}` — use
+  │ `{{name}}` (double braces)
+    ╭─[rules-tour.mds:30:47]
+ 29 │
+ 30 │ Legacy single-brace interpolation fires here: {name}
+    ·                                               ───┬──
+    ·                                                  ╰── legacy single-brace interpolation `{name}` — use `{{name}}` (double braces)
+    ╰────
+  help: Run `mds lint --fix` to migrate to `{{x}}` syntax automatically.
+```
+
+`mds lint examples/linting/rules-tour.mds` exits **`2`** — the `duplicate-export` and
+`unreachable-branch` findings are error-severity.
+
+### JSON output and fix_edits
+
+`legacy-interpolation` is a Tier A rule that rewrites source text rather than removing
+whole lines. Its fix is expressed as a `fix_edits` array (not `fix_removals`), making it
+the only finding in the tour with a non-null `fix_edits` value in the JSON:
+
+```console
+$ mds lint --format json examples/linting/rules-tour.mds
+```
+
+```json
+{"files":[{"diagnostics":[{"fix_edits":null,"fixable":true,"help":"Export the function with @export or call it somewhere, or remove the definition.","message":"Function 'helper' is defined but never exported or called.","rule":"unused-function","severity":"warn","span":{"length":14,"offset":74}},{"fix_edits":null,"fixable":true,"help":"Remove the duplicate @export directive.","message":"Duplicate export: 'greet' is exported more than once.","rule":"duplicate-export","severity":"error","span":{"length":7,"offset":167}},{"fix_edits":null,"fixable":true,"help":"Replace the constant condition with a variable or remove the dead branch.","message":"@if condition is always false — the then-body is dead code.","rule":"unreachable-branch","severity":"error","span":{"length":3,"offset":489}},{"fix_edits":null,"fixable":true,"help":"Add content inside the @if block or remove it.","message":"@if then-body is empty.","rule":"empty-block","severity":"warn","span":{"length":3,"offset":587}},{"fix_edits":[{"end":657,"new_text":"{{name}}","start":651}],"fixable":true,"help":"Run `mds lint --fix` to migrate to `{{x}}` syntax automatically.","message":"legacy single-brace interpolation `{name}` — use `{{name}}` (double braces)","rule":"legacy-interpolation","severity":"warn","span":{"length":6,"offset":651}}],"file":"rules-tour.mds"}],"truncated":false,"version":1}
+```
+
+The `legacy-interpolation` entry is the only one with a non-null `fix_edits`: a single
+atomic `TextEdit` that replaces the `{name}` span (bytes 651–657) with `{{name}}`.
+
+### Preview the auto-fix
+
+```console
+$ mds lint --fix --diff examples/linting/rules-tour.mds
+--- examples/linting/rules-tour.mds
++++ examples/linting/rules-tour.mds
+@@ -6,12 +6,8 @@
+ Hello, {{name}}!
+ @end
+
+-@define helper():
+-This function is defined but never exported or called.
+-@end
+
+ @export greet
+-@export greet
+
+ # Rules tour
+
+@@ -20,11 +16,8 @@
+ **unreachable-branch** (error, auto-fixable), **unused-function** (warn), and
+ **legacy-interpolation** (warn, auto-fixable via fix_edits).
+
+-@if "x" == "y":
+-This branch is always-false dead code — unreachable-branch fires (error).
+-@end
+
+ @if active:
+ @end
+
+-Legacy single-brace interpolation fires here: {name}
++Legacy single-brace interpolation fires here: {{name}}
+```
+
+`--fix --diff` (and `--fix --check`) never write. Running plain `--fix` applies the
+four auto-fixable findings — the `unused-function` (Tier B, standalone), `duplicate-export`
+and `unreachable-branch` (Tier A, line-removal), and `legacy-interpolation` (Tier A,
+`fix_edits` rewrite). The `empty-block` warning is left for manual resolution in this run.
+
 ## Config demo (`config-demo/`)
 
 `config-demo/` carries its own `mds.json` that overrides three rule severities:
@@ -206,3 +346,13 @@ not emit the unknown-rule warning.
 `mds lint examples/linting/demo.mds` exits **`2`** by design — the duplicate import
 is an error-severity finding. With `--fix`, the *residual* findings after fixing
 determine the exit code.
+
+`mds lint examples/linting/rules-tour.mds` also exits **`2`** — `duplicate-export`
+and `unreachable-branch` are both error-severity.
+
+`mds lint examples/linting` (directory mode) exits **`2`** and reports
+`1 clean, 0 with warnings, 3 with errors, 0 resource-limited`.
+
+`mds build examples/linting` exits **`0`** — all files compile cleanly regardless of
+lint findings. `mds fmt --check examples/linting` exits **`0`** — all source files
+are formatter-clean.

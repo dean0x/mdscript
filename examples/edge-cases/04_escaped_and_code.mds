@@ -6,7 +6,8 @@ language: Python
 
 Here's how to use string formatting in {{language}}:
 
-Escaped braces: {variable} should appear literally.
+Single braces: {variable} is plain literal text in v0.4.0 — single `{` / `}`
+are never interpolated, so no escape is needed to suppress them.
 
 ```python
 name = "World"
@@ -26,3 +27,17 @@ This is literal text inside a code fence.
 ```
 
 Back to normal: {{language}} rocks.
+
+The v0.4.0 escape for a literal double-opening-brace in output is a leading
+backslash. The fenced block below shows source and result side-by-side (both
+are verbatim inside the fence — no processing occurs):
+
+~~~
+source:  \{{language}}
+output:  {{language}}
+~~~
+
+Live — the line below uses the escape in source; the compiled output is the
+literal text shown:
+
+\{{language}} — the backslash-escape produced a literal `\{{` pair here.

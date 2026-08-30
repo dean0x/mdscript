@@ -1,0 +1,8 @@
+---
+title: Python Binding Demo
+unused_key: not-referenced
+---
+# {{title}}
+
+This template is used by the Python binding demo.
+It exercises `check_file` and `lint_file`.
