@@ -86,6 +86,13 @@ pub struct NamespaceScope {
     /// The `Arc` enables O(1) copy into the `NamespaceScope` without cloning
     /// the segment data; all `@include` call sites share one allocation.
     pub(crate) prompt_map: Option<Arc<crate::sourcemap::FragmentMap>>,
+    /// `true` when the module has body text but its explicit `@export` list
+    /// excludes `"prompt"`.  Lets `evaluate_include` emit a precise WARN-B
+    /// ("add `@export prompt`") instead of the generic WARN-A ("no body text").
+    ///
+    /// `false` when the module genuinely has no body text (WARN-A) or when
+    /// prompt is visible (no warning needed).
+    pub(crate) prompt_suppressed_by_exports: bool,
 }
 
 impl Default for Scope {
@@ -272,6 +279,7 @@ mod tests {
             functions: HashMap::new(),
             prompt_body: None,
             prompt_map: None,
+            prompt_suppressed_by_exports: false,
         }
     }
 
@@ -292,6 +300,7 @@ mod tests {
                 functions: HashMap::new(),
                 prompt_body: Some("outer".into()),
                 prompt_map: None,
+                prompt_suppressed_by_exports: false,
             },
         );
         scope.push();
@@ -301,6 +310,7 @@ mod tests {
                 functions: HashMap::new(),
                 prompt_body: Some("inner".into()),
                 prompt_map: None,
+                prompt_suppressed_by_exports: false,
             },
         );
         // Inner frame shadows outer.

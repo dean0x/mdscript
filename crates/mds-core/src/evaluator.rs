@@ -1157,10 +1157,24 @@ fn evaluate_include(
         None => {
             if ctx.warnings.len() < MAX_WARNINGS {
                 // Untrusted identifier from template source — WIRE (spec 7.5).
-                ctx.warnings.push(format!(
-                    "warning: @include of '{}' produced empty output — module has no body text",
-                    crate::lint::sanitize_control_chars_wire(&inc.alias)
-                ));
+                let safe_alias = crate::lint::sanitize_control_chars_wire(&inc.alias);
+                let msg = if ns.prompt_suppressed_by_exports {
+                    // WARN-B: module has body text but @export list excludes "prompt".
+                    format!(
+                        "warning: @include of '{safe_alias}' produced empty output \
+                         — module has body text, but its explicit @export list does not export \
+                         'prompt'; add `@export prompt` to the module, or call its functions \
+                         directly: {{{{{safe_alias}.fn()}}}}"
+                    )
+                } else {
+                    // WARN-A: module has no body text at all.
+                    format!(
+                        "warning: @include of '{safe_alias}' produced empty output \
+                         — module has no body text; to use the module's functions, call them \
+                         directly: {{{{{safe_alias}.fn()}}}}"
+                    )
+                };
+                ctx.warnings.push(msg);
             }
             return Ok(String::new());
         }

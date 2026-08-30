@@ -2023,15 +2023,21 @@ impl ResolvedModule {
         // Respect export visibility: prompt_body and prompt_map are only included
         // in the namespace when "prompt" is an available export (same rule as
         // get_prompt_value).  Arc::clone is O(1) — no segment data is copied.
-        let (prompt_body, prompt_map) = if self.is_exported("prompt") {
+        let prompt_exported = self.is_exported("prompt");
+        let (prompt_body, prompt_map) = if prompt_exported {
             (self.prompt_body.clone(), self.prompt_map.clone())
         } else {
             (None, None)
         };
+        // True when the module has body text but its @export list explicitly
+        // excludes "prompt" — the caller's @include will produce empty output
+        // and WARN-B should fire instead of WARN-A.
+        let prompt_suppressed_by_exports = !prompt_exported && self.prompt_body.is_some();
         NamespaceScope {
             functions,
             prompt_body,
             prompt_map,
+            prompt_suppressed_by_exports,
         }
     }
 }

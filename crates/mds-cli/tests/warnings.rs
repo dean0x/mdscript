@@ -433,3 +433,43 @@ fn i7_hostile_key_is_wire_escaped_in_warning() {
     // Now assert the raw control bytes are absent.
     assert_no_control_chars(&stderr, "I7 stderr");
 }
+
+// ── R2: @include warning precision ───────────────────────────────────────────
+
+#[test]
+fn r2_include_export_hides_prompt_warns_about_export_list() {
+    // include_export_hides_prompt.mds imports a module that HAS body text but
+    // whose @export list excludes "prompt".  The warning should mention the
+    // exports list, NOT say "no body text".
+    let output = mds_bin()
+        .args([
+            "build",
+            "-o",
+            "-",
+            fixture("include_export_hides_prompt.mds").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "build of include_export_hides_prompt.mds should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    // Warning should be present.
+    assert!(
+        stderr.contains("empty output"),
+        "R2: expected 'empty output' warning; got: {stderr:?}"
+    );
+    // WARN-B: mentions the exports list.
+    assert!(
+        stderr.contains("does not export") || stderr.contains("@export list"),
+        "R2: WARN-B must mention the @export list; got: {stderr:?}"
+    );
+    // WARN-B must NOT say "no body text".
+    assert!(
+        !stderr.contains("no body text"),
+        "R2: WARN-B must NOT say 'no body text'; got: {stderr:?}"
+    );
+    assert_no_control_chars(&stderr, "R2 warning line");
+}
