@@ -408,6 +408,25 @@ pub enum MdsError {
     )]
     InvalidVars { message: String },
 
+    /// A runtime variable key was supplied through both `--set` and
+    /// `--set-string` in the same CLI invocation.
+    ///
+    /// A usage error over runtime VARIABLES, not an analysis failure: every
+    /// subcommand exits 1 for it (the logical/content error class), including
+    /// `mds lint`, which carves this one variant out of its blanket
+    /// analysis-failure exit 2.
+    ///
+    /// The key is NOT `safe_inline`'d at construction — `serialize()` and
+    /// `eprint_error` sanitize in one place (ADR-008).  No constructor fn:
+    /// the CLI struct-literals this variant (precedent: `MdsError::Io` at the
+    /// lint config-load sites).
+    #[error("variable '{key}' is set by both --set and --set-string; use only one")]
+    #[diagnostic(
+        code(mds::var_conflict),
+        help("--set coerces the value (bool/number/null/array/string); --set-string always passes a string — keep the flag whose semantics you want and drop the other")
+    )]
+    VarConflict { key: String },
+
     /// A virtual module key requested by `compile_virtual`, `lint_virtual`, or
     /// an in-template `@import` was not found in the virtual module map.
     ///
@@ -1020,6 +1039,7 @@ impl MdsError {
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
+            | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,
@@ -1112,6 +1132,7 @@ impl MdsError {
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
+            | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,
