@@ -7,6 +7,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'nod
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createMdsTransformer } from '../dist/index.js';
+import { stripWindowsVerbatimPrefix } from '../dist/project-root.js';
 
 // ---------------------------------------------------------------------------
 // Mock MdsApi
@@ -544,6 +545,30 @@ describe('dependency path contracts (J1)', () => {
     }
   });
 
+  test('T-J1-7: Windows verbatim canonical dep is stripped — absolute watch dep, root-relative metadata', async () => {
+    const root = makeTmpRoot('verbatim');
+    try {
+      // On Windows, std::fs::canonicalize returns extended-length verbatim
+      // paths (`\\?\D:\...`), and the native backend reports dependencies in
+      // that form. path.relative cannot bridge a verbatim path and a
+      // non-verbatim root (no common component → it returns the absolute `to`
+      // path), so without stripping, every native dep degrades to its basename
+      // in metadata and the watch dep diverges from the wasm leg (PF-007
+      // parity). The `\\?\` prefix is a pure string prefix on every platform,
+      // so this replicates the Windows condition platform-agnostically.
+      const plain = join(root, 'lib', 'helper.mds');
+      const transformer = createMdsTransformer(mdsWithDeps(['\\\\?\\' + plain]));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      assert.deepEqual(result.dependencies, [plain],
+        'verbatim prefix must be stripped from the functional watch dep (wasm/native parity)');
+      assert.deepEqual(parseMetadata(result.code).dependencies, ['lib/helper.mds'],
+        'verbatim canonical dep inside the root must relativize in metadata, not degrade to basename');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('T-J1-6: result and metadata shapes are stable', async () => {
     const root = makeTmpRoot('shape');
     try {
@@ -556,6 +581,39 @@ describe('dependency path contracts (J1)', () => {
         'metadata key set/order must not drift');
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// J1: stripWindowsVerbatimPrefix — pure string function, exercised directly so
+// the Windows-only shapes (drive verbatim, UNC verbatim) are pinned on every
+// platform. Mirrors path_to_unified in crates/mds-core/src/source_path.rs.
+// ---------------------------------------------------------------------------
+describe('stripWindowsVerbatimPrefix (J1)', () => {
+  test('T-J1-8: strips the drive verbatim prefix', () => {
+    assert.equal(stripWindowsVerbatimPrefix('\\\\?\\C:\\proj\\a.mds'), 'C:\\proj\\a.mds');
+  });
+
+  test('T-J1-9: rewrites the UNC verbatim prefix to a functional UNC root', () => {
+    assert.equal(
+      stripWindowsVerbatimPrefix('\\\\?\\UNC\\srv\\share\\a.mds'),
+      '\\\\srv\\share\\a.mds',
+      'UNC verbatim must stay an absolute UNC path (functional watch sink), not lose its root');
+  });
+
+  test('T-J1-10: strips the forward-slash verbatim form (post-unification shape)', () => {
+    assert.equal(stripWindowsVerbatimPrefix('//?/C:/proj/a.mds'), 'C:/proj/a.mds');
+  });
+
+  test('T-J1-11: leaves non-verbatim paths untouched', () => {
+    for (const p of [
+      'C:\\proj\\a.mds',
+      '/abs/posix.mds',
+      'rel/posix.mds',
+      '\\\\srv\\share\\a.mds', // plain UNC — no `?` component, must pass through
+    ]) {
+      assert.equal(stripWindowsVerbatimPrefix(p), p);
     }
   });
 });
