@@ -1,6 +1,8 @@
+import { dirname } from 'node:path';
 import type { MdsApi, MdsPluginOptions, TransformResult } from './types.js';
 import { shouldTransform as checkTransform } from './frontmatter.js';
 import { LazyInit } from './lazy-init.js';
+import { findProjectRoot, toAbsoluteDependency, toRootRelativePosix } from './project-root.js';
 
 // Characters that must be escaped inside a JS double-quoted string literal.
 // U+2028 (line separator) and U+2029 (paragraph separator) are treated as
@@ -107,13 +109,27 @@ export function createMdsTransformer(mds: MdsApi, options?: MdsPluginOptions): {
         }
       }
 
+      // Two contracts for one datum (spec.md "Carve-out: functional path
+      // references", PF-033):
+      // - TransformResult.dependencies is a FUNCTIONAL watch input — bundlers
+      //   resolve relative paths against cwd in addWatchFile/addDependency, so
+      //   entries must be ABSOLUTE. The WASM backend emits project-root-relative
+      //   deps, so they are absolutized here at the boundary (native deps are
+      //   already absolute and pass through unchanged).
+      // - The emitted `metadata` literal lands in production bundles — an
+      //   absolute host path there is an information leak, so it carries
+      //   project-root-relative POSIX paths instead.
+      const root = findProjectRoot(dirname(id));
+      const absoluteDeps = result.dependencies.map((dep) => toAbsoluteDependency(root, dep));
+      const metadataDeps = absoluteDeps.map((dep) => toRootRelativePosix(root, dep));
+
       const code =
         defaultExport +
-        `export const metadata = ${safeJsonForJs({ warnings: result.warnings, dependencies: result.dependencies })};\n`;
+        `export const metadata = ${safeJsonForJs({ warnings: result.warnings, dependencies: metadataDeps })};\n`;
 
       return {
         code,
-        dependencies: result.dependencies,
+        dependencies: absoluteDeps,
         warnings: result.warnings,
       };
     },

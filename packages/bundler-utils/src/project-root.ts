@@ -1,0 +1,105 @@
+import { existsSync } from 'node:fs';
+import { resolve, relative, dirname, isAbsolute, sep } from 'node:path';
+
+// DUPLICATED deliberately from @mdscript/mds `src/util/module-scanner.ts`
+// (findProjectRoot): a static import of ESM-only @mdscript/mds from this
+// package breaks the CJS build (dist-cjs) with ERR_REQUIRE_ESM, and threading
+// a root through every plugin was rejected — Vite's `config.root` is the app
+// root, not the project root, and the other bundlers have no equivalent.
+// Keep the walk semantics in sync with module-scanner.ts (and with the Rust
+// NativeFs::find_project_root): same markers, same bounded traversal.
+const PROJECT_ROOT_MARKERS = ['.git', '.mdsroot'] as const;
+const MAX_TRAVERSAL_DEPTH = 256;
+
+// Windows drive-qualified prefix (`C:`, `C:/`, `C:\` — after separator
+// unification only the first two forms remain).
+const DRIVE_QUALIFIED_RE = /^[A-Za-z]:($|\/)/;
+
+/**
+ * Cache from start-directory → project root. The project root is invariant
+ * within a single build, so repeated calls from the same directory (one per
+ * transform) skip the bounded synchronous traversal entirely.
+ */
+const projectRootCache = new Map<string, string>();
+
+/**
+ * Walk up from a directory to find the project root (`.git` / `.mdsroot`
+ * marker), falling back to the start directory when no marker is found within
+ * MAX_TRAVERSAL_DEPTH parents.
+ *
+ * ARCHITECTURE EXCEPTION: synchronous `existsSync` in an otherwise-async
+ * package — the result is cached per start directory, so the bounded blocking
+ * traversal runs at most once per unique directory per process (same
+ * trade-off as module-scanner.ts in @mdscript/mds).
+ */
+export function findProjectRoot(start: string): string {
+  const normalized = resolve(start);
+  const cached = projectRootCache.get(normalized);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  let dir = normalized;
+  let result = normalized;
+  for (let i = 0; i < MAX_TRAVERSAL_DEPTH; i++) {
+    if (PROJECT_ROOT_MARKERS.some((marker) => existsSync(resolve(dir, marker)))) {
+      result = dir;
+      break;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  projectRootCache.set(normalized, result);
+  return result;
+}
+
+/**
+ * Resolve a compiler-reported dependency to an absolute path.
+ *
+ * The native backend emits absolute canonical paths (returned unchanged —
+ * idempotent); the WASM backend emits project-root-relative POSIX paths,
+ * which are resolved against `root`. TransformResult.dependencies is a
+ * FUNCTIONAL watch input — bundlers resolve relative paths against cwd in
+ * `addWatchFile`/`addDependency` — so it must always carry absolute paths.
+ */
+export function toAbsoluteDependency(root: string, dep: string): string {
+  return isAbsolute(dep) ? dep : resolve(root, dep);
+}
+
+/**
+ * Convert an absolute dependency path to a project-root-relative POSIX path
+ * for the emitted `metadata` literal (which lands in production bundles —
+ * absolute host paths there are an information leak).
+ *
+ * Semantic source of truth: `relativize_source` in
+ * `crates/mds-core/src/source_path.rs` — this is its reduced TS mirror for
+ * the metadata sink (inputs are compiler-produced filesystem paths, not
+ * arbitrary hostile strings, so only the guards reachable here are mirrored):
+ * separators are unified to `/`, and a path that escapes the root, stays
+ * absolute, or is drive-qualified degrades to its basename (never `../`,
+ * never a host prefix). Ultimate fallback is `"source"`, as in core.
+ */
+export function toRootRelativePosix(root: string, absPath: string): string {
+  // Unify separators FIRST (core's step 2): a backslash-separated segment must
+  // be visible to the escape/drive guards below. Same deliberate trade-off as
+  // relativize_source — a literal `\` in a POSIX filename becomes `/`.
+  const rel = relative(root, absPath).split('\\').join('/').split(sep).join('/');
+  if (rel === '' || rel === '..' || rel.startsWith('../') || rel.startsWith('/') || DRIVE_QUALIFIED_RE.test(rel)) {
+    return basenameFallback(absPath);
+  }
+  return rel;
+}
+
+/** Last non-`.`/`..` component of the separator-unified path; `"source"` when none. */
+function basenameFallback(p: string): string {
+  const comps = p
+    .split('\\')
+    .join('/')
+    .split('/')
+    .filter((c) => c !== '' && c !== '.' && c !== '..');
+  const last = comps[comps.length - 1];
+  return last !== undefined && last !== '' ? last : 'source';
+}
