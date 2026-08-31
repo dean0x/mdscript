@@ -337,7 +337,7 @@ impl NativeFs {
     ///
     /// Error messages use `path.display()` so callers that pass an already-safe
     /// path (e.g. a CLI-provided absolute path) get a useful diagnostic.  For
-    /// import-path resolution use [`NativeFs::check_symlink_named`] instead, which
+    /// import-path resolution use the private `check_symlink_named` instead, which
     /// accepts a separate `shown` string to avoid leaking the absolute joined path.
     ///
     /// # Errors
