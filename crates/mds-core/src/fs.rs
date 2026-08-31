@@ -1507,4 +1507,109 @@ mod tests {
             "VirtualFs source_root() must always be None"
         );
     }
+
+    // ── R3 / CWE-209: read() error messages show root-relative display ────────
+    //
+    // Each test pairs the "no absolute path" absence assertion with a PF-013
+    // positive control proving the harness would catch the absolute form if it
+    // leaked (same pattern as the display_path_for tests in source_path.rs).
+
+    /// Root-anchored NativeFs over a temp project with a `sub/` directory.
+    ///
+    /// Returns the TempDir guard (keeps the tree alive), the canonicalized
+    /// project root (macOS resolves `/var` → `/private/var`), and a NativeFs
+    /// whose display root is anchored at that root.
+    fn r3_read_display_project() -> (TempDir, PathBuf, NativeFs) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        // Deterministic walk-up anchor: without a marker, find_project_root
+        // would scan every ancestor for .git/.mdsroot.
+        std::fs::write(root.join(".mdsroot"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let fs = NativeFs::new();
+        fs.set_root(root.to_str().unwrap()).unwrap();
+        (dir, root, fs)
+    }
+
+    #[test]
+    fn native_read_missing_file_error_shows_root_relative_display() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let path = root.join("sub").join("missing.mds");
+
+        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+
+        let root_str = root.to_str().unwrap();
+        // Positive control (PF-013): a message carrying the absolute path WOULD
+        // be caught by the absence assertion below.
+        let planted = format!("cannot read {}: No such file", path.display());
+        assert!(
+            planted.contains(root_str),
+            "positive control: planted absolute form must match the absence predicate"
+        );
+        assert!(
+            msg.contains("cannot read sub/missing.mds"),
+            "read error must show the root-relative path; got: {msg}"
+        );
+        assert!(
+            !msg.contains(root_str),
+            "read error must not leak the absolute root prefix; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_read_oversize_error_shows_root_relative_display() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let path = root.join("sub").join("big.mds");
+        std::fs::write(&path, "x".repeat((MAX_FILE_SIZE + 1) as usize)).unwrap();
+
+        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            matches!(err, MdsError::ResourceLimit { .. }),
+            "expected ResourceLimit, got {err:?}"
+        );
+        let msg = err.to_string();
+
+        let root_str = root.to_str().unwrap();
+        // Positive control (PF-013): the absolute form would be caught below.
+        let planted = format!("file too large (… bytes): {}", path.display());
+        assert!(
+            planted.contains(root_str),
+            "positive control: planted absolute form must match the absence predicate"
+        );
+        assert!(
+            msg.contains("sub/big.mds"),
+            "oversize error must show the root-relative path; got: {msg}"
+        );
+        assert!(
+            !msg.contains(root_str),
+            "oversize error must not leak the absolute root prefix; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn native_read_invalid_utf8_error_shows_root_relative_display() {
+        let (_guard, root, fs) = r3_read_display_project();
+        let path = root.join("sub").join("bad.mds");
+        std::fs::write(&path, b"Hello \xFF\xFE world\n").unwrap();
+
+        let err = fs.read(path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+
+        let root_str = root.to_str().unwrap();
+        // Positive control (PF-013): the absolute form would be caught below.
+        let planted = format!("invalid UTF-8 in {}: …", path.display());
+        assert!(
+            planted.contains(root_str),
+            "positive control: planted absolute form must match the absence predicate"
+        );
+        assert!(
+            msg.contains("invalid UTF-8 in sub/bad.mds"),
+            "UTF-8 error must show the root-relative path; got: {msg}"
+        );
+        assert!(
+            !msg.contains(root_str),
+            "UTF-8 error must not leak the absolute root prefix; got: {msg}"
+        );
+    }
 }

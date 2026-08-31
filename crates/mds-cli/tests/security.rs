@@ -1008,3 +1008,59 @@ fn walker_depth_limit_warning_cannot_be_forged_by_a_hostile_directory_name() {
         }
     }
 }
+
+// ── R3 / CWE-209: analysis-failure JSON carries no absolute path ─────────────
+
+#[test]
+fn r3_lint_json_analysis_failure_message_has_no_absolute_path() {
+    // Invalid UTF-8 fails on the raw-read path (lint.rs read_source_file),
+    // which must anchor its display root at the project root so the
+    // `--format json` analysis-failure `error.message` shows "sub/bad.mds" —
+    // never a bare basename and never the canonical absolute path (R3 /
+    // CWE-209). The vector is proven reachable: it produces the analysis
+    // envelope asserted below (PF-013 non-vacuity).
+    let dir = tempfile::tempdir().unwrap();
+    // Canonical form (macOS: /var → /private/var) — what a leaked key carries.
+    let root = dir.path().canonicalize().unwrap();
+    // Deterministic project-root walk-up anchor.
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let input = sub.join("bad.mds");
+    std::fs::write(&input, b"Hello \xFF\xFE world\n").unwrap();
+
+    let output = mds_bin()
+        .args(["lint", "--format", "json", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid UTF-8 is an analysis failure (exit 2); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).expect("analysis-failure envelope must be valid JSON");
+    let msg = v["error"]["message"]
+        .as_str()
+        .expect("envelope must carry error.message");
+
+    let root_str = root.to_str().unwrap();
+    // Positive control (PF-013): a message carrying the absolute path WOULD be
+    // caught by the absence assertion below.
+    let planted = format!("invalid UTF-8 in {}: …", input.display());
+    assert!(
+        planted.contains(root_str),
+        "positive control: planted absolute form must match the absence predicate"
+    );
+    assert!(
+        msg.contains("sub/bad.mds"),
+        "error.message must show the project-root-relative path; got: {msg}"
+    );
+    assert!(
+        !msg.contains(root_str),
+        "error.message must not leak the absolute path prefix; got: {msg}"
+    );
+}
