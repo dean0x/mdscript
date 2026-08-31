@@ -47,7 +47,13 @@ export interface MarkdownResult {
   output: string;
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
+  /**
+   * Paths of every file transitively imported by the source. The native
+   * backend emits absolute canonical paths; the WASM backend emits
+   * project-root-relative POSIX paths. Entries are untrusted functional
+   * references (spec.md "Carve-out: functional path references") — resolve
+   * relative entries against the project root before filesystem use.
+   */
   dependencies: string[];
   /**
    * Source Map v3 document. Present only when `sourceMap: true` was passed
@@ -66,7 +72,13 @@ export interface MessagesResult {
   messages: Message[];
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
+  /**
+   * Paths of every file transitively imported by the source. The native
+   * backend emits absolute canonical paths; the WASM backend emits
+   * project-root-relative POSIX paths. Entries are untrusted functional
+   * references (spec.md "Carve-out: functional path references") — resolve
+   * relative entries against the project root before filesystem use.
+   */
   dependencies: string[];
 }
 

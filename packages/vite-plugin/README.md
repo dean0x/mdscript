@@ -40,7 +40,7 @@ import content from './system-prompt.mds';
 
 import content, { metadata } from './system-prompt.mds';
 // metadata.warnings     - string[]
-// metadata.dependencies - string[] of imported file paths
+// metadata.dependencies - string[] of project-root-relative POSIX paths of imported files
 ```
 
 ## TypeScript setup
