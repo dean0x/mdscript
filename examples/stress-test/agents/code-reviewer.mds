@@ -20,7 +20,7 @@ severity_levels:
 
 {{badge("Language", language)}}
 
-@include guard
+{{guard.safety_rules()}}
 
 ## Focus Areas
 

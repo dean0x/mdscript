@@ -2,7 +2,11 @@ import systemPrompt from './prompts/system.mds';
 import reviewerPrompt from './prompts/reviewer.mds';
 import v2Features from './prompts/v2-features.mds';
 import chatMessages from './prompts/chat.mds';
-import { codePassthrough, escapedBraces, shadowingStress, emptyCollections } from './stress';
+// NAMED imports (not side-effect imports): logMetadata keeps `metadata` live in
+// the bundle — the J1 regression witness that metadata.dependencies carries no
+// absolute host paths in the built output.
+import { codePassthrough, escapedBraces, shadowingStress, emptyCollections, logStressTests } from './stress';
+import { logMetadata } from './test-metadata';
 
 console.log('=== System Prompt ===');
 console.log(systemPrompt);
@@ -23,13 +27,7 @@ if (typeof systemPrompt !== 'string') {
 console.log('\n=== Chat Messages (array) ===');
 console.log(JSON.stringify(chatMessages, null, 2));
 
-console.log('\n=== Stress Test: Code Passthrough ===');
-console.log(codePassthrough);
-console.log('\n=== Stress Test: Escaped Braces ===');
-console.log(escapedBraces);
-console.log('\n=== Stress Test: Shadowing ===');
-console.log(shadowingStress);
-console.log('\n=== Stress Test: Empty Collections ===');
-console.log(emptyCollections);
+logStressTests();
+logMetadata();
 
 export { systemPrompt, reviewerPrompt, v2Features, chatMessages, codePassthrough, escapedBraces, shadowingStress, emptyCollections };

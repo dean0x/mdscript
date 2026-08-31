@@ -678,6 +678,100 @@ fn compile_result_warnings_emitted_for_empty_include() {
     );
 }
 
+// ── R2: @include warning precision ───────────────────────────────────────────
+
+/// R2-A: @include of a module with no body text produces WARN-A ("no body text").
+#[test]
+fn r2_a_include_no_body_text_warns_no_body() {
+    let mut modules = std::collections::HashMap::new();
+    // Module has a @define but NO top-level body text → prompt_body = None.
+    modules.insert(
+        "fns.mds".to_string(),
+        "@define greet(x):\nHello {{x}}!\n@end\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./fns.mds\" as fns\n@include fns\n".to_string(),
+    );
+    let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)
+        .expect("should compile");
+    let warn = result.warnings.iter().find(|w| w.contains("empty output"));
+    assert!(
+        warn.is_some(),
+        "R2-A: expected 'empty output' warning; got: {:?}",
+        result.warnings
+    );
+    let w = warn.unwrap();
+    assert!(
+        w.contains("no body text"),
+        "R2-A: WARN-A must say 'no body text'; got: {w}"
+    );
+    // Must NOT say "does not export" — that is WARN-B.
+    assert!(
+        !w.contains("does not export"),
+        "R2-A: WARN-A must NOT mention 'does not export'; got: {w}"
+    );
+}
+
+/// R2-B: @include of a module that HAS body text but whose @export list excludes
+/// "prompt" produces WARN-B mentioning the exports list.  The "no body text"
+/// message must be absent.
+#[test]
+fn r2_b_include_body_hidden_by_export_warns_export_list() {
+    let mut modules = std::collections::HashMap::new();
+    // Module has body text AND an explicit @export that does NOT include "prompt".
+    modules.insert(
+        "lib.mds".to_string(),
+        "This is body text.\n@define greet(x):\nHi {{x}}!\n@end\n@export greet\n".to_string(),
+    );
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./lib.mds\" as lib\n@include lib\n".to_string(),
+    );
+    let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)
+        .expect("should compile");
+    let warn = result.warnings.iter().find(|w| w.contains("empty output"));
+    assert!(
+        warn.is_some(),
+        "R2-B: expected 'empty output' warning; got: {:?}",
+        result.warnings
+    );
+    let w = warn.unwrap();
+    // WARN-B must mention the exports list / prompt export.
+    assert!(
+        w.contains("does not export") || w.contains("@export list"),
+        "R2-B: WARN-B must mention exports; got: {w}"
+    );
+    // WARN-B must NOT say "no body text" — the module has body text.
+    assert!(
+        !w.contains("no body text"),
+        "R2-B: WARN-B must NOT say 'no body text'; got: {w}"
+    );
+}
+
+/// R2-C: @include of a module that renders normally (exports prompt) produces no warning.
+#[test]
+fn r2_c_include_exports_prompt_no_warning() {
+    let mut modules = std::collections::HashMap::new();
+    // Module has body text and does NOT have an explicit @export list → prompt is exported.
+    modules.insert("lib.mds".to_string(), "Prompt body here.\n".to_string());
+    modules.insert(
+        "main.mds".to_string(),
+        "@import \"./lib.mds\" as lib\n@include lib\n".to_string(),
+    );
+    let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)
+        .expect("should compile");
+    let include_warns: Vec<_> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("empty output"))
+        .collect();
+    assert!(
+        include_warns.is_empty(),
+        "R2-C: @include of a module with exported prompt must not warn; got: {include_warns:?}"
+    );
+}
+
 /// Verify that `compile_str_with` resolves `@import` paths relative to the
 /// supplied `base_dir`. The reported `dependencies` must list the real imported
 /// path (ending with "lib.mds") with no spurious entries. Regression test for

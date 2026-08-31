@@ -164,9 +164,11 @@ export default function mdsPlugin(options?: MdsPluginOptions): VitePlugin {
         // even across symlinks (gap D / edge E-norm).
         transformed.add(canon(id));
         for (const dep of result.dependencies) {
-          // result.dependencies are already absolute/canonical paths from the
-          // mds compiler; we still run through canon() for OS-separator
-          // normalization and symlink resolution.
+          // result.dependencies are absolutized at the transform boundary
+          // (bundler-utils resolves WASM-backend root-relative deps against
+          // the project root; native deps are already absolute/canonical); we
+          // still run through canon() for OS-separator normalization and
+          // symlink resolution.
           transformed.add(canon(dep));
           this.addWatchFile(dep);
         }

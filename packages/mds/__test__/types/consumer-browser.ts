@@ -52,9 +52,9 @@ const _lintFileFromVar: LintFileOptions = _lintSrcVar;
 
 // ── AC-P3-16: all seven lint types are nameable from the browser entry ────────
 const _diagArr: LintDiagnostic[] = [];
-// testing-03: pins LintDiagnostic.help: string | null and .span: LintSpan | null.
-// Reverting either `| null` widening in types.ts causes TS2322 on these
-// assignments, making the breaking type change detectable at compile time.
+// testing-03 (revised): pins LintDiagnostic.help, .span, and .fix_edits as
+// REQUIRED `| null` keys on the browser re-export too. Backends always emit
+// all three keys (serde_json serializes Option::None as JSON null).
 const _diagWithNulls: LintDiagnostic = {
   rule: 'empty-block',
   severity: 'error',
@@ -62,6 +62,15 @@ const _diagWithNulls: LintDiagnostic = {
   help: null,
   fixable: false,
   span: null,
+  fix_edits: null,
+};
+// PF-013 positive control: a literal missing one of the required nullable keys
+// must FAIL to typecheck from the browser entry as well. If `fix_edits`
+// regresses to optional, tsc reports "Unused '@ts-expect-error' directive".
+// @ts-expect-error — `fix_edits` is a required key (fix_edits: Array<...> | null)
+const _diagMissingFixEdits: LintDiagnostic = {
+  rule: 'empty-block', severity: 'error', message: 'empty block', fixable: false,
+  help: null, span: null,
 };
 const _span: LintSpan = { offset: 0, length: 0 };
 const _report: LintFileReport = { file: 'a.mds', diagnostics: _diagArr };
@@ -74,5 +83,5 @@ const _ruleName: LintRuleName = 'empty-block';
 const _sourceMap: SourceMapV3 = { version: 3, sources: ['input.mds'], names: [], mappings: '' };
 
 void _compileOpts; void _checkOpts; void _lintOpts; void _lintFileOpts; void _lintFileFromVar;
-void _diagArr; void _diagWithNulls; void _span; void _report; void _result; void _severity; void _ruleName;
+void _diagArr; void _diagWithNulls; void _diagMissingFixEdits; void _span; void _report; void _result; void _severity; void _ruleName;
 void _sourceMap;

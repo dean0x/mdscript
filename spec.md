@@ -949,8 +949,8 @@ mds lint                                   # Auto-detect single .mds in current 
 mds lint template.mds                      # Lint a single file
 mds lint src/                              # Lint all .mds files recursively (incl. partials)
 mds lint --fix template.mds                # Auto-fix fixable issues in place
-mds lint --fix --check template.mds        # Preview --fix: exit 1 if any file would change
-mds lint --fix --diff template.mds         # Preview --fix: print unified diff without writing
+mds lint --fix --check template.mds        # Preview --fix: exit = max(1, residual severity); never writes
+mds lint --fix --diff template.mds         # Preview --fix: print unified diff without writing (same exit rule)
 mds lint --format json template.mds        # Machine-readable JSON output (stdout)
 mds lint --quiet template.mds              # Suppress warnings; exit 2 on errors only
 cat template.mds | mds lint -             # Lint from stdin
@@ -968,8 +968,8 @@ cat template.mds | mds lint --fix -       # Fix from stdin, write fixed source t
 | Option | Description |
 |--------|-------------|
 | `--fix` | Apply auto-fixable issues in place. Tier A fixes apply always; Tier B fixes apply only to standalone (non-importing) files. |
-| `--check` | With `--fix`: exit 1 if any file would change; never writes. Useful for CI. |
-| `--diff` | With `--fix`: print unified diff of pending changes without writing. |
+| `--check` | With `--fix`: never writes; exit is `max(1, residual severity)` — 1 when a fix is pending and the post-fix residual would be clean or warn-only, 2 when findings the fix cannot remove would remain at error severity. The emitted diagnostics stay pre-fix (the preview reports what is wrong now); only the exit code looks through to the residual. Useful for CI. |
+| `--diff` | With `--fix`: print unified diff of pending changes without writing. Exit follows the same `max(1, residual severity)` preview rule as `--check`. |
 | `--format <FORMAT>` | Output format: `human` (default, stderr) or `json` (stdout). |
 | `--vars <FILE>` | JSON file with runtime variable overrides (forwarded to the check gate). |
 | `--set KEY=VALUE` | Set a single variable. Repeatable. Type coercion applies. Repeating a key emits a warning; the last value wins. |

@@ -31,7 +31,7 @@ const transformer = createMdsTransformer(mds, { vars: { env: 'production' } });
 if (await transformer.shouldTransform('/path/to/file.mds')) {
   const result = await transformer.transform('/path/to/file.mds');
   // result.code        - JS module source
-  // result.dependencies - absolute paths of transitively imported files
+  // result.dependencies - ABSOLUTE paths of transitively imported files (functional watch input)
   // result.warnings    - non-fatal compiler warnings
 }
 ```
@@ -56,6 +56,8 @@ Or add a triple-slash reference in any `.d.ts` file in your project:
 
 This makes `import content from './prompt.mds'` type-safe: `content` is `string`
 and the module also exports `metadata: { warnings: string[]; dependencies: string[] }`.
+`metadata.dependencies` entries are project-root-relative POSIX paths — never
+absolute host paths, because the metadata literal is embedded in production bundles.
 
 ## LazyInit
 

@@ -5,6 +5,14 @@ is_development: true
 debug: false
 ---
 
+> **Emitted frontmatter vs evaluated body:** runtime variables (`--vars`,
+> `--set`, `--set-string`) override the evaluation scope — they control
+> which `@if` branches fire and what `\{{variables}}` expand to. The emitted
+> frontmatter in the compiled output is the template's own source YAML,
+> verbatim; runtime overrides never alter it (spec §7.7). So the frontmatter
+> below says `is_production: false` while the body renders production content
+> because `vars.json` supplies `is_production: true` at evaluation time only.
+
 # {{app_name}}
 
 @if debug:

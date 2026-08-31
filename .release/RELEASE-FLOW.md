@@ -38,7 +38,7 @@ Fully automated via GitHub Actions `release.yml` workflow dispatch.
 
 - CI handles all builds (7 native targets + WASM)
 - Local pre-flight validates correctness only
-- WASM requires Binaryen v129+ (`wasm-opt -Oz`)
+- WASM: wasm-pack auto-downloads wasm-opt (`-Oz`); system Binaryen v129+ only for offline builds or to reproduce CI's exact release optimizer
 
 ## Publish
 

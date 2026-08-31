@@ -118,7 +118,8 @@ pub(super) fn apply_block_overrides(
 
     // Build the override origin ONCE — O(1) Arc bumps per override node.
     let override_origin = Origin {
-        file: Arc::from(ctx.file_str),
+        file: Arc::from(ctx.key),
+        display: Arc::from(ctx.file_str),
         source: Arc::from(ctx.source),
     };
 

@@ -422,8 +422,10 @@ impl ModuleCache {
         self.resolving.insert(key.to_string());
 
         let base_dir_owned = self.fs.parent_dir(key);
+        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
         let ctx = ModuleCtx {
-            file_str: key,
+            key,
+            file_str: &display_owned,
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
@@ -514,6 +516,7 @@ impl ModuleCache {
         self.resolving.insert(SOURCE_LABEL.into());
 
         let ctx = ModuleCtx {
+            key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
@@ -595,8 +598,10 @@ impl ModuleCache {
         self.resolving.insert(key.to_string());
 
         let base_dir_owned = self.fs.parent_dir(key);
+        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
         let ctx = ModuleCtx {
-            file_str: key,
+            key,
+            file_str: &display_owned,
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
@@ -623,6 +628,7 @@ impl ModuleCache {
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
+            key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
@@ -648,6 +654,7 @@ impl ModuleCache {
         self.check_import_depth()?;
         self.resolving.insert(SOURCE_LABEL.into());
         let ctx = ModuleCtx {
+            key: SOURCE_LABEL,
             file_str: SOURCE_LABEL,
             source,
             base_dir: &canonical_str,
@@ -689,7 +696,11 @@ impl ModuleCache {
         for (nodes, origin) in regions {
             // Switch the builder's current_src to the source that owns this region.
             if let Some(ref mut builder) = current_map {
-                let src_idx = builder.source_index(origin.file.as_ref(), origin.source.as_ref());
+                let src_idx = builder.source_index(
+                    origin.file.as_ref(),
+                    origin.display.as_ref(),
+                    origin.source.as_ref(),
+                );
                 builder.current_src = src_idx;
                 // Cursor must equal accumulated output length before entering each region.
                 // evaluate_with_map_seeded maintains this invariant internally, but after
@@ -845,6 +856,7 @@ impl ModuleCache {
                 // Seed builder with the skeleton's root file.
                 let builder = crate::sourcemap::MapBuilder::new(
                     skeleton_origin.file.to_string(),
+                    skeleton_origin.display.to_string(),
                     skeleton_origin.source.to_string(),
                 );
                 let (raw, maybe_builder) =
@@ -932,10 +944,13 @@ impl ModuleCache {
         }
 
         let (body_raw, map_out) = if opts.source_map {
-            // Builder seeds current_src=0 pointing to ctx.file_str/ctx.source;
-            // evaluate_with_map derives file/source from builder (issue #58).
-            let builder =
-                crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            // Builder seeds current_src=0 pointing to ctx.key / ctx.file_str / ctx.source;
+            // evaluate_with_map derives display/source from builder (issue #58 / R3).
+            let builder = crate::sourcemap::MapBuilder::new(
+                ctx.key.to_string(),
+                ctx.file_str.to_string(),
+                ctx.source.to_string(),
+            );
             let (raw, returned) = evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
             // AC-PERF-03 + AC-SEC-04: degrade if cap hit or sourcesContent too large.
             apply_map_degradation(raw, returned, opts, warnings)
@@ -1060,8 +1075,11 @@ impl ModuleCache {
         // FragmentMap is cached in ResolvedModule and cloned into every NamespaceScope
         // that imports this module, enabling @include splice attribution (S6).
         let (prompt_body, prompt_map) = if self.source_map_mode && prompt_exported {
-            let builder =
-                crate::sourcemap::MapBuilder::new(ctx.file_str.to_string(), ctx.source.to_string());
+            let builder = crate::sourcemap::MapBuilder::new(
+                ctx.key.to_string(),
+                ctx.file_str.to_string(),
+                ctx.source.to_string(),
+            );
             // evaluate_with_map derives file/source from builder.current_src (issue #58).
             let (body_raw, returned) =
                 evaluate_with_map(&module.body, &mut scope, warnings, builder)?;
@@ -1107,7 +1125,8 @@ impl ModuleCache {
 
         // Build Origin once for this module — Arc::clone'd into each EffectiveBlock (P3).
         let origin = Origin {
-            file: Arc::from(ctx.file_str),
+            file: Arc::from(ctx.key),
+            display: Arc::from(ctx.file_str),
             source: Arc::from(ctx.source),
         };
 
@@ -1202,8 +1221,10 @@ impl ModuleCache {
         // for consistency.
         let base_source_ref: &str = &base.skeleton_origin.source;
         let base_base_dir = self.fs.parent_dir(base_key);
+        let base_display_owned = crate::source_path::display_path_for(&*self.fs, base_key);
         let base_ctx = ModuleCtx {
-            file_str: base_key,
+            key: base_key,
+            file_str: &base_display_owned,
             source: base_source_ref,
             base_dir: &base_base_dir,
             runtime_vars: ctx.runtime_vars,
@@ -1459,8 +1480,10 @@ impl ModuleCache {
         self.resolving.insert(key.to_string());
 
         let base_dir_owned = self.fs.parent_dir(key);
+        let display_owned = crate::source_path::display_path_for(&*self.fs, key);
         let ctx = ModuleCtx {
-            file_str: key,
+            key,
+            file_str: &display_owned,
             source: &source,
             base_dir: &base_dir_owned,
             runtime_vars,
@@ -1590,7 +1613,8 @@ impl ModuleCache {
                 // Root base: own body is the skeleton; blocks seeded from own @block declarations.
                 // Build Origin once — Arc::clone'd into each seeded EffectiveBlock (P3).
                 let root_origin = Origin {
-                    file: Arc::from(ctx.file_str),
+                    file: Arc::from(ctx.key),
+                    display: Arc::from(ctx.file_str),
                     source: Arc::from(ctx.source),
                 };
                 // Seed blocks first so module.body can be moved into the Arc (no element clones, P1).
@@ -1658,7 +1682,8 @@ impl ModuleCache {
             match node {
                 Node::Define(def) => {
                     let origin = module_origin.get_or_insert_with(|| Origin {
-                        file: Arc::from(ctx.file_str),
+                        file: Arc::from(ctx.key),
+                        display: Arc::from(ctx.file_str),
                         source: Arc::from(ctx.source),
                     });
                     collect_define(def, &mut defs, scope, ctx, Some(origin))?
@@ -1998,15 +2023,21 @@ impl ResolvedModule {
         // Respect export visibility: prompt_body and prompt_map are only included
         // in the namespace when "prompt" is an available export (same rule as
         // get_prompt_value).  Arc::clone is O(1) — no segment data is copied.
-        let (prompt_body, prompt_map) = if self.is_exported("prompt") {
+        let prompt_exported = self.is_exported("prompt");
+        let (prompt_body, prompt_map) = if prompt_exported {
             (self.prompt_body.clone(), self.prompt_map.clone())
         } else {
             (None, None)
         };
+        // True when the module has body text but its @export list explicitly
+        // excludes "prompt" — the caller's @include will produce empty output
+        // and WARN-B should fire instead of WARN-A.
+        let prompt_suppressed_by_exports = !prompt_exported && self.prompt_body.is_some();
         NamespaceScope {
             functions,
             prompt_body,
             prompt_map,
+            prompt_suppressed_by_exports,
         }
     }
 }
@@ -2058,7 +2089,19 @@ struct ExtendsComponents {
 
 /// Bundle of borrowed per-module context threaded through the AST walk helpers.
 struct ModuleCtx<'a> {
-    /// Canonical display path of the source file (e.g. the path shown in error messages).
+    /// Canonical key of the source file.
+    ///
+    /// For `NativeFs` compiles this is the absolute canonical path returned by
+    /// `fs.normalize()`.  For string-source compiles this is `SOURCE_LABEL`.  Used
+    /// for source-map interning (`MapBuilder::new` / `Origin::file`) — must be the
+    /// stable, dedup-safe identity key, never the display-friendly path.
+    key: &'a str,
+    /// Display-safe (root-relative) path for user-visible strings — error messages,
+    /// `NamedSource` names, validator diagnostics (R3 / CWE-209).
+    ///
+    /// Derived from `display_path_for(fs, key)` at construction time.  For `VirtualFs`
+    /// and string-source sentinels this equals `key` (already relative / already a
+    /// `<…>` sentinel).
     file_str: &'a str,
     /// Raw file content used for source-span diagnostics (offset → line/column lookup).
     source: &'a str,
@@ -2457,6 +2500,9 @@ fn attach_import_span(
         MdsError::FileNotFound { span: None, .. } => {
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)
         }
+        MdsError::ModuleNotFound {
+            key, span: None, ..
+        } => MdsError::module_not_found_at(key, file_str, source, offset, line_len),
         MdsError::CircularImport {
             cycle, span: None, ..
         } => MdsError::circular_import_at(cycle, file_str, source, offset, line_len),
@@ -2474,6 +2520,11 @@ fn attach_frontmatter_index(err: MdsError, i: usize) -> MdsError {
             path, span: None, ..
         } => MdsError::import_error(format!(
             "file not found: \"{path}\" (in frontmatter imports[{i}])"
+        )),
+        MdsError::ModuleNotFound {
+            key, span: None, ..
+        } => MdsError::import_error(format!(
+            "module not found: \"{key}\" (in frontmatter imports[{i}])"
         )),
         MdsError::CircularImport {
             cycle, span: None, ..

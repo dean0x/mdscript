@@ -173,12 +173,16 @@ pub(crate) fn evaluate_with_map_seeded(
     seed_iterations: usize,
     seed_msg_bytes: usize,
 ) -> Result<(String, crate::sourcemap::MapBuilder, usize, usize), MdsError> {
-    // Clone file/source from the builder's current source entry before moving
-    // builder into EvalContext.map.  This is the single source of truth for
+    // Clone display name / source from the builder's current source entry before
+    // moving builder into EvalContext.map.  This is the single source of truth for
     // diagnostic span attribution — eliminates the redundant explicit params
     // that caused mis-attributed spans before c5a4d65 (issue #58).
+    //
+    // R3 (CWE-209): read from display_names (root-relative, never absolute) rather
+    // than from sources (canonical keys, may be absolute) so that file-backed
+    // compile error messages show "src/a.mds" instead of "/proj/src/a.mds".
     let file_owned = builder
-        .sources
+        .display_names
         .get(builder.current_src as usize)
         .cloned()
         .unwrap_or_default();
@@ -677,7 +681,11 @@ fn invoke_function(
                 let sc = map.cursor;
                 let ss = map.segments.len();
                 let sr = map.current_src;
-                let def_src = map.source_index(origin.file.as_ref(), origin.source.as_ref());
+                let def_src = map.source_index(
+                    origin.file.as_ref(),
+                    origin.display.as_ref(),
+                    origin.source.as_ref(),
+                );
                 map.current_src = def_src;
                 (sc, ss, sr)
                 // map and origin borrows released here; ctx is usable below.
@@ -883,10 +891,12 @@ fn build_type_mismatch(
         None => return MdsError::type_mismatch(lhs_type, rhs_type),
     };
 
-    // Select (file, source) from body_origin when inside a function body,
-    // else fall back to the top-level module context (applies PF-012).
+    // Select (display, source) from body_origin when inside a function body,
+    // else fall back to the top-level module context (applies PF-012 / R3).
+    // Use origin.display (root-relative) rather than origin.file (canonical key) so
+    // type-mismatch spans in @define bodies show safe display paths (CWE-209).
     let (file, source) = if let Some(ref origin) = ctx.body_origin {
-        (origin.file.as_ref(), origin.source.as_ref())
+        (origin.display.as_ref(), origin.source.as_ref())
     } else {
         (ctx.file, ctx.source)
     };
@@ -1147,10 +1157,24 @@ fn evaluate_include(
         None => {
             if ctx.warnings.len() < MAX_WARNINGS {
                 // Untrusted identifier from template source — WIRE (spec 7.5).
-                ctx.warnings.push(format!(
-                    "warning: @include of '{}' produced empty output — module has no body text",
-                    crate::lint::sanitize_control_chars_wire(&inc.alias)
-                ));
+                let safe_alias = crate::lint::sanitize_control_chars_wire(&inc.alias);
+                let msg = if ns.prompt_suppressed_by_exports {
+                    // WARN-B: module has body text but @export list excludes "prompt".
+                    format!(
+                        "warning: @include of '{safe_alias}' produced empty output \
+                         — module has body text, but its explicit @export list does not export \
+                         'prompt'; add `@export prompt` to the module, or call its functions \
+                         directly: {{{{{safe_alias}.fn()}}}}"
+                    )
+                } else {
+                    // WARN-A: module has no body text at all.
+                    format!(
+                        "warning: @include of '{safe_alias}' produced empty output \
+                         — module has no body text; to use the module's functions, call them \
+                         directly: {{{{{safe_alias}.fn()}}}}"
+                    )
+                };
+                ctx.warnings.push(msg);
             }
             return Ok(String::new());
         }
@@ -1174,9 +1198,16 @@ fn evaluate_include(
             // Build the remap if not already cached for this include site,
             // then borrow it directly from the entry return value.
             let remap: &Vec<u32> = ctx.fragment_remap_cache.entry(fmap_ptr).or_insert_with(|| {
+                // S6 @include splice: register each included source in the outer builder.
+                // `path` is the canonical key from the fragment's MapBuilder.sources[].
+                // Display names for @include sources are not read via EvalContext.file
+                // (current_src is never changed during splice), so using the canonical
+                // path as the display_name here is safe — it never surfaces in diagnostics.
                 fmap.sources
                     .iter()
-                    .map(|(path, content)| map.source_index(path.as_ref(), content.as_ref()))
+                    .map(|(path, content)| {
+                        map.source_index(path.as_ref(), path.as_ref(), content.as_ref())
+                    })
                     .collect()
             });
 

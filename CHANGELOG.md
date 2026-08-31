@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--set` / `--set-string` collisions are now a typed error: `mds::var_conflict`,
+  exit 1 on every subcommand.** Setting the same variable key with both flags in one
+  invocation keeps its message (`variable 'name' is set by both --set and
+  --set-string; use only one`) but now carries the `mds::var_conflict` error code and
+  exits 1 uniformly — `mds lint` previously exited 2 (its blanket analysis-failure
+  code) for this usage error, and `mds lint --format json` printed nothing on stdout;
+  it now emits the standard `{"version":1,"error":{"code":"mds::var_conflict",...}}`
+  envelope. `build`, `check`, and `watch` keep exit 1, with the code header newly
+  visible on stderr.
+
+- **The `mds build <dir>` summary now counts empty outputs.** When a successful
+  directory build writes a zero-byte output — a definitions-only module with no body
+  text — the summary reads `N built (M empty), K failed` so silent-empty artifacts
+  are visible. The clause appears only when at least one output is empty (strictly
+  zero bytes): the historical `N built, K failed` form is byte-identical otherwise,
+  and `--quiet` behavior is unchanged.
+
 - **`mds build`, `mds check`, `mds lint`, and `mds watch` now warn when a
   variable key is repeated within a single `--set` or `--set-string` group
   (#200).** The last value still wins (unchanged), but a warning is emitted to
@@ -19,7 +36,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The warning is suppressed by `--quiet`. Repeating the same key across `--set`
   and `--set-string` in the same invocation remains a hard error (unchanged).
 
+### Changed
+
+- **Diagnostic file paths are now project-root-relative on every surface (CWE-209).**
+  On the native filesystem backend (CLI, napi, Python), error messages, diagnostic
+  span labels, and source-excerpt headers previously showed the canonicalized
+  absolute path of the file involved (e.g. `/home/user/project/src/foo.mds`),
+  disclosing the host filesystem layout to anything that captures or serializes
+  error output. They now show the same root-relative form that Source Map v3
+  `sources[]` already uses (e.g. `src/foo.mds`, resolved against the project root
+  located via the `.mdsroot` / `.git` walk-up, basename fallback outside the root).
+  Emitted source maps are byte-identical — `sources[]` was already root-relative and
+  is untouched; only the diagnostic-facing display changed. Scripts that match
+  absolute paths in stderr diagnostics must switch to the relative form.
+
 ### Fixed
+
+- **`mds lint --fix` preview modes (`--check`, `--diff`) now exit by residual
+  severity.** The preview exit code is now `max(1 if any fixes are pending, severity
+  of what would remain after fixing)`: a tree whose only problems would all be
+  auto-fixed exits 1, and a tree left with a non-fixable error exits 2 — previously
+  `--check` reported exit 1 even when non-fixable errors would remain, and
+  `--fix --diff` had no exit-1 floor at all (pending fixes could exit 0). Two
+  companion behavior notes: stdin `--fix --check` now renders the pre-fix
+  diagnostics on stderr before exiting (previously it printed only
+  `Would fix: <stdin>`), and the directory-mode stderr summary buckets
+  (clean / warnings / errors) classify each file by its residual in preview mode
+  while the diagnostic body (human or JSON) stays pre-fix.
+
+- **The empty-`@include` warning now names the real cause.** A module whose body
+  text exists but whose explicit `@export` list omits `prompt` previously produced
+  the same "no body text" warning as a genuinely body-less module, pointing authors
+  at the wrong fix. The two cases now emit distinct warnings:
+  ```
+  warning: @include of 'name' produced empty output — module has no body text; to use the module's functions, call them directly: {{name.fn()}}
+  ```
+  ```
+  warning: @include of 'name' produced empty output — module has body text, but its explicit @export list does not export 'prompt'; add `@export prompt` to the module, or call its functions directly: {{name.fn()}}
+  ```
+
+- **Missing virtual-module keys now fail with `mds::module_not_found` instead of
+  `mds::file_not_found`.** On the virtual-module surfaces — `compile_virtual`,
+  `lint_virtual`, and in-template `@import`s resolved against a virtual module map
+  (WASM, napi, Python) — a key absent from the map is a caller error against a
+  closed map, not an OS file-not-found. The new error reads `module 'key' is not in
+  the virtual module map` and its help points at `options.modules` (or switching to
+  the native backend for filesystem-backed imports). The native filesystem backend
+  keeps `mds::file_not_found` unchanged. Consumers matching `mds::file_not_found` to
+  detect a missing virtual module must update to the new code.
+
+- **Bundler watch mode now works under the WASM backend fallback.** The WASM backend
+  reports dependency paths root-relative, and `@mdscript/bundler-utils` handed them
+  to `addWatchFile` / `addDependency` verbatim, where they resolved against the
+  process cwd — so when the native addon was unavailable, edits to imported `.mds`
+  partials silently stopped triggering rebuilds. `TransformResult.dependencies` is
+  now absolutized at the transform boundary, so watch wiring behaves identically
+  under both backends.
 
 - **`mds watch` no longer silently loses a save made during startup (#317).**
   Both watch modes published the first compiled output *before* arming change
@@ -269,10 +341,10 @@ diagnostic messages must update to check for the `\uXXXX` literal form instead.
   (`sourceMap`, `sourcesContent`) are not valid for either check call and are rejected with
   `mds::invalid_options`. `CompileOptions` retains `sourceMap`/`sourcesContent`. TS interface
   implementers: `check` narrows to `CheckOptions`; `checkFile` narrows to `CheckFileOptions`
-  (amended by #180). Non-`strict`-mode TypeScript consumers who guard on
-  `diag.span !== undefined` must update to `diag.span != null` — `help` and `span` on
-  `LintDiagnostic` are now typed as `... | null` so the `!== undefined` guard no longer
-  catches `null` values. (#196)
+  (amended by #180). TypeScript consumers who guard on `diag.span !== undefined` must
+  update to `diag.span !== null` — `help`, `span`, and `fix_edits` on `LintDiagnostic`
+  are now required keys typed `... | null`: the wire always emits each key, with `null`
+  for the no-value case, and never produces `undefined`. (#196)
 
 - **String-source `sourceMap` label changed from `"<source>"` to `"input.mds"`**
   across all surfaces (CLI, napi, WASM, Python). The `sources[0]` entry in Source Map v3
@@ -830,13 +902,14 @@ directly via `ModuleCache::with_fs`.
 
 ### Changed
 
-- **TypeScript: `LintDiagnostic.help` and `LintDiagnostic.span` widened to include `null`**
-  (`help?: string | null`, `span?: LintSpan | null`). The JSON wire format has always emitted
-  these as `null` (not absent keys) when no hint or span is available — only the TypeScript
-  declaration was narrower than the runtime value. This is a semver event for consumers who
-  pattern-matched on `diag.span !== undefined` to detect the no-span case; after this change,
-  both `undefined` and `null` indicate "no span" and the guard should use `diag.span != null`.
-  Matches the already-correct `fix_edits?: ... | null` pattern on the same interface.
+- **TypeScript: `LintDiagnostic.help`, `LintDiagnostic.span`, and `LintDiagnostic.fix_edits`
+  are now required keys typed `| null`** (`help: string | null`, `span: LintSpan | null`,
+  `fix_edits: Array<{start, end, new_text}> | null`). The JSON wire format has always emitted
+  all three keys on every diagnostic — `null` (never an absent key) when no hint, span, or
+  edits are available — so the optional `?:` declarations were wrong in both directions: they
+  admitted an `undefined` arm the runtime never produces and let literals omit keys that are
+  always present. This is a semver event for consumers who pattern-matched on
+  `diag.span !== undefined` to detect the no-span case; use `diag.span !== null`.
 
 - **`mds build --quiet <dir>` no longer prints its summary line on a fully-successful run (#216).**
   Previously `mds build --quiet <dir>` printed `N built, 0 failed` even when every file
@@ -1189,6 +1262,18 @@ directly via `ModuleCache::with_fs`.
   surfaces now emit root-relative paths (e.g. `src/foo.mds`) relative to the
   project root (located via `.mdsroot` / `.git` walk-up), and `..`-escaping
   references outside the project root fall back to the basename. (#3)
+
+- **Bundler `metadata.dependencies` no longer embeds absolute host paths in emitted
+  bundles.** The `@mdscript/bundler-utils` transform (behind the vite, rollup,
+  webpack, and rspack plugins) serialized each compiled template's dependency list
+  into the generated module's `metadata.dependencies` literal as absolute filesystem
+  paths, so a production bundle could ship the full path layout of the machine that
+  built it — reproduced in both vite and rollup builds. The emitted literal now
+  carries project-root-relative POSIX paths (the same `.mdsroot` / `.git` root
+  walk-up as the `sources[]` fix above), with a basename fallback for paths that
+  escape the project root or sit on a foreign drive. Watch wiring is unaffected —
+  the dependency paths handed to the bundlers' watch APIs are absolutized
+  separately; see the companion entry under Fixed.
 
 - **Control-byte injection hardening (CWE-150 / #176):** Raw C0 / DEL / C1
   control bytes in `.mds` source content could reach terminal stderr and

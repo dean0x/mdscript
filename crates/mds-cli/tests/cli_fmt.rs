@@ -1324,3 +1324,48 @@ fn fmt_nonexistent_non_mds_reports_file_not_found_not_extension_error() {
         "must NOT report 'not an .mds file' for a non-existent path; got: {stderr:?}"
     );
 }
+
+// ── R3 / CWE-209: fmt raw-read errors name the project-root-relative path ────
+
+#[test]
+fn r3_fmt_read_error_names_root_relative_path() {
+    // Invalid UTF-8 fails on the raw-read path (fmt.rs read_source_file),
+    // which must anchor its display root at the project root so the error
+    // message shows "sub/bad.mds" — never a bare basename and never the
+    // canonical absolute path (R3 / CWE-209; mirrors lint.rs).
+    let dir = tempfile::tempdir().unwrap();
+    // Canonical form (macOS: /var → /private/var) — what a leaked key carries.
+    let root = dir.path().canonicalize().unwrap();
+    // Deterministic project-root walk-up anchor.
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    let sub = root.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let input = sub.join("bad.mds");
+    fs::write(&input, b"Hello \xFF\xFE world\n").unwrap();
+
+    let output = fmt_path(&input, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid UTF-8 must exit 2 (I/O class); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let root_str = root.to_str().unwrap();
+    // Positive control (PF-013): a message carrying the absolute path WOULD be
+    // caught by the absence assertion below.
+    let planted = format!("invalid UTF-8 in {}: …", input.display());
+    assert!(
+        planted.contains(root_str),
+        "positive control: planted absolute form must match the absence predicate"
+    );
+    assert!(
+        stderr.contains("sub/bad.mds"),
+        "fmt read error must show the project-root-relative path; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains(root_str),
+        "fmt read error must not leak the absolute path prefix; got: {stderr}"
+    );
+}

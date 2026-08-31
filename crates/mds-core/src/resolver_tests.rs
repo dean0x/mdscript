@@ -1002,14 +1002,24 @@ fn e6_depth_limit_exceeded() {
 
 #[test]
 fn e10_missing_base_file_not_found() {
+    // R6 audit: VirtualFs now emits mds::module_not_found (not mds::file_not_found)
+    // when a key is absent from the in-memory module map.  mds::file_not_found is
+    // reserved for NativeFs.  The @extends resolver attaches a span via
+    // attach_import_span, so the final error may keep the module_not_found code
+    // with a span (attach_import_span path) or be wrapped as ImportError for the
+    // frontmatter path — either is correct; what must NOT occur is file_not_found.
     let child = "@extends \"./missing.mds\"\n";
     let files = [("child.mds", child)];
     let err = compile_virtual(&files, "child.mds")
-        .expect_err("E10: missing base should produce file-not-found");
+        .expect_err("E10: missing base should produce module-not-found");
     let serialized = err.serialize();
-    assert_eq!(
+    assert!(
+        serialized.code == "mds::module_not_found" || serialized.code == "mds::import",
+        "E10: expected module_not_found or import, got: {serialized:?}"
+    );
+    assert_ne!(
         serialized.code, "mds::file_not_found",
-        "E10: should be file_not_found: {serialized:?}"
+        "E10: VirtualFs missing base must not produce file_not_found: {serialized:?}"
     );
 }
 
@@ -3245,5 +3255,159 @@ fn line_len_at_offset_at_end_returns_zero() {
         line_len_at(s, 5),
         0,
         "offset == source.len() must return 0 (empty trailing slice)"
+    );
+}
+
+// ── R3 / CWE-209: construction-time display-path relativization ──────────────
+//
+// These tests pin the diagnostic display contract on the NativeFs backend:
+// NamedSource names and diagnostic file labels are project-root-relative (never
+// absolute), while emitted source-map sources[] stay exactly as they were
+// pre-R3 (map-relative when source_map_base is set — ADR-005 byte-identity).
+// Every absence assertion is paired with a PF-013 positive control.
+
+/// Temp project with a `.mdsroot` marker at the root and a `sub/` directory.
+///
+/// The marker makes the `find_project_root` walk-up deterministic; the returned
+/// root is canonicalized (macOS resolves `/var` → `/private/var`) so prefix
+/// checks compare against the same form the canonical module keys carry.
+fn r3_project() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    (dir, root)
+}
+
+#[test]
+fn r3_compile_error_named_source_is_root_relative() {
+    let (_guard, root) = r3_project();
+    let entry = root.join("sub").join("err.mds");
+    std::fs::write(&entry, "Hello {{undefined_var}}!\n").unwrap();
+
+    let err = crate::compile(&entry, None).unwrap_err();
+    let name = err
+        .source_name()
+        .expect("undefined-variable error must carry a NamedSource");
+
+    // Positive control (PF-013): the canonical key IS absolute — the absence
+    // assertions below would catch it if it leaked into the name.
+    let canonical = entry.canonicalize().unwrap();
+    assert!(
+        canonical.is_absolute(),
+        "positive control: canonical key must be absolute"
+    );
+    assert_eq!(
+        name, "sub/err.mds",
+        "NamedSource name must be project-root-relative"
+    );
+    assert!(
+        !std::path::Path::new(name).is_absolute(),
+        "NamedSource name must never be absolute; got: {name}"
+    );
+}
+
+#[test]
+fn r3_cross_file_error_keeps_own_files_display() {
+    // PF-012: relativize the EXISTING label — never substitute another file's.
+    // The error originates in sub/lib.mds; its display must name sub/lib.mds,
+    // not the importing main.mds and never the absolute canonical key.
+    let (_guard, root) = r3_project();
+    std::fs::write(root.join("main.mds"), "@import \"./sub/lib.mds\"\nbody\n").unwrap();
+    let lib = root.join("sub").join("lib.mds");
+    std::fs::write(&lib, "{{undefined_var}}\n").unwrap();
+
+    let err = crate::compile(root.join("main.mds"), None).unwrap_err();
+    let name = err
+        .source_name()
+        .expect("imported-file error must carry a NamedSource");
+
+    // Positive control (PF-013): the canonical key of the ERRORING file is
+    // absolute; the equality below would fail if it leaked.
+    assert!(
+        lib.canonicalize().unwrap().is_absolute(),
+        "positive control: canonical key must be absolute"
+    );
+    assert_eq!(
+        name, "sub/lib.mds",
+        "cross-file error must keep its OWN file's root-relative display (PF-012)"
+    );
+    assert_ne!(
+        name, "main.mds",
+        "cross-file error must not be attributed to the importing file"
+    );
+}
+
+#[test]
+fn r3_sources_stay_map_relative_with_source_map_base() {
+    // ADR-005 byte-identity: sources[] emission reads MapBuilder.sources
+    // (canonical keys relativized at finalize), never display_names. With
+    // source_map_base set, the entries are exactly the pre-R3 map-relative
+    // values. The CLI-level goldens (cli_source_map.rs SM-GOLD / SM-DET) pin
+    // the end-to-end surface; this is the core-level pin with an explicit base.
+    let (_guard, root) = r3_project();
+    let entry = root.join("main.mds");
+    std::fs::write(&entry, "@import \"./sub/lib.mds\"\n{{greet(\"World\")}}\n").unwrap();
+    std::fs::write(
+        root.join("sub").join("lib.mds"),
+        "@define greet(x):\nHello {{x}}!\n@end\n",
+    )
+    .unwrap();
+
+    let opts = crate::CompileOptions::default()
+        .with_source_map(true)
+        .with_source_map_base(Some(root.join("out")));
+    let result = crate::compile_with_deps_opts(&entry, None, opts).expect("compile must succeed");
+    let sm = result.source_map.expect("source map must be emitted");
+
+    // Exact pre-R3 expected values: anchored to the MAP location (root/out),
+    // so both entries climb one level (map-relative, inside the root).
+    assert_eq!(
+        sm.sources,
+        vec!["../main.mds".to_string(), "../sub/lib.mds".to_string()],
+        "sources[] must be byte-identical to the pre-R3 map-relative form"
+    );
+    // Positive control (PF-013): the canonical keys ARE absolute — the loop
+    // below would catch one leaking through.
+    assert!(
+        entry.canonicalize().unwrap().is_absolute(),
+        "positive control: canonical key must be absolute"
+    );
+    for s in &sm.sources {
+        assert!(
+            !std::path::Path::new(s).is_absolute(),
+            "sources[] entry must never be absolute; got: {s}"
+        );
+    }
+}
+
+#[test]
+fn r3_map_mode_eval_diagnostic_display_is_root_relative() {
+    // Map-mode diagnostics derive their file label from MapBuilder.display_names
+    // (evaluate_with_map_seeded), not from the canonical sources keys. A
+    // cross-type comparison errors at eval time — exactly the path that reads
+    // display_names — and must show the root-relative display.
+    let (_guard, root) = r3_project();
+    let entry = root.join("sub").join("cond.mds");
+    std::fs::write(&entry, "---\nx: 3\n---\n@if x == \"3\":\nyes\n@end\n").unwrap();
+
+    let opts = crate::CompileOptions::default().with_source_map(true);
+    let err = crate::compile_with_deps_opts(&entry, None, opts).unwrap_err();
+    let name = err
+        .source_name()
+        .expect("map-mode type-mismatch must carry a NamedSource");
+
+    // Positive control (PF-013): the canonical key IS absolute.
+    assert!(
+        entry.canonicalize().unwrap().is_absolute(),
+        "positive control: canonical key must be absolute"
+    );
+    assert_eq!(
+        name, "sub/cond.mds",
+        "map-mode diagnostic must use the root-relative display"
+    );
+    assert!(
+        !std::path::Path::new(name).is_absolute(),
+        "map-mode diagnostic label must never be absolute; got: {name}"
     );
 }

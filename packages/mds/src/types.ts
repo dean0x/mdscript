@@ -47,7 +47,13 @@ export interface MarkdownResult {
   output: string;
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
+  /**
+   * Paths of every file transitively imported by the source. The native
+   * backend emits absolute canonical paths; the WASM backend emits
+   * project-root-relative POSIX paths. Entries are untrusted functional
+   * references (spec.md "Carve-out: functional path references") — resolve
+   * relative entries against the project root before filesystem use.
+   */
   dependencies: string[];
   /**
    * Source Map v3 document. Present only when `sourceMap: true` was passed
@@ -66,7 +72,13 @@ export interface MessagesResult {
   messages: Message[];
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
+  /**
+   * Paths of every file transitively imported by the source. The native
+   * backend emits absolute canonical paths; the WASM backend emits
+   * project-root-relative POSIX paths. Entries are untrusted functional
+   * references (spec.md "Carve-out: functional path references") — resolve
+   * relative entries against the project root before filesystem use.
+   */
   dependencies: string[];
 }
 
@@ -210,21 +222,26 @@ export interface LintDiagnostic {
   severity: 'error' | 'warn' | 'info';
   /** Human-readable description of the finding. */
   message: string;
-  /** Optional guidance on how to resolve the finding. `null` when the rule emits no hint. */
-  help?: string | null;
+  /**
+   * Guidance on how to resolve the finding. Always present on the wire —
+   * backends serialize `Option::None` as JSON `null` — so the value is
+   * `null` (never `undefined`) when the rule emits no hint.
+   */
+  help: string | null;
   /** Whether the lint engine can auto-fix this diagnostic (`--fix`). */
   fixable: boolean;
   /**
-   * Source location of the finding. May be absent (`undefined`) or `null` when
-   * the rule produces no source span.
+   * Source location of the finding. Always present on the wire; `null`
+   * (never `undefined`) when the rule produces no source span.
    */
-  span?: LintSpan | null;
+  span: LintSpan | null;
   /**
-   * Byte-range replacement edits the fix engine would apply, if available.
-   * Each edit is `{ start, end, new_text }` with byte offsets into the source.
-   * `null` when no edits are available.
+   * Byte-range replacement edits the fix engine would apply. Each edit is
+   * `{ start, end, new_text }` with byte offsets into the source. Always
+   * present on the wire; `null` (never `undefined`) when the engine has no
+   * auto-fix edits for this diagnostic.
    */
-  fix_edits?: Array<{ start: number; end: number; new_text: string }> | null;
+  fix_edits: Array<{ start: number; end: number; new_text: string }> | null;
 }
 
 /**

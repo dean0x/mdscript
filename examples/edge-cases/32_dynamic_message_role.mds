@@ -1,0 +1,19 @@
+---
+speaker_role: user
+question: What is 2 + 2?
+---
+@message system:
+Dynamic-role demo (v0.4.0): `@message \{{role}}:` lets a variable supply the
+role. The second message in this file uses role "{{speaker_role}}" — driven by
+the `speaker_role` frontmatter variable (default: "user").
+
+Override at runtime and the JSON role changes while the emitted frontmatter stays
+as the template defined it:
+
+    mds build examples/edge-cases/32_dynamic_message_role.mds \
+        --set-string speaker_role=assistant -o -
+@end
+
+@message {{speaker_role}}:
+{{question}}
+@end

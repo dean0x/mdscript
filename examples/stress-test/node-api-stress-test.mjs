@@ -93,7 +93,8 @@ async function run() {
     assertContains(result.output, '**CodeReview Bot**', 'code-reviewer bold name');
     assertContains(result.output, '`critical` — Must fix before merge', 'code-reviewer conditional severity');
     assertContains(result.output, '**Type safety**', 'code-reviewer focus area');
-    assert(result.warnings.length > 0, 'code-reviewer warns about empty include');
+    assertContains(result.output, '## Safety Guidelines', 'code-reviewer renders safety guidelines');
+    assert(result.warnings.length === 0, 'code-reviewer compiles warning-free');
   }
   {
     const result = await compileFile(r('agents/orchestrator.mds'));

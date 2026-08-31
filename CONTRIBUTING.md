@@ -98,6 +98,9 @@ wasm-pack test --node crates/mds-wasm
 ```bash
 npm ci
 npm run build --workspaces --if-present
+# The native addon is NOT built by `--workspaces` (its script is `build:native`, not
+# `build`); needs the Rust toolchain. Without it @mdscript/mds silently falls back to WASM.
+npm run build:native -w @mdscript/mds-napi
 npm test --workspaces --if-present
 ```
 

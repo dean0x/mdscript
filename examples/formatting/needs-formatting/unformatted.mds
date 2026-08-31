@@ -1,0 +1,12 @@
+---
+role: reviewer
+audience: technical
+---
+
+# {{role}} checklist
+
+@if audience == "technical":   
+Include code samples and API references.
+@end   
+
+

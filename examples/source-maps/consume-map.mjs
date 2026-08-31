@@ -61,6 +61,34 @@ function decodeMappings(mappings) {
   return lines;
 }
 
+// ── Security assertion: sources[] must never contain absolute paths ────────────
+// Enforces the invariant documented in crates/mds-core/src/source_path.rs
+// (PF-005 / ADR-005): the relativization guard ensures no raw filesystem path
+// leaks into sources[]. An absolute or drive-qualified entry means the guard
+// was bypassed — report that as a bug in source_path.rs.
+//
+// The check itself is verifiable: run with MDS_BACKEND=wasm to confirm both
+// backends honour the invariant on the same compilation.
+function assertNoAbsoluteSources(sources) {
+  for (const src of sources) {
+    if (src.startsWith('/')) {
+      throw new Error(
+        `SECURITY: sources[] contains an absolute path: ${JSON.stringify(src)}\n` +
+        'This violates the PF-005 invariant — file the bug in ' +
+        'crates/mds-core/src/source_path.rs',
+      );
+    }
+    // Windows drive-qualified path: C:\... or C:/...
+    if (/^[A-Za-z]:/.test(src)) {
+      throw new Error(
+        `SECURITY: sources[] contains a drive-qualified path: ${JSON.stringify(src)}\n` +
+        'This violates the PF-005 invariant — file the bug in ' +
+        'crates/mds-core/src/source_path.rs',
+      );
+    }
+  }
+}
+
 // ── Compile with a source map ───────────────────────────────────────────────
 await mds.init();
 console.log(`Backend: ${mds.getBackend()}\n`);
@@ -71,6 +99,11 @@ if (result.kind !== 'markdown') {
 }
 
 const map = result.sourceMap;
+
+// Assert the security invariant before printing anything.
+assertNoAbsoluteSources(map.sources);
+console.log(`Security check passed: sources[] has ${map.sources.length} entries, none absolute.\n`);
+
 console.log('Source Map v3 document:');
 console.log(`  version:  ${map.version}`);
 console.log(`  sources:  ${JSON.stringify(map.sources)}`);

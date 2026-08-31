@@ -48,6 +48,28 @@ describe('bundler-utils integration', () => {
     }
   });
 
+  test('metadata deps are root-relative POSIX and code carries no repo-root prefix (J1)', async () => {
+    const REPO_ROOT = resolve(__dirname, '../../..');
+    const transformer = createMdsTransformer(mds);
+    const result = await transformer.transform(CONSUMER_MDS);
+
+    const line = result.code.split('\n').find((l) => l.startsWith('export const metadata = '));
+    assert.ok(line, 'metadata export line present');
+    const metadata = JSON.parse(line.slice('export const metadata = '.length, -1));
+
+    assert.ok(metadata.dependencies.length >= 1, 'non-vacuity: at least one metadata dependency');
+    for (const dep of metadata.dependencies) {
+      assert.ok(!isAbsolute(dep), `metadata dependency must be root-relative: ${dep}`);
+      assert.ok(!dep.includes('\\'), `metadata dependency must use POSIX separators: ${dep}`);
+    }
+
+    const leaks = (code) => code.includes(REPO_ROOT);
+    assert.equal(leaks(result.code), false, 'emitted code must not contain the repo root');
+    // PF-013 positive control: the predicate must catch a planted absolute path.
+    assert.equal(leaks(result.code + REPO_ROOT), true,
+      'positive control: leak predicate must detect an injected repo-root path');
+  });
+
   test('compiles deep import chain', async () => {
     const transformer = createMdsTransformer(mds);
     const result = await transformer.transform(ENTRY_MDS);

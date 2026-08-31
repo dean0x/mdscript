@@ -928,3 +928,85 @@ fn dir_build_quiet_works_in_pre_subcommand_position() {
         String::from_utf8_lossy(&control.stderr)
     );
 }
+
+// ── R5 (v0.4.0 dogfood): build summary counts zero-byte outputs ──────────────
+//
+// A definitions-only module (only @define/@export, no body) compiles
+// successfully to ZERO bytes, so "N built" silently implies N useful artifacts
+// when some are empty (PF-034-adjacent: a definitions-only @include shipping an
+// empty section was normalized as noise).  R5: the summary becomes
+// `{ok} built ({empty} empty), {fail} failed` — the clause appears ONLY when
+// empty > 0 (zero golden churn otherwise), "empty" is STRICT zero bytes (not
+// trim — messages-mode JSON output is never empty), and the summary/quiet gate
+// (`!quiet || fail_count > 0`) is unchanged.
+
+fn create_defs_only_mds(dir: &Path, name: &str) {
+    // Compiles successfully to zero bytes: @define/@export contribute nothing
+    // to the compiled body.
+    fs::write(
+        dir.join(name),
+        "@define greet(name):\n  Hi {{name}}\n@end\n\n@export greet\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn d5_dir_build_summary_reports_empty_outputs() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "a.mds");
+    create_defs_only_mds(src.path(), "lib.mds");
+
+    let output = build_dir(src.path(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "both files compile successfully; stderr: {stderr}"
+    );
+    // Non-vacuity: the zero-byte artifact must actually exist and be empty.
+    let lib_out = src.path().join("lib.md");
+    assert_eq!(
+        fs::metadata(&lib_out).map(|m| m.len()).ok(),
+        Some(0),
+        "fixture invariant: lib.md must be a zero-byte output"
+    );
+    assert!(
+        stderr.contains("2 built (1 empty), 0 failed"),
+        "R5: summary must count zero-byte outputs; got: {stderr}"
+    );
+}
+
+#[test]
+fn d5_dir_build_summary_omits_empty_clause_when_none() {
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "a.mds");
+
+    let output = build_dir(src.path(), &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 built, 0 failed"),
+        "summary keeps its historical form when no output is empty; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("empty"),
+        "R5: the empty clause must be ABSENT when every output has content \
+         (no golden churn); got: {stderr}"
+    );
+}
+
+#[test]
+fn d5_dir_build_quiet_gate_unchanged_with_empty_outputs() {
+    // The summary gate stays `!quiet || fail_count > 0`: empty outputs do NOT
+    // force the summary through --quiet on an all-success run.
+    let src = tempfile::tempdir().unwrap();
+    create_plain_mds(src.path(), "a.mds");
+    create_defs_only_mds(src.path(), "lib.mds");
+
+    let output = build_dir(src.path(), &["--quiet"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "all-success run; stderr: {stderr}");
+    assert!(
+        !stderr.contains("built"),
+        "R5: --quiet must still suppress the summary on an all-success run even \
+         when empty outputs exist (gate unchanged); got: {stderr}"
+    );
+}

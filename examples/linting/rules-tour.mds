@@ -1,0 +1,30 @@
+---
+name: World
+active: false
+---
+@define greet():
+Hello, {{name}}!
+@end
+
+@define helper():
+This function is defined but never exported or called.
+@end
+
+@export greet
+@export greet
+
+# Rules tour
+
+This template compiles cleanly but deliberately trips five lint rules:
+**duplicate-export** (error, auto-fixable), **empty-block** (warn, auto-fixable),
+**unreachable-branch** (error, auto-fixable), **unused-function** (warn), and
+**legacy-interpolation** (warn, auto-fixable via fix_edits).
+
+@if "x" == "y":
+This branch is always-false dead code — unreachable-branch fires (error).
+@end
+
+@if active:
+@end
+
+Legacy single-brace interpolation fires here: {name}

@@ -253,6 +253,13 @@ const ALLOWED_UNSANITIZED: &[(&str, &str, &str)] = &[
         "`usize` tally of failed compilations in `mds build <dir>` summary output.",
     ),
     (
+        "build.rs",
+        "empty_count",
+        "`usize` tally of successful compilations whose written artifact is zero \
+         bytes, in the `mds build <dir>` summary line (R5). An integer counter \
+         cannot carry a control byte.",
+    ),
+    (
         "fmt.rs",
         "walk.excluded_by_default",
         "`usize` count of `.mds` files the default-exclusion walker skipped \

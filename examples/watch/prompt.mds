@@ -1,0 +1,13 @@
+---
+role: code reviewer
+topic: Rust lifetime errors
+name: Sage
+---
+
+@import "./_persona.mds" as persona
+
+{{persona.intro(role, name)}}
+
+Your task: explain {{topic}} to a junior developer.
+
+{{persona.style()}}

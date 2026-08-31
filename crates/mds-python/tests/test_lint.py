@@ -659,3 +659,20 @@ def test_py_warn_live_lint_escapes_hostile_rule_name() -> None:
     assert expected_escape in w0, (
         f"sanitized \\u001B literal must appear in lint_warnings[0]; got: {w0!r}"
     )
+
+
+# ── R6: VirtualFs emits mds::module_not_found, not mds::file_not_found ───────
+
+
+def test_r6_lint_virtual_missing_entry_module_not_found() -> None:
+    """R6: lint_virtual on a missing entry key raises with code mds::module_not_found."""
+    modules = {"other.mds": "Hello!\n"}
+    with pytest.raises(m.MdsError) as exc_info:
+        m.lint_virtual(modules, "main.mds")
+    err = exc_info.value
+    assert err.code == "mds::module_not_found", (
+        f"R6: expected mds::module_not_found, got: {err.code}"
+    )
+    assert "main.mds" in err.message, (
+        f"R6: message must contain the key 'main.mds'; got: {err.message}"
+    )

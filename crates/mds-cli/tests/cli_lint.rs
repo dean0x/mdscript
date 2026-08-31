@@ -6329,3 +6329,291 @@ fn lint_fix_diff_format_json_diff_precedes_json_envelope() {
          this is the documented exception (spec.md:938); stdout: {stdout:?}"
     );
 }
+
+// ── R1 (v0.4.0 dogfood): preview exit = max(1 if fixes pending, residual severity) ──
+//
+// `--fix --check` / `--fix --diff` previously discarded the residual (post-fix)
+// `LintResult`: `--check` hardcoded exit 1 and `--diff` exited by PRE-fix severity,
+// so a preview over a file whose `--fix` would leave error-severity findings behind
+// reported exit 1 while the real `--fix` run exits 2 — and a file with only
+// info-severity fixable findings previewed as exit 0 under `--diff`.
+//
+// Binding rule (R1): preview exit = `result_exit_code(residual)` floored at 1 when
+// any fix is pending.  The emitted body stays PRE-fix — the preview reports what is
+// wrong NOW; only the exit code looks through to the post-fix residual.  The
+// residual can never exceed the pre-fix severity (the reverify gate refuses edits
+// that add findings), so body and exit cannot contradict each other.
+//
+// Fixture: lint_preview_exit/lint_fixable_plus_error.mds carries one fixable warn
+// (empty-block on a bare `@if`) and one non-fixable error (unused-variable,
+// elevated to error by lint_preview_exit/mds.json).  The residual after the
+// preview fix still carries the error → preview exit must be 2 on every input mode.
+
+/// Run `mds lint [extra_args] -` with `input` on stdin, from working dir `dir`
+/// (stdin mode discovers mds.json by walking up from the process cwd).
+fn lint_stdin_in_dir(dir: &Path, input: &str, extra_args: &[&str]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = mds_bin()
+        .current_dir(dir)
+        .arg("lint")
+        .args(extra_args)
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Ignore BrokenPipe — the child may exit before reading stdin.
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+/// Copy the lint_preview_exit fixture pair (mds.json + named .mds files) into a
+/// fresh tempdir for directory-mode runs.
+fn preview_exit_tempdir(files: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::copy(
+        fixture("lint_preview_exit/mds.json"),
+        dir.path().join("mds.json"),
+    )
+    .unwrap();
+    for name in files {
+        fs::copy(
+            fixture(&format!("lint_preview_exit/{name}")),
+            dir.path().join(name),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[test]
+fn d1_file_fix_check_residual_error_exits_2() {
+    let target = fixture("lint_preview_exit/lint_fixable_plus_error.mds");
+    let original = fs::read_to_string(&target).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Would fix:"),
+        "R1: --fix --check must still report the pending fix; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: --fix --check must exit 2 when the residual carries an error-severity \
+         finding (was hardcoded 1); stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        original,
+        "--fix --check must never write"
+    );
+}
+
+#[test]
+fn d1_file_fix_diff_residual_error_exits_2() {
+    let target = fixture("lint_preview_exit/lint_fixable_plus_error.mds");
+    let original = fs::read_to_string(&target).unwrap();
+
+    let out = lint_path(&target, &["--fix", "--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@@"),
+        "non-vacuity: --fix --diff must render a hunk; stdout: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: --fix --diff must exit 2 when the residual carries an error-severity \
+         finding; stdout: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        original,
+        "--fix --diff must never write"
+    );
+}
+
+#[test]
+fn d1_stdin_fix_check_residual_error_exits_2() {
+    let source =
+        fs::read_to_string(fixture("lint_preview_exit/lint_fixable_plus_error.mds")).unwrap();
+    let config_dir = fixture("lint_preview_exit");
+
+    let out = lint_stdin_in_dir(&config_dir, &source, &["--fix", "--check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Would fix: <stdin>"),
+        "R1: stdin --fix --check must still report the pending fix; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: stdin --fix --check must exit 2 when the residual carries an \
+         error-severity finding (was hardcoded 1); stderr: {stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "stdin --fix --check must not write the fixed source to stdout; got: {stdout}"
+    );
+}
+
+#[test]
+fn d1_stdin_fix_diff_residual_error_exits_2() {
+    let source =
+        fs::read_to_string(fixture("lint_preview_exit/lint_fixable_plus_error.mds")).unwrap();
+    let config_dir = fixture("lint_preview_exit");
+
+    let out = lint_stdin_in_dir(&config_dir, &source, &["--fix", "--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@@"),
+        "non-vacuity: stdin --fix --diff must render a hunk; stdout: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: stdin --fix --diff must exit 2 when the residual carries an \
+         error-severity finding; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn d1_dir_fix_check_residual_error_exits_2() {
+    let dir = preview_exit_tempdir(&["lint_fixable_plus_error.mds"]);
+
+    let out = lint_path(dir.path(), &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Would fix:"),
+        "R1: dir --fix --check must still report the pending fix; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: dir --fix --check must exit 2 when any residual carries an \
+         error-severity finding (the old early exit(1) shadowed max_tally); \
+         stderr: {stderr}"
+    );
+}
+
+#[test]
+fn d1_dir_fix_diff_residual_error_exits_2() {
+    let dir = preview_exit_tempdir(&["lint_fixable_plus_error.mds"]);
+
+    let out = lint_path(dir.path(), &["--fix", "--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("@@"),
+        "non-vacuity: dir --fix --diff must render a hunk; stdout: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: dir --fix --diff must exit 2 when any residual carries an \
+         error-severity finding; stdout: {stdout}"
+    );
+}
+
+#[test]
+fn d1_fix_diff_residual_clean_info_only_exits_1() {
+    // The floor: a file whose only findings are info-severity but FIXABLE
+    // previously previewed as exit 0 under --fix --diff (exit_by_severity on the
+    // pre-fix result ignores Info).  R1 floors the preview at 1 whenever a fix
+    // is pending, matching --check's "would change" contract.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("mds.json"),
+        r#"{ "lint": { "rules": { "empty-block": "info" } } }"#,
+    )
+    .unwrap();
+    let target = dir.path().join("floor.mds");
+    fs::write(&target, "@if \"a\" == \"a\":\n@end\n\nHello\n").unwrap();
+
+    let out = lint_path(&target, &["--fix", "--diff"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("@@"),
+        "non-vacuity: --fix --diff must render a hunk; stdout: {stdout}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "R1: --fix --diff must exit at least 1 when a fix is pending, even when \
+         every finding is info-severity (was 0); stderr: {stderr}"
+    );
+}
+
+#[test]
+fn d1_fix_check_nothing_fixable_error_exits_2() {
+    // No fixable finding at all + an error-severity finding: the NothingToFix
+    // path must keep exiting by severity (2), unchanged by R1.
+    let target = fixture("lint_preview_exit/lint_nothing_fixable_error.mds");
+
+    let out = lint_path(&target, &["--fix", "--check"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Would fix:"),
+        "nothing-fixable file must not report a pending fix; stderr: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--fix --check with nothing fixable and an error finding must exit 2; \
+         stderr: {stderr}"
+    );
+}
+
+#[test]
+fn d1_file_fix_check_json_body_pre_fix_and_exit_2() {
+    // JSON body/exit consistency: the envelope stays PRE-fix (both findings
+    // present — the preview reports what is wrong now) while the exit code
+    // reflects the residual (2: the unused-variable error survives the fix).
+    let target = fixture("lint_preview_exit/lint_fixable_plus_error.mds");
+
+    let out = lint_path(&target, &["--fix", "--check", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one parseable envelope ({e}); got: {stdout}"));
+    let diags = json["files"][0]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
+    assert!(
+        rules.contains(&"unused-variable") && rules.contains(&"empty-block"),
+        "R1: JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: exit must reflect the residual error while the body stays pre-fix; \
+         stdout: {stdout}"
+    );
+}
+
+#[test]
+fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
+    let dir = preview_exit_tempdir(&["lint_fixable_plus_error.mds"]);
+
+    let out = lint_path(dir.path(), &["--fix", "--check", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one parseable envelope ({e}); got: {stdout}"));
+    let diags = json["files"][0]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
+    assert!(
+        rules.contains(&"unused-variable") && rules.contains(&"empty-block"),
+        "R1: dir JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "R1: dir --fix --check --format json must emit the envelope AND exit 2 \
+         (residual error); stdout: {stdout}"
+    );
+}

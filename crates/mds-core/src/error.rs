@@ -408,6 +408,48 @@ pub enum MdsError {
     )]
     InvalidVars { message: String },
 
+    /// A runtime variable key was supplied through both `--set` and
+    /// `--set-string` in the same CLI invocation.
+    ///
+    /// A usage error over runtime VARIABLES, not an analysis failure: every
+    /// subcommand exits 1 for it (the logical/content error class), including
+    /// `mds lint`, which carves this one variant out of its blanket
+    /// analysis-failure exit 2.
+    ///
+    /// The key is NOT `safe_inline`'d at construction — `serialize()` and
+    /// `eprint_error` sanitize in one place (ADR-008).  No constructor fn:
+    /// the CLI struct-literals this variant (precedent: `MdsError::Io` at the
+    /// lint config-load sites).
+    #[error("variable '{key}' is set by both --set and --set-string; use only one")]
+    #[diagnostic(
+        code(mds::var_conflict),
+        help("--set coerces the value (bool/number/null/array/string); --set-string always passes a string — keep the flag whose semantics you want and drop the other")
+    )]
+    VarConflict { key: String },
+
+    /// A virtual module key requested by `compile_virtual`, `lint_virtual`, or
+    /// an in-template `@import` was not found in the virtual module map.
+    ///
+    /// Distinct from [`FileNotFound`][MdsError::FileNotFound], which is reserved for
+    /// the `NativeFs` filesystem backend.  VirtualFs uses a closed HashMap — "not
+    /// in the map" is a caller error, not an OS file-not-found, and deserves its own
+    /// code so the help text can point at `options.modules` / the native backend.
+    ///
+    /// The key is NOT `safe_inline`'d at construction — `serialize()` and
+    /// `eprint_error` sanitize in one place (ADR-008).
+    #[error("module '{key}' is not in the virtual module map")]
+    #[diagnostic(
+        code(mds::module_not_found),
+        help("add the module to `options.modules` (WASM / napi / Python) or switch to the native backend for filesystem-backed imports")
+    )]
+    ModuleNotFound {
+        key: String,
+        #[label("imported here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        src: Option<Arc<miette::NamedSource<String>>>,
+    },
+
     #[error("recursion detected in function '{name}'")]
     #[diagnostic(
         code(mds::recursion),
@@ -743,6 +785,34 @@ impl MdsError {
         }
     }
 
+    /// Construct a `ModuleNotFound` error for a missing virtual module key.
+    ///
+    /// Use this for `VirtualFs`-backed paths only; `NativeFs` uses
+    /// [`file_not_found`][MdsError::file_not_found].
+    pub(crate) fn module_not_found(key: impl Into<String>) -> Self {
+        MdsError::ModuleNotFound {
+            key: key.into(),
+            span: None,
+            src: None,
+        }
+    }
+
+    /// Construct a `ModuleNotFound` error with an import-site span.
+    pub(crate) fn module_not_found_at(
+        key: impl Into<String>,
+        file: &str,
+        source: &str,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        let (span, src) = at(file, source, offset, len);
+        MdsError::ModuleNotFound {
+            key: key.into(),
+            span,
+            src,
+        }
+    }
+
     pub(crate) fn import_error(message: impl Into<String>) -> Self {
         MdsError::ImportError {
             message: message.into(),
@@ -937,6 +1007,7 @@ impl MdsError {
             | MdsError::TypeMismatch { span, src, .. }
             | MdsError::CircularImport { span, src, .. }
             | MdsError::FileNotFound { span, src, .. }
+            | MdsError::ModuleNotFound { span, src, .. }
             | MdsError::ImportError { span, src, .. }
             | MdsError::NameCollision { span, src, .. }
             | MdsError::Recursion { span, src, .. }
@@ -968,6 +1039,7 @@ impl MdsError {
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
+            | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,
@@ -1046,6 +1118,7 @@ impl MdsError {
             | MdsError::TypeMismatch { src, .. }
             | MdsError::CircularImport { src, .. }
             | MdsError::FileNotFound { src, .. }
+            | MdsError::ModuleNotFound { src, .. }
             | MdsError::ImportError { src, .. }
             | MdsError::NameCollision { src, .. }
             | MdsError::Recursion { src, .. }
@@ -1059,6 +1132,7 @@ impl MdsError {
             | MdsError::YamlError { .. }
             | MdsError::JsonError { .. }
             | MdsError::InvalidVars { .. }
+            | MdsError::VarConflict { .. }
             | MdsError::ExpectedMarkdown
             | MdsError::ExpectedMessages
             | MdsError::FormatterInvariant { .. } => None,

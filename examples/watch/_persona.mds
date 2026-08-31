@@ -1,0 +1,7 @@
+@define intro(role, name):
+You are a helpful {{role}} named {{name}}.
+@end
+
+@define style():
+Use plain language. Keep responses under 150 words.
+@end

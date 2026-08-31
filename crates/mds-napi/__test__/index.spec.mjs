@@ -17,7 +17,19 @@ import fs from 'node:fs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
-// Load the native addon from the built .node file.
+// Load the native addon from the built .node file. The raw require of the base
+// filename (bypassing the index.js loader chain) is a deliberate contract — the
+// loader chain is A3-gate territory (scripts/verify-napi-names.mjs).
+const ADDON_PATH = path.join(__dirname, '..', 'mds-napi.node');
+if (!fs.existsSync(ADDON_PATH)) {
+  // THROW, never skip (PF-013): a skipped suite reads as green while testing nothing.
+  throw new Error(
+    `mds-napi addon not built: ${ADDON_PATH} is missing. Build it with: ` +
+      'npm run build:native -w @mdscript/mds-napi (requires the Rust toolchain). ' +
+      'Note: `napi build --platform` writes a platform-suffixed .node file this ' +
+      'harness does NOT load (PF-035).',
+  );
+}
 const addon = require('../mds-napi.node');
 const { compile, compileFile, check, checkFile } = addon;
 
@@ -1021,6 +1033,25 @@ describe('lintVirtual', () => {
         assert.ok(
           !err.message.includes('lintFile'),
           `expected message NOT to name lintFile; got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  // R6: missing virtual module emits mds::module_not_found, not mds::file_not_found.
+  test('R6-NV: lintVirtual on missing entry emits mds::module_not_found', () => {
+    assert.throws(
+      () => lintVirtual({ 'other.mds': 'Hello!\n' }, 'main.mds'),
+      (err) => {
+        assert.equal(
+          err.code,
+          'mds::module_not_found',
+          `R6-NV: expected mds::module_not_found, got: ${err.code}`,
+        );
+        assert.ok(
+          err.message.includes('main.mds'),
+          `R6-NV: message must contain the key; got: ${err.message}`,
         );
         return true;
       },

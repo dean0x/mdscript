@@ -286,7 +286,9 @@ jobs:
             examples/inheritance \
             examples/linting \
             examples/prompt-library \
+            examples/python \
             examples/source-maps \
+            examples/watch \
             examples/stress-test/agents \
             examples/stress-test/edge \
             examples/stress-test/lib \

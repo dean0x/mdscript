@@ -2,15 +2,15 @@
 name: Test
 ---
 
-@import "../prompt-library/guardrails.mds" as guard
+@import "./_included_body.mds" as included
 
 # Header
 
 This is the main content for {{name}}.
 
-## Included Guardrails Module
+## Included Partial
 
-@include guard
+@include included
 
 ## Back to Main
 

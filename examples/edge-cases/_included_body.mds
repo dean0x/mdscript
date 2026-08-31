@@ -1,0 +1,7 @@
+### From the Included Partial
+
+This paragraph lives in `_included_body.mds` and is spliced in verbatim by
+`@include`. That is the difference between the two directives: `@import` loads
+a module's exported definitions and discards its body text, while `@include`
+emits the target module's body — so a partial meant for inclusion should carry
+body content, like this one.

@@ -701,3 +701,153 @@ fn check_directory_esc_byte_in_syntax_error_is_sanitized_on_stderr() {
         &out.stdout[..out.stdout.len().min(512)]
     );
 }
+
+// ── R4 (v0.4.0 dogfood): --set/--set-string collision → mds::var_conflict, exit 1 ──
+//
+// The cross-flag collision was a bare `miette::miette!()` string: no diagnostic
+// code anywhere, and `mds lint` blanket-exited 2 (analysis-failure code) for what
+// is a runtime-variable usage error — while build/check/watch exited 1 via the
+// untyped-error fall-through.  R4 types it as `MdsError::VarConflict` (code
+// `mds::var_conflict`) and pins exit 1 on every subcommand; the message text is
+// byte-identical to the old one so message-substring pins stay green.
+
+/// Write a minimal template that uses {{x}} and return (tempdir, path-string).
+fn var_conflict_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("conflict.mds");
+    std::fs::write(&src, "{{x}}\n").unwrap();
+    (dir, src)
+}
+
+const VAR_CONFLICT_ARGS: [&str; 4] = ["--set", "x=1", "--set-string", "x=2"];
+const VAR_CONFLICT_MSG: &str = "variable 'x' is set by both --set and --set-string; use only one";
+
+#[test]
+fn d4_build_var_conflict_exits_1_with_code() {
+    let (_dir, src) = var_conflict_fixture();
+    let output = mds_bin()
+        .arg("build")
+        .arg(&src)
+        .args(["-o", "-"])
+        .args(VAR_CONFLICT_ARGS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "R4: build var conflict must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::var_conflict"),
+        "R4: stderr must carry the diagnostic code; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(VAR_CONFLICT_MSG),
+        "message must stay byte-identical; got: {stderr}"
+    );
+}
+
+#[test]
+fn d4_check_var_conflict_exits_1_with_code() {
+    let (_dir, src) = var_conflict_fixture();
+    let output = mds_bin()
+        .arg("check")
+        .arg(&src)
+        .args(VAR_CONFLICT_ARGS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "R4: check var conflict must exit 1; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::var_conflict"),
+        "R4: stderr must carry the diagnostic code; got: {stderr}"
+    );
+}
+
+#[test]
+fn d4_lint_var_conflict_exits_1_with_code() {
+    // THE regression: lint blanket-exited 2 for the same usage error that
+    // build/check/watch report as exit 1.
+    let (_dir, src) = var_conflict_fixture();
+    let output = mds_bin()
+        .arg("lint")
+        .arg(&src)
+        .args(VAR_CONFLICT_ARGS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "R4: lint var conflict must exit 1 (was 2); stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::var_conflict"),
+        "R4: stderr must carry the diagnostic code; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(VAR_CONFLICT_MSG),
+        "message must stay byte-identical; got: {stderr}"
+    );
+}
+
+#[test]
+fn d4_lint_json_var_conflict_emits_error_envelope() {
+    // JSON consumers must see the structured code, not an empty stdout with a
+    // stderr-only report: the collision routes through the analysis-failure
+    // envelope ({"version":1,"error":{...}}) like every other lint-level failure.
+    let (_dir, src) = var_conflict_fixture();
+    let output = mds_bin()
+        .arg("lint")
+        .arg(&src)
+        .args(["--format", "json"])
+        .args(VAR_CONFLICT_ARGS)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "R4: lint --format json must emit the error envelope on stdout ({e}); \
+             stdout: {stdout:?}; stderr: {stderr}"
+        )
+    });
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("mds::var_conflict"),
+        "R4: envelope must carry the typed code; got: {json}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "R4: lint --format json var conflict must exit 1; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn d4_watch_var_conflict_exits_1_with_code() {
+    // The conflict is detected at watch startup, before any watcher is armed —
+    // the process exits on its own (no readiness handshake needed).
+    let (_dir, src) = var_conflict_fixture();
+    let output = mds_bin()
+        .arg("watch")
+        .arg(&src)
+        .args(VAR_CONFLICT_ARGS)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "R4: watch var conflict must exit 1 at startup; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("mds::var_conflict"),
+        "R4: stderr must carry the diagnostic code; got: {stderr}"
+    );
+}

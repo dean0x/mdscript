@@ -1,0 +1,4 @@
+@import "./export_hides_prompt_lib.mds" as lib
+Before
+@include lib
+After

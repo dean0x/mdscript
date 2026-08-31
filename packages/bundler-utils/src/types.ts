@@ -38,7 +38,12 @@ export interface MarkdownResult {
   output: string;
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
+  /**
+   * Paths of every file transitively imported by the source. The native
+   * backend emits absolute canonical paths; the WASM backend emits
+   * project-root-relative POSIX paths — the transformer absolutizes them
+   * at the boundary before they reach {@link TransformResult.dependencies}.
+   */
   dependencies: string[];
 }
 
@@ -49,7 +54,12 @@ export interface MessagesResult {
   messages: Message[];
   /** Non-fatal diagnostic messages produced during compilation. */
   warnings: string[];
-  /** Absolute paths of every file transitively imported by the source. */
+  /**
+   * Paths of every file transitively imported by the source. The native
+   * backend emits absolute canonical paths; the WASM backend emits
+   * project-root-relative POSIX paths — the transformer absolutizes them
+   * at the boundary before they reach {@link TransformResult.dependencies}.
+   */
   dependencies: string[];
 }
 
@@ -57,7 +67,14 @@ export interface MessagesResult {
 export interface TransformResult {
   /** The generated JavaScript module source code. */
   code: string;
-  /** Absolute paths of every file this transform depends on. */
+  /**
+   * ABSOLUTE paths of every file this transform depends on — a FUNCTIONAL
+   * watch input: bundlers resolve relative paths against cwd in
+   * `addWatchFile`/`addDependency`, so entries are always absolute (WASM
+   * root-relative deps are absolutized at the transform boundary). The
+   * emitted `metadata` literal carries project-root-relative POSIX paths
+   * instead — never these absolute paths.
+   */
   dependencies: string[];
   /** Non-fatal compiler warnings from this transform. */
   warnings: string[];

@@ -78,6 +78,29 @@ fn serialize_syntax_without_span() {
 }
 
 #[test]
+fn serialize_var_conflict() {
+    // R4: --set/--set-string cross-flag collision is a typed error so every
+    // surface sees the stable code.  The message is byte-identical to the old
+    // CLI miette! string; the help names both flags' semantics.
+    let e = MdsError::VarConflict {
+        key: "x".to_string(),
+    };
+    let s = e.serialize();
+    assert_eq!(s.code, "mds::var_conflict");
+    assert_eq!(
+        s.message,
+        "variable 'x' is set by both --set and --set-string; use only one"
+    );
+    let help = s.help.expect("var_conflict must carry help");
+    assert!(
+        help.contains("--set ") && help.contains("--set-string"),
+        "help must name both flags' semantics; got: {help}"
+    );
+    assert_eq!(s.span, None);
+    assert_eq!(e.source_name(), None, "var_conflict carries no source");
+}
+
+#[test]
 fn serialize_undefined_var_with_span() {
     // "{{ x }}" — 'x' is at offset 3, length 1.
     let e = MdsError::undefined_var_at("x", "f.mds", "{{ x }}", 3, 1);

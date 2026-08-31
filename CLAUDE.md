@@ -8,6 +8,9 @@ Composable LLM prompt template compiler. Rust core (`crates/`) with WASM, native
 cargo test --workspace                        # 590+ Rust tests
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 npm ci && npm run build -w @mdscript/mds-wasm && npm run build --workspaces --if-present
+# The native addon is NOT built by `--workspaces` (its script is `build:native`, not
+# `build`); needs the Rust toolchain. Without it @mdscript/mds silently falls back to WASM.
+npm run build:native -w @mdscript/mds-napi
 npm test --workspaces --if-present
 
 # Python bindings (crates/mds-python) — 0 Rust tests by design; test via pytest:
@@ -41,10 +44,11 @@ See @RELEASING.md for the full runbook.
 - aarch64 Linux cross-builds use system gcc (gnu) and zig (musl) instead of napi `--use-napi-cross` because the macOS-generated lockfile doesn't resolve `@napi-rs/tar` linux binaries
 - `cargo publish -p mds-cli --dry-run` fails locally because mds-cli has a path+version dep on mds-core — this is expected; CI publishes mds-core first
 - `scripts/verify-napi-names.mjs` (A3 gate) is critical — if the hand-written `crates/mds-napi/index.js` loader drifts from generated platform packages, the universal package silently fails to load native binaries at runtime
+- Stale `.node` files silently serve old behavior — `crates/mds-napi/` can hold multiple addon vintages (`mds-napi.node` from `build:native`, platform-suffixed `mds-napi.<triple>.node` from `napi build --platform`), and the test harness loads the base `mds-napi.node` by name. After any Rust change, rebuild with `npm run build:native -w @mdscript/mds-napi` or the suite exercises an old binary (PF-035)
 - `NPM_CONFIG_ACCESS=public` is required for first-time publishes of scoped `@mdscript/*` packages with provenance
 - `debug-panics` Cargo feature must never ship enabled (all three binding crates) — it attaches raw panic payloads (may contain filesystem paths) to errors
 - `startup-race-probe` Cargo feature (`mds-cli`) must never ship enabled — it injects a 200 ms sleep into `mds watch` startup as the positive control for the arm-before-publish ordering (#317). It is non-default, but `mds-cli` publishes to crates.io, so `cargo install mds-cli --features startup-race-probe` would ship the delay to a user. It is exercised only by the `Watch startup race (probe)` CI job
-- Local WASM builds require Binaryen v129+ for wasm-opt — `brew install binaryen` (macOS) or `apt install binaryen` (Linux)
+- Local WASM builds do NOT require system Binaryen — wasm-pack auto-downloads wasm-opt (v117) into its cache on first use. Install Binaryen v129+ (`brew install binaryen` / `apt install binaryen`) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer (the setup-wasm action pins v129)
 - `crates/mds-python` (PyO3): test with **pytest, not `cargo test`** — 0 Rust tests by design (`[lib] test = false`). `abi3-py311` is always-on and `extension-module` is the default feature, so `cargo build/clippy/test --workspace` compile the cdylib without linking libpython; pyo3's abi3 forward-compat tolerates an older `python3` on PATH (repo default is 3.9)
 - `crates/mds-python/build.rs` emits a cdylib-scoped `-undefined dynamic_lookup` so bare `cargo build` links the extension on macOS (Linux allows undefined cdylib symbols; maturin passes the flag itself when it builds the wheel)
 - Local Python dev: `maturin develop` needs an active **virtualenv** + `python3` on PATH; CI has no venv so it uses `pip install ./crates/mds-python` (the maturin PEP 517 backend). Wheels are `cp311-abi3` (one per platform)

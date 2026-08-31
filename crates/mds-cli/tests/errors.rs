@@ -499,3 +499,50 @@ fn type_mismatch_cli_shows_miette_code_frame() {
         "D2: miette code frame must reference file or line 4; got: {stderr}"
     );
 }
+
+// ── R3 / CWE-209: human error frame names the project-root-relative path ─────
+
+#[test]
+fn r3_error_frame_names_root_relative_path_for_subdir_file() {
+    // A compile error in a subdirectory file must render its miette frame
+    // header with the project-root-relative path ("sub/err_test.mds"), never
+    // the canonicalized absolute path (R3 / CWE-209, construction-time
+    // relativization in mds-core).
+    let dir = tempfile::tempdir().unwrap();
+    // Canonicalize: macOS resolves /var → /private/var; the canonical form is
+    // what a leaked absolute key would carry.
+    let root = dir.path().canonicalize().unwrap();
+    // Deterministic project-root walk-up anchor.
+    std::fs::write(root.join(".mdsroot"), "").unwrap();
+    let sub = root.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let input = sub.join("err_test.mds");
+    std::fs::write(&input, "Hello {{undefined_var}}!\n").unwrap();
+
+    let output = mds_bin()
+        .args(["build", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "undefined variable must fail the build"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let root_str = root.to_str().unwrap();
+    // Positive control (PF-013): a frame naming the absolute path WOULD be
+    // caught by the absence assertion below.
+    let planted = format!("╭─[{}:1:10]", input.display());
+    assert!(
+        planted.contains(root_str),
+        "positive control: planted absolute frame must match the absence predicate"
+    );
+    assert!(
+        stderr.contains("sub/err_test.mds"),
+        "frame header must name the root-relative path; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains(root_str),
+        "stderr must not leak the absolute path prefix; got: {stderr}"
+    );
+}

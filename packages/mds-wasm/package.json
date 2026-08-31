@@ -45,6 +45,6 @@
     "README.md"
   ],
   "scripts": {
-    "build": "wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm && rm -f dist/node/.gitignore dist/web/.gitignore"
+    "build": "wasm-pack build ../../crates/mds-wasm --target nodejs --out-dir ../../packages/mds-wasm/dist/node --out-name mds_wasm && wasm-pack build ../../crates/mds-wasm --target web --out-dir ../../packages/mds-wasm/dist/web --out-name mds_wasm && rm -f dist/node/.gitignore dist/web/.gitignore dist/node/LICENSE dist/web/LICENSE"
   }
 }
