@@ -8,7 +8,7 @@ directories:
   - crates/mds-cli/src
   - packages/mds/src
 created: 2026-07-19
-updated: 2026-07-19
+updated: 2026-08-31
 ---
 
 # Source Map Security and Path Containment
@@ -140,6 +140,56 @@ In CI the JS job must:
 - `pip install ./crates/mds-python` to supply the Python surface.
 - Expose `MDS_CLI_BIN` and `MDS_PYTHON_BIN` env vars so the test's surface-discovery logic finds them.
 
+
+### R3 Display-Path Architecture (`display_path_for`)
+
+Source-map `sources[]` interning uses the canonical key (absolute path), but **diagnostic display** must never expose absolute paths (CWE-209). `display_path_for` in `source_path.rs` bridges the two:
+
+```rust
+// crates/mds-core/src/source_path.rs
+// Wraps relativize_source with base=None: produces root-relative display paths.
+// Returns the key verbatim for VirtualFs (no root) and <sentinel> paths.
+pub(crate) fn display_path_for(fs: &dyn FileSystem, key: &str) -> String {
+    let root_str = fs.source_root();
+    let root = root_str.as_deref().map(std::path::Path::new);
+    relativize_source(key, None, root)
+}
+```
+
+**`Origin` struct split** (`crates/mds-core/src/sourcemap.rs`): each loaded module carries two identity fields:
+- `file: Arc<str>` — canonical key (absolute path for NativeFs, virtual key or `<source>` sentinel for VirtualFs). Used exclusively for source-map interning in `MapBuilder::source_index`. Must NEVER reach a user-visible surface.
+- `display: Arc<str>` — root-relative display path, populated at construction time via `display_path_for(fs, key)`. Used for error messages, `NamedSource` names, and diagnostic `file` labels (R3 / CWE-209 / PF-013).
+
+The `Origin.display` field is populated eagerly at module-load time so no absolute path can "escape" to a display surface later, even via a code path that doesn't explicitly call `display_path_for`.
+
+**`MapBuilder` parallel `display_names`**: `MapBuilder` carries two parallel vecs:
+- `sources: Vec<String>` — canonical keys; emitted verbatim into SMv3 `sources[]` (byte-identical to ADR-005 contract)
+- `display_names: Vec<String>` — root-relative display paths; used only for diagnostics, never emitted into `sources[]`
+
+Both `MapBuilder::new(source_name, display_name, source_content)` and `MapBuilder::source_index(file, display, content)` are 3-argument; callers must supply both the canonical key and the display path. A `debug_assert_eq!` enforces strict length parity between the two vecs after every insertion.
+
+The `sources[]` bytes emitted into produced source maps are **byte-identical** to what they were before R3 — only the diagnostic display path changes. ADR-005 is preserved.
+
+**CLI `read_source_file` anchors display roots**: In `crates/mds-cli/src/lint.rs`, `read_source_file` calls `fs.set_root(effective_parent(&canonical))` before `fs.read()`. This anchors the project-root walk-up for the `NativeFs` instance used in single-file lint mode, so even error messages from the raw read path show root-relative display paths instead of the basename fallback.
+
+### TS Mirror: `packages/bundler-utils/src/project-root.ts`
+
+The bundler-utils package mirrors the Rust display-path logic in TypeScript for two concerns: finding the project root and normalising dependency paths emitted to bundler metadata.
+
+**`findProjectRoot(start)`**: Walks up from `start` to find `.git` or `.mdsroot` markers (same marker list and bounded traversal as `NativeFs::find_project_root`). Result is cached per start-directory. ARCHITECTURE EXCEPTION: uses synchronous `existsSync` — bounded and cached, same trade-off as `module-scanner.ts`.
+
+**`stripWindowsVerbatimPrefix(p)`**: Strips Windows verbatim extended-length path prefixes produced by `std::fs::canonicalize`. Mirrors `path_to_unified` in `source_path.rs`. **Deliberate divergence**: core drops the `\\?\UNC\` prefix entirely (it builds component lists), but the TS version rewrites it to `\\` so the result remains a functional absolute UNC path for the watch sink (`addWatchFile`/`addDependency` must receive absolute paths).
+
+**`toAbsoluteDependency(root, dep)`**: Converts a compiler-reported dependency to an absolute path. The native backend emits absolute canonical paths (passed through after `stripWindowsVerbatimPrefix`); the WASM backend emits root-relative POSIX paths (resolved against `root`). `TransformResult.dependencies` carries ABSOLUTE paths — bundlers resolve relative paths against cwd, not the project root.
+
+**`toRootRelativePosix(root, absPath)`**: Converts an absolute dependency path to a root-relative POSIX path for the emitted `metadata` literal (which ships in production bundles — absolute host paths are an information leak). Mirrors `relativize_source`: strips verbatim prefixes, unifies separators, then applies the escape/drive-qualified/`../` guards before the basename fallback. Ultimate fallback is `"source"`, matching core.
+
+**Two wire contracts**:
+1. `TransformResult.dependencies` — ABSOLUTE paths (watch input). Bundlers call `addWatchFile`/`addDependency` with these.
+2. Emitted `metadata` literal — ROOT-RELATIVE POSIX paths. Never absolute, never `../`, never drive-qualified.
+
+The Windows verbatim lesson is the same on both sides: native backend emits `\\?\D:\...` on Windows; the TS must strip verbatim prefixes BEFORE unifying separators, mirroring what `path_to_unified` does in core. The UNC rewrite divergence (functional `\\server\share` vs. dropped prefix in core) is intentional and documented at the call site.
+
 ## Anti-Patterns
 
 - **Adding a second call site for `sources[]` relativization**: The entire security guarantee rests on the single choke-point. A second inline call bypasses the 10-step guard algorithm partially or entirely.
@@ -172,11 +222,13 @@ In CI the JS job must:
 
 ## Key Files
 
-- `crates/mds-core/src/source_path.rs` — `relativize_source` (the single choke-point; 10-step guard algorithm; `path_to_unified` with verbatim-prefix strip; `basename_fallback` using normalized components; `core_rule_map_relative` and `core_rule_source_outside_root` discriminating test pair)
+- `crates/mds-core/src/source_path.rs` — `relativize_source` (the single choke-point; 10-step guard algorithm; `path_to_unified` with verbatim-prefix strip; `basename_fallback` using normalized components; `core_rule_map_relative` and `core_rule_source_outside_root` discriminating test pair); `display_path_for` (R3 display-path wrapper, root-relative for NativeFs, verbatim for VirtualFs)
 - `crates/mds-core/src/fs.rs:111-132` — `FileSystem::source_root()` (defaulted `None`; NativeFs override at line 522)
 - `crates/mds-core/src/resolver.rs:865-884, 943-963` — two finalize sites; both call `relativize_source` unconditionally; both include the defense-in-depth `set_root` guard
-- `crates/mds-core/src/sourcemap.rs:424-446` — `CompileOptions` struct (`source_map_base: Option<PathBuf>` at line 445); `SourceMap` struct carries `#[non_exhaustive]` (line 121), `CompileOptions` does not
-- `crates/mds-cli/src/build.rs:848-916` — `compute_source_map_base` (pure oracle; uses `compute_output_dir_path_for_kind`); `:932-` — `apply_source_map_file_label` (two-job post-processor: `sm.file` + `<stdin>` relabel)
+- `crates/mds-core/src/sourcemap.rs` — `Origin` struct (`file: Arc<str>` canonical key; `display: Arc<str>` root-relative display path, populated via `display_path_for`); `MapBuilder` (`sources[]` + parallel `display_names[]`; 3-arg `new` and `source_index`); `CompileOptions` struct (`source_map_base: Option<PathBuf>`); `SourceMap` struct carries `#[non_exhaustive]`, `CompileOptions` does not
+- `crates/mds-cli/src/build.rs` — `compute_source_map_base` (pure oracle; uses `compute_output_dir_path_for_kind`); `apply_source_map_file_label` (two-job post-processor: `sm.file` + `<stdin>` relabel)
+- `crates/mds-cli/src/lint.rs:380-393` — `read_source_file`: calls `fs.set_root(effective_parent(&canonical))` before `fs.read()` to anchor display roots for single-file lint mode
+- `packages/bundler-utils/src/project-root.ts` — TS mirror of R3 display-path logic: `findProjectRoot` (`.git`/`.mdsroot` walk, cached), `stripWindowsVerbatimPrefix` (mirrors `path_to_unified`; UNC divergence documented), `toAbsoluteDependency` (watch-input absolutisation), `toRootRelativePosix` (metadata literal, mirrors `relativize_source`)
 - `packages/mds/__test__/source-map.spec.mjs` — V-SM1 (WASM↔native virtual parity), CF-SM2 (four-surface differential test; hard-fails in CI if any surface missing)
 
 ## Related
@@ -186,5 +238,6 @@ In CI the JS job must:
 - **PF-005** (security invariants must be unconditional, never `debug_assert!`): every guard in `source_path.rs` is a runtime check in release builds.
 - **PF-007** (per-surface goldens cannot catch cross-surface divergence): V-SM1 and CF-SM2 are the differential tests this pitfall required. CF-SM2 hard-fails in CI if any surface is unavailable.
 - **PF-008** (pytest `-k` vs `-m`): use `-m "not perf"` when running Python parity tests.
-- `.devflow/features/mds-lint/KNOWLEDGE.md` — lint's `atomic_write_file` (unrelated to source maps but shares `output.rs`).
+- `.devflow/features/mds-lint/KNOWLEDGE.md` — lint's `atomic_write_file` (unrelated to source maps but shares `output.rs`); `display_label`/`read_source_file` anchor the same R3 display-root for lint display paths.
 - `.devflow/features/mds-fmt/KNOWLEDGE.md` — fmt does not emit source maps (CLI-only), but shares `output.rs` and `effective_parent`.
+- `packages/bundler-utils/src/project-root.ts` — TS mirror of the display-path and verbatim-strip logic; two wire contracts (ABSOLUTE dependencies, root-relative POSIX metadata).

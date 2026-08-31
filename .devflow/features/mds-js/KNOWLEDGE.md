@@ -16,7 +16,7 @@ referencedFiles:
   - packages/mds/__test__/types/consumer-node.ts
   - packages/mds/__test__/types/consumer-browser.ts
 created: 2026-06-26
-updated: 2026-08-21
+updated: 2026-08-31
 ---
 
 # @mdscript/mds Universal JS Package
@@ -91,7 +91,15 @@ export type CompileResult = MarkdownResult | MessagesResult;
 
 ### LintDiagnostic nullability
 
-`LintDiagnostic.help` is `string | null | undefined` (declared as `?: string | null`), and `LintDiagnostic.span` is `LintSpan | null | undefined` (declared as `?: LintSpan | null`). The `?` (undefined) was deliberately kept: with `span?: LintSpan | null`, `diag.span !== undefined` narrows to `LintSpan | null` under `strict`. Dropping `?` would be a further source-breaking narrowing. These shapes are pinned by `consumer-node.ts` / `consumer-browser.ts` type fixtures (testing-03).
+`LintDiagnostic.help`, `.span`, and `.fix_edits` are all **required** keys with `| null` types — no `?` (no `undefined` arm). As declared in `types.ts`:
+
+- `help: string | null` — always present on the wire; `null` (never `undefined`) when the rule emits no hint
+- `span: LintSpan | null` — always present on the wire; `null` when the rule produces no source span
+- `fix_edits: Array<{ start: number; end: number; new_text: string }> | null` — always present on the wire; `null` when no auto-fix edits exist
+
+**PR #335 (J2) reversed the prior `?:` shape.** The `?` was removed because backends always emit all three keys (serde serializes `Option::None` as JSON `null`), so `undefined` was never reachable at runtime. Guards must check `!== null`, NOT `!== undefined` — a `!== undefined` guard silently passes `null` through.
+
+Consumer fixtures pin this invariant: `consumer-node.ts` carries `fix_edits: null` literals and three `@ts-expect-error` missing-key positive controls for `help`, `span`, and `fix_edits`; `consumer-browser.ts` carries the same for `fix_edits` (testing-03 revised). If any of the three fields regresses to optional (`?:`), tsc reports "Unused '@ts-expect-error' directive" and the type-check build fails.
 
 ### Export divergence: node.ts vs browser.ts
 

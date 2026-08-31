@@ -11,7 +11,7 @@ directories:
   - crates/mds-python/src
   - packages/mds/src
 created: 2026-07-11
-updated: 2026-08-21
+updated: 2026-08-31
 ---
 
 # mds lint — Static Analysis Engine and Tiered --fix
@@ -208,7 +208,26 @@ The output-equality sub-check (3) is **skipped** when the plan contains any edit
 
 ### CLI Preview Pipeline (`preview_fixes`)
 
-`preview_fixes` in lint.rs routes through the same gated pipeline as the write path — it calls `apply_fixes_incremental` with the full reverify closure and does NOT write to disk. `PreviewOutcome` has three variants: `WouldFix(String)` (at least one edit applies; contains would-be source), `Rejected(String)` (every edit refused), `NothingToFix`. The three-way gate in both single-file and directory modes: `fix && !check && !diff` → write path; `fix && (check || diff)` → preview path; report-only (no `fix`) → `mds::lint` + render.
+`preview_fixes` in lint.rs routes through the same gated pipeline as the write path — it calls `apply_fixes_incremental` with the full reverify closure and does NOT write to disk.
+
+`PreviewOutcome` has three variants:
+- `WouldFix { fixed: String, residual: mds::LintResult }` — at least one edit would apply; `fixed` is the would-be source text (used for `--diff` rendering); `residual` is the post-fix lint result (used for the R1 preview exit code)
+- `Rejected(String)` — every edit refused by the reverify gate
+- `NothingToFix` — no edits to apply
+
+The `WouldFix` variant carries a named `residual` because the preview exit code is derived from it, not from a simple "any file would change" boolean:
+
+```
+preview_exit_code(residual) = result_exit_code(residual).max(1)
+```
+
+The `.max(1)` floors the exit at 1 (signaling "fixes are pending" for the `--fix --check` CI contract). Residual Error-severity findings push the exit above 1: a tree where `--fix` would leave Error findings behind exits 2 even though every file "would fix". This formula governs both `--fix --check` and `--fix --diff`.
+
+`display_label` (the caller-supplied relative, forward-slash-normalised path) is passed to both `plan_and_apply_fixes` and `preview_fixes` and applied to every residual diagnostic's `file` field via `set_diag_display_path`. Without it the residual would leak the basename or `STRING_SOURCE_MAP_LABEL` instead of the navigable relative path.
+
+**Directory mode**: In the `WouldFix` arm, the per-file tally comes from the RESIDUAL (`tally_from_result(residual)`), not the pre-fix result. Summary-bucket counters (`warn_file_count`, `error_file_count`, etc.) are residual-based under preview. `any_would_fix = true` then floors the aggregate at 1 via `exit = max_tally.exit_code().max(if any_would_fix { 1 } else { 0 })`. A former early-exit `if flags.check && any_would_fix { exit(1) }` shadowed `max_tally` — residual errors would have exited 1 instead of 2. That early-exit is removed.
+
+The three-way gate in both single-file and directory modes: `fix && !check && !diff` → write path; `fix && (check || diff)` → preview path; report-only (no `fix`) → `mds::lint` + render.
 
 ### Directory Mode: Per-File Config Discovery
 
@@ -424,11 +443,17 @@ Lint uses **direct `std::process::exit`**, never the shared `exit_code()` functi
 | Code | Condition |
 |------|-----------|
 | 0 | Clean — no Warn or Error findings |
-| 1 | Warn-severity findings only, no errors; also `--fix --check` when any file would change |
-| 2 | Any Error-severity finding OR analysis failure (parse, syntax, nesting-overflow) OR usage error |
+| 1 | Warn-severity findings only, no errors; preview mode (`--fix --check` / `--fix --diff`) when any file would change and residual has no Error findings |
+| 2 | Any Error-severity finding OR analysis failure (parse, syntax, nesting-overflow) OR usage error; preview mode: residual has Error findings |
 | 3 | ResourceLimit — `MAX_BLOCKS_PER_MODULE=256` exceeded in the resolver's `collect_block()` |
 
-`Info` severity never contributes to exit code. With `--fix`, residual post-fix findings determine the code.
+`Info` severity never contributes to exit code. With `--fix`, residual post-fix findings determine the code (see `preview_exit_code` above).
+
+**R4 carve-out — `mds::var_conflict`**: A `--set`/`--set-string` key collision exits **1** on ALL subcommands including lint, not 2. This is consistent with how `build`/`check`/`watch` handle it via `exit_code()`. Implementation: a one-variant-wide downcast in `do_lint` matches `MdsError::VarConflict { .. }`, routes through `emit_analysis_failure_json_or_stderr` (so `--format json` consumers get the structured envelope), then calls `process::exit(1)`. Every other setup error keeps the blanket exit 2 in `run_lint`'s catch.
+
+**R6 — `mds::module_not_found`**: When `lint_virtual` (or the public `mds::lint_virtual` in mds-core) is called with an `entry` key absent from the `modules` map, the resolver returns `MdsError::module_not_found(entry)` rather than the file-surface `FileNotFound`. This preserves error-code accuracy on virtual surfaces — `VirtualFs` has no filesystem, so `FileNotFound` would be misleading.
+
+**WARN-A / WARN-B — `@include` empty-output warnings (R2)**: Two variants of the empty-`@include` warning exist in the resolver. WARN-A fires when the included module has no prompt body at all. WARN-B fires when the module has prompt body text but its `@export` list explicitly excludes `"prompt"` — the `@include` caller still sees empty output because the body is suppressed by export gating (`prompt_suppressed_by_exports = true` in `NamespaceScope::to_namespace_scope`). Both warnings surface in the `warnings` field of compile/lint results.
 
 ## State Transitions
 
