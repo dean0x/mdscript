@@ -247,7 +247,10 @@ fn module_not_found() {
     );
     let err = compile_vfs(modules, "main.mds").expect_err("should fail: module not found");
     assert!(
-        matches!(err, MdsError::ModuleNotFound { .. } | MdsError::ImportError { .. }),
+        matches!(
+            err,
+            MdsError::ModuleNotFound { .. } | MdsError::ImportError { .. }
+        ),
         "expected ModuleNotFound or ImportError, got {err:?}"
     );
 }
@@ -1931,7 +1934,8 @@ fn r6_a_virtual_fs_compile_missing_module_not_found() {
     // After attach_import_span, ModuleNotFound becomes ImportError (with span text).
     // Either ModuleNotFound (no span yet) or ImportError (span attached) is valid.
     assert!(
-        matches!(err, MdsError::ModuleNotFound { .. }) || matches!(err, MdsError::ImportError { .. }),
+        matches!(err, MdsError::ModuleNotFound { .. })
+            || matches!(err, MdsError::ImportError { .. }),
         "R6-A: expected ModuleNotFound or ImportError (span-wrapped), got {err:?}"
     );
     // Must NOT be the NativeFs FileNotFound variant.
@@ -1944,10 +1948,8 @@ fn r6_a_virtual_fs_compile_missing_module_not_found() {
 /// R6-B: Error code is `mds::module_not_found` on the direct lint_virtual path.
 #[test]
 fn r6_b_virtual_fs_module_not_found_code() {
-    let modules: HashMap<String, String> = HashMap::from([(
-        "main.mds".to_string(),
-        "Hello!\n".to_string(),
-    )]);
+    let modules: HashMap<String, String> =
+        HashMap::from([("main.mds".to_string(), "Hello!\n".to_string())]);
     let err = mds::lint_virtual(modules, "missing.mds", None, &mds::LintConfig::default())
         .expect_err("expected ModuleNotFound for missing entry");
     let s = err.serialize();

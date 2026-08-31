@@ -2500,9 +2500,9 @@ fn attach_import_span(
         MdsError::FileNotFound { span: None, .. } => {
             MdsError::file_not_found_at(path, file_str, source, offset, line_len)
         }
-        MdsError::ModuleNotFound { key, span: None, .. } => {
-            MdsError::module_not_found_at(key, file_str, source, offset, line_len)
-        }
+        MdsError::ModuleNotFound {
+            key, span: None, ..
+        } => MdsError::module_not_found_at(key, file_str, source, offset, line_len),
         MdsError::CircularImport {
             cycle, span: None, ..
         } => MdsError::circular_import_at(cycle, file_str, source, offset, line_len),

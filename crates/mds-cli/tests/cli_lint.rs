@@ -6437,8 +6437,8 @@ fn d1_file_fix_diff_residual_error_exits_2() {
 
 #[test]
 fn d1_stdin_fix_check_residual_error_exits_2() {
-    let source = fs::read_to_string(fixture("lint_preview_exit/lint_fixable_plus_error.mds"))
-        .unwrap();
+    let source =
+        fs::read_to_string(fixture("lint_preview_exit/lint_fixable_plus_error.mds")).unwrap();
     let config_dir = fixture("lint_preview_exit");
 
     let out = lint_stdin_in_dir(&config_dir, &source, &["--fix", "--check"]);
@@ -6462,8 +6462,8 @@ fn d1_stdin_fix_check_residual_error_exits_2() {
 
 #[test]
 fn d1_stdin_fix_diff_residual_error_exits_2() {
-    let source = fs::read_to_string(fixture("lint_preview_exit/lint_fixable_plus_error.mds"))
-        .unwrap();
+    let source =
+        fs::read_to_string(fixture("lint_preview_exit/lint_fixable_plus_error.mds")).unwrap();
     let config_dir = fixture("lint_preview_exit");
 
     let out = lint_stdin_in_dir(&config_dir, &source, &["--fix", "--diff"]);
@@ -6581,10 +6581,7 @@ fn d1_file_fix_check_json_body_pre_fix_and_exit_2() {
     let diags = json["files"][0]["diagnostics"]
         .as_array()
         .expect("diagnostics array");
-    let rules: Vec<&str> = diags
-        .iter()
-        .filter_map(|d| d["rule"].as_str())
-        .collect();
+    let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
     assert!(
         rules.contains(&"unused-variable") && rules.contains(&"empty-block"),
         "R1: JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"
@@ -6608,10 +6605,7 @@ fn d1_dir_fix_check_json_body_pre_fix_and_exit_2() {
     let diags = json["files"][0]["diagnostics"]
         .as_array()
         .expect("diagnostics array");
-    let rules: Vec<&str> = diags
-        .iter()
-        .filter_map(|d| d["rule"].as_str())
-        .collect();
+    let rules: Vec<&str> = diags.iter().filter_map(|d| d["rule"].as_str()).collect();
     assert!(
         rules.contains(&"unused-variable") && rules.contains(&"empty-block"),
         "R1: dir JSON body must stay PRE-fix (both findings present); got rules: {rules:?}"

@@ -693,10 +693,14 @@ fn r2_a_include_no_body_text_warns_no_body() {
         "main.mds".to_string(),
         "@import \"./fns.mds\" as fns\n@include fns\n".to_string(),
     );
-    let result =
-        mds::compile_virtual_collecting_warnings(modules, "main.mds", None).expect("should compile");
+    let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)
+        .expect("should compile");
     let warn = result.warnings.iter().find(|w| w.contains("empty output"));
-    assert!(warn.is_some(), "R2-A: expected 'empty output' warning; got: {:?}", result.warnings);
+    assert!(
+        warn.is_some(),
+        "R2-A: expected 'empty output' warning; got: {:?}",
+        result.warnings
+    );
     let w = warn.unwrap();
     assert!(
         w.contains("no body text"),
@@ -724,10 +728,14 @@ fn r2_b_include_body_hidden_by_export_warns_export_list() {
         "main.mds".to_string(),
         "@import \"./lib.mds\" as lib\n@include lib\n".to_string(),
     );
-    let result =
-        mds::compile_virtual_collecting_warnings(modules, "main.mds", None).expect("should compile");
+    let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)
+        .expect("should compile");
     let warn = result.warnings.iter().find(|w| w.contains("empty output"));
-    assert!(warn.is_some(), "R2-B: expected 'empty output' warning; got: {:?}", result.warnings);
+    assert!(
+        warn.is_some(),
+        "R2-B: expected 'empty output' warning; got: {:?}",
+        result.warnings
+    );
     let w = warn.unwrap();
     // WARN-B must mention the exports list / prompt export.
     assert!(
@@ -751,9 +759,13 @@ fn r2_c_include_exports_prompt_no_warning() {
         "main.mds".to_string(),
         "@import \"./lib.mds\" as lib\n@include lib\n".to_string(),
     );
-    let result =
-        mds::compile_virtual_collecting_warnings(modules, "main.mds", None).expect("should compile");
-    let include_warns: Vec<_> = result.warnings.iter().filter(|w| w.contains("empty output")).collect();
+    let result = mds::compile_virtual_collecting_warnings(modules, "main.mds", None)
+        .expect("should compile");
+    let include_warns: Vec<_> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("empty output"))
+        .collect();
     assert!(
         include_warns.is_empty(),
         "R2-C: @include of a module with exported prompt must not warn; got: {include_warns:?}"
