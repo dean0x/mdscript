@@ -36,6 +36,24 @@
 //! depth-limit warning (fires on trees deeper than MAX_DEPTH=64) accepts no quiet
 //! parameter — documented limitation per AC-Q05/PF-015, mirroring `build.rs`.
 //!
+//! # Diagnostic path anchors (directory-mode divergence, R3 / CWE-209)
+//!
+//! Two path families appear in lint output and deliberately use different
+//! anchor directories in directory mode:
+//!
+//! - **Rule diagnostics** display *walk-root-relative* paths: `diag.file` is
+//!   overwritten via [`set_diag_display_path`] with the path relative to the
+//!   linted directory (the walk root), keeping per-file output stable and
+//!   sortable within one run.
+//! - **Analysis-failure frames** (parse/resolve/IO/config-load errors) display
+//!   *project-root-relative* paths: mds-core relativizes `NamedSource` names and
+//!   message paths at construction time against the `.mdsroot` / `.git` walk-up
+//!   root (R3), and [`read_source_file`] anchors the same root for raw-read
+//!   errors.
+//!
+//! The two anchors differ, but both are safe: neither surface ever shows an
+//! absolute path (basename fallback outside the root).
+//!
 //! # Exit codes (via direct `std::process::exit`, NEVER via `exit_code()`)
 //!
 //! - 0: clean (no Warn/Error findings)
@@ -364,7 +382,14 @@ fn read_source_file(path: &Path) -> std::result::Result<String, MdsError> {
     let path_str = canonical.to_str().ok_or_else(|| MdsError::Io {
         message: format!("path is not valid UTF-8: {}", path.display()),
     })?;
-    NativeFs::new().read(path_str)
+    let fs = NativeFs::new();
+    // R3 / CWE-209: anchor the display root (project-root walk-up from the
+    // file's directory) BEFORE read(), so read-error messages show a
+    // project-root-relative path instead of falling back to the bare basename.
+    // Best-effort like the resolver's defense-in-depth guard: on failure the
+    // display degrades to the basename fallback, which is still never absolute.
+    let _ = fs.set_root(&effective_parent(&canonical).display().to_string());
+    fs.read(path_str)
 }
 
 // ── stdout write ──────────────────────────────────────────────────────────────

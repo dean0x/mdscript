@@ -97,9 +97,15 @@ fn read_source_file(path: &Path) -> Result<String> {
     let path_str = canonical
         .to_str()
         .ok_or_else(|| miette::miette!("path is not valid UTF-8: {}", path.display()))?;
-    mds::NativeFs::new()
-        .read(path_str)
-        .map_err(miette::Error::from)
+    let fs = mds::NativeFs::new();
+    // R3 / CWE-209: anchor the display root (project-root walk-up from the
+    // file's directory) BEFORE read(), so read-error messages show a
+    // project-root-relative path instead of falling back to the bare basename.
+    // Best-effort like the resolver's defense-in-depth guard: on failure the
+    // display degrades to the basename fallback, which is still never absolute.
+    // Mirrors lint.rs read_source_file exactly.
+    let _ = fs.set_root(&effective_parent(&canonical).display().to_string());
+    fs.read(path_str).map_err(miette::Error::from)
 }
 
 /// The result of formatting one file's content: whether it changed, and the
