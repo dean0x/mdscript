@@ -17,7 +17,19 @@ import fs from 'node:fs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 
-// Load the native addon from the built .node file.
+// Load the native addon from the built .node file. The raw require of the base
+// filename (bypassing the index.js loader chain) is a deliberate contract — the
+// loader chain is A3-gate territory (scripts/verify-napi-names.mjs).
+const ADDON_PATH = path.join(__dirname, '..', 'mds-napi.node');
+if (!fs.existsSync(ADDON_PATH)) {
+  // THROW, never skip (PF-013): a skipped suite reads as green while testing nothing.
+  throw new Error(
+    `mds-napi addon not built: ${ADDON_PATH} is missing. Build it with: ` +
+      'npm run build:native -w @mdscript/mds-napi (requires the Rust toolchain). ' +
+      'Note: `napi build --platform` writes a platform-suffixed .node file this ' +
+      'harness does NOT load (PF-035).',
+  );
+}
 const addon = require('../mds-napi.node');
 const { compile, compileFile, check, checkFile } = addon;
 
