@@ -10,6 +10,9 @@ crates/mds-napi/npm/
 crates/mds-napi/artifacts/
 packages/*/dist/
 packages/*/dist-cjs/
+# Root dist/ — the examples README's `mds build examples/ --out-dir dist/` and a
+# local repro of the ci.yml maturin step can both create one; never tracked.
+/dist/
 
 # Example app build output (sources are tracked, builds are not)
 examples/*/dist/
