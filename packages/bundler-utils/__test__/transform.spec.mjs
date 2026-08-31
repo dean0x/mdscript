@@ -3,6 +3,9 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { createMdsTransformer } from '../dist/index.js';
 
 // ---------------------------------------------------------------------------
@@ -417,5 +420,142 @@ describe('createMdsTransformer — intrinsic bundler export', () => {
     const exportLine = result.code.split('\n').find(l => l.startsWith('export default'));
     assert.ok(exportLine, 'should have export default line');
     assert.ok(!exportLine.includes('</script>'), '</script> must not appear verbatim in messages export');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// J1: dependency path contracts (spec.md "Carve-out: functional path references")
+//
+// Two contracts, one datum:
+// - TransformResult.dependencies is a FUNCTIONAL watch input (addWatchFile /
+//   addDependency resolve relative paths against cwd) — entries must be ABSOLUTE.
+// - The emitted `metadata` literal lands in production bundles — entries must be
+//   project-root-relative POSIX paths, never host-absolute (PF-033 leak class).
+// ---------------------------------------------------------------------------
+describe('dependency path contracts (J1)', () => {
+  /** Create a temp project root marked with .mdsroot (realpath'd for macOS /var symlink). */
+  function makeTmpRoot(tag) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), `mds-j1-${tag}-`)));
+    writeFileSync(join(root, '.mdsroot'), '');
+    mkdirSync(join(root, 'src'), { recursive: true });
+    return root;
+  }
+
+  /** Extract and JSON.parse the emitted `export const metadata = {...};` literal. */
+  function parseMetadata(code) {
+    const line = code.split('\n').find((l) => l.startsWith('export const metadata = '));
+    assert.ok(line, 'metadata export line present');
+    return JSON.parse(line.slice('export const metadata = '.length, -1));
+  }
+
+  function mdsWithDeps(deps) {
+    return createMockMds({
+      async compileFile() {
+        return { kind: 'markdown', output: 'content', warnings: [], dependencies: deps };
+      },
+    });
+  }
+
+  test('T-J1-1: metadata deps root-relative, TransformResult deps absolute, no root prefix in code', async () => {
+    const root = makeTmpRoot('leak');
+    try {
+      const dep = join(root, 'lib', 'helper.mds');
+      const transformer = createMdsTransformer(mdsWithDeps([dep]));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      assert.deepEqual(result.dependencies, [dep],
+        'TransformResult.dependencies must stay ABSOLUTE (functional watch input)');
+      assert.deepEqual(parseMetadata(result.code).dependencies, ['lib/helper.mds'],
+        'metadata deps must be project-root-relative POSIX');
+
+      const leaks = (code) => code.includes(root);
+      assert.equal(leaks(result.code), false, `emitted code must not contain the project root ${root}`);
+      // PF-013 positive control: the predicate must catch a planted absolute path.
+      assert.equal(leaks(result.code + root), true,
+        'positive control: leak predicate must detect an injected absolute path');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('T-J1-2: WASM-shaped root-relative input deps are absolutized in TransformResult (idempotent round-trip)', async () => {
+    const root = makeTmpRoot('wasm');
+    try {
+      // The WASM backend emits project-root-relative POSIX deps.
+      const transformer = createMdsTransformer(mdsWithDeps(['lib/helper.mds']));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      assert.deepEqual(result.dependencies, [resolve(root, 'lib/helper.mds')],
+        'root-relative input must come out absolute — watch wiring must work under WASM fallback');
+      assert.deepEqual(parseMetadata(result.code).dependencies, ['lib/helper.mds'],
+        'relativize(absolutize(rel)) must round-trip to the same relative path');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('T-J1-3: dependency escaping the project root degrades to basename in metadata', async () => {
+    const root = makeTmpRoot('escape');
+    try {
+      // Parent of the temp root is outside the project root by construction.
+      const outside = join(resolve(root, '..'), 'mds-j1-outside.mds');
+      const transformer = createMdsTransformer(mdsWithDeps([outside]));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      assert.deepEqual(result.dependencies, [outside],
+        'escaping dep must stay absolute in TransformResult (functional watch input)');
+      const metaDeps = parseMetadata(result.code).dependencies;
+      assert.deepEqual(metaDeps, ['mds-j1-outside.mds'],
+        'root-escaping dep must degrade to basename in metadata (no ../ disclosure)');
+      assert.ok(!result.code.includes('..'), 'metadata must not carry ../ traversal segments');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('T-J1-4: foreign drive-qualified dependency degrades to basename in metadata', async () => {
+    const root = makeTmpRoot('drive');
+    try {
+      const transformer = createMdsTransformer(mdsWithDeps(['D:\\evil\\dep.mds']));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      assert.deepEqual(parseMetadata(result.code).dependencies, ['dep.mds'],
+        'drive-qualified dep must degrade to basename in metadata on every platform');
+      assert.ok(!result.code.includes('evil'), 'foreign drive path segments must not reach the emitted code');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('T-J1-5: metadata deps use POSIX separators for nested paths', async () => {
+    const root = makeTmpRoot('sep');
+    try {
+      const dep = join(root, 'lib', 'sub', 'helper.mds');
+      const transformer = createMdsTransformer(mdsWithDeps([dep]));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      const metaDeps = parseMetadata(result.code).dependencies;
+      assert.deepEqual(metaDeps, ['lib/sub/helper.mds'], 'nested metadata dep must be POSIX-joined');
+      for (const d of metaDeps) {
+        assert.ok(!d.includes('\\'), `metadata dep must not contain backslashes: ${d}`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('T-J1-6: result and metadata shapes are stable', async () => {
+    const root = makeTmpRoot('shape');
+    try {
+      const transformer = createMdsTransformer(mdsWithDeps([join(root, 'lib', 'helper.mds')]));
+      const result = await transformer.transform(join(root, 'src', 'module.mds'));
+
+      assert.deepEqual(Object.keys(result), ['code', 'dependencies', 'warnings'],
+        'TransformResult key set/order must not drift');
+      assert.deepEqual(Object.keys(parseMetadata(result.code)), ['warnings', 'dependencies'],
+        'metadata key set/order must not drift');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
