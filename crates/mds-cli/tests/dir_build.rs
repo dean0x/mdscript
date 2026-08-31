@@ -1003,10 +1003,7 @@ fn d5_dir_build_quiet_gate_unchanged_with_empty_outputs() {
 
     let output = build_dir(src.path(), &["--quiet"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "all-success run; stderr: {stderr}"
-    );
+    assert!(output.status.success(), "all-success run; stderr: {stderr}");
     assert!(
         !stderr.contains("built"),
         "R5: --quiet must still suppress the summary on an all-success run even \

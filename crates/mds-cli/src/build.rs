@@ -1576,6 +1576,12 @@ fn run_build_directory(
 
     let mut ok_count: usize = 0;
     let mut fail_count: usize = 0;
+    // R5: successful compilations whose written artifact is ZERO bytes (strict
+    // `is_empty()`, not trim — messages-mode JSON is never empty, and a
+    // whitespace-only markdown body is still content the author wrote).  A
+    // definitions-only module compiles to zero bytes silently; "N built" alone
+    // implies N useful artifacts (PF-034-adjacent).
+    let mut empty_count: usize = 0;
     // Track paths successfully written in this build run so the stale-cleanup
     // step can verify it was tool-produced before deleting (issue 1 guard):
     // prevents clobbering a hand-authored file that shares a stem with a .mds
@@ -1642,8 +1648,16 @@ fn run_build_directory(
                     compiled.content
                 };
 
+                // R5: capture emptiness BEFORE the write moves/borrows the content;
+                // counted only in the Ok arm below — a failed write is a failure,
+                // not an empty success.
+                let wrote_empty = final_content.is_empty();
+
                 match std::fs::write(&out_path, &final_content) {
                     Ok(()) => {
+                        if wrote_empty {
+                            empty_count += 1;
+                        }
                         if !quiet {
                             eprintln!("Compiled to {}", crate::output::safe_path(&out_path));
                         }
@@ -1717,8 +1731,17 @@ fn run_build_directory(
     // suppress the summary under --quiet when every file succeeded, so a quiet CI job
     // produces no output on a clean run.  AD-216-2: exit codes are untouched — a
     // --quiet build with failures still exits 1 with the summary explaining why.
+    // R5: the empty clause appears ONLY when empty_count > 0 — the historical
+    // `{ok} built, {fail} failed` form is byte-identical otherwise (no golden
+    // churn).  The suppression gate itself is unchanged (AD-216-1): empty
+    // outputs are informational, not failures, so they do not force the summary
+    // through --quiet.
     if !quiet || fail_count > 0 {
-        eprintln!("{ok_count} built, {fail_count} failed");
+        if empty_count > 0 {
+            eprintln!("{ok_count} built ({empty_count} empty), {fail_count} failed");
+        } else {
+            eprintln!("{ok_count} built, {fail_count} failed");
+        }
     }
 
     if fail_count > 0 {
