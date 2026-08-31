@@ -123,9 +123,10 @@ const _markdown: MarkdownResult = {
 // (browser types are verified in consumer-browser.ts; here we just confirm they
 // compile correctly when imported from the node entry.)
 const _diagArr: LintDiagnostic[] = [];
-// testing-03: pins LintDiagnostic.help: string | null and .span: LintSpan | null.
-// Reverting either `| null` widening in types.ts causes TS2322 on these
-// assignments, making the breaking type change detectable at compile time.
+// testing-03 (revised): pins LintDiagnostic.help, .span, and .fix_edits as
+// REQUIRED `| null` keys. Backends always emit all three keys (serde_json
+// serializes Option::None as JSON null), so the type carries no `undefined`
+// arm. Narrowing any of them back to non-nullable causes TS2322 here.
 const _diagWithNulls: LintDiagnostic = {
   rule: 'unused-variable',
   severity: 'warn',
@@ -133,6 +134,25 @@ const _diagWithNulls: LintDiagnostic = {
   help: null,
   fixable: false,
   span: null,
+  fix_edits: null,
+};
+// PF-013 positive controls: a literal missing any ONE of the three required
+// nullable keys must FAIL to typecheck. If a key regresses to optional (`?:`),
+// tsc reports "Unused '@ts-expect-error' directive" and the type test fails.
+// @ts-expect-error — `help` is a required key (help: string | null)
+const _diagMissingHelp: LintDiagnostic = {
+  rule: 'unused-variable', severity: 'warn', message: 'm', fixable: false,
+  span: null, fix_edits: null,
+};
+// @ts-expect-error — `span` is a required key (span: LintSpan | null)
+const _diagMissingSpan: LintDiagnostic = {
+  rule: 'unused-variable', severity: 'warn', message: 'm', fixable: false,
+  help: null, fix_edits: null,
+};
+// @ts-expect-error — `fix_edits` is a required key (fix_edits: Array<...> | null)
+const _diagMissingFixEdits: LintDiagnostic = {
+  rule: 'unused-variable', severity: 'warn', message: 'm', fixable: false,
+  help: null, span: null,
 };
 const _span: LintSpan = { offset: 0, length: 0 };
 const _report: LintFileReport = { file: 'a.mds', diagnostics: _diagArr };
@@ -149,3 +169,4 @@ void _inferredWithBasePath; void _compileFileFromInferred;
 void _validRule; void _fwdCompat; void _badSeverity;
 void _sourceMap; void _markdown;
 void _diagArr; void _diagWithNulls; void _span; void _report; void _result; void _severity; void _ruleName;
+void _diagMissingHelp; void _diagMissingSpan; void _diagMissingFixEdits;

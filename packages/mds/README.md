@@ -210,8 +210,8 @@ surfaces it appears in `lint_warnings`.
 **Lint result shape:**
 ```ts
 { version: 1, files: [{ file: string, diagnostics: LintDiagnostic[] }], truncated: boolean, lint_warnings?: string[] }
-// LintDiagnostic: { rule, severity, message, help?: string | null, fixable, fix_edits?: ... | null, span?: LintSpan | null }
-// help, span, and fix_edits are always-present keys in the JSON wire format; their value is null when absent.
+// LintDiagnostic: { rule, severity, message, help: string | null, fixable, fix_edits: Array<{start, end, new_text}> | null, span: LintSpan | null }
+// help, span, and fix_edits are REQUIRED keys — always present in the JSON wire format, `null` (never `undefined`) when absent.
 ```
 
 **`files[].file` key:** `lint()` sets this to `"input.mds"` (string-source); `lintFile()` sets it to the file's path; `lintVirtual()` sets it to the caller-supplied entry key. The CLI additionally relabels stdin input as `"<stdin>"` — this asymmetry does not apply to the binding surfaces.
