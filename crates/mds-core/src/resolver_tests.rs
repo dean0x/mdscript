@@ -3313,11 +3313,7 @@ fn r3_cross_file_error_keeps_own_files_display() {
     // The error originates in sub/lib.mds; its display must name sub/lib.mds,
     // not the importing main.mds and never the absolute canonical key.
     let (_guard, root) = r3_project();
-    std::fs::write(
-        root.join("main.mds"),
-        "@import \"./sub/lib.mds\"\nbody\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("main.mds"), "@import \"./sub/lib.mds\"\nbody\n").unwrap();
     let lib = root.join("sub").join("lib.mds");
     std::fs::write(&lib, "{{undefined_var}}\n").unwrap();
 
@@ -3351,11 +3347,7 @@ fn r3_sources_stay_map_relative_with_source_map_base() {
     // the end-to-end surface; this is the core-level pin with an explicit base.
     let (_guard, root) = r3_project();
     let entry = root.join("main.mds");
-    std::fs::write(
-        &entry,
-        "@import \"./sub/lib.mds\"\n{{greet(\"World\")}}\n",
-    )
-    .unwrap();
+    std::fs::write(&entry, "@import \"./sub/lib.mds\"\n{{greet(\"World\")}}\n").unwrap();
     std::fs::write(
         root.join("sub").join("lib.mds"),
         "@define greet(x):\nHello {{x}}!\n@end\n",
