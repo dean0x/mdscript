@@ -165,8 +165,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
   # Linux legs: x86_64-gnu uses napi's --use-napi-cross (gnu sysroot);
-  # aarch64-gnu links with the apt cross gcc (the macOS-generated lockfile
-  # lacks linux @napi-rs/tar so @napi-rs/cross-toolchain cannot reify);
+  # aarch64-gnu links with the apt cross gcc: --use-napi-cross regressed on
+  # aarch64 in 4e88ebd (the then macOS-generated lockfile did not resolve
+  # @napi-rs/tar-linux-x64-gnu). Not re-tested since; the apt gcc works.
   # BOTH musl legs link with a zig cc wrapper because --use-napi-cross has
   # no musl toolchain and napi forces -C target-feature=-crt-static on musl,
   # so the host gcc would link glibc (see x86_64-unknown-linux-musl).
@@ -295,16 +296,18 @@ jobs:
         run: |
           # Detector self-test: the glibc pattern must fire on a planted glibc
           # NEEDED line, so a silently broken pattern cannot read as "clean".
+          GLIBC_RE='libc\.so\.6|ld-linux'
           printf ' 0x0000000000000001 (NEEDED) Shared library: [libc.so.6]\n' \
-            | grep -Eq 'libc\.so\.6|ld-linux' \
+            | grep -Eq "$GLIBC_RE" \
             || { echo "::error::glibc detector self-test failed to fire"; exit 1; }
+          shopt -s nullglob
           set -- *.node
-          [ "$#" -eq 1 ] || { echo "::error::expected exactly one .node artifact, found $#: $*"; exit 1; }
+          [ "$#" -eq 1 ] || { echo "::error::expected exactly one .node artifact, found $#${1:+: $*}"; exit 1; }
           node_file=$1
           readelf -d "$node_file" > /tmp/dyn.txt
           # Non-vacuity guard: readelf must have produced NEEDED entries at all.
           grep -q 'NEEDED' /tmp/dyn.txt || { echo "::error::no NEEDED entries parsed from $node_file"; exit 1; }
-          if grep -Eq 'libc\.so\.6|ld-linux' /tmp/dyn.txt; then
+          if grep -Eq "$GLIBC_RE" /tmp/dyn.txt; then
             echo "::error::$node_file is glibc-linked; expected musl (libc.so)"
             cat /tmp/dyn.txt
             exit 1
