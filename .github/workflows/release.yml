@@ -164,8 +164,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
-  # Linux gnu/musl/arm use napi v3 `--use-napi-cross` (zig-based sysroots);
-  # bare `rustup target add` cannot link musl/arm. macOS x86_64 cross-links from
+  # x86_64 linux targets use --use-napi-cross; aarch64-gnu links via the apt cross gcc;
+  # aarch64-musl uses a zig cc wrapper (--use-napi-cross cannot resolve the macOS lockfile's
+  # linux tar binaries and silently falls back to host cc on x86_64-musl). macOS x86_64 cross-links from
   # the arm64 host via the installed target. `--no-js` preserves the hand-written
   # index.js loader (index.d.ts still regenerates).
   # ---------------------------------------------------------------------------
@@ -200,8 +201,38 @@ jobs:
             build: napi build --platform --release --target aarch64-unknown-linux-musl --no-js
             use-zig: true
             setup: |
-              printf '#!/bin/sh\nexec zig cc -target aarch64-linux-musl "$@"\n' > /tmp/zig-cc-aarch64-musl
+              # rustc 1.98.0 (rust-lang/rust#155453) passes -Wl,--fix-cortex-a53-843419 for
+              # both aarch64 linux targets. GNU ld accepts it (the -gnu leg builds); zig cc
+              # rejects any -Wl, arg missing from its own allowlist before lld sees it, and no
+              # released zig accepts this one (ziglang/zig#36624 on Codeberg, open). lld never
+              # applies the erratum fix by default, so no zig-linked artifact we have shipped
+              # ever carried it; stripping restores v0.3.0 behaviour. Same remedy as
+              # cargo-zigbuild#452. The loop is bounded: exactly $# iterations, order kept.
+              cat > /tmp/zig-cc-aarch64-musl <<'ZIGCC'
+              #!/bin/sh
+              n=$#
+              i=0
+              while [ "$i" -lt "$n" ]; do
+                arg=$1
+                shift
+                i=$((i + 1))
+                case "$arg" in
+                  -Wl,--fix-cortex-a53-843419|--fix-cortex-a53-843419) ;;
+                  *) set -- "$@" "$arg" ;;
+                esac
+              done
+              exec zig cc -target aarch64-linux-musl "$@"
+              ZIGCC
               chmod +x /tmp/zig-cc-aarch64-musl
+              # Self-check with a fake zig: a silently broken filter must fail here, not at
+              # link time (positive control: the flag is present on input and must be gone).
+              mkdir -p /tmp/fakezig
+              printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > /tmp/fakezig/zig
+              chmod +x /tmp/fakezig/zig
+              OUT=$(PATH=/tmp/fakezig:$PATH /tmp/zig-cc-aarch64-musl -Wl,--fix-cortex-a53-843419 -o out.so obj.o)
+              echo "$OUT" | grep -q 843419 && { echo "::error::zig wrapper failed to strip --fix-cortex-a53-843419"; exit 1; }
+              echo "$OUT" | grep -qx -- '-o' || { echo "::error::zig wrapper dropped unrelated args"; exit 1; }
+              rm -rf /tmp/fakezig
               echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/zig-cc-aarch64-musl" >> "$GITHUB_ENV"
           - host: windows-latest
             target: x86_64-pc-windows-msvc
