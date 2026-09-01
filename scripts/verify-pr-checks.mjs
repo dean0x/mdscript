@@ -28,6 +28,10 @@
  *                                (failure, cancelled, timed_out, action_required, stale,
  *                                skipped, neutral, null, any future value) = FAIL.
  *                                not-yet-completed = FAIL (avoids PF-017).
+ *                                Exception: the three release publish jobs are guarded by
+ *                                startsWith(github.ref,'refs/tags/v') and report as skipped
+ *                                on a PR-branch dry-run; only those three names, only when
+ *                                skipped, are allowed (TIER_B_EXPECTED_SKIPPED).
  *   Tier C  (legacy statuses):   advisory unless the context is required
  *
  * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing even though
@@ -118,6 +122,19 @@ export const EXPECTED_CONTEXTS = [
   'examples/ gitignore coverage',
   'Python — wheel install smoke',
 ];
+
+// Tier B allowance (release pre-flight): release.yml's publish jobs are
+// guarded by startsWith(github.ref, 'refs/tags/v'), so the RELEASING.md
+// dry-run dispatched on a PR branch reports them on the PR head as
+// conclusion=skipped. That skip IS the guard working, not a missing
+// verification. Only these three names, only when 'skipped', pass Tier B;
+// any other conclusion (cancelled, failure, neutral, null) still fails, and a
+// skipped run under any other name still fails.
+export const TIER_B_EXPECTED_SKIPPED = new Set([
+  'Publish to crates.io',
+  'Publish to npm',
+  'GitHub Release',
+]);
 
 // ---------------------------------------------------------------------------
 // gh runner (thin IO shim; injected in tests for offline operation)
@@ -415,6 +432,19 @@ export function evaluateChecks({
         `must not merge while checks are still running)`,
       );
       pass = false;
+      continue;
+    }
+
+    // Allowance: release.yml publish jobs are skipped on a PR-branch dry-run
+    // because they are guarded by startsWith(github.ref, 'refs/tags/v').
+    // That skip IS the guard working; allow exactly these three names, only
+    // when skipped. Cancelled/failed/neutral publish runs still fail, and a
+    // skipped run under any other name still fails (TIER_B_EXPECTED_SKIPPED).
+    if (cr.conclusion === 'skipped' && TIER_B_EXPECTED_SKIPPED.has(cr.name)) {
+      lines.push(
+        `  · Tier B: "${cr.name}" skipped by its refs/tags/v guard` +
+        ` (release dry-run on PR head) — allowed`,
+      );
       continue;
     }
 

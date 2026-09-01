@@ -182,6 +182,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds the tick from the other side too, so a probe that overruns its own interval
   cannot queue up catch-up ticks — at most one tick per interval, under any load.
 
+- **linux-x64-musl native addon was glibc-linked.** Since v0.1.0 the
+  `@mdscript/mds-napi-linux-x64-musl` package needed `libc.so.6`/GLIBC_2.34
+  and could not load on Alpine x64 (`@mdscript/mds` silently fell back to WASM;
+  `MDS_BACKEND=native` and direct `@mdscript/mds-napi` users got a load error).
+  The release build now links that target with zig cc against musl, matching
+  aarch64-musl, and a release gate asserts every musl artifact links musl rather
+  than glibc.
+
 ### Changed — lint JSON wire: `fix_edits[].new_text` is now WIRE-sanitized
 
 `LintDiagnostic.fix_edits[].new_text` in the `"version": 1` JSON envelope is now

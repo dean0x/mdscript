@@ -7,6 +7,7 @@ Composable LLM prompt template compiler. Rust core (`crates/`) with WASM, native
 ```bash
 cargo test --workspace                        # 590+ Rust tests
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps   # CI rustdoc gate: catches broken intra-doc links
 npm ci && npm run build -w @mdscript/mds-wasm && npm run build --workspaces --if-present
 # The native addon is NOT built by `--workspaces` (its script is `build:native`, not
 # `build`); needs the Rust toolchain. Without it @mdscript/mds silently falls back to WASM.
@@ -41,7 +42,7 @@ See @RELEASING.md for the full runbook.
 
 - Workspace panic strategy must stay `unwind` — catch_unwind at the JS/Python FFI boundary requires it
 - `mds-wasm/Cargo.toml` has explicit (non-inherited) license/repo fields because older wasm-pack parsers fail on workspace inheritance
-- aarch64 Linux cross-builds use system gcc (gnu) and zig (musl) instead of napi `--use-napi-cross` because the macOS-generated lockfile doesn't resolve `@napi-rs/tar` linux binaries
+- Linux cross-builds: only x86_64-gnu uses napi `--use-napi-cross`; aarch64-gnu uses the apt cross gcc; BOTH musl legs use zig cc wrappers, because `--use-napi-cross` has no musl toolchain and napi forces `-C target-feature=-crt-static` on musl, so the host gcc silently links glibc (v0.1.0-v0.3.0 shipped a glibc-linked linux-x64-musl addon). release.yml gates every musl artifact with readelf.
 - `cargo publish -p mds-cli --dry-run` fails locally because mds-cli has a path+version dep on mds-core — this is expected; CI publishes mds-core first
 - `scripts/verify-napi-names.mjs` (A3 gate) is critical — if the hand-written `crates/mds-napi/index.js` loader drifts from generated platform packages, the universal package silently fails to load native binaries at runtime
 - Stale `.node` files silently serve old behavior — `crates/mds-napi/` can hold multiple addon vintages (`mds-napi.node` from `build:native`, platform-suffixed `mds-napi.<triple>.node` from `napi build --platform`), and the test harness loads the base `mds-napi.node` by name. After any Rust change, rebuild with `npm run build:native -w @mdscript/mds-napi` or the suite exercises an old binary (PF-035)

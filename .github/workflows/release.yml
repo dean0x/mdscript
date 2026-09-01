@@ -164,10 +164,16 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
-  # Linux gnu/musl/arm use napi v3 `--use-napi-cross` (zig-based sysroots);
-  # bare `rustup target add` cannot link musl/arm. macOS x86_64 cross-links from
-  # the arm64 host via the installed target. `--no-js` preserves the hand-written
-  # index.js loader (index.d.ts still regenerates).
+  # Linux legs: x86_64-gnu uses napi's --use-napi-cross (gnu sysroot);
+  # aarch64-gnu links with the apt cross gcc: --use-napi-cross regressed on
+  # aarch64 in 4e88ebd (the then macOS-generated lockfile did not resolve
+  # @napi-rs/tar-linux-x64-gnu). Not re-tested since; the apt gcc works.
+  # BOTH musl legs link with a zig cc wrapper because --use-napi-cross has
+  # no musl toolchain and napi forces -C target-feature=-crt-static on musl,
+  # so the host gcc would link glibc (see x86_64-unknown-linux-musl).
+  # macOS x86_64 cross-links from the arm64 host via the installed target.
+  # `--no-js` preserves the hand-written index.js loader (index.d.ts still
+  # regenerates).
   # ---------------------------------------------------------------------------
   build-napi:
     name: Build napi (${{ matrix.settings.target }})
@@ -188,7 +194,32 @@ jobs:
             build: napi build --platform --release --target x86_64-unknown-linux-gnu --use-napi-cross --no-js
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            build: napi build --platform --release --target x86_64-unknown-linux-musl --use-napi-cross --no-js
+            build: napi build --platform --release --target x86_64-unknown-linux-musl --no-js
+            use-zig: true
+            setup: |
+              # --use-napi-cross supports gnu triples only: @napi-rs/cross-toolchain
+              # has no musl entry, so napi warned "Unsupported arch: x64 triple:
+              # x86_64-unknown-linux-musl", swallowed it, and built the musl target
+              # with the host gcc. Because napi forces -C target-feature=-crt-static
+              # on every musl ABI (a cdylib cannot use crt-static), rustc's
+              # self-contained musl libc is off too, so that link resolved -lc
+              # against the runner's glibc: v0.1.0-v0.3.0 shipped a linux-x64-musl
+              # addon needing libc.so.6 / GLIBC_2.34 (rust-lang/rust#135244).
+              # zig cc supplies musl, exactly as on aarch64-musl. No arg
+              # filter here: of the flags zig cc's allowlist rejects,
+              # --fix-cortex-a53-843419 is aarch64-only, and
+              # -Wl,-znostart-stop-gc (also rejected by zig 0.16.0;
+              # cargo-zigbuild filters both in src/zig/linker_args.rs)
+              # is gated by rustc to llvm_target x86_64-unknown-linux-gnu
+              # (rust-lang/rust#137685). If a future rustc widens that
+              # gate this leg fails with "unsupported linker extension
+              # flag: -z nostart-stop-gc".
+              cat > /tmp/zig-cc-x86_64-musl <<'ZIGCC'
+              #!/bin/sh
+              exec zig cc -target x86_64-linux-musl "$@"
+              ZIGCC
+              chmod +x /tmp/zig-cc-x86_64-musl
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/zig-cc-x86_64-musl" >> "$GITHUB_ENV"
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             build: napi build --platform --release --target aarch64-unknown-linux-gnu --no-js
@@ -200,8 +231,38 @@ jobs:
             build: napi build --platform --release --target aarch64-unknown-linux-musl --no-js
             use-zig: true
             setup: |
-              printf '#!/bin/sh\nexec zig cc -target aarch64-linux-musl "$@"\n' > /tmp/zig-cc-aarch64-musl
+              # rustc 1.98.0 (rust-lang/rust#155453) passes -Wl,--fix-cortex-a53-843419 for
+              # both aarch64 linux targets. GNU ld accepts it (the -gnu leg builds); zig cc
+              # rejects any -Wl, arg missing from its own allowlist before lld sees it, and no
+              # released zig accepts this one (ziglang/zig#36624 on Codeberg, open). lld never
+              # applies the erratum fix by default, so no zig-linked artifact we have shipped
+              # ever carried it; stripping restores v0.3.0 behaviour. Same remedy as
+              # cargo-zigbuild#452. The loop is bounded: exactly $# iterations, order kept.
+              cat > /tmp/zig-cc-aarch64-musl <<'ZIGCC'
+              #!/bin/sh
+              n=$#
+              i=0
+              while [ "$i" -lt "$n" ]; do
+                arg=$1
+                shift
+                i=$((i + 1))
+                case "$arg" in
+                  -Wl,--fix-cortex-a53-843419|--fix-cortex-a53-843419) ;;
+                  *) set -- "$@" "$arg" ;;
+                esac
+              done
+              exec zig cc -target aarch64-linux-musl "$@"
+              ZIGCC
               chmod +x /tmp/zig-cc-aarch64-musl
+              # Self-check with a fake zig: a silently broken filter must fail here, not at
+              # link time (positive control: the flag is present on input and must be gone).
+              mkdir -p /tmp/fakezig
+              printf '#!/bin/sh\nprintf "%%s\\n" "$@"\n' > /tmp/fakezig/zig
+              chmod +x /tmp/fakezig/zig
+              OUT=$(PATH=/tmp/fakezig:$PATH /tmp/zig-cc-aarch64-musl -Wl,--fix-cortex-a53-843419 -o out.so obj.o)
+              echo "$OUT" | grep -q 843419 && { echo "::error::zig wrapper failed to strip --fix-cortex-a53-843419"; exit 1; }
+              echo "$OUT" | grep -qx -- '-o' || { echo "::error::zig wrapper dropped unrelated args"; exit 1; }
+              rm -rf /tmp/fakezig
               echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/zig-cc-aarch64-musl" >> "$GITHUB_ENV"
           - host: windows-latest
             target: x86_64-pc-windows-msvc
@@ -220,6 +281,8 @@ jobs:
       - name: Install zig
         if: matrix.settings.use-zig
         uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
       - name: Setup cross-compilation tools
         if: matrix.settings.setup
         run: ${{ matrix.settings.setup }}
@@ -227,6 +290,36 @@ jobs:
       - name: Build addon
         working-directory: crates/mds-napi
         run: npx ${{ matrix.settings.build }}
+      - name: Assert musl artifact links musl, not glibc
+        if: ${{ endsWith(matrix.settings.target, '-linux-musl') }}
+        working-directory: crates/mds-napi
+        run: |
+          # Detector self-test: the glibc pattern must fire on a planted glibc
+          # NEEDED line, so a silently broken pattern cannot read as "clean".
+          GLIBC_RE='libc\.so\.6|ld-linux'
+          printf ' 0x0000000000000001 (NEEDED) Shared library: [libc.so.6]\n' \
+            | grep -Eq "$GLIBC_RE" \
+            || { echo "::error::glibc detector self-test failed to fire"; exit 1; }
+          shopt -s nullglob
+          set -- *.node
+          [ "$#" -eq 1 ] || { echo "::error::expected exactly one .node artifact, found $#${1:+: $*}"; exit 1; }
+          node_file=$1
+          readelf -d "$node_file" > /tmp/dyn.txt
+          # Non-vacuity guard: readelf must have produced NEEDED entries at all.
+          grep -q 'NEEDED' /tmp/dyn.txt || { echo "::error::no NEEDED entries parsed from $node_file"; exit 1; }
+          if grep -Eq "$GLIBC_RE" /tmp/dyn.txt; then
+            echo "::error::$node_file is glibc-linked; expected musl (libc.so)"
+            cat /tmp/dyn.txt
+            exit 1
+          fi
+          # Positive assertion: a musl cdylib links musl's libc by its
+          # soname libc.so.
+          grep -q 'Shared library: \[libc\.so\]' /tmp/dyn.txt || {
+            echo "::error::$node_file does not link musl libc.so"
+            cat /tmp/dyn.txt
+            exit 1
+          }
+          cat /tmp/dyn.txt
       - uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.settings.target }}

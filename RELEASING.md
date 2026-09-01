@@ -44,6 +44,9 @@ Run the local dry-runs and gates:
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+# Rustdoc gate (mirrors the CI `rust` job). nextest, clippy, and `cargo test --doc`
+# all miss broken private intra-doc links; only this command catches them.
+RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps
 cargo publish -p mds-core --dry-run
 # NOTE: `cargo publish -p mds-cli --dry-run` fails locally with
 # "no matching package named `mds-core` found" until mds-core is on crates.io —
@@ -70,6 +73,7 @@ npm run test:gates                           # positive-control spec suite
 # Before any --admin merge (PF-017 guard — cancelled runs read as green):
 PR_NUMBER=NNN  # replace NNN with the bump PR number
 node scripts/verify-pr-checks.mjs "$PR_NUMBER"
+# Note: a branch dry-run's skipped publish jobs are tolerated by the verifier.
 
 # Packaging spot-check (inspect tarball contents)
 npm pack -w @mdscript/mds --dry-run
@@ -158,7 +162,7 @@ The `release.yml` workflow runs, in order:
 
 ## Notes
 
-- The 7 native targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. Linux musl/arm builds use napi's --use-napi-cross.
+- The 7 native targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs link with zig cc wrappers, and a release gate asserts each musl artifact links musl rather than glibc (see the build-napi matrix in release.yml). zig is pinned to 0.16.0 in release.yml's Install zig step; bump it deliberately, since zig cc's linker-arg allowlist changes between releases.
 - wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds do not need system Binaryen — wasm-pack auto-downloads wasm-opt (v117) on first use; install Binaryen v129+ (brew install binaryen / apt install binaryen) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer.
 - Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.
 - Due to its temp-file-then-rename implementation, atomic_write_file does not preserve hard links, ACLs, extended attributes (xattrs), or owner/group metadata of the original file.

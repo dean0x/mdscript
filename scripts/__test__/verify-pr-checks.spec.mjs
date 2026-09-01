@@ -26,6 +26,7 @@ import {
   fetchCheckRuns,
   parseGhStderrHttpStatus,
   EXPECTED_CONTEXTS,
+  TIER_B_EXPECTED_SKIPPED,
 } from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
@@ -1413,6 +1414,142 @@ describe('architecture-08: fetchCheckRuns — bounded loop and total_count guard
     const result = fetchCheckRuns('abc123sha', runner);
     assert.ok(result.ok, `must return ok:true for a complete single-page result; got: ${JSON.stringify(result)}`);
     assert.deepEqual(result.checkRuns, expected, 'must return all check-runs unchanged');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// TIER_B_EXPECTED_SKIPPED: release publish jobs may be skipped on a PR-branch
+// dry-run (guarded by startsWith(github.ref, 'refs/tags/v') in release.yml).
+// Only 'Publish to crates.io', 'Publish to npm', 'GitHub Release', only when
+// 'skipped', pass Tier B. Any other conclusion or any other name still fails.
+// ---------------------------------------------------------------------------
+describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => {
+
+  // Helper: build a full passing run set (all required + expected contexts)
+  // then inject extra check-runs from the caller.
+  function basePassingRunsWith(extras) {
+    return [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      ...extras,
+    ];
+  }
+
+  test('D-PR5a: all three publish names skipped + required green → PASS and merge command printed', () => {
+    // The RELEASING.md dry-run dispatched on a PR branch sees the three publish
+    // jobs as skipped (their refs/tags/v guard fires). The verifier must exit 0
+    // so the operator can proceed to tag.
+    const skippedPublishRuns = [...TIER_B_EXPECTED_SKIPPED].map(name => ({
+      name,
+      status: 'completed',
+      conclusion: 'skipped',
+    }));
+    const runs = basePassingRunsWith(skippedPublishRuns);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      prNumber: 338,
+    });
+    assert.equal(result.exitCode, 0,
+      `three publish names skipped must not block PASS; lines:\n${result.lines.join('\n')}`);
+    assert.ok(result.pass, 'must return pass=true');
+    assert.ok(result.mergeCommand, 'PASS must produce a merge command');
+    // Informational lines must be present (one per skipped job)
+    const allLines = result.lines.join('\n');
+    for (const name of TIER_B_EXPECTED_SKIPPED) {
+      assert.ok(
+        allLines.includes(name),
+        `output must mention skipped job "${name}"; got:\n${allLines}`,
+      );
+    }
+  });
+
+  test('D-PR5b: "Publish to npm" with conclusion=cancelled → FAIL (only skipped is allowed)', () => {
+    // A cancelled publish run is not the refs/tags/v guard — it is a real
+    // failure that must block the merge. Only conclusion=skipped is allowed.
+    const runs = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'completed', conclusion: 'cancelled' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'cancelled Publish to npm must exit 1 (only skipped is allowed in TIER_B_EXPECTED_SKIPPED)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Publish to npm'), `must name the failing job; got:\n${allLines}`);
+    assert.ok(allLines.includes('cancelled'), `must quote the conclusion; got:\n${allLines}`);
+  });
+
+  test('D-PR5c: Tier B allowance never satisfies a Tier A required context', () => {
+    // The TIER_B_EXPECTED_SKIPPED allowance lives in the Tier B loop only. If a
+    // mutation leaked it into the Tier A loop, a required "Publish to npm" with
+    // conclusion=skipped would pass when it must not (avoids PF-017). Making
+    // "Publish to npm" required here pins that boundary.
+    const runs = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'completed', conclusion: 'skipped' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: [...REQUIRED, 'Publish to npm'],
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'a required context with conclusion=skipped must fail Tier A even if it is in ' +
+      `TIER_B_EXPECTED_SKIPPED; got:\n${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Publish to npm'),
+      `must name the failing Tier A context; got:\n${allLines}`);
+    assert.ok(allLines.includes('avoids PF-017'),
+      `must cite avoids PF-017 in the Tier A failure message; got:\n${allLines}`);
+  });
+
+  test('D-PR5d: an unrelated Tier B name with conclusion=skipped → FAIL (whitelist is exact)', () => {
+    // The allowance is exactly the three publish job names. Any other job name
+    // that reports skipped must still fail Tier B (security-13: whitelist).
+    const runs = basePassingRunsWith([
+      { name: 'Some other job', status: 'completed', conclusion: 'skipped' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'skipped run under an unlisted name must fail (whitelist is exact, security-13)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Some other job'), `must name the job; got:\n${allLines}`);
+    assert.ok(allLines.includes('skipped'), `must quote the conclusion; got:\n${allLines}`);
+  });
+
+  test('D-PR5e: "Publish to npm" in_progress → FAIL (not-yet-completed guard precedes allowance, PF-017)', () => {
+    // The not-yet-completed guard (status !== 'completed') in Tier B fires before
+    // the TIER_B_EXPECTED_SKIPPED allowance. An in_progress publish run must
+    // still block the merge — widening the allowance to accept status!='completed'
+    // for the three names would silently break PF-017 (avoids that mutation).
+    const runs = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'in_progress', conclusion: null },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'in_progress publish run must exit 1 (not-yet-completed guard, avoids PF-017)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('not yet completed') || allLines.includes('in_progress'),
+      `failure must mention not-yet-completed or in_progress; got:\n${allLines}`,
+    );
   });
 
 });
