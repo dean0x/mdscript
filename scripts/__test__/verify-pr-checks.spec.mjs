@@ -1486,26 +1486,28 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     assert.ok(allLines.includes('cancelled'), `must quote the conclusion; got:\n${allLines}`);
   });
 
-  test('D-PR5c: "Publish to npm" skipped but one required context missing → FAIL (Tier A still binding)', () => {
-    // The allowance is in Tier B only. If a Tier A required context is absent,
-    // the skipped publish jobs are irrelevant — the gate must still exit 1.
-    const msrvName = 'MSRV (Rust 1.88)';
-    const runsWithoutMsrv = [
-      ...loadCheckRuns('checks-main-113f472.json').filter(cr => cr.name !== msrvName),
-      { ...SOURCE_HYGIENE_PASS },
+  test('D-PR5c: Tier B allowance never satisfies a Tier A required context', () => {
+    // The TIER_B_EXPECTED_SKIPPED allowance lives in the Tier B loop only. If a
+    // mutation leaked it into the Tier A loop, a required "Publish to npm" with
+    // conclusion=skipped would pass when it must not (avoids PF-017). Making
+    // "Publish to npm" required here pins that boundary.
+    const runs = basePassingRunsWith([
       { name: 'Publish to npm', status: 'completed', conclusion: 'skipped' },
-    ];
+    ]);
     const result = evaluateChecks({
-      requiredContexts: REQUIRED,
-      checkRuns: runsWithoutMsrv,
+      requiredContexts: [...REQUIRED, 'Publish to npm'],
+      checkRuns: runs,
       statuses: [],
       headSha: HEAD_113F472,
     });
     assert.equal(result.exitCode, 1,
-      'missing required context must still fail even when publish runs are skipped');
+      'a required context with conclusion=skipped must fail Tier A even if it is in ' +
+      `TIER_B_EXPECTED_SKIPPED; got:\n${result.lines.join('\n')}`);
     const allLines = result.lines.join('\n');
-    assert.ok(allLines.includes(msrvName),
-      `must name the missing required context "${msrvName}"; got:\n${allLines}`);
+    assert.ok(allLines.includes('Publish to npm'),
+      `must name the failing Tier A context; got:\n${allLines}`);
+    assert.ok(allLines.includes('avoids PF-017'),
+      `must cite avoids PF-017 in the Tier A failure message; got:\n${allLines}`);
   });
 
   test('D-PR5d: an unrelated Tier B name with conclusion=skipped → FAIL (whitelist is exact)', () => {
@@ -1525,6 +1527,29 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     const allLines = result.lines.join('\n');
     assert.ok(allLines.includes('Some other job'), `must name the job; got:\n${allLines}`);
     assert.ok(allLines.includes('skipped'), `must quote the conclusion; got:\n${allLines}`);
+  });
+
+  test('D-PR5e: "Publish to npm" in_progress → FAIL (not-yet-completed guard precedes allowance, PF-017)', () => {
+    // The not-yet-completed guard (status !== 'completed') in Tier B fires before
+    // the TIER_B_EXPECTED_SKIPPED allowance. An in_progress publish run must
+    // still block the merge — widening the allowance to accept status!='completed'
+    // for the three names would silently break PF-017 (avoids that mutation).
+    const runs = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'in_progress', conclusion: null },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'in_progress publish run must exit 1 (not-yet-completed guard, avoids PF-017)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('not yet completed') || allLines.includes('in_progress'),
+      `failure must mention not-yet-completed or in_progress; got:\n${allLines}`,
+    );
   });
 
 });
