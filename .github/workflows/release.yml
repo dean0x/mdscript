@@ -271,6 +271,8 @@ jobs:
       - name: Install zig
         if: matrix.settings.use-zig
         uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
       - name: Setup cross-compilation tools
         if: matrix.settings.setup
         run: ${{ matrix.settings.setup }}
