@@ -182,7 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounds the tick from the other side too, so a probe that overruns its own interval
   cannot queue up catch-up ticks — at most one tick per interval, under any load.
 
-- **linux-x64-musl native addon was glibc-linked** — since v0.1.0 the
+- **linux-x64-musl native addon was glibc-linked.** Since v0.1.0 the
   `@mdscript/mds-napi-linux-x64-musl` package needed `libc.so.6`/GLIBC_2.34
   and could not load on Alpine x64 (`@mdscript/mds` silently fell back to WASM;
   `MDS_BACKEND=native` and direct `@mdscript/mds-napi` users got a load error).

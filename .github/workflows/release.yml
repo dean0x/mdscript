@@ -165,12 +165,14 @@ jobs:
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
   # Linux legs: x86_64-gnu uses napi's --use-napi-cross (gnu sysroot);
-  # aarch64-gnu links with the apt cross gcc; BOTH musl legs link with a
-  # zig cc wrapper because --use-napi-cross has no musl toolchain and napi
-  # forces -crt-static on musl, so the host gcc would link glibc (see the
-  # x86_64-unknown-linux-musl entry). macOS x86_64 cross-links from
-  # the arm64 host via the installed target. `--no-js` preserves the hand-written
-  # index.js loader (index.d.ts still regenerates).
+  # aarch64-gnu links with the apt cross gcc (the macOS-generated lockfile
+  # lacks linux @napi-rs/tar so @napi-rs/cross-toolchain cannot reify);
+  # BOTH musl legs link with a zig cc wrapper because --use-napi-cross has
+  # no musl toolchain and napi forces -C target-feature=-crt-static on musl,
+  # so the host gcc would link glibc (see x86_64-unknown-linux-musl).
+  # macOS x86_64 cross-links from the arm64 host via the installed target.
+  # `--no-js` preserves the hand-written index.js loader (index.d.ts still
+  # regenerates).
   # ---------------------------------------------------------------------------
   build-napi:
     name: Build napi (${{ matrix.settings.target }})
@@ -202,8 +204,15 @@ jobs:
               # self-contained musl libc is off too, so that link resolved -lc
               # against the runner's glibc: v0.1.0-v0.3.0 shipped a linux-x64-musl
               # addon needing libc.so.6 / GLIBC_2.34 (rust-lang/rust#135244).
-              # zig cc supplies musl, exactly as on aarch64-musl. No arg filter:
-              # -Wl,--fix-cortex-a53-843419 is emitted for aarch64 only.
+              # zig cc supplies musl, exactly as on aarch64-musl. No arg
+              # filter here: of the flags zig cc's allowlist rejects,
+              # --fix-cortex-a53-843419 is aarch64-only, and
+              # -Wl,-znostart-stop-gc (also rejected by zig 0.16.0;
+              # cargo-zigbuild filters both in src/zig/linker_args.rs)
+              # is gated by rustc to llvm_target x86_64-unknown-linux-gnu
+              # (rust-lang/rust#137685). If a future rustc widens that
+              # gate this leg fails with "unsupported linker extension
+              # flag: -z nostart-stop-gc".
               cat > /tmp/zig-cc-x86_64-musl <<'ZIGCC'
               #!/bin/sh
               exec zig cc -target x86_64-linux-musl "$@"
@@ -284,16 +293,29 @@ jobs:
         if: ${{ endsWith(matrix.settings.target, '-linux-musl') }}
         working-directory: crates/mds-napi
         run: |
-          node_file=$(ls *.node)
+          # Detector self-test: the glibc pattern must fire on a planted glibc
+          # NEEDED line, so a silently broken pattern cannot read as "clean".
+          printf ' 0x0000000000000001 (NEEDED) Shared library: [libc.so.6]\n' \
+            | grep -Eq 'libc\.so\.6|ld-linux' \
+            || { echo "::error::glibc detector self-test failed to fire"; exit 1; }
+          set -- *.node
+          [ "$#" -eq 1 ] || { echo "::error::expected exactly one .node artifact, found $#: $*"; exit 1; }
+          node_file=$1
           readelf -d "$node_file" > /tmp/dyn.txt
-          # Positive control: if readelf output changes shape, fail loudly
-          # rather than reading an empty file as clean.
+          # Non-vacuity guard: readelf must have produced NEEDED entries at all.
           grep -q 'NEEDED' /tmp/dyn.txt || { echo "::error::no NEEDED entries parsed from $node_file"; exit 1; }
           if grep -Eq 'libc\.so\.6|ld-linux' /tmp/dyn.txt; then
             echo "::error::$node_file is glibc-linked; expected musl (libc.so)"
             cat /tmp/dyn.txt
             exit 1
           fi
+          # Positive assertion: a musl cdylib links musl's libc by its
+          # soname libc.so.
+          grep -q 'Shared library: \[libc\.so\]' /tmp/dyn.txt || {
+            echo "::error::$node_file does not link musl libc.so"
+            cat /tmp/dyn.txt
+            exit 1
+          }
           cat /tmp/dyn.txt
       - uses: actions/upload-artifact@v7
         with:
