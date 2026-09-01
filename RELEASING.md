@@ -44,6 +44,9 @@ Run the local dry-runs and gates:
 cargo test --workspace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+# Rustdoc gate (mirrors the CI `rust` job). nextest, clippy, and `cargo test --doc`
+# all miss broken private intra-doc links; only this command catches them.
+RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps
 cargo publish -p mds-core --dry-run
 # NOTE: `cargo publish -p mds-cli --dry-run` fails locally with
 # "no matching package named `mds-core` found" until mds-core is on crates.io —

@@ -7,6 +7,7 @@ Composable LLM prompt template compiler. Rust core (`crates/`) with WASM, native
 ```bash
 cargo test --workspace                        # 590+ Rust tests
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p mds-core --no-deps   # CI rustdoc gate: catches broken intra-doc links
 npm ci && npm run build -w @mdscript/mds-wasm && npm run build --workspaces --if-present
 # The native addon is NOT built by `--workspaces` (its script is `build:native`, not
 # `build`); needs the Rust toolchain. Without it @mdscript/mds silently falls back to WASM.
