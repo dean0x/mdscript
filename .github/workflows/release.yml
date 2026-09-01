@@ -164,9 +164,11 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
-  # x86_64 linux targets use --use-napi-cross; aarch64-gnu links via the apt cross gcc;
-  # aarch64-musl uses a zig cc wrapper (--use-napi-cross cannot resolve the macOS lockfile's
-  # linux tar binaries and silently falls back to host cc on x86_64-musl). macOS x86_64 cross-links from
+  # Linux legs: x86_64-gnu uses napi's --use-napi-cross (gnu sysroot);
+  # aarch64-gnu links with the apt cross gcc; BOTH musl legs link with a
+  # zig cc wrapper because --use-napi-cross has no musl toolchain and napi
+  # forces -crt-static on musl, so the host gcc would link glibc (see the
+  # x86_64-unknown-linux-musl entry). macOS x86_64 cross-links from
   # the arm64 host via the installed target. `--no-js` preserves the hand-written
   # index.js loader (index.d.ts still regenerates).
   # ---------------------------------------------------------------------------
@@ -189,7 +191,25 @@ jobs:
             build: napi build --platform --release --target x86_64-unknown-linux-gnu --use-napi-cross --no-js
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            build: napi build --platform --release --target x86_64-unknown-linux-musl --use-napi-cross --no-js
+            build: napi build --platform --release --target x86_64-unknown-linux-musl --no-js
+            use-zig: true
+            setup: |
+              # --use-napi-cross supports gnu triples only: @napi-rs/cross-toolchain
+              # has no musl entry, so napi warned "Unsupported arch: x64 triple:
+              # x86_64-unknown-linux-musl", swallowed it, and built the musl target
+              # with the host gcc. Because napi forces -C target-feature=-crt-static
+              # on every musl ABI (a cdylib cannot use crt-static), rustc's
+              # self-contained musl libc is off too, so that link resolved -lc
+              # against the runner's glibc: v0.1.0-v0.3.0 shipped a linux-x64-musl
+              # addon needing libc.so.6 / GLIBC_2.34 (rust-lang/rust#135244).
+              # zig cc supplies musl, exactly as on aarch64-musl. No arg filter:
+              # -Wl,--fix-cortex-a53-843419 is emitted for aarch64 only.
+              cat > /tmp/zig-cc-x86_64-musl <<'ZIGCC'
+              #!/bin/sh
+              exec zig cc -target x86_64-linux-musl "$@"
+              ZIGCC
+              chmod +x /tmp/zig-cc-x86_64-musl
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/zig-cc-x86_64-musl" >> "$GITHUB_ENV"
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             build: napi build --platform --release --target aarch64-unknown-linux-gnu --no-js
@@ -258,6 +278,21 @@ jobs:
       - name: Build addon
         working-directory: crates/mds-napi
         run: npx ${{ matrix.settings.build }}
+      - name: Assert musl artifact links musl, not glibc
+        if: ${{ endsWith(matrix.settings.target, '-linux-musl') }}
+        working-directory: crates/mds-napi
+        run: |
+          node_file=$(ls *.node)
+          readelf -d "$node_file" > /tmp/dyn.txt
+          # Positive control: if readelf output changes shape, fail loudly
+          # rather than reading an empty file as clean.
+          grep -q 'NEEDED' /tmp/dyn.txt || { echo "::error::no NEEDED entries parsed from $node_file"; exit 1; }
+          if grep -Eq 'libc\.so\.6|ld-linux' /tmp/dyn.txt; then
+            echo "::error::$node_file is glibc-linked; expected musl (libc.so)"
+            cat /tmp/dyn.txt
+            exit 1
+          fi
+          cat /tmp/dyn.txt
       - uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.settings.target }}
