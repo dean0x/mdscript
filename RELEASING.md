@@ -102,6 +102,10 @@ closes the former gap where a bad npm token was only discovered after
 `@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
 fails at publish time.
 
+The dry run also exercises the **CI-history gate** (PF-017), asserting a
+completed+success `CI` run for the dispatched ref's HEAD. Dispatch it only after
+that ref's CI has finished, or the gate fails closed on a still-running run.
+
 Confirm the **A3 name-gate** step (`scripts/verify-napi-names.mjs`) passes in that
 run. **This is a hard checkpoint** — if the generated platform package names or
 their `.node` filenames drift from the hand-written `crates/mds-napi/index.js`
@@ -131,6 +135,10 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
    verification and merge. Both flags are emitted by the script — copy the
    printed command without modification.)
 3. **Tag the merged commit and push:**
+   Wait for the `CI` workflow run on the merge commit to finish green
+   (`gh run list --commit <sha>` / `gh run watch <id>`): the release's
+   version-gate asserts a completed+success CI run for the tagged SHA and fails
+   closed while it is still running.
    ```bash
    git tag -a vX.Y.Z -m vX.Y.Z
    git push origin vX.Y.Z
