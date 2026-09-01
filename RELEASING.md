@@ -73,6 +73,7 @@ npm run test:gates                           # positive-control spec suite
 # Before any --admin merge (PF-017 guard — cancelled runs read as green):
 PR_NUMBER=NNN  # replace NNN with the bump PR number
 node scripts/verify-pr-checks.mjs "$PR_NUMBER"
+# Note: a branch dry-run's skipped publish jobs are tolerated by the verifier.
 
 # Packaging spot-check (inspect tarball contents)
 npm pack -w @mdscript/mds --dry-run
