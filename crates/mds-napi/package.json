@@ -48,7 +48,7 @@
     "README.md"
   ],
   "devDependencies": {
-    "@napi-rs/cli": "^3.0.0",
+    "@napi-rs/cli": "^3.8.6",
     "js-yaml": "4.3.1"
   }
 }
