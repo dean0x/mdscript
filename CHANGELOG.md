@@ -9,8 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.2] — 2026-09-03
 
-## [0.4.2] — 2026-09-03
-
 ### Fixed
 
 - **Fix `pypa/gh-action-pypi-publish` pin so PyPI publish succeeds.**
