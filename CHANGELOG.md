@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-03
+
+## [0.4.2] — 2026-09-03
+
+### Fixed
+
+- **Fix `pypa/gh-action-pypi-publish` pin so PyPI publish succeeds.**
+  v0.4.1 published to crates.io (`mds-core`, `mds-cli`) and npm (`@mdscript/*`)
+  but did **not** publish `markdown-script` to PyPI. The `Publish to PyPI` step
+  failed immediately with:
+  ```
+  Unable to find image 'ghcr.io/pypa/gh-action-pypi-publish:a892a5a61159132606e93a2fa6f4358831b04d26'
+  docker: Error response from daemon: manifest unknown
+  ```
+  Root cause: `pypa/gh-action-pypi-publish` is a Docker-based composite action.
+  It derives its GHCR image tag from `github.action_ref` at runtime. When pinned
+  via `@<sha>`, `action_ref` resolves to that SHA — but the GHCR only publishes
+  images for tagged releases, not for every commit SHA. The previous pin
+  `a892a5a...` was the **annotated tag object** SHA for `v1.14.2` (not the
+  underlying commit SHA `dc37677b...`). No GHCR image exists for the annotated
+  tag object SHA, so the Docker pull failed. The fix pins to the version tag
+  string `v1.14.2` directly; the corresponding GHCR image
+  (`sha256:5c2f7030...`, tags: `v1.14.2`, `v1.14`, `v1`) was verified to exist
+  via the GitHub Packages API before this change landed. A comment in
+  `release.yml` documents why SHA-pinning was not used, to prevent the same
+  mistake from recurring. v0.4.2 is therefore the first release to successfully
+  publish `markdown-script` to PyPI.
+
 ## [0.4.1] — 2026-09-03
 
 ### Added
@@ -1754,7 +1782,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/dean0x/mdscript/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/dean0x/mdscript/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dean0x/mdscript/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
