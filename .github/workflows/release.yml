@@ -378,6 +378,195 @@ jobs:
             crates/mds-napi/npm/**
             crates/mds-napi/*.node
 
+  # ---------------------------------------------------------------------------
+  # Python wheels + sdist — cp311-abi3, 7 platforms + sdist.
+  # THIS JOB IS NOT REF-GUARDED: it runs on both workflow_dispatch (dry run)
+  # and tag push. Only the upload to PyPI (publish-python) is tag-guarded.
+  # (PF-039: every step behind a ref guard is code the dry run cannot execute;
+  # the build + verification gate must run in dispatch mode to be tested.)
+  #
+  # The wheel verification gate (readelf on Linux legs) guards against silent
+  # glibc contamination of musl targets — a toolchain fallback that produces an
+  # artifact with the right NAME and the wrong libc (PF-038). It mirrors the
+  # build-napi musl readelf gate: positive control + non-vacuity guard.
+  #
+  # build-python is in publish-crates's needs: so a Python build failure aborts
+  # the release before ANY registry write (crates.io is irreversible — PF-023).
+  # ---------------------------------------------------------------------------
+  build-python:
+    name: Build Python (${{ matrix.target || 'sdist' }})
+    needs: [version-gate]
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- manylinux (glibc) ---
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+            plat-tag: linux_x86_64
+            libc: glibc
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+            plat-tag: linux_aarch64
+            libc: glibc
+          # --- musllinux ---
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+            plat-tag: musllinux_1_2_x86_64
+            libc: musl
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            manylinux: musllinux_1_2
+            plat-tag: musllinux_1_2_aarch64
+            libc: musl
+          # --- macOS ---
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            plat-tag: arm64
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            plat-tag: x86_64
+          # --- Windows ---
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            plat-tag: win_amd64
+          # --- sdist (source distribution, once) ---
+          - host: ubuntu-latest
+            sdist: true
+    runs-on: ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref }}
+      # Rust toolchain needed for wheel builds; Docker containers on Linux also
+      # carry their own Rust, but we install here for consistency and for cache.
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.sdist }}
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ !matrix.sdist }}
+      # --- build wheel ---
+      - name: Build wheel
+        if: ${{ !matrix.sdist }}
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          command: build
+          args: --release -m crates/mds-python/Cargo.toml --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          maturin-version: "v1.13.3"
+      # --- build sdist ---
+      - name: Build sdist
+        if: ${{ matrix.sdist }}
+        uses: PyO3/maturin-action@v1.51.0
+        with:
+          command: sdist
+          args: -m crates/mds-python/Cargo.toml --out dist
+          maturin-version: "v1.13.3"
+      # --- wheel filename gate (all wheel legs) ---
+      # Asserts cp311-abi3 tag and the expected platform string are both present.
+      # A wrong Python tag or missing platform tag is a packaging defect that
+      # would be accepted by pip but install under the wrong interpreter.
+      - name: Assert wheel filename (cp311-abi3 + platform tag)
+        if: ${{ !matrix.sdist }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          set -- dist/*.whl
+          [ "$#" -eq 1 ] \
+            || { echo "::error::expected exactly 1 .whl in dist/, found $#${1:+: $*}"; exit 1; }
+          WHEEL="$1"
+          FNAME=$(basename "$WHEEL")
+          echo "Wheel: $FNAME"
+          echo "$FNAME" | grep -q 'cp311-abi3' \
+            || { echo "::error::wheel is not cp311-abi3: $FNAME"; exit 1; }
+          PLAT_TAG="${{ matrix.plat-tag }}"
+          echo "$FNAME" | grep -q "$PLAT_TAG" \
+            || { echo "::error::wheel platform tag missing '$PLAT_TAG': $FNAME"; exit 1; }
+          echo "Wheel filename OK"
+      # --- wheel version gate (all wheel legs) ---
+      # Asserts the wheel version matches the workspace Cargo version. Maturin
+      # reads the version dynamically from Cargo.toml, so this mainly guards
+      # against a misconfigured pyproject.toml overriding dynamic versioning.
+      - name: Assert wheel version matches workspace version
+        if: ${{ !matrix.sdist }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read workspace version directly from root Cargo.toml (no cargo
+          # invocation needed; the version is a plain string in the file).
+          WS_VER=$(grep -A20 '^\[workspace\.package\]' Cargo.toml \
+            | grep '^version' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          WHEEL=$(ls dist/*.whl | head -1)
+          # Wheel filename: {name}-{version}-{python}-{abi}-{platform}.whl
+          WHEEL_VER=$(basename "$WHEEL" | cut -d'-' -f2)
+          echo "Workspace version: $WS_VER  Wheel version: $WHEEL_VER"
+          [ "$WS_VER" = "$WHEEL_VER" ] \
+            || { echo "::error::wheel version $WHEEL_VER != workspace version $WS_VER"; exit 1; }
+          echo "Wheel version OK"
+      # --- libc linkage gate (Linux wheel legs only — readelf available) ---
+      # Asserts the .so inside the wheel links the correct libc. A cross-compile
+      # toolchain with no musl entry silently falls back to the host glibc
+      # compiler, producing an artifact with the right NAME and the wrong libc
+      # (PF-038; mirrors the build-napi musl readelf gate exactly).
+      - name: Assert wheel links correct libc (PF-038)
+        if: ${{ runner.os == 'Linux' && !matrix.sdist }}
+        run: |
+          set -euo pipefail
+          LIBC="${{ matrix.libc }}"
+          GLIBC_RE='libc\.so\.6|ld-linux'
+          # Positive control: the glibc detector MUST fire on a planted NEEDED
+          # line. A silently broken detector cannot pass as "clean" (PF-038).
+          printf ' 0x0000000000000001 (NEEDED) Shared library: [libc.so.6]\n' \
+            | grep -Eq "$GLIBC_RE" \
+            || { echo "::error::glibc detector self-test failed to fire"; exit 1; }
+          shopt -s nullglob
+          set -- dist/*.whl
+          [ "$#" -eq 1 ] \
+            || { echo "::error::expected exactly 1 .whl in dist/, found $#"; exit 1; }
+          TMP=$(mktemp -d)
+          unzip -q "$1" -d "$TMP"
+          SO=$(find "$TMP" -name "*.so" | head -1)
+          [ -n "$SO" ] \
+            || { echo "::error::no .so found in wheel $1"; exit 1; }
+          echo "Checking: $SO"
+          readelf -d "$SO" > /tmp/dyn.txt
+          # Non-vacuity guard: NEEDED entries must exist. An empty parse reads
+          # as "clean" but proves nothing (PF-038).
+          grep -q 'NEEDED' /tmp/dyn.txt \
+            || { echo "::error::no NEEDED entries in $SO — parse failed or artifact is static"; exit 1; }
+          if [ "$LIBC" = "musl" ]; then
+            # musllinux: must NOT link glibc
+            if grep -Eq "$GLIBC_RE" /tmp/dyn.txt; then
+              echo "::error::$SO is glibc-linked; expected musl (libc.so)"
+              cat /tmp/dyn.txt
+              exit 1
+            fi
+            # Positive assertion: musl cdylib links musl's libc by its soname libc.so
+            grep -q 'Shared library: \[libc\.so\]' /tmp/dyn.txt \
+              || { echo "::error::$SO does not link musl libc.so"; cat /tmp/dyn.txt; exit 1; }
+          else
+            # manylinux (glibc): must link glibc
+            if ! grep -Eq "$GLIBC_RE" /tmp/dyn.txt; then
+              echo "::error::$SO is not glibc-linked; expected glibc for manylinux target"
+              cat /tmp/dyn.txt
+              exit 1
+            fi
+          fi
+          cat /tmp/dyn.txt
+          rm -rf "$TMP"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ matrix.target || 'sdist' }}
+          path: dist/
+          if-no-files-found: error
+
   # ===========================================================================
   # Everything below publishes — gated to tag pushes only.
   # workflow_dispatch (no inputs) stops above; publish jobs see a non-tag ref
@@ -394,8 +583,13 @@ jobs:
     # (RELEASING.md "hard checkpoint") must pass before crates.io (irreversible)
     # publishes. Without this, the 7-target napi matrix can still be running while
     # crates.io is already live at the new version.
-    needs: [version-gate, stage-and-verify-napi]
-    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    # build-python is listed here so a Python wheel build failure aborts the
+    # release before ANY registry write. crates.io is irreversible; blocking
+    # on Python here avoids a partial state where crates.io is live but PyPI
+    # fails (PF-023; PF-039: build-python runs unguarded so this blocking is
+    # exercised by the dispatch dry run).
+    needs: [version-gate, stage-and-verify-napi, build-python]
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && needs.build-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -589,12 +783,44 @@ jobs:
           publish_if_absent "@mdscript/rspack-loader"
 
   # ---------------------------------------------------------------------------
-  # GitHub Release — cut last, after crates + npm succeed.
+  # PyPI — Python wheels + sdist (OIDC trusted publishing, PEP 740 attestations).
+  # skip-existing: true — a re-run after partial failure must not abort on
+  # already-uploaded files (PF-023).
+  # IMPORTANT: NO environment: field. The PyPI trusted publisher for this project
+  # was filed with the environment field BLANK. A named environment causes PyPI
+  # to reject the OIDC token because the claim does not match the filed record.
+  # Likewise this job must stay in release.yml specifically; moving it to another
+  # workflow file breaks the filed record (workflow filename is part of the claim).
+  # ---------------------------------------------------------------------------
+  publish-python:
+    name: Publish to PyPI
+    needs: [build-python, publish-crates]
+    if: ${{ !cancelled() && needs.build-python.result == 'success' && needs.publish-crates.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC for PyPI trusted publishing + PEP 740 attestations
+      contents: read
+    steps:
+      - name: Download Python artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: python-dist/
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: python-dist/
+          skip-existing: true
+          attestations: true
+
+  # ---------------------------------------------------------------------------
+  # GitHub Release — cut last, after crates + npm + PyPI succeed.
   # ---------------------------------------------------------------------------
   github-release:
     name: GitHub Release
-    needs: [publish-crates, publish-npm]
-    if: ${{ !cancelled() && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [publish-crates, publish-npm, publish-python]
+    if: ${{ !cancelled() && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

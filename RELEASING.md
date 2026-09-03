@@ -17,6 +17,9 @@ asserts these are all equal before anything publishes:
   `@mdscript/mds-wasm`, `@mdscript/bundler-utils`, `@mdscript/vite-plugin`,
   `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`, `@mdscript/rspack-loader`
 - All internal `@mdscript/*` dependency ranges are `^<version>` (no `file:`)
+- The `markdown-script` Python wheel version — maturin stamps it dynamically from
+  the Cargo workspace at build time. The gate asserts `pyproject.toml` names the
+  package `markdown-script` (ADR-012) and keeps `"version"` in `dynamic[]`.
 
 ## One-time prerequisites (maintainer / repo owner)
 
@@ -34,6 +37,26 @@ These are **not** automated and must be done before the first release:
    `mds-core` and `mds-cli` on crates.io.
 4. **Enable GitHub private vulnerability reporting** (Settings → Code security →
    Private vulnerability reporting) so the SECURITY.md flow works.
+5. **Configure PyPI trusted publisher** for `markdown-script` at
+   [pypi.org/manage/account/publishing](https://pypi.org/manage/account/publishing/):
+   - Project name: `markdown-script`
+   - Owner / repository: `dean0x/mdscript`
+   - Workflow filename: `release.yml` (must match exactly)
+   - Environment name: **leave blank** — the `publish-python` job has no
+     `environment:` field; a named environment would cause PyPI to reject the
+     OIDC token because the claim would not match the filed record.
+
+   **Note:** A PyPI *pending publisher* is not a name reservation and blocks no
+   one — it auto-expires ~30 days after creation unless a first upload actually
+   lands (ADR-012 amendment). Only the first `pypa/gh-action-pypi-publish` run
+   on a real tag push secures the name.
+
+   **OIDC credential probe limitation:** The `version-gate` credential probe
+   calls `npm whoami` to verify the npm token before any irreversible publish.
+   PyPI OIDC has no equivalent long-lived token to probe; `pypi.org` issues the
+   upload token just-in-time for the OIDC exchange at publish time. The probe
+   therefore cannot cover PyPI — a misconfigured trusted publisher is only
+   discovered when `publish-python` runs on a real tag push.
 
 ## Pre-flight (before tagging)
 
@@ -79,6 +102,17 @@ node scripts/verify-pr-checks.mjs "$PR_NUMBER"
 npm pack -w @mdscript/mds --dry-run
 npm pack -w @mdscript/mds-wasm --dry-run
 npm pack -w @mdscript/mds-napi --dry-run
+
+# Python — local wheel build and install smoke (mirrors ci.yml's python-wheel job)
+# Note: cross-platform Python wheels can only be verified in CI (manylinux/musl
+# Docker containers are not reproduced locally). Use the branch dry-run below
+# instead of trying to replicate the musl readelf gate locally. PF-036.
+python -m venv .venv && . .venv/bin/activate
+pip install "maturin==1.13.3" pytest
+maturin build -m crates/mds-python/Cargo.toml --out dist
+ls dist/ | grep -q 'cp311-abi3' || (echo "expected a cp311-abi3 wheel" && exit 1)
+pip install --find-links dist --no-index markdown-script
+python -c "import markdown_script as m; r = m.compile('Hello {{n}}!', vars={'n': 'CI'}); print('smoke ok:', r.output)"
 ```
 
 Then validate the **risky cross-compile + platform packaging** without publishing,
@@ -86,8 +120,10 @@ via the dry-run workflow:
 
 ```bash
 gh workflow run release.yml          # workflow_dispatch — builds the 7-target
-                                     # napi matrix, stages platform packages,
-                                     # runs the A3 name<->loader gate, uploads
+                                     # napi matrix AND the 7-target + sdist
+                                     # Python wheel matrix, stages packages,
+                                     # runs the A3 name<->loader gate and the
+                                     # Python readelf linkage gate, uploads
                                      # artifacts. Publishes NOTHING.
 ```
 
@@ -149,28 +185,37 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 
 The `release.yml` workflow runs, in order:
    1. **version-gate** — synchronized-version check (fails fast).
-   2. **build-napi** — cross-compiles the addon for all 7 targets.
-   3. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
+   2. **build-napi** (parallel with build-python) — cross-compiles the addon for
+      all 7 targets.
+   3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
+      for 7 platforms + sdist, runs the readelf linkage gate on Linux legs.
+   4. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
       LICENSE into each platform dir, runs the **A3 name-gate**.
-   4. **publish-crates** — `cargo publish` `mds-core`, polls the crates.io index
-      for up to 5 min (bounded, max 20 × 15 s), then `mds-cli`.
-   5. **publish-npm** — regenerate `index.d.ts`, re-run the A3 gate, then publish
-      (with provenance): the **platform packages** (`napi prepublish`), the
-      **host** `@mdscript/mds-napi`, **`@mdscript/mds-wasm`**, the **universal**
-      `@mdscript/mds`, and the **bundler** packages.
-   6. **github-release** — `gh release create` with generated notes.
+   5. **publish-crates** — blocked until BOTH `stage-and-verify-napi` and
+      `build-python` succeed (so a Python build failure aborts before crates.io,
+      which is irreversible — PF-023). `cargo publish` `mds-core`, polls the
+      crates.io index for up to 5 min (bounded, max 20 × 15 s), then `mds-cli`.
+   6. **publish-npm** and **publish-python** (parallel, both after publish-crates)
+      — publish npm packages (with provenance) and PyPI `markdown-script` (OIDC
+      trusted publishing + PEP 740 attestations, `skip-existing: true`).
+   7. **github-release** — `gh release create` with generated notes; runs only
+      after all three publish jobs succeed.
 
 ## Post-release
 
 - Verify each package on its registry (crates.io, npmjs.com) and that npm shows
   the **provenance** attestation.
+- Verify `markdown-script` on PyPI and that it shows the PEP 740 attestation.
 - Smoke test a clean install on a fresh machine/container:
-  `npm i @mdscript/mds` then `node -e "import('@mdscript/mds').then(m=>m.init())"`.
+  - npm: `npm i @mdscript/mds` then `node -e "import('@mdscript/mds').then(m=>m.init())"`
+  - Python: `pip install markdown-script` then
+    `python -c "import markdown_script as m; print(m.compile('{{x}}', vars={'x':'ok'}).output)"`
 - Open a fresh `## [Unreleased]` section in `CHANGELOG.md`.
 
 ## Notes
 
-- The 7 native targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs link with zig cc wrappers, and a release gate asserts each musl artifact links musl rather than glibc (see the build-napi matrix in release.yml). zig is pinned to 0.16.0 in release.yml's Install zig step; bump it deliberately, since zig cc's linker-arg allowlist changes between releases.
+- The 7 native napi targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs link with zig cc wrappers, and a release gate asserts each musl artifact links musl rather than glibc (see the build-napi matrix in release.yml). zig is pinned to 0.16.0 in release.yml's Install zig step; bump it deliberately, since zig cc's linker-arg allowlist changes between releases.
+- The 8 Python artifacts (7 `cp311-abi3` wheels + 1 sdist): manylinux x86_64 and aarch64, musllinux_1_2 x86_64 and aarch64, macOS x86_64 and arm64, Windows x86_64, plus one source distribution. Built by `PyO3/maturin-action@v1.51.0` (maturin 1.13.3). The musl and manylinux legs run inside Docker containers that maturin-action manages; the readelf linkage gate asserts the `.so` inside each Linux wheel links the correct libc (musl or glibc), with a positive control and a non-vacuity guard (PF-038). Platform wheels cannot be built or validated locally — use the branch dry-run workflow instead.
 - wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds do not need system Binaryen — wasm-pack auto-downloads wasm-opt (v117) on first use; install Binaryen v129+ (brew install binaryen / apt install binaryen) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer.
 - Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.
 - Due to its temp-file-then-rename implementation, atomic_write_file does not preserve hard links, ACLs, extended attributes (xattrs), or owner/group metadata of the original file.
