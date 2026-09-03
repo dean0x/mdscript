@@ -9,6 +9,9 @@
 //      (e.g. ^0.1.0), so installed consumers resolve the matching release.
 //   4. Every workspace crate's path+version dep on mds-core matches the
 //      workspace version (kept in lockstep by bump-version.mjs).
+//   5. crates/mds-python/pyproject.toml names the package "markdown-script"
+//      (ADR-012) and declares version as dynamic (maturin reads from Cargo
+//      workspace), so the published wheel version always equals canonical.
 //
 // Run locally and in CI before publishing. Exit 0 = consistent; 1 = drift.
 'use strict';
@@ -101,10 +104,32 @@ for (const rel of PKG_PATHS) {
   }
 }
 
+// --- Check Python pyproject.toml (ADR-012: name must be "markdown-script";
+//     version must be dynamic so maturin stamps it from the Cargo workspace) ----
+const PYPROJECT_PATH = 'crates/mds-python/pyproject.toml';
+const pyprojectAbs = join(ROOT, PYPROJECT_PATH);
+if (!existsSync(pyprojectAbs)) {
+  fail(`${PYPROJECT_PATH}: missing (expected mds-python package manifest)`);
+} else {
+  const pyproject = readFileSync(pyprojectAbs, 'utf8');
+  // Assert distribution name is "markdown-script" (ADR-012; "mdscript" on PyPI
+  // is held by an unrelated project — sharing the name is unsafe).
+  if (!/\bname\s*=\s*"markdown-script"/.test(pyproject)) {
+    fail(`${PYPROJECT_PATH}: project name is not "markdown-script" (ADR-012)`);
+  }
+  // Assert version is dynamic. maturin stamps the version from the Cargo
+  // workspace [workspace.package] version at build time. If "version" is
+  // removed from dynamic[], maturin will fail to build the wheel; but catching
+  // it here avoids a confusing maturin error deep in the release pipeline.
+  if (!/dynamic\s*=\s*\[(?:[^[\]]*,\s*)?["']version["']/.test(pyproject)) {
+    fail(`${PYPROJECT_PATH}: "version" must be in dynamic[] so maturin reads it from the Cargo workspace`);
+  }
+}
+
 if (errors.length > 0) {
   console.error('✖ version-consistency gate FAILED:');
   for (const e of errors) console.error(`  - ${e}`);
   process.exit(1);
 }
 
-console.log(`✓ version gate: ${PKG_PATHS.length} packages + ${CRATE_CARGO_PATHS.length} crates all at ${canonical}; no file: refs; internal deps pinned to ${semverCaret}`);
+console.log(`✓ version gate: ${PKG_PATHS.length} packages + ${CRATE_CARGO_PATHS.length} crates all at ${canonical}; no file: refs; internal deps pinned to ${semverCaret}; Python pyproject.toml name=markdown-script version=dynamic`);

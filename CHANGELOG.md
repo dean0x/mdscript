@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Python wheel matrix and PyPI publishing (issue #132).** `release.yml` now
+  builds `cp311-abi3` wheels for 7 platforms (manylinux x86\_64 + aarch64,
+  musllinux\_1\_2 x86\_64 + aarch64, macOS x86\_64 + arm64, Windows x86\_64) and a
+  source distribution via `PyO3/maturin-action` (maturin 1.13.3), then publishes
+  the set to PyPI as `markdown-script` via OIDC trusted publishing with PEP 740
+  attestations (no long-lived credential). A readelf linkage gate on the Linux
+  legs guards against silent glibc contamination on musl targets (PF-038; mirrors
+  the existing `build-napi` musl gate). The upload is re-run safe via
+  `skip-existing: true` (PF-023). The build job is not ref-guarded and runs in
+  the dispatch dry run, so the build + verification gates are exercised before
+  any tag push (PF-039). ADR-012: distribution name is `markdown-script`
+  (import `markdown_script`); `mdscript` on PyPI is an unrelated project.
+
 ## [0.4.0] — 2026-09-01
 
 ### Added
@@ -649,8 +664,7 @@ directly via `ModuleCache::with_fs`.
   - `mds-core`: `LintConfig::from_rules_checked(HashMap<String, Severity>) -> (LintConfig,
     Option<UnknownRuleNames>)` — the preferred constructor. It returns the config and the
     unknowns report in one `#[must_use]` call so a caller cannot silently skip detection.
-    `LintConfig::from_rules` is retained but **deprecated since 0.4.0** in its favour; it
-    still behaves exactly as before (it never fails on an unknown name) and is not removed.
+    `LintConfig::from_rules` is **removed in 0.4.0** in its favour (see `### Removed` below).
   - `mds-core`: `attach_lint_warnings(&mut serde_json::Map<String, Value>, Option<String>)`
     — the single definition of the `lint_warnings` wire contract (key name, `string[]`
     shape, absent-when-empty) shared by the napi, WASM, and Python bindings. It takes a
