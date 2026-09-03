@@ -488,7 +488,7 @@ jobs:
         uses: PyO3/maturin-action@3e2bdf6ba6453a61e649744019b8a2d906c7eb38  # v1.51.0
         with:
           command: sdist
-          args: --locked -m crates/mds-python/Cargo.toml --out dist
+          args: -m crates/mds-python/Cargo.toml --out dist
           maturin-version: "v1.13.3"
       # --- wheel filename gate (all wheel legs) ---
       # Asserts cp311-abi3 tag and the expected platform string are both present.
