@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-03
+
 ### Added
 
 - **Python wheel matrix and PyPI publishing (issue #132).** `release.yml` now
@@ -1752,7 +1754,8 @@ First public release of the MDS (Markdown Script) compiler.
 
 - 590 Rust tests (integration, unit, and doc-tests across the workspace) plus the JavaScript package suites
 
-[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/dean0x/mdscript/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/dean0x/mdscript/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/dean0x/mdscript/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/dean0x/mdscript/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/dean0x/mdscript/compare/v0.1.0...v0.2.0
