@@ -47,7 +47,7 @@
   },
   "peerDependencies": {
     "@mdscript/mds": "^0.4.1",
-    "webpack": "^5.0.0"
+    "webpack": "^5.110.2"
   },
   "devDependencies": {
     "@mdscript/mds": "file:../mds",
@@ -55,6 +55,6 @@
     "browserslist": "4.28.7",
     "fast-uri": "3.1.5",
     "typescript": "^6.0.3",
-    "webpack": "^5.0.0"
+    "webpack": "^5.110.2"
   }
 }
