@@ -11,6 +11,7 @@ publishes nothing.
 - **Crates**: `mds-core`, `mds-cli` (published to crates.io in dependency order)
 - **npm**: `@mdscript/mds-napi` (7 native targets), `@mdscript/mds-wasm`, `@mdscript/mds`,
   `@mdscript/bundler-utils`, `@mdscript/vite-plugin`, `@mdscript/rollup-plugin`, `@mdscript/webpack-loader`
+- **PyPI**: `markdown-script` (7 cp311-abi3 wheels + 1 sdist; OIDC trusted publishing)
 
 ## Version Strategy
 
@@ -65,15 +66,16 @@ publishes nothing.
 ## Publish
 
 - **Trigger (tag-push — the only path)**: Land version bump on `main` via CI-gated PR. Before
-  merging, run `node scripts/verify-pr-checks.mjs <pr-number>` — it tolerates the three
+  merging, run `node scripts/verify-pr-checks.mjs <pr-number>` — it tolerates the four
   tag-guarded publish jobs appearing as `skipped` on a branch dry-run head; any other conclusion
   fails. Wait for the `CI` workflow run on the merge commit to finish green before tagging — the
   release version-gate asserts a completed+success CI run for the tagged SHA and fails closed
   while CI is still running. Then:
   `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`.
   The tag fires `release.yml`; build+publish run from the tag.
-- **Dry run**: `gh workflow run release.yml` (no version input) — runs version-gate, 7-target
-  build, A3 gate, and credential probe; publishes nothing. **Limitation**: ref-guarded steps
+- **Dry run**: `gh workflow run release.yml` (no version input) — runs version-gate (including
+  the PyPI OIDC trusted-publisher probe), 7-target napi build, 7-target + sdist Python wheel
+  matrix, A3 gate, and credential probe; publishes nothing. **Limitation**: ref-guarded steps
   (tag-only publish gates) are structurally un-exercisable from a branch dispatch — four clean
   dry-runs still let a tag-only gate fail on the first real tag.
 - **Recovery**: Publishes are idempotent (crates.io matches "already uploaded/exists"; npm
@@ -82,8 +84,8 @@ publishes nothing.
 - **Known gap (issue #345)**: The version-gate credential probe runs `npm whoami` for npm but
   only checks `CARGO_REGISTRY_TOKEN` for non-emptiness, not capability — a dead crates.io token
   is only discovered after builds have run.
-- **Flow (tag-push)**: version-gate → build-napi (7 targets) → stage+verify → publish-crates →
-  publish-npm → github-release
+- **Flow (tag-push)**: version-gate → build-napi (7 targets) + build-python (7 wheels + sdist,
+  parallel) → stage+verify → publish-crates → publish-npm → publish-python → github-release
 - **Critical gate**: A3 name↔loader verification (`scripts/verify-napi-names.mjs`)
 - **Toolchain pins**: Unpinned inputs that have broken release builds: stable rustc (1.98.0 added
   `-Wl,--fix-cortex-a53-843419`; aarch64-musl wrapper filters it) and zig (pinned to 0.16.0 in

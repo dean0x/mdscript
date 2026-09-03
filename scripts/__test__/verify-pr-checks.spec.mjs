@@ -1421,8 +1421,9 @@ describe('architecture-08: fetchCheckRuns — bounded loop and total_count guard
 // ---------------------------------------------------------------------------
 // TIER_B_EXPECTED_SKIPPED: release publish jobs may be skipped on a PR-branch
 // dry-run (guarded by startsWith(github.ref, 'refs/tags/v') in release.yml).
-// Only 'Publish to crates.io', 'Publish to npm', 'GitHub Release', only when
-// 'skipped', pass Tier B. Any other conclusion or any other name still fails.
+// Only 'Publish to crates.io', 'Publish to npm', 'Publish to PyPI', 'GitHub
+// Release', only when 'skipped', pass Tier B. Any other conclusion or any
+// other name still fails.
 // ---------------------------------------------------------------------------
 describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => {
 
@@ -1436,8 +1437,8 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     ];
   }
 
-  test('D-PR5a: all three publish names skipped + required green → PASS and merge command printed', () => {
-    // The RELEASING.md dry-run dispatched on a PR branch sees the three publish
+  test('D-PR5a: all four publish names skipped + required green → PASS and merge command printed', () => {
+    // The RELEASING.md dry-run dispatched on a PR branch sees the four publish
     // jobs as skipped (their refs/tags/v guard fires). The verifier must exit 0
     // so the operator can proceed to tag.
     const skippedPublishRuns = [...TIER_B_EXPECTED_SKIPPED].map(name => ({
@@ -1454,7 +1455,7 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
       prNumber: 338,
     });
     assert.equal(result.exitCode, 0,
-      `three publish names skipped must not block PASS; lines:\n${result.lines.join('\n')}`);
+      `four publish names skipped must not block PASS; lines:\n${result.lines.join('\n')}`);
     assert.ok(result.pass, 'must return pass=true');
     assert.ok(result.mergeCommand, 'PASS must produce a merge command');
     // Informational lines must be present (one per skipped job)
@@ -1511,7 +1512,7 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
   });
 
   test('D-PR5d: an unrelated Tier B name with conclusion=skipped → FAIL (whitelist is exact)', () => {
-    // The allowance is exactly the three publish job names. Any other job name
+    // The allowance is exactly the four publish job names. Any other job name
     // that reports skipped must still fail Tier B (security-13: whitelist).
     const runs = basePassingRunsWith([
       { name: 'Some other job', status: 'completed', conclusion: 'skipped' },
@@ -1533,7 +1534,7 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     // The not-yet-completed guard (status !== 'completed') in Tier B fires before
     // the TIER_B_EXPECTED_SKIPPED allowance. An in_progress publish run must
     // still block the merge — widening the allowance to accept status!='completed'
-    // for the three names would silently break PF-017 (avoids that mutation).
+    // for the four names would silently break PF-017 (avoids that mutation).
     const runs = basePassingRunsWith([
       { name: 'Publish to npm', status: 'in_progress', conclusion: null },
     ]);

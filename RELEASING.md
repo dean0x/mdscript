@@ -51,12 +51,13 @@ These are **not** automated and must be done before the first release:
    lands (ADR-012 amendment). Only the first `pypa/gh-action-pypi-publish` run
    on a real tag push secures the name.
 
-   **OIDC credential probe limitation:** The `version-gate` credential probe
-   calls `npm whoami` to verify the npm token before any irreversible publish.
-   PyPI OIDC has no equivalent long-lived token to probe; `pypi.org` issues the
-   upload token just-in-time for the OIDC exchange at publish time. The probe
-   therefore cannot cover PyPI — a misconfigured trusted publisher is only
-   discovered when `publish-python` runs on a real tag push.
+   **PyPI OIDC probe:** The `version-gate` job also probes the PyPI trusted
+   publisher by performing the OIDC mint-token exchange (`pypi.org/_/oidc/mint-token`)
+   before any irreversible publish. A missing, expired, or mismatched trusted-publisher
+   record causes version-gate to fail, aborting the release before any crates.io or
+   npm publish runs. The minted token expires unused — the probe is free and safe.
+   This step is NOT tag-guarded so it runs in the `workflow_dispatch` dry run too,
+   exercising the PyPI trust chain before the real tag push (PF-039).
 
 ## Pre-flight (before tagging)
 
@@ -129,10 +130,12 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
 
 The dry-run workflow runs `version-gate` in full, which now includes the
 **credential probe** (security-08): it calls `npm whoami` against the live
-registry to verify the `NPM_TOKEN` is valid, and guards `CARGO_REGISTRY_TOKEN`
-for non-empty. A revoked or absent token therefore fails the dry run — this
-closes the former gap where a bad npm token was only discovered after
-`cargo publish` had already made an irreversible crates.io release.
+registry to verify the `NPM_TOKEN` is valid, guards `CARGO_REGISTRY_TOKEN`
+for non-empty, and probes the PyPI trusted publisher via the OIDC mint-token
+exchange. A revoked token, absent secret, or misconfigured trusted publisher
+therefore fails the dry run — this closes the former gap where a bad credential
+was only discovered after `cargo publish` had already made an irreversible
+crates.io release.
 
 **Note:** `npm whoami` verifies authentication, not publish rights to the
 `@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
