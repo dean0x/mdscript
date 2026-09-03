@@ -558,7 +558,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "mds-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "ctrlc",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "mds-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "indexmap",
  "miette",
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "mds-napi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mds-core",
  "napi",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "mds-python"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "mds-core",
  "pyo3",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "mds-wasm"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "js-sys",
  "mds-core",
