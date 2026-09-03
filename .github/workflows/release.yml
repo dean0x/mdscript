@@ -903,7 +903,21 @@ jobs:
           [ "${#sd[@]}"  -eq 1 ] || { echo "::error::expected 1 sdist, found ${#sd[@]}"; exit 1; }
           echo "Python distributions complete: ${#whl[@]} wheels + ${#sd[@]} sdist"
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26  # v1.14.2
+        # IMPORTANT: Do NOT change this pin back to a commit SHA.
+        # pypa/gh-action-pypi-publish is a Docker-based composite action that
+        # derives its GHCR image tag from `github.action_ref`. When you pin via
+        # `@<sha>`, GitHub Actions sets action_ref to that SHA, and the action
+        # pulls ghcr.io/pypa/gh-action-pypi-publish:<sha>. GHCR only publishes
+        # images for tagged releases — not for every commit SHA.
+        # The v0.4.1 release used `@a892a5a...`, which is the annotated *tag
+        # object* SHA for v1.14.2 (not the commit SHA). No GHCR image exists for
+        # it, so the publish-python job failed with "manifest unknown". The
+        # underlying commit SHA (dc37677b...) does have a GHCR image and could
+        # be used as a SHA pin, but the risk of the same annotated-vs-commit
+        # confusion recurring outweighs the marginal supply-chain benefit here.
+        # Using the version tag is unambiguous: v1.14.2 maps directly to a
+        # published GHCR image (verified via GitHub Packages API, 2026-09-03).
+        uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           packages-dir: python-dist/
           skip-existing: true
