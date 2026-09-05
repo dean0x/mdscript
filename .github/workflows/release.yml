@@ -481,7 +481,7 @@ jobs:
       # --- build wheel ---
       - name: Build wheel
         if: ${{ !matrix.sdist }}
-        uses: PyO3/maturin-action@3e2bdf6ba6453a61e649744019b8a2d906c7eb38  # v1.51.0
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
         with:
           command: build
           args: --release --locked --compatibility pypi -m crates/mds-python/Cargo.toml --out dist
@@ -491,7 +491,7 @@ jobs:
       # --- build sdist ---
       - name: Build sdist
         if: ${{ matrix.sdist }}
-        uses: PyO3/maturin-action@3e2bdf6ba6453a61e649744019b8a2d906c7eb38  # v1.51.0
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
         with:
           command: sdist
           args: -m crates/mds-python/Cargo.toml --out dist
