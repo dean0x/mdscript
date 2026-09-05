@@ -145,6 +145,13 @@ jobs:
             #   Net CI savings vs PR2 baseline: -8,046 bytes.
             #   Guard NOT raised: 13,874 bytes (1.63%) headroom.
             #   Toolchain now pinned to 1.96.0 in the wasm job (see companion commit).
+            #   chore/deps-cargo-sweep-2026-09 (2026-09-06, PR #361): wasm-bindgen
+            #   0.2.121 -> 0.2.126, js-sys 0.3.98 -> 0.3.103 (wasm-bindgen-futures
+            #   0.4.76, wasm-bindgen-test 0.3.76); no Rust source change.
+            #   Prior CI baseline: 836,126 bytes (ticket/wasm-size-optimization).
+            #   CI-measured post-change: 839,456 bytes raw, 337,231 bytes gzipped
+            #   (Binaryen v129, CI run 33995227961). Delta: +3,330 bytes (+0.40%).
+            #   Guard NOT raised: 10,544 bytes (1.24%) headroom.
             if [ "$raw" -gt 850000 ]; then
               echo "::error::WASM binary exceeds 850,000 byte threshold: ${label} is ${raw} bytes"
               exit 1
