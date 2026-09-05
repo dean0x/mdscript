@@ -29,6 +29,22 @@ updates:
       prefix: "chore(deps)"
     cooldown:
       default-days: 30
+    # Phantom floor pins (PF-001): fast-uri, nanoid and js-yaml are exact-ish devDependencies
+    # with NO source importer; they exist only to hold a transitive floor because root
+    # `overrides` do not reify in this monorepo. Their real consumers require the current
+    # majors (ajv -> fast-uri ^3, postcss -> nanoid ^3, @napi-rs/cli -> js-yaml ^4), so a
+    # semver-major bump of the pin only adds a duplicate copy next to the consumer's own
+    # resolution. Dependabot #355, #357 and #279 were false positives on exactly this
+    # (#355 was also a security regression: fast-uri 4.1.2 predates the 2026-08-23 fix
+    # releases). Per the Dependabot options reference, `ignore` filters VERSION updates
+    # only — Dependabot SECURITY updates for these packages still arrive.
+    ignore:
+      - dependency-name: "fast-uri"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "nanoid"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "js-yaml"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
