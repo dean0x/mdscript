@@ -7,6 +7,18 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(deps)"
+    # Version updates wait 30 days after a release before Dependabot proposes
+    # them. Security updates are exempt and still arrive immediately.
+    cooldown:
+      default-days: 30
+    # napi, napi-derive and napi-build are ABI-coupled: a lone napi-derive bump
+    # (#282) produced 16 compile errors. Propose them as a single grouped PR.
+    groups:
+      napi:
+        patterns:
+          - "napi"
+          - "napi-derive"
+          - "napi-build"
 
   - package-ecosystem: npm
     directory: "/"
@@ -15,6 +27,8 @@ updates:
     open-pull-requests-limit: 10
     commit-message:
       prefix: "chore(deps)"
+    cooldown:
+      default-days: 30
 
   - package-ecosystem: github-actions
     directory: "/"
@@ -22,3 +36,5 @@ updates:
       interval: weekly
     commit-message:
       prefix: "chore(ci)"
+    cooldown:
+      default-days: 30
