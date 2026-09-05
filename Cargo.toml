@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 version = "0.4.2"
 edition = "2021"
-rust-version = "1.88" # napi 3.9.0 sets rust-version = "1.88" in its published Cargo.toml
+rust-version = "1.88" # napi 3.12.2 sets rust-version = "1.88" in its published Cargo.toml
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/dean0x/mdscript"
@@ -24,22 +24,23 @@ wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen-test = "0.3"
 js-sys = "0.3"
-napi = { version = "3.9.0", default-features = false, features = ["napi3", "serde-json"] }
-napi-derive = "3.5.6"
-napi-build = "2"
-# Python bindings (crates/mds-python). Pins are exact and soak-checked (2026-07-02):
+napi = { version = "3.12.2", default-features = false, features = ["napi3", "serde-json"] }
+napi-derive = "3.6.3"
+napi-build = "2.4.1"
+# Python bindings (crates/mds-python). Pins are exact and soak-checked (2026-09-06):
 # pyo3 0.29.0 patches two RustSec advisories disclosed 2026-06-11 — RUSTSEC-2026-0176
 # (OOB read in PyList/PyTuple iterator nth/nth_back) and RUSTSEC-2026-0177 (missing
 # Sync bound on PyCFunction::new_closure, a free-threading soundness gap this crate is
 # directly exposed to via `gil_used = false` below). Both are fixed only in >=0.29.0.
-# 0.29.0 is a security-patch release, so the 16-27d soak carve-out applies (not the
-# routine 30d window); it is ~21d old today and is the oldest version patching both
-# advisories — compliant. `abi3-py311` is ALWAYS on (not optional) so
-# `cargo build/clippy/test --workspace` compile the cdylib against the stable ABI
-# without linking libpython or needing a Python interpreter. `extension-module` is
-# gated behind the crate's own default feature so it can be toggled off. pyo3 default
-# features (incl. `macros`) are kept. pythonize's minor must track pyo3's (0.29 ↔ 0.29).
-pyo3 = { version = "=0.29.0", features = ["abi3-py311"] }
+# 0.29.2 is a patch on the already-fixed 0.29 line (both advisories remain fixed);
+# published 2026-08-05 (32 days of soak at 2026-09-06), past the routine 30d window.
+# It is the newest patch available — no 0.29.x above 0.29.2 exists. `abi3-py311` is
+# ALWAYS on (not optional) so `cargo build/clippy/test --workspace` compile the cdylib
+# against the stable ABI without linking libpython or needing a Python interpreter.
+# `extension-module` is gated behind the crate's own default feature so it can be
+# toggled off. pyo3 default features (incl. `macros`) are kept. pythonize's minor must
+# track pyo3's (0.29 ↔ 0.29); no 0.29.x above 0.29.0 exists for pythonize — pin stays.
+pyo3 = { version = "=0.29.2", features = ["abi3-py311"] }
 pythonize = "=0.29.0"
 # notify is CC0-1.0 (public-domain dedication). CC0 is permissive and non-contaminating
 # with respect to the workspace MIT license. Explicitly accepted here.
@@ -53,9 +54,9 @@ pythonize = "=0.29.0"
 notify = "8"
 ctrlc = "3.5"
 # similar: pure-Rust diffing (mds-cli `fmt --diff`). Apache-2.0 (MIT-compatible, no
-# copyleft). 3.1.1 released 2026-05-23 (~40d before this pin) — past the routine 30d
-# soak window. rust-version = "1.85" in its published Cargo.toml, within the workspace
-# MSRV (1.88). Only the default features ("std", "text") are used.
+# copyleft). 3.2.0 released 2026-08-17 (20d soak at 2026-09-06) — within the one-off
+# 14-day flush rule for this batch. rust-version = "1.85" in its published Cargo.toml,
+# within the workspace MSRV (1.88). Only the default features ("std", "text") are used.
 similar = "3.1"
 
 # panic = "unwind" is required workspace-wide because mds-wasm and mds-napi use
