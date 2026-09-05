@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- Cargo dependency sweep: napi 3.9.0 → 3.12.2, napi-derive 3.5.6 → 3.6.3, napi-build 2.3.2 → 2.4.1 (napi-sys 3.3.0, napi-derive-backend 6.1.2), pyo3 0.29.0 → 0.29.2, clap 4.6.1 → 4.6.6, similar 3.1.1 → 3.2.0, wasm-bindgen 0.2.121 → 0.2.126 (js-sys 0.3.103, wasm-bindgen-futures 0.4.76, wasm-bindgen-test 0.3.76), serde 1.0.228 → 1.0.229, serde_json 1.0.150 → 1.0.151, thiserror 2.0.18 → 2.0.20, libc 0.2.186 → 0.2.189. Supersedes Dependabot #354 #360 #359 #358 #280 #251 #249 #246 #243.
+
 ## [0.4.2] — 2026-09-03
 
 ### Fixed
