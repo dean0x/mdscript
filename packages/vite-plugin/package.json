@@ -45,7 +45,7 @@
   },
   "devDependencies": {
     "@mdscript/mds": "file:../mds",
-    "@types/node": "^25.9.1",
+    "@types/node": "^26.4.0",
     "nanoid": "3.3.18",
     "typescript": "^6.0.3",
     "vite": "^8.1.0"
