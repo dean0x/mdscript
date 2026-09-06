@@ -732,7 +732,7 @@ jobs:
       # `uses: pypa/gh-action-pypi-publish@<ref>` lines in publish-python and
       # publish-testpypi — spec S16 pins that equality, because a rehearsal that
       # validates a different ref than the release pulls proves nothing (PF-040).
-      PIN_REF: v1.14.2
+      PIN_REF: v9.99.99
       PUBLISH_IMAGE: ghcr.io/pypa/gh-action-pypi-publish
       # A ref that must never exist — the known-bad input every positive control
       # below is exercised against.
@@ -941,7 +941,7 @@ jobs:
       - name: Publish to TestPyPI
         # IMPORTANT: Do NOT change this pin back to a commit SHA — see the
         # extended comment in the publish-python step below (PF-040).
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v9.99.99
         with:
           packages-dir: python-dist/
           repository-url: https://test.pypi.org/legacy/
@@ -1225,7 +1225,7 @@ jobs:
         # When bumping this pin: update PIN_REF in rehearse-publish-python AND
         # the uses: pin in publish-testpypi, together. Spec S16 fails the build
         # if they drift.
-        uses: pypa/gh-action-pypi-publish@v1.14.2
+        uses: pypa/gh-action-pypi-publish@v9.99.99
         with:
           packages-dir: python-dist/
           skip-existing: true
