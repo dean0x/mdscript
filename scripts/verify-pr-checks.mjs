@@ -124,18 +124,82 @@ export const EXPECTED_CONTEXTS = [
 ];
 
 // Tier B allowance (release pre-flight): release.yml's publish jobs are
-// guarded by startsWith(github.ref, 'refs/tags/v'), so the RELEASING.md
-// dry-run dispatched on a PR branch reports them on the PR head as
-// conclusion=skipped. That skip IS the guard working, not a missing
-// verification. Only these four names, only when 'skipped', pass Tier B;
-// any other conclusion (cancelled, failure, neutral, null) still fails, and a
-// skipped run under any other name still fails.
+// guarded by startsWith(github.ref, 'refs/tags/v') (or the testpypi dispatch
+// input), so the RELEASING.md dry-run dispatched on a PR branch reports them
+// on the PR head as conclusion=skipped. That skip IS the guard working, not a
+// missing verification. Only these five names, only when 'skipped', pass Tier
+// B; any other conclusion (cancelled, failure, neutral, null) still fails, and
+// a skipped run under any other name still fails.
+// ADR-013 amendment (2026-09-06): 'Publish to TestPyPI (rehearsal)' is
+// dispatch-input-guarded — skipped everywhere except `workflow_dispatch -f
+// testpypi=true`. Adding it to this set so the mandatory pre-merge verifier
+// does not hard-fail on PRs that dispatch a release dry-run.
 export const TIER_B_EXPECTED_SKIPPED = new Set([
   'Publish to crates.io',
   'Publish to npm',
   'Publish to PyPI',
   'GitHub Release',
+  'Publish to TestPyPI (rehearsal)',
 ]);
+
+// ---------------------------------------------------------------------------
+// D-PR6: Release-surface presence check
+//
+// When a PR touches the release surface (paths matching release.yml's
+// pull_request.paths filter), the verifier REQUIRES a completed+success run
+// from each job in RELEASE_SURFACE_CONTEXTS. This closes the gap: a
+// mis-specified paths filter could pass as a silent no-run (ADR-013 §3).
+//
+// RELEASE_SURFACE must equal the workflow's on.pull_request.paths list
+// exactly. Spec S12 (release-auth-probe.spec.mjs) enforces that constraint.
+// ---------------------------------------------------------------------------
+
+/**
+ * The set of paths that trigger release.yml on pull_request.
+ * Must equal the `on.pull_request.paths:` list in .github/workflows/release.yml
+ * (enforced by spec S12 in release-auth-probe.spec.mjs).
+ *
+ * Pattern rules: a pattern ending in `/**` matches any file under that prefix;
+ * all other patterns are exact file path equality (no glob library needed).
+ */
+export const RELEASE_SURFACE = [
+  '.github/workflows/release.yml',
+  '.github/actions/**',
+  'crates/mds-napi/**',
+  'crates/mds-python/**',
+  'scripts/verify-napi-names.mjs',
+];
+
+/**
+ * Job display-names in release.yml that must be completed+success on a PR
+ * that touches the release surface. Matrix legs are implied by Stage's needs.
+ * These are Tier A semantics applied to release check-runs (presence required).
+ */
+export const RELEASE_SURFACE_CONTEXTS = [
+  'Version gate',
+  'Stage + verify platform packages',
+  'Rehearse PyPI publish (no upload)',
+];
+
+/**
+ * Returns true when `file` matches any pattern in RELEASE_SURFACE.
+ * A pattern ending in `/**` matches any file under that directory prefix.
+ * All other patterns require exact equality.
+ *
+ * @param {string} file - a changed file path (e.g. 'crates/mds-napi/src/lib.rs')
+ * @returns {boolean}
+ */
+export function matchesReleaseSurface(file) {
+  for (const pattern of RELEASE_SURFACE) {
+    if (pattern.endsWith('/**')) {
+      const prefix = pattern.slice(0, -3) + '/';
+      if (file.startsWith(prefix)) return true;
+    } else if (file === pattern) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // gh runner (thin IO shim; injected in tests for offline operation)
@@ -226,6 +290,7 @@ function defaultGhRunner(args) {
  *   headSha: string;
  *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
+ *   changedFiles?: string[];      // D-PR6: when present, release-surface presence check runs
  * }} EvaluateInput
  *
  * @typedef {{
@@ -253,6 +318,7 @@ export function evaluateChecks({
   headSha,
   prNumber,
   expectedContexts = EXPECTED_CONTEXTS,
+  changedFiles,
 }) {
   const lines = [];
   const failures = [];
@@ -470,6 +536,50 @@ export function evaluateChecks({
       lines.push(`  advisory (Tier C): "${st.context}" — state=pending (not yet resolved)`);
     } else if (st.state !== 'success') {
       lines.push(`  advisory (Tier C): "${st.context}" — state=${st.state}`);
+    }
+  }
+
+  // ---- D-PR6: release-surface presence check ----
+  // When changedFiles is provided and any file matches the release surface,
+  // require each RELEASE_SURFACE_CONTEXTS job to be present and success.
+  // Absence or non-success is FAIL (Tier A semantics applied to release runs).
+  // When changedFiles is undefined, skip — callers that only have a SHA cannot
+  // enumerate files without an additional API call.
+  if (changedFiles === undefined) {
+    lines.push(
+      '  · D-PR6: changedFiles not provided — release-surface presence check skipped ' +
+      '(caller would need a PR number to enumerate changed files)',
+    );
+  } else {
+    const touchedFiles = changedFiles.filter(f => matchesReleaseSurface(f));
+    if (touchedFiles.length > 0) {
+      lines.push(
+        `  release surface touched (${touchedFiles.length} file(s): ${touchedFiles.slice(0, 5).join(', ')}` +
+        (touchedFiles.length > 5 ? ', …' : '') +
+        ') — requiring release check-runs',
+      );
+      for (const ctx of RELEASE_SURFACE_CONTEXTS) {
+        const releaseRuns = checkRuns.filter(cr => cr.name === ctx);
+        if (releaseRuns.length === 0) {
+          failures.push(
+            `D-PR6 (release surface): "${ctx}" absent — the PR touches the release ` +
+            `surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
+          );
+          pass = false;
+        } else {
+          for (const cr of releaseRuns) {
+            if (cr.status !== 'completed' || cr.conclusion !== 'success') {
+              failures.push(
+                `D-PR6 (release surface): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
+                `— the PR touches the release surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
+              );
+              pass = false;
+            }
+          }
+        }
+      }
+    } else {
+      lines.push('  release surface not touched — no release run required');
     }
   }
 
@@ -782,6 +892,56 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     return st.exitCode;
   }
 
+  // ---- D-PR6: fetch changed files for release-surface presence check ----
+  // Paginated with the same bounded pattern as fetchCheckRuns (D-PR4a).
+  // If the API call fails we degrade gracefully (skip the check) rather than
+  // hard-failing — the changed-files API is best-effort context, not a gate.
+  // Non-vacuity: assert collected count equals PR's changed_files (exit 2 on
+  // shortfall so a partial set is never silently evaluated as complete).
+  const MAX_FILES_PAGES = 30;
+  let changedFiles;
+  {
+    const declaredCount = prData.changed_files ?? null;
+    const collected = [];
+    let filesPage = 1;
+    let filesFailed = false;
+    let filesPagError = null;
+
+    while (filesPage <= MAX_FILES_PAGES) {
+      const filesUrl =
+        `/repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100&page=${filesPage}`;
+      const filesData = runner(['api', filesUrl]);
+      if (filesData.__error) {
+        filesFailed = true;
+        filesPagError = `PR files API error (page ${filesPage}): ${filesData.stderr}`;
+        break;
+      }
+      const page = Array.isArray(filesData) ? filesData : (filesData.files ?? []);
+      collected.push(...page.map(f => f.filename));
+      if (page.length < 100) break;
+      filesPage++;
+    }
+
+    if (!filesFailed && filesPage > MAX_FILES_PAGES) {
+      fail(`PR files pagination exceeded ${MAX_FILES_PAGES} pages — refusing to evaluate partial release-surface result`);
+      return 2;
+    }
+
+    if (filesFailed) {
+      console.log(`  · D-PR6: changed-files API error — release-surface check skipped: ${filesPagError}`);
+      changedFiles = undefined;
+    } else if (declaredCount !== null && collected.length !== declaredCount) {
+      fail(
+        `collected ${collected.length} changed files but PR declares changed_files=${declaredCount} — ` +
+        `partial file list (D-PR6 non-vacuity, avoids PF-013)`,
+      );
+      return 2;
+    } else {
+      changedFiles = collected;
+      console.log(`  changed files: ${collected.length}`);
+    }
+  }
+
   // ---- Evaluate (D-PR1: pure function) ----
   const result = evaluateChecks({
     requiredContexts: req.contexts,
@@ -789,6 +949,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     statuses: st.statuses,
     headSha,
     prNumber,
+    changedFiles,
   });
 
   for (const line of result.lines) {

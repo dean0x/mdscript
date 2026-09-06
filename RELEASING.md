@@ -59,6 +59,19 @@ These are **not** automated and must be done before the first release:
    This step is NOT tag-guarded so it runs in the `workflow_dispatch` dry run too,
    exercising the PyPI trust chain before the real tag push (PF-039).
 
+6. **Configure TestPyPI trusted publisher** (optional, needed for `testpypi: true`
+   dispatch runs) at [test.pypi.org/manage/account/publishing](https://test.pypi.org/manage/account/publishing/):
+   - Project name: `markdown-script`
+   - Owner / repository: `dean0x/mdscript`
+   - Workflow filename: `release.yml`
+   - Environment name: **leave blank**
+
+   The `publish-testpypi` job is a dispatch-input-guarded opt-in leg (`testpypi: true`
+   on `workflow_dispatch`). It is skipped on all PR and standard dispatch runs;
+   `TIER_B_EXPECTED_SKIPPED` lists its name so the pre-merge verifier tolerates the
+   skipped conclusion. The trusted publisher for TestPyPI is independent of the PyPI
+   one — both must be configured separately.
+
 ## Pre-flight (before tagging)
 
 Run the local dry-runs and gates:
@@ -125,16 +138,17 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # Python wheel matrix, stages packages,
                                      # runs the A3 name<->loader gate and the
                                      # Python readelf linkage gate, uploads
-                                     # artifacts. Publishes NOTHING.
+                                     # artifacts. Rehearses the PyPI OIDC
+                                     # exchange. Publishes NOTHING.
 ```
 
 The dry-run workflow runs `version-gate` in full, which now includes the
 **credential probe** (security-08): it calls `npm whoami` against the live
 registry to verify the `NPM_TOKEN` is valid, guards `CARGO_REGISTRY_TOKEN`
-for non-empty, and probes the PyPI trusted publisher via the OIDC mint-token
-exchange. A revoked token, absent secret, or misconfigured trusted publisher
-therefore fails the dry run — this closes the former gap where a bad credential
-was only discovered after `cargo publish` had already made an irreversible
+for non-empty, probes the PyPI trusted publisher via the OIDC mint-token
+exchange, and probes the GHCR manifest for the `pypa/gh-action-pypi-publish`
+pin (PF-040). A revoked token, absent secret, misconfigured trusted publisher,
+or broken action pin therefore fails the dry run — all before any irreversible
 crates.io release.
 
 **Note:** `npm whoami` verifies authentication, not publish rights to the
@@ -145,11 +159,32 @@ The dry run also exercises the **CI-history gate** (PF-017), asserting a
 completed+success `CI` run for the dispatched ref's HEAD. Dispatch it only after
 that ref's CI has finished, or the gate fails closed on a still-running run.
 
+The dry run also runs the new **`rehearse-publish-python` job** — a `dry-run: true`
+publish that exercises the OIDC exchange end-to-end without uploading any wheels.
+A misconfigured or expired trusted publisher fails here, before `publish-crates`
+starts (PF-039: the rehearsal job is intentionally unguarded so it runs on dispatch
+and PRs, not just tag pushes).
+
+Five jobs are expected-skipped on a standard `workflow_dispatch` dry run and
+are listed in `TIER_B_EXPECTED_SKIPPED` in `scripts/verify-pr-checks.mjs`:
+`Publish to crates.io`, `Publish to npm`, `Publish to PyPI`, `GitHub Release`,
+and `Publish to TestPyPI (rehearsal)`.
+
 Confirm the **A3 name-gate** step (`scripts/verify-napi-names.mjs`) passes in that
 run. **This is a hard checkpoint** — if the generated platform package names or
 their `.node` filenames drift from the hand-written `crates/mds-napi/index.js`
 loader, the published universal package will fail to load the native binary at
 runtime on the affected platform. Do not proceed past a failing gate.
+
+### PyPI publish rehearsal
+
+Release-surface PRs (those touching `.github/workflows/release.yml`,
+`.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`, or
+`scripts/verify-napi-names.mjs`) also trigger the workflow via the
+`pull_request` event. On such PRs, `verify-pr-checks.mjs` requires three
+additional check-runs: `Version gate`, `Stage + verify platform packages`, and
+`Rehearse PyPI publish (no upload)`. All other publish jobs are skipped and
+their skipped conclusions are tolerated by the verifier.
 
 ## Release
 
@@ -187,21 +222,24 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 ### What happens after tagging
 
 The `release.yml` workflow runs, in order:
-   1. **version-gate** — synchronized-version check (fails fast).
+   1. **version-gate** — synchronized-version check, credential probe, GHCR pin
+      probe, PyPI OIDC probe, and CI-history gate (fails fast).
    2. **build-napi** (parallel with build-python) — cross-compiles the addon for
       all 7 targets.
    3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
       for 7 platforms + sdist, runs the readelf linkage gate on Linux legs.
    4. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
       LICENSE into each platform dir, runs the **A3 name-gate**.
-   5. **publish-crates** — blocked until BOTH `stage-and-verify-napi` and
-      `build-python` succeed (so a Python build failure aborts before crates.io,
-      which is irreversible — PF-023). `cargo publish` `mds-core`, polls the
+   5. **rehearse-publish-python** — `dry-run: true` publish to PyPI; exercises the
+      OIDC exchange end-to-end without uploading any wheels. publish-crates blocks
+      on this so a broken trusted publisher aborts before crates.io (irreversible).
+   6. **publish-crates** — blocked until `stage-and-verify-napi`, `build-python`,
+      AND `rehearse-publish-python` succeed. `cargo publish` `mds-core`, polls the
       crates.io index for up to 5 min (bounded, max 20 × 15 s), then `mds-cli`.
-   6. **publish-npm** and **publish-python** (parallel, both after publish-crates)
+   7. **publish-npm** and **publish-python** (parallel, both after publish-crates)
       — publish npm packages (with provenance) and PyPI `markdown-script` (OIDC
       trusted publishing + PEP 740 attestations, `skip-existing: true`).
-   7. **github-release** — `gh release create` with generated notes; runs only
+   8. **github-release** — `gh release create` with generated notes; runs only
       after all three publish jobs succeed.
 
 ## Post-release

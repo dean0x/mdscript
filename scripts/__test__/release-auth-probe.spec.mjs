@@ -23,6 +23,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  RELEASE_SURFACE,
+  TIER_B_EXPECTED_SKIPPED,
+} from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
 const RELEASE_YML = join(ROOT, '.github/workflows/release.yml');
@@ -223,6 +227,230 @@ describe('security-08: npm auth probe in version-gate', () => {
         `Direct needs of "${job}": [${(graph.get(job) ?? []).join(', ')}]`,
       );
     }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Additional structural helpers for B1 checks (S5-S13)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the `on:` block — from `on:` (0-indent) to the next 0-indent key.
+ */
+function extractOnBlock(source) {
+  const lines = source.split('\n');
+  const start = lines.findIndex(l => /^on:\s*$/.test(l));
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^[a-z]/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join('\n');
+}
+
+/**
+ * Extract the job-level `if:` condition (4-space indent).
+ * Returns the condition string, or null when none is present.
+ */
+function extractJobIf(jobSection) {
+  if (!jobSection) return null;
+  for (const line of jobSection.split('\n')) {
+    const m = /^    if:\s+(.+)$/.exec(line);
+    if (m) return m[1].trim();
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// B1 structural invariants (S5-S13)
+// ---------------------------------------------------------------------------
+
+describe('B1: release-surface PR gate and rehearsal jobs', () => {
+
+  // -------------------------------------------------------------------------
+  // S5: rehearse-publish-python job must exist.
+  // Non-vacuity: without this job the D-PR6 release-surface check would never
+  // be exercised on PRs, defeating PF-039 (tag-guarded steps are untested).
+  // -------------------------------------------------------------------------
+  test('S5: rehearse-publish-python job exists in release.yml', () => {
+    const section = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(
+      section !== null,
+      'rehearse-publish-python job must exist; PF-039 — a tag-guarded publish step ' +
+      'that is never rehearsed on PRs cannot be validated before the release',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S6: rehearse-publish-python must have NO job-level if: guard.
+  // The job must run on pull_request, workflow_dispatch, AND tag push so that
+  // the OIDC exchange is validated before any irreversible crates.io publish.
+  // A job-level tag guard would re-introduce PF-039 for this job.
+  // -------------------------------------------------------------------------
+  test('S6: rehearse-publish-python has no job-level if: (runs on PR, dispatch, and tag push)', () => {
+    const section = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(section !== null, 'rehearse-publish-python must exist (see S5)');
+    const jobIf = extractJobIf(section);
+    assert.equal(
+      jobIf, null,
+      'rehearse-publish-python must have NO job-level if: guard — it must run on all ' +
+      'triggering events (pull_request, workflow_dispatch, push) so PRs exercise the ' +
+      'OIDC exchange before the irreversible crates.io publish (PF-039); ' +
+      `got if: ${jobIf}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S7: rehearse-publish-python must transitively need version-gate.
+  // This ensures the credential probe runs before the OIDC exchange contacts
+  // the registry, preserving the security-08 ordering invariant.
+  // -------------------------------------------------------------------------
+  test('S7: rehearse-publish-python transitively needs version-gate (ordering invariant)', () => {
+    const graph = buildNeedsGraph(yml);
+    assert.ok(
+      graph.has('rehearse-publish-python'),
+      'rehearse-publish-python must be in the jobs graph (see S5)',
+    );
+    assert.ok(
+      transitivelyNeeds(graph, 'rehearse-publish-python', 'version-gate'),
+      'rehearse-publish-python must transitively need version-gate so the credential ' +
+      'probe runs before the OIDC exchange; ' +
+      `direct needs: [${(graph.get('rehearse-publish-python') ?? []).join(', ')}]`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S8: version-gate must contain a GHCR manifest probe for the
+  // pypa/gh-action-pypi-publish pin (PF-040, #350 option 3).
+  // An absent or stale pin (SHA instead of tag name) silently breaks the
+  // publish-python job at runtime with "manifest unknown".
+  // -------------------------------------------------------------------------
+  test('S8: version-gate contains GHCR manifest probe for pypa/gh-action-pypi-publish', () => {
+    const section = extractJobSection(yml, 'version-gate');
+    assert.ok(section !== null, 'version-gate must exist');
+    assert.ok(
+      section.includes('ghcr.io/v2/pypa/gh-action-pypi-publish/manifests'),
+      'version-gate must probe the GHCR manifest for the pypa/gh-action-pypi-publish ' +
+      'pin (#350 option 3, PF-040); a missing or SHA-pinned image causes publish-python ' +
+      'to fail at runtime with "manifest unknown"; ' +
+      `got section (first 600 chars):\n${section.slice(0, 600)}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S9: The CI-history step in version-gate must use a step-level if: guard
+  // (not a job-level guard).
+  //
+  // If version-gate itself were guarded at the job level to skip on PRs, the
+  // Tier-B verifier would see version-gate as skipped and fail the PR
+  // (ADR-013 amendment 2026-09-06). The fix is a step-level if: so the job
+  // runs (and succeeds) but the CI-history step is skipped on non-tag events.
+  // -------------------------------------------------------------------------
+  test('S9: CI-history step in version-gate uses step-level if: (not job-level)', () => {
+    const section = extractJobSection(yml, 'version-gate');
+    assert.ok(section !== null, 'version-gate must exist');
+
+    // Confirm the CI-history step still exists (non-vacuity).
+    assert.ok(
+      section.includes('Assert tagged SHA has green CI history'),
+      'version-gate must still contain the CI-history step (non-vacuity guard)',
+    );
+
+    // Step-level if: is at 8-space indent (step field); job-level at 4-space.
+    // We accept step-level if: anywhere in the section (the step is the only
+    // consumer of a conditional skip in version-gate).
+    const hasStepLevelIf = section.split('\n').some(l => /^        if:/.test(l));
+    assert.ok(
+      hasStepLevelIf,
+      'version-gate must use a step-level if: (8-space indent) on the CI-history step ' +
+      'so that PRs can skip that step without marking version-gate itself skipped — a ' +
+      'skipped version-gate would fail the Tier-B verifier (ADR-013 amendment 2026-09-06); ' +
+      `got section (first 800 chars):\n${section.slice(0, 800)}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S10: The on: block must include a pull_request trigger with at least one
+  // path from RELEASE_SURFACE (ensuring release-surface PRs exercise the gate).
+  // -------------------------------------------------------------------------
+  test('S10: on: block includes pull_request trigger with RELEASE_SURFACE paths', () => {
+    const onBlock = extractOnBlock(yml);
+    assert.ok(onBlock !== null, 'release.yml must have an on: block');
+    assert.ok(
+      onBlock.includes('pull_request:'),
+      'release.yml must have a pull_request: trigger so release-surface PRs are validated; ' +
+      `got on: block:\n${onBlock}`,
+    );
+    // At least one RELEASE_SURFACE entry must appear in the on: block paths list.
+    const hasPath = RELEASE_SURFACE.some(entry => {
+      const base = entry.endsWith('/**') ? entry.slice(0, -3) : entry;
+      return onBlock.includes(base);
+    });
+    assert.ok(
+      hasPath,
+      'pull_request trigger paths must include at least one entry from RELEASE_SURFACE; ' +
+      `RELEASE_SURFACE = [\n  ${RELEASE_SURFACE.join(',\n  ')}\n]; ` +
+      `got on: block:\n${onBlock}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S11: publish-testpypi job must exist (opt-in TestPyPI leg, #350).
+  // -------------------------------------------------------------------------
+  test('S11: publish-testpypi job exists in release.yml', () => {
+    const section = extractJobSection(yml, 'publish-testpypi');
+    assert.ok(
+      section !== null,
+      'publish-testpypi job must exist for the opt-in TestPyPI leg (#350)',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S12: publish-testpypi must be guarded by a job-level if: that references
+  // inputs.testpypi so it only runs when the dispatch input is set to true.
+  // Without this guard it would run on every PR and tag push, causing
+  // unintended TestPyPI uploads.
+  // -------------------------------------------------------------------------
+  test('S12: publish-testpypi has job-level if: referencing inputs.testpypi', () => {
+    const section = extractJobSection(yml, 'publish-testpypi');
+    assert.ok(section !== null, 'publish-testpypi must exist (see S11)');
+    const jobIf = extractJobIf(section);
+    assert.ok(
+      jobIf !== null && jobIf.includes('inputs.testpypi'),
+      'publish-testpypi must have a job-level if: referencing inputs.testpypi; ' +
+      'this keeps it out of PR and standard dispatch runs — it runs ONLY when the ' +
+      'workflow_dispatch testpypi input is true (#350); ' +
+      `got if: ${jobIf}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S13: publish-testpypi's name: field must appear in TIER_B_EXPECTED_SKIPPED
+  // so the Tier-B verifier tolerates the skipped conclusion on standard PRs
+  // and dispatch runs (ADR-013).
+  // -------------------------------------------------------------------------
+  test('S13: publish-testpypi name is listed in TIER_B_EXPECTED_SKIPPED', () => {
+    const section = extractJobSection(yml, 'publish-testpypi');
+    assert.ok(section !== null, 'publish-testpypi must exist (see S11)');
+
+    // Extract the job name: field (4-space indent).
+    let jobName = null;
+    for (const line of section.split('\n')) {
+      const m = /^    name:\s+(.+)$/.exec(line);
+      if (m) { jobName = m[1].trim(); break; }
+    }
+    assert.ok(
+      jobName !== null,
+      `publish-testpypi must have a name: field; got section:\n${section}`,
+    );
+
+    assert.ok(
+      TIER_B_EXPECTED_SKIPPED.has(jobName),
+      `publish-testpypi name "${jobName}" must be listed in TIER_B_EXPECTED_SKIPPED ` +
+      `in verify-pr-checks.mjs so skipped conclusions are tolerated on non-dispatch runs ` +
+      `(ADR-013); current set: [${[...TIER_B_EXPECTED_SKIPPED].join(', ')}]`,
+    );
   });
 
 });

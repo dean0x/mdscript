@@ -27,6 +27,9 @@ import {
   parseGhStderrHttpStatus,
   EXPECTED_CONTEXTS,
   TIER_B_EXPECTED_SKIPPED,
+  RELEASE_SURFACE,
+  RELEASE_SURFACE_CONTEXTS,
+  matchesReleaseSurface,
 } from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
@@ -647,7 +650,9 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     // CPU cost and any unexpected loops — network latency is zero.
     assert.ok(elapsed < 15000,
       `verifier must complete in < 15 s wall-clock (AC-30 clause b); took ${elapsed}ms`);
-    assert.equal(calls.length, 4, `expected 4 API calls (pr, protection, checks, status); got ${calls.length}`);
+    // D-PR6: adds one PR-files call (pulls/{n}/files?per_page=100) for the release-surface check.
+    // The /pulls/ stub also matches the files URL and returns PR_OK (no .files → empty list → ok).
+    assert.equal(calls.length, 5, `expected 5 API calls (pr, protection, checks, status, files); got ${calls.length}`);
     const checkCall = calls.find(u => u.includes('/check-runs'));
     assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
     // D-PR4a parity: combined-status endpoint must request per_page=100 so a context
@@ -1420,10 +1425,11 @@ describe('architecture-08: fetchCheckRuns — bounded loop and total_count guard
 
 // ---------------------------------------------------------------------------
 // TIER_B_EXPECTED_SKIPPED: release publish jobs may be skipped on a PR-branch
-// dry-run (guarded by startsWith(github.ref, 'refs/tags/v') in release.yml).
-// Only 'Publish to crates.io', 'Publish to npm', 'Publish to PyPI', 'GitHub
-// Release', only when 'skipped', pass Tier B. Any other conclusion or any
-// other name still fails.
+// dry-run (guarded by startsWith(github.ref,'refs/tags/v') or the testpypi
+// dispatch input). Five names: 'Publish to crates.io', 'Publish to npm',
+// 'Publish to PyPI', 'GitHub Release', 'Publish to TestPyPI (rehearsal)';
+// only when 'skipped', pass Tier B. Any other conclusion or any other name
+// still fails. (ADR-013 amendment 2026-09-06)
 // ---------------------------------------------------------------------------
 describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => {
 
@@ -1550,6 +1556,192 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     assert.ok(
       allLines.includes('not yet completed') || allLines.includes('in_progress'),
       `failure must mention not-yet-completed or in_progress; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR5f: "Publish to TestPyPI (rehearsal)" with conclusion=cancelled → FAIL (only skipped is allowed)', () => {
+    // ADR-013 amendment: this job is added to TIER_B_EXPECTED_SKIPPED so that
+    // a skipped run (dispatch-input-guarded) does not block the verifier.
+    // But cancelled is NOT skipped — it is a real anomaly and must fail closed.
+    const runs = basePassingRunsWith([
+      { name: 'Publish to TestPyPI (rehearsal)', status: 'completed', conclusion: 'cancelled' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'cancelled Publish to TestPyPI must exit 1 (only skipped is allowed in TIER_B_EXPECTED_SKIPPED)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Publish to TestPyPI'), `must name the failing job; got:\n${allLines}`);
+    assert.ok(allLines.includes('cancelled'), `must quote the conclusion; got:\n${allLines}`);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR6: Release-surface presence check
+//
+// When a PR touches .github/workflows/release.yml, .github/actions/**,
+// crates/mds-napi/**, crates/mds-python/**, or scripts/verify-napi-names.mjs,
+// the verifier REQUIRES completed+success runs for each RELEASE_SURFACE_CONTEXTS
+// job: "Version gate", "Stage + verify platform packages",
+// "Rehearse PyPI publish (no upload)".
+// ---------------------------------------------------------------------------
+describe('D-PR6: release-surface presence check', () => {
+
+  // Helper: all required + expected passes; inject extras.
+  function passingRunsWith(extras) {
+    return [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      ...extras,
+    ];
+  }
+
+  // Three release-surface jobs, all success.
+  function releaseSuccessRuns() {
+    return RELEASE_SURFACE_CONTEXTS.map(name => ({
+      name,
+      status: 'completed',
+      conclusion: 'success',
+    }));
+  }
+
+  test('D-PR6a: changedFiles touches release surface + all RELEASE_SURFACE_CONTEXTS present/success → exit 0 and "release surface touched" line', () => {
+    const checkRuns = passingRunsWith(releaseSuccessRuns());
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 0,
+      `touched release surface + all contexts success must exit 0; lines:\n${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('release surface touched'),
+      `output must include "release surface touched"; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR6b: touched + "Version gate" absent → exit 1 naming it (#342)', () => {
+    const withoutVersionGate = releaseSuccessRuns().filter(r => r.name !== 'Version gate');
+    const checkRuns = passingRunsWith(withoutVersionGate);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 1,
+      `absent "Version gate" with release surface touched must exit 1; got:\n${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Version gate'), `must name the absent job; got:\n${allLines}`);
+  });
+
+  test('D-PR6c: touched + "Rehearse PyPI publish (no upload)" completed+skipped → exit 1', () => {
+    const withSkippedRehearse = releaseSuccessRuns().map(r =>
+      r.name === 'Rehearse PyPI publish (no upload)'
+        ? { ...r, conclusion: 'skipped' }
+        : r,
+    );
+    const checkRuns = passingRunsWith(withSkippedRehearse);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 1,
+      'release surface requires success, not skipped; must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('Rehearse PyPI publish (no upload)'),
+      `must name the non-success context; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR6d: touched + one present run in_progress → exit 1', () => {
+    const withInProgress = releaseSuccessRuns().map(r =>
+      r.name === 'Stage + verify platform packages'
+        ? { name: r.name, status: 'in_progress', conclusion: null }
+        : r,
+    );
+    const checkRuns = passingRunsWith(withInProgress);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['crates/mds-napi/src/lib.rs'],
+    });
+    assert.equal(result.exitCode, 1, 'in_progress release job with touched surface must exit 1');
+  });
+
+  test('D-PR6e: changedFiles = ["crates/mds-core/src/lib.rs"], no release runs → exit 0 and "not touched" line', () => {
+    const checkRuns = passingRunsWith([]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['crates/mds-core/src/lib.rs'],
+    });
+    assert.equal(result.exitCode, 0,
+      'non-release file must not require release check-runs; must exit 0');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('release surface not touched'),
+      `must include "release surface not touched"; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR6f: matchesReleaseSurface positives and negatives', () => {
+    // Positives (must return true)
+    assert.ok(matchesReleaseSurface('.github/actions/setup-wasm/action.yml'),
+      '.github/actions/** pattern must match .github/actions/setup-wasm/action.yml');
+    assert.ok(matchesReleaseSurface('crates/mds-napi/src/lib.rs'),
+      'crates/mds-napi/** must match crates/mds-napi/src/lib.rs');
+    assert.ok(matchesReleaseSurface('scripts/verify-napi-names.mjs'),
+      'exact match must work for scripts/verify-napi-names.mjs');
+    assert.ok(matchesReleaseSurface('.github/workflows/release.yml'),
+      'exact match must work for .github/workflows/release.yml');
+    assert.ok(matchesReleaseSurface('crates/mds-python/src/lib.rs'),
+      'crates/mds-python/** must match crates/mds-python/src/lib.rs');
+
+    // Negatives (must return false)
+    assert.ok(!matchesReleaseSurface('.github/workflows/ci.yml'),
+      '.github/workflows/ci.yml must NOT match (only release.yml is listed)');
+    assert.ok(!matchesReleaseSurface('scripts/verify-versions.mjs'),
+      'scripts/verify-versions.mjs must NOT match (only verify-napi-names.mjs is listed)');
+    assert.ok(!matchesReleaseSurface('crates/mds-core/src/lib.rs'),
+      'crates/mds-core/** must NOT match (not in RELEASE_SURFACE)');
+  });
+
+  test('D-PR6g: changedFiles undefined → exit 0 with skip notice (changedFiles is optional)', () => {
+    // When main() cannot fetch the changed-files list (API error), it passes
+    // changedFiles=undefined. evaluateChecks must skip the D-PR6 check and
+    // include a notice so the operator knows the check was skipped.
+    const checkRuns = passingRunsWith([]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: undefined,
+    });
+    assert.equal(result.exitCode, 0, 'undefined changedFiles must not cause failure');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('release-surface presence check skipped') ||
+      allLines.includes('changedFiles not provided'),
+      `must include a skip notice; got:\n${allLines}`,
     );
   });
 

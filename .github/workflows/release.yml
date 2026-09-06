@@ -1,13 +1,27 @@
 name: Release
 
-# Two entry points:
+# Three entry points:
 #   * push a version tag (v*) -> full coordinated release
-#   * workflow_dispatch (no inputs) -> dry run (build + verify, no publish)
+#   * pull_request touching release-surface paths -> rehearse only, no publish
+#   * workflow_dispatch -> dry run (build + verify, no publish)
+#     testpypi: true   -> same + publish to TestPyPI (opt-in leg)
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/actions/**'
+      - 'crates/mds-napi/**'
+      - 'crates/mds-python/**'
+      - 'scripts/verify-napi-names.mjs'
+  workflow_dispatch:
+    inputs:
+      testpypi:
+        description: 'Publish to TestPyPI (rehearsal; skip-existing is on)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -50,7 +64,7 @@ jobs:
           # to an empty string in GitHub Actions — not an error — so this must be checked
           # explicitly before cargo publish runs and makes crates.io publish irreversible.
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. (security-08)"
+            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. NOTE: Dependabot and fork pull_request events do not receive repository secrets; only first-party branch PRs do. (security-08)"
             exit 1
           fi
           # Guard: cargo token must be non-empty. A missing token fails before the
@@ -87,6 +101,29 @@ jobs:
             echo "::error::PyPI OIDC mint failed (HTTP $CODE) — trusted publisher missing, expired, or mismatched. Fix BEFORE tagging; crates.io is irreversible."
             jq -r '.message // .' /tmp/mint.json; exit 1; }
           echo "PyPI trusted publisher OK"
+      # PF-040: verify the pypa/gh-action-pypi-publish tag pin resolves in GHCR
+      # before any irreversible publish. The action derives its GHCR image tag
+      # from github.action_ref — a commit-SHA or annotated-tag-object-SHA pin
+      # causes "manifest unknown" because GHCR only publishes images for release
+      # tag names. This probe catches a bad pin (SHA instead of tag name) at
+      # version-gate time, before the build matrix starts. Anonymous REST; no
+      # Docker CLI needed. Runs on all triggers (PF-039).
+      - name: "Probe GHCR: verify pypa/gh-action-pypi-publish pin resolves (PF-040, #350)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIN_REF=v1.14.2
+          TOKEN=$(curl -sf \
+            'https://ghcr.io/token?scope=repository:pypa/gh-action-pypi-publish:pull' \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>process.stdout.write(JSON.parse(d).token))")
+          STATUS=$(curl -sf -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/pypa/gh-action-pypi-publish/manifests/${PIN_REF}")
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::GHCR manifest probe failed — pypa/gh-action-pypi-publish:${PIN_REF} returned HTTP ${STATUS}. The pin in publish-python/publish-testpypi must be a release tag name, not a SHA (PF-040). If the tag was bumped, update PIN_REF here and the uses: pins in publish-python and publish-testpypi."
+            exit 1
+          fi
+          echo "GHCR probe OK: pypa/gh-action-pypi-publish:${PIN_REF} → HTTP ${STATUS}"
       - name: "Assert synchronized versions, no file: refs"
         run: node scripts/verify-versions.mjs
       # #288: Source-hygiene gate — also runs on tag pushes via this job.
@@ -100,11 +137,15 @@ jobs:
       - name: "Run positive-control and class-completeness suite"
         run: npm run test:gates
       # reliability-12: assert the SHA being released went green in CI before
-      # any irreversible publish starts. Runs on BOTH triggers - a tag push
-      # verifies the tagged commit, a workflow_dispatch dry run verifies the
-      # dispatched ref's HEAD - so the dry run now exercises this gate instead
-      # of skipping it. Cancelled, failed, in-progress and absent runs all fail
-      # closed (PF-017; PF-013: absence is not success).
+      # any irreversible publish starts. Runs on tag push and workflow_dispatch
+      # (dry run) - a tag push verifies the tagged commit, a dispatch verifies
+      # the dispatched ref's HEAD. Skipped on pull_request events: a PR's merge
+      # commit may not have a ci.yml run yet, and PRs exercise the rehearsal
+      # jobs rather than the full publish sequence. Step-level if: (not
+      # job-level) keeps version-gate itself running (and succeeding) on PRs so
+      # Tier-B verifier sees a success, not a skipped result (ADR-013 amendment
+      # 2026-09-06). Cancelled, failed, in-progress and absent runs all fail
+      # closed on tag/dispatch (PF-017; PF-013: absence is not success).
       # Cannot reuse scripts/verify-pr-checks.mjs here - that script requires a
       # PR number, and tag pushes reference a commit, not a PR.
       # Branch protection is NOT read: /branches/main/protection needs
@@ -112,6 +153,7 @@ jobs:
       # hold (it returned HTTP 403 on the v0.4.0 tag push). ADR-013's
       # required-context count is mirrored into MIN_CI_JOBS below instead.
       - name: "Assert tagged SHA has green CI history (PF-017)"
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -192,6 +234,10 @@ jobs:
           echo "CI run ${RUN_ID} (event=${RUN_EVENT}): ${RUN_URL}"
           echo "  ${N} job(s), all completed+success (floor: ${MIN_CI_JOBS})"
           echo "CI history OK for ${SHA}"
+      - name: "CI-history check skipped on pull_request (step-level guard — see ADR-013 amendment)"
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "::notice::CI-history gate skipped for pull_request events — only required on tag push and workflow_dispatch dry runs."
 
   # ---------------------------------------------------------------------------
   # A6 — cross-compile the native addon for all 7 targets.
@@ -648,9 +694,73 @@ jobs:
           if-no-files-found: error
 
   # ===========================================================================
-  # Everything below publishes — gated to tag pushes only.
-  # workflow_dispatch (no inputs) stops above; publish jobs see a non-tag ref
-  # and their startsWith(github.ref, 'refs/tags/v') condition evaluates false.
+  # Rehearsal jobs — run on pull_request, workflow_dispatch, AND tag push.
+  # Intentionally unguarded (no if:) so PRs exercise the OIDC exchange before
+  # any irreversible crates.io publish (PF-039: tag-guarded steps unexercised).
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Rehearse the PyPI OIDC exchange + wheel shape without uploading.
+  # Runs on all three triggers. publish-crates blocks on this so a failed
+  # OIDC exchange aborts before the irreversible crates.io write.
+  # ---------------------------------------------------------------------------
+  rehearse-publish-python:
+    name: Rehearse PyPI publish (no upload)
+    needs: [version-gate, stage-and-verify-napi, build-python]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC for PyPI trusted publisher dry-run
+      contents: read
+    steps:
+      - name: Download Python artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: python-dist/
+          merge-multiple: true
+      - name: Rehearse PyPI publish (dry-run — no upload)
+        # IMPORTANT: Do NOT change this pin back to a commit SHA — see the
+        # extended comment in the publish-python step below (PF-040).
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: python-dist/
+          dry-run: true
+
+  # ---------------------------------------------------------------------------
+  # Opt-in TestPyPI leg — only runs on workflow_dispatch with testpypi: true.
+  # Skipped on all PR and standard dispatch runs; its name must appear in
+  # TIER_B_EXPECTED_SKIPPED in scripts/verify-pr-checks.mjs (ADR-013).
+  # publish-testpypi is intentionally NOT in publish-crates needs: — crates.io
+  # ordering is handled by rehearse-publish-python, not this optional leg.
+  # ---------------------------------------------------------------------------
+  publish-testpypi:
+    name: Publish to TestPyPI (rehearsal)
+    needs: [version-gate, stage-and-verify-napi, build-python]
+    if: ${{ inputs.testpypi == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # OIDC for TestPyPI trusted publisher
+      contents: read
+    steps:
+      - name: Download Python artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          path: python-dist/
+          merge-multiple: true
+      - name: Publish to TestPyPI
+        # IMPORTANT: Do NOT change this pin back to a commit SHA — see the
+        # extended comment in the publish-python step below (PF-040).
+        uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: python-dist/
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          attestations: true
+
+  # ===========================================================================
+  # Everything below publishes to live registries — gated to tag pushes only.
+  # Non-tag refs (PRs, dispatch without inputs) stop at the rehearsal jobs.
   # ===========================================================================
 
   # ---------------------------------------------------------------------------
@@ -668,8 +778,11 @@ jobs:
     # on Python here avoids a partial state where crates.io is live but PyPI
     # fails (PF-023; PF-039: build-python runs unguarded so this blocking is
     # exercised by the dispatch dry run).
-    needs: [version-gate, stage-and-verify-napi, build-python]
-    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && needs.build-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    # rehearse-publish-python is listed here so a failed OIDC exchange aborts
+    # before the irreversible crates.io write (if PyPI will fail, we learn before
+    # crates.io is already live at the new version).
+    needs: [version-gate, stage-and-verify-napi, build-python, rehearse-publish-python]
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && needs.build-python.result == 'success' && needs.rehearse-publish-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -903,7 +1016,7 @@ jobs:
           [ "${#sd[@]}"  -eq 1 ] || { echo "::error::expected 1 sdist, found ${#sd[@]}"; exit 1; }
           echo "Python distributions complete: ${#whl[@]} wheels + ${#sd[@]} sdist"
       - name: Publish to PyPI
-        # IMPORTANT: Do NOT change this pin back to a commit SHA.
+        # IMPORTANT: Do NOT change this pin back to a commit SHA (PF-040).
         # pypa/gh-action-pypi-publish is a Docker-based composite action that
         # derives its GHCR image tag from `github.action_ref`. When you pin via
         # `@<sha>`, GitHub Actions sets action_ref to that SHA, and the action
@@ -911,12 +1024,11 @@ jobs:
         # images for tagged releases — not for every commit SHA.
         # The v0.4.1 release used `@a892a5a...`, which is the annotated *tag
         # object* SHA for v1.14.2 (not the commit SHA). No GHCR image exists for
-        # it, so the publish-python job failed with "manifest unknown". The
-        # underlying commit SHA (dc37677b...) does have a GHCR image and could
-        # be used as a SHA pin, but the risk of the same annotated-vs-commit
-        # confusion recurring outweighs the marginal supply-chain benefit here.
-        # Using the version tag is unambiguous: v1.14.2 maps directly to a
-        # published GHCR image (verified via GitHub Packages API, 2026-09-03).
+        # it, so the publish-python job failed with "manifest unknown".
+        # Using the release tag name is unambiguous. The version-gate GHCR probe
+        # verifies the pin resolves before any irreversible publish starts.
+        # When bumping this pin: update PIN_REF in the GHCR probe step above
+        # AND the uses: pin in rehearse-publish-python and publish-testpypi.
         uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           packages-dir: python-dist/
