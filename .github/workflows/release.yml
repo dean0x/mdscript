@@ -730,8 +730,8 @@ jobs:
       contents: read
     env:
       # Single source of truth for the pin under test. Must equal the ref in the
-      # `uses: pypa/gh-action-pypi-publish@<ref>` lines in publish-python and
-      # publish-testpypi — spec S16 pins that equality, because a rehearsal that
+      # two publish steps that invoke pypa/gh-action-pypi-publish (publish-python and
+      # publish-testpypi) — spec S16 pins that equality, because a rehearsal that
       # validates a different ref than the release pulls proves nothing (PF-040).
       PIN_REF: v1.14.2
       PUBLISH_IMAGE: ghcr.io/pypa/gh-action-pypi-publish
@@ -885,6 +885,10 @@ jobs:
               -v "${dir}:/dist:ro" \
               --entrypoint twine "${PUBLISH_IMAGE}:${PIN_REF}" check "$@"
           }
+
+          echo "image twine:"
+          docker run --rm --network none \
+            --entrypoint twine "${PUBLISH_IMAGE}:${PIN_REF}" --version
 
           # Positive control (PF-013): a corrupt wheel must be REJECTED. A green
           # `twine check` over the real distributions says nothing until the

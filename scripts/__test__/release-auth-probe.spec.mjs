@@ -765,6 +765,14 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
       'the GHCR and docker-pull gates must be exercised against a ref that cannot exist, ' +
       'so a probe that returns 200 for everything is caught (PF-013)',
     );
+
+    // Gate 4: the rehearsal must print the twine version from the publish image
+    // so logs capture which twine validated the distributions (plan spec item).
+    assert.ok(
+      section.includes('--version'),
+      'Gate 4: rehearsal must invoke the image twine with --version (--entrypoint twine ' +
+      '... --version) so the log captures which twine version validated the distributions',
+    );
   });
 
   // -------------------------------------------------------------------------
