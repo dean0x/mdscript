@@ -791,6 +791,56 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
   return { ok: true, contexts, resolvedBranch: branch, notes };
 }
 
+/**
+ * Fetch changed-file paths for a PR, paginated (D-PR6).
+ *
+ * Three outcomes:
+ *   - API error  → { ok: 'skip', notice: string }  — degrade gracefully (best-effort)
+ *   - Pagination overflow or count mismatch → { ok: false, exitCode: 2, message: string }
+ *   - Success    → { ok: true, files: string[] }
+ *
+ * @param {number|string} prNumber
+ * @param {number|null} declaredCount — PR's `changed_files` field, or null when absent
+ * @param {function} runner
+ */
+export function fetchChangedFiles(prNumber, declaredCount, runner) {
+  const MAX_FILES_PAGES = 30;
+  const files = [];
+  let page = 1;
+
+  while (page <= MAX_FILES_PAGES) {
+    const url = `/repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100&page=${page}`;
+    const data = runner(['api', url]);
+    if (data.__error) {
+      return { ok: 'skip', notice: `PR files API error (page ${page}): ${data.stderr}` };
+    }
+    const items = Array.isArray(data) ? data : (data.files ?? []);
+    files.push(...items.map(f => f.filename));
+    if (items.length < 100) break;
+    page++;
+  }
+
+  if (page > MAX_FILES_PAGES) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message: `PR files pagination exceeded ${MAX_FILES_PAGES} pages — refusing to evaluate partial release-surface result`,
+    };
+  }
+
+  if (declaredCount !== null && files.length !== declaredCount) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message:
+        `collected ${files.length} changed files but PR declares changed_files=${declaredCount} — ` +
+        `partial file list (D-PR6 non-vacuity, avoids PF-013)`,
+    };
+  }
+
+  return { ok: true, files };
+}
+
 const USAGE =
   'Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>]';
 
@@ -893,53 +943,19 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
   }
 
   // ---- D-PR6: fetch changed files for release-surface presence check ----
-  // Paginated with the same bounded pattern as fetchCheckRuns (D-PR4a).
-  // If the API call fails we degrade gracefully (skip the check) rather than
-  // hard-failing — the changed-files API is best-effort context, not a gate.
-  // Non-vacuity: assert collected count equals PR's changed_files (exit 2 on
-  // shortfall so a partial set is never silently evaluated as complete).
-  const MAX_FILES_PAGES = 30;
+  // API errors degrade gracefully (skip the check); pagination overflow and
+  // count mismatches fail closed (exit 2, non-vacuity — avoids PF-013).
+  const filesResult = fetchChangedFiles(prNumber, prData.changed_files ?? null, runner);
   let changedFiles;
-  {
-    const declaredCount = prData.changed_files ?? null;
-    const collected = [];
-    let filesPage = 1;
-    let filesFailed = false;
-    let filesPagError = null;
-
-    while (filesPage <= MAX_FILES_PAGES) {
-      const filesUrl =
-        `/repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100&page=${filesPage}`;
-      const filesData = runner(['api', filesUrl]);
-      if (filesData.__error) {
-        filesFailed = true;
-        filesPagError = `PR files API error (page ${filesPage}): ${filesData.stderr}`;
-        break;
-      }
-      const page = Array.isArray(filesData) ? filesData : (filesData.files ?? []);
-      collected.push(...page.map(f => f.filename));
-      if (page.length < 100) break;
-      filesPage++;
-    }
-
-    if (!filesFailed && filesPage > MAX_FILES_PAGES) {
-      fail(`PR files pagination exceeded ${MAX_FILES_PAGES} pages — refusing to evaluate partial release-surface result`);
-      return 2;
-    }
-
-    if (filesFailed) {
-      console.log(`  · D-PR6: changed-files API error — release-surface check skipped: ${filesPagError}`);
-      changedFiles = undefined;
-    } else if (declaredCount !== null && collected.length !== declaredCount) {
-      fail(
-        `collected ${collected.length} changed files but PR declares changed_files=${declaredCount} — ` +
-        `partial file list (D-PR6 non-vacuity, avoids PF-013)`,
-      );
-      return 2;
-    } else {
-      changedFiles = collected;
-      console.log(`  changed files: ${collected.length}`);
-    }
+  if (filesResult.ok === false) {
+    fail(filesResult.message);
+    return filesResult.exitCode;
+  } else if (filesResult.ok === 'skip') {
+    console.log(`  · D-PR6: changed-files API error — release-surface check skipped: ${filesResult.notice}`);
+    changedFiles = undefined;
+  } else {
+    changedFiles = filesResult.files;
+    console.log(`  changed files: ${changedFiles.length}`);
   }
 
   // ---- Evaluate (D-PR1: pure function) ----
