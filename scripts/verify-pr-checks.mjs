@@ -151,13 +151,13 @@ export const TIER_B_EXPECTED_SKIPPED = new Set([
 // mis-specified paths filter could pass as a silent no-run (ADR-013 §3).
 //
 // RELEASE_SURFACE must equal the workflow's on.pull_request.paths list
-// exactly. Spec S12 (release-auth-probe.spec.mjs) enforces that constraint.
+// exactly. Spec S10 (release-auth-probe.spec.mjs) compares the two as sets.
 // ---------------------------------------------------------------------------
 
 /**
  * The set of paths that trigger release.yml on pull_request.
  * Must equal the `on.pull_request.paths:` list in .github/workflows/release.yml
- * (enforced by spec S12 in release-auth-probe.spec.mjs).
+ * (enforced as a set equality by spec S10 in release-auth-probe.spec.mjs).
  *
  * Pattern rules: a pattern ending in `/**` matches any file under that prefix;
  * all other patterns are exact file path equality (no glob library needed).
@@ -543,8 +543,16 @@ export function evaluateChecks({
   // When changedFiles is provided and any file matches the release surface,
   // require each RELEASE_SURFACE_CONTEXTS job to be present and success.
   // Absence or non-success is FAIL (Tier A semantics applied to release runs).
-  // When changedFiles is undefined, skip — callers that only have a SHA cannot
-  // enumerate files without an additional API call.
+  //
+  // Duplicate names are resolved the same way Tier A resolves them: EVERY run
+  // carrying the name must be completed+success. Newest-wins would let a green
+  // re-run mask a red sibling from another check-suite — a fail-open in a merge
+  // gate. `filter=latest` already de-duplicates within one suite.
+  //
+  // changedFiles === undefined is the CALLER-path skip: evaluateChecks is an
+  // exported pure function and a caller holding only a SHA cannot enumerate
+  // files. main() never takes this path — fetchChangedFiles fails closed on an
+  // API error rather than degrading to undefined.
   if (changedFiles === undefined) {
     lines.push(
       '  · D-PR6: changedFiles not provided — release-surface presence check skipped ' +
@@ -794,9 +802,14 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
 /**
  * Fetch changed-file paths for a PR, paginated (D-PR6).
  *
- * Three outcomes:
- *   - API error  → { ok: 'skip', notice: string }  — degrade gracefully (best-effort)
- *   - Pagination overflow or count mismatch → { ok: false, exitCode: 2, message: string }
+ * Fails CLOSED on every indeterminate outcome, matching fetchCheckRuns,
+ * fetchStatuses and fetchRequiredContexts: a transient API error must not let a
+ * release-surface PR through without its release check-runs. "Cannot tell" is
+ * exit 2, never a silent skip (applies ADR-009, avoids PF-013).
+ *
+ * Two outcomes:
+ *   - API error, pagination overflow, or count mismatch
+ *                → { ok: false, exitCode: 2, message: string }
  *   - Success    → { ok: true, files: string[] }
  *
  * @param {number|string} prNumber
@@ -812,7 +825,17 @@ export function fetchChangedFiles(prNumber, declaredCount, runner) {
     const url = `/repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100&page=${page}`;
     const data = runner(['api', url]);
     if (data.__error) {
-      return { ok: 'skip', notice: `PR files API error (page ${page}): ${data.stderr}` };
+      // Fail closed. Skipping the release-surface check here would mean a
+      // 500 from the files endpoint silently converts a PR that MUST carry
+      // release check-runs into one that needs none — a fail-open in a merge
+      // gate, which is the whole defect class this tool exists to remove.
+      return {
+        ok: false,
+        exitCode: 2,
+        message:
+          `PR files API error (page ${page}): ${data.stderr} — cannot determine whether ` +
+          `this PR touches the release surface, and "cannot tell" is not a pass (D-PR6)`,
+      };
     }
     const items = Array.isArray(data) ? data : (data.files ?? []);
     files.push(...items.map(f => f.filename));
@@ -943,20 +966,16 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
   }
 
   // ---- D-PR6: fetch changed files for release-surface presence check ----
-  // API errors degrade gracefully (skip the check); pagination overflow and
-  // count mismatches fail closed (exit 2, non-vacuity — avoids PF-013).
+  // Fails closed on every indeterminate outcome (API error, pagination
+  // overflow, count mismatch), exactly like the three fetches above: the live
+  // path always knows the file list or exits 2 (avoids PF-013).
   const filesResult = fetchChangedFiles(prNumber, prData.changed_files ?? null, runner);
-  let changedFiles;
-  if (filesResult.ok === false) {
+  if (!filesResult.ok) {
     fail(filesResult.message);
     return filesResult.exitCode;
-  } else if (filesResult.ok === 'skip') {
-    console.log(`  · D-PR6: changed-files API error — release-surface check skipped: ${filesResult.notice}`);
-    changedFiles = undefined;
-  } else {
-    changedFiles = filesResult.files;
-    console.log(`  changed files: ${changedFiles.length}`);
   }
+  const changedFiles = filesResult.files;
+  console.log(`  changed files: ${changedFiles.length}`);
 
   // ---- Evaluate (D-PR1: pure function) ----
   const result = evaluateChecks({

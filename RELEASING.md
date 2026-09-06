@@ -57,7 +57,9 @@ These are **not** automated and must be done before the first release:
    record causes version-gate to fail, aborting the release before any crates.io or
    npm publish runs. The minted token expires unused — the probe is free and safe.
    This step is NOT tag-guarded so it runs in the `workflow_dispatch` dry run too,
-   exercising the PyPI trust chain before the real tag push (PF-039).
+   exercising the PyPI trust chain before the real tag push (PF-039). It is
+   skipped on `pull_request` events, which receive no `id-token` on forks and
+   cannot reach a publish in any case.
 
 6. **Configure TestPyPI trusted publisher** (optional, needed for `testpypi: true`
    dispatch runs) at [test.pypi.org/manage/account/publishing](https://test.pypi.org/manage/account/publishing/):
@@ -138,18 +140,23 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # Python wheel matrix, stages packages,
                                      # runs the A3 name<->loader gate and the
                                      # Python readelf linkage gate, uploads
-                                     # artifacts. Rehearses the PyPI OIDC
-                                     # exchange. Publishes NOTHING.
+                                     # artifacts. Rehearses the publish-python
+                                     # step. Publishes NOTHING.
 ```
 
 The dry-run workflow runs `version-gate` in full, which now includes the
 **credential probe** (security-08): it calls `npm whoami` against the live
 registry to verify the `NPM_TOKEN` is valid, guards `CARGO_REGISTRY_TOKEN`
-for non-empty, probes the PyPI trusted publisher via the OIDC mint-token
-exchange, and probes the GHCR manifest for the `pypa/gh-action-pypi-publish`
-pin (PF-040). A revoked token, absent secret, misconfigured trusted publisher,
-or broken action pin therefore fails the dry run — all before any irreversible
-crates.io release.
+for non-empty, and probes the PyPI trusted publisher via the OIDC mint-token
+exchange. A revoked token, absent secret, or misconfigured trusted publisher
+therefore fails the dry run — all before any irreversible crates.io release.
+
+Both probes are **skipped on `pull_request` events** (step-level, so
+`version-gate` itself still runs and succeeds — ADR-013 amendment). Fork and
+Dependabot PRs receive no repository secrets and no `id-token: write`, so the
+probes cannot pass there, and no PR run can reach a registry write. They run
+and fail closed on tag push and `workflow_dispatch`, which are the only events
+that publish.
 
 **Note:** `npm whoami` verifies authentication, not publish rights to the
 `@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
@@ -159,16 +166,40 @@ The dry run also exercises the **CI-history gate** (PF-017), asserting a
 completed+success `CI` run for the dispatched ref's HEAD. Dispatch it only after
 that ref's CI has finished, or the gate fails closed on a still-running run.
 
-The dry run also runs the new **`rehearse-publish-python` job** — a `dry-run: true`
-publish that exercises the OIDC exchange end-to-end without uploading any wheels.
-A misconfigured or expired trusted publisher fails here, before `publish-crates`
-starts (PF-039: the rehearsal job is intentionally unguarded so it runs on dispatch
-and PRs, not just tag pushes).
+The dry run also runs the **`rehearse-publish-python` job**, which rehearses
+everything about `publish-python` except the one irreversible act. It runs four
+gates, each with a positive control (PF-013 — a gate never observed rejecting
+anything is not evidence):
+
+1. **Pin shape** — the `pypa/gh-action-pypi-publish` pin must be a `vX.Y.Z`
+   release tag. Control: the v0.4.1 annotated-tag-object SHA must be rejected.
+2. **GHCR manifest** — GHCR must hold an image for that exact ref. Control: a ref
+   that cannot exist must not return HTTP 200.
+3. **`docker pull`** — the image the runner actually fetches must pull. Control:
+   pulling the impossible ref must fail. ("The ref resolves in git" is necessary
+   and never sufficient — PF-040.)
+4. **`twine check`** — twine runs out of that image with `--network none` and
+   `--entrypoint twine`, so the step physically cannot reach pypi.org. Control:
+   a deliberately corrupt wheel must be rejected.
+
+> The job **must never** `uses: pypa/gh-action-pypi-publish`. The action has no
+> dry-run/no-upload mode: an unrecognised `dry-run:` input is warned about and
+> ignored, and the action then uploads for real. A `dry-run: true` rehearsal
+> shipped briefly and attempted a live pypi.org upload from a pull request
+> (run 34060146952); it failed only because that version was already published.
+> Spec S14 in `scripts/__test__/release-auth-probe.spec.mjs` now pins the
+> invocation to `publish-python` and `publish-testpypi` only, and the rehearsal
+> is denied `id-token` so it holds no credential to upload with.
+
+`publish-crates` needs this job, so a broken pin aborts the release before the
+irreversible crates.io write. It is intentionally unguarded, so it runs on
+`pull_request` and `workflow_dispatch`, not just tag pushes (PF-039).
 
 Five jobs are expected-skipped on a standard `workflow_dispatch` dry run and
 are listed in `TIER_B_EXPECTED_SKIPPED` in `scripts/verify-pr-checks.mjs`:
 `Publish to crates.io`, `Publish to npm`, `Publish to PyPI`, `GitHub Release`,
-and `Publish to TestPyPI (rehearsal)`.
+and `Publish to TestPyPI (rehearsal)`. The same five are skipped on a
+release-surface PR run.
 
 Confirm the **A3 name-gate** step (`scripts/verify-napi-names.mjs`) passes in that
 run. **This is a hard checkpoint** — if the generated platform package names or
@@ -176,15 +207,26 @@ their `.node` filenames drift from the hand-written `crates/mds-napi/index.js`
 loader, the published universal package will fail to load the native binary at
 runtime on the affected platform. Do not proceed past a failing gate.
 
-### PyPI publish rehearsal
+### Release-surface PRs
 
-Release-surface PRs (those touching `.github/workflows/release.yml`,
+Release-surface PRs — those touching `.github/workflows/release.yml`,
 `.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`, or
-`scripts/verify-napi-names.mjs`) also trigger the workflow via the
-`pull_request` event. On such PRs, `verify-pr-checks.mjs` requires three
-additional check-runs: `Version gate`, `Stage + verify platform packages`, and
-`Rehearse PyPI publish (no upload)`. All other publish jobs are skipped and
-their skipped conclusions are tolerated by the verifier.
+`scripts/verify-napi-names.mjs` — also trigger the workflow via the
+`pull_request` event, so a Dependabot bump to an action reachable only from a
+tag-guarded job is exercised on the PR instead of first running on a tag push
+after crates.io has published (PF-039).
+
+On such PRs, `verify-pr-checks.mjs` requires three additional check-runs:
+`Version gate`, `Stage + verify platform packages`, and `Rehearse PyPI publish
+(no upload)`. All other publish jobs are skipped, and their skipped conclusions
+are tolerated by the verifier.
+
+That path list lives in **two** places that must stay identical: the
+`on.pull_request.paths` filter in `release.yml` and `RELEASE_SURFACE` in
+`scripts/verify-pr-checks.mjs`. Spec S10 compares them as sets — a filter the
+verifier does not know about would let a release-surface PR pass as a silent
+no-run (ADR-013 amendment). The verifier also fails closed (exit 2) if it
+cannot enumerate the PR's changed files at all.
 
 ## Release
 
@@ -222,17 +264,18 @@ The release is driven by pushing a `vX.Y.Z` tag. This is how all versions have s
 ### What happens after tagging
 
 The `release.yml` workflow runs, in order:
-   1. **version-gate** — synchronized-version check, credential probe, GHCR pin
-      probe, PyPI OIDC probe, and CI-history gate (fails fast).
+   1. **version-gate** — synchronized-version check, credential probe, PyPI OIDC
+      probe, source-hygiene gate, and CI-history gate (fails fast).
    2. **build-napi** (parallel with build-python) — cross-compiles the addon for
       all 7 targets.
    3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
       for 7 platforms + sdist, runs the readelf linkage gate on Linux legs.
    4. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
       LICENSE into each platform dir, runs the **A3 name-gate**.
-   5. **rehearse-publish-python** — `dry-run: true` publish to PyPI; exercises the
-      OIDC exchange end-to-end without uploading any wheels. publish-crates blocks
-      on this so a broken trusted publisher aborts before crates.io (irreversible).
+   5. **rehearse-publish-python** — pin shape, GHCR manifest, `docker pull` and
+      `twine check` (each with a positive control); uploads nothing and holds no
+      OIDC token. publish-crates blocks on this so a broken action pin aborts
+      before crates.io (irreversible).
    6. **publish-crates** — blocked until `stage-and-verify-napi`, `build-python`,
       AND `rehearse-publish-python` succeed. `cargo publish` `mds-core`, polls the
       crates.io index for up to 5 min (bounded, max 20 × 15 s), then `mds-cli`.
@@ -241,6 +284,9 @@ The `release.yml` workflow runs, in order:
       trusted publishing + PEP 740 attestations, `skip-existing: true`).
    8. **github-release** — `gh release create` with generated notes; runs only
       after all three publish jobs succeed.
+
+   `publish-testpypi` never runs on a tag: it is guarded by `inputs.testpypi`,
+   which only a `workflow_dispatch` can set. On a tag push it reports `skipped`.
 
 ## Post-release
 

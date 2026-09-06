@@ -1724,10 +1724,13 @@ describe('D-PR6: release-surface presence check', () => {
       'crates/mds-core/** must NOT match (not in RELEASE_SURFACE)');
   });
 
-  test('D-PR6g: changedFiles undefined → exit 0 with skip notice (changedFiles is optional)', () => {
-    // When main() cannot fetch the changed-files list (API error), it passes
-    // changedFiles=undefined. evaluateChecks must skip the D-PR6 check and
-    // include a notice so the operator knows the check was skipped.
+  test('D-PR6g: changedFiles undefined → exit 0 with skip notice (caller-path only, never an API failure)', () => {
+    // evaluateChecks is an exported pure function; a caller holding only a SHA
+    // cannot enumerate changed files, so `undefined` skips the check with a
+    // notice. main() NEVER reaches this path: fetchChangedFiles fails closed on
+    // an API error (see D-PR6h) rather than degrading to undefined, because a
+    // transient 500 must not turn a release-surface PR into one that needs no
+    // release check-runs (fail-open in a merge gate).
     const checkRuns = passingRunsWith([]);
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
@@ -1743,6 +1746,134 @@ describe('D-PR6: release-surface presence check', () => {
       allLines.includes('changedFiles not provided'),
       `must include a skip notice; got:\n${allLines}`,
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // D-PR6h: the live path must FAIL CLOSED when the files endpoint errors.
+  //
+  // This is the fail-open that would otherwise sit under D-PR6: a 500 from
+  // /pulls/N/files would let a PR that touches release.yml pass the verifier
+  // without a single release check-run. Indeterminate is exit 2 — the same
+  // contract fetchCheckRuns, fetchStatuses and fetchRequiredContexts hold.
+  // -------------------------------------------------------------------------
+  test('D-PR6h: PR-files API error → exit 2 (fail closed, never a silent skip)', () => {
+    // Route the files URL to an error BEFORE the generic /pulls/ route, which
+    // would otherwise answer it with PR metadata.
+    const runner = stubRunner([
+      ['/files', { __error: true, httpStatus: 500, stderr: 'server error' }],
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(
+      main(['1'], runner, OK_GH_VERSION), 2,
+      'a files-endpoint error is indeterminate: it must exit 2, not skip the ' +
+      'release-surface check and report PASS',
+    );
+  });
+
+  test('D-PR6h: changed_files count mismatch → exit 2 (partial file list)', () => {
+    // The PR declares 3 changed files but the endpoint returns 1. Evaluating
+    // the release-surface question on a partial list could miss the one file
+    // that touches the surface (non-vacuity, avoids PF-013).
+    const runner = stubRunner([
+      ['/files', [{ filename: 'README.md' }]],
+      ['/pulls/', { ...PR_OK, changed_files: 3 }],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2,
+      'a partial changed-files list must exit 2');
+  });
+
+  test('D-PR6h: live path requires the release runs when the files endpoint reports a surface file', () => {
+    // End-to-end through main(): the files endpoint (not a hand-built
+    // changedFiles array) drives the presence check. Without the release
+    // check-runs this PR must FAIL — proving fetchChangedFiles is wired into
+    // evaluateChecks and that D-PR6a-f are not testing a disconnected function.
+    const runner = stubRunner([
+      ['/files', [{ filename: 'crates/mds-napi/src/lib.rs' }]],
+      ['/pulls/', { ...PR_OK, changed_files: 1 }],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 1,
+      'a release-surface file with no release check-runs must exit 1');
+  });
+
+  test('D-PR6h: live path passes when the release runs are present for a surface file', () => {
+    // The complement of the case above: same PR, plus the three release runs.
+    // Without this pair, exit 1 could be coming from anywhere.
+    const withRelease = {
+      ...CHECKS_OK_WITH_HYGIENE,
+      check_runs: [
+        ...CHECKS_OK_WITH_HYGIENE.check_runs,
+        ...RELEASE_SURFACE_CONTEXTS.map(name => ({
+          name, status: 'completed', conclusion: 'success',
+        })),
+      ],
+      total_count: CHECKS_OK_WITH_HYGIENE.total_count + RELEASE_SURFACE_CONTEXTS.length,
+    };
+    const runner = stubRunner([
+      ['/files', [{ filename: 'crates/mds-napi/src/lib.rs' }]],
+      ['/pulls/', { ...PR_OK, changed_files: 1 }],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', withRelease],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
+      'a release-surface file WITH all release check-runs must exit 0');
+  });
+
+  // -------------------------------------------------------------------------
+  // D-PR6j: duplicate names resolve ALL-MUST-PASS, not newest-wins.
+  //
+  // Same contract as Tier A (see the checksByName comment in the production
+  // file): `filter=latest` de-duplicates within one check-suite, but two suites
+  // can publish the same name, so keeping only the last entry would let a green
+  // re-run mask a red sibling — a fail-open in a merge gate.
+  // -------------------------------------------------------------------------
+  test('D-PR6j: a failed and a succeeded run sharing a release-surface name → exit 1 (all must pass)', () => {
+    const checkRuns = passingRunsWith([
+      ...releaseSuccessRuns(),
+      // A second run under a name that already has a success above.
+      { name: 'Version gate', status: 'completed', conclusion: 'failure' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 1,
+      'a later success must not mask an earlier failure under the same name; must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Version gate') && allLines.includes('failure'),
+      `must name the failing run and its conclusion; got:\n${allLines}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-PR6i: matchesReleaseSurface prefix and exact-match boundaries.
+  // A `dir/**` pattern must not match a sibling whose name merely starts with
+  // the directory name, and an exact pattern must not prefix-match.
+  // -------------------------------------------------------------------------
+  test('D-PR6i: "/**" requires a trailing slash and exact patterns do not prefix-match', () => {
+    assert.ok(!matchesReleaseSurface('.github/actions-foo/x.yml'),
+      '.github/actions/** must not match the sibling directory .github/actions-foo/');
+    assert.ok(!matchesReleaseSurface('crates/mds-napi-extra/src/lib.rs'),
+      'crates/mds-napi/** must not match crates/mds-napi-extra/');
+    assert.ok(!matchesReleaseSurface('scripts/verify-napi-names.mjs.bak'),
+      'an exact pattern must not prefix-match scripts/verify-napi-names.mjs.bak');
+    assert.ok(!matchesReleaseSurface('.github/workflows/release.yml.orig'),
+      'an exact pattern must not prefix-match .github/workflows/release.yml.orig');
+    // The directory itself, with no file under it, is not a changed file path
+    // GitHub ever reports — but the prefix rule must still be strict about it.
+    assert.ok(!matchesReleaseSurface('.github/actions'),
+      '.github/actions/** must not match the bare directory name');
   });
 
 });
