@@ -58,8 +58,9 @@ These are **not** automated and must be done before the first release:
    npm publish runs. The minted token expires unused — the probe is free and safe.
    This step is NOT tag-guarded so it runs in the `workflow_dispatch` dry run too,
    exercising the PyPI trust chain before the real tag push (PF-039). It is
-   skipped on `pull_request` events, which receive no `id-token` on forks and
-   cannot reach a publish in any case.
+   run on `pull_request` events too — the version-gate step fails closed on
+   fork and Dependabot PRs (they receive no `id-token: write` and no
+   repository secrets), and no PR run can reach a publish in any case.
 
 6. **Configure TestPyPI trusted publisher** (optional, needed for `testpypi: true`
    dispatch runs) at [test.pypi.org/manage/account/publishing](https://test.pypi.org/manage/account/publishing/):
@@ -73,6 +74,11 @@ These are **not** automated and must be done before the first release:
    `TIER_B_EXPECTED_SKIPPED` lists its name so the pre-merge verifier tolerates the
    skipped conclusion. The trusted publisher for TestPyPI is independent of the PyPI
    one — both must be configured separately.
+
+   **Publisher expiry:** a PyPI pending publisher auto-expires ~30 days after
+   creation unless an upload lands. For TestPyPI, the first `workflow_dispatch`
+   run with `testpypi: true` is what locks the name — it is the first upload.
+   Re-create the publisher if it has expired before that first dispatch.
 
 ## Pre-flight (before tagging)
 
@@ -151,12 +157,12 @@ for non-empty, and probes the PyPI trusted publisher via the OIDC mint-token
 exchange. A revoked token, absent secret, or misconfigured trusted publisher
 therefore fails the dry run — all before any irreversible crates.io release.
 
-Both probes are **skipped on `pull_request` events** (step-level, so
-`version-gate` itself still runs and succeeds — ADR-013 amendment). Fork and
-Dependabot PRs receive no repository secrets and no `id-token: write`, so the
-probes cannot pass there, and no PR run can reach a registry write. They run
-and fail closed on tag push and `workflow_dispatch`, which are the only events
-that publish.
+Both probes **run on every event, including `pull_request`**. On fork and
+Dependabot PRs — which receive no repository secrets and no `id-token:
+write` — the probes fail closed with an actionable error: maintainers must
+supersede with a first-party branch PR or dispatch `gh workflow run
+release.yml --ref <branch>`. No PR run can reach a publish in any case,
+so the fail-closed behaviour is informational, not a merge blocker by itself.
 
 **Note:** `npm whoami` verifies authentication, not publish rights to the
 `@mdscript` scope. A read-only or wrongly-scoped token passes the probe but

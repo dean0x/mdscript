@@ -5,6 +5,14 @@ name: Release
 #   * pull_request touching release-surface paths -> rehearse only, no publish
 #   * workflow_dispatch -> dry run (build + verify, no publish)
 #     testpypi: true   -> same + publish to TestPyPI (opt-in leg)
+#
+# The `paths:` list IS the release surface. Publish jobs stay dark on PRs
+# (refs/pull/N/merge fails the refs/tags/v tag guard -> skipped, tolerated by
+# scripts/verify-pr-checks.mjs for exactly the five enumerated job names in
+# TIER_B_EXPECTED_SKIPPED). crates/mds-core/**, Cargo.toml, and package.json
+# are excluded on purpose: they change on most PRs and ci.yml already covers
+# them; a dependency sweep that does not touch the five paths below still needs
+# the manual workflow_dispatch dry-run.
 on:
   push:
     tags:
@@ -55,28 +63,26 @@ jobs:
           ref: ${{ github.ref }}
       - uses: actions/setup-node@v7
         with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
-      # Skipped on pull_request (step-level, not job-level — ADR-013 amendment
-      # 2026-09-06: a job present on a PR head must reach conclusion=success or
-      # the mandatory pre-merge verifier hard-fails the very PR that changes the
-      # release surface, and the operator's next move is to bypass the verifier,
-      # which is the PF-017 shape). Fork and Dependabot pull_request events
-      # receive NO repository secrets and no id-token: write, so these probes
-      # CANNOT pass there — and a Dependabot bump to a publish-python action is
-      # precisely the PR class #350 exists to catch (PF-039 amendment
-      # 2026-09-05). Skipping loses nothing: no pull_request run can reach a
-      # registry write. The probes still run, and still fail closed, on tag push
-      # and workflow_dispatch — the only events that publish.
       - name: "Verify publish credentials before irreversible steps (security-08)"
-        if: github.event_name != 'pull_request'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
         run: |
+          # Fail closed on fork and Dependabot pull_request events: these receive
+          # no repository secrets and no id-token: write (read-only GITHUB_TOKEN),
+          # so the credential probes cannot succeed there. A maintainer-authored PR
+          # or a manual `gh workflow run release.yml --ref <branch>` is the remedy.
+          if [ -z "$NODE_AUTH_TOKEN" ] && [ "${GITHUB_EVENT_NAME}" = "pull_request" ] \
+             && { [ "${GITHUB_ACTOR}" = "dependabot[bot]" ] || [ "${IS_FORK}" = "true" ]; }; then
+            echo "::error::No Actions secrets on this run: pull_request runs from Dependabot or a fork are treated as fork PRs (read-only token, no Actions secrets, no id-token: write), so the release credentials cannot be verified here. Do NOT merge on these checks. Supersede with a maintainer-authored PR, or run: gh workflow run release.yml --ref ${GITHUB_HEAD_REF}"
+            exit 1
+          fi
           # Guard: npm token must be non-empty. A missing or revoked secret interpolates
           # to an empty string in GitHub Actions — not an error — so this must be checked
           # explicitly before cargo publish runs and makes crates.io publish irreversible.
           if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. NOTE: Dependabot and fork pull_request events do not receive repository secrets; only first-party branch PRs do. (security-08)"
+            echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. (security-08)"
             exit 1
           fi
           # Guard: cargo token must be non-empty. A missing token fails before the
@@ -99,11 +105,7 @@ jobs:
       # NOT tag-guarded: this step must run in the workflow_dispatch dry run
       # (PF-039) so a misconfigured or expired trusted publisher is caught BEFORE
       # any irreversible crates.io publish. version-gate has id-token: write above.
-      # Skipped on pull_request for the same reason as the credential probe: a
-      # fork PR's GITHUB_TOKEN is read-only regardless of the permissions block,
-      # so ACTIONS_ID_TOKEN_REQUEST_URL is unset and the step cannot succeed.
       - name: "Verify PyPI trusted publisher before irreversible steps (security-08)"
-        if: github.event_name != 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
@@ -117,10 +119,6 @@ jobs:
             echo "::error::PyPI OIDC mint failed (HTTP $CODE) — trusted publisher missing, expired, or mismatched. Fix BEFORE tagging; crates.io is irreversible."
             jq -r '.message // .' /tmp/mint.json; exit 1; }
           echo "PyPI trusted publisher OK"
-      - name: "Credential + OIDC probes skipped on pull_request (step-level guard — ADR-013 amendment)"
-        if: github.event_name == 'pull_request'
-        run: |
-          echo "::notice::Credential and PyPI OIDC probes skipped for pull_request events — fork and Dependabot PRs receive no repository secrets and no id-token, and no PR run can reach a registry write. Both probes run and fail closed on tag push and workflow_dispatch."
       # The pypa/gh-action-pypi-publish pin is validated in rehearse-publish-python
       # (pin shape, GHCR manifest, docker pull, twine check — each with a positive
       # control). publish-crates needs that job, so a bad pin still aborts the
@@ -138,15 +136,11 @@ jobs:
       - name: "Run positive-control and class-completeness suite"
         run: npm run test:gates
       # reliability-12: assert the SHA being released went green in CI before
-      # any irreversible publish starts. Runs on tag push and workflow_dispatch
-      # (dry run) - a tag push verifies the tagged commit, a dispatch verifies
-      # the dispatched ref's HEAD. Skipped on pull_request events: a PR's merge
-      # commit may not have a ci.yml run yet, and PRs exercise the rehearsal
-      # jobs rather than the full publish sequence. Step-level if: (not
-      # job-level) keeps version-gate itself running (and succeeding) on PRs so
-      # Tier-B verifier sees a success, not a skipped result (ADR-013 amendment
-      # 2026-09-06). Cancelled, failed, in-progress and absent runs all fail
-      # closed on tag/dispatch (PF-017; PF-013: absence is not success).
+      # any irreversible publish starts. Runs on BOTH triggers - a tag push
+      # verifies the tagged commit, a workflow_dispatch dry run verifies the
+      # dispatched ref's HEAD - so the dry run now exercises this gate instead
+      # of skipping it. Cancelled, failed, in-progress and absent runs all fail
+      # closed (PF-017; PF-013: absence is not success).
       # Cannot reuse scripts/verify-pr-checks.mjs here - that script requires a
       # PR number, and tag pushes reference a commit, not a PR.
       # Branch protection is NOT read: /branches/main/protection needs
@@ -725,7 +719,8 @@ jobs:
   # ---------------------------------------------------------------------------
   rehearse-publish-python:
     name: Rehearse PyPI publish (no upload)
-    needs: [version-gate, stage-and-verify-napi, build-python]
+    needs: [build-python]
+    if: ${{ !cancelled() && needs.build-python.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       # Deliberately NO OIDC write permission here. A job that cannot mint a
@@ -772,18 +767,21 @@ jobs:
           # crates.io and 15 npm packages had published irreversibly.
           is_release_tag() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
 
-          # Positive control first (PF-013): the v0.4.1 pin must be REJECTED, or
-          # this gate is a no-op that would accept the exact value that broke a
-          # release. a892a5a6 is the annotated tag OBJECT of v1.14.2.
-          BAD_PIN=a892a5a61159132606e93a2fa6f4358831b04d26
-          if is_release_tag "${BAD_PIN}"; then
-            echo "::error::positive control FAILED — the pin-shape gate accepted the v0.4.1 annotated-tag-object SHA ${BAD_PIN}. The gate is broken, not the pin (PF-013)."
-            exit 1
-          fi
-          echo "positive control OK: ${BAD_PIN} rejected by the pin-shape gate"
+          # Positive control first (PF-013): BOTH known-bad pins must be REJECTED.
+          # a892a5a6 is the annotated tag OBJECT of v1.14.2 (the v0.4.1 break).
+          # dc37677b is the COMMIT sha of v1.14.2 — a real, image-backed commit
+          # sha — the shape check must reject it too (the gate enforces policy,
+          # not existence: a commit sha may have an image but is ambiguous by eye).
+          for BAD_PIN in a892a5a61159132606e93a2fa6f4358831b04d26 dc37677b2e1c63e2034f94d8a5b11f265b73ba33; do
+            if is_release_tag "${BAD_PIN}"; then
+              echo "::error::positive control FAILED — the pin-shape gate accepted the SHA ${BAD_PIN}. The gate is broken, not the pin (PF-013)."
+              exit 1
+            fi
+            echo "positive control OK: ${BAD_PIN} rejected by the pin-shape gate"
+          done
 
           if ! is_release_tag "${PIN_REF}"; then
-            echo "::error::pypa/gh-action-pypi-publish pin '${PIN_REF}' is not a vX.Y.Z release tag. GHCR publishes images for release tags only, so a SHA pin cannot resolve to an image under any circumstance (PF-040)."
+            echo "::error::pypa/gh-action-pypi-publish is pinned to '${PIN_REF}', which is not a vX.Y.Z release tag. The action resolves github.action_ref into a GHCR image tag; GHCR has images for release tags and for commit shas on upstream release/* branches but NEVER for an annotated tag object, and a 40-hex pin is indistinguishable by eye between those two. Tag-pin it (PF-040)."
             exit 1
           fi
           echo "pin shape OK: ${PIN_REF}"
@@ -796,10 +794,10 @@ jobs:
           # GHCR the same question the runner will ask at publish time — the
           # only question that matters. "The ref resolves in git" is necessary
           # and never sufficient (PF-040).
-          TOKEN=$(curl -sS --fail --max-time 30 \
-            'https://ghcr.io/token?scope=repository:pypa/gh-action-pypi-publish:pull' \
-            | jq -r '.token')
-          [ -n "${TOKEN}" ] && [ "${TOKEN}" != "null" ] \
+          TOKEN=$(curl -sS --max-time 30 --retry 3 --retry-delay 5 \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:pypa/gh-action-pypi-publish:pull" \
+            | jq -r '.token // empty')
+          [ -n "${TOKEN}" ] \
             || { echo "::error::could not obtain an anonymous GHCR pull token"; exit 1; }
 
           # No --fail here: a 404 is a RESULT to report, not a curl error to
@@ -810,45 +808,67 @@ jobs:
           # manifest served as the wrong type would answer 404 for an image that
           # exists — a false failure in a release gate.
           ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
-          manifest_status() {
-            curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+          manifest_fetch() {
+            curl -sS -o /tmp/ghcr-body.json -w '%{http_code}' --max-time 30 \
               -H "Authorization: Bearer ${TOKEN}" \
               -H "Accept: ${ACCEPT}" \
               "https://ghcr.io/v2/pypa/gh-action-pypi-publish/manifests/$1"
           }
 
-          # Positive control (PF-013): a ref that cannot exist must NOT be 200.
-          CONTROL=$(manifest_status "${BOGUS_REF}")
-          if [ "${CONTROL}" = "200" ]; then
-            echo "::error::positive control FAILED — GHCR returned 200 for the bogus ref ${BOGUS_REF}. This probe cannot tell a present image from an absent one (PF-013)."
+          # Positive control (PF-013): the control ref must return 404 AND the
+          # body must contain MANIFEST_UNKNOWN. If either condition fails, the
+          # probe cannot detect a missing image and every result is indeterminate.
+          CTRL_CODE=$(manifest_fetch "${BOGUS_REF}-positive-control-does-not-exist")
+          if [ "${CTRL_CODE}" != "404" ] || ! grep -qiF 'MANIFEST_UNKNOWN' /tmp/ghcr-body.json; then
+            echo "::error::GHCR probe cannot detect a missing image (control returned HTTP ${CTRL_CODE}); every result from this step is indeterminate, not a pass (PF-013)."
+            cat /tmp/ghcr-body.json
             exit 1
           fi
-          echo "positive control OK: ${BOGUS_REF} → HTTP ${CONTROL} (not 200)"
+          echo "Positive control OK: missing manifests are detected."
 
-          STATUS=$(manifest_status "${PIN_REF}")
+          STATUS=$(manifest_fetch "${PIN_REF}")
           if [ "${STATUS}" != "200" ]; then
-            echo "::error::GHCR has no image for ${PUBLISH_IMAGE}:${PIN_REF} (HTTP ${STATUS}). publish-python would fail with 'manifest unknown' AFTER crates.io and npm have published irreversibly (PF-040). Update PIN_REF and the uses: pins in publish-python and publish-testpypi together."
+            echo "::error::GHCR has no image for ${PUBLISH_IMAGE}:${PIN_REF} (HTTP ${STATUS}). publish-python would fail with 'manifest unknown' AFTER crates.io and npm published irreversibly — the v0.4.1 failure (#350, PF-040). Update PIN_REF and the uses: pins in publish-python and publish-testpypi together."
+            cat /tmp/ghcr-body.json
             exit 1
           fi
+          echo "GHCR manifest present for ghcr.io/pypa/gh-action-pypi-publish:${PIN_REF}"
           echo "GHCR manifest OK: ${PUBLISH_IMAGE}:${PIN_REF} → HTTP ${STATUS}"
       - name: "Gate 3/4: docker pull the image the publish step will run (PF-040)"
         shell: bash
         run: |
           set -euo pipefail
+          IMAGE="${PUBLISH_IMAGE}:${PIN_REF}"
           # Positive control (PF-013): pulling a ref that cannot exist must fail.
-          if docker pull --quiet "${PUBLISH_IMAGE}:${BOGUS_REF}" >/dev/null 2>&1; then
-            echo "::error::positive control FAILED — docker pull succeeded for the bogus ref ${BOGUS_REF}. The pull gate proves nothing (PF-013)."
+          CTRL_LOG=$(docker pull "${PUBLISH_IMAGE}:${BOGUS_REF}" 2>&1) || true
+          if echo "${CTRL_LOG}" | grep -qiE 'manifest unknown|not found|denied|unauthorized'; then
+            echo "Positive control OK: docker pull rejects a missing tag."
+          else
+            echo "::error::control pull failed for an unexpected reason (not a registry miss) - indeterminate, not a pass."
+            echo "${CTRL_LOG}"
             exit 1
           fi
-          echo "positive control OK: docker pull ${PUBLISH_IMAGE}:${BOGUS_REF} failed as expected"
 
-          docker pull --quiet "${PUBLISH_IMAGE}:${PIN_REF}"
-          # Go template, not a GitHub expression: Actions only interpolates ${{ }},
-          # so a bare {{ }} passes through untouched. `json` rather than
-          # `index .RepoDigests 0` because index on an empty slice is a template
-          # error, and a diagnostic print must not be able to fail the gate.
-          docker image inspect "${PUBLISH_IMAGE}:${PIN_REF}" \
-            --format 'pulled digests: {{json .RepoDigests}}'
+          # Pull the real image with up to 3 attempts (transient registry blips).
+          PULLED=0
+          for i in 1 2 3; do
+            if timeout 300 docker pull --quiet "${IMAGE}"; then
+              PULLED=1
+              break
+            fi
+            echo "::notice::docker pull attempt ${i}/3 failed for ${IMAGE}; retrying in 10 s..."
+            sleep 10
+          done
+          [ "${PULLED}" -eq 1 ] || {
+            echo "::error::docker pull failed for ${IMAGE} after 3 attempts"
+            exit 1
+          }
+          # Go template braces, not an Actions expression: Actions only interpolates
+          # dollar-double-brace sequences, so {{json .RepoDigests}} is passed to
+          # docker untouched. `json` rather than `index .RepoDigests 0` because
+          # index on an empty slice is a template error, and a diagnostic print
+          # must not be able to fail the gate.
+          docker image inspect "${IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
       - name: "Gate 4/4: twine check the distributions (no upload, no network)"
         shell: bash
         run: |
@@ -895,8 +915,8 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-testpypi:
     name: Publish to TestPyPI (rehearsal)
-    needs: [version-gate, stage-and-verify-napi, build-python]
-    if: ${{ inputs.testpypi == true }}
+    needs: [build-python, rehearse-publish-python]
+    if: ${{ !cancelled() && needs.build-python.result == 'success' && needs.rehearse-publish-python.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.testpypi == true }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # OIDC for TestPyPI trusted publisher
@@ -908,6 +928,16 @@ jobs:
           pattern: python-*
           path: python-dist/
           merge-multiple: true
+      - name: Assert all 8 Python distributions are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ls -la python-dist/
+          whl=(python-dist/*.whl); sd=(python-dist/*.tar.gz)
+          [ "${#whl[@]}" -eq 7 ] || { echo "::error::expected 7 wheels, found ${#whl[@]}"; exit 1; }
+          [ "${#sd[@]}"  -eq 1 ] || { echo "::error::expected 1 sdist, found ${#sd[@]}"; exit 1; }
+          echo "Python distributions complete: ${#whl[@]} wheels + ${#sd[@]} sdist"
       - name: Publish to TestPyPI
         # IMPORTANT: Do NOT change this pin back to a commit SHA — see the
         # extended comment in the publish-python step below (PF-040).
@@ -1147,8 +1177,8 @@ jobs:
   # ---------------------------------------------------------------------------
   publish-python:
     name: Publish to PyPI
-    needs: [build-python, publish-crates, publish-npm]
-    if: ${{ !cancelled() && needs.build-python.result == 'success' && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    needs: [build-python, rehearse-publish-python, publish-crates, publish-npm]
+    if: ${{ !cancelled() && needs.build-python.result == 'success' && needs.rehearse-publish-python.result == 'success' && needs.publish-crates.result == 'success' && needs.publish-npm.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # OIDC for PyPI trusted publishing + PEP 740 attestations
@@ -1179,12 +1209,15 @@ jobs:
         # IMPORTANT: Do NOT change this pin back to a commit SHA (PF-040).
         # pypa/gh-action-pypi-publish is a Docker-based composite action that
         # derives its GHCR image tag from `github.action_ref`. When you pin via
-        # `@<sha>`, GitHub Actions sets action_ref to that SHA, and the action
-        # pulls ghcr.io/pypa/gh-action-pypi-publish:<sha>. GHCR only publishes
-        # images for tagged releases — not for every commit SHA.
-        # The v0.4.1 release used `@a892a5a...`, which is the annotated *tag
-        # object* SHA for v1.14.2 (not the commit SHA). No GHCR image exists for
-        # it, so the publish-python job failed with "manifest unknown".
+        # `@<ref>`, GitHub Actions sets action_ref to that ref, and the action
+        # pulls ghcr.io/pypa/gh-action-pypi-publish:<ref>. GHCR carries images
+        # for release tags, the vX / vX.Y aliases, AND commit SHAs that landed
+        # on upstream release/* branches (the v1.14.2 commit dc37677b returns
+        # HTTP 200) — but NEVER for an annotated tag object (a892a5a6 = 404,
+        # the v0.4.1 failure). A 40-hex pin is indistinguishable by eye between
+        # the two cases, which is why the policy requires a vX.Y.Z release tag.
+        # `rehearse-publish-python` enforces this as a gate on every PR, dry run
+        # and tag push (#350, PF-040).
         # Using the release tag name is unambiguous. rehearse-publish-python
         # proves this exact ref resolves to a pullable GHCR image (and that twine
         # accepts the distributions) before publish-crates makes crates.io

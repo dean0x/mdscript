@@ -59,6 +59,13 @@
  * D-PR6: Exit codes — 0 PASS, 1 FAIL, 2 indeterminate. "Cannot tell" is
  *        never 0.
  *
+ * D-PR7: Release-surface presence check — when a PR touches the release
+ *        surface (paths matching release.yml's pull_request.paths filter),
+ *        each RELEASE_SURFACE_CONTEXTS job must be completed+success.
+ *        Absence or non-success is FAIL (Tier A semantics applied to release
+ *        check-runs). The changed-file list is fetched via the PR-files API
+ *        and fails closed on every indeterminate outcome (avoids PF-013).
+ *
  * Usage:
  *   node scripts/verify-pr-checks.mjs <pr-number>
  *   node scripts/verify-pr-checks.mjs <pr-number> --required-from <branch>
@@ -143,7 +150,7 @@ export const TIER_B_EXPECTED_SKIPPED = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// D-PR6: Release-surface presence check
+// D-PR7: Release-surface presence check
 //
 // When a PR touches the release surface (paths matching release.yml's
 // pull_request.paths filter), the verifier REQUIRES a completed+success run
@@ -290,7 +297,7 @@ function defaultGhRunner(args) {
  *   headSha: string;
  *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
- *   changedFiles?: string[];      // D-PR6: when present, release-surface presence check runs
+ *   changedFiles?: string[];      // D-PR7: when present, release-surface presence check runs
  * }} EvaluateInput
  *
  * @typedef {{
@@ -539,7 +546,7 @@ export function evaluateChecks({
     }
   }
 
-  // ---- D-PR6: release-surface presence check ----
+  // ---- D-PR7: release-surface presence check ----
   // When changedFiles is provided and any file matches the release surface,
   // require each RELEASE_SURFACE_CONTEXTS job to be present and success.
   // Absence or non-success is FAIL (Tier A semantics applied to release runs).
@@ -555,7 +562,7 @@ export function evaluateChecks({
   // API error rather than degrading to undefined.
   if (changedFiles === undefined) {
     lines.push(
-      '  · D-PR6: changedFiles not provided — release-surface presence check skipped ' +
+      '  · D-PR7: changedFiles not provided — release-surface presence check skipped ' +
       '(caller would need a PR number to enumerate changed files)',
     );
   } else {
@@ -570,7 +577,7 @@ export function evaluateChecks({
         const releaseRuns = checkRuns.filter(cr => cr.name === ctx);
         if (releaseRuns.length === 0) {
           failures.push(
-            `D-PR6 (release surface): "${ctx}" absent — the PR touches the release ` +
+            `D-PR7 (release surface): "${ctx}" absent — the PR touches the release ` +
             `surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
           );
           pass = false;
@@ -578,7 +585,7 @@ export function evaluateChecks({
           for (const cr of releaseRuns) {
             if (cr.status !== 'completed' || cr.conclusion !== 'success') {
               failures.push(
-                `D-PR6 (release surface): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
+                `D-PR7 (release surface): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
                 `— the PR touches the release surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
               );
               pass = false;
@@ -800,7 +807,7 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
 }
 
 /**
- * Fetch changed-file paths for a PR, paginated (D-PR6).
+ * Fetch changed-file paths for a PR, paginated (D-PR7).
  *
  * Fails CLOSED on every indeterminate outcome, matching fetchCheckRuns,
  * fetchStatuses and fetchRequiredContexts: a transient API error must not let a
@@ -834,7 +841,7 @@ export function fetchChangedFiles(prNumber, declaredCount, runner) {
         exitCode: 2,
         message:
           `PR files API error (page ${page}): ${data.stderr} — cannot determine whether ` +
-          `this PR touches the release surface, and "cannot tell" is not a pass (D-PR6)`,
+          `this PR touches the release surface, and "cannot tell" is not a pass (D-PR7)`,
       };
     }
     const items = Array.isArray(data) ? data : (data.files ?? []);
@@ -857,7 +864,7 @@ export function fetchChangedFiles(prNumber, declaredCount, runner) {
       exitCode: 2,
       message:
         `collected ${files.length} changed files but PR declares changed_files=${declaredCount} — ` +
-        `partial file list (D-PR6 non-vacuity, avoids PF-013)`,
+        `partial file list (D-PR7 non-vacuity, avoids PF-013)`,
     };
   }
 
@@ -965,7 +972,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     return st.exitCode;
   }
 
-  // ---- D-PR6: fetch changed files for release-surface presence check ----
+  // ---- D-PR7: fetch changed files for release-surface presence check ----
   // Fails closed on every indeterminate outcome (API error, pagination
   // overflow, count mismatch), exactly like the three fetches above: the live
   // path always knows the file list or exits 2 (avoids PF-013).

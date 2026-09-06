@@ -326,21 +326,37 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
   });
 
   // -------------------------------------------------------------------------
-  // S6: rehearse-publish-python must have NO job-level if: guard.
-  // The job must run on pull_request, workflow_dispatch, AND tag push so that
-  // the OIDC exchange is validated before any irreversible crates.io publish.
-  // A job-level tag guard would re-introduce PF-039 for this job.
+  // S6: rehearse-publish-python must have a job-level if: that is conditioned
+  // on needs.build-python.result == 'success' but NOT on refs/tags/v or any
+  // startsWith(github.ref) guard, so PRs and dispatches both exercise it.
+  //
+  // PF-039 rationale: a tag guard would make rehearse-publish-python skip on
+  // pull_request, removing the only pre-tag validation of the pypa action pin
+  // and GHCR image. The job must run on all three triggers; using a needs
+  // result-condition (not an event guard) is the correct pattern.
   // -------------------------------------------------------------------------
-  test('S6: rehearse-publish-python has no job-level if: (runs on PR, dispatch, and tag push)', () => {
+  test('S6: rehearse-publish-python has a job-level if: conditioned on build-python success (not a tag guard)', () => {
     const section = extractJobSection(yml, 'rehearse-publish-python');
     assert.ok(section !== null, 'rehearse-publish-python must exist (see S5)');
     const jobIf = extractJobIf(section);
-    assert.equal(
-      jobIf, null,
-      'rehearse-publish-python must have NO job-level if: guard — it must run on all ' +
-      'triggering events (pull_request, workflow_dispatch, push) so PRs exercise the ' +
-      'OIDC exchange before the irreversible crates.io publish (PF-039); ' +
+    assert.ok(
+      jobIf !== null,
+      'rehearse-publish-python must have a job-level if: conditioned on needs.build-python.result ' +
+      '(the job is decoupled from stage-and-verify-napi so a napi failure cannot block the rehearsal); ' +
       `got if: ${jobIf}`,
+    );
+    assert.ok(
+      jobIf.includes("needs.build-python.result == 'success'"),
+      'rehearse-publish-python if: must contain needs.build-python.result == \'success\'; ' +
+      `got: ${jobIf}`,
+    );
+    // The guard must NOT be a refs/tags/v or startsWith(github.ref) condition —
+    // those would re-introduce PF-039 by skipping on pull_request events.
+    assert.ok(
+      !jobIf.includes('refs/tags') && !jobIf.includes('startsWith(github.ref'),
+      'rehearse-publish-python if: must NOT contain a refs/tags/v or startsWith guard — ' +
+      'that would skip on pull_request, removing pre-tag validation (PF-039); ' +
+      `got: ${jobIf}`,
     );
   });
 
@@ -681,6 +697,24 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
         `pulls (PF-040). Bump both together.`,
       );
     }
+
+    // The single distinct action ref must be a vX.Y.Z release tag (M17 / PF-040).
+    // The gate enforces policy — not just existence — so a commit SHA or annotated-tag
+    // object SHA that happens to have a GHCR image is not acceptable (the policy is
+    // "pin by release tag name so humans can read the version at a glance").
+    const distinctRefs = [...new Set(refs)];
+    assert.equal(
+      distinctRefs.length, 1,
+      `all pypa/gh-action-pypi-publish uses must pin the same ref; found: [${distinctRefs.join(', ')}]`,
+    );
+    assert.ok(
+      /^v\d+\.\d+\.\d+$/.test(distinctRefs[0]),
+      `the single distinct pypa/gh-action-pypi-publish pin "${distinctRefs[0]}" must match ` +
+      '/^v\\d+\\.\\d+\\.\\d+$/ (a vX.Y.Z release tag) — a commit SHA or annotated-tag object ' +
+      'SHA is indistinguishable by eye but has no GHCR image for annotated objects (PF-040); ' +
+      `positive control: "a892a5a61159132606e93a2fa6f4358831b04d26" must be REJECTED ` +
+      `(it matches /^[0-9a-f]{40}$/ but not /^v\\d+\\.\\d+\\.\\d+$/)`,
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -776,6 +810,203 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
         `Declared job names: [${[...jobNames].join(' | ')}]`,
       );
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // M10a: every job whose section contains `cargo publish` must transitively
+  // need rehearse-publish-python, so a failed OIDC exchange aborts before the
+  // irreversible crates.io write (PF-039/PF-023).
+  //
+  // Non-vacuity: assert at least one such job exists (PF-013).
+  // Positive control: a graph where publish-crates needs only version-gate
+  // must be flagged (rehearsal edge is absent → not transitive).
+  // -------------------------------------------------------------------------
+  test('M10a: every cargo-publish job transitively needs rehearse-publish-python', () => {
+    const graph = buildNeedsGraph(yml);
+    assert.ok(
+      graph.has('rehearse-publish-python'),
+      'non-vacuity: rehearse-publish-python must be a graph node; PF-013',
+    );
+
+    const allIds = findAllJobIds(yml);
+    const cargoPublishJobs = allIds.filter(id => {
+      // Use stripCommentLines and then look for lines where "cargo publish" is
+      // the actual command being run (not in echo strings or error messages).
+      // A line that is the command starts with leading whitespace then "cargo ",
+      // as opposed to being inside an echo/error string.
+      const section = stripCommentLines(extractJobSection(yml, id) ?? '');
+      return section.split('\n').some(line => {
+        const trimmed = line.trimStart();
+        return trimmed.startsWith('cargo publish') ||
+               // inside if/OUTPUT=$(...) patterns
+               trimmed.includes('cargo publish -p ') ||
+               // bare cargo publish invocation
+               /^\s*cargo publish\b/.test(line);
+      });
+    });
+    assert.ok(
+      cargoPublishJobs.length > 0,
+      'non-vacuity (PF-013): at least one job must contain "cargo publish"; found none',
+    );
+
+    // Positive control: a graph without the rehearsal edge must be flagged.
+    const controlGraph = new Map([
+      ['publish-crates', new Set(['version-gate'])],
+      ['version-gate', new Set()],
+      ['rehearse-publish-python', new Set(['build-python'])],
+      ['build-python', new Set(['version-gate'])],
+    ]);
+    assert.ok(
+      !transitivelyNeeds(controlGraph, 'publish-crates', 'rehearse-publish-python'),
+      'positive control: graph without rehearsal edge must report NOT transitive (PF-013)',
+    );
+
+    for (const id of cargoPublishJobs) {
+      assert.ok(
+        transitivelyNeeds(graph, id, 'rehearse-publish-python'),
+        `job "${id}" contains "cargo publish" but does not transitively need ` +
+        `rehearse-publish-python — a failed GHCR or twine rehearsal cannot abort ` +
+        `before the crates.io write (irreversible, PF-039)`,
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // M10b: publish-crates must NOT transitively need publish-testpypi.
+  // publish-testpypi is the opt-in TestPyPI leg and must never gate the tag
+  // path — a failing or skipped TestPyPI upload must not block a release.
+  //
+  // Positive control: a graph with publish-crates → publish-testpypi must be
+  // flagged as transitive (so we know the check can actually detect the edge).
+  // -------------------------------------------------------------------------
+  test('M10b: publish-crates must NOT transitively need publish-testpypi (opt-in leg must never gate the tag path)', () => {
+    const graph = buildNeedsGraph(yml);
+    assert.ok(
+      graph.has('publish-crates'),
+      'non-vacuity: publish-crates must be a graph node; PF-013',
+    );
+    assert.ok(
+      graph.has('publish-testpypi'),
+      'non-vacuity: publish-testpypi must be a graph node; PF-013',
+    );
+
+    // Positive control: adding the edge must make the check fire.
+    const controlGraph = new Map([...graph].map(([k, v]) => [k, new Set(v)]));
+    const pcNeeds = controlGraph.get('publish-crates') ?? new Set();
+    pcNeeds.add('publish-testpypi');
+    controlGraph.set('publish-crates', pcNeeds);
+    assert.ok(
+      transitivelyNeeds(controlGraph, 'publish-crates', 'publish-testpypi'),
+      'positive control: graph with publish-crates → publish-testpypi edge must report transitive (PF-013)',
+    );
+
+    assert.ok(
+      !transitivelyNeeds(graph, 'publish-crates', 'publish-testpypi'),
+      'publish-crates must NOT transitively need publish-testpypi — the opt-in TestPyPI ' +
+      'upload must never block a tag release (ADR-013)',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // M10c: ADR-013 three-place rule — for every job id, a job-level if:
+  // containing "refs/tags/v" or "inputs." implies its display name: is in
+  // TIER_B_EXPECTED_SKIPPED, and every member of TIER_B_EXPECTED_SKIPPED is
+  // such a guarded job. Set-equality with size 5.
+  //
+  // Positive control: a fake job section with a guarded if: and a name not in
+  // the set must be flagged.
+  // -------------------------------------------------------------------------
+  test('M10c: ADR-013 three-place rule — guarded jobs and TIER_B_EXPECTED_SKIPPED are the same set (size 5)', () => {
+    const allIds = findAllJobIds(yml);
+
+    // Helper: extract job name field from a section.
+    const jobNameOf = (text) => {
+      const section = stripCommentLines(text);
+      const m = /^    name:\s+(.+)$/m.exec(section);
+      return m ? m[1].trim() : null;
+    };
+
+    // Collect guarded job names: jobs whose if: contains refs/tags/v or inputs.
+    const guardedNames = new Set();
+    for (const id of allIds) {
+      const section = extractJobSection(yml, id) ?? '';
+      const jobIf = extractJobIf(section);
+      if (jobIf && (jobIf.includes('refs/tags/v') || jobIf.includes('inputs.'))) {
+        const name = jobNameOf(section);
+        if (name) guardedNames.add(name);
+      }
+    }
+
+    // Positive control (PF-013): a fake section with guarded if: and unlisted
+    // name must be detected as missing from TIER_B_EXPECTED_SKIPPED.
+    const fakeSection = [
+      '  fake-publish-somewhere:',
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}",
+      '    name: Publish to Somewhere Unlisted',
+      '    runs-on: ubuntu-latest',
+    ].join('\n');
+    const fakeIf = extractJobIf(fakeSection);
+    const fakeName = jobNameOf(fakeSection);
+    assert.ok(fakeIf && fakeIf.includes('refs/tags/v'), 'positive control: extractJobIf must find the guarded if:');
+    assert.ok(fakeName === 'Publish to Somewhere Unlisted', 'positive control: jobNameOf must read the name');
+    assert.ok(!TIER_B_EXPECTED_SKIPPED.has(fakeName), 'positive control: unlisted name must not be in TIER_B_EXPECTED_SKIPPED');
+
+    // TIER_B_EXPECTED_SKIPPED must equal the guarded-jobs set exactly.
+    for (const name of guardedNames) {
+      assert.ok(
+        TIER_B_EXPECTED_SKIPPED.has(name),
+        `job with guarded if: (refs/tags/v or inputs.) named "${name}" is not in ` +
+        `TIER_B_EXPECTED_SKIPPED — a skipped run for this job would fail the Tier B verifier ` +
+        `on a dry-run or dispatch run (ADR-013 three-place rule)`,
+      );
+    }
+    for (const name of TIER_B_EXPECTED_SKIPPED) {
+      assert.ok(
+        guardedNames.has(name),
+        `TIER_B_EXPECTED_SKIPPED contains "${name}" but no job in release.yml has a guarded ` +
+        `if: (refs/tags/v or inputs.) and that display name — the set has drifted (ADR-013)`,
+      );
+    }
+    assert.equal(
+      guardedNames.size, 5,
+      `expected exactly 5 guarded jobs (ADR-013 three-place rule); found ${guardedNames.size}: ` +
+      `[${[...guardedNames].join(', ')}]`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S19: no run: block in release.yml may contain the empty expression ${{ }}
+  // (dollar-brace-brace-whitespace*-brace-brace). GitHub's expression
+  // preprocessor scans run: block text WITHOUT stripping shell comments, and
+  // the empty expression is a parse error that makes GitHub reject the entire
+  // workflow with zero jobs emitted (run 34061583304 confirmed).
+  //
+  // Positive control: a planted string containing the pattern must be flagged.
+  // -------------------------------------------------------------------------
+  test('S19: no run: block in release.yml contains the empty GitHub expression ${{ }} (parse rejection guard)', () => {
+    const EMPTY_EXPR = /\$\{\{\s*\}\}/;
+
+    // Positive control (PF-013): the regex must match a planted occurrence.
+    const planted = 'echo "Actions only interpolates ${{ }}, not bare {{ }}"';
+    assert.ok(
+      EMPTY_EXPR.test(planted),
+      'positive control: the empty-expression regex must match the planted string; ' +
+      'if this fails, the guard is broken',
+    );
+
+    // Count occurrences in the real file.
+    const matches = yml.match(new RegExp(EMPTY_EXPR.source, 'g')) ?? [];
+    assert.equal(
+      matches.length, 0,
+      `release.yml contains ${matches.length} occurrence(s) of the empty expression ` +
+      '\\$\\{\\{\\s*\\}\\} — GitHub\'s parser rejects this even inside shell comments ' +
+      `within run: blocks (run 34061583304, P-fix). Found at: ` +
+      matches.map((_, i) => {
+        const idx = yml.indexOf(matches[i] ?? '');
+        const lineNum = yml.slice(0, idx).split('\n').length;
+        return `line ~${lineNum}`;
+      }).join(', '),
+    );
   });
 
 });
