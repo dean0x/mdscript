@@ -45,6 +45,12 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "js-yaml"
         update-types: ["version-update:semver-major"]
+      # typescript 7.x is blocked on a build-system migration, not a version bump: the CJS half of
+      # the dual build (packages/{bundler-utils,webpack-loader,rspack-loader}/tsconfig.cjs.json)
+      # uses moduleResolution=node10, which TS 7 removed (TS5108). Tracked in #364; remove this
+      # entry when it lands. `ignore` filters VERSION updates only — SECURITY updates still arrive.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

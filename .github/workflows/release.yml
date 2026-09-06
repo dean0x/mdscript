@@ -36,10 +36,10 @@ jobs:
       actions: read  # CI workflow runs + their jobs, for the CI-history step
       id-token: write # OIDC for PyPI trusted publisher probe (F5, security-08)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
       - name: "Verify publish credentials before irreversible steps (security-08)"
         env:
@@ -300,10 +300,10 @@ jobs:
             build: napi build --platform --release --target x86_64-pc-windows-msvc --no-js
     runs-on: ${{ matrix.settings.host }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm }
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -369,10 +369,10 @@ jobs:
     if: ${{ !cancelled() && needs.build-napi.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - name: Download all .node artifacts
@@ -461,7 +461,7 @@ jobs:
             sdist: true
     runs-on: ${{ matrix.host }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
       # Rust toolchain needed for macOS/Windows wheel builds. Linux legs run
@@ -481,7 +481,7 @@ jobs:
       # --- build wheel ---
       - name: Build wheel
         if: ${{ !matrix.sdist }}
-        uses: PyO3/maturin-action@3e2bdf6ba6453a61e649744019b8a2d906c7eb38  # v1.51.0
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
         with:
           command: build
           args: --release --locked --compatibility pypi -m crates/mds-python/Cargo.toml --out dist
@@ -491,7 +491,7 @@ jobs:
       # --- build sdist ---
       - name: Build sdist
         if: ${{ matrix.sdist }}
-        uses: PyO3/maturin-action@3e2bdf6ba6453a61e649744019b8a2d906c7eb38  # v1.51.0
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b  # v1.51.0
         with:
           command: sdist
           args: -m crates/mds-python/Cargo.toml --out dist
@@ -672,7 +672,7 @@ jobs:
     if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && needs.build-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
@@ -755,10 +755,10 @@ jobs:
       NPM_CONFIG_ACCESS: "public"
       NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -934,7 +934,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.ref }}
       - name: Create release
