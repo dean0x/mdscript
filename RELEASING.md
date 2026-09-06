@@ -75,10 +75,18 @@ These are **not** automated and must be done before the first release:
    skipped conclusion. The trusted publisher for TestPyPI is independent of the PyPI
    one — both must be configured separately.
 
+   To trigger the first upload and lock the TestPyPI name, run:
+   `gh workflow run release.yml --ref <branch> -f testpypi=true`
+   A boolean dispatch input cannot be set without `-f`; omitting it leaves `testpypi`
+   at its default (`false`) and `publish-testpypi` is skipped.
+
    **Publisher expiry:** a PyPI pending publisher auto-expires ~30 days after
    creation unless an upload lands. For TestPyPI, the first `workflow_dispatch`
-   run with `testpypi: true` is what locks the name — it is the first upload.
-   Re-create the publisher if it has expired before that first dispatch.
+   run with `testpypi: true` is the first upload that locks the name. If the
+   pending publisher is missing or expired, the `Publish to TestPyPI (rehearsal)`
+   job fails at the OIDC token exchange with an `invalid-publisher` message —
+   re-file the pending publisher (environment name BLANK) and re-dispatch; no
+   code change needed.
 
 ## Pre-flight (before tagging)
 
@@ -168,25 +176,51 @@ so the fail-closed behaviour is informational, not a merge blocker by itself.
 `@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
 fails at publish time.
 
+Even though release-surface PRs now trigger `release.yml` automatically, a
+manual `gh workflow run release.yml --ref <branch>` is still required in four
+cases (the five release-surface paths are `.github/workflows/release.yml`,
+`.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`, and
+`scripts/verify-napi-names.mjs`):
+
+1. **CI-history gate (PF-017)** — the gate is step-skipped on `pull_request`
+   because `github.sha` is the ephemeral merge commit, not the branch head; a
+   `::notice::` makes the skip visible. It runs only on tag push and dispatch.
+2. **Changes outside the release surface** — dependency sweeps,
+   `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the five
+   paths above and do not trigger a `pull_request` run on `release.yml`.
+3. **Dependabot and fork PRs** — no repository secrets and no `id-token: write`;
+   `Version gate` fails closed with the "No Actions secrets on this run" error.
+   Do not merge on those checks; supersede with a maintainer-authored PR or
+   dispatch by hand.
+4. **TestPyPI handshake** — `gh workflow run release.yml --ref <branch> -f testpypi=true`
+   (once per version; `skip-existing: true` makes repeats no-ops).
+
 The dry run also exercises the **CI-history gate** (PF-017), asserting a
 completed+success `CI` run for the dispatched ref's HEAD. Dispatch it only after
-that ref's CI has finished, or the gate fails closed on a still-running run.
+that ref's CI has finished, or the gate fails closed on a still-running run. The
+gate is skipped on `pull_request` runs by a step-level guard (the sibling notice
+step makes the skip visible) and is enforced unchanged on tag push and
+`workflow_dispatch`.
 
-The dry run also runs the **`rehearse-publish-python` job**, which rehearses
-everything about `publish-python` except the one irreversible act. It runs four
-gates, each with a positive control (PF-013 — a gate never observed rejecting
-anything is not evidence):
+### PyPI publish rehearsal (#350, PF-039)
+
+The dry run also runs the **`rehearse-publish-python` job** (`Rehearse PyPI
+publish (no upload)`), which rehearses everything about `publish-python` except
+the one irreversible act. It proves four properties, each with a positive
+control (PF-013 — a gate never observed rejecting anything is not evidence):
 
 1. **Pin shape** — the `pypa/gh-action-pypi-publish` pin must be a `vX.Y.Z`
-   release tag. Control: the v0.4.1 annotated-tag-object SHA must be rejected.
-2. **GHCR manifest** — GHCR must hold an image for that exact ref. Control: a ref
-   that cannot exist must not return HTTP 200.
-3. **`docker pull`** — the image the runner actually fetches must pull. Control:
-   pulling the impossible ref must fail. ("The ref resolves in git" is necessary
-   and never sufficient — PF-040.)
-4. **`twine check`** — twine runs out of that image with `--network none` and
-   `--entrypoint twine`, so the step physically cannot reach pypi.org. Control:
-   a deliberately corrupt wheel must be rejected.
+   release tag. Control: the image-backed commit `dc37677b...` and the annotated
+   tag object `a892a5a6...` are both rejected — policy, not existence.
+2. **GHCR manifest** — GHCR must hold an image for that exact ref (HTTP 200).
+   Control: a ref that cannot exist must return 404 with `MANIFEST_UNKNOWN`.
+3. **`docker pull`** — the image must actually pull. Control: a missing tag must
+   fail; bounded to 3 attempts. ("The ref resolves in git" is necessary and
+   never sufficient — PF-040.)
+4. **`twine check`** — the image's own twine 7.0.0 runs against all 8
+   distributions with `--network none` and `--entrypoint twine`, so the step
+   physically cannot reach pypi.org. Control: a deliberately corrupt wheel must
+   be rejected.
 
 > The job **must never** `uses: pypa/gh-action-pypi-publish`. The action has no
 > dry-run/no-upload mode: an unrecognised `dry-run:` input is warned about and
@@ -196,6 +230,12 @@ anything is not evidence):
 > Spec S14 in `scripts/__test__/release-auth-probe.spec.mjs` now pins the
 > invocation to `publish-python` and `publish-testpypi` only, and the rehearsal
 > is denied `id-token` so it holds no credential to upload with.
+
+The rehearsal proves everything listed above; it cannot prove the upload handshake
+and trusted-publisher exchange at publish time — the action has no dry-run mode.
+The credential half is covered by `version-gate`'s OIDC probe (which runs on
+every event including PRs); the upload half is closed by the opt-in TestPyPI leg
+(`-f testpypi=true`), which exercises the full exchange once per version.
 
 `publish-crates` needs this job, so a broken pin aborts the release before the
 irreversible crates.io write. It is intentionally unguarded, so it runs on

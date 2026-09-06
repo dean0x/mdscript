@@ -136,11 +136,12 @@ jobs:
       - name: "Run positive-control and class-completeness suite"
         run: npm run test:gates
       # reliability-12: assert the SHA being released went green in CI before
-      # any irreversible publish starts. Runs on BOTH triggers - a tag push
-      # verifies the tagged commit, a workflow_dispatch dry run verifies the
-      # dispatched ref's HEAD - so the dry run now exercises this gate instead
-      # of skipping it. Cancelled, failed, in-progress and absent runs all fail
-      # closed (PF-017; PF-013: absence is not success).
+      # any irreversible publish starts. Runs on tag push (verifies the tagged
+      # commit) and workflow_dispatch (verifies the dispatched ref's HEAD).
+      # Step-skipped on pull_request: github.sha is the ephemeral merge commit,
+      # not the branch head — see the if: guard on this step and the sibling
+      # notice step below. Cancelled, failed, in-progress and absent runs all
+      # fail closed (PF-017; PF-013: absence is not success).
       # Cannot reuse scripts/verify-pr-checks.mjs here - that script requires a
       # PR number, and tag pushes reference a commit, not a PR.
       # Branch protection is NOT read: /branches/main/protection needs
@@ -1216,8 +1217,6 @@ jobs:
         # HTTP 200) — but NEVER for an annotated tag object (a892a5a6 = 404,
         # the v0.4.1 failure). A 40-hex pin is indistinguishable by eye between
         # the two cases, which is why the policy requires a vX.Y.Z release tag.
-        # `rehearse-publish-python` enforces this as a gate on every PR, dry run
-        # and tag push (#350, PF-040).
         # Using the release tag name is unambiguous. rehearse-publish-python
         # proves this exact ref resolves to a pullable GHCR image (and that twine
         # accepts the distributions) before publish-crates makes crates.io
@@ -1225,6 +1224,8 @@ jobs:
         # When bumping this pin: update PIN_REF in rehearse-publish-python AND
         # the uses: pin in publish-testpypi, together. Spec S16 fails the build
         # if they drift.
+        # `rehearse-publish-python` enforces this as a gate on every PR, dry run
+        # and tag push (#350, PF-040).
         uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           packages-dir: python-dist/
