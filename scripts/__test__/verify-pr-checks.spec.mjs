@@ -27,6 +27,9 @@ import {
   parseGhStderrHttpStatus,
   EXPECTED_CONTEXTS,
   TIER_B_EXPECTED_SKIPPED,
+  RELEASE_SURFACE,
+  RELEASE_SURFACE_CONTEXTS,
+  matchesReleaseSurface,
 } from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
@@ -647,7 +650,9 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     // CPU cost and any unexpected loops — network latency is zero.
     assert.ok(elapsed < 15000,
       `verifier must complete in < 15 s wall-clock (AC-30 clause b); took ${elapsed}ms`);
-    assert.equal(calls.length, 4, `expected 4 API calls (pr, protection, checks, status); got ${calls.length}`);
+    // D-PR7: adds one PR-files call (pulls/{n}/files?per_page=100) for the release-surface check.
+    // The /pulls/ stub also matches the files URL and returns PR_OK (no .files → empty list → ok).
+    assert.equal(calls.length, 5, `expected 5 API calls (pr, protection, checks, status, files); got ${calls.length}`);
     const checkCall = calls.find(u => u.includes('/check-runs'));
     assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
     // D-PR4a parity: combined-status endpoint must request per_page=100 so a context
@@ -1420,10 +1425,11 @@ describe('architecture-08: fetchCheckRuns — bounded loop and total_count guard
 
 // ---------------------------------------------------------------------------
 // TIER_B_EXPECTED_SKIPPED: release publish jobs may be skipped on a PR-branch
-// dry-run (guarded by startsWith(github.ref, 'refs/tags/v') in release.yml).
-// Only 'Publish to crates.io', 'Publish to npm', 'Publish to PyPI', 'GitHub
-// Release', only when 'skipped', pass Tier B. Any other conclusion or any
-// other name still fails.
+// dry-run (guarded by startsWith(github.ref,'refs/tags/v') or the testpypi
+// dispatch input). Five names: 'Publish to crates.io', 'Publish to npm',
+// 'Publish to PyPI', 'GitHub Release', 'Publish to TestPyPI (rehearsal)';
+// only when 'skipped', pass Tier B. Any other conclusion or any other name
+// still fails. (ADR-013 amendment 2026-09-06)
 // ---------------------------------------------------------------------------
 describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => {
 
@@ -1437,9 +1443,9 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     ];
   }
 
-  test('D-PR5a: all four publish names skipped + required green → PASS and merge command printed', () => {
-    // The RELEASING.md dry-run dispatched on a PR branch sees the four publish
-    // jobs as skipped (their refs/tags/v guard fires). The verifier must exit 0
+  test('D-PR5a: all five publish names skipped + required green → PASS and merge command printed', () => {
+    // The RELEASING.md dry-run dispatched on a PR branch sees the five publish
+    // jobs as skipped (their refs/tags/v or inputs. guard fires). The verifier must exit 0
     // so the operator can proceed to tag.
     const skippedPublishRuns = [...TIER_B_EXPECTED_SKIPPED].map(name => ({
       name,
@@ -1455,7 +1461,7 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
       prNumber: 338,
     });
     assert.equal(result.exitCode, 0,
-      `four publish names skipped must not block PASS; lines:\n${result.lines.join('\n')}`);
+      `five publish names skipped must not block PASS; lines:\n${result.lines.join('\n')}`);
     assert.ok(result.pass, 'must return pass=true');
     assert.ok(result.mergeCommand, 'PASS must produce a merge command');
     // Informational lines must be present (one per skipped job)
@@ -1512,7 +1518,7 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
   });
 
   test('D-PR5d: an unrelated Tier B name with conclusion=skipped → FAIL (whitelist is exact)', () => {
-    // The allowance is exactly the four publish job names. Any other job name
+    // The allowance is exactly the five publish job names. Any other job name
     // that reports skipped must still fail Tier B (security-13: whitelist).
     const runs = basePassingRunsWith([
       { name: 'Some other job', status: 'completed', conclusion: 'skipped' },
@@ -1551,6 +1557,323 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
       allLines.includes('not yet completed') || allLines.includes('in_progress'),
       `failure must mention not-yet-completed or in_progress; got:\n${allLines}`,
     );
+  });
+
+  test('D-PR5f: "Publish to TestPyPI (rehearsal)" with conclusion=cancelled → FAIL (only skipped is allowed)', () => {
+    // ADR-013 amendment: this job is added to TIER_B_EXPECTED_SKIPPED so that
+    // a skipped run (dispatch-input-guarded) does not block the verifier.
+    // But cancelled is NOT skipped — it is a real anomaly and must fail closed.
+    const runs = basePassingRunsWith([
+      { name: 'Publish to TestPyPI (rehearsal)', status: 'completed', conclusion: 'cancelled' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+    });
+    assert.equal(result.exitCode, 1,
+      'cancelled Publish to TestPyPI must exit 1 (only skipped is allowed in TIER_B_EXPECTED_SKIPPED)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Publish to TestPyPI'), `must name the failing job; got:\n${allLines}`);
+    assert.ok(allLines.includes('cancelled'), `must quote the conclusion; got:\n${allLines}`);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR7: Release-surface presence check
+//
+// When a PR touches .github/workflows/release.yml, .github/actions/**,
+// crates/mds-napi/**, crates/mds-python/**, or scripts/verify-napi-names.mjs,
+// the verifier REQUIRES completed+success runs for each RELEASE_SURFACE_CONTEXTS
+// job: "Version gate", "Stage + verify platform packages",
+// "Rehearse PyPI publish (no upload)".
+// ---------------------------------------------------------------------------
+describe('D-PR7: release-surface presence check', () => {
+
+  // Helper: all required + expected passes; inject extras.
+  function passingRunsWith(extras) {
+    return [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      ...extras,
+    ];
+  }
+
+  // Three release-surface jobs, all success.
+  function releaseSuccessRuns() {
+    return RELEASE_SURFACE_CONTEXTS.map(name => ({
+      name,
+      status: 'completed',
+      conclusion: 'success',
+    }));
+  }
+
+  test('D-PR7a: changedFiles touches release surface + all RELEASE_SURFACE_CONTEXTS present/success → exit 0 and "release surface touched" line', () => {
+    const checkRuns = passingRunsWith(releaseSuccessRuns());
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 0,
+      `touched release surface + all contexts success must exit 0; lines:\n${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('release surface touched'),
+      `output must include "release surface touched"; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR7b: touched + "Version gate" absent → exit 1 naming it (#342)', () => {
+    const withoutVersionGate = releaseSuccessRuns().filter(r => r.name !== 'Version gate');
+    const checkRuns = passingRunsWith(withoutVersionGate);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 1,
+      `absent "Version gate" with release surface touched must exit 1; got:\n${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Version gate'), `must name the absent job; got:\n${allLines}`);
+  });
+
+  test('D-PR7c: touched + "Rehearse PyPI publish (no upload)" completed+skipped → exit 1', () => {
+    const withSkippedRehearse = releaseSuccessRuns().map(r =>
+      r.name === 'Rehearse PyPI publish (no upload)'
+        ? { ...r, conclusion: 'skipped' }
+        : r,
+    );
+    const checkRuns = passingRunsWith(withSkippedRehearse);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 1,
+      'release surface requires success, not skipped; must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('Rehearse PyPI publish (no upload)'),
+      `must name the non-success context; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR7d: touched + one present run in_progress → exit 1', () => {
+    const withInProgress = releaseSuccessRuns().map(r =>
+      r.name === 'Stage + verify platform packages'
+        ? { name: r.name, status: 'in_progress', conclusion: null }
+        : r,
+    );
+    const checkRuns = passingRunsWith(withInProgress);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['crates/mds-napi/src/lib.rs'],
+    });
+    assert.equal(result.exitCode, 1, 'in_progress release job with touched surface must exit 1');
+  });
+
+  test('D-PR7e: changedFiles = ["crates/mds-core/src/lib.rs"], no release runs → exit 0 and "not touched" line', () => {
+    const checkRuns = passingRunsWith([]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['crates/mds-core/src/lib.rs'],
+    });
+    assert.equal(result.exitCode, 0,
+      'non-release file must not require release check-runs; must exit 0');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('release surface not touched'),
+      `must include "release surface not touched"; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR7f: matchesReleaseSurface positives and negatives', () => {
+    // Positives (must return true)
+    assert.ok(matchesReleaseSurface('.github/actions/setup-wasm/action.yml'),
+      '.github/actions/** pattern must match .github/actions/setup-wasm/action.yml');
+    assert.ok(matchesReleaseSurface('crates/mds-napi/src/lib.rs'),
+      'crates/mds-napi/** must match crates/mds-napi/src/lib.rs');
+    assert.ok(matchesReleaseSurface('scripts/verify-napi-names.mjs'),
+      'exact match must work for scripts/verify-napi-names.mjs');
+    assert.ok(matchesReleaseSurface('.github/workflows/release.yml'),
+      'exact match must work for .github/workflows/release.yml');
+    assert.ok(matchesReleaseSurface('crates/mds-python/src/lib.rs'),
+      'crates/mds-python/** must match crates/mds-python/src/lib.rs');
+
+    // Negatives (must return false)
+    assert.ok(!matchesReleaseSurface('.github/workflows/ci.yml'),
+      '.github/workflows/ci.yml must NOT match (only release.yml is listed)');
+    assert.ok(!matchesReleaseSurface('scripts/verify-versions.mjs'),
+      'scripts/verify-versions.mjs must NOT match (only verify-napi-names.mjs is listed)');
+    assert.ok(!matchesReleaseSurface('crates/mds-core/src/lib.rs'),
+      'crates/mds-core/** must NOT match (not in RELEASE_SURFACE)');
+  });
+
+  test('D-PR7g: changedFiles undefined → exit 0 with skip notice (caller-path only, never an API failure)', () => {
+    // evaluateChecks is an exported pure function; a caller holding only a SHA
+    // cannot enumerate changed files, so `undefined` skips the check with a
+    // notice. main() NEVER reaches this path: fetchChangedFiles fails closed on
+    // an API error (see D-PR7h) rather than degrading to undefined, because a
+    // transient 500 must not turn a release-surface PR into one that needs no
+    // release check-runs (fail-open in a merge gate).
+    const checkRuns = passingRunsWith([]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: undefined,
+    });
+    assert.equal(result.exitCode, 0, 'undefined changedFiles must not cause failure');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('release-surface presence check skipped') ||
+      allLines.includes('changedFiles not provided'),
+      `must include a skip notice; got:\n${allLines}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // D-PR7h: the live path must FAIL CLOSED when the files endpoint errors.
+  //
+  // This is the fail-open that would otherwise sit under D-PR7: a 500 from
+  // /pulls/N/files would let a PR that touches release.yml pass the verifier
+  // without a single release check-run. Indeterminate is exit 2 — the same
+  // contract fetchCheckRuns, fetchStatuses and fetchRequiredContexts hold.
+  // -------------------------------------------------------------------------
+  test('D-PR7h: PR-files API error → exit 2 (fail closed, never a silent skip)', () => {
+    // Route the files URL to an error BEFORE the generic /pulls/ route, which
+    // would otherwise answer it with PR metadata.
+    const runner = stubRunner([
+      ['/files', { __error: true, httpStatus: 500, stderr: 'server error' }],
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(
+      main(['1'], runner, OK_GH_VERSION), 2,
+      'a files-endpoint error is indeterminate: it must exit 2, not skip the ' +
+      'release-surface check and report PASS',
+    );
+  });
+
+  test('D-PR7h: changed_files count mismatch → exit 2 (partial file list)', () => {
+    // The PR declares 3 changed files but the endpoint returns 1. Evaluating
+    // the release-surface question on a partial list could miss the one file
+    // that touches the surface (non-vacuity, avoids PF-013).
+    const runner = stubRunner([
+      ['/files', [{ filename: 'README.md' }]],
+      ['/pulls/', { ...PR_OK, changed_files: 3 }],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2,
+      'a partial changed-files list must exit 2');
+  });
+
+  test('D-PR7h: live path requires the release runs when the files endpoint reports a surface file', () => {
+    // End-to-end through main(): the files endpoint (not a hand-built
+    // changedFiles array) drives the presence check. Without the release
+    // check-runs this PR must FAIL — proving fetchChangedFiles is wired into
+    // evaluateChecks and that D-PR7a-f are not testing a disconnected function.
+    const runner = stubRunner([
+      ['/files', [{ filename: 'crates/mds-napi/src/lib.rs' }]],
+      ['/pulls/', { ...PR_OK, changed_files: 1 }],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 1,
+      'a release-surface file with no release check-runs must exit 1');
+  });
+
+  test('D-PR7h: live path passes when the release runs are present for a surface file', () => {
+    // The complement of the case above: same PR, plus the three release runs.
+    // Without this pair, exit 1 could be coming from anywhere.
+    const withRelease = {
+      ...CHECKS_OK_WITH_HYGIENE,
+      check_runs: [
+        ...CHECKS_OK_WITH_HYGIENE.check_runs,
+        ...RELEASE_SURFACE_CONTEXTS.map(name => ({
+          name, status: 'completed', conclusion: 'success',
+        })),
+      ],
+      total_count: CHECKS_OK_WITH_HYGIENE.total_count + RELEASE_SURFACE_CONTEXTS.length,
+    };
+    const runner = stubRunner([
+      ['/files', [{ filename: 'crates/mds-napi/src/lib.rs' }]],
+      ['/pulls/', { ...PR_OK, changed_files: 1 }],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', withRelease],
+      ['/status', { statuses: [], total_count: 0 }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
+      'a release-surface file WITH all release check-runs must exit 0');
+  });
+
+  // -------------------------------------------------------------------------
+  // D-PR7j: duplicate names resolve ALL-MUST-PASS, not newest-wins.
+  //
+  // Same contract as Tier A (see the checksByName comment in the production
+  // file): `filter=latest` de-duplicates within one check-suite, but two suites
+  // can publish the same name, so keeping only the last entry would let a green
+  // re-run mask a red sibling — a fail-open in a merge gate.
+  // -------------------------------------------------------------------------
+  test('D-PR7j: a failed and a succeeded run sharing a release-surface name → exit 1 (all must pass)', () => {
+    const checkRuns = passingRunsWith([
+      ...releaseSuccessRuns(),
+      // A second run under a name that already has a success above.
+      { name: 'Version gate', status: 'completed', conclusion: 'failure' },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+    });
+    assert.equal(result.exitCode, 1,
+      'a later success must not mask an earlier failure under the same name; must exit 1');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Version gate') && allLines.includes('failure'),
+      `must name the failing run and its conclusion; got:\n${allLines}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-PR7i: matchesReleaseSurface prefix and exact-match boundaries.
+  // A `dir/**` pattern must not match a sibling whose name merely starts with
+  // the directory name, and an exact pattern must not prefix-match.
+  // -------------------------------------------------------------------------
+  test('D-PR7i: "/**" requires a trailing slash and exact patterns do not prefix-match', () => {
+    assert.ok(!matchesReleaseSurface('.github/actions-foo/x.yml'),
+      '.github/actions/** must not match the sibling directory .github/actions-foo/');
+    assert.ok(!matchesReleaseSurface('crates/mds-napi-extra/src/lib.rs'),
+      'crates/mds-napi/** must not match crates/mds-napi-extra/');
+    assert.ok(!matchesReleaseSurface('scripts/verify-napi-names.mjs.bak'),
+      'an exact pattern must not prefix-match scripts/verify-napi-names.mjs.bak');
+    assert.ok(!matchesReleaseSurface('.github/workflows/release.yml.orig'),
+      'an exact pattern must not prefix-match .github/workflows/release.yml.orig');
+    // The directory itself, with no file under it, is not a changed file path
+    // GitHub ever reports — but the prefix rule must still be strict about it.
+    assert.ok(!matchesReleaseSurface('.github/actions'),
+      '.github/actions/** must not match the bare directory name');
   });
 
 });

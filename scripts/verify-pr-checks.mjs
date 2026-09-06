@@ -59,6 +59,13 @@
  * D-PR6: Exit codes — 0 PASS, 1 FAIL, 2 indeterminate. "Cannot tell" is
  *        never 0.
  *
+ * D-PR7: Release-surface presence check — when a PR touches the release
+ *        surface (paths matching release.yml's pull_request.paths filter),
+ *        each RELEASE_SURFACE_CONTEXTS job must be completed+success.
+ *        Absence or non-success is FAIL (Tier A semantics applied to release
+ *        check-runs). The changed-file list is fetched via the PR-files API
+ *        and fails closed on every indeterminate outcome (avoids PF-013).
+ *
  * Usage:
  *   node scripts/verify-pr-checks.mjs <pr-number>
  *   node scripts/verify-pr-checks.mjs <pr-number> --required-from <branch>
@@ -124,18 +131,82 @@ export const EXPECTED_CONTEXTS = [
 ];
 
 // Tier B allowance (release pre-flight): release.yml's publish jobs are
-// guarded by startsWith(github.ref, 'refs/tags/v'), so the RELEASING.md
-// dry-run dispatched on a PR branch reports them on the PR head as
-// conclusion=skipped. That skip IS the guard working, not a missing
-// verification. Only these four names, only when 'skipped', pass Tier B;
-// any other conclusion (cancelled, failure, neutral, null) still fails, and a
-// skipped run under any other name still fails.
+// guarded by startsWith(github.ref, 'refs/tags/v') (or the testpypi dispatch
+// input), so the RELEASING.md dry-run dispatched on a PR branch reports them
+// on the PR head as conclusion=skipped. That skip IS the guard working, not a
+// missing verification. Only these five names, only when 'skipped', pass Tier
+// B; any other conclusion (cancelled, failure, neutral, null) still fails, and
+// a skipped run under any other name still fails.
+// ADR-013 amendment (2026-09-06): 'Publish to TestPyPI (rehearsal)' is
+// dispatch-input-guarded — skipped everywhere except `workflow_dispatch -f
+// testpypi=true`. Adding it to this set so the mandatory pre-merge verifier
+// does not hard-fail on PRs that dispatch a release dry-run.
 export const TIER_B_EXPECTED_SKIPPED = new Set([
   'Publish to crates.io',
   'Publish to npm',
   'Publish to PyPI',
   'GitHub Release',
+  'Publish to TestPyPI (rehearsal)',
 ]);
+
+// ---------------------------------------------------------------------------
+// D-PR7: Release-surface presence check
+//
+// When a PR touches the release surface (paths matching release.yml's
+// pull_request.paths filter), the verifier REQUIRES a completed+success run
+// from each job in RELEASE_SURFACE_CONTEXTS. This closes the gap: a
+// mis-specified paths filter could pass as a silent no-run (ADR-013 §3).
+//
+// RELEASE_SURFACE must equal the workflow's on.pull_request.paths list
+// exactly. Spec S10 (release-auth-probe.spec.mjs) compares the two as sets.
+// ---------------------------------------------------------------------------
+
+/**
+ * The set of paths that trigger release.yml on pull_request.
+ * Must equal the `on.pull_request.paths:` list in .github/workflows/release.yml
+ * (enforced as a set equality by spec S10 in release-auth-probe.spec.mjs).
+ *
+ * Pattern rules: a pattern ending in `/**` matches any file under that prefix;
+ * all other patterns are exact file path equality (no glob library needed).
+ */
+export const RELEASE_SURFACE = [
+  '.github/workflows/release.yml',
+  '.github/actions/**',
+  'crates/mds-napi/**',
+  'crates/mds-python/**',
+  'scripts/verify-napi-names.mjs',
+];
+
+/**
+ * Job display-names in release.yml that must be completed+success on a PR
+ * that touches the release surface. Matrix legs are implied by Stage's needs.
+ * These are Tier A semantics applied to release check-runs (presence required).
+ */
+export const RELEASE_SURFACE_CONTEXTS = [
+  'Version gate',
+  'Stage + verify platform packages',
+  'Rehearse PyPI publish (no upload)',
+];
+
+/**
+ * Returns true when `file` matches any pattern in RELEASE_SURFACE.
+ * A pattern ending in `/**` matches any file under that directory prefix.
+ * All other patterns require exact equality.
+ *
+ * @param {string} file - a changed file path (e.g. 'crates/mds-napi/src/lib.rs')
+ * @returns {boolean}
+ */
+export function matchesReleaseSurface(file) {
+  for (const pattern of RELEASE_SURFACE) {
+    if (pattern.endsWith('/**')) {
+      const prefix = pattern.slice(0, -3) + '/';
+      if (file.startsWith(prefix)) return true;
+    } else if (file === pattern) {
+      return true;
+    }
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // gh runner (thin IO shim; injected in tests for offline operation)
@@ -226,6 +297,7 @@ function defaultGhRunner(args) {
  *   headSha: string;
  *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
+ *   changedFiles?: string[];      // D-PR7: when present, release-surface presence check runs
  * }} EvaluateInput
  *
  * @typedef {{
@@ -253,6 +325,7 @@ export function evaluateChecks({
   headSha,
   prNumber,
   expectedContexts = EXPECTED_CONTEXTS,
+  changedFiles,
 }) {
   const lines = [];
   const failures = [];
@@ -473,6 +546,58 @@ export function evaluateChecks({
     }
   }
 
+  // ---- D-PR7: release-surface presence check ----
+  // When changedFiles is provided and any file matches the release surface,
+  // require each RELEASE_SURFACE_CONTEXTS job to be present and success.
+  // Absence or non-success is FAIL (Tier A semantics applied to release runs).
+  //
+  // Duplicate names are resolved the same way Tier A resolves them: EVERY run
+  // carrying the name must be completed+success. Newest-wins would let a green
+  // re-run mask a red sibling from another check-suite — a fail-open in a merge
+  // gate. `filter=latest` already de-duplicates within one suite.
+  //
+  // changedFiles === undefined is the CALLER-path skip: evaluateChecks is an
+  // exported pure function and a caller holding only a SHA cannot enumerate
+  // files. main() never takes this path — fetchChangedFiles fails closed on an
+  // API error rather than degrading to undefined.
+  if (changedFiles === undefined) {
+    lines.push(
+      '  · D-PR7: changedFiles not provided — release-surface presence check skipped ' +
+      '(caller would need a PR number to enumerate changed files)',
+    );
+  } else {
+    const touchedFiles = changedFiles.filter(f => matchesReleaseSurface(f));
+    if (touchedFiles.length > 0) {
+      lines.push(
+        `  release surface touched (${touchedFiles.length} file(s): ${touchedFiles.slice(0, 5).join(', ')}` +
+        (touchedFiles.length > 5 ? ', …' : '') +
+        ') — requiring release check-runs',
+      );
+      for (const ctx of RELEASE_SURFACE_CONTEXTS) {
+        const releaseRuns = checkRuns.filter(cr => cr.name === ctx);
+        if (releaseRuns.length === 0) {
+          failures.push(
+            `D-PR7 (release surface): "${ctx}" absent — the PR touches the release ` +
+            `surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
+          );
+          pass = false;
+        } else {
+          for (const cr of releaseRuns) {
+            if (cr.status !== 'completed' || cr.conclusion !== 'success') {
+              failures.push(
+                `D-PR7 (release surface): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
+                `— the PR touches the release surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
+              );
+              pass = false;
+            }
+          }
+        }
+      }
+    } else {
+      lines.push('  release surface not touched — no release run required');
+    }
+  }
+
   // ---- Compose result ----
   for (const f of failures) {
     lines.push(`✖ ${f}`);
@@ -681,6 +806,71 @@ export function fetchRequiredContexts(baseBranch, requiredFrom, runner) {
   return { ok: true, contexts, resolvedBranch: branch, notes };
 }
 
+/**
+ * Fetch changed-file paths for a PR, paginated (D-PR7).
+ *
+ * Fails CLOSED on every indeterminate outcome, matching fetchCheckRuns,
+ * fetchStatuses and fetchRequiredContexts: a transient API error must not let a
+ * release-surface PR through without its release check-runs. "Cannot tell" is
+ * exit 2, never a silent skip (applies ADR-009, avoids PF-013).
+ *
+ * Two outcomes:
+ *   - API error, pagination overflow, or count mismatch
+ *                → { ok: false, exitCode: 2, message: string }
+ *   - Success    → { ok: true, files: string[] }
+ *
+ * @param {number|string} prNumber
+ * @param {number|null} declaredCount — PR's `changed_files` field, or null when absent
+ * @param {function} runner
+ */
+export function fetchChangedFiles(prNumber, declaredCount, runner) {
+  const MAX_FILES_PAGES = 30;
+  const files = [];
+  let page = 1;
+
+  while (page <= MAX_FILES_PAGES) {
+    const url = `/repos/{owner}/{repo}/pulls/${prNumber}/files?per_page=100&page=${page}`;
+    const data = runner(['api', url]);
+    if (data.__error) {
+      // Fail closed. Skipping the release-surface check here would mean a
+      // 500 from the files endpoint silently converts a PR that MUST carry
+      // release check-runs into one that needs none — a fail-open in a merge
+      // gate, which is the whole defect class this tool exists to remove.
+      return {
+        ok: false,
+        exitCode: 2,
+        message:
+          `PR files API error (page ${page}): ${data.stderr} — cannot determine whether ` +
+          `this PR touches the release surface, and "cannot tell" is not a pass (D-PR7)`,
+      };
+    }
+    const items = Array.isArray(data) ? data : (data.files ?? []);
+    files.push(...items.map(f => f.filename));
+    if (items.length < 100) break;
+    page++;
+  }
+
+  if (page > MAX_FILES_PAGES) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message: `PR files pagination exceeded ${MAX_FILES_PAGES} pages — refusing to evaluate partial release-surface result`,
+    };
+  }
+
+  if (declaredCount !== null && files.length !== declaredCount) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message:
+        `collected ${files.length} changed files but PR declares changed_files=${declaredCount} — ` +
+        `partial file list (D-PR7 non-vacuity, avoids PF-013)`,
+    };
+  }
+
+  return { ok: true, files };
+}
+
 const USAGE =
   'Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>]';
 
@@ -782,6 +972,18 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     return st.exitCode;
   }
 
+  // ---- D-PR7: fetch changed files for release-surface presence check ----
+  // Fails closed on every indeterminate outcome (API error, pagination
+  // overflow, count mismatch), exactly like the three fetches above: the live
+  // path always knows the file list or exits 2 (avoids PF-013).
+  const filesResult = fetchChangedFiles(prNumber, prData.changed_files ?? null, runner);
+  if (!filesResult.ok) {
+    fail(filesResult.message);
+    return filesResult.exitCode;
+  }
+  const changedFiles = filesResult.files;
+  console.log(`  changed files: ${changedFiles.length}`);
+
   // ---- Evaluate (D-PR1: pure function) ----
   const result = evaluateChecks({
     requiredContexts: req.contexts,
@@ -789,6 +991,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     statuses: st.statuses,
     headSha,
     prNumber,
+    changedFiles,
   });
 
   for (const line of result.lines) {

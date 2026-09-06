@@ -23,6 +23,11 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  RELEASE_SURFACE,
+  RELEASE_SURFACE_CONTEXTS,
+  TIER_B_EXPECTED_SKIPPED,
+} from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
 const RELEASE_YML = join(ROOT, '.github/workflows/release.yml');
@@ -223,6 +228,793 @@ describe('security-08: npm auth probe in version-gate', () => {
         `Direct needs of "${job}": [${(graph.get(job) ?? []).join(', ')}]`,
       );
     }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Additional structural helpers for B1 checks (S5-S13)
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the `on:` block — from `on:` (0-indent) to the next 0-indent key.
+ */
+function extractOnBlock(source) {
+  const lines = source.split('\n');
+  const start = lines.findIndex(l => /^on:\s*$/.test(l));
+  if (start === -1) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^[a-z]/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join('\n');
+}
+
+/**
+ * Extract the job-level `if:` condition (4-space indent).
+ * Returns the condition string, or null when none is present.
+ */
+function extractJobIf(jobSection) {
+  if (!jobSection) return null;
+  for (const line of jobSection.split('\n')) {
+    const m = /^    if:\s+(.+)$/.exec(line);
+    if (m) return m[1].trim();
+  }
+  return null;
+}
+
+/**
+ * Drop whole-line YAML comments.
+ *
+ * Checks that ask "does this job invoke X?" must read executable YAML only: a
+ * comment naming `uses: pypa/gh-action-pypi-publish` (as the rehearsal's own
+ * warning-not-to does) is documentation, not an invocation, and a guard that
+ * cannot tell them apart fires on the text that exists to prevent the defect.
+ */
+function stripCommentLines(text) {
+  return text.split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
+}
+
+/**
+ * Extract the `on.pull_request.paths:` list as an array of path patterns.
+ * Returns null when the trigger or its paths filter is absent.
+ *
+ * Indentation contract inside the `on:` block:
+ *   2-space: event names (push, pull_request, workflow_dispatch)
+ *   4-space: event fields (paths, tags, inputs)
+ *   6-space: list items (`      - '<pattern>'`)
+ */
+function extractPullRequestPaths(source) {
+  const onBlock = extractOnBlock(source);
+  if (onBlock === null) return null;
+  const lines = onBlock.split('\n');
+  const prIdx = lines.findIndex(l => /^  pull_request:\s*$/.test(l));
+  if (prIdx === -1) return null;
+  let pathsIdx = -1;
+  for (let i = prIdx + 1; i < lines.length; i++) {
+    if (/^  [a-z_]+:/.test(lines[i])) break;   // next event — paths not found
+    if (/^    paths:\s*$/.test(lines[i])) { pathsIdx = i; break; }
+  }
+  if (pathsIdx === -1) return null;
+  const out = [];
+  for (let i = pathsIdx + 1; i < lines.length; i++) {
+    const m = /^      - ['"]?([^'"]+)['"]?\s*$/.exec(lines[i]);
+    if (!m) break;
+    out.push(m[1]);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// B1 structural invariants (S5-S13)
+// ---------------------------------------------------------------------------
+
+describe('B1: release-surface PR gate and rehearsal jobs', () => {
+
+  // -------------------------------------------------------------------------
+  // S5: rehearse-publish-python job must exist.
+  // Non-vacuity: without this job the D-PR6 release-surface check would never
+  // be exercised on PRs, defeating PF-039 (tag-guarded steps are untested).
+  // -------------------------------------------------------------------------
+  test('S5: rehearse-publish-python job exists in release.yml', () => {
+    const section = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(
+      section !== null,
+      'rehearse-publish-python job must exist; PF-039 — a tag-guarded publish step ' +
+      'that is never rehearsed on PRs cannot be validated before the release',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S6: rehearse-publish-python must have a job-level if: that is conditioned
+  // on needs.build-python.result == 'success' but NOT on refs/tags/v or any
+  // startsWith(github.ref) guard, so PRs and dispatches both exercise it.
+  //
+  // PF-039 rationale: a tag guard would make rehearse-publish-python skip on
+  // pull_request, removing the only pre-tag validation of the pypa action pin
+  // and GHCR image. The job must run on all three triggers; using a needs
+  // result-condition (not an event guard) is the correct pattern.
+  // -------------------------------------------------------------------------
+  test('S6: rehearse-publish-python has a job-level if: conditioned on build-python success (not a tag guard)', () => {
+    const section = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(section !== null, 'rehearse-publish-python must exist (see S5)');
+    const jobIf = extractJobIf(section);
+    assert.ok(
+      jobIf !== null,
+      'rehearse-publish-python must have a job-level if: conditioned on needs.build-python.result ' +
+      '(the job is decoupled from stage-and-verify-napi so a napi failure cannot block the rehearsal); ' +
+      `got if: ${jobIf}`,
+    );
+    assert.ok(
+      jobIf.includes("needs.build-python.result == 'success'"),
+      'rehearse-publish-python if: must contain needs.build-python.result == \'success\'; ' +
+      `got: ${jobIf}`,
+    );
+    // The guard must NOT be a refs/tags/v or startsWith(github.ref) condition —
+    // those would re-introduce PF-039 by skipping on pull_request events.
+    assert.ok(
+      !jobIf.includes('refs/tags') && !jobIf.includes('startsWith(github.ref'),
+      'rehearse-publish-python if: must NOT contain a refs/tags/v or startsWith guard — ' +
+      'that would skip on pull_request, removing pre-tag validation (PF-039); ' +
+      `got: ${jobIf}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S7: rehearse-publish-python must transitively need version-gate.
+  // This ensures the credential probe runs before the OIDC exchange contacts
+  // the registry, preserving the security-08 ordering invariant.
+  // -------------------------------------------------------------------------
+  test('S7: rehearse-publish-python transitively needs version-gate (ordering invariant)', () => {
+    const graph = buildNeedsGraph(yml);
+    assert.ok(
+      graph.has('rehearse-publish-python'),
+      'rehearse-publish-python must be in the jobs graph (see S5)',
+    );
+    assert.ok(
+      transitivelyNeeds(graph, 'rehearse-publish-python', 'version-gate'),
+      'rehearse-publish-python must transitively need version-gate so the credential ' +
+      'probe runs before the OIDC exchange; ' +
+      `direct needs: [${(graph.get('rehearse-publish-python') ?? []).join(', ')}]`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S8: the rehearsal must contain a GHCR manifest probe for the
+  // pypa/gh-action-pypi-publish pin (PF-040, #350 option 3).
+  // An absent or stale pin (SHA instead of tag name) silently breaks the
+  // publish-python job at runtime with "manifest unknown".
+  //
+  // The probe lives in rehearse-publish-python, not version-gate: publish-crates
+  // needs the rehearsal, so a bad pin still aborts the release before the
+  // irreversible crates.io write, and keeping one copy means there is one place
+  // to bump when the pin moves (a second copy is a place to forget).
+  // -------------------------------------------------------------------------
+  test('S8: rehearse-publish-python contains GHCR manifest probe for pypa/gh-action-pypi-publish', () => {
+    const section = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(section !== null, 'rehearse-publish-python must exist');
+    assert.ok(
+      section.includes('ghcr.io/v2/pypa/gh-action-pypi-publish/manifests'),
+      'rehearse-publish-python must probe the GHCR manifest for the ' +
+      'pypa/gh-action-pypi-publish pin (#350 option 3, PF-040); a missing or SHA-pinned ' +
+      'image causes publish-python to fail at runtime with "manifest unknown"; ' +
+      `got section (first 600 chars):\n${section.slice(0, 600)}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S9: The CI-history step in version-gate must use a step-level if: guard
+  // (not a job-level guard).
+  //
+  // If version-gate itself were guarded at the job level to skip on PRs, the
+  // Tier-B verifier would see version-gate as skipped and fail the PR
+  // (ADR-013 amendment 2026-09-06). The fix is a step-level if: so the job
+  // runs (and succeeds) but the CI-history step is skipped on non-tag events.
+  // -------------------------------------------------------------------------
+  test('S9: CI-history step in version-gate uses step-level if: (not job-level)', () => {
+    const section = extractJobSection(yml, 'version-gate');
+    assert.ok(section !== null, 'version-gate must exist');
+
+    // Confirm the CI-history step still exists (non-vacuity).
+    assert.ok(
+      section.includes('Assert tagged SHA has green CI history'),
+      'version-gate must still contain the CI-history step (non-vacuity guard)',
+    );
+
+    // Step-level if: is at 8-space indent (step field); job-level at 4-space.
+    // We accept step-level if: anywhere in the section (the step is the only
+    // consumer of a conditional skip in version-gate).
+    const hasStepLevelIf = section.split('\n').some(l => /^        if:/.test(l));
+    assert.ok(
+      hasStepLevelIf,
+      'version-gate must use a step-level if: (8-space indent) on the CI-history step ' +
+      'so that PRs can skip that step without marking version-gate itself skipped — a ' +
+      'skipped version-gate would fail the Tier-B verifier (ADR-013 amendment 2026-09-06); ' +
+      `got section (first 800 chars):\n${section.slice(0, 800)}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S10: The on: block must include a pull_request trigger with at least one
+  // path from RELEASE_SURFACE (ensuring release-surface PRs exercise the gate).
+  // -------------------------------------------------------------------------
+  test('S10: on.pull_request.paths equals RELEASE_SURFACE exactly (as a set)', () => {
+    const onBlock = extractOnBlock(yml);
+    assert.ok(onBlock !== null, 'release.yml must have an on: block');
+    assert.ok(
+      onBlock.includes('pull_request:'),
+      'release.yml must have a pull_request: trigger so release-surface PRs are validated; ' +
+      `got on: block:\n${onBlock}`,
+    );
+
+    const paths = extractPullRequestPaths(yml);
+    assert.ok(
+      Array.isArray(paths) && paths.length > 0,
+      'on.pull_request.paths must be a non-empty list — an unfiltered trigger would run the ' +
+      'whole release matrix on every PR, and an unparseable one would make this test vacuous ' +
+      `(PF-013); got on: block:\n${onBlock}`,
+    );
+
+    // Positive control (PF-013): the extractor must actually FIND a planted entry.
+    // Without this, a regex that silently returns [] would satisfy nothing and the
+    // set comparison below would be comparing two empty sets.
+    const control = extractPullRequestPaths([
+      'on:',
+      '  pull_request:',
+      '    paths:',
+      "      - 'planted/control/**'",
+      '  workflow_dispatch:',
+      'permissions:',
+    ].join('\n'));
+    assert.deepEqual(
+      control, ['planted/control/**'],
+      'positive control: extractPullRequestPaths must parse a planted paths list; ' +
+      `got ${JSON.stringify(control)}`,
+    );
+
+    // The two lists must be EQUAL as sets. This is the invariant the D-PR6 header
+    // comment in verify-pr-checks.mjs asserts: RELEASE_SURFACE is the verifier's
+    // model of what triggers this workflow, and a filter the verifier does not
+    // know about is a path whose PR silently gets no release run (ADR-013
+    // amendment 2026-09-06 — a mis-specified paths filter must not pass as a
+    // silent no-run).
+    assert.deepEqual(
+      [...paths].sort(), [...RELEASE_SURFACE].sort(),
+      'on.pull_request.paths and RELEASE_SURFACE (verify-pr-checks.mjs) must be the same set. ' +
+      'A path in the workflow but not in RELEASE_SURFACE runs the release matrix without the ' +
+      'verifier requiring it; a path in RELEASE_SURFACE but not in the workflow makes the ' +
+      'verifier demand release check-runs that can never appear, hard-failing the PR. ' +
+      `workflow paths = ${JSON.stringify(paths)}; RELEASE_SURFACE = ${JSON.stringify(RELEASE_SURFACE)}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S11: publish-testpypi job must exist (opt-in TestPyPI leg, #350).
+  // -------------------------------------------------------------------------
+  test('S11: publish-testpypi job exists in release.yml', () => {
+    const section = extractJobSection(yml, 'publish-testpypi');
+    assert.ok(
+      section !== null,
+      'publish-testpypi job must exist for the opt-in TestPyPI leg (#350)',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S12: publish-testpypi must be guarded by a job-level if: that references
+  // inputs.testpypi so it only runs when the dispatch input is set to true.
+  // Without this guard it would run on every PR and tag push, causing
+  // unintended TestPyPI uploads.
+  // -------------------------------------------------------------------------
+  test('S12: publish-testpypi has job-level if: referencing inputs.testpypi', () => {
+    const section = extractJobSection(yml, 'publish-testpypi');
+    assert.ok(section !== null, 'publish-testpypi must exist (see S11)');
+    const jobIf = extractJobIf(section);
+    assert.ok(
+      jobIf !== null && jobIf.includes('inputs.testpypi'),
+      'publish-testpypi must have a job-level if: referencing inputs.testpypi; ' +
+      'this keeps it out of PR and standard dispatch runs — it runs ONLY when the ' +
+      'workflow_dispatch testpypi input is true (#350); ' +
+      `got if: ${jobIf}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S13: publish-testpypi's name: field must appear in TIER_B_EXPECTED_SKIPPED
+  // so the Tier-B verifier tolerates the skipped conclusion on standard PRs
+  // and dispatch runs (ADR-013).
+  // -------------------------------------------------------------------------
+  test('S13: publish-testpypi name is listed in TIER_B_EXPECTED_SKIPPED', () => {
+    const section = extractJobSection(yml, 'publish-testpypi');
+    assert.ok(section !== null, 'publish-testpypi must exist (see S11)');
+
+    // Extract the job name: field (4-space indent).
+    const jobNameOf = (text) => {
+      for (const line of text.split('\n')) {
+        const m = /^    name:\s+(.+)$/.exec(line);
+        if (m) return m[1].trim();
+      }
+      return null;
+    };
+
+    // Positive control (PF-013): the pair (extractor, membership check) must be
+    // able to FAIL. A planted section whose name is not in the allowlist has to
+    // be flagged — otherwise `TIER_B_EXPECTED_SKIPPED.has(jobName)` could be
+    // passing on a name nobody set, or on an extractor that never returns.
+    const plantedName = jobNameOf([
+      '  publish-testpypi:',
+      '    name: Publish to Somewhere Nobody Allowed',
+      '    runs-on: ubuntu-latest',
+    ].join('\n'));
+    assert.equal(plantedName, 'Publish to Somewhere Nobody Allowed',
+      'positive control: the name: extractor must read a planted name');
+    assert.ok(!TIER_B_EXPECTED_SKIPPED.has(plantedName),
+      'positive control: an unlisted job name must NOT be treated as an allowed skip');
+
+    const jobName = jobNameOf(section);
+    assert.ok(
+      jobName !== null,
+      `publish-testpypi must have a name: field; got section:\n${section}`,
+    );
+
+    assert.ok(
+      TIER_B_EXPECTED_SKIPPED.has(jobName),
+      `publish-testpypi name "${jobName}" must be listed in TIER_B_EXPECTED_SKIPPED ` +
+      `in verify-pr-checks.mjs so skipped conclusions are tolerated on non-dispatch runs ` +
+      `(ADR-013); current set: [${[...TIER_B_EXPECTED_SKIPPED].join(', ')}]`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S14: pypa/gh-action-pypi-publish must be invoked ONLY by the two jobs that
+  // genuinely publish. This is a drift guard for a defect that actually shipped.
+  //
+  // Run 34060146952 (a pull_request run of this workflow) executed
+  // `uses: pypa/gh-action-pypi-publish@v1.14.2` with `dry-run: true` inside
+  // rehearse-publish-python. v1.14.2 has NO dry-run input: the runner logged
+  // "Unexpected input(s) 'dry-run'", the action ignored it, and then performed a
+  // REAL upload to https://upload.pypi.org/legacy/ from a pull request. It failed
+  // only because the workspace version (0.4.2) was already on PyPI — on a
+  // version-bump PR (which touches crates/mds-python/Cargo.toml and therefore
+  // matches the release-surface paths filter) the upload would have SUCCEEDED,
+  // publishing an unreleased version from an unmerged branch.
+  //
+  // There is no no-upload mode to configure. The rehearsal must reproduce what
+  // the action does — pull its GHCR image and run twine out of it — never call it.
+  // -------------------------------------------------------------------------
+  test('S14: pypa/gh-action-pypi-publish is invoked ONLY by publish-python and publish-testpypi', () => {
+    const USES = 'uses: pypa/gh-action-pypi-publish';
+
+    // Positive control (PF-013): `!section.includes(USES)` is satisfied by ANY
+    // string, including the empty one a broken extractor would return. Prove the
+    // check flags a section that does carry the invocation before trusting it on
+    // the real ones.
+    const plantedRehearsal = [
+      '  rehearse-publish-python:',
+      '    name: Rehearse PyPI publish (no upload)',
+      '    steps:',
+      '      - uses: pypa/gh-action-pypi-publish@v1.14.2',
+      '        with:',
+      '          dry-run: true',
+    ].join('\n');
+    assert.ok(
+      plantedRehearsal.includes(USES),
+      'positive control: a section carrying the invocation must be detected by this check',
+    );
+
+    assert.ok(
+      !stripCommentLines(plantedRehearsal.replace('      - uses:', '      # - uses:')).includes(USES),
+      'positive control: a commented-out invocation must NOT count as an invocation',
+    );
+
+    for (const jobId of ['rehearse-publish-python', 'version-gate']) {
+      const section = stripCommentLines(extractJobSection(yml, jobId) ?? '');
+      assert.ok(section !== '', `${jobId} must exist`);
+      assert.ok(
+        !section.includes(USES),
+        `${jobId} must NOT invoke pypa/gh-action-pypi-publish. The action has no ` +
+        `dry-run/no-upload mode: an unrecognised input is warned about and ignored, and ` +
+        `the action then uploads for real (run 34060146952 did exactly that from a ` +
+        `pull_request). Reproduce the action instead of calling it — GHCR probe, ` +
+        `docker pull, twine check (PF-039, PF-040);\ngot section:\n${section}`,
+      );
+    }
+
+    const invocations = stripCommentLines(yml).split('\n').filter(l => l.includes(USES));
+    assert.equal(
+      invocations.length, 2,
+      `release.yml must invoke pypa/gh-action-pypi-publish exactly twice — once in ` +
+      `publish-python (PyPI) and once in publish-testpypi (TestPyPI). Every other ` +
+      `invocation is an upload nobody asked for; found ${invocations.length}: ` +
+      `${JSON.stringify(invocations.map(l => l.trim()))}`,
+    );
+    for (const jobId of ['publish-python', 'publish-testpypi']) {
+      const section = extractJobSection(yml, jobId);
+      assert.ok(section !== null, `${jobId} must exist`);
+      assert.ok(
+        section.includes(USES),
+        `${jobId} is one of the two jobs that must invoke pypa/gh-action-pypi-publish; ` +
+        `got section:\n${section}`,
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // S15: the rehearsal must not hold id-token: write.
+  //
+  // Defence in depth behind S14: without id-token the job cannot mint a PyPI
+  // trusted-publishing token, so even a re-introduced upload step has no
+  // credential to upload with. `contents: read` is the whole permission set.
+  // -------------------------------------------------------------------------
+  test('S15: rehearse-publish-python has contents: read and NO id-token permission', () => {
+    const raw = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(raw !== null, 'rehearse-publish-python must exist (see S5)');
+    const section = stripCommentLines(raw);
+    assert.ok(
+      section.includes('contents: read'),
+      `rehearse-publish-python must declare permissions: contents: read; got:\n${section}`,
+    );
+    assert.ok(
+      !section.includes('id-token'),
+      'rehearse-publish-python must NOT be granted id-token — a job that cannot mint a ' +
+      'PyPI trusted-publishing token cannot upload even if an upload step is ' +
+      're-introduced (defence in depth behind S14); ' +
+      `got section:\n${section}`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S16: the pin the rehearsal validates must be the pin the publish jobs use.
+  //
+  // The rehearsal proves an image exists for PIN_REF. If PIN_REF and the
+  // `uses: ...@<ref>` pins drift, the rehearsal proves the wrong image and the
+  // release fails on the pin it never checked — the v0.4.1 shape (PF-040).
+  // -------------------------------------------------------------------------
+  test('S16: rehearse-publish-python PIN_REF equals every pypa/gh-action-pypi-publish pin', () => {
+    const raw = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(raw !== null, 'rehearse-publish-python must exist (see S5)');
+    const section = stripCommentLines(raw);
+    const m = /^\s+PIN_REF:\s*(\S+)\s*$/m.exec(section);
+    assert.ok(
+      m !== null,
+      'rehearse-publish-python must declare a PIN_REF env var naming the pin under test; ' +
+      `got section:\n${section}`,
+    );
+    const pin = m[1];
+
+    const refs = [...stripCommentLines(yml)
+      .matchAll(/uses:\s*pypa\/gh-action-pypi-publish@(\S+)/g)].map(x => x[1]);
+    // Non-vacuity (PF-013): an empty ref list would make the loop below pass
+    // without comparing anything.
+    assert.ok(
+      refs.length > 0,
+      'release.yml must invoke pypa/gh-action-pypi-publish somewhere (see S14); found none',
+    );
+    for (const ref of refs) {
+      assert.equal(
+        ref, pin,
+        `pypa/gh-action-pypi-publish is pinned to "${ref}" but the rehearsal validates ` +
+        `PIN_REF="${pin}". The rehearsal would prove an image that the publish job never ` +
+        `pulls (PF-040). Bump both together.`,
+      );
+    }
+
+    // The single distinct action ref must be a vX.Y.Z release tag (M17 / PF-040).
+    // The gate enforces policy — not just existence — so a commit SHA or annotated-tag
+    // object SHA that happens to have a GHCR image is not acceptable (the policy is
+    // "pin by release tag name so humans can read the version at a glance").
+    const distinctRefs = [...new Set(refs)];
+    assert.equal(
+      distinctRefs.length, 1,
+      `all pypa/gh-action-pypi-publish uses must pin the same ref; found: [${distinctRefs.join(', ')}]`,
+    );
+    assert.ok(
+      /^v\d+\.\d+\.\d+$/.test(distinctRefs[0]),
+      `the single distinct pypa/gh-action-pypi-publish pin "${distinctRefs[0]}" must match ` +
+      '/^v\\d+\\.\\d+\\.\\d+$/ (a vX.Y.Z release tag) — a commit SHA or annotated-tag object ' +
+      'SHA is indistinguishable by eye but has no GHCR image for annotated objects (PF-040); ' +
+      `positive control: "a892a5a61159132606e93a2fa6f4358831b04d26" must be REJECTED ` +
+      `(it matches /^[0-9a-f]{40}$/ but not /^v\\d+\\.\\d+\\.\\d+$/)`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S17: the rehearsal's four gates, each with a positive control.
+  //
+  // PF-013: a gate that has never been observed rejecting anything is not
+  // evidence. Each gate below runs a known-bad input first and fails if that
+  // input is ACCEPTED.
+  // -------------------------------------------------------------------------
+  test('S17: rehearsal gates the pin shape, GHCR manifest, docker pull and twine — with positive controls', () => {
+    const section = extractJobSection(yml, 'rehearse-publish-python');
+    assert.ok(section !== null, 'rehearse-publish-python must exist (see S5)');
+
+    const gates = [
+      ['ghcr.io/v2/pypa/gh-action-pypi-publish/manifests',
+        'GHCR manifest probe — asks GHCR the same question the runner asks at publish time'],
+      ['docker pull',
+        'docker pull — proves the artifact the RUNTIME fetches, not just that the git ref resolves (PF-040)'],
+      ['--entrypoint twine',
+        'twine check must run out of the publish image, bypassing its upload entrypoint'],
+      ['--network none',
+        'the twine check must run with the network switched off so the rehearsal physically cannot reach pypi.org'],
+    ];
+    for (const [needle, why] of gates) {
+      assert.ok(
+        section.includes(needle),
+        `rehearse-publish-python must contain "${needle}": ${why};\ngot section:\n${section}`,
+      );
+    }
+
+    // Each of the four gates must carry a positive control (PF-013).
+    const controlLines = section.split('\n').filter(l => l.includes('positive control'));
+    assert.ok(
+      controlLines.length >= gates.length,
+      `each of the ${gates.length} rehearsal gates needs a positive control (PF-013: a gate ` +
+      `never observed rejecting anything is not evidence); found ${controlLines.length} ` +
+      `line(s) mentioning one`,
+    );
+
+    // The controls must be concrete known-bad inputs, not prose.
+    assert.ok(
+      section.includes('a892a5a61159132606e93a2fa6f4358831b04d26'),
+      'the pin-shape gate must be exercised against the v0.4.1 annotated-tag-object SHA ' +
+      'that actually broke a release (PF-040), so the gate is proven to reject it',
+    );
+    assert.ok(
+      section.includes('BOGUS_REF'),
+      'the GHCR and docker-pull gates must be exercised against a ref that cannot exist, ' +
+      'so a probe that returns 200 for everything is caught (PF-013)',
+    );
+
+    // Gate 4: the rehearsal must print the twine version from the publish image
+    // so logs capture which twine validated the distributions (plan spec item).
+    assert.ok(
+      section.includes('--version'),
+      'Gate 4: rehearsal must invoke the image twine with --version (--entrypoint twine ' +
+      '... --version) so the log captures which twine version validated the distributions',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S18: every name the verifier REQUIRES on a release-surface PR must be a
+  // real job display-name in release.yml.
+  //
+  // RELEASE_SURFACE_CONTEXTS is Tier A semantics applied to release check-runs:
+  // absence is FAIL. So a job renamed in the workflow without the verifier being
+  // updated makes the verifier demand a check-run that can never appear, and the
+  // mandatory pre-merge gate hard-fails every release-surface PR — whose natural
+  // workaround is bypassing the gate, the PF-017 shape ADR-013's 2026-09-06
+  // amendment warns about. Same three-place accounting, third place pinned.
+  // -------------------------------------------------------------------------
+  test('S18: every RELEASE_SURFACE_CONTEXTS name is a real job name: in release.yml', () => {
+    const jobNames = new Set(
+      findAllJobIds(yml)
+        .map(id => {
+          const section = stripCommentLines(extractJobSection(yml, id) ?? '');
+          const m = /^    name:\s+(.+)$/m.exec(section);
+          return m ? m[1].trim() : null;
+        })
+        .filter(n => n !== null),
+    );
+
+    // Non-vacuity (PF-013): an empty set would satisfy nothing and make every
+    // membership assertion below unreachable.
+    assert.ok(
+      jobNames.size > 0,
+      `release.yml must declare job name: fields; found none among jobs [${findAllJobIds(yml).join(', ')}]`,
+    );
+    // Positive control: a name nobody declared must NOT be found.
+    assert.ok(
+      !jobNames.has('Rehearse PyPI publish (no upload) — renamed'),
+      'positive control: an undeclared job name must not be reported as present',
+    );
+
+    for (const ctx of RELEASE_SURFACE_CONTEXTS) {
+      assert.ok(
+        jobNames.has(ctx),
+        `RELEASE_SURFACE_CONTEXTS lists "${ctx}" but no job in release.yml carries that ` +
+        `name:. The verifier would require a check-run that can never appear, hard-failing ` +
+        `every release-surface PR (ADR-013 amendment 2026-09-06, PF-017). ` +
+        `Declared job names: [${[...jobNames].join(' | ')}]`,
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // M10a: every job whose section contains `cargo publish` must transitively
+  // need rehearse-publish-python, so a failed OIDC exchange aborts before the
+  // irreversible crates.io write (PF-039/PF-023).
+  //
+  // Non-vacuity: assert at least one such job exists (PF-013).
+  // Positive control: a graph where publish-crates needs only version-gate
+  // must be flagged (rehearsal edge is absent → not transitive).
+  // -------------------------------------------------------------------------
+  test('M10a: every cargo-publish job transitively needs rehearse-publish-python', () => {
+    const graph = buildNeedsGraph(yml);
+    assert.ok(
+      graph.has('rehearse-publish-python'),
+      'non-vacuity: rehearse-publish-python must be a graph node; PF-013',
+    );
+
+    const allIds = findAllJobIds(yml);
+    const cargoPublishJobs = allIds.filter(id => {
+      // Use stripCommentLines and then look for lines where "cargo publish" is
+      // the actual command being run (not in echo strings or error messages).
+      // A line that is the command starts with leading whitespace then "cargo ",
+      // as opposed to being inside an echo/error string.
+      const section = stripCommentLines(extractJobSection(yml, id) ?? '');
+      return section.split('\n').some(line => {
+        const trimmed = line.trimStart();
+        return trimmed.startsWith('cargo publish') ||
+               // inside if/OUTPUT=$(...) patterns
+               trimmed.includes('cargo publish -p ') ||
+               // bare cargo publish invocation
+               /^\s*cargo publish\b/.test(line);
+      });
+    });
+    assert.ok(
+      cargoPublishJobs.length > 0,
+      'non-vacuity (PF-013): at least one job must contain "cargo publish"; found none',
+    );
+
+    // Positive control: a graph without the rehearsal edge must be flagged.
+    const controlGraph = new Map([
+      ['publish-crates', new Set(['version-gate'])],
+      ['version-gate', new Set()],
+      ['rehearse-publish-python', new Set(['build-python'])],
+      ['build-python', new Set(['version-gate'])],
+    ]);
+    assert.ok(
+      !transitivelyNeeds(controlGraph, 'publish-crates', 'rehearse-publish-python'),
+      'positive control: graph without rehearsal edge must report NOT transitive (PF-013)',
+    );
+
+    for (const id of cargoPublishJobs) {
+      assert.ok(
+        transitivelyNeeds(graph, id, 'rehearse-publish-python'),
+        `job "${id}" contains "cargo publish" but does not transitively need ` +
+        `rehearse-publish-python — a failed GHCR or twine rehearsal cannot abort ` +
+        `before the crates.io write (irreversible, PF-039)`,
+      );
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // M10b: publish-crates must NOT transitively need publish-testpypi.
+  // publish-testpypi is the opt-in TestPyPI leg and must never gate the tag
+  // path — a failing or skipped TestPyPI upload must not block a release.
+  //
+  // Positive control: a graph with publish-crates → publish-testpypi must be
+  // flagged as transitive (so we know the check can actually detect the edge).
+  // -------------------------------------------------------------------------
+  test('M10b: publish-crates must NOT transitively need publish-testpypi (opt-in leg must never gate the tag path)', () => {
+    const graph = buildNeedsGraph(yml);
+    assert.ok(
+      graph.has('publish-crates'),
+      'non-vacuity: publish-crates must be a graph node; PF-013',
+    );
+    assert.ok(
+      graph.has('publish-testpypi'),
+      'non-vacuity: publish-testpypi must be a graph node; PF-013',
+    );
+
+    // Positive control: adding the edge must make the check fire.
+    const controlGraph = new Map([...graph].map(([k, v]) => [k, new Set(v)]));
+    const pcNeeds = controlGraph.get('publish-crates') ?? new Set();
+    pcNeeds.add('publish-testpypi');
+    controlGraph.set('publish-crates', pcNeeds);
+    assert.ok(
+      transitivelyNeeds(controlGraph, 'publish-crates', 'publish-testpypi'),
+      'positive control: graph with publish-crates → publish-testpypi edge must report transitive (PF-013)',
+    );
+
+    assert.ok(
+      !transitivelyNeeds(graph, 'publish-crates', 'publish-testpypi'),
+      'publish-crates must NOT transitively need publish-testpypi — the opt-in TestPyPI ' +
+      'upload must never block a tag release (ADR-013)',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // M10c: ADR-013 three-place rule — for every job id, a job-level if:
+  // containing "refs/tags/v" or "inputs." implies its display name: is in
+  // TIER_B_EXPECTED_SKIPPED, and every member of TIER_B_EXPECTED_SKIPPED is
+  // such a guarded job. Set-equality with size 5.
+  //
+  // Positive control: a fake job section with a guarded if: and a name not in
+  // the set must be flagged.
+  // -------------------------------------------------------------------------
+  test('M10c: ADR-013 three-place rule — guarded jobs and TIER_B_EXPECTED_SKIPPED are the same set (size 5)', () => {
+    const allIds = findAllJobIds(yml);
+
+    // Helper: extract job name field from a section.
+    const jobNameOf = (text) => {
+      const section = stripCommentLines(text);
+      const m = /^    name:\s+(.+)$/m.exec(section);
+      return m ? m[1].trim() : null;
+    };
+
+    // Collect guarded job names: jobs whose if: contains refs/tags/v or inputs.
+    const guardedNames = new Set();
+    for (const id of allIds) {
+      const section = extractJobSection(yml, id) ?? '';
+      const jobIf = extractJobIf(section);
+      if (jobIf && (jobIf.includes('refs/tags/v') || jobIf.includes('inputs.'))) {
+        const name = jobNameOf(section);
+        if (name) guardedNames.add(name);
+      }
+    }
+
+    // Positive control (PF-013): a fake section with guarded if: and unlisted
+    // name must be detected as missing from TIER_B_EXPECTED_SKIPPED.
+    const fakeSection = [
+      '  fake-publish-somewhere:',
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}",
+      '    name: Publish to Somewhere Unlisted',
+      '    runs-on: ubuntu-latest',
+    ].join('\n');
+    const fakeIf = extractJobIf(fakeSection);
+    const fakeName = jobNameOf(fakeSection);
+    assert.ok(fakeIf && fakeIf.includes('refs/tags/v'), 'positive control: extractJobIf must find the guarded if:');
+    assert.ok(fakeName === 'Publish to Somewhere Unlisted', 'positive control: jobNameOf must read the name');
+    assert.ok(!TIER_B_EXPECTED_SKIPPED.has(fakeName), 'positive control: unlisted name must not be in TIER_B_EXPECTED_SKIPPED');
+
+    // TIER_B_EXPECTED_SKIPPED must equal the guarded-jobs set exactly.
+    for (const name of guardedNames) {
+      assert.ok(
+        TIER_B_EXPECTED_SKIPPED.has(name),
+        `job with guarded if: (refs/tags/v or inputs.) named "${name}" is not in ` +
+        `TIER_B_EXPECTED_SKIPPED — a skipped run for this job would fail the Tier B verifier ` +
+        `on a dry-run or dispatch run (ADR-013 three-place rule)`,
+      );
+    }
+    for (const name of TIER_B_EXPECTED_SKIPPED) {
+      assert.ok(
+        guardedNames.has(name),
+        `TIER_B_EXPECTED_SKIPPED contains "${name}" but no job in release.yml has a guarded ` +
+        `if: (refs/tags/v or inputs.) and that display name — the set has drifted (ADR-013)`,
+      );
+    }
+    assert.equal(
+      guardedNames.size, 5,
+      `expected exactly 5 guarded jobs (ADR-013 three-place rule); found ${guardedNames.size}: ` +
+      `[${[...guardedNames].join(', ')}]`,
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // S19: no run: block in release.yml may contain the empty expression ${{ }}
+  // (dollar-brace-brace-whitespace*-brace-brace). GitHub's expression
+  // preprocessor scans run: block text WITHOUT stripping shell comments, and
+  // the empty expression is a parse error that makes GitHub reject the entire
+  // workflow with zero jobs emitted (run 34061583304 confirmed).
+  //
+  // Positive control: a planted string containing the pattern must be flagged.
+  // -------------------------------------------------------------------------
+  test('S19: no run: block in release.yml contains the empty GitHub expression ${{ }} (parse rejection guard)', () => {
+    const EMPTY_EXPR = /\$\{\{\s*\}\}/;
+
+    // Positive control (PF-013): the regex must match a planted occurrence.
+    const planted = 'echo "Actions only interpolates ${{ }}, not bare {{ }}"';
+    assert.ok(
+      EMPTY_EXPR.test(planted),
+      'positive control: the empty-expression regex must match the planted string; ' +
+      'if this fails, the guard is broken',
+    );
+
+    // Count occurrences in the real file.
+    const matches = yml.match(new RegExp(EMPTY_EXPR.source, 'g')) ?? [];
+    assert.equal(
+      matches.length, 0,
+      `release.yml contains ${matches.length} occurrence(s) of the empty expression ` +
+      '\\$\\{\\{\\s*\\}\\} — GitHub\'s parser rejects this even inside shell comments ' +
+      `within run: blocks (run 34061583304, P-fix). Found at: ` +
+      matches.map((_, i) => {
+        const idx = yml.indexOf(matches[i] ?? '');
+        const lineNum = yml.slice(0, idx).split('\n').length;
+        return `line ~${lineNum}`;
+      }).join(', '),
+    );
   });
 
 });
