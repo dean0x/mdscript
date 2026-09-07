@@ -268,6 +268,11 @@ export function releaseSuiteIdsFrom(runs) {
   return ids;
 }
 
+/** Format a set of suite ids for diagnostic messages. Returns 'none' when the set is empty. */
+function formatSuiteIds(ids) {
+  return [...ids].join(', ') || 'none';
+}
+
 // ---------------------------------------------------------------------------
 // gh runner (thin IO shim; injected in tests for offline operation)
 // ---------------------------------------------------------------------------
@@ -614,7 +619,7 @@ export function evaluateChecks({
         continue;
       }
       if (!releaseSuiteIds.has(suiteId)) {
-        const relIds = [...releaseSuiteIds].join(', ') || 'none';
+        const relIds = formatSuiteIds(releaseSuiteIds);
         failures.push(
           `Tier B (non-required): "${cr.name}" — conclusion=skipped in suite ${suiteId} ` +
           `which is NOT a release.yml suite (D-PR8: allowed release suite ids: ${relIds})`,
@@ -699,7 +704,7 @@ export function evaluateChecks({
         );
         const ignoredCount = allRunsForName.length - releaseRuns.length;
         if (releaseRuns.length === 0) {
-          const relIds = [...releaseSuiteIds].join(', ') || 'none';
+          const relIds = formatSuiteIds(releaseSuiteIds);
           const ignoredNote = ignoredCount > 0
             ? `; ${ignoredCount} same-name run(s) in other suites ignored`
             : '';
