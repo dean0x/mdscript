@@ -1894,7 +1894,6 @@ describe('D-PR7: release-surface presence check', () => {
   // re-run mask a red sibling — a fail-open in a merge gate.
   // -------------------------------------------------------------------------
   test('D-PR7j: a failed and a succeeded run sharing a release-surface name → exit 1 (all must pass)', () => {
-    // 3a803f5 is the commit cited by the original D-PR7j all-must-pass spec.
     const checkRuns = passingRunsWith([
       ...releaseSuccessRuns(),
       // A second run under a name that already has a success above, in the SAME release suite.
@@ -2291,7 +2290,7 @@ describe('D-PR5k: multiple release suites on one head (dispatch + pull_request)'
     assert.equal(result.exitCode, 0,
       'both release suites must allow their skipped runs → pass');
 
-    // Control: flip TestPyPI in SUITE_B to failure → exit 1 (all-must-pass, D-PR7j ref 3a803f5)
+    // Control: flip TestPyPI in SUITE_B to failure → exit 1 (all-must-pass, D-PR7j)
     const runs2 = basePassingRunsWith([
       ...['Publish to crates.io', 'Publish to npm', 'Publish to PyPI', 'GitHub Release'].map(name =>
         withSuite({ name, status: 'completed', conclusion: 'skipped' }, SUITE_A),
@@ -2337,7 +2336,7 @@ describe('D-PR7k, D-PR7l: D-PR7 attribution keyed on release suite identity', ()
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['.github/workflows/release.yml'],
-      releaseSuiteIds: RELEASE_SUITES, // correct spelling
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1, 'contexts only in ci.yml suite must fail (D-PR8)');
     const allLines = result.lines.join('\n');

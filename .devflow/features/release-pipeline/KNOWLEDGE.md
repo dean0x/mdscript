@@ -173,7 +173,7 @@ Steps (in order):
 1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all four spec files, 211 tests including pin-shape specs (S16) and per-leg cache key spec (S20).
+4. Run `npm run test:gates` — all four spec files, 210 tests including pin-shape specs (S16) and per-leg cache key spec (S20).
 5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA

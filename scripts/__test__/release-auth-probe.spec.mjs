@@ -1056,34 +1056,47 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns one entry per `- uses: Swatinem/rust-cache@` step in the comment-
- * stripped job section, with the `key:` value from its `with:` block, or null
- * when absent. A step ends at the next 6-space `- ` item in the stripped text.
+ * Returns one entry per Swatinem/rust-cache step in the comment-stripped job
+ * section, with the `key:` value from its `with:` block, or null when absent.
+ *
+ * Steps are segmented FIRST — a step runs from its 6-space `- ` line to the
+ * next one — and each segment is then tested for a `uses: Swatinem/rust-cache@`
+ * line at ANY position. Anchoring detection on `- uses:` would miss a step
+ * written `- name: …` / `  uses: Swatinem/rust-cache@…`, so a benign reorder
+ * would silently stop S20 from gating that step (avoids PF-013). Reading the
+ * key from the segment (rather than scanning forward until the next step)
+ * likewise cannot borrow a `key:` belonging to a different step.
  */
 function rustCacheSteps(jobSection) {
-  const stripped = stripCommentLines(jobSection);
-  const lines = stripped.split('\n');
-  const steps = [];
+  const lines = stripCommentLines(jobSection).split('\n');
+  const starts = [];
   for (let i = 0; i < lines.length; i++) {
-    if (/^      - uses: Swatinem\/rust-cache@/.test(lines[i])) {
-      let key = null;
-      for (let j = i + 1; j < lines.length; j++) {
-        if (/^      - /.test(lines[j])) break; // next step
-        const km = /^\s+key:\s+(.+)$/.exec(lines[j]);
-        if (km) { key = km[1].trim(); break; }
-      }
-      steps.push({ key });
+    if (/^      - /.test(lines[i])) starts.push(i);
+  }
+  const steps = [];
+  for (const [n, start] of starts.entries()) {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length);
+    if (!body.some(l => /^\s*(- )?uses:\s*Swatinem\/rust-cache@/.test(l))) continue;
+    let key = null;
+    for (const line of body) {
+      const km = /^\s+key:\s+(.+)$/.exec(line);
+      if (km) { key = km[1].trim(); break; }
     }
+    steps.push({ key });
   }
   return steps;
 }
 
 /**
- * True iff a 4-space `strategy:` line exists after comment stripping.
+ * True iff a 4-space `strategy:` key exists after comment stripping.
  * Matrix jobs declare `    strategy:` inside the job body.
+ *
+ * Trailing content is deliberately NOT anchored: `strategy:` followed by an
+ * inline comment or written as a flow mapping must still count, or a matrix
+ * job would be silently exempted from S20 (avoids PF-013).
  */
 function hasMatrix(jobSection) {
-  return stripCommentLines(jobSection).split('\n').some(l => /^    strategy:\s*$/.test(l));
+  return stripCommentLines(jobSection).split('\n').some(l => /^    strategy:(\s|$)/.test(l));
 }
 
 describe('B2: per-leg rust-cache keys in matrix jobs (#352, PF-041)', () => {
@@ -1193,6 +1206,60 @@ describe('B2: per-leg rust-cache keys in matrix jobs (#352, PF-041)', () => {
       !hasMatrix(commentedStrategySection),
       'PC5: a job with strategy: only in a comment must not be treated as a matrix job',
     );
+
+    // PC5b: `strategy:` carrying trailing content (inline comment, flow mapping)
+    // must STILL count as a matrix job — anchoring on end-of-line would exempt a
+    // real matrix job from S20 without any test failing (avoids PF-013).
+    assert.ok(
+      hasMatrix(['  fake:', '    strategy:  # fail-fast tuned below', '    steps:'].join('\n')),
+      'PC5b: strategy: with a trailing inline comment must still be a matrix job',
+    );
+    assert.ok(
+      hasMatrix(['  fake:', '    strategy: { matrix: { target: [a, b] } }', '    steps:'].join('\n')),
+      'PC5b: strategy: written as a flow mapping must still be a matrix job',
+    );
+
+    // PC6: a rust-cache step whose `uses:` is NOT the first key must still be
+    // detected, and its key read. Anchoring detection on `- uses:` would let a
+    // benign reorder (adding a `name:`) silently disable S20 for that step.
+    const nameFirstSection = [
+      '  fake-matrix:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          - target: aarch64',
+      '    steps:',
+      '      - name: Cache Rust artifacts',
+      '        uses: Swatinem/rust-cache@v2',
+      '        with:',
+      '          key: ${{ matrix.target }}',
+      '      - name: Next step',
+      '        run: echo done',
+    ].join('\n');
+    const nameFirstSteps = rustCacheSteps(nameFirstSection);
+    assert.equal(nameFirstSteps.length, 1,
+      'PC6: a rust-cache step whose uses: is not the first key must still be detected');
+    assert.equal(nameFirstSteps[0].key, '${{ matrix.target }}',
+      'PC6: key must be read from a step whose uses: is not the first key');
+
+    // PC7 (negative): a `key:` that belongs to a LATER, non-rust-cache step must
+    // not be borrowed by a bare rust-cache step that precedes it.
+    const borrowedKeySection = [
+      '  fake-matrix:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          - target: aarch64',
+      '    steps:',
+      '      - uses: Swatinem/rust-cache@v2',
+      '      - uses: actions/cache@v4',
+      '        with:',
+      '          key: someone-elses-key',
+    ].join('\n');
+    const borrowedSteps = rustCacheSteps(borrowedKeySection);
+    assert.equal(borrowedSteps.length, 1, 'PC7: only the rust-cache step must be collected');
+    assert.equal(borrowedSteps[0].key, null,
+      'PC7: a bare rust-cache step must not borrow the next step\'s key');
 
     // --- Non-vacuity: confirm checked set membership ---
 
