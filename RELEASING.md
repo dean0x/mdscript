@@ -34,7 +34,10 @@ These are **not** automated and must be done before the first release:
    Provenance requires the `id-token: write` permission (already set on the
    publish job) plus publishing from GitHub Actions.
 3. **Add the `CARGO_REGISTRY_TOKEN` repo secret** with publish rights to
-   `mds-core` and `mds-cli` on crates.io.
+   `mds-core` and `mds-cli` on crates.io. The workflow cannot probe this token
+   (crates.io has no read-only endpoint that accepts a scoped token — see the
+   credential probe under Pre-flight); verify it in the crates.io UI before
+   tagging (PF-023).
 4. **Enable GitHub private vulnerability reporting** (Settings → Code security →
    Private vulnerability reporting) so the SECURITY.md flow works.
 5. **Configure PyPI trusted publisher** for `markdown-script` at
@@ -158,23 +161,39 @@ gh workflow run release.yml          # workflow_dispatch — builds the 7-target
                                      # step. Publishes NOTHING.
 ```
 
-The dry-run workflow runs `version-gate` in full, which now includes the
-**credential probe** (security-08): it calls `npm whoami` against the live
-registry to verify the `NPM_TOKEN` is valid, guards `CARGO_REGISTRY_TOKEN`
-for non-empty, and probes the PyPI trusted publisher via the OIDC mint-token
-exchange. A revoked token, absent secret, or misconfigured trusted publisher
-therefore fails the dry run — all before any irreversible crates.io release.
+The dry-run workflow runs `version-gate` in full, which includes the
+**credential probe** (security-08). What each registry check proves:
 
-Both probes **run on every event, including `pull_request`**. On fork and
-Dependabot PRs — which receive no repository secrets and no `id-token:
-write` — the probes fail closed with an actionable error: maintainers must
-supersede with a first-party branch PR or dispatch `gh workflow run
-release.yml --ref <branch>`. No PR run can reach a publish in any case,
-so the fail-closed behaviour is informational, not a merge blocker by itself.
+- **npm** (`npm whoami`): proves the token is accepted by the npm registry
+  (authentication). Does NOT prove publish rights to the `@mdscript` scope —
+  a read-only or wrongly-scoped token passes this check but fails at publish time.
+- **PyPI**: the OIDC mint-token exchange (`pypi.org/_/oidc/mint-token`) proves the
+  trusted-publisher record matches the workflow. The minted token expires unused —
+  the probe is free and safe.
+- **crates.io**: non-empty guard only. This is the strongest check the crates.io
+  API allows for an API token: `GET /api/v1/me` is `AuthCheck::only_cookie()`
+  (`src/controllers/user/me.rs:38-41`) and returns HTTP 403 for any token, scoped
+  or unscoped (`src/auth.rs:136-144`). The only token-accepting read endpoint,
+  `GET /api/v1/me/tokens/{id}` (`src/controllers/token.rs:269-282`), accepts
+  legacy unscoped tokens only — a scoped token (the least-privilege kind a publish
+  secret should be) is rejected there with HTTP 403. A well-formed but
+  revoked/deleted token gets HTTP 403 "authentication failed" (`src/auth.rs:297-303`);
+  a malformed token gets HTTP 401 "The given API token does not match the format
+  used by crates.io" (`src/auth.rs:295`, `InsecurelyGeneratedTokenRevoked`). In
+  practice this means a revoked crates.io token is first detected at the first
+  `cargo publish` (fail-before-write, after the build matrix has been paid for).
+  The v0.4.0 release experienced exactly this (run 33569514359 attempt 1 failed
+  at `Publish mds-core` with HTTP 403, nothing published, `gh run rerun --failed`
+  completed it; see PF-023). A durable fix — Trusted Publishing for crates.io —
+  is tracked in #368; #345 is closed as won't-fix-as-filed with this finding.
 
-**Note:** `npm whoami` verifies authentication, not publish rights to the
-`@mdscript` scope. A read-only or wrongly-scoped token passes the probe but
-fails at publish time.
+All three checks **run on every event, including `pull_request`**. On fork and
+Dependabot PRs — which receive no repository secrets and no `id-token: write` —
+they fail closed with an actionable error: maintainers must supersede with a
+first-party branch PR or dispatch `gh workflow run release.yml --ref <branch>`.
+On release-surface PRs a fail-closed `Version gate` **blocks the merge** because
+D-PR7 requires it (by design, not advisory) — supersede with a first-party branch
+PR or dispatch by hand.
 
 Even though release-surface PRs now trigger `release.yml` automatically, a
 manual `gh workflow run release.yml --ref <branch>` is still required in four
@@ -245,7 +264,12 @@ Five jobs are expected-skipped on a standard `workflow_dispatch` dry run and
 are listed in `TIER_B_EXPECTED_SKIPPED` in `scripts/verify-pr-checks.mjs`:
 `Publish to crates.io`, `Publish to npm`, `Publish to PyPI`, `GitHub Release`,
 and `Publish to TestPyPI (rehearsal)`. The same five are skipped on a
-release-surface PR run.
+release-surface PR run. The skipped tolerance applies only to check-runs whose
+`check_suite.id` maps (via `GET /actions/runs?head_sha=`) to a `release.yml`
+check suite (any event); the three D-PR7 contexts (`Version gate`,
+`Stage + verify platform packages`, `Rehearse PyPI publish (no upload)`) are
+attributed by the same suite. The verifier exits 2 when it cannot enumerate the
+head's workflow runs (D-PR8, #341).
 
 Confirm the **A3 name-gate** step (`scripts/verify-napi-names.mjs`) passes in that
 run. **This is a hard checkpoint** — if the generated platform package names or
@@ -272,7 +296,11 @@ That path list lives in **two** places that must stay identical: the
 `scripts/verify-pr-checks.mjs`. Spec S10 compares them as sets — a filter the
 verifier does not know about would let a release-surface PR pass as a silent
 no-run (ADR-013 amendment). The verifier also fails closed (exit 2) if it
-cannot enumerate the PR's changed files at all.
+cannot enumerate the PR's changed files at all. The skipped-publish allowance
+and D-PR7 context attribution are both keyed on the check-run's `release.yml`
+check suite (D-PR8, #341 — any release.yml event counts, including `pull_request`
+and `workflow_dispatch`); the verifier exits 2 when it cannot enumerate the
+head's workflow runs.
 
 ## Release
 
@@ -352,3 +380,4 @@ The `release.yml` workflow runs, in order:
 - wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds do not need system Binaryen — wasm-pack auto-downloads wasm-opt (v117) on first use; install Binaryen v129+ (brew install binaryen / apt install binaryen) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer.
 - Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.
 - Due to its temp-file-then-rename implementation, atomic_write_file does not preserve hard links, ACLs, extended attributes (xattrs), or owner/group metadata of the original file.
+- `Swatinem/rust-cache` computes its key as `v0-rust[-<key>]-<job>-<runner.os>-<runner.arch>-<envhash>-<lockhash>`; the env hash covers `rustc -vV` (the HOST triple) plus `CARGO*`/`CC*`/`CFLAGS` env. The cross TARGET is not in it, so without `key:` all four ubuntu legs in `build-napi` and both macOS legs share one blob. Both matrix jobs carry per-leg keys: `build-napi` uses `key: ${{ matrix.settings.target }}` (#352, PF-041); `build-python` uses `key: ${{ matrix.target }}-${{ matrix.manylinux }}` (#347) so a containerised Linux leg never restores host-built build scripts or proc-macro `.so` files written by another leg. `publish-crates` and `publish-npm` are single-leg and use the automatic key. Spec S20 in `scripts/__test__/release-auth-probe.spec.mjs` pins this — dropping `with: key:` from a matrix job's rust-cache step causes S20 to fail `Version gate`. Validation: two runs in the SAME cache scope — first run shows `No cache found.`; second shows `Restored from cache key "v0-rust-<target>-build-napi-..."` full match: true for every leg with the readelf gates green. `pull_request` caches live under `refs/pull/N/merge` and are invisible to a branch dispatch, so warm evidence comes from a second dispatch on the same branch (or a PR-run rerun), never from a dispatch that follows a PR run.

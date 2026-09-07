@@ -85,9 +85,8 @@ jobs:
             echo "::error::NPM_TOKEN is empty or unset — npm publish would fail AFTER cargo publish (irreversible). Set the NPM_TOKEN repo secret. (security-08)"
             exit 1
           fi
-          # Guard: cargo token must be non-empty. A missing token fails before the
-          # irreversible crates.io publish, but catching it here avoids burning the
-          # expensive 7-target cross-compile matrix.
+          # Guard: cargo token non-empty. That is the strongest check crates.io allows for an
+          # API token (no read-only endpoint accepts a scoped token; #345, RELEASING.md "credential probe").
           if [ -z "$CARGO_REG_TOKEN" ]; then
             echo "::error::CARGO_REGISTRY_TOKEN is empty or unset — cargo publish would fail. Set the CARGO_REGISTRY_TOKEN repo secret. (security-08)"
             exit 1
@@ -350,7 +349,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.settings.target }}
+      # Per-leg cache key (PF-041, #352). The automatic key is job id + runner
+      # os/arch + a hash of the rustc HOST triple, env and lockfiles; the cross
+      # target is not part of it, so without `key:` all four ubuntu legs and both
+      # macOS legs restore ONE blob (run 34065573775: every Linux leg restored
+      # v0-rust-build-napi-Linux-x64-...). Keying on the target keeps each leg's
+      # target/<triple>/ artifacts and host-built build scripts to itself. The
+      # host is already encoded (runner.os/arch + rustc host hash), so only the
+      # target is added. Intentional; must survive rust-cache version bumps --
+      # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.settings.target }}
       - name: Install zig
         if: matrix.settings.use-zig
         uses: mlugg/setup-zig@v2
@@ -516,6 +526,11 @@ jobs:
         if: ${{ !matrix.sdist && runner.os != 'Linux' }}
         with:
           targets: ${{ matrix.target }}
+      # Per-leg cache key: target + manylinux flavour so a containerised Linux
+      # leg (glibc 2.17 manylinux / musl) never restores host-built build scripts
+      # or proc-macro .so files written by another leg; legs without manylinux
+      # render a trailing dash (harmless, validated warm in #347). Intentional;
+      # spec S20 in scripts/__test__/release-auth-probe.spec.mjs pins it.
       - uses: Swatinem/rust-cache@v2
         if: ${{ !matrix.sdist }}
         with:
@@ -984,6 +999,7 @@ jobs:
         with:
           ref: ${{ github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+      # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
       - uses: Swatinem/rust-cache@v2
       - name: Verify tag matches workspace version
         run: |
@@ -1079,6 +1095,7 @@ jobs:
       # update here to keep both in sync.
       - uses: dtolnay/rust-toolchain@01ba1edad32c6f80dbcce879d3e0fa5a00b2a84e  # 1.96.0
         with: { targets: wasm32-unknown-unknown }
+      # Single-leg job: the automatic job-id key is already unique; no per-leg key (#352).
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/setup-wasm
       - run: npm ci

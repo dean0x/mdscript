@@ -125,14 +125,15 @@ a job-level skip would make `Version gate` report `skipped` and break the verifi
 
 ## Component Interactions — `verify-pr-checks.mjs` Tier System
 
-The verifier is **event-blind**: it reads only check-run name, status, and conclusion —
-never the triggering event, workflow file, or check-suite.
+The verifier reads check-run name, status, conclusion, and check-suite identity — one
+bounded `GET /actions/runs?head_sha=` call maps each check-suite id to its workflow file
+(D-PR8, #341). The verifier exits 2 when that run-list cannot be enumerated.
 
 | Tier | Membership | Passing condition |
 |---|---|---|
 | **Tier A** (required) | 15 contexts from live branch protection API | `completed+success` |
 | **Tier A+ (local)** | `EXPECTED_CONTEXTS` (4 entries: Source hygiene, Python — build & test, examples/ gitignore coverage, Python — wheel install smoke) | `completed+success`, presence required |
-| **Tier B** | Everything else | `completed+success`; `skipped` tolerated ONLY for the five names in `TIER_B_EXPECTED_SKIPPED` |
+| **Tier B** | Everything else | `completed+success`; `skipped` tolerated ONLY for the five names in `TIER_B_EXPECTED_SKIPPED` AND only when the check-run belongs to a `release.yml` check suite |
 
 `TIER_B_EXPECTED_SKIPPED` (5 names):
 - `Publish to crates.io`
@@ -141,15 +142,17 @@ never the triggering event, workflow file, or check-suite.
 - `GitHub Release`
 - `Publish to TestPyPI (rehearsal)`
 
-Any `skipped` conclusion under any other name fails Tier B. Any `cancelled`, `neutral`,
-`in_progress`, or `queued` conclusion fails regardless of name (PF-017). A Tier-B-only
-rejection (e.g. an advisory CodeQL `neutral`) must be adjudicated against the required-context
-set before it is believed — it is never license to merge unverified.
+Any `skipped` conclusion under any other name, or for a name in the list whose check-suite
+is NOT a `release.yml` run, fails Tier B. Any `cancelled`, `neutral`, `in_progress`, or
+`queued` conclusion fails regardless of name (PF-017). A Tier-B-only rejection
+(e.g. an advisory CodeQL `neutral`) must be adjudicated against the required-context set
+before it is believed — it is never license to merge unverified.
 
 **D-PR7 release-surface presence check**: When any changed file matches `RELEASE_SURFACE`,
 the verifier additionally requires `Version gate`, `Stage + verify platform packages`, and
-`Rehearse PyPI publish (no upload)` to each be `completed+success`. All runs under each
-name must pass (duplicate names = all-must-pass).
+`Rehearse PyPI publish (no upload)` to each be `completed+success`. These are attributed
+by suite — the check-run must belong to a `release.yml` run; any event counts. All runs
+under each name must pass (duplicate names = all-must-pass).
 
 The verifier prints `gh pr merge N --squash --admin --match-head-commit <sha>` on PASS.
 Always use this command verbatim — confirm the current branch resolves to the intended PR
@@ -170,7 +173,7 @@ Steps (in order):
 1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all four spec files, 187 tests including pin-shape specs (S16).
+4. Run `npm run test:gates` — all four spec files, 211 tests including pin-shape specs (S16) and per-leg cache key spec (S20).
 5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
@@ -244,8 +247,11 @@ such a file. Never write `${{` in comments; describe it in words.
   reads as non-failing under `--admin` merge (PF-017) while leaving registries in a partial state.
 - `publish-testpypi` is intentionally NOT in `publish-crates`'s `needs:` — a TestPyPI failure
   should not abort the live release.
-- The fixture `scripts/__test__/fixtures/protection-main.json` holds 6 contexts vs. 15 live —
-  known drift tracked as issue #341.
+- The 2026-08 fixture `scripts/__test__/fixtures/protection-main.json` holds 6 contexts vs.
+  15 live — kept byte-identical as a historical baseline. The 2026-09 fixtures added:
+  `checks-pr366-e02bcf2.json` (check-runs with suite ids), `runs-pr366-e02bcf2.json`
+  (workflow runs mapping suite ids to workflow files), and
+  `protection-main-2026-09.json` (15 live contexts, the current shape).
 - The `startup-race-probe` Cargo feature (`mds-cli`) must never ship enabled.
 - `debug-panics` Cargo feature must never ship enabled (all three binding crates).
 
@@ -269,6 +275,11 @@ such a file. Never write `${{` in comments; describe it in words.
   holds no image for annotated tag object SHAs. Use a `vX.Y.Z` release tag (PF-040).
 - **Dispatching a dry run before that ref's `ci.yml` finishes**: the CI-history gate in
   `version-gate` fails closed on an in-progress or absent run.
+- **Dropping `with: key:` from a matrix job's rust-cache step**: without a per-leg key all
+  legs on the same runner OS restore each other's `target/<triple>/` artifacts and
+  host-built build scripts (PF-041). Confirmed live in run 34065573775: every Linux leg in
+  `build-napi` restored `v0-rust-build-napi-Linux-x64-6ff13d87-4c33221b`. Spec S20 in
+  `release-auth-probe.spec.mjs` fails `Version gate` if a key is removed (#347, #352).
 
 ## Gotchas
 
@@ -298,6 +309,17 @@ such a file. Never write `${{` in comments; describe it in words.
   `release-${{ github.ref }}`); it does not cancel it.
 - **`version-gate` prints a `::notice::` not a `::skip::`** when it skips the CI-history step
   on `pull_request`: the job still completes `success`, which is the required state.
+- **rust-cache cache scope**: `pull_request` caches live under `refs/pull/N/merge` and are
+  invisible to a `workflow_dispatch` on the branch. `main` has no `release.yml` caches
+  (the workflow never runs on push-to-main), so tag runs are always cold. Warm-cache
+  evidence comes from a second dispatch on the same branch ref (or a PR-run rerun) —
+  never from a dispatch that follows a PR run.
+- **crates.io token — no read-only probe**: `GET /api/v1/me` is `AuthCheck::only_cookie()`
+  and returns HTTP 403 for any API token. The only token-accepting read route
+  (`GET /api/v1/me/tokens/{id}`) rejects scoped tokens with HTTP 403. The non-empty guard
+  in `version-gate` is therefore the strongest check available. A revoked token is first
+  detected at `cargo publish` (fail-before-write, after the build matrix is paid for); see
+  PF-023 and the v0.4.0 precedent (`gh run rerun --failed`). Durable fix tracked in #368.
 
 ## Key Files
 
@@ -308,9 +330,15 @@ such a file. Never write `${{` in comments; describe it in words.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;
   length assertion for `EXPECTED_CONTEXTS`).
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape
-  (S16), set equality S10, guard detection, no `${{ }}` literal (S19), `uses:` count (S14).
-- `scripts/__test__/fixtures/protection-main.json` — 6-context branch protection fixture
-  (known drift from 15 live; tracked as #341).
+  (S16), set equality S10, guard detection, no dollar-brace-brace literal (S19), `uses:` count
+  (S14), per-leg cache key (S20), cargo token -z guard (S3 extension).
+- `scripts/__test__/fixtures/protection-main.json` — 6-context branch protection (historical,
+  2026-08 baseline; kept byte-identical).
+- `scripts/__test__/fixtures/protection-main-2026-09.json` — 15-context branch protection
+  (current live shape, 2026-09).
+- `scripts/__test__/fixtures/checks-pr366-e02bcf2.json` — check-runs with suite ids (2026-09).
+- `scripts/__test__/fixtures/runs-pr366-e02bcf2.json` — workflow runs mapping suite ids to
+  workflow files (2026-09).
 - `RELEASING.md` — full release runbook including pre-flight checklist, tag-push procedure,
   and post-release verification.
 

@@ -189,6 +189,28 @@ describe('security-08: npm auth probe in version-gate', () => {
       'version-gate must guard CARGO_REGISTRY_TOKEN via env: in the probe step; ' +
       `got section:\n${section}`,
     );
+    // S3 extension: the -z guard must be in executable code, not inside a comment.
+    // Positive control (avoids PF-013): a section that binds the secret but places
+    // the guard line only inside a comment must return false.
+    const guardLineInComment = [
+      '        env:',
+      '          CARGO_REG_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}',
+      '        run: |',
+      '          # if [ -z "$CARGO_REG_TOKEN" ]; then',
+      '          echo "do something else"',
+    ].join('\n');
+    assert.ok(
+      !hasEmptyGuard(guardLineInComment),
+      'positive control: hasEmptyGuard must return false when the guard line is only inside a comment',
+    );
+    assert.ok(
+      hasEmptyGuard(section),
+      'version-gate must contain an executable `if [ -z "$CARGO_REG_TOKEN" ]; then` guard ' +
+      '(#345, RELEASING.md "credential probe") — the strongest check crates.io allows for an ' +
+      'API token; a missing token is first detected at cargo publish (fail-before-write) but ' +
+      'this guard catches it before the expensive 7-target cross-compile matrix runs; ' +
+      `got section:\n${section}`,
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -273,6 +295,16 @@ function extractJobIf(jobSection) {
  */
 function stripCommentLines(text) {
   return text.split('\n').filter(l => !/^\s*#/.test(l)).join('\n');
+}
+
+/**
+ * True iff the text contains an executable (non-comment) line that matches
+ * `if [ -z "$CARGO_REG_TOKEN" ]; then` — the -z guard for the cargo token
+ * (#345). Uses stripCommentLines so a line that appears only inside a comment
+ * does not satisfy the check (positive control in S3).
+ */
+function hasEmptyGuard(text) {
+  return /^\s*if \[ -z "\$CARGO_REG_TOKEN" \]; then\s*$/m.test(stripCommentLines(text));
 }
 
 /**
@@ -1015,6 +1047,210 @@ describe('B1: release-surface PR gate and rehearsal jobs', () => {
         return `line ~${lineNum}`;
       }).join(', '),
     );
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// B2: per-leg rust-cache helpers and S20 spec
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns one entry per `- uses: Swatinem/rust-cache@` step in the comment-
+ * stripped job section, with the `key:` value from its `with:` block, or null
+ * when absent. A step ends at the next 6-space `- ` item in the stripped text.
+ */
+function rustCacheSteps(jobSection) {
+  const stripped = stripCommentLines(jobSection);
+  const lines = stripped.split('\n');
+  const steps = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^      - uses: Swatinem\/rust-cache@/.test(lines[i])) {
+      let key = null;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (/^      - /.test(lines[j])) break; // next step
+        const km = /^\s+key:\s+(.+)$/.exec(lines[j]);
+        if (km) { key = km[1].trim(); break; }
+      }
+      steps.push({ key });
+    }
+  }
+  return steps;
+}
+
+/**
+ * True iff a 4-space `strategy:` line exists after comment stripping.
+ * Matrix jobs declare `    strategy:` inside the job body.
+ */
+function hasMatrix(jobSection) {
+  return stripCommentLines(jobSection).split('\n').some(l => /^    strategy:\s*$/.test(l));
+}
+
+describe('B2: per-leg rust-cache keys in matrix jobs (#352, PF-041)', () => {
+
+  // -------------------------------------------------------------------------
+  // S20: every Swatinem/rust-cache step in a matrix job must carry a `key:`
+  // that includes `matrix.` so each leg's compiled artifacts stay isolated.
+  //
+  // Without a per-leg key the automatic key (job-id + runner-os/arch + rustc
+  // host hash + lock hash) is SHARED across all legs on the same runner OS:
+  // all four ubuntu legs restore each other's target/<triple>/ blobs, and both
+  // macOS legs do the same (confirmed live: run 34065573775, every Linux leg
+  // restored `v0-rust-build-napi-Linux-x64-6ff13d87-4c33221b`).
+  // `build-python` already carries `key: matrix.target-matrix.manylinux` (#347);
+  // this spec extends that gate to `build-napi` (#352, PF-041).
+  //
+  // Non-vacuity: build-napi and build-python must have rust-cache steps, and
+  // publish-crates must NOT qualify (single-leg, no matrix → exempt).
+  // Failure message names PF-041, #347, #352.
+  // -------------------------------------------------------------------------
+  test('S20: every rust-cache step in every matrix job carries a key containing matrix. (PF-041, #352)', () => {
+
+    // --- Positive controls (PF-013) ---
+
+    // PC1: bare step in a matrix job → key must be null
+    const bareJobSection = [
+      '  fake-matrix:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          - target: aarch64',
+      '    steps:',
+      '      - uses: Swatinem/rust-cache@v2',
+      '      - name: Next step',
+      '        run: echo done',
+    ].join('\n');
+    const bareSteps = rustCacheSteps(bareJobSection);
+    assert.equal(bareSteps.length, 1, 'PC1: bare step must be detected');
+    assert.equal(bareSteps[0].key, null, 'PC1: bare step key must be null');
+
+    // PC2: static key → read back verbatim
+    const staticKeySection = [
+      '  fake-matrix:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          - target: aarch64',
+      '    steps:',
+      '      - uses: Swatinem/rust-cache@v2',
+      '        with:',
+      '          key: my-static-key',
+      '      - name: Next step',
+      '        run: echo done',
+    ].join('\n');
+    const staticSteps = rustCacheSteps(staticKeySection);
+    assert.equal(staticSteps.length, 1, 'PC2: static-key step must be detected');
+    assert.equal(staticSteps[0].key, 'my-static-key', 'PC2: static key must be read verbatim');
+
+    // PC3: commented-out key → key must be null
+    const commentedKeySection = [
+      '  fake-matrix:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          - target: aarch64',
+      '    steps:',
+      '      - uses: Swatinem/rust-cache@v2',
+      '        # with:',
+      '        #   key: ${{ matrix.target }}',
+      '      - name: Next step',
+      '        run: echo done',
+    ].join('\n');
+    const commentedSteps = rustCacheSteps(commentedKeySection);
+    assert.equal(commentedSteps.length, 1, 'PC3: step with commented key must be detected');
+    assert.equal(commentedSteps[0].key, null, 'PC3: commented-out key must yield null');
+
+    // PC4: matrix-derived key → read back verbatim and contains matrix.
+    const matrixKeySection = [
+      '  fake-matrix:',
+      '    strategy:',
+      '      matrix:',
+      '        include:',
+      '          - target: aarch64',
+      '    steps:',
+      '      - uses: Swatinem/rust-cache@v2',
+      '        with:',
+      '          key: ${{ matrix.settings.target }}',
+      '      - name: Next step',
+      '        run: echo done',
+    ].join('\n');
+    const matrixSteps = rustCacheSteps(matrixKeySection);
+    assert.equal(matrixSteps.length, 1, 'PC4: matrix-key step must be detected');
+    assert.equal(
+      matrixSteps[0].key, '${{ matrix.settings.target }}',
+      'PC4: matrix key must be read back verbatim',
+    );
+    assert.ok(matrixSteps[0].key.includes('matrix.'), 'PC4: matrix key must contain "matrix."');
+
+    // PC5: job with strategy: only in a comment → not a matrix job (exempt)
+    const commentedStrategySection = [
+      '  fake-single:',
+      '    # strategy: not a real matrix',
+      '    steps:',
+      '      - uses: Swatinem/rust-cache@v2',
+    ].join('\n');
+    assert.ok(
+      !hasMatrix(commentedStrategySection),
+      'PC5: a job with strategy: only in a comment must not be treated as a matrix job',
+    );
+
+    // --- Non-vacuity: confirm checked set membership ---
+
+    const buildNapiSection = extractJobSection(yml, 'build-napi');
+    assert.ok(buildNapiSection !== null, 'non-vacuity: build-napi must exist');
+    assert.ok(
+      rustCacheSteps(buildNapiSection).length > 0,
+      'non-vacuity: build-napi must have at least one Swatinem/rust-cache step',
+    );
+    assert.ok(hasMatrix(buildNapiSection), 'non-vacuity: build-napi must be a matrix job');
+
+    const buildPythonSection = extractJobSection(yml, 'build-python');
+    assert.ok(buildPythonSection !== null, 'non-vacuity: build-python must exist');
+    assert.ok(
+      rustCacheSteps(buildPythonSection).length > 0,
+      'non-vacuity: build-python must have at least one Swatinem/rust-cache step',
+    );
+    assert.ok(hasMatrix(buildPythonSection), 'non-vacuity: build-python must be a matrix job');
+
+    // publish-crates must NOT qualify (single-leg, exempt)
+    const publishCratesSection = extractJobSection(yml, 'publish-crates');
+    assert.ok(publishCratesSection !== null, 'non-vacuity: publish-crates must exist');
+    assert.ok(
+      !hasMatrix(publishCratesSection),
+      'non-vacuity: publish-crates must NOT be a matrix job (single-leg, exempt from S20)',
+    );
+
+    // --- Core assertion: every rust-cache step in every matrix job has a matrix. key ---
+    const matrixJobIds = findAllJobIds(yml).filter(id => {
+      const section = extractJobSection(yml, id);
+      return section !== null && hasMatrix(section);
+    });
+
+    // Non-vacuity: checked set must include build-napi and build-python
+    assert.ok(
+      matrixJobIds.includes('build-napi'),
+      'S20 non-vacuity: build-napi must be in the matrix job set',
+    );
+    assert.ok(
+      matrixJobIds.includes('build-python'),
+      'S20 non-vacuity: build-python must be in the matrix job set',
+    );
+
+    for (const id of matrixJobIds) {
+      const section = extractJobSection(yml, id);
+      const steps = rustCacheSteps(section);
+      for (const step of steps) {
+        assert.ok(
+          step.key !== null && step.key.includes('matrix.'),
+          `Matrix job "${id}" has a Swatinem/rust-cache step whose key is ` +
+          `${JSON.stringify(step.key)} — without a per-leg key all legs on the same ` +
+          `runner OS restore each other's target/<triple>/ artifacts (PF-041, confirmed ` +
+          `live in run 34065573775). build-python already keys on matrix.target + ` +
+          `matrix.manylinux (#347); build-napi must key on matrix.settings.target (#352). ` +
+          `Fix: add \`with:\\n            key: \${{ matrix.settings.target }}\` under the step.`,
+        );
+      }
+    }
   });
 
 });
