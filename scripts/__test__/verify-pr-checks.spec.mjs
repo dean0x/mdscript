@@ -2040,6 +2040,20 @@ describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
         `failure must name "${name}"; got:\n${allLines}`,
       );
     }
+    // Positive control: with releaseSuiteIds supplied the same five skips (with suite) are allowed → PASS
+    const skippedPublishRuns2 = [...TIER_B_EXPECTED_SKIPPED].map(name =>
+      withSuite({ name, status: 'completed', conclusion: 'skipped' }),
+    );
+    const runs2 = basePassingRunsWith(skippedPublishRuns2);
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs2,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
+    });
+    assert.equal(result2.exitCode, 0,
+      'control: with releaseSuiteIds supplied, five skips in release suite are allowed → PASS');
   });
 
   test('D-PR5h2: releaseSuiteIds undefined but no skipped allow-listed names and untouched surface → PASS; prints "not provided" line', () => {
@@ -2050,7 +2064,7 @@ describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['README.md'],
-      // relaseSuiteIds: undefined — not provided
+      // releaseSuiteIds: undefined — not provided
     });
     assert.equal(result.exitCode, 0,
       'undefined releaseSuiteIds with no skipped names and untouched surface must pass');
@@ -2059,6 +2073,22 @@ describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
       allLines.includes('not provided'),
       `output must print the "not provided" state; got:\n${allLines}`,
     );
+    // Positive control: adding one skipped allow-listed run without releaseSuiteIds → FAIL with DISABLED
+    const runs2 = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'completed', conclusion: 'skipped' },
+    ]);
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs2,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['README.md'],
+      // releaseSuiteIds: undefined — not provided
+    });
+    assert.equal(result2.exitCode, 1,
+      'control: skipped allow-listed run with undefined releaseSuiteIds → FAIL with DISABLED');
+    assert.ok(result2.lines.join('\n').includes('DISABLED'),
+      'control must say DISABLED');
   });
 
   test('D-PR5i: live path, runs-API error → exit 2 (D-PR8, fail closed)', () => {
@@ -2071,6 +2101,16 @@ describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2,
       'runs API error must exit 2 (D-PR8, fail closed)');
+    // Positive control: valid runs response → not exit 2
+    const runner2 = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_RELEASE],
+    ]);
+    assert.notEqual(main(['1'], runner2, OK_GH_VERSION), 2,
+      'control: valid runs response must not exit 2');
   });
 
 });
@@ -2096,6 +2136,19 @@ describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projec
     assert.equal(result.exitCode, 2, 'pagination cap must produce exit 2 (D-PR8)');
     assert.ok(calls <= 5, `must not exceed 5 page requests; made ${calls} (pinned to MAX_RUNS_PAGES=5)`);
     assert.ok(calls >= 1, 'must have made at least one request');
+    // Positive control: 5 pages whose total_count is satisfied → ok:true
+    let calls2 = 0;
+    const fullPage2 = {
+      total_count: 500,
+      workflow_runs: Array.from({ length: 100 }, (_, i) => ({
+        id: i, path: '.github/workflows/ci.yml', event: 'pull_request',
+        check_suite_id: i + 1, conclusion: 'success',
+      })),
+    };
+    const runner2 = (_args) => { calls2++; return fullPage2; };
+    const result2 = fetchWorkflowRuns('abc123sha', runner2);
+    assert.ok(result2.ok, `control: 5 pages with satisfied total_count must return ok:true; got: ${JSON.stringify(result2)}`);
+    assert.equal(calls2, 5, `control: must have made exactly 5 requests; made ${calls2}`);
   });
 
   test('total_count mismatch → ok:false/exitCode 2 (D-PR8)', () => {
@@ -2110,6 +2163,13 @@ describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projec
       result.message.includes('total_count') || result.message.includes('D-PR8'),
       `message must mention total_count or D-PR8; got: ${result.message}`,
     );
+    // Positive control: matching total_count → ok:true
+    const runner2 = (_args) => ({
+      total_count: 1,
+      workflow_runs: [{ id: 1, path: '.github/workflows/release.yml', event: 'pull_request', check_suite_id: 123, conclusion: 'success' }],
+    });
+    const result2 = fetchWorkflowRuns('abc123sha', runner2);
+    assert.ok(result2.ok, `control: matching total_count must return ok:true; got: ${JSON.stringify(result2)}`);
   });
 
   test('single complete page → ok:true with ONLY the projected fields', () => {
@@ -2266,26 +2326,7 @@ describe('D-PR7k, D-PR7l: D-PR7 attribution keyed on release suite identity', ()
     ];
   }
 
-  test('D-PR7k: release-surface contexts present ONLY in ci.yml suite → exit 1; "absent from every … check-suite" AND "other suites ignored"', () => {
-    const releaseRunsInCiSuite = RELEASE_SURFACE_CONTEXTS.map(name => ({
-      name, status: 'completed', conclusion: 'success', check_suite: { id: CI_SUITE_113F472 },
-    }));
-    const checkRuns = passingRunsWith(releaseRunsInCiSuite);
-    const result = evaluateChecks({
-      requiredContexts: REQUIRED,
-      checkRuns,
-      statuses: [],
-      headSha: HEAD_113F472,
-      changedFiles: ['.github/workflows/release.yml'],
-      relaseSuiteIds: RELEASE_SUITES,  // intentional typo for RED — see correction in code
-    });
-    // This test is RED until the code is implemented (relaseSuiteIds → undefined → fail closed)
-    // After fix: releaseSuiteIds will be used correctly
-    assert.equal(result.exitCode, 1,
-      'release-surface contexts in non-release suite must exit 1 (D-PR8)');
-  });
-
-  test('D-PR7k (corrected): contexts in ci.yml suite → exit 1; message cites "absent from every .github/workflows/release.yml" and N same-name runs ignored', () => {
+  test('D-PR7k: contexts in ci.yml suite → exit 1; message cites "absent from every .github/workflows/release.yml" and N same-name runs ignored', () => {
     const releaseRunsInCiSuite = RELEASE_SURFACE_CONTEXTS.map(name => ({
       name, status: 'completed', conclusion: 'success', check_suite: { id: CI_SUITE_113F472 },
     }));
@@ -2301,13 +2342,16 @@ describe('D-PR7k, D-PR7l: D-PR7 attribution keyed on release suite identity', ()
     assert.equal(result.exitCode, 1, 'contexts only in ci.yml suite must fail (D-PR8)');
     const allLines = result.lines.join('\n');
     assert.ok(
-      allLines.includes('absent from every .github/workflows/release.yml') ||
-      allLines.includes('absent from every'),
-      `must say "absent from every .github/workflows/release.yml"; got:\n${allLines}`,
+      allLines.includes('absent from every .github/workflows/release.yml check-suite on this head'),
+      `must say "absent from every .github/workflows/release.yml check-suite on this head"; got:\n${allLines}`,
     );
     assert.ok(
-      allLines.includes('other suites ignored') || allLines.includes('ignored'),
-      `must mention that same-name runs in other suites are ignored; got:\n${allLines}`,
+      allLines.includes('same-name run(s) in other suites ignored'),
+      `must mention "same-name run(s) in other suites ignored"; got:\n${allLines}`,
+    );
+    assert.ok(
+      allLines.includes(`release suites: ${RELEASE_SUITE}`),
+      `must list release suite id ${RELEASE_SUITE}; got:\n${allLines}`,
     );
     // Positive control: same runs but CI_SUITE_113F472 IS a release suite → PASS
     const result2 = evaluateChecks({
@@ -2346,6 +2390,21 @@ describe('D-PR7k, D-PR7l: D-PR7 attribution keyed on release suite identity', ()
     for (const ctx of RELEASE_SURFACE_CONTEXTS) {
       assert.ok(allLines.includes(ctx), `must name context "${ctx}"; got:\n${allLines}`);
     }
+    // Positive control: supplying RELEASE_SUITES with attributed successful runs → 0 D-PR7 failures
+    const releaseRuns2 = RELEASE_SURFACE_CONTEXTS.map(name => ({
+      name, status: 'completed', conclusion: 'success', check_suite: { id: RELEASE_SUITE },
+    }));
+    const checkRuns2 = passingRunsWith(releaseRuns2);
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: checkRuns2,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: RELEASE_SUITES,
+    });
+    assert.equal(result2.exitCode, 0,
+      'control: RELEASE_SUITES with properly attributed runs → 0 D-PR7 failures → PASS');
   });
 
 });
