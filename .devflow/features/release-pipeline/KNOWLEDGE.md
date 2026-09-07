@@ -330,7 +330,7 @@ such a file. Never write `${{` in comments; describe it in words.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;
   length assertion for `EXPECTED_CONTEXTS`).
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape
-  (S16), set equality S10, guard detection, no dollar-brace-brace literal (S19), `uses:` count
+  (S16), set equality S10, guard detection, no `${{ }}` literal (S19), `uses:` count
   (S14), per-leg cache key (S20), cargo token -z guard (S3 extension).
 - `scripts/__test__/fixtures/protection-main.json` — 6-context branch protection (historical,
   2026-08 baseline; kept byte-identical).
