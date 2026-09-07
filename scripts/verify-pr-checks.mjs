@@ -28,10 +28,11 @@
  *                                (failure, cancelled, timed_out, action_required, stale,
  *                                skipped, neutral, null, any future value) = FAIL.
  *                                not-yet-completed = FAIL (avoids PF-017).
- *                                Exception: the four release publish jobs are guarded by
+ *                                Exception: the five release publish jobs are guarded by
  *                                startsWith(github.ref,'refs/tags/v') and report as skipped
- *                                on a PR-branch dry-run; only those four names, only when
- *                                skipped, are allowed (TIER_B_EXPECTED_SKIPPED).
+ *                                on a PR-branch dry-run; only those five names, only when
+ *                                skipped AND in a release.yml check-suite, are allowed
+ *                                (TIER_B_EXPECTED_SKIPPED + D-PR8 suite keying).
  *   Tier C  (legacy statuses):   advisory unless the context is required
  *
  * D-PR3b: EXPECTED_CONTEXTS lists jobs that must be present and passing even though
@@ -61,10 +62,38 @@
  *
  * D-PR7: Release-surface presence check — when a PR touches the release
  *        surface (paths matching release.yml's pull_request.paths filter),
- *        each RELEASE_SURFACE_CONTEXTS job must be completed+success.
- *        Absence or non-success is FAIL (Tier A semantics applied to release
- *        check-runs). The changed-file list is fetched via the PR-files API
- *        and fails closed on every indeterminate outcome (avoids PF-013).
+ *        each RELEASE_SURFACE_CONTEXTS job must be completed+success IN A
+ *        release.yml check-suite (D-PR8). Absence or non-success is FAIL
+ *        (Tier A semantics applied to release check-runs). The changed-file
+ *        list is fetched via the PR-files API and fails closed on every
+ *        indeterminate outcome (avoids PF-013).
+ *
+ * D-PR8: Suite-keyed skipped-publish allowance — Tier B's allow-listed skip
+ *        (TIER_B_EXPECTED_SKIPPED) and D-PR7's release-surface context check
+ *        both require that the check-run belongs to a check-suite originating
+ *        from .github/workflows/release.yml. The suite set is built by ONE
+ *        bounded (MAX_RUNS_PAGES), total_count-asserted GET /actions/runs?head_sha=
+ *        call (fetchWorkflowRuns — the LAST fetch in main()). Any release.yml
+ *        event qualifies: pull_request, workflow_dispatch, push, schedule, etc.
+ *        (The RELEASING.md dry-run is a workflow_dispatch; PR #365 carries a
+ *        dispatch-only release suite 92246852351 alongside ci.yml runs.)
+ *
+ *        Fail-closed matrix (all → exit 2 or exit 1):
+ *          runs API error / >MAX_RUNS_PAGES pages / total_count mismatch → exit 2
+ *          zero release suites → allow-listed skips fail (D-PR8 DISABLED) and
+ *            D-PR7 contexts read as absent (exit 1)
+ *          missing check_suite on a skipped allow-listed run → fail (exit 1)
+ *          skipped run's suite not in releaseSuiteIds → fail, names both ids (exit 1)
+ *          releaseSuiteIds undefined → allowance disabled; D-PR7 cannot attribute
+ *          several release suites → each run attributed on its own; all must pass
+ *
+ *        app.slug is NOT consulted: the mapping keeps only runs whose path ===
+ *        RELEASE_WORKFLOW_PATH ('.github/workflows/release.yml'), so a ci.yml
+ *        run, the dynamic CodeQL analysis run (path 'dynamic/github-code-scanning/
+ *        codeql', which DOES appear in /actions/runs), and the github-advanced-
+ *        security umbrella suite (which does not appear in /actions/runs at all)
+ *        can never contribute a suite id — every id in the set is therefore a
+ *        release.yml suite and app.slug would add nothing.
  *
  * Usage:
  *   node scripts/verify-pr-checks.mjs <pr-number>
@@ -105,6 +134,8 @@ function isMainModule(metaUrl) {
 
 // D-PR4a: hard page cap — exit 2 rather than evaluating a partial result
 const MAX_PAGES = 20;
+// D-PR8: hard page cap for workflow-runs fetch (suites per head are small, 5 is ample)
+const MAX_RUNS_PAGES = 5;
 // D-PR5: minimum gh version required for --match-head-commit
 const MIN_GH_MAJOR = 2;
 const MIN_GH_MINOR = 31;
@@ -134,9 +165,11 @@ export const EXPECTED_CONTEXTS = [
 // guarded by startsWith(github.ref, 'refs/tags/v') (or the testpypi dispatch
 // input), so the RELEASING.md dry-run dispatched on a PR branch reports them
 // on the PR head as conclusion=skipped. That skip IS the guard working, not a
-// missing verification. Only these five names, only when 'skipped', pass Tier
-// B; any other conclusion (cancelled, failure, neutral, null) still fails, and
-// a skipped run under any other name still fails.
+// missing verification. The name is one of THREE keys — the run must also be
+// `skipped` AND sit in a release.yml check-suite (D-PR8); any other conclusion
+// (cancelled, failure, neutral, null) still fails, and a skipped run under any
+// other name still fails. M10c/S13 in release-auth-probe.spec.mjs keep this
+// set equal to release.yml's guarded jobs.
 // ADR-013 amendment (2026-09-06): 'Publish to TestPyPI (rehearsal)' is
 // dispatch-input-guarded — skipped everywhere except `workflow_dispatch -f
 // testpypi=true`. Adding it to this set so the mandatory pre-merge verifier
@@ -206,6 +239,44 @@ export function matchesReleaseSurface(file) {
     }
   }
   return false;
+}
+
+/**
+ * The workflow path used to identify release.yml check-suites (D-PR8).
+ * releaseSuiteIdsFrom filters Actions runs by this value to build the set of
+ * suite ids that grant the Tier B skipped-publish exception and D-PR7 credit.
+ *
+ * Must equal the workflow file path that GitHub populates in `workflow_runs[].path`.
+ */
+export const RELEASE_WORKFLOW_PATH = '.github/workflows/release.yml';
+
+/**
+ * Build the set of check_suite_id values for workflow runs whose path is
+ * RELEASE_WORKFLOW_PATH (D-PR8).
+ *
+ * Only numeric (integer) ids are included — non-integer values are excluded
+ * as anomalous. Every id in the result is guaranteed to be a GitHub-Actions
+ * check-suite id originating from release.yml: the path filter excludes ci.yml
+ * runs, the dynamic CodeQL analysis run ('dynamic/github-code-scanning/codeql',
+ * which does appear in /actions/runs), and — because it has no /actions/runs
+ * entry at all — the github-advanced-security umbrella suite.
+ *
+ * @param {Array<{path: string, check_suite_id: any}>} runs — projected run objects
+ * @returns {Set<number>}
+ */
+export function releaseSuiteIdsFrom(runs) {
+  const ids = new Set();
+  for (const run of runs) {
+    if (run.path === RELEASE_WORKFLOW_PATH && Number.isInteger(run.check_suite_id)) {
+      ids.add(run.check_suite_id);
+    }
+  }
+  return ids;
+}
+
+/** Format a set of suite ids for diagnostic messages. Returns 'none' when the set is empty. */
+function formatSuiteIds(ids) {
+  return [...ids].join(', ') || 'none';
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +354,7 @@ function defaultGhRunner(args) {
  *   name: string;
  *   status: string;       // 'completed' | 'queued' | 'in_progress' | ...
  *   conclusion: string | null;  // 'success' | 'failure' | 'cancelled' | ...
+ *   check_suite?: { id: number };  // D-PR8: suite identity (absent on legacy fixtures)
  * }} CheckRun
  *
  * @typedef {{
@@ -298,6 +370,7 @@ function defaultGhRunner(args) {
  *   prNumber?: number;            // included in the emitted merge command (D-PR5)
  *   expectedContexts?: string[];  // defaults to EXPECTED_CONTEXTS
  *   changedFiles?: string[];      // D-PR7: when present, release-surface presence check runs
+ *   releaseSuiteIds?: Set<number>; // D-PR8: check_suite_id values for release.yml runs
  * }} EvaluateInput
  *
  * @typedef {{
@@ -326,6 +399,7 @@ export function evaluateChecks({
   prNumber,
   expectedContexts = EXPECTED_CONTEXTS,
   changedFiles,
+  releaseSuiteIds,
 }) {
   const lines = [];
   const failures = [];
@@ -366,6 +440,21 @@ export function evaluateChecks({
 
   // Always print counts (D-PR4 / avoids PF-013)
   lines.push(`  check-runs: ${nChecks}, statuses: ${nStatuses}, required contexts: ${nRequired}`);
+
+  // D-PR8: announce whether the release-suite mapping is available.
+  // When undefined, skipped allow-listed runs and release-surface contexts will
+  // fail closed (the notice here makes the state visible even on a PASS).
+  if (releaseSuiteIds === undefined) {
+    lines.push(
+      '  · D-PR8: releaseSuiteIds not provided — skipped allow-listed runs and ' +
+      'D-PR7 release-surface contexts CANNOT be suite-verified (disabled path)',
+    );
+  } else {
+    lines.push(
+      `  · D-PR8: ${releaseSuiteIds.size} release.yml suite(s) on this head` +
+      (releaseSuiteIds.size > 0 ? `: ${[...releaseSuiteIds].join(', ')}` : ' — none found'),
+    );
+  }
 
   // Build lookup maps.
   // A name maps to EVERY check-run carrying it, not just the last one seen:
@@ -511,13 +600,42 @@ export function evaluateChecks({
 
     // Allowance: release.yml publish jobs are skipped on a PR-branch dry-run
     // because they are guarded by startsWith(github.ref, 'refs/tags/v').
-    // That skip IS the guard working; allow exactly these four names, only
-    // when skipped. Cancelled/failed/neutral publish runs still fail, and a
-    // skipped run under any other name still fails (TIER_B_EXPECTED_SKIPPED).
+    // That skip IS the guard working; allow exactly these five names, only
+    // when skipped AND the run belongs to a release.yml check-suite (D-PR8).
+    // Cancelled/failed/neutral publish runs still fail, and a skipped run
+    // under any other name still fails (TIER_B_EXPECTED_SKIPPED).
     if (cr.conclusion === 'skipped' && TIER_B_EXPECTED_SKIPPED.has(cr.name)) {
+      // D-PR8: fail closed when the suite mapping is unavailable — a skipped
+      // publish run cannot be attributed without the workflow-run data.
+      if (releaseSuiteIds === undefined) {
+        failures.push(
+          `Tier B (non-required): "${cr.name}" — conclusion=skipped (DISABLED: ` +
+          `releaseSuiteIds undefined; D-PR8 suite-keying requires fetchWorkflowRuns to run first)`,
+        );
+        pass = false;
+        continue;
+      }
+      const suiteId = cr.check_suite?.id;
+      if (!Number.isInteger(suiteId)) {
+        failures.push(
+          `Tier B (non-required): "${cr.name}" — conclusion=skipped but check_suite.id missing ` +
+          `(D-PR8: skipped allow-listed run must carry a verifiable release.yml suite id)`,
+        );
+        pass = false;
+        continue;
+      }
+      if (!releaseSuiteIds.has(suiteId)) {
+        const relIds = formatSuiteIds(releaseSuiteIds);
+        failures.push(
+          `Tier B (non-required): "${cr.name}" — conclusion=skipped in suite ${suiteId} ` +
+          `which is NOT a release.yml suite (D-PR8: allowed release suite ids: ${relIds})`,
+        );
+        pass = false;
+        continue;
+      }
       lines.push(
         `  · Tier B: "${cr.name}" skipped by its refs/tags/v guard` +
-        ` (release dry-run on PR head) — allowed`,
+        ` (release dry-run on PR head, suite ${suiteId}) — allowed (D-PR8)`,
       );
       continue;
     }
@@ -574,19 +692,44 @@ export function evaluateChecks({
         ') — requiring release check-runs',
       );
       for (const ctx of RELEASE_SURFACE_CONTEXTS) {
-        const releaseRuns = checkRuns.filter(cr => cr.name === ctx);
-        if (releaseRuns.length === 0) {
+        // D-PR8: fail closed when suite mapping unavailable — cannot verify
+        // that a success run belongs to release.yml and not ci.yml.
+        if (releaseSuiteIds === undefined) {
           failures.push(
-            `D-PR7 (release surface): "${ctx}" absent — the PR touches the release ` +
-            `surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
+            `D-PR7 (release surface): "${ctx}" — releaseSuiteIds not provided (D-PR8: ` +
+            `suite attribution required for release-surface contexts; fetchWorkflowRuns must run first)`,
+          );
+          pass = false;
+          continue;
+        }
+        const allRunsForName = checkRuns.filter(cr => cr.name === ctx);
+        // Only count runs belonging to a release.yml check-suite (D-PR8).
+        // Runs in ci.yml or other suites sharing the same name are ignored.
+        const releaseRuns = allRunsForName.filter(
+          cr => Number.isInteger(cr.check_suite?.id) && releaseSuiteIds.has(cr.check_suite.id),
+        );
+        const ignoredCount = allRunsForName.length - releaseRuns.length;
+        if (releaseRuns.length === 0) {
+          const relIds = formatSuiteIds(releaseSuiteIds);
+          const ignoredNote = ignoredCount > 0
+            ? `; ${ignoredCount} same-name run(s) in other suites ignored`
+            : '';
+          failures.push(
+            `D-PR7 (release surface): "${ctx}" absent from every .github/workflows/release.yml` +
+            ` check-suite on this head (release suites: ${relIds}${ignoredNote})` +
+            ` — the PR touches the release surface but release.yml's run is missing, not finished, or failed (#342, D-PR8)`,
           );
           pass = false;
         } else {
+          if (ignoredCount > 0) {
+            lines.push(`  · D-PR7: ${ignoredCount} same-name run(s) for "${ctx}" in other suites ignored (D-PR8)`);
+          }
           for (const cr of releaseRuns) {
             if (cr.status !== 'completed' || cr.conclusion !== 'success') {
               failures.push(
-                `D-PR7 (release surface): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'} ` +
-                `— the PR touches the release surface but release.yml's pull_request run is missing, not finished, or failed (#342)`,
+                `D-PR7 (release surface): "${ctx}" — status=${cr.status}, conclusion=${cr.conclusion ?? 'null'}` +
+                ` (suite ${cr.check_suite?.id})` +
+                ` — the PR touches the release surface but release.yml's run failed (#342, D-PR8)`,
               );
               pass = false;
             }
@@ -871,6 +1014,82 @@ export function fetchChangedFiles(prNumber, declaredCount, runner) {
   return { ok: true, files };
 }
 
+/**
+ * Fetch workflow runs for a given head SHA, bounded at MAX_RUNS_PAGES (D-PR8).
+ *
+ * Maps check_suite_id → workflow path so Tier B and D-PR7 can verify that a
+ * skipped allow-listed run belongs to a release.yml check-suite. Only the five
+ * fields needed by releaseSuiteIdsFrom and evaluateChecks are retained (minimal
+ * projection); the rest of the run object is discarded.
+ *
+ * Fails closed on API error, pagination overflow, and total_count mismatch —
+ * consistent with fetchCheckRuns and fetchChangedFiles (D-PR4a parity).
+ *
+ * @param {string} headSha
+ * @param {function} runner
+ * @returns {{ ok: true, runs: Array<{id:number, path:string, event:string, check_suite_id:number, conclusion:string|null}> }
+ *          | { ok: false, exitCode: 2, message: string }}
+ */
+export function fetchWorkflowRuns(headSha, runner) {
+  const perPage = 100;
+  let page = 1;
+  const allRuns = [];
+  let totalCount = null;
+
+  // Bounded loop (reliability rule): at most MAX_RUNS_PAGES iterations, always.
+  // security-11: headSha is network-derived data; encode for safe URL construction.
+  while (page <= MAX_RUNS_PAGES) {
+    const url =
+      `/repos/{owner}/{repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&per_page=${perPage}&page=${page}`;
+    const data = runner(['api', url]);
+    if (data.__error) {
+      return {
+        ok: false,
+        exitCode: 2,
+        message: `workflow-runs API error (page ${page}): ${data.stderr} (D-PR8; PF-013: indeterminate is never a pass)`,
+      };
+    }
+    if (totalCount === null) {
+      totalCount = data.total_count ?? 0;
+    }
+    const runs = data.workflow_runs ?? [];
+    // Project to only the five fields we need — avoids leaking unneeded data
+    // into evaluateChecks and makes the contract explicit (D-PR8: minimal surface).
+    allRuns.push(...runs.map(r => ({
+      id: r.id,
+      path: r.path,
+      event: r.event,
+      check_suite_id: r.check_suite_id,
+      conclusion: r.conclusion,
+    })));
+    if (runs.length < perPage || allRuns.length >= totalCount) break;
+    page++;
+  }
+
+  if (page > MAX_RUNS_PAGES) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message:
+        `workflow-runs pagination exceeded ${MAX_RUNS_PAGES} pages (D-PR8; PF-013: indeterminate is never a pass) — ` +
+        `refusing to evaluate partial result`,
+    };
+  }
+
+  // D-PR4a parity: assert we collected everything declared by total_count
+  if (totalCount !== null && allRuns.length !== totalCount) {
+    return {
+      ok: false,
+      exitCode: 2,
+      message:
+        `collected ${allRuns.length} workflow runs but total_count=${totalCount} — ` +
+        `partial page set (D-PR8 total_count guard; PF-013: indeterminate is never a pass)`,
+    };
+  }
+
+  return { ok: true, runs: allRuns };
+}
+
 const USAGE =
   'Usage: node scripts/verify-pr-checks.mjs <pr-number> [--required-from <branch>]';
 
@@ -984,6 +1203,24 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
   const changedFiles = filesResult.files;
   console.log(`  changed files: ${changedFiles.length}`);
 
+  // ---- D-PR8: fetch workflow runs for release.yml suite attribution ----
+  // Must be the LAST fetch so that earlier exit-2 paths (fetchCheckRuns,
+  // fetchStatuses, fetchChangedFiles) still fire before reaching this call.
+  // The result feeds releaseSuiteIdsFrom so Tier B and D-PR7 can verify that
+  // skipped allow-listed runs and release-surface contexts belong to a
+  // release.yml check-suite rather than ci.yml or another workflow.
+  const runsResult = fetchWorkflowRuns(headSha, runner);
+  if (!runsResult.ok) {
+    fail(runsResult.message);
+    return runsResult.exitCode;
+  }
+  const releaseSuiteIds = releaseSuiteIdsFrom(runsResult.runs);
+  const releaseRunsForLog = runsResult.runs.filter(r => releaseSuiteIds.has(r.check_suite_id));
+  const suitesStr = releaseRunsForLog.length > 0
+    ? releaseRunsForLog.map(r => `${r.check_suite_id} (${r.event})`).join(', ')
+    : 'none';
+  console.log(`  workflow runs on head: ${runsResult.runs.length}; release.yml suites: ${suitesStr}`);
+
   // ---- Evaluate (D-PR1: pure function) ----
   const result = evaluateChecks({
     requiredContexts: req.contexts,
@@ -992,6 +1229,7 @@ export function main(argv = process.argv.slice(2), runner = defaultGhRunner, ghV
     headSha,
     prNumber,
     changedFiles,
+    releaseSuiteIds,  // D-PR8: suite attribution for Tier B and D-PR7
   });
 
   for (const line of result.lines) {
