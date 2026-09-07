@@ -87,9 +87,13 @@
  *          releaseSuiteIds undefined → allowance disabled; D-PR7 cannot attribute
  *          several release suites → each run attributed on its own; all must pass
  *
- *        app.slug is NOT consulted: every id in releaseSuiteIds came from
- *        /actions/runs (GitHub Actions runs only), so the CodeQL umbrella suite
- *        never appears — no app-slug filter is needed.
+ *        app.slug is NOT consulted: the mapping keeps only runs whose path ===
+ *        RELEASE_WORKFLOW_PATH ('.github/workflows/release.yml'), so a ci.yml
+ *        run, the dynamic CodeQL analysis run (path 'dynamic/github-code-scanning/
+ *        codeql', which DOES appear in /actions/runs), and the github-advanced-
+ *        security umbrella suite (which does not appear in /actions/runs at all)
+ *        can never contribute a suite id — every id in the set is therefore a
+ *        release.yml suite and app.slug would add nothing.
  *
  * Usage:
  *   node scripts/verify-pr-checks.mjs <pr-number>
@@ -252,8 +256,10 @@ export const RELEASE_WORKFLOW_PATH = '.github/workflows/release.yml';
  *
  * Only numeric (integer) ids are included — non-integer values are excluded
  * as anomalous. Every id in the result is guaranteed to be a GitHub-Actions
- * check-suite id originating from release.yml (by construction, the CodeQL
- * umbrella never appears in /actions/runs).
+ * check-suite id originating from release.yml: the path filter excludes ci.yml
+ * runs, the dynamic CodeQL analysis run ('dynamic/github-code-scanning/codeql',
+ * which does appear in /actions/runs), and — because it has no /actions/runs
+ * entry at all — the github-advanced-security umbrella suite.
  *
  * @param {Array<{path: string, check_suite_id: any}>} runs — projected run objects
  * @returns {Set<number>}
@@ -1040,7 +1046,7 @@ export function fetchWorkflowRuns(headSha, runner) {
       return {
         ok: false,
         exitCode: 2,
-        message: `workflow-runs API error (page ${page}): ${data.stderr} (D-PR8)`,
+        message: `workflow-runs API error (page ${page}): ${data.stderr} (D-PR8; PF-013: indeterminate is never a pass)`,
       };
     }
     if (totalCount === null) {
@@ -1065,7 +1071,7 @@ export function fetchWorkflowRuns(headSha, runner) {
       ok: false,
       exitCode: 2,
       message:
-        `workflow-runs pagination exceeded ${MAX_RUNS_PAGES} pages (D-PR8) — ` +
+        `workflow-runs pagination exceeded ${MAX_RUNS_PAGES} pages (D-PR8; PF-013: indeterminate is never a pass) — ` +
         `refusing to evaluate partial result`,
     };
   }
@@ -1077,7 +1083,7 @@ export function fetchWorkflowRuns(headSha, runner) {
       exitCode: 2,
       message:
         `collected ${allRuns.length} workflow runs but total_count=${totalCount} — ` +
-        `partial page set (D-PR8 total_count guard)`,
+        `partial page set (D-PR8 total_count guard; PF-013: indeterminate is never a pass)`,
     };
   }
 

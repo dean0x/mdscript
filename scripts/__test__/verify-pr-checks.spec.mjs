@@ -2120,7 +2120,7 @@ describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
 // ---------------------------------------------------------------------------
 describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projection', () => {
 
-  test('page cap (≤ 5 requests) then ok:false/exitCode 2 (D-PR8)', () => {
+  test('D-PR5i2: page cap (≤ 5 requests) then ok:false/exitCode 2 (D-PR8)', () => {
     let calls = 0;
     const fullPage = {
       total_count: 100_000,
@@ -2150,7 +2150,7 @@ describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projec
     assert.equal(calls2, 5, `control: must have made exactly 5 requests; made ${calls2}`);
   });
 
-  test('total_count mismatch → ok:false/exitCode 2 (D-PR8)', () => {
+  test('D-PR5i2: total_count mismatch → ok:false/exitCode 2 (D-PR8)', () => {
     const runner = (_args) => ({
       total_count: 50,
       workflow_runs: [{ id: 1, path: '.github/workflows/release.yml', event: 'pull_request', check_suite_id: 123, conclusion: 'success' }],
@@ -2171,7 +2171,7 @@ describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projec
     assert.ok(result2.ok, `control: matching total_count must return ok:true; got: ${JSON.stringify(result2)}`);
   });
 
-  test('single complete page → ok:true with ONLY the projected fields', () => {
+  test('D-PR5i2: single complete page → ok:true with ONLY the projected fields', () => {
     const rawRun = {
       id: 123,
       path: '.github/workflows/release.yml',
@@ -2196,7 +2196,7 @@ describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projec
     assert.ok(!('actor' in projected), 'extra field "actor" must be excluded');
   });
 
-  test('API error → ok:false/exitCode 2 (D-PR8)', () => {
+  test('D-PR5i2: API error → ok:false/exitCode 2 (D-PR8)', () => {
     const runner = (_args) => ({ __error: true, httpStatus: 500, stderr: 'server error' });
     const result = fetchWorkflowRuns('abc123sha', runner);
     assert.ok(!result.ok, 'API error must return ok:false');
@@ -2482,6 +2482,8 @@ describe('current fixtures (2026-09): live-shaped evaluation', () => {
       'protection-main-2026-09 must have 15 required contexts');
     assert.equal(CHECK_RUNS_PR366.length, 44,
       'checks-pr366-e02bcf2 must have 44 check-runs');
+    assert.equal(CHECKS_PR366.total_count, 44,
+      'checks-pr366-e02bcf2 total_count must equal 44');
     const suiteIds = new Set(CHECK_RUNS_PR366.map(cr => cr.check_suite.id));
     assert.equal(suiteIds.size, 4, 'must have 4 distinct check-suites');
     const appSlugs = new Set(CHECK_RUNS_PR366.map(cr => cr.app.slug));

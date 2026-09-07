@@ -176,7 +176,8 @@ The dry-run workflow runs `version-gate` in full, which includes the
   or unscoped (`src/auth.rs:136-144`). The only token-accepting read endpoint,
   `GET /api/v1/me/tokens/{id}` (`src/controllers/token.rs:269-282`), accepts
   legacy unscoped tokens only — a scoped token (the least-privilege kind a publish
-  secret should be) is rejected there with HTTP 403. A well-formed but
+  secret should be) is rejected there with HTTP 403 "this token does not have the
+  required permissions". A well-formed but
   revoked/deleted token gets HTTP 403 "authentication failed" (`src/auth.rs:297-303`);
   a malformed token gets HTTP 401 "The given API token does not match the format
   used by crates.io" (`src/auth.rs:295`, `InsecurelyGeneratedTokenRevoked`).
