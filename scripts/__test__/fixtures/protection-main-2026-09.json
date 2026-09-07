@@ -1,0 +1,86 @@
+{
+  "required_status_checks": {
+    "checks": [
+      {
+        "app_id": 15368,
+        "context": "Rust — fmt, clippy, test"
+      },
+      {
+        "app_id": 15368,
+        "context": "MSRV (Rust 1.88)"
+      },
+      {
+        "app_id": 15368,
+        "context": "WASM — build & test"
+      },
+      {
+        "app_id": 15368,
+        "context": "JS packages — build & test (ubuntu-latest)"
+      },
+      {
+        "app_id": 15368,
+        "context": "JS packages — build & test (macos-latest)"
+      },
+      {
+        "app_id": 15368,
+        "context": "JS packages — build & test (windows-latest)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Source hygiene"
+      },
+      {
+        "app_id": 15368,
+        "context": "examples/ gitignore coverage"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — build & test (ubuntu-latest, 3.11)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — build & test (ubuntu-latest, 3.13)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — build & test (macos-latest, 3.11)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — build & test (macos-latest, 3.13)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — build & test (windows-latest, 3.11)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — build & test (windows-latest, 3.13)"
+      },
+      {
+        "app_id": 15368,
+        "context": "Python — wheel install smoke"
+      }
+    ],
+    "contexts": [
+      "Rust — fmt, clippy, test",
+      "MSRV (Rust 1.88)",
+      "WASM — build & test",
+      "JS packages — build & test (ubuntu-latest)",
+      "JS packages — build & test (macos-latest)",
+      "JS packages — build & test (windows-latest)",
+      "Source hygiene",
+      "examples/ gitignore coverage",
+      "Python — build & test (ubuntu-latest, 3.11)",
+      "Python — build & test (ubuntu-latest, 3.13)",
+      "Python — build & test (macos-latest, 3.11)",
+      "Python — build & test (macos-latest, 3.13)",
+      "Python — build & test (windows-latest, 3.11)",
+      "Python — build & test (windows-latest, 3.13)",
+      "Python — wheel install smoke"
+    ],
+    "contexts_url": "https://api.github.com/repos/dean0x/mdscript/branches/main/protection/required_status_checks/contexts",
+    "strict": true,
+    "url": "https://api.github.com/repos/dean0x/mdscript/branches/main/protection/required_status_checks"
+  }
+}

@@ -24,12 +24,15 @@ import {
   fetchRequiredContexts,
   fetchStatuses,
   fetchCheckRuns,
+  fetchWorkflowRuns,
   parseGhStderrHttpStatus,
   EXPECTED_CONTEXTS,
   TIER_B_EXPECTED_SKIPPED,
   RELEASE_SURFACE,
   RELEASE_SURFACE_CONTEXTS,
+  RELEASE_WORKFLOW_PATH,
   matchesReleaseSurface,
+  releaseSuiteIdsFrom,
 } from '../verify-pr-checks.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../..');
@@ -60,11 +63,37 @@ const REQUIRED = loadProtection();
 // "JS packages — build & test (ubuntu-latest)",
 // "JS packages — build & test (macos-latest)",
 // "JS packages — build & test (windows-latest)"
-assert.equal(REQUIRED.length, 6, 'fixture must have 6 required contexts');
+assert.equal(REQUIRED.length, 6, 'historical fixture (2026-08) must have 6 required contexts');
 
 const HEAD_113F472 = '113f472684d6ee7e398d54c1aadc22b2ad747ae1';
 const HEAD_F168944 = 'f168944'; // PR #239
 const HEAD_E9DACE1 = 'e9dace1'; // PR #240
+
+// D-PR8: release.yml check-suite identity constants.
+// RELEASE_SUITE: the release.yml pull_request suite for PR #366 head e02bcf2.
+// CI_SUITE_113F472: the ci.yml suite in the 2026-08 113f472 fixture (a NON-release suite).
+const RELEASE_SUITE = 92290758559;
+const CI_SUITE_113F472 = 84976779019;
+const RELEASE_SUITES = new Set([RELEASE_SUITE]);
+
+/** Returns a copy of run with check_suite: { id } injected (defaults to RELEASE_SUITE). */
+function withSuite(run, id = RELEASE_SUITE) {
+  return { ...run, check_suite: { id } };
+}
+
+// Minimal runs stubs for the fetchWorkflowRuns call added to main() (D-PR8).
+// Every main() stub test that reaches evaluateChecks needs one of these routes.
+const RUNS_NONE = { total_count: 0, workflow_runs: [] };
+const RUNS_RELEASE = {
+  total_count: 1,
+  workflow_runs: [{
+    id: 34065573775,
+    path: '.github/workflows/release.yml',
+    event: 'pull_request',
+    check_suite_id: RELEASE_SUITE,
+    conclusion: 'success',
+  }],
+};
 
 // A synthetic Source hygiene run (D-PR3b). The 113f472 fixture predates the
 // source-hygiene job (#288); tests that verify a PASSING run today must inject one.
@@ -504,6 +533,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NONE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
   });
@@ -595,6 +625,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/protection', onlyChecks],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NONE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
 
@@ -634,13 +665,14 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     assert.equal(main(['1'], runner, OK_GH_VERSION), 2);
   });
 
-  test('AC-30: the live path issues at most page-bound + 3 API calls', () => {
+  test('AC-30: the live path issues at most page-bound + 3 fixed API calls (6 with single-page stubs)', () => {
     const calls = [];
     const runner = stubRunner([
       ['/pulls/', PR_OK],
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NONE],
     ], calls);
     const start = Date.now();
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0);
@@ -650,9 +682,10 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     // CPU cost and any unexpected loops — network latency is zero.
     assert.ok(elapsed < 15000,
       `verifier must complete in < 15 s wall-clock (AC-30 clause b); took ${elapsed}ms`);
-    // D-PR7: adds one PR-files call (pulls/{n}/files?per_page=100) for the release-surface check.
-    // The /pulls/ stub also matches the files URL and returns PR_OK (no .files → empty list → ok).
-    assert.equal(calls.length, 5, `expected 5 API calls (pr, protection, checks, status, files); got ${calls.length}`);
+    // Fixed calls: pr, protection, checks, status, files, runs = 6.
+    // Budget: fixed 3 + pages ≤ 20 + 30 + 5 = 58 worst case (was 53).
+    // The /pulls/ stub matches the files URL (/pulls/1/files) and returns PR_OK (no .files → ok).
+    assert.equal(calls.length, 6, `expected 6 API calls (pr, protection, checks, status, files, runs); got ${calls.length}`);
     const checkCall = calls.find(u => u.includes('/check-runs'));
     assert.ok(checkCall.includes('filter=latest'), 'filter=latest must be pinned explicitly (D-PR4a)');
     // D-PR4a parity: combined-status endpoint must request per_page=100 so a context
@@ -660,6 +693,11 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
     const statusCall = calls.find(u => u.includes('/status'));
     assert.ok(statusCall && statusCall.includes('per_page=100'),
       `status URL must include per_page=100 (D-PR4a parity); got: ${statusCall}`);
+    // D-PR8: runs call must include head_sha and per_page=100
+    const runsCall = calls.find(u => u.includes('/actions/runs'));
+    assert.ok(runsCall, 'must have made a /actions/runs call');
+    assert.ok(runsCall.includes('head_sha='), 'runs call must include head_sha=');
+    assert.ok(runsCall.includes('per_page=100'), 'runs call must include per_page=100');
   });
 
   test('check-runs API error → exit 2 (indeterminate), not 1', () => {
@@ -677,6 +715,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', { total_count: 0, check_runs: [] }],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NONE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 1);
   });
@@ -707,6 +746,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { total_count: 1, statuses: [{ context: 'foo', state: 'success' }] }],
+      ['/actions/runs', RUNS_NONE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
       'non-truncated status list must not block a passing run');
@@ -720,6 +760,7 @@ describe('AC-26 AC-28 AC-29: live path exit codes (injected runner)', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [] }],  // no total_count
+      ['/actions/runs', RUNS_NONE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
       'missing total_count must not cause a false exit 2');
@@ -1231,6 +1272,7 @@ describe('complexity-08: argument parsing and merge command', () => {
       if (url.includes('/protection')) return PROTECTION_OK;
       if (url.includes('/check-runs')) return CHECKS_OK_WITH_HYGIENE;
       if (url.includes('/status')) return { statuses: [], total_count: 0 };
+      if (url.includes('/actions/runs')) return RUNS_NONE;
       return { __error: true, httpStatus: 404, stderr: 'no route' };
     };
     // '123' is the branch name for --required-from; '456' is the PR number.
@@ -1280,6 +1322,7 @@ describe('complexity-08: argument parsing and merge command', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NONE],
     ]);
     // Intercept console.log to capture the merge command line.
     const origLog = console.log;
@@ -1443,11 +1486,11 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     ];
   }
 
-  test('D-PR5a: all five publish names skipped + required green → PASS and merge command printed', () => {
+  test('D-PR5a: all five publish names skipped in release suite → PASS; each allowed line names suite id (D-PR8)', () => {
     // The RELEASING.md dry-run dispatched on a PR branch sees the five publish
     // jobs as skipped (their refs/tags/v or inputs. guard fires). The verifier must exit 0
-    // so the operator can proceed to tag.
-    const skippedPublishRuns = [...TIER_B_EXPECTED_SKIPPED].map(name => ({
+    // so the operator can proceed to tag. D-PR8: each run must be in a release.yml suite.
+    const skippedPublishRuns = [...TIER_B_EXPECTED_SKIPPED].map(name => withSuite({
       name,
       status: 'completed',
       conclusion: 'skipped',
@@ -1459,18 +1502,20 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
       statuses: [],
       headSha: HEAD_113F472,
       prNumber: 338,
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 0,
-      `five publish names skipped must not block PASS; lines:\n${result.lines.join('\n')}`);
+      `five publish names skipped in release suite must not block PASS; lines:\n${result.lines.join('\n')}`);
     assert.ok(result.pass, 'must return pass=true');
     assert.ok(result.mergeCommand, 'PASS must produce a merge command');
-    // Informational lines must be present (one per skipped job)
-    const allLines = result.lines.join('\n');
+    // D-PR8: each allowed line must say 'allowed' and name the suite id
     for (const name of TIER_B_EXPECTED_SKIPPED) {
-      assert.ok(
-        allLines.includes(name),
-        `output must mention skipped job "${name}"; got:\n${allLines}`,
-      );
+      const line = result.lines.find(l => l.includes(name));
+      assert.ok(line, `output must include a line for skipped job "${name}"; got:\n${result.lines.join('\n')}`);
+      assert.ok(line.includes('allowed'),
+        `output for "${name}" must say "allowed"; got: ${line}`);
+      assert.ok(line.includes(String(RELEASE_SUITE)),
+        `output for "${name}" must name suite id ${RELEASE_SUITE}; got: ${line}`);
     }
   });
 
@@ -1478,13 +1523,14 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     // A cancelled publish run is not the refs/tags/v guard — it is a real
     // failure that must block the merge. Only conclusion=skipped is allowed.
     const runs = basePassingRunsWith([
-      { name: 'Publish to npm', status: 'completed', conclusion: 'cancelled' },
+      withSuite({ name: 'Publish to npm', status: 'completed', conclusion: 'cancelled' }),
     ]);
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
       checkRuns: runs,
       statuses: [],
       headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'cancelled Publish to npm must exit 1 (only skipped is allowed in TIER_B_EXPECTED_SKIPPED)');
@@ -1499,13 +1545,14 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     // conclusion=skipped would pass when it must not (avoids PF-017). Making
     // "Publish to npm" required here pins that boundary.
     const runs = basePassingRunsWith([
-      { name: 'Publish to npm', status: 'completed', conclusion: 'skipped' },
+      withSuite({ name: 'Publish to npm', status: 'completed', conclusion: 'skipped' }),
     ]);
     const result = evaluateChecks({
       requiredContexts: [...REQUIRED, 'Publish to npm'],
       checkRuns: runs,
       statuses: [],
       headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'a required context with conclusion=skipped must fail Tier A even if it is in ' +
@@ -1521,13 +1568,14 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     // The allowance is exactly the five publish job names. Any other job name
     // that reports skipped must still fail Tier B (security-13: whitelist).
     const runs = basePassingRunsWith([
-      { name: 'Some other job', status: 'completed', conclusion: 'skipped' },
+      withSuite({ name: 'Some other job', status: 'completed', conclusion: 'skipped' }),
     ]);
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
       checkRuns: runs,
       statuses: [],
       headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'skipped run under an unlisted name must fail (whitelist is exact, security-13)');
@@ -1540,15 +1588,16 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     // The not-yet-completed guard (status !== 'completed') in Tier B fires before
     // the TIER_B_EXPECTED_SKIPPED allowance. An in_progress publish run must
     // still block the merge — widening the allowance to accept status!='completed'
-    // for the four names would silently break PF-017 (avoids that mutation).
+    // for the five names would silently break PF-017 (avoids that mutation).
     const runs = basePassingRunsWith([
-      { name: 'Publish to npm', status: 'in_progress', conclusion: null },
+      withSuite({ name: 'Publish to npm', status: 'in_progress', conclusion: null }),
     ]);
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
       checkRuns: runs,
       statuses: [],
       headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'in_progress publish run must exit 1 (not-yet-completed guard, avoids PF-017)');
@@ -1564,13 +1613,14 @@ describe('TIER_B_EXPECTED_SKIPPED: release dry-run skipped publish jobs', () => 
     // a skipped run (dispatch-input-guarded) does not block the verifier.
     // But cancelled is NOT skipped — it is a real anomaly and must fail closed.
     const runs = basePassingRunsWith([
-      { name: 'Publish to TestPyPI (rehearsal)', status: 'completed', conclusion: 'cancelled' },
+      withSuite({ name: 'Publish to TestPyPI (rehearsal)', status: 'completed', conclusion: 'cancelled' }),
     ]);
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
       checkRuns: runs,
       statuses: [],
       headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'cancelled Publish to TestPyPI must exit 1 (only skipped is allowed in TIER_B_EXPECTED_SKIPPED)');
@@ -1601,9 +1651,9 @@ describe('D-PR7: release-surface presence check', () => {
     ];
   }
 
-  // Three release-surface jobs, all success.
+  // Three release-surface jobs, all success, each attributed to RELEASE_SUITE (D-PR8).
   function releaseSuccessRuns() {
-    return RELEASE_SURFACE_CONTEXTS.map(name => ({
+    return RELEASE_SURFACE_CONTEXTS.map(name => withSuite({
       name,
       status: 'completed',
       conclusion: 'success',
@@ -1618,6 +1668,7 @@ describe('D-PR7: release-surface presence check', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 0,
       `touched release surface + all contexts success must exit 0; lines:\n${result.lines.join('\n')}`);
@@ -1637,6 +1688,7 @@ describe('D-PR7: release-surface presence check', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       `absent "Version gate" with release surface touched must exit 1; got:\n${result.lines.join('\n')}`);
@@ -1657,6 +1709,7 @@ describe('D-PR7: release-surface presence check', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'release surface requires success, not skipped; must exit 1');
@@ -1670,7 +1723,7 @@ describe('D-PR7: release-surface presence check', () => {
   test('D-PR7d: touched + one present run in_progress → exit 1', () => {
     const withInProgress = releaseSuccessRuns().map(r =>
       r.name === 'Stage + verify platform packages'
-        ? { name: r.name, status: 'in_progress', conclusion: null }
+        ? withSuite({ name: r.name, status: 'in_progress', conclusion: null })
         : r,
     );
     const checkRuns = passingRunsWith(withInProgress);
@@ -1680,6 +1733,7 @@ describe('D-PR7: release-surface presence check', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['crates/mds-napi/src/lib.rs'],
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1, 'in_progress release job with touched surface must exit 1');
   });
@@ -1692,6 +1746,7 @@ describe('D-PR7: release-surface presence check', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['crates/mds-core/src/lib.rs'],
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 0,
       'non-release file must not require release check-runs; must exit 0');
@@ -1799,6 +1854,7 @@ describe('D-PR7: release-surface presence check', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', CHECKS_OK_WITH_HYGIENE],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NONE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 1,
       'a release-surface file with no release check-runs must exit 1');
@@ -1811,7 +1867,7 @@ describe('D-PR7: release-surface presence check', () => {
       ...CHECKS_OK_WITH_HYGIENE,
       check_runs: [
         ...CHECKS_OK_WITH_HYGIENE.check_runs,
-        ...RELEASE_SURFACE_CONTEXTS.map(name => ({
+        ...RELEASE_SURFACE_CONTEXTS.map(name => withSuite({
           name, status: 'completed', conclusion: 'success',
         })),
       ],
@@ -1823,6 +1879,7 @@ describe('D-PR7: release-surface presence check', () => {
       ['/protection', PROTECTION_OK],
       ['/check-runs', withRelease],
       ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_RELEASE],
     ]);
     assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
       'a release-surface file WITH all release check-runs must exit 0');
@@ -1837,10 +1894,11 @@ describe('D-PR7: release-surface presence check', () => {
   // re-run mask a red sibling — a fail-open in a merge gate.
   // -------------------------------------------------------------------------
   test('D-PR7j: a failed and a succeeded run sharing a release-surface name → exit 1 (all must pass)', () => {
+    // 3a803f5 is the commit cited by the original D-PR7j all-must-pass spec.
     const checkRuns = passingRunsWith([
       ...releaseSuccessRuns(),
-      // A second run under a name that already has a success above.
-      { name: 'Version gate', status: 'completed', conclusion: 'failure' },
+      // A second run under a name that already has a success above, in the SAME release suite.
+      withSuite({ name: 'Version gate', status: 'completed', conclusion: 'failure' }),
     ]);
     const result = evaluateChecks({
       requiredContexts: REQUIRED,
@@ -1848,6 +1906,7 @@ describe('D-PR7: release-surface presence check', () => {
       statuses: [],
       headSha: HEAD_113F472,
       changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: RELEASE_SUITES,
     });
     assert.equal(result.exitCode, 1,
       'a later success must not mask an earlier failure under the same name; must exit 1');
@@ -1874,6 +1933,688 @@ describe('D-PR7: release-surface presence check', () => {
     // GitHub ever reports — but the prefix rule must still be strict about it.
     assert.ok(!matchesReleaseSurface('.github/actions'),
       '.github/actions/** must not match the bare directory name');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR8: Suite-keyed skipped-publish allowance — new tests
+// ---------------------------------------------------------------------------
+describe('D-PR8: suite-keyed TIER_B_EXPECTED_SKIPPED allowance', () => {
+
+  function basePassingRunsWith(extras) {
+    return [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      ...extras,
+    ];
+  }
+
+  test('D-PR5g: allow-listed name skipped in NON-release suite (CI_SUITE_113F472) → exit 1; message names both suite ids (D-PR8)', () => {
+    const runs = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'completed', conclusion: 'skipped', check_suite: { id: CI_SUITE_113F472 } },
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
+    });
+    assert.equal(result.exitCode, 1,
+      'allow-listed name in non-release suite must fail (D-PR8)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Publish to npm'), `must name the job; got:\n${allLines}`);
+    assert.ok(
+      allLines.includes(String(CI_SUITE_113F472)),
+      `failure must name the check-run's suite id (${CI_SUITE_113F472}); got:\n${allLines}`,
+    );
+    assert.ok(
+      allLines.includes(String(RELEASE_SUITE)) || allLines.includes('none'),
+      `failure must mention the release suite list; got:\n${allLines}`,
+    );
+    // Positive control: same check-run but treat CI_SUITE as a release suite → PASS
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: new Set([CI_SUITE_113F472]),
+    });
+    assert.equal(result2.exitCode, 0,
+      'control: when the run\'s suite IS in releaseSuiteIds, must pass');
+  });
+
+  test('D-PR5g2: allow-listed name skipped but check_suite field absent → exit 1; "check_suite.id missing" (D-PR8)', () => {
+    const runs = basePassingRunsWith([
+      { name: 'Publish to npm', status: 'completed', conclusion: 'skipped' }, // no check_suite
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
+    });
+    assert.equal(result.exitCode, 1, 'missing check_suite must fail (D-PR8)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('check_suite.id missing'),
+      `failure must say "check_suite.id missing"; got:\n${allLines}`,
+    );
+    // Positive control: add check_suite in release suite → PASS
+    const runs2 = basePassingRunsWith([
+      withSuite({ name: 'Publish to npm', status: 'completed', conclusion: 'skipped' }),
+    ]);
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs2,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: RELEASE_SUITES,
+    });
+    assert.equal(result2.exitCode, 0, 'control: check_suite present in release suite must pass');
+  });
+
+  test('D-PR5h: releaseSuiteIds undefined → all five skipped allow-listed names FAIL with DISABLED in message (D-PR8, fails closed)', () => {
+    const skippedPublishRuns = [...TIER_B_EXPECTED_SKIPPED].map(name => ({
+      name, status: 'completed', conclusion: 'skipped',
+    }));
+    const runs = basePassingRunsWith(skippedPublishRuns);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      // releaseSuiteIds: undefined — not provided
+    });
+    assert.equal(result.exitCode, 1,
+      'undefined releaseSuiteIds must fail the five skipped allow-listed names');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('DISABLED'),
+      `failure must say DISABLED when releaseSuiteIds is undefined; got:\n${allLines}`);
+    // Each of the five names must appear in a failure
+    for (const name of TIER_B_EXPECTED_SKIPPED) {
+      assert.ok(
+        allLines.includes(name),
+        `failure must name "${name}"; got:\n${allLines}`,
+      );
+    }
+  });
+
+  test('D-PR5h2: releaseSuiteIds undefined but no skipped allow-listed names and untouched surface → PASS; prints "not provided" line', () => {
+    const runs = basePassingRunsWith([]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['README.md'],
+      // relaseSuiteIds: undefined — not provided
+    });
+    assert.equal(result.exitCode, 0,
+      'undefined releaseSuiteIds with no skipped names and untouched surface must pass');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('not provided'),
+      `output must print the "not provided" state; got:\n${allLines}`,
+    );
+  });
+
+  test('D-PR5i: live path, runs-API error → exit 2 (D-PR8, fail closed)', () => {
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', CHECKS_OK_WITH_HYGIENE],
+      ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', { __error: true, httpStatus: 500, stderr: 'server error' }],
+    ]);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 2,
+      'runs API error must exit 2 (D-PR8, fail closed)');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR5i2: fetchWorkflowRuns unit tests (bounded loop, total_count guard,
+// field projection). Mirrors architecture-08 for fetchCheckRuns.
+// ---------------------------------------------------------------------------
+describe('D-PR5i2: fetchWorkflowRuns — bounded loop, total_count guard, projection', () => {
+
+  test('page cap (≤ 5 requests) then ok:false/exitCode 2 (D-PR8)', () => {
+    let calls = 0;
+    const fullPage = {
+      total_count: 100_000,
+      workflow_runs: Array.from({ length: 100 }, (_, i) => ({
+        id: i, path: '.github/workflows/ci.yml', event: 'pull_request',
+        check_suite_id: i + 1, conclusion: 'success',
+      })),
+    };
+    const runner = (_args) => { calls++; return fullPage; };
+    const result = fetchWorkflowRuns('abc123sha', runner);
+    assert.ok(!result.ok, 'must return ok:false when pagination exceeds MAX_RUNS_PAGES');
+    assert.equal(result.exitCode, 2, 'pagination cap must produce exit 2 (D-PR8)');
+    assert.ok(calls <= 5, `must not exceed 5 page requests; made ${calls} (pinned to MAX_RUNS_PAGES=5)`);
+    assert.ok(calls >= 1, 'must have made at least one request');
+  });
+
+  test('total_count mismatch → ok:false/exitCode 2 (D-PR8)', () => {
+    const runner = (_args) => ({
+      total_count: 50,
+      workflow_runs: [{ id: 1, path: '.github/workflows/release.yml', event: 'pull_request', check_suite_id: 123, conclusion: 'success' }],
+    });
+    const result = fetchWorkflowRuns('abc123sha', runner);
+    assert.ok(!result.ok, 'total_count mismatch must return ok:false');
+    assert.equal(result.exitCode, 2, 'total_count mismatch must produce exit 2 (D-PR8)');
+    assert.ok(
+      result.message.includes('total_count') || result.message.includes('D-PR8'),
+      `message must mention total_count or D-PR8; got: ${result.message}`,
+    );
+  });
+
+  test('single complete page → ok:true with ONLY the projected fields', () => {
+    const rawRun = {
+      id: 123,
+      path: '.github/workflows/release.yml',
+      event: 'pull_request',
+      check_suite_id: RELEASE_SUITE,
+      conclusion: 'success',
+      // Extra fields that must NOT appear in the projected output:
+      name: 'Release', html_url: 'https://...', actor: { login: 'user' },
+    };
+    const runner = (_args) => ({ total_count: 1, workflow_runs: [rawRun] });
+    const result = fetchWorkflowRuns('abc123sha', runner);
+    assert.ok(result.ok, `must return ok:true for a complete single-page result; got: ${JSON.stringify(result)}`);
+    assert.equal(result.runs.length, 1, 'must return one run');
+    const projected = result.runs[0];
+    assert.equal(projected.id, 123, 'id must be projected');
+    assert.equal(projected.path, '.github/workflows/release.yml', 'path must be projected');
+    assert.equal(projected.event, 'pull_request', 'event must be projected');
+    assert.equal(projected.check_suite_id, RELEASE_SUITE, 'check_suite_id must be projected');
+    assert.equal(projected.conclusion, 'success', 'conclusion must be projected');
+    assert.ok(!('name' in projected), 'extra field "name" must be excluded');
+    assert.ok(!('html_url' in projected), 'extra field "html_url" must be excluded');
+    assert.ok(!('actor' in projected), 'extra field "actor" must be excluded');
+  });
+
+  test('API error → ok:false/exitCode 2 (D-PR8)', () => {
+    const runner = (_args) => ({ __error: true, httpStatus: 500, stderr: 'server error' });
+    const result = fetchWorkflowRuns('abc123sha', runner);
+    assert.ok(!result.ok, 'API error must return ok:false');
+    assert.equal(result.exitCode, 2, 'API error must produce exit 2');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR5j: live path with RUNS_RELEASE → 6 API calls, exit 0; control with
+// ci.yml path → exit 1 (D-PR8)
+// ---------------------------------------------------------------------------
+describe('D-PR5j: live path with workflow runs routing (D-PR8)', () => {
+
+  test('D-PR5j: RUNS_RELEASE → exit 0 and 6 URLs; control: run path = ci.yml → releaseSuiteIds empty → exit 1', () => {
+    // Add a skipped publish run so that the "no release suite → fail" control fires.
+    const withSkipped = {
+      ...CHECKS_OK_WITH_HYGIENE,
+      check_runs: [
+        ...CHECKS_OK_WITH_HYGIENE.check_runs,
+        { name: 'Publish to npm', status: 'completed', conclusion: 'skipped', check_suite: { id: RELEASE_SUITE } },
+      ],
+      total_count: CHECKS_OK_WITH_HYGIENE.total_count + 1,
+    };
+    const calls = [];
+    const runner = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', withSkipped],
+      ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_RELEASE],
+    ], calls);
+    assert.equal(main(['1'], runner, OK_GH_VERSION), 0,
+      'RUNS_RELEASE must allow the skipped publish run and exit 0');
+    assert.equal(calls.length, 6, `expected 6 API calls (pr, protection, checks, status, files, runs); got ${calls.length}`);
+    const runsCall = calls.find(u => u.includes('/actions/runs'));
+    assert.ok(runsCall, 'must have made a /actions/runs call');
+    assert.ok(runsCall.includes('head_sha='), 'runs call must include head_sha=');
+    assert.ok(runsCall.includes('per_page=100'), 'runs call must include per_page=100');
+
+    // Control: same check-runs but run path = ci.yml → empty releaseSuiteIds → skipped run fails
+    const CI_RUNS = {
+      total_count: 1,
+      workflow_runs: [{ id: 99, path: '.github/workflows/ci.yml', event: 'pull_request', check_suite_id: CI_SUITE_113F472, conclusion: 'success' }],
+    };
+    const runner2 = stubRunner([
+      ['/pulls/', PR_OK],
+      ['/protection', PROTECTION_OK],
+      ['/check-runs', withSkipped],
+      ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', CI_RUNS],
+    ]);
+    assert.equal(main(['1'], runner2, OK_GH_VERSION), 1,
+      'control: ci.yml path → releaseSuiteIds empty → skipped publish run fails → exit 1');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR5k: two release suites on one head — each run attributed on its own
+// ---------------------------------------------------------------------------
+describe('D-PR5k: multiple release suites on one head (dispatch + pull_request)', () => {
+
+  test('D-PR5k: two release suites → each skip attributed to its own suite; PASS; control: failure in second suite → exit 1', () => {
+    const SUITE_A = RELEASE_SUITE;
+    const SUITE_B = 92246852351; // PR #365 dispatch-only release suite (event-agnostic)
+    const twoSuites = new Set([SUITE_A, SUITE_B]);
+
+    function basePassingRunsWith(extras) {
+      return [
+        ...loadCheckRuns('checks-main-113f472.json'),
+        { ...SOURCE_HYGIENE_PASS },
+        ...extras,
+      ];
+    }
+
+    // Four names in SUITE_A, TestPyPI in SUITE_B
+    const runs = basePassingRunsWith([
+      ...['Publish to crates.io', 'Publish to npm', 'Publish to PyPI', 'GitHub Release'].map(name =>
+        withSuite({ name, status: 'completed', conclusion: 'skipped' }, SUITE_A),
+      ),
+      withSuite({ name: 'Publish to TestPyPI (rehearsal)', status: 'completed', conclusion: 'skipped' }, SUITE_B),
+    ]);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: twoSuites,
+    });
+    assert.equal(result.exitCode, 0,
+      'both release suites must allow their skipped runs → pass');
+
+    // Control: flip TestPyPI in SUITE_B to failure → exit 1 (all-must-pass, D-PR7j ref 3a803f5)
+    const runs2 = basePassingRunsWith([
+      ...['Publish to crates.io', 'Publish to npm', 'Publish to PyPI', 'GitHub Release'].map(name =>
+        withSuite({ name, status: 'completed', conclusion: 'skipped' }, SUITE_A),
+      ),
+      withSuite({ name: 'Publish to TestPyPI (rehearsal)', status: 'completed', conclusion: 'failure' }, SUITE_B),
+    ]);
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns: runs2,
+      statuses: [],
+      headSha: HEAD_113F472,
+      releaseSuiteIds: twoSuites,
+    });
+    assert.equal(result2.exitCode, 1,
+      'control: failure in second release suite must exit 1 (all-must-pass)');
+    const allLines2 = result2.lines.join('\n');
+    assert.ok(allLines2.includes('Publish to TestPyPI'), 'must name the failing job');
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// D-PR7k, D-PR7l: release-surface attribution via releaseSuiteIds (D-PR8)
+// ---------------------------------------------------------------------------
+describe('D-PR7k, D-PR7l: D-PR7 attribution keyed on release suite identity', () => {
+
+  function passingRunsWith(extras) {
+    return [
+      ...loadCheckRuns('checks-main-113f472.json'),
+      { ...SOURCE_HYGIENE_PASS },
+      ...extras,
+    ];
+  }
+
+  test('D-PR7k: release-surface contexts present ONLY in ci.yml suite → exit 1; "absent from every … check-suite" AND "other suites ignored"', () => {
+    const releaseRunsInCiSuite = RELEASE_SURFACE_CONTEXTS.map(name => ({
+      name, status: 'completed', conclusion: 'success', check_suite: { id: CI_SUITE_113F472 },
+    }));
+    const checkRuns = passingRunsWith(releaseRunsInCiSuite);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+      relaseSuiteIds: RELEASE_SUITES,  // intentional typo for RED — see correction in code
+    });
+    // This test is RED until the code is implemented (relaseSuiteIds → undefined → fail closed)
+    // After fix: releaseSuiteIds will be used correctly
+    assert.equal(result.exitCode, 1,
+      'release-surface contexts in non-release suite must exit 1 (D-PR8)');
+  });
+
+  test('D-PR7k (corrected): contexts in ci.yml suite → exit 1; message cites "absent from every .github/workflows/release.yml" and N same-name runs ignored', () => {
+    const releaseRunsInCiSuite = RELEASE_SURFACE_CONTEXTS.map(name => ({
+      name, status: 'completed', conclusion: 'success', check_suite: { id: CI_SUITE_113F472 },
+    }));
+    const checkRuns = passingRunsWith(releaseRunsInCiSuite);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: RELEASE_SUITES, // correct spelling
+    });
+    assert.equal(result.exitCode, 1, 'contexts only in ci.yml suite must fail (D-PR8)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('absent from every .github/workflows/release.yml') ||
+      allLines.includes('absent from every'),
+      `must say "absent from every .github/workflows/release.yml"; got:\n${allLines}`,
+    );
+    assert.ok(
+      allLines.includes('other suites ignored') || allLines.includes('ignored'),
+      `must mention that same-name runs in other suites are ignored; got:\n${allLines}`,
+    );
+    // Positive control: same runs but CI_SUITE_113F472 IS a release suite → PASS
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds: new Set([CI_SUITE_113F472]),
+    });
+    assert.equal(result2.exitCode, 0,
+      'control: when ci.yml suite is treated as a release suite, must pass');
+  });
+
+  test('D-PR7l: releaseSuiteIds undefined + surface touched → 3 D-PR7 failures ("not provided")', () => {
+    const releaseRuns = RELEASE_SURFACE_CONTEXTS.map(name => ({
+      name, status: 'completed', conclusion: 'success',
+    }));
+    const checkRuns = passingRunsWith(releaseRuns);
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED,
+      checkRuns,
+      statuses: [],
+      headSha: HEAD_113F472,
+      changedFiles: ['.github/workflows/release.yml'],
+      // releaseSuiteIds: undefined — not provided
+    });
+    assert.equal(result.exitCode, 1,
+      'undefined releaseSuiteIds + surface touched must fail (D-PR8, fails closed)');
+    const allLines = result.lines.join('\n');
+    assert.ok(
+      allLines.includes('not provided'),
+      `must say "not provided" in D-PR7 failure; got:\n${allLines}`,
+    );
+    // All 3 RELEASE_SURFACE_CONTEXTS should fail
+    for (const ctx of RELEASE_SURFACE_CONTEXTS) {
+      assert.ok(allLines.includes(ctx), `must name context "${ctx}"; got:\n${allLines}`);
+    }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// releaseSuiteIdsFrom unit tests (D-PR8)
+// ---------------------------------------------------------------------------
+describe('releaseSuiteIdsFrom: builds Set<number> of check_suite_ids for release.yml runs', () => {
+
+  test('returns Set<number> with release.yml suite ids only; non-release paths excluded; non-integer ids excluded', () => {
+    const runs = [
+      { id: 1, path: '.github/workflows/release.yml', event: 'pull_request', check_suite_id: 123, conclusion: 'success' },
+      { id: 2, path: '.github/workflows/ci.yml', event: 'pull_request', check_suite_id: 456, conclusion: 'success' },
+      { id: 3, path: '.github/workflows/release.yml', event: 'workflow_dispatch', check_suite_id: 789, conclusion: 'success' },
+      { id: 4, path: '.github/workflows/release.yml', event: 'push', check_suite_id: 'not-a-number', conclusion: 'success' },
+    ];
+    const result = releaseSuiteIdsFrom(runs);
+    assert.ok(result instanceof Set, 'must return a Set');
+    assert.ok(result.has(123), 'must include pull_request release suite 123');
+    assert.ok(result.has(789), 'must include workflow_dispatch release suite 789 (any event counts)');
+    assert.ok(!result.has(456), 'must exclude ci.yml suite 456');
+    assert.ok(!result.has('not-a-number'), 'must exclude non-integer ids');
+    assert.equal(result.size, 2, 'must contain exactly 2 entries');
+  });
+
+  test('empty runs array → empty Set (no release suites on this head)', () => {
+    const result = releaseSuiteIdsFrom([]);
+    assert.ok(result instanceof Set, 'must return a Set');
+    assert.equal(result.size, 0, 'empty runs must yield empty Set');
+  });
+
+  test('drift guard: RELEASE_SURFACE includes RELEASE_WORKFLOW_PATH (ADR-013 amendment)', () => {
+    // releaseSuiteIdsFrom uses RELEASE_WORKFLOW_PATH to filter runs.
+    // RELEASE_SURFACE must include that path so the release-surface presence check
+    // and the suite attribution use the same path string (ADR-013).
+    assert.ok(
+      RELEASE_SURFACE.includes(RELEASE_WORKFLOW_PATH),
+      `RELEASE_WORKFLOW_PATH "${RELEASE_WORKFLOW_PATH}" must be in RELEASE_SURFACE: ${RELEASE_SURFACE.join(', ')}`,
+    );
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// Current fixtures (2026-09): live-shaped evaluation with the PR #366 fixture
+// ---------------------------------------------------------------------------
+describe('current fixtures (2026-09): live-shaped evaluation', () => {
+
+  const CHECKS_PR366 = JSON.parse(readFileSync(join(FIXTURES, 'checks-pr366-e02bcf2.json'), 'utf8'));
+  const RUNS_PR366 = JSON.parse(readFileSync(join(FIXTURES, 'runs-pr366-e02bcf2.json'), 'utf8'));
+  const PROTECTION_2026_09 = JSON.parse(readFileSync(join(FIXTURES, 'protection-main-2026-09.json'), 'utf8'));
+
+  const REQUIRED_2026_09 = PROTECTION_2026_09.required_status_checks.contexts;
+  const CHECK_RUNS_PR366 = CHECKS_PR366.check_runs;
+  const PR366_HEAD = 'e02bcf280dc50bb8df032744aa2a2520c02865ee';
+  // B1 files changed in PR #366:
+  const PR366_FILES = [
+    { filename: '.github/workflows/release.yml' },
+    { filename: 'CHANGELOG.md' },
+    { filename: 'RELEASING.md' },
+    { filename: 'scripts/__test__/release-auth-probe.spec.mjs' },
+    { filename: 'scripts/__test__/verify-pr-checks.spec.mjs' },
+    { filename: 'scripts/verify-pr-checks.mjs' },
+  ];
+  const CI_SUITE_PR366 = 92290758550; // ci.yml suite for PR #366
+
+  // Build releaseSuiteIds from the runs fixture
+  function pr366ReleaseSuiteIds() {
+    return releaseSuiteIdsFrom(RUNS_PR366.workflow_runs.map(r => ({
+      id: r.id, path: r.path, event: r.event, check_suite_id: r.check_suite_id, conclusion: r.conclusion,
+    })));
+  }
+
+  test('fixture shapes: 15 required contexts; 44 check-runs across 4 suites; app.slug ∈ {github-actions, github-advanced-security}; 3 workflow runs with exactly 1 release.yml run (check_suite_id = RELEASE_SUITE)', () => {
+    assert.equal(REQUIRED_2026_09.length, 15,
+      'protection-main-2026-09 must have 15 required contexts');
+    assert.equal(CHECK_RUNS_PR366.length, 44,
+      'checks-pr366-e02bcf2 must have 44 check-runs');
+    const suiteIds = new Set(CHECK_RUNS_PR366.map(cr => cr.check_suite.id));
+    assert.equal(suiteIds.size, 4, 'must have 4 distinct check-suites');
+    const appSlugs = new Set(CHECK_RUNS_PR366.map(cr => cr.app.slug));
+    for (const slug of appSlugs) {
+      assert.ok(
+        ['github-actions', 'github-advanced-security'].includes(slug),
+        `unexpected app.slug "${slug}" — only github-actions and github-advanced-security expected`,
+      );
+    }
+    assert.equal(RUNS_PR366.total_count, 3, 'runs fixture must declare total_count=3');
+    const releaseRuns = RUNS_PR366.workflow_runs.filter(r => r.path === RELEASE_WORKFLOW_PATH);
+    assert.equal(releaseRuns.length, 1, 'exactly one release.yml workflow run expected');
+    assert.equal(releaseRuns[0].check_suite_id, RELEASE_SUITE,
+      `release run must have check_suite_id ${RELEASE_SUITE}`);
+  });
+
+  test('CF-1: pure evaluateChecks with PR #366 fixture → PASS; "release surface touched"; five allowed (D-PR8) lines with suite id; control: mutate Version gate → exit 1', () => {
+    const releaseSuiteIds = pr366ReleaseSuiteIds();
+
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED_2026_09,
+      checkRuns: CHECK_RUNS_PR366,
+      statuses: [],
+      headSha: PR366_HEAD,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds,
+    });
+    assert.equal(result.exitCode, 0, `must PASS; lines:\n${result.lines.join('\n')}`);
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('release surface touched'), 'must say "release surface touched"');
+
+    // Five allowed lines (D-PR8): each must say "allowed" and name the release suite id
+    for (const name of TIER_B_EXPECTED_SKIPPED) {
+      const line = result.lines.find(l => l.includes(name));
+      assert.ok(line, `output must include a line for "${name}"; got:\n${allLines}`);
+      assert.ok(line.includes('allowed'), `"${name}" allowed line must say "allowed"; got: ${line}`);
+      assert.ok(
+        line.includes(String(RELEASE_SUITE)),
+        `"${name}" allowed line must name suite id ${RELEASE_SUITE}; got: ${line}`,
+      );
+    }
+
+    // Control: mutate "Version gate" to failure → exit 1
+    const withFailedGate = CHECK_RUNS_PR366.map(cr =>
+      (cr.name === 'Version gate' && cr.check_suite.id === RELEASE_SUITE)
+        ? { ...cr, conclusion: 'failure' }
+        : cr,
+    );
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED_2026_09,
+      checkRuns: withFailedGate,
+      statuses: [],
+      headSha: PR366_HEAD,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds,
+    });
+    assert.equal(result2.exitCode, 1, 'control: failed Version gate must exit 1');
+    assert.ok(result2.lines.join('\n').includes('Version gate'), 'must name Version gate in failure');
+  });
+
+  test('CF-2: "Publish to npm" re-suited to ci.yml suite → exit 1 (D-PR8: skipped allowance requires release suite)', () => {
+    const releaseSuiteIds = pr366ReleaseSuiteIds();
+    // Move "Publish to npm" from release suite to ci.yml suite
+    const resuitedChecks = CHECK_RUNS_PR366.map(cr =>
+      (cr.name === 'Publish to npm' && cr.check_suite.id === RELEASE_SUITE)
+        ? { ...cr, check_suite: { id: CI_SUITE_PR366 } }
+        : cr,
+    );
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED_2026_09,
+      checkRuns: resuitedChecks,
+      statuses: [],
+      headSha: PR366_HEAD,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds,
+    });
+    assert.equal(result.exitCode, 1,
+      '"Publish to npm" re-suited to ci.yml must fail the skipped-allowance check (D-PR8)');
+    const allLines = result.lines.join('\n');
+    assert.ok(allLines.includes('Publish to npm'), 'must name the failing job');
+    assert.ok(
+      allLines.includes(String(CI_SUITE_PR366)) || allLines.includes(String(RELEASE_SUITE)),
+      'must mention a suite id in the failure',
+    );
+  });
+
+  test('CF-3: live main() over fixtures (stubbed runner) → exit 0; 6 API calls; merge line contains "366"; control: run path = ci.yml → exit 1', () => {
+    const PR366_DATA = { head: { sha: PR366_HEAD }, base: { ref: 'main' }, changed_files: 6 };
+    const calls = [];
+    const runner = stubRunner([
+      ['/files', PR366_FILES],
+      ['/pulls/', PR366_DATA],
+      ['/protection', PROTECTION_2026_09],
+      ['/check-runs', CHECKS_PR366],
+      ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_PR366],
+    ], calls);
+
+    const lines = [];
+    const origLog = console.log;
+    console.log = (...args) => lines.push(args.join(' '));
+    let exitCode;
+    try {
+      exitCode = main(['366'], runner, OK_GH_VERSION);
+    } finally {
+      console.log = origLog;
+    }
+    assert.equal(exitCode, 0, `must exit 0; output:\n${lines.join('\n')}`);
+    assert.equal(calls.length, 6, `expected 6 API calls; got ${calls.length}: ${calls.join(', ')}`);
+    const mergeLine = lines.find(l => l.includes('gh pr merge'));
+    assert.ok(mergeLine, `output must include a merge command; got:\n${lines.join('\n')}`);
+    assert.ok(mergeLine.includes('366'), `merge command must contain PR number 366; got: ${mergeLine}`);
+
+    // Control: rewrite the release run's path to ci.yml → releaseSuiteIds empty → 5+3 failures → exit 1
+    const RUNS_NO_RELEASE_PATH = {
+      ...RUNS_PR366,
+      workflow_runs: RUNS_PR366.workflow_runs.map(r =>
+        r.path === RELEASE_WORKFLOW_PATH ? { ...r, path: '.github/workflows/ci.yml' } : r,
+      ),
+    };
+    const runner2 = stubRunner([
+      ['/files', PR366_FILES],
+      ['/pulls/', PR366_DATA],
+      ['/protection', PROTECTION_2026_09],
+      ['/check-runs', CHECKS_PR366],
+      ['/status', { statuses: [], total_count: 0 }],
+      ['/actions/runs', RUNS_NO_RELEASE_PATH],
+    ]);
+    assert.equal(main(['366'], runner2, OK_GH_VERSION), 1,
+      'control: no release.yml run in the runs fixture → exit 1');
+  });
+
+  test('CF-4: release run removed from runs fixture → Tier B (5 skipped) + D-PR7 (3 contexts) all FAIL', () => {
+    const RUNS_STRIPPED = {
+      total_count: 2,
+      workflow_runs: RUNS_PR366.workflow_runs.filter(r => r.path !== RELEASE_WORKFLOW_PATH),
+    };
+    const releaseSuiteIds = releaseSuiteIdsFrom(RUNS_STRIPPED.workflow_runs.map(r => ({
+      id: r.id, path: r.path, event: r.event, check_suite_id: r.check_suite_id, conclusion: r.conclusion,
+    })));
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED_2026_09,
+      checkRuns: CHECK_RUNS_PR366,
+      statuses: [],
+      headSha: PR366_HEAD,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds,
+    });
+    assert.equal(result.exitCode, 1, 'no release suite → must fail');
+    // 5 Tier B failures + 3 D-PR7 failures = 8 content failures + 1 summary line = 9 ✖ lines
+    const failureLines = result.lines.filter(l => l.startsWith('✖'));
+    assert.ok(
+      failureLines.length >= 9,
+      `expected ≥9 failure lines (5 Tier B + 3 D-PR7 + summary); got ${failureLines.length}:\n${result.lines.join('\n')}`,
+    );
+  });
+
+  test('CF-5: with 2026-09 protection, EXPECTED_CONTEXTS are now Tier A — no double-report; Tier A catches planted Source hygiene failure', () => {
+    const releaseSuiteIds = pr366ReleaseSuiteIds();
+
+    // PASS: all 15 required contexts + surface contexts → no double-report
+    const result = evaluateChecks({
+      requiredContexts: REQUIRED_2026_09,
+      checkRuns: CHECK_RUNS_PR366,
+      statuses: [],
+      headSha: PR366_HEAD,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds,
+    });
+    assert.equal(result.exitCode, 0, `must PASS; lines:\n${result.lines.join('\n')}`);
+    // Source hygiene is now Tier A (in the 2026-09 required set); must NOT appear in Tier A+
+    const tierAplusLines = result.lines.filter(l => l.includes('Tier A+') && l.includes('Source hygiene'));
+    assert.equal(tierAplusLines.length, 0,
+      'Source hygiene must not appear in Tier A+ — it is now in Tier A (2026-09 protection)');
+
+    // Tier A catches planted Source hygiene failure
+    const withFailedHygiene = CHECK_RUNS_PR366.map(cr =>
+      cr.name === 'Source hygiene' ? { ...cr, conclusion: 'failure' } : cr,
+    );
+    const result2 = evaluateChecks({
+      requiredContexts: REQUIRED_2026_09,
+      checkRuns: withFailedHygiene,
+      statuses: [],
+      headSha: PR366_HEAD,
+      changedFiles: ['.github/workflows/release.yml'],
+      releaseSuiteIds,
+    });
+    assert.equal(result2.exitCode, 1, 'planted Source hygiene failure must fail');
+    const allLines2 = result2.lines.join('\n');
+    assert.ok(allLines2.includes('Source hygiene'), 'must name Source hygiene');
+    assert.ok(allLines2.includes('Tier A'), 'must report as Tier A failure (not Tier A+)');
   });
 
 });
