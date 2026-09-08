@@ -36,7 +36,7 @@ pull_request       ─┘                   (publish jobs tag-guarded / input-gu
 
 Three entry points, one workflow:
 
-- **`push.tags v*`** — full coordinated release; all ten jobs run.
+- **`push.tags v*`** — full coordinated release; all eleven jobs run.
 - **`workflow_dispatch`** — dry run; five publish jobs are `skipped` (tag guard fails). Add
   `-f testpypi=true` to also trigger the `publish-testpypi` opt-in leg.
 - **`pull_request` (path-filtered)** — rehearsal only; paths filter is the release surface
@@ -47,12 +47,12 @@ Three entry points, one workflow:
 (avoids PF-017's cancelled-run-as-green shape mid-sequence and prevents a partial-publish
 state between `cargo publish` and `npm publish`).
 
-## Component Architecture — Ten Jobs and Their DAG
+## Component Architecture — Eleven Jobs and Their DAG
 
 ```
 version-gate
-  ├─→ build-napi (7 legs)  ─→ stage-and-verify-napi ─┐
-  └─→ build-python (8 legs) ─→ rehearse-publish-python ─┤
+  ├─→ build-napi (7 legs)  ─→ stage-and-verify-napi ─→ load-test-musl-arm64 ─┐
+  └─→ build-python (8 legs) ─→ rehearse-publish-python ──────────────────────┤
                                 └─→ publish-testpypi     │ (dispatch+input only)
                                                           ↓
                                               publish-crates  (tag only)
@@ -70,13 +70,21 @@ Job details:
 | `version-gate` | Version gate | nothing (always runs) | — |
 | `build-napi` | Build napi (...) | nothing | version-gate |
 | `stage-and-verify-napi` | Stage + verify platform packages | nothing | build-napi |
+| `load-test-musl-arm64` | Alpine load test (linux-arm64-musl) | unguarded, not-cancelled + `needs.stage-and-verify-napi.result == 'success'` | stage-and-verify-napi |
 | `build-python` | Build Python (...) | nothing | version-gate |
 | `rehearse-publish-python` | Rehearse PyPI publish (no upload) | nothing | build-python |
 | `publish-testpypi` | Publish to TestPyPI (rehearsal) | `workflow_dispatch && inputs.testpypi` | build-python, rehearse-publish-python |
-| `publish-crates` | Publish to crates.io | `startsWith(ref, 'refs/tags/v')` | version-gate, stage-and-verify-napi, build-python, rehearse-publish-python |
+| `publish-crates` | Publish to crates.io | `startsWith(ref, 'refs/tags/v')` | version-gate, stage-and-verify-napi, load-test-musl-arm64, build-python, rehearse-publish-python |
 | `publish-npm` | Publish to npm | `startsWith(ref, 'refs/tags/v')` | stage-and-verify-napi, publish-crates |
 | `publish-python` | Publish to PyPI | `startsWith(ref, 'refs/tags/v')` | build-python, rehearse-publish-python, publish-crates, publish-npm |
 | `github-release` | GitHub Release | `startsWith(ref, 'refs/tags/v')` | publish-crates, publish-npm, publish-python |
+
+`load-test-musl-arm64` proves the `linux-arm64-musl` addon dlopens on `node:22-alpine`
+(the readelf gate proves ELF metadata but not runtime loadability — a missing NEEDED
+entry like `libunwind.so.1` is invisible to readelf; PF-038 shape). The x64 equivalent
+runs as the last step of `stage-and-verify-napi` after the staged artifact upload, so
+an x64 failure never suppresses the artifact; `load-test-musl-arm64` is skipped when
+x64 fails (both are re-run together after the fix).
 
 Key ordering constraints:
 - `publish-crates` blocks on `rehearse-publish-python`: a failed OIDC exchange aborts before the irreversible crates.io write (PF-039).
@@ -86,7 +94,7 @@ Key ordering constraints:
 
 ## Component Interactions — RELEASE_SURFACE and the Three-Place Rule (ADR-013)
 
-The `pull_request` trigger fires on exactly five paths (the **release surface**):
+The `pull_request` trigger fires on exactly six paths (the **release surface**):
 
 ```
 .github/workflows/release.yml
@@ -94,11 +102,12 @@ The `pull_request` trigger fires on exactly five paths (the **release surface**)
 crates/mds-napi/**
 crates/mds-python/**
 scripts/verify-napi-names.mjs
+scripts/musl-load-probe.cjs
 ```
 
 `crates/mds-core/**`, `Cargo.toml`, and `package.json` are excluded on purpose: they change
 on most PRs and `ci.yml` already covers them. A dependency sweep that does not touch these
-five paths still needs a manual `workflow_dispatch` dry run.
+six paths still needs a manual `workflow_dispatch` dry run.
 
 `scripts/verify-pr-checks.mjs` exports `RELEASE_SURFACE` (the same list) and spec S10 in
 `release-auth-probe.spec.mjs` asserts set-equality between the two. They must be kept in
@@ -154,6 +163,12 @@ the verifier additionally requires `Version gate`, `Stage + verify platform pack
 by suite — the check-run must belong to a `release.yml` run; any event counts. All runs
 under each name must pass (duplicate names = all-must-pass).
 
+`Alpine load test (linux-arm64-musl)` (`load-test-musl-arm64`) is a Tier-B-binding
+unguarded check-run on release-surface PRs — it reaches `conclusion=success` on every PR
+and dispatch run. It is deliberately NOT listed in `RELEASE_SURFACE_CONTEXTS` (the 2026-09
+verifier fixtures predate it); spec S21 pins its existence, runner, guard shape, wiring,
+and step order instead (ADR-013). It is not a branch-protection required context.
+
 The verifier prints `gh pr merge N --squash --admin --match-head-commit <sha>` on PASS.
 Always use this command verbatim — confirm the current branch resolves to the intended PR
 before running it (the command names a SHA but not a PR; `gh pr merge` re-resolves the
@@ -173,7 +188,7 @@ Steps (in order):
 1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all four spec files, 210 tests including pin-shape specs (S16) and per-leg cache key spec (S20).
+4. Run `npm run test:gates` — all four spec files, 211 tests including pin-shape specs (S16), per-leg cache key spec (S20), and Alpine load test job spec (S21).
 5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
@@ -280,6 +295,23 @@ such a file. Never write `${{` in comments; describe it in words.
   host-built build scripts (PF-041). Confirmed live in run 34065573775: every Linux leg in
   `build-napi` restored `v0-rust-build-napi-Linux-x64-6ff13d87-4c33221b`. Spec S20 in
   `release-auth-probe.spec.mjs` fails `Version gate` if a key is removed (#347, #352).
+- **Using `job-level container:` on an arm64 runner for Alpine load tests**: GitHub-hosted
+  arm64 runners reject `container:` at job level with "JavaScript Actions in Alpine
+  containers are only supported on x64 Linux runners". Use `docker run` from a host job
+  instead.
+- **Adding a `needs:` edge to `publish-crates` without a matching `result == 'success'`
+  conjunct in its `if:`** (PF-047): the `!cancelled()` opener removes the implicit
+  success-of-needs gate, so a failed load-test job would not block crates.io publish;
+  both `needs:` AND `if:` must name the dependency.
+- **Counting `positive control` occurrences without `stripCommentLines` first**: the
+  `build-python` banner comment contains the phrase `positive control`; stripping comment
+  lines before counting is required to get the correct count.
+- **Building a load-test fixture from the crate directory or the artifact root**: `napi
+  artifacts --output-dir .` writes every `.node` into the crate root; the artifact also carries
+  root-level `*.node` files — either source activates candidate 2 of the loader (`.node`
+  beside `index.js`) and short-circuits the fixture, making the test vacuous.
+- **Testing the musl addon through `@mdscript/mds`**: its WASM fallback makes the test
+  vacuous — a successful load does not prove the native addon was reached.
 
 ## Gotchas
 
@@ -320,18 +352,44 @@ such a file. Never write `${{` in comments; describe it in words.
   in `version-gate` is therefore the strongest check available. A revoked token is first
   detected at `cargo publish` (fail-before-write, after the build matrix is paid for); see
   PF-023 and the v0.4.0 precedent (`gh run rerun --failed`). Durable fix tracked in #368.
+- **`napi-staged` artifact carries root-level `*.node` files** in addition to `npm/**`: the
+  artifact upload captures the crate root, which may contain multiple addon vintages from
+  prior `build:native` or `napi build --platform` calls. Never place a `.node` file beside
+  `index.js` in a load-test fixture — loader candidate 2 would short-circuit and bypass
+  the platform-package lookup.
+- **`extractNeeds` is comment-stripped**: the parser strips comment lines from the job
+  section before matching `needs: [...]` so `# needs: [bogus]` is ignored. A comment above
+  an inline `needs:` line would previously confuse parsers that did not strip first.
+- **`/usr/bin/ldd` on `node:22-alpine` is musl-utils' script**: the file is a shell script
+  containing the literal string `musl`; `readFileSync('/usr/bin/ldd', 'utf-8').includes('musl')`
+  is the `isMusl()` predicate both in `index.js` and in `musl-load-probe.cjs`.
+- **Docker Hub pull limit exemption for hosted runners**: GitHub-hosted runners are exempt
+  from Docker Hub's anonymous pull limit for public images (documented at
+  docs.github.com/en/actions/reference/limits). A mirror (`public.ecr.aws`) would operate
+  under a tighter tier. The gate uses Docker Hub directly and is blocking.
+- **Alpine container must run with `-w /w`**: `node:22-alpine` sets no `WORKDIR`; the default
+  container cwd is `/`; mds-core rejects a filesystem-root base directory with "cannot resolve
+  path /: file not found: /" (#371, surfaced by this gate's first run on PR #370). All four
+  `docker run` invocations in the Alpine load-test steps pass `-w /w` so the probe executes
+  from the fixture directory — the shape any real non-root cwd has. `musl-load-probe.cjs`
+  asserts `process.cwd() === '/w'` so a dropped flag fails loudly rather than silently
+  returning a spurious "file not found" error. S21 pins `-w /w` in the needle list.
 
 ## Key Files
 
-- `.github/workflows/release.yml` — the complete 10-job release workflow (1260+ lines).
+- `.github/workflows/release.yml` — the complete 11-job release workflow (1430+ lines).
 - `.github/workflows/ci.yml` — the build/test workflow whose contexts populate Tier A.
 - `scripts/verify-pr-checks.mjs` — mandatory pre-merge verifier; exports `EXPECTED_CONTEXTS`,
   `TIER_B_EXPECTED_SKIPPED`, `RELEASE_SURFACE`, `RELEASE_SURFACE_CONTEXTS`.
+- `scripts/musl-load-probe.cjs` — Alpine container smoke-test for musl napi addons; accepts
+  `linux-x64-musl` or `linux-arm64-musl` as argv[2]; run inside `node:22-alpine` via
+  `docker run --rm --network none --pull=never -w /w -v <staged-dir>:/w:ro <image> node /w/probe.cjs <platform>`.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;
   length assertion for `EXPECTED_CONTEXTS`).
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape
   (S16), set equality S10, guard detection, no `${{ }}` literal (S19), `uses:` count
-  (S14), per-leg cache key (S20), cargo token -z guard (S3 extension).
+  (S14), per-leg cache key (S20), cargo token -z guard (S3 extension), Alpine load test
+  job structure and wiring (S21).
 - `scripts/__test__/fixtures/protection-main.json` — 6-context branch protection (historical,
   2026-08 baseline; kept byte-identical).
 - `scripts/__test__/fixtures/protection-main-2026-09.json` — 15-context branch protection

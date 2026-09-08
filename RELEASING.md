@@ -202,15 +202,15 @@ PR or dispatch by hand.
 
 Even though release-surface PRs now trigger `release.yml` automatically, a
 manual `gh workflow run release.yml --ref <branch>` is still required in four
-cases (the five release-surface paths are `.github/workflows/release.yml`,
-`.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`, and
-`scripts/verify-napi-names.mjs`):
+cases (the six release-surface paths are `.github/workflows/release.yml`,
+`.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`,
+`scripts/verify-napi-names.mjs`, and `scripts/musl-load-probe.cjs`):
 
 1. **CI-history gate (PF-017)** — the gate is step-skipped on `pull_request`
    because `github.sha` is the ephemeral merge commit, not the branch head; a
    `::notice::` makes the skip visible. It runs only on tag push and dispatch.
 2. **Changes outside the release surface** — dependency sweeps,
-   `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the five
+   `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the six
    paths above and do not trigger a `pull_request` run on `release.yml`.
 3. **Dependabot and fork PRs** — no repository secrets and no `id-token: write`;
    `Version gate` fails closed with the "No Actions secrets on this run" error.
@@ -285,11 +285,11 @@ runtime on the affected platform. Do not proceed past a failing gate.
 ### Release-surface PRs
 
 Release-surface PRs — those touching `.github/workflows/release.yml`,
-`.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`, or
-`scripts/verify-napi-names.mjs` — also trigger the workflow via the
-`pull_request` event, so a Dependabot bump to an action reachable only from a
-tag-guarded job is exercised on the PR instead of first running on a tag push
-after crates.io has published (PF-039).
+`.github/actions/**`, `crates/mds-napi/**`, `crates/mds-python/**`,
+`scripts/verify-napi-names.mjs`, or `scripts/musl-load-probe.cjs` — also
+trigger the workflow via the `pull_request` event, so a Dependabot bump to an
+action reachable only from a tag-guarded job is exercised on the PR instead of
+first running on a tag push after crates.io has published (PF-039).
 
 On such PRs, `verify-pr-checks.mjs` requires three additional check-runs:
 `Version gate`, `Stage + verify platform packages`, and `Rehearse PyPI publish
@@ -306,6 +306,16 @@ and D-PR7 context attribution are both keyed on the check-run's `release.yml`
 check suite (D-PR8, #341 — any release.yml event counts, including `pull_request`
 and `workflow_dispatch`); the verifier exits 2 when it cannot enumerate the
 head's workflow runs.
+
+The `Alpine load test (linux-arm64-musl)` job (`load-test-musl-arm64`) is an
+unguarded Tier-B-binding check-run on release-surface PRs — it reaches
+`conclusion=success` on every PR and dispatch run. It is deliberately NOT added
+to `RELEASE_SURFACE_CONTEXTS` (the 2026-09 verifier fixtures predate it and
+would fail if it appeared there); instead, spec S21 in
+`scripts/__test__/release-auth-probe.spec.mjs` pins its existence, runner,
+guard shape, wiring into `publish-crates`, and step order. It is not a
+branch-protection required context (branch protection covers `ci.yml` jobs only;
+`release.yml` jobs only run on release-surface PRs).
 
 ## Release
 
@@ -350,18 +360,32 @@ The `release.yml` workflow runs, in order:
    3. **build-python** (parallel with build-napi) — builds `cp311-abi3` wheels
       for 7 platforms + sdist, runs the readelf linkage gate on Linux legs.
    4. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
-      LICENSE into each platform dir, runs the **A3 name-gate**.
-   5. **rehearse-publish-python** — pin shape, GHCR manifest, `docker pull` and
+      LICENSE into each platform dir, runs the **A3 name-gate**. The last step
+      runs the x64 Alpine load test (`linux-x64-musl`) inside `node:22-alpine`
+      after the staged artifact upload, so the artifact is preserved even when
+      the x64 test fails; if x64 fails, the arm64 job is skipped and both are
+      re-run together after the fix.
+   5. **load-test-musl-arm64** — unguarded job on a native `ubuntu-24.04-arm`
+      runner (no QEMU); downloads the `napi-staged` artifact; asserts the arm64
+      ELF shape with a positive control; runs the arm64 Alpine load test
+      (`linux-arm64-musl`) on `node:22-alpine` with a run block byte-identical
+      to the x64 step. Skipped when x64 fails (`if: !cancelled() &&
+      needs.stage-and-verify-napi.result == 'success'`); both are re-run
+      together after a fix. `publish-crates` needs this job and requires
+      `needs.load-test-musl-arm64.result == 'success'` in its `if:` (PF-047,
+      PF-038, #340).
+   6. **rehearse-publish-python** — pin shape, GHCR manifest, `docker pull` and
       `twine check` (each with a positive control); uploads nothing and holds no
       OIDC token. publish-crates blocks on this so a broken action pin aborts
       before crates.io (irreversible).
-   6. **publish-crates** — blocked until `stage-and-verify-napi`, `build-python`,
-      AND `rehearse-publish-python` succeed. `cargo publish` `mds-core`, polls the
-      crates.io index for up to 5 min (bounded, max 20 × 15 s), then `mds-cli`.
-   7. **publish-npm** and **publish-python** (parallel, both after publish-crates)
+   7. **publish-crates** — blocked until `stage-and-verify-napi`,
+      `load-test-musl-arm64`, `build-python`, AND `rehearse-publish-python`
+      succeed. `cargo publish` `mds-core`, polls the crates.io index for up to
+      5 min (bounded, max 20 × 15 s), then `mds-cli`.
+   8. **publish-npm** and **publish-python** (parallel, both after publish-crates)
       — publish npm packages (with provenance) and PyPI `markdown-script` (OIDC
       trusted publishing + PEP 740 attestations, `skip-existing: true`).
-   8. **github-release** — `gh release create` with generated notes; runs only
+   9. **github-release** — `gh release create` with generated notes; runs only
       after all three publish jobs succeed.
 
    `publish-testpypi` never runs on a tag: it is guarded by `inputs.testpypi`,
@@ -380,7 +404,7 @@ The `release.yml` workflow runs, in order:
 
 ## Notes
 
-- The 7 native napi targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs link with zig cc wrappers, and a release gate asserts each musl artifact links musl rather than glibc (see the build-napi matrix in release.yml). zig is pinned to 0.16.0 in release.yml's Install zig step; bump it deliberately, since zig cc's linker-arg allowlist changes between releases.
+- The 7 native napi targets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-gnu, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc. x86_64-gnu passes napi's --use-napi-cross; aarch64-gnu links with the apt cross gcc; both musl legs link with zig cc wrappers, and a release gate asserts each musl artifact links musl rather than glibc (see the build-napi matrix in release.yml). zig is pinned to 0.16.0 in release.yml's Install zig step; bump it deliberately, since zig cc's linker-arg allowlist changes between releases. Both musl addons are load-tested on `node:22-alpine` before anything publishes: the x64 load test is the last step of `stage-and-verify-napi` (placed after the staged artifact upload so the artifact is preserved even when the x64 test fails), and the arm64 load test runs in the separate unguarded `load-test-musl-arm64` job on a native `ubuntu-24.04-arm` runner using the `napi-staged` artifact. The fixture is `index.js` + `scripts/musl-load-probe.cjs` + only the musl platform package under `node_modules/@mdscript/`, so a pass is proof the loader's `isMusl()` returned true; a control fixture without the package must fail first (PF-013). `publish-crates` blocks on both via its `needs:` list AND its `if:` conjunct (PF-047). The readelf gate proves ELF metadata (no glibc soname) but not that the addon dlopens on Alpine — a NEEDED entry that Alpine does not ship (e.g. `libunwind.so.1`) is invisible to it; only a real load on `node:22-alpine` catches that (PF-038 shape). When the x64 load test fails, the arm64 job is skipped (its `if:` requires `stage-and-verify-napi` to succeed) and both tests are re-run together after the fix. The container runs with `-w /w` because `node:22-alpine` has no `WORKDIR` and mds-core rejects a filesystem-root base directory (#371, surfaced by this gate's first run on PR #370); `musl-load-probe.cjs` asserts `process.cwd() === '/w'` so a dropped flag fails loudly.
 - The 8 Python artifacts (7 `cp311-abi3` wheels + 1 sdist): manylinux x86_64 and aarch64, musllinux_1_2 x86_64 and aarch64, macOS x86_64 and arm64, Windows x86_64, plus one source distribution. Built by `PyO3/maturin-action@v1.51.0` (maturin 1.13.3). The musl and manylinux legs run inside Docker containers that maturin-action manages; the readelf linkage gate asserts the `.so` inside each Linux wheel links the correct libc (musl or glibc), with a positive control and a non-vacuity guard (PF-038). Platform wheels cannot be built or validated locally — use the branch dry-run workflow instead.
 - wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-sign-ext", ...] is enabled in crates/mds-wasm/Cargo.toml; CI installs wasm-pack and Binaryen v129 via the composite action at .github/actions/setup-wasm/ (version pins live there). Local builds do not need system Binaryen — wasm-pack auto-downloads wasm-opt (v117) on first use; install Binaryen v129+ (brew install binaryen / apt install binaryen) only for offline builds, to override a stale wasm-opt on PATH, or to reproduce CI's exact release optimizer.
 - Platform packages are generated in CI only — they cannot be validated with a local npm pack; use the dry-run workflow instead.

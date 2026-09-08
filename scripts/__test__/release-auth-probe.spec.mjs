@@ -89,7 +89,7 @@ function findAllJobIds(source) {
  */
 function extractNeeds(jobSection) {
   if (!jobSection) return [];
-  for (const line of jobSection.split('\n')) {
+  for (const line of stripCommentLines(jobSection).split('\n')) {
     // 4-space indent, inline array: `    needs: [a, b, c]`
     const m = /^\s+needs:\s+\[(.+)\]\s*$/.exec(line);
     if (m) return m[1].split(',').map(s => s.trim());
@@ -1318,6 +1318,601 @@ describe('B2: per-leg rust-cache keys in matrix jobs (#352, PF-041)', () => {
         );
       }
     }
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// B3a: Alpine musl load-test helpers and S21 spec (#340)
+//
+// Two `docker run node:22-alpine` steps prove the musl addons actually dlopen
+// on Alpine — x64 as the last step of stage-and-verify-napi, arm64 in a new
+// unguarded job load-test-musl-arm64 on a native ubuntu-24.04-arm runner.
+// The probe script is scripts/musl-load-probe.cjs.
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the `runs-on:` value from a job section (4-space indent).
+ * Returns the trimmed value string, or null when absent.
+ */
+function runsOnOf(section) {
+  const m = /^    runs-on:\s+(.+)$/m.exec(section);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Return the `run: |` block text for the step whose segment contains
+ * `name: "Alpine load test (`. Segments steps exactly like `rustCacheSteps`
+ * (comment-stripped, `/^      - /` boundaries), finds the load-test step, and
+ * returns the lines after `run: |` that are indented deeper than the `run:`
+ * key, joined with '\n'. Returns null when no such step or run block is found.
+ *
+ * Trailing blank lines are dropped before joining. When the load-test step is
+ * the LAST step of its job, the scan runs to the end of the job section, so the
+ * blank separator lines between that step and the next job's comment banner
+ * (the banner itself is removed by stripCommentLines) would otherwise land
+ * inside the returned block. That would make the byte-equality assertion below
+ * sensitive to blank lines OUTSIDE either run block — a purely cosmetic edit to
+ * one job's spacing would fail S21 with "must be BYTE-EQUAL", a true verdict for
+ * a false reason. Blank lines are not shell code; only the script text is
+ * compared. Control PC-I pins both halves: trailing blanks are ignored, and a
+ * real trailing command difference is still detected.
+ */
+function loadTestRunBlock(section) {
+  const lines = stripCommentLines(section).split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^      - /.test(lines[i])) starts.push(i);
+  }
+  for (const [n, start] of starts.entries()) {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length);
+    if (!body.some(l => l.includes('name: "Alpine load test ('))) continue;
+    const runIdx = body.findIndex(l => /^\s+run: \|/.test(l));
+    if (runIdx === -1) return null;
+    const runLineIndent = (body[runIdx].match(/^(\s*)/) ?? ['', ''])[1].length;
+    const runLines = [];
+    for (let i = runIdx + 1; i < body.length; i++) {
+      const line = body[i];
+      if (line.trim() === '') { runLines.push(line); continue; }
+      const lineIndent = (line.match(/^(\s*)/) ?? ['', ''])[1].length;
+      if (lineIndent <= runLineIndent) break;
+      runLines.push(line);
+    }
+    while (runLines.length > 0 && runLines[runLines.length - 1].trim() === '') runLines.pop();
+    return runLines.join('\n');
+  }
+  return null;
+}
+
+/**
+ * Return the 0-based index of the step (in the comment-stripped section)
+ * whose segment contains `needle`, or -1 when not found.
+ * Steps are segmented at `/^      - /` boundaries, matching `rustCacheSteps`.
+ */
+function stepIndexOf(section, needle) {
+  const lines = stripCommentLines(section).split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^      - /.test(lines[i])) starts.push(i);
+  }
+  for (const [n, start] of starts.entries()) {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length);
+    if (body.some(l => l.includes(needle))) return n;
+  }
+  return -1;
+}
+
+/**
+ * Return the env: key-value lines for the Alpine load test step in the given
+ * section, comment-stripped, as "KEY: value" strings joined by '\n'.
+ * Returns null when the step or env block is absent.
+ */
+function loadTestEnvBlock(section) {
+  const lines = stripCommentLines(section).split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^      - /.test(lines[i])) starts.push(i);
+  }
+  for (const [n, start] of starts.entries()) {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length);
+    if (!body.some(l => l.includes('name: "Alpine load test ('))) continue;
+    const envIdx = body.findIndex(l => /^\s+env:\s*$/.test(l));
+    if (envIdx === -1) return null;
+    const envIndent = (body[envIdx].match(/^(\s*)/) ?? ['', ''])[1].length;
+    const envLines = [];
+    for (let i = envIdx + 1; i < body.length; i++) {
+      const line = body[i];
+      if (line.trim() === '') break;
+      const lineIndent = (line.match(/^(\s*)/) ?? ['', ''])[1].length;
+      if (lineIndent <= envIndent) break;
+      envLines.push(line.trim());
+    }
+    return envLines.join('\n');
+  }
+  return null;
+}
+
+describe('B3a: Alpine musl load tests (#340)', () => {
+
+  // -------------------------------------------------------------------------
+  // S21: real Alpine dlopen tests for musl napi addons (#340).
+  //
+  // The release pipeline cross-compiles two musl addons (linux-x64-musl,
+  // linux-arm64-musl). The existing readelf gate proves ELF metadata but cannot
+  // prove the addon dlopens on Alpine. Two `docker run node:22-alpine` steps
+  // close this gap using scripts/musl-load-probe.cjs.
+  //
+  // Ordering invariant (PF-047): load-test-musl-arm64 must be in publish-crates
+  // needs: AND its result == 'success' must be in the if: conjunct. With
+  // !cancelled() present, needs: is ordering-only — only the if: conjunct gates.
+  //
+  // ADR-013 step-level-guard rule: the arm64 job must reach success on PRs so
+  // the mandatory verifier counts it. A job-level tag/input guard would make it
+  // skip, producing a skipped conclusion the verifier rejects.
+  //
+  // PF-013: parser controls run on planted YAML first; absence-only checks are
+  // vacuous. Failure message names #340, ADR-013, PF-013, PF-023.
+  // -------------------------------------------------------------------------
+  test('S21: load-test-musl-arm64 job exists, is unguarded, wired into publish-crates, run blocks match (PF-047, ADR-013, #340)', () => {
+
+    // -----------------------------------------------------------------------
+    // Parser positive controls (PF-013) — all run against planted YAML strings,
+    // not the real release.yml. All must pass in both RED and GREEN states.
+    // -----------------------------------------------------------------------
+
+    // S21/PC-A: loadTestRunBlock finds a planted Alpine load test step and
+    // returns its run block content. Proves the helper does not always return null.
+    const plantedWithLoadTest = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-x64-musl)"',
+      '        env:',
+      '          ALPINE_IMAGE: node:22-alpine',
+      '        run: |',
+      '          set -euo pipefail',
+      '          docker run --network none :/w:ro',
+      '      - name: Next step',
+      '        run: echo done',
+    ].join('\n');
+    const plantedRunBlock = loadTestRunBlock(plantedWithLoadTest);
+    assert.ok(
+      plantedRunBlock !== null,
+      'S21/PC-A: loadTestRunBlock must find a planted Alpine load test step (PF-013)',
+    );
+    assert.ok(
+      plantedRunBlock.includes('set -euo pipefail'),
+      'S21/PC-A: returned run block must include the planted run block content',
+    );
+
+    // S21/PC-B: "positive control" appearing ONLY in a comment yields zero
+    // matching lines after stripCommentLines. Proves the strip is effective.
+    const plantedCommentSection = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: fake step',
+      '        run: |',
+      '          # positive control: this line is a comment',
+      '          echo "all clear"',
+    ].join('\n');
+    const pcLinesAfterStrip = stripCommentLines(plantedCommentSection)
+      .split('\n').filter(l => l.includes('positive control'));
+    assert.equal(
+      pcLinesAfterStrip.length, 0,
+      'S21/PC-B: "positive control" in a comment only must yield zero matching lines ' +
+      'after stripCommentLines (PF-013)',
+    );
+
+    // S21/PC-C: runsOnOf returns the correct value, and the equality check against
+    // the required runner fails for the wrong runner name.
+    const plantedArm64Section = '  fake-job:\n    runs-on: ubuntu-24.04-arm64';
+    assert.equal(
+      runsOnOf(plantedArm64Section), 'ubuntu-24.04-arm64',
+      'S21/PC-C: runsOnOf must parse the runs-on value from a planted section',
+    );
+    assert.notEqual(
+      runsOnOf(plantedArm64Section), 'ubuntu-24.04-arm',
+      'S21/PC-C: ubuntu-24.04-arm64 must not equal ubuntu-24.04-arm (the required runner)',
+    );
+
+    // S21/PC-D: a needs-graph WITHOUT the publish-crates -> load-test-musl-arm64
+    // edge makes transitivelyNeeds return false. Proves the edge is load-bearing
+    // and the check cannot be trivially satisfied. (PF-047)
+    const controlGraphMissingEdge = new Map([
+      ['publish-crates', ['stage-and-verify-napi', 'version-gate']],
+      ['load-test-musl-arm64', ['stage-and-verify-napi']],
+      ['stage-and-verify-napi', ['build-napi']],
+      ['version-gate', []],
+      ['build-napi', ['version-gate']],
+    ]);
+    assert.ok(
+      !transitivelyNeeds(controlGraphMissingEdge, 'publish-crates', 'load-test-musl-arm64'),
+      'S21/PC-D: a graph without the publish-crates -> load-test-musl-arm64 edge must ' +
+      'report NOT transitive (PF-047, PF-013)',
+    );
+
+    // S21/PC-E: a publish-crates-shaped if: string lacking the load-test result
+    // conjunct is detectable. With !cancelled(), needs: is ordering-only — only
+    // the if: conjunct gates the job (PF-047).
+    const incompleteIf =
+      "${{ !cancelled() && needs.stage-and-verify-napi.result == 'success'" +
+      " && startsWith(github.ref, 'refs/tags/v') }}";
+    assert.ok(
+      !incompleteIf.includes("needs.load-test-musl-arm64.result == 'success'"),
+      'S21/PC-E: a publish-crates if: without the load-test result conjunct must be ' +
+      'flagged as incomplete (PF-047)',
+    );
+
+    // S21/PC-F: two run blocks differing by exactly one character are unequal.
+    const runBlockA = 'set -euo pipefail\n  echo "hello alpine"';
+    const runBlockB = 'set -euo pipefail\n  echo "hello alpinex"';
+    assert.notEqual(runBlockA, runBlockB,
+      'S21/PC-F: run blocks differing by one character must be unequal');
+
+    // S21/PC-G: a step text missing --network none is detectable; the same
+    // planted text also lacks timeout 600 docker run and -w /w (pin E2, #340, PF-013).
+    const missingNetwork = 'docker run --rm :/w:ro --pull=never alpine sh';
+    assert.ok(
+      !missingNetwork.includes('--network none'),
+      'S21/PC-G: a step text missing --network none must be detectable (PF-013)',
+    );
+    assert.ok(
+      !missingNetwork.includes('timeout 600 docker run'),
+      'S21/PC-G: a step text missing timeout 600 docker run must be detectable (PF-013, #340)',
+    );
+    assert.ok(
+      !missingNetwork.includes('-w /w'),
+      'S21/PC-G: a step text missing -w /w must be detectable — a root cwd trips the ' +
+      'mds-core base-directory defect (#371, PF-013, #340)',
+    );
+
+    // S21/PC-H: extractNeeds strips comment lines before matching (hardening).
+    // A `# needs: [bogus]` comment above `    needs: [real-dep]` must yield
+    // ['real-dep'], not ['bogus']. (stripCommentLines call added to extractNeeds)
+    const commentedNeedsSection = [
+      '  fake-job:',
+      '    # needs: [bogus]',
+      '    needs: [real-dep]',
+      '    steps:',
+    ].join('\n');
+    assert.deepEqual(
+      extractNeeds(commentedNeedsSection), ['real-dep'],
+      'S21/PC-H: extractNeeds must strip comment lines; # needs: [bogus] above ' +
+      'needs: [real-dep] must yield [\'real-dep\'] (PF-013)',
+    );
+
+    // S21/PC-I: the byte-equality comparison below must ignore blank lines that
+    // sit OUTSIDE the run block — when the load-test step is the last step of a
+    // job, the scan reaches the end of the section and would otherwise absorb
+    // the blank separator before the next job's (comment-stripped) banner. Both
+    // halves are pinned so the trim cannot silently swallow a divergent script.
+    const plantLoadTestStep = (tail) => [
+      '  fake-job:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-x64-musl)"',
+      '        run: |',
+      '          set -euo pipefail',
+      '          docker run --network none :/w:ro',
+      ...tail,
+    ].join('\n');
+    assert.equal(
+      loadTestRunBlock(plantLoadTestStep([])),
+      loadTestRunBlock(plantLoadTestStep(['', '', ''])),
+      'S21/PC-I: two run blocks differing ONLY in trailing blank lines must compare ' +
+      'EQUAL — a blank separator outside the block is not shell code, and letting it ' +
+      'in makes S21 fail for a cosmetic edit to an unrelated job (PF-013)',
+    );
+    assert.notEqual(
+      loadTestRunBlock(plantLoadTestStep([])),
+      loadTestRunBlock(plantLoadTestStep(['          echo extra', ''])),
+      'S21/PC-I: a run block carrying a real extra trailing COMMAND must still compare ' +
+      'UNEQUAL — the trailing-blank trim must not swallow a divergent script (PF-013)',
+    );
+
+    // S21/PC-J: a section without 'Upload staged napi tree' yields stepIndexOf === -1,
+    // so the non-vacuity guard on the step-ordering check is demonstrably reachable —
+    // renaming that step cannot make the ordering check pass vacuously (PF-013, #340).
+    const sectionWithoutUpload = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-x64-musl)"',
+      '        run: |',
+      '          echo hi',
+    ].join('\n');
+    assert.strictEqual(
+      stepIndexOf(sectionWithoutUpload, 'name: Upload staged napi tree'),
+      -1,
+      'S21/PC-J: stepIndexOf must return -1 when "Upload staged napi tree" is absent (PF-013, #340)',
+    );
+
+    // S21/PC-K: a planted upload step without if-no-files-found: error is flagged by
+    // the pin-E1 assertion below (the staged upload must fail loudly on an empty tree; #340).
+    const uploadStepWithoutIfNoFiles = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: Upload staged napi tree',
+      '        uses: actions/upload-artifact@v7',
+      '        with:',
+      '          name: napi-staged',
+    ].join('\n');
+    assert.ok(
+      !uploadStepWithoutIfNoFiles.includes('if-no-files-found: error'),
+      'S21/PC-K: a planted upload step without if-no-files-found: error must not include it (PF-013, #340)',
+    );
+
+    // S21/PC-K (cont.): a planted step whose if-no-files-found line is COMMENTED OUT
+    // must be rejected by stripCommentLines — proving the strip is what makes Pin-E1
+    // non-bypassable by a commented-out line (#340, PF-013).
+    const commentedIfNoFiles = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: Upload staged napi tree',
+      '        uses: actions/upload-artifact@v7',
+      '        with:',
+      '          name: napi-staged',
+      '          # if-no-files-found: error',
+    ].join('\n');
+    assert.ok(
+      commentedIfNoFiles.includes('if-no-files-found: error'),
+      'S21/PC-K: planted step with commented if-no-files-found must include the raw text (PF-013, #340)',
+    );
+    assert.ok(
+      !stripCommentLines(commentedIfNoFiles).includes('if-no-files-found: error'),
+      'S21/PC-K: stripCommentLines must strip the commented if-no-files-found line, ' +
+      'proving the pin is load-bearing (PF-013, #340)',
+    );
+
+    // S21/PC-L: a planted arm64-shaped load-test step with PLATFORM: linux-x64-musl is
+    // detectable — an arch flip would only fail at runtime (#340, PF-013).
+    const plantedArmWithWrongPlatform = [
+      '  load-test-musl-arm64:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-arm64-musl)"',
+      '        env:',
+      '          ALPINE_IMAGE: node:22-alpine',
+      '          PLATFORM: linux-x64-musl',
+      '          ARCHKEY: linux-arm64',
+      '          NPM_DIR: staged/npm',
+      '        run: |',
+      '          echo hi',
+    ].join('\n');
+    const plantedArmEnv = loadTestEnvBlock(plantedArmWithWrongPlatform);
+    assert.ok(
+      plantedArmEnv !== null && !plantedArmEnv.includes('PLATFORM: linux-arm64-musl'),
+      'S21/PC-L: a planted arm64 load-test step with PLATFORM: linux-x64-musl must not ' +
+      'contain PLATFORM: linux-arm64-musl — demonstrating the per-arch env check is reachable (#340, PF-013)',
+    );
+
+    // -----------------------------------------------------------------------
+    // Real-file assertions (S21) — these fail in the RED state because
+    // load-test-musl-arm64 does not exist in release.yml yet (#340, Phase A2).
+    // -----------------------------------------------------------------------
+
+    // S21: job must exist. Without it, linux-arm64-musl is never proven to dlopen
+    // on Alpine before an irreversible crates.io publish (PF-023, ADR-013).
+    const arm64JobSection = extractJobSection(yml, 'load-test-musl-arm64');
+    assert.ok(
+      arm64JobSection !== null,
+      'S21: load-test-musl-arm64 job must exist in release.yml. ' +
+      'This unguarded job runs real Alpine load tests on a native ubuntu-24.04-arm ' +
+      'runner (no QEMU) and must reach success on every PR/dispatch run (ADR-013). ' +
+      'Without it, linux-arm64-musl addon is never proven to dlopen on Alpine before ' +
+      'an irreversible crates.io publish (PF-023, #340). Phase A2 adds this job.',
+    );
+
+    assert.ok(
+      arm64JobSection.includes('name: Alpine load test (linux-arm64-musl)'),
+      'S21: load-test-musl-arm64 must declare name: Alpine load test (linux-arm64-musl)',
+    );
+
+    // Must run on the native arm64 runner (no QEMU/cross-emulation).
+    assert.equal(
+      runsOnOf(arm64JobSection), 'ubuntu-24.04-arm',
+      'S21: load-test-musl-arm64 must declare runs-on: ubuntu-24.04-arm (native arm64)',
+    );
+
+    // Must be unguarded at job level (ADR-013 step-level-guard rule: the job must
+    // reach success on every PR so the mandatory verifier can count it as success;
+    // a job-level tag/input guard makes it skip, which the Tier-B verifier rejects).
+    const arm64If = extractJobIf(arm64JobSection);
+    assert.ok(
+      arm64If === null ||
+        (!arm64If.includes('refs/tags') &&
+         !arm64If.includes('startsWith(github.ref') &&
+         !arm64If.includes('inputs.')),
+      'S21: load-test-musl-arm64 must not have a job-level if: guarded on refs/tags, ' +
+      'startsWith(github.ref), or inputs. — a tag/input guard would skip the job on PRs, ' +
+      'producing a skipped conclusion the Tier-B verifier rejects (ADR-013)',
+    );
+
+    // Must not use container: (x64-only for JS actions) or QEMU.
+    const arm64Stripped = stripCommentLines(arm64JobSection);
+    assert.ok(
+      !arm64Stripped.split('\n').some(l => /^    container:/.test(l)),
+      'S21: load-test-musl-arm64 must not declare a job-level container: ' +
+      '(container: is x64-only for JS actions; use docker run from the host job)',
+    );
+    assert.ok(!arm64Stripped.includes('setup-qemu'),
+      'S21: load-test-musl-arm64 must not use setup-qemu (native runner eliminates QEMU)');
+    assert.ok(!arm64Stripped.includes('--platform'),
+      'S21: load-test-musl-arm64 must not pass --platform to docker (native runner)');
+
+    // Required structural fields.
+    assert.ok(arm64JobSection.includes('timeout-minutes: 15'),
+      'S21: load-test-musl-arm64 must declare timeout-minutes: 15');
+    assert.ok(arm64JobSection.includes('contents: read'),
+      'S21: load-test-musl-arm64 must declare permissions: contents: read');
+    assert.ok(arm64JobSection.includes('uses: actions/checkout@'),
+      'S21: load-test-musl-arm64 must include a checkout step');
+    assert.ok(arm64JobSection.includes('name: napi-staged'),
+      'S21: load-test-musl-arm64 must download the napi-staged artifact');
+
+    // Needs must be exactly [stage-and-verify-napi].
+    assert.deepEqual(
+      extractNeeds(arm64JobSection), ['stage-and-verify-napi'],
+      'S21: load-test-musl-arm64 needs must be exactly [stage-and-verify-napi]',
+    );
+
+    // --- Wiring (PF-047 guard) ---
+    // publish-crates must list load-test-musl-arm64 in BOTH needs: AND if:.
+    // With !cancelled(), needs: is ordering-only; only the if: conjunct gates
+    // the irreversible cargo publish (PF-047, PF-023).
+
+    const publishCratesSection = extractJobSection(yml, 'publish-crates');
+    assert.ok(publishCratesSection !== null, 'S21 non-vacuity: publish-crates must exist');
+
+    assert.ok(
+      extractNeeds(publishCratesSection).includes('load-test-musl-arm64'),
+      'S21: publish-crates needs: must include load-test-musl-arm64 (PF-047, #340)',
+    );
+
+    assert.ok(
+      transitivelyNeeds(buildNeedsGraph(yml), 'publish-crates', 'load-test-musl-arm64'),
+      'S21: publish-crates must transitively need load-test-musl-arm64 (#340, PF-047)',
+    );
+
+    const publishCratesIf = extractJobIf(publishCratesSection);
+    assert.ok(
+      publishCratesIf !== null &&
+        publishCratesIf.includes("needs.load-test-musl-arm64.result == 'success'"),
+      'S21: publish-crates if: must include needs.load-test-musl-arm64.result == \'success\'. ' +
+      'With !cancelled() present, needs: is ordering-only — the if: conjunct is the real gate ' +
+      'preventing an irreversible cargo publish when the Alpine load test failed ' +
+      '(PF-047, PF-023, #340).',
+    );
+
+    // --- Step content checks ---
+
+    const stageSection = extractJobSection(yml, 'stage-and-verify-napi');
+    assert.ok(stageSection !== null, 'S21 non-vacuity: stage-and-verify-napi must exist');
+    const stageStripped = stripCommentLines(stageSection);
+
+    // The two job sections must be distinct strings (sanity check).
+    assert.notEqual(stageSection, arm64JobSection,
+      'S21: stage-and-verify-napi and load-test-musl-arm64 sections must be distinct');
+
+    // Both must contain an Alpine load test step with a run block.
+    const stageRunBlock = loadTestRunBlock(stageSection);
+    const arm64RunBlock = loadTestRunBlock(arm64JobSection);
+    assert.ok(stageRunBlock !== null,
+      'S21: stage-and-verify-napi must contain an Alpine load test step with run: |');
+    assert.ok(arm64RunBlock !== null,
+      'S21: load-test-musl-arm64 must contain an Alpine load test step with run: |');
+
+    // Run blocks must be BYTE-EQUAL — two divergent scripts create two failure modes.
+    assert.equal(stageRunBlock, arm64RunBlock,
+      'S21: Alpine load test run blocks in stage-and-verify-napi and load-test-musl-arm64 ' +
+      'must be BYTE-EQUAL (#340)');
+
+    // Validate required content in both run blocks (comment-stripped).
+    const needles = [
+      '--network none',
+      ':/w:ro',
+      '--pull=never',
+      '-w /w',
+      'timeout 300',
+      'timeout 600 docker run',
+      'probe.cjs',
+      'NODE_PATH=',
+    ];
+    // Non-vacuity: the needle list must be non-empty.
+    assert.ok(needles.length > 0, 'S21 non-vacuity: needle list must be non-empty');
+
+    for (const block of [stageRunBlock, arm64RunBlock]) {
+      const strippedBlock = stripCommentLines(block);
+      for (const needle of needles) {
+        assert.ok(strippedBlock.includes(needle),
+          `S21: Alpine load test run block must contain "${needle}" in executable code (#340)`);
+      }
+      // At least 2 executable lines containing "positive control" (PF-013: both a
+      // probe-level and a fixture-level control must be present).
+      const pcLines = strippedBlock.split('\n').filter(l => l.includes('positive control'));
+      assert.ok(pcLines.length >= 2,
+        `S21: Alpine load test run block must have at least 2 executable lines containing ` +
+        `"positive control" (PF-013); found ${pcLines.length}`);
+      // Safety: neither $PWD:/w nor GITHUB_WORKSPACE:/w (prevents host-path leakage).
+      assert.ok(!strippedBlock.includes('$PWD:/w'),
+        'S21: Alpine load test run block must not use $PWD:/w');
+      assert.ok(!strippedBlock.includes('GITHUB_WORKSPACE:/w'),
+        'S21: Alpine load test run block must not use GITHUB_WORKSPACE:/w');
+    }
+
+    // Each load-test step env must include ALPINE_IMAGE: node:22-alpine.
+    assert.ok(stageSection.includes('ALPINE_IMAGE: node:22-alpine'),
+      'S21: stage-and-verify-napi Alpine load test step env must include ALPINE_IMAGE: node:22-alpine');
+    assert.ok(arm64JobSection.includes('ALPINE_IMAGE: node:22-alpine'),
+      'S21: load-test-musl-arm64 step env must include ALPINE_IMAGE: node:22-alpine');
+
+    // Pin E1: the staged upload must fail loudly on an empty tree (#340).
+    assert.ok(
+      stageStripped.includes('if-no-files-found: error'),
+      'S21 Pin E1: stage-and-verify-napi must contain if-no-files-found: error — ' +
+      'the staged upload must fail loudly when the napi tree is empty (#340)',
+    );
+
+    // Per-arch env values — an arch flip would only fail at runtime (#340).
+    const stageEnv = loadTestEnvBlock(stageSection);
+    assert.ok(stageEnv !== null,
+      'S21: stage-and-verify-napi Alpine load test step must have an env: block');
+    assert.ok(stageEnv.includes('PLATFORM: linux-x64-musl'),
+      'S21: stage-and-verify-napi load-test env must set PLATFORM: linux-x64-musl (#340)');
+    assert.ok(stageEnv.includes('ARCHKEY: linux-x64'),
+      'S21: stage-and-verify-napi load-test env must set ARCHKEY: linux-x64 (#340)');
+    assert.ok(stageEnv.includes('NPM_DIR: crates/mds-napi/npm'),
+      'S21: stage-and-verify-napi load-test env must set NPM_DIR: crates/mds-napi/npm (#340)');
+
+    const arm64Env = loadTestEnvBlock(arm64JobSection);
+    assert.ok(arm64Env !== null,
+      'S21: load-test-musl-arm64 Alpine load test step must have an env: block');
+    assert.ok(arm64Env.includes('PLATFORM: linux-arm64-musl'),
+      'S21: load-test-musl-arm64 load-test env must set PLATFORM: linux-arm64-musl (#340)');
+    assert.ok(arm64Env.includes('ARCHKEY: linux-arm64'),
+      'S21: load-test-musl-arm64 load-test env must set ARCHKEY: linux-arm64 (#340)');
+    assert.ok(arm64Env.includes('NPM_DIR: staged/npm'),
+      'S21: load-test-musl-arm64 load-test env must set NPM_DIR: staged/npm (#340)');
+
+    // In stage-and-verify-napi, the load-test step must come AFTER Upload staged napi tree.
+    const uploadStepIdx = stepIndexOf(stageSection, 'name: Upload staged napi tree');
+    const loadTestStepIdx = stepIndexOf(stageSection, 'name: "Alpine load test (');
+    // Non-vacuity: both steps must exist; -1 > -1 is false but N > -1 holds for any N >= 0,
+    // making the ordering check vacuous when the upload step is renamed (PF-013, #340).
+    assert.ok(
+      uploadStepIdx !== -1 && loadTestStepIdx !== -1,
+      'S21 non-vacuity: "Upload staged napi tree" and Alpine load test steps must both ' +
+      'exist in stage-and-verify-napi (stepIndexOf returns -1 when absent; a missing ' +
+      'upload step would let N > -1 pass vacuously; #340, PF-013)',
+    );
+    // Exact-name check: stepIndexOf uses substring matching, so a suffix like " (v2)"
+    // would still return a non-(-1) index — this end-of-line regex catches any suffix rename
+    // (#340, PF-013). The YAML step line is "      - name: Upload staged napi tree" so the
+    // regex anchors to EOL (no trailing chars after the name).
+    assert.ok(
+      /name: Upload staged napi tree\s*$/m.test(stageStripped),
+      'S21 non-vacuity: stage-and-verify-napi must contain a step named exactly ' +
+      '"Upload staged napi tree" — a rename like (v2) bypasses the stepIndexOf check ' +
+      'via substring matching but is caught here (#340, PF-013)',
+    );
+    assert.ok(
+      loadTestStepIdx > uploadStepIdx,
+      `S21: in stage-and-verify-napi the Alpine load test step (index ${loadTestStepIdx}) ` +
+      `must come AFTER the Upload staged napi tree step (index ${uploadStepIdx}) so the ` +
+      'artifact is available before the container mounts it (#340)',
+    );
+
+    // RELEASE_SURFACE must include scripts/musl-load-probe.cjs so that S10 forces
+    // it into on.pull_request.paths (ADR-013 three-place rule: probe changes must
+    // trigger the release rehearsal on PRs).
+    assert.ok(
+      RELEASE_SURFACE.includes('scripts/musl-load-probe.cjs'),
+      'S21: RELEASE_SURFACE must include "scripts/musl-load-probe.cjs" so changes to the ' +
+      'probe trigger release.yml on release-surface PRs (ADR-013, #340). Add the path to ' +
+      'RELEASE_SURFACE in verify-pr-checks.mjs AND to on.pull_request.paths in release.yml.',
+    );
+
+    // Non-vacuity: job id must appear in the full job list.
+    assert.ok(
+      findAllJobIds(yml).includes('load-test-musl-arm64'),
+      'S21 non-vacuity: load-test-musl-arm64 must appear in findAllJobIds output (#340)',
+    );
   });
 
 });

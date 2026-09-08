@@ -208,6 +208,7 @@ export const RELEASE_SURFACE = [
   'crates/mds-napi/**',
   'crates/mds-python/**',
   'scripts/verify-napi-names.mjs',
+  'scripts/musl-load-probe.cjs',
 ];
 
 /**
