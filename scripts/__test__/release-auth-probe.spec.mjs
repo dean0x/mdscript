@@ -1916,3 +1916,626 @@ describe('B3a: Alpine musl load tests (#340)', () => {
   });
 
 });
+
+// ---------------------------------------------------------------------------
+// B3b helpers and S22 spec — cargo-zigbuild musl legs (#339)
+//
+// Phase B2 replaces the hand-written /tmp/zig-cc-* wrapper scripts with
+// `napi build … -x` (cargo-zigbuild 0.23.0). This spec describes the REQUIRED
+// shape of build-napi after that migration. It is RED until Phase B2 lands.
+//
+// Two migration traps drive the checks:
+//   Trap 1: napi's cargo-zigbuild detector is presence-only (`cargo help zigbuild`);
+//     on failure it runs an UNPINNED `cargo install cargo-zigbuild` mid-build.
+//     Pre-install via install-action with fallback:none prevents the fallback.
+//   Trap 2: cargo-zigbuild's add_env_if_missing yields to a pre-set
+//     CARGO_TARGET_*_LINKER, so any leftover musl linker export silently reverts
+//     the migration while every gate stays green.
+// ---------------------------------------------------------------------------
+
+/**
+ * Return an ordered array of step segments from the comment-stripped job section.
+ * Each entry is { index: number, body: string } where body is the full text of
+ * that step segment. Steps are segmented at /^      - / boundaries (6-space
+ * bullet), matching the convention in rustCacheSteps and loadTestRunBlock.
+ */
+function jobSteps(section) {
+  const lines = stripCommentLines(section).split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^      - /.test(lines[i])) starts.push(i);
+  }
+  return starts.map((start, n) => ({
+    index: n,
+    body: lines.slice(start, starts[n + 1] ?? lines.length).join('\n'),
+  }));
+}
+
+/**
+ * Return the first step in `steps` (from jobSteps) whose body matches `regex`,
+ * or null when none match.
+ */
+function stepMatching(steps, regex) {
+  return steps.find(s => regex.test(s.body)) ?? null;
+}
+
+/**
+ * Split the comment-stripped build-napi section into matrix settings entries.
+ * Each entry starts at a 10-space bullet line (the list items under `settings:`).
+ * Returns an array of multi-line text blocks, one per matrix entry.
+ *
+ * Segmentation boundary: /^          - / (10 leading spaces + dash + space).
+ * This matches the `settings:` list indentation in build-napi but nothing else
+ * in the section (steps are at 6-space bullets; step fields at 8-space).
+ */
+function matrixEntries(section) {
+  const stripped = stripCommentLines(section);
+  const lines = stripped.split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^          - /.test(lines[i])) starts.push(i);
+  }
+  return starts.map((start, n) =>
+    lines.slice(start, starts[n + 1] ?? lines.length).join('\n'),
+  );
+}
+
+describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
+
+  // -------------------------------------------------------------------------
+  // S22: build-napi musl legs use cargo-zigbuild via napi -x, no wrapper residue.
+  //
+  // References: #339 (migration), PF-013 (positive-control discipline),
+  // PF-038 (cross-toolchain flag with no entry for the target falls back silently),
+  // PF-040 (composite SHA pin correct; Docker-trampoline needs tag pin),
+  // S20 (per-leg rust-cache key must survive this migration, PF-041).
+  // -------------------------------------------------------------------------
+  test('S22: build-napi musl legs use napi -x (cargo-zigbuild), no zig-cc wrapper residue (PF-013, PF-038, S20, #339)', () => {
+
+    // Word-boundary cross-compile flag matcher.
+    const CROSS_RE = /(?:^|\s)(-x|--cross-compile)(?:\s|$)/;
+    // install-action must be SHA-pinned (PF-040: composite action, not Docker-trampoline).
+    const INSTALL_ACTION_SHA_RE = /uses:\s*taiki-e\/install-action@[0-9a-f]{40}\b/;
+    // READ form for a musl linker env name: [ -z "${NAME...}" ].
+    const MUSL_LINKER_READ_RE = /\[\s*-z\s+"\$\{CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER[^}]*\}"/;
+
+    // -----------------------------------------------------------------------
+    // Parser positive controls (PF-013) — all operate on planted YAML strings.
+    // All must pass in both RED and GREEN states to prove the helpers work.
+    // -----------------------------------------------------------------------
+
+    // PC1: install-action step after rust-cache — the ordering check fires.
+    // Ordering invariant: install-action index < rust-cache index.
+    // Planted section has install-action at a higher index than rust-cache.
+    const plantedOrderViolation = [
+      '  fake-job:',
+      '    steps:',
+      '      - uses: dtolnay/rust-toolchain@stable',
+      '      - uses: Swatinem/rust-cache@v2',
+      '        with:',
+      '          key: ${{ matrix.settings.target }}',
+      '      - name: Install zig',
+      '        uses: mlugg/setup-zig@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      '        with:',
+      '          version: 0.16.0',
+      '      - name: Install cargo-zigbuild (pinned)',
+      '        uses: taiki-e/install-action@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    ].join('\n');
+    const pcOVSteps = jobSteps(plantedOrderViolation);
+    const pcInstallIdx = stepMatching(pcOVSteps, /taiki-e\/install-action/)?.index ?? -1;
+    const pcCacheIdx = stepMatching(pcOVSteps, /Swatinem\/rust-cache/)?.index ?? -1;
+    assert.ok(pcInstallIdx !== -1 && pcCacheIdx !== -1,
+      'PC1: planted section must contain both install-action and rust-cache steps');
+    assert.ok(pcInstallIdx > pcCacheIdx,
+      'PC1: in the planted violation, install-action must be at a higher index than rust-cache');
+    // The real check asserts install < cache; planted violation makes it false.
+    assert.ok(!(pcInstallIdx < pcCacheIdx),
+      'PC1: "install < cache" must evaluate to false on the planted violation');
+
+    // PC2: version-assert step before rust-cache — ordering check fires.
+    // Invariant: rust-cache index < version-assert index.
+    // Planted section has version-assert at a lower index than rust-cache.
+    const plantedVersionBefore = [
+      '  fake-job:',
+      '    steps:',
+      '      - uses: dtolnay/rust-toolchain@stable',
+      '      - name: Assert cargo-zigbuild is the pinned version',
+      '        if: matrix.settings.use-zig',
+      '        run: |',
+      '          cargo help zigbuild',
+      '          cargo zigbuild --version | grep 0.23.0 # positive control: must match',
+      '      - uses: Swatinem/rust-cache@v2',
+      '        with:',
+      '          key: ${{ matrix.settings.target }}',
+    ].join('\n');
+    const pcVBSteps = jobSteps(plantedVersionBefore);
+    const pcVBVersionIdx = stepMatching(pcVBSteps, /Assert cargo-zigbuild/)?.index ?? -1;
+    const pcVBCacheIdx = stepMatching(pcVBSteps, /Swatinem\/rust-cache/)?.index ?? -1;
+    assert.ok(pcVBVersionIdx !== -1 && pcVBCacheIdx !== -1,
+      'PC2: planted section must contain both version-assert and rust-cache steps');
+    assert.ok(pcVBVersionIdx < pcVBCacheIdx,
+      'PC2: in the planted violation, version-assert must precede rust-cache');
+    // The real check asserts cache < version-assert; violation makes it false.
+    assert.ok(!(pcVBCacheIdx < pcVBVersionIdx),
+      'PC2: "cache < version-assert" must be false on the planted violation');
+
+    // PC3: exec zig cc only in a comment — no residue hit after stripCommentLines.
+    const plantedZigComment = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: some step',
+      '        run: |',
+      '          # exec zig cc -target x86_64-linux-musl "$@"',
+      '          echo "clean"',
+    ].join('\n');
+    assert.ok(
+      !stripCommentLines(plantedZigComment).includes('exec zig cc'),
+      'PC3: "exec zig cc" only in a comment must not appear after stripCommentLines (PF-013)',
+    );
+
+    // PC4: build line without -x is not matched by CROSS_RE.
+    const plantedBuildNoX =
+      'napi build --platform --release --target x86_64-unknown-linux-musl --no-js';
+    assert.ok(
+      !CROSS_RE.test(plantedBuildNoX),
+      'PC4: a musl build line without -x must not match the cross-compile regex',
+    );
+
+    // PC5: -xyz suffix does NOT satisfy the word-boundary -x matcher; -x with
+    // surrounding spaces does.
+    const plantedBuildXyz =
+      'napi build --platform --release --target x86_64-unknown-linux-musl -xyz';
+    assert.ok(
+      !CROSS_RE.test(plantedBuildXyz),
+      'PC5: "-xyz" must not match CROSS_RE — it is not the -x flag but a longer option',
+    );
+    assert.ok(
+      CROSS_RE.test('napi build --target foo -x --no-js'),
+      'PC5: "-x" with surrounding whitespace must match CROSS_RE',
+    );
+    assert.ok(
+      CROSS_RE.test('napi build --target foo --cross-compile'),
+      'PC5: "--cross-compile" at end of line must match CROSS_RE',
+    );
+
+    // PC6: tag pin rejected by SHA regex; 40-hex SHA accepted.
+    assert.ok(
+      !INSTALL_ACTION_SHA_RE.test(
+        '      - uses: taiki-e/install-action@v2',
+      ),
+      'PC6: tag pin "taiki-e/install-action@v2" must be rejected by INSTALL_ACTION_SHA_RE (PF-040)',
+    );
+    assert.ok(
+      INSTALL_ACTION_SHA_RE.test(
+        '      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad',
+      ),
+      'PC6: a 40-hex SHA pin must be accepted by INSTALL_ACTION_SHA_RE',
+    );
+
+    // PC7: READ form accepted; SET form (export / GITHUB_ENV) not accepted as READ.
+    const plantedMuslRead =
+      '[ -z "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-}" ]';
+    const plantedMuslSet =
+      'export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/x';
+    assert.ok(
+      MUSL_LINKER_READ_RE.test(plantedMuslRead),
+      'PC7: [ -z "${CARGO_TARGET_*MUSL*_LINKER:-}" ] must match MUSL_LINKER_READ_RE',
+    );
+    assert.ok(
+      !MUSL_LINKER_READ_RE.test(plantedMuslSet),
+      'PC7: export CARGO_TARGET_*MUSL*_LINKER=... must NOT match MUSL_LINKER_READ_RE ' +
+      '(any assignment is a SET, not a READ)',
+    );
+
+    // PC8: readelf body without ALLOWED_NEEDED is flagged.
+    const plantedReadelfNoAllowed = [
+      "GLIBC_RE='libc\\.so\\.6|ld-linux'",
+      'readelf -d "$node_file" > /tmp/dyn.txt',
+      'grep -q NEEDED /tmp/dyn.txt',
+    ].join('\n');
+    assert.ok(
+      !plantedReadelfNoAllowed.includes('ALLOWED_NEEDED'),
+      'PC8: a readelf step body without ALLOWED_NEEDED must be detectable ' +
+      '(proves the assertion cannot pass vacuously)',
+    );
+
+    // -----------------------------------------------------------------------
+    // Real-file assertions — RED on current release.yml, GREEN after Phase B2.
+    // The FIRST failure below is the -x check on musl build lines.
+    // -----------------------------------------------------------------------
+
+    const buildNapiSection = extractJobSection(yml, 'build-napi');
+    assert.ok(buildNapiSection !== null, 'S22 non-vacuity: build-napi must exist in release.yml');
+
+    const strippedSection = stripCommentLines(buildNapiSection);
+    const steps = jobSteps(buildNapiSection);
+    assert.ok(steps.length > 0, 'S22 non-vacuity: build-napi must have steps (jobSteps non-empty)');
+
+    // --- Matrix build: lines ---
+
+    // Collect all `build: napi build …` lines from the comment-stripped section.
+    const buildLineMatches = [...strippedSection.matchAll(/^\s+build:\s+(napi build .+)$/gm)];
+    const buildLines = buildLineMatches.map(m => m[1].trim());
+
+    assert.equal(
+      buildLines.length, 7,
+      `S22: build-napi matrix must have exactly 7 build: lines (one per target); ` +
+      `found ${buildLines.length}: ${JSON.stringify(buildLines)}`,
+    );
+
+    // Identify the two musl build lines by --target value ending in -linux-musl.
+    const muslBuildLines = buildLines.filter(b => {
+      const m = /--target\s+(\S+)/.exec(b);
+      return m !== null && m[1].endsWith('-linux-musl');
+    });
+
+    assert.equal(
+      muslBuildLines.length, 2,
+      `S22: exactly 2 build: lines must target a -linux-musl triple; ` +
+      `found ${muslBuildLines.length}: ${JSON.stringify(muslBuildLines)}`,
+    );
+
+    // Each musl build line must carry -x or --cross-compile.
+    // This is the FIRST REAL-FILE assertion to fail on RED (current file has no -x).
+    for (const line of muslBuildLines) {
+      assert.ok(
+        CROSS_RE.test(line),
+        `S22: musl build line must include -x or --cross-compile (cargo-zigbuild flag, #339); ` +
+        `got: "${line}" — Phase B2 appends " -x" to each musl napi build command`,
+      );
+    }
+
+    // No musl build line may carry --use-napi-cross (PF-038: napi's cross-toolchain
+    // has no musl entry and silently falls back to the host glibc linker).
+    for (const line of muslBuildLines) {
+      assert.ok(
+        !line.includes('--use-napi-cross'),
+        `S22: musl build line must NOT contain --use-napi-cross (PF-038: napi warns ` +
+        `"Unsupported arch" and falls back to host glibc, shipping a glibc-linked musl addon); ` +
+        `got: "${line}"`,
+      );
+    }
+
+    // Matrix entry checks: each musl entry must carry use-zig: true and no setup: key.
+    // Entries are segmented at 10-space bullet boundaries (see matrixEntries docs).
+    const entries = matrixEntries(buildNapiSection);
+    assert.ok(entries.length > 0, 'S22 non-vacuity: matrixEntries must return at least one entry');
+
+    const muslEntries = entries.filter(e => {
+      const bm = /build:\s+(napi build .+)$/m.exec(e);
+      if (!bm) return false;
+      const tm = /--target\s+(\S+)/.exec(bm[1]);
+      return tm !== null && tm[1].endsWith('-linux-musl');
+    });
+
+    assert.equal(
+      muslEntries.length, 2,
+      `S22: exactly 2 matrix entries must have a musl --target; found ${muslEntries.length}`,
+    );
+
+    for (const entry of muslEntries) {
+      assert.ok(
+        entry.includes('use-zig: true'),
+        `S22: each musl matrix entry must carry "use-zig: true" — the install-action and ` +
+        `Install zig steps are guarded by matrix.settings.use-zig; got entry:\n${entry}`,
+      );
+      assert.ok(
+        !entry.includes('setup:'),
+        `S22: musl matrix entries must NOT have a "setup:" key — Phase B2 removes the ` +
+        `hand-written zig-cc wrapper scripts and the setup: block that created them; ` +
+        `got entry:\n${entry}`,
+      );
+    }
+
+    // --- Residue checks ---
+    // None of the old wrapper artifacts may remain in the comment-stripped section,
+    // except zig-cc- inside the no-op detector step's /tmp/zig-cc-* absence assertion.
+
+    // Find the no-op detector step (if present) to carve out its body before
+    // checking zig-cc- — the detector itself is allowed to reference /tmp/zig-cc-
+    // as the thing it is asserting absent.
+    const nopDetectorStep = stepMatching(
+      steps,
+      /CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER/,
+    );
+    const nopBody = nopDetectorStep?.body ?? '';
+
+    assert.ok(
+      !strippedSection.includes('exec zig cc'),
+      'S22: "exec zig cc" must not appear in build-napi after Phase B2 — ' +
+      'the hand-written zig-cc wrapper scripts (x86_64-musl and aarch64-musl) are ' +
+      'replaced by cargo-zigbuild (#339)',
+    );
+
+    assert.ok(
+      !strippedSection.includes('ZIGCC'),
+      'S22: "ZIGCC" heredoc marker must not appear in build-napi after Phase B2 (#339)',
+    );
+
+    // zig-cc- may appear only in the no-op detector step's /tmp/zig-cc- absence assertion.
+    // Carve out the nop body (empty string when the step does not exist) before checking.
+    const strippedOutsideNop = strippedSection.replace(nopBody, '');
+    assert.ok(
+      !strippedOutsideNop.includes('zig-cc-'),
+      'S22: "zig-cc-" must not appear in build-napi outside the no-op detector step (#339); ' +
+      'the /tmp/zig-cc-* form is allowed ONLY in that step as an absence assertion',
+    );
+
+    assert.ok(
+      !strippedSection.includes('fakezig'),
+      'S22: "fakezig" (the aarch64 wrapper self-check helper) must not appear in ' +
+      'build-napi after Phase B2 (#339)',
+    );
+
+    assert.ok(
+      !strippedSection.includes('843419'),
+      'S22: "843419" (--fix-cortex-a53-843419) must not appear in build-napi after Phase B2 — ' +
+      'cargo-zigbuild filters this flag internally in its linker_args.rs; the wrapper ' +
+      'loop that stripped it is removed (#339)',
+    );
+
+    // Every CARGO_TARGET_*MUSL*_LINKER occurrence must be a READ ([ -z form]).
+    // Any assignment or >> "$GITHUB_ENV" form silently reverts the migration (Trap 2).
+    const muslLinkerLines = strippedSection.split('\n').filter(l =>
+      /CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER/.test(l),
+    );
+    for (const line of muslLinkerLines) {
+      assert.ok(
+        MUSL_LINKER_READ_RE.test(line),
+        `S22: every CARGO_TARGET_*MUSL*_LINKER line must be a READ ([ -z form) — ` +
+        `any export or >> "$GITHUB_ENV" form silently reverts the cargo-zigbuild migration ` +
+        `(cargo-zigbuild's add_env_if_missing yields to a pre-set linker env, Trap 2 from #339); ` +
+        `got: "${line}"`,
+      );
+    }
+
+    // Non-vacuity: the GNU linker export must still be present so the MUSL regex is non-vacuous.
+    assert.ok(
+      strippedSection.includes('CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER'),
+      'S22 non-vacuity: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER must still appear ' +
+      'in build-napi (aarch64-gnu uses the apt cross gcc, not cargo-zigbuild) — proves ' +
+      'the MUSL_LINKER_READ_RE is not matching the GNU export',
+    );
+
+    // --- Pinned install-action step ---
+
+    const installStep = stepMatching(steps, INSTALL_ACTION_SHA_RE);
+    assert.ok(
+      installStep !== null,
+      'S22: build-napi must contain a taiki-e/install-action step pinned to a 40-hex SHA ' +
+      '(PF-040: SHA-pinning composite actions is correct hardening; install-action is ' +
+      'composite, not Docker-trampoline); ' +
+      'steps found: [' + steps.map(s => s.body.split('\n')[0].trim()).join(' | ') + ']',
+    );
+
+    assert.ok(
+      installStep.body.includes('tool: cargo-zigbuild@0.23.0'),
+      `S22: install-action step must specify tool: cargo-zigbuild@0.23.0; ` +
+      `got step:\n${installStep.body}`,
+    );
+
+    assert.ok(
+      installStep.body.includes('fallback: none'),
+      `S22: install-action step must set "fallback: none" — without this, if the ` +
+      `pre-installed binary is absent napi runs an UNPINNED "cargo install cargo-zigbuild" ` +
+      `mid-build, violating the version pin (Trap 1 from #339); got step:\n${installStep.body}`,
+    );
+
+    assert.ok(
+      installStep.body.includes('GITHUB_TOKEN'),
+      `S22: install-action step must pass GITHUB_TOKEN in env:; got step:\n${installStep.body}`,
+    );
+
+    assert.ok(
+      installStep.body.includes('if: matrix.settings.use-zig'),
+      `S22: install-action step must be guarded by "if: matrix.settings.use-zig" so it ` +
+      `only runs on musl legs; got step:\n${installStep.body}`,
+    );
+
+    // --- Ordering: install-action < rust-cache < Install zig < version-assert ---
+
+    const rustCacheStep = stepMatching(steps, /Swatinem\/rust-cache@/);
+    const installZigStep = stepMatching(steps, /name: Install zig/);
+    const versionAssertStep = stepMatching(
+      steps,
+      /Assert cargo-zigbuild is the pinned version/,
+    );
+
+    assert.ok(rustCacheStep !== null,
+      'S22 non-vacuity: build-napi must have a Swatinem/rust-cache step');
+    assert.ok(installZigStep !== null,
+      'S22 non-vacuity: build-napi must have an "Install zig" step');
+    assert.ok(
+      versionAssertStep !== null,
+      'S22: build-napi must contain an "Assert cargo-zigbuild is the pinned version" step ' +
+      '(if: matrix.settings.use-zig) that verifies cargo-zigbuild identity after install',
+    );
+
+    assert.ok(
+      installStep.index < rustCacheStep.index,
+      `S22: "Install cargo-zigbuild (pinned)" (index ${installStep.index}) must precede ` +
+      `Swatinem/rust-cache (index ${rustCacheStep.index}) — rust-cache deletes ~/.cargo/bin ` +
+      `before saving the cache, so a binary installed AFTER rust-cache is evicted on next ` +
+      `warm restore (#339)`,
+    );
+
+    assert.ok(
+      rustCacheStep.index < installZigStep.index,
+      `S22: Swatinem/rust-cache (index ${rustCacheStep.index}) must precede ` +
+      `"Install zig" (index ${installZigStep.index})`,
+    );
+
+    assert.ok(
+      installZigStep.index < versionAssertStep.index,
+      `S22: "Install zig" (index ${installZigStep.index}) must precede ` +
+      `"Assert cargo-zigbuild is the pinned version" (index ${versionAssertStep.index})`,
+    );
+
+    // version-assert step body: required probes and a positive control.
+    assert.ok(
+      versionAssertStep.body.includes('cargo help zigbuild'),
+      'S22: version-assert step must call "cargo help zigbuild" — napi uses this as its ' +
+      'presence detector; without it napi falls back to UNPINNED cargo install (Trap 1)',
+    );
+    assert.ok(
+      versionAssertStep.body.includes('cargo zigbuild --version'),
+      'S22: version-assert step must call "cargo zigbuild --version" to log the version',
+    );
+    assert.ok(
+      versionAssertStep.body.includes('0.23.0'),
+      'S22: version-assert step must assert version string "0.23.0"',
+    );
+    const versionPCLines = stripCommentLines(versionAssertStep.body)
+      .split('\n')
+      .filter(l => l.includes('positive control'));
+    assert.ok(
+      versionPCLines.length >= 1,
+      `S22: version-assert step must contain at least 1 non-comment line with ` +
+      `"positive control" (PF-013: a step that cannot reject a wrong version is vacuous); ` +
+      `found ${versionPCLines.length}`,
+    );
+
+    // --- No-op detector step ---
+    // Must exist before Build addon; must check both musl linker names in [ -z ] form;
+    // must assert absence of .cache/cargo-zigbuild and /tmp/zig-cc-*.
+
+    const buildAddonStep = stepMatching(steps, /name: Build addon/);
+    assert.ok(
+      buildAddonStep !== null,
+      'S22 non-vacuity: build-napi must have a "Build addon" step',
+    );
+
+    assert.ok(
+      nopDetectorStep !== null,
+      'S22: build-napi must contain a no-op detector step (before "Build addon") that ' +
+      'checks CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER in a [ -z ] test — any ' +
+      'leftover musl linker export silently reverts the cargo-zigbuild migration (Trap 2)',
+    );
+
+    assert.ok(
+      nopDetectorStep.index < buildAddonStep.index,
+      `S22: no-op detector step (index ${nopDetectorStep.index}) must precede ` +
+      `"Build addon" (index ${buildAddonStep.index})`,
+    );
+
+    assert.ok(
+      nopDetectorStep.body.includes('CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER'),
+      'S22: no-op detector must also check CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER',
+    );
+
+    // Both musl linker names must appear inside [ -z ] tests.
+    for (const name of [
+      'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER',
+      'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER',
+    ]) {
+      assert.ok(
+        nopDetectorStep.body.includes(`[ -z "\${${name}`),
+        `S22: no-op detector must check ${name} with a [ -z "\${${name}...}" ] guard`,
+      );
+    }
+
+    // Absence assertion: .cache/cargo-zigbuild must not exist before the build.
+    assert.ok(
+      nopDetectorStep.body.includes('.cache/cargo-zigbuild') &&
+        (nopDetectorStep.body.includes('! -d') || nopDetectorStep.body.includes('! -e')),
+      'S22: no-op detector must assert absence of .cache/cargo-zigbuild (! -d or ! -e) ' +
+      'before "Build addon" — proves cargo-zigbuild has not yet run at this point',
+    );
+
+    // Absence assertion: /tmp/zig-cc-* wrapper scripts must not exist.
+    assert.ok(
+      nopDetectorStep.body.includes('/tmp/zig-cc-'),
+      'S22: no-op detector must assert absence of /tmp/zig-cc-* wrapper scripts',
+    );
+
+    // --- Post-build step ---
+    // Must exist after Build addon; must confirm .cache/cargo-zigbuild/0.23.0.
+
+    const postBuildStep =
+      steps.find(s =>
+        s.index > buildAddonStep.index &&
+        s.body.includes('.cache/cargo-zigbuild/0.23.0'),
+      ) ?? null;
+
+    assert.ok(
+      postBuildStep !== null,
+      'S22: build-napi must contain a post-build step (after "Build addon") that asserts ' +
+      '.cache/cargo-zigbuild/0.23.0 is present — proves cargo-zigbuild 0.23.0 (not another ' +
+      'version) ran in this specific job (#339)',
+    );
+
+    assert.ok(
+      postBuildStep.body.includes('cargo zigbuild --version'),
+      'S22: post-build step must call "cargo zigbuild --version" to record the version in logs',
+    );
+
+    // --- readelf gate (name contains "links musl, not glibc") ---
+
+    const readelfStep = stepMatching(steps, /links musl, not glibc/);
+    assert.ok(
+      readelfStep !== null,
+      'S22 non-vacuity: build-napi must have a step whose name/body contains "links musl, not glibc"',
+    );
+
+    assert.ok(
+      readelfStep.body.includes('ALLOWED_NEEDED'),
+      'S22: readelf gate must define ALLOWED_NEEDED — cargo-zigbuild links libunwind.so.1 ' +
+      'instead of libgcc_s.so.1 (dynamic exception unwind ABI); a plain "no glibc" check ' +
+      'is not sufficient; the allowlist enumerates expected NEEDED entries (PF-038)',
+    );
+
+    assert.ok(
+      readelfStep.body.includes('libgcc_s.so.1'),
+      'S22: readelf gate ALLOWED_NEEDED must list libgcc_s.so.1 (PF-038)',
+    );
+
+    assert.ok(
+      readelfStep.body.includes('libunwind.so.1'),
+      'S22: readelf gate must include libunwind.so.1 as a planted positive control — ' +
+      'an unexpected NEEDED soname would only fail at runtime in the Alpine load tests; ' +
+      'planting it here proves the ALLOWED_NEEDED check is non-vacuous (PF-013, PF-038)',
+    );
+
+    // --- Install zig step: SHA-pinned, version 0.16.0, guarded by use-zig ---
+
+    assert.ok(
+      /uses:\s*mlugg\/setup-zig@[0-9a-f]{40}/.test(installZigStep.body),
+      `S22: "Install zig" step must pin mlugg/setup-zig to a 40-hex SHA (PF-040 — ` +
+      `composite action; SHA-pinning is correct here, not a tag); ` +
+      `got step:\n${installZigStep.body}`,
+    );
+
+    assert.ok(
+      installZigStep.body.includes('version: 0.16.0'),
+      `S22: "Install zig" step must pin zig to version 0.16.0; got step:\n${installZigStep.body}`,
+    );
+
+    assert.ok(
+      installZigStep.body.includes('if: matrix.settings.use-zig'),
+      `S22: "Install zig" step must be guarded by "if: matrix.settings.use-zig"; ` +
+      `got step:\n${installZigStep.body}`,
+    );
+
+    // S20 reuse: rust-cache key must still include matrix.settings.target (PF-041, #352).
+    const cacheSteps = rustCacheSteps(buildNapiSection);
+    assert.ok(cacheSteps.length > 0,
+      'S22 reuse S20: build-napi must have at least one Swatinem/rust-cache step');
+    for (const step of cacheSteps) {
+      assert.ok(
+        step.key !== null && step.key.includes('matrix.'),
+        `S22 reuse S20: build-napi rust-cache key must include "matrix." (PF-041, #352) — ` +
+        `this migration must not drop the per-leg cache key; got key: ${JSON.stringify(step.key)}`,
+      );
+    }
+
+    // Non-vacuity: findAllJobIds includes build-napi; residue needle list is non-empty.
+    assert.ok(
+      findAllJobIds(yml).includes('build-napi'),
+      'S22 non-vacuity: findAllJobIds must include build-napi',
+    );
+    const residueNeedles = ['exec zig cc', 'ZIGCC', 'zig-cc-', 'fakezig', '843419'];
+    assert.ok(residueNeedles.length > 0,
+      'S22 non-vacuity: residue needle list must be non-empty');
+  });
+
+});
