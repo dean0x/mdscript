@@ -88,8 +88,8 @@ publishes nothing.
   parallel) → stage+verify → publish-crates → publish-npm → publish-python → github-release
 - **Critical gate**: A3 name↔loader verification (`scripts/verify-napi-names.mjs`)
 - **Toolchain pins**: Unpinned inputs that have broken release builds: stable rustc (1.98.0 added
-  `-Wl,--fix-cortex-a53-843419`; aarch64-musl wrapper filters it) and zig (pinned to 0.16.0 in
-  `release.yml`). See #339 for the durable fix.
+  `-Wl,--fix-cortex-a53-843419`; cargo-zigbuild 0.23.0 filters this flag internally in `src/zig.rs`
+  and the hand-written wrappers were removed in #339) and zig (pinned to 0.16.0 in `release.yml`).
 
 ## Post-release
 
