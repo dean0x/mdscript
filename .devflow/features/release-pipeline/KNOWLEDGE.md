@@ -458,6 +458,10 @@ such a file. Never write `${{` in comments; describe it in words.
   from the fixture directory — the shape any real non-root cwd has. `musl-load-probe.cjs`
   asserts `process.cwd() === '/w'` so a dropped flag fails loudly rather than silently
   returning a spurious "file not found" error. S21 pins `-w /w` in the needle list.
+- **`DEBUG` env on `Build addon` was deliberately NOT added**: there is no verified `@napi-rs/cli`
+  debug namespace to enable, and the wrapper-cache presence check (wrappers found under
+  `~/.cache/cargo-zigbuild/0.23.0/wrappers/` by the post-build step) is the run-proof that
+  cargo-zigbuild 0.23.0 actually executed in the job.
 
 ## Key Files
 

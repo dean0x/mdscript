@@ -2356,11 +2356,79 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       'loop that stripped it is removed (#339)',
     );
 
-    // Every CARGO_TARGET_*MUSL*_LINKER occurrence must be a READ ([ -z form]).
-    // Any assignment or >> "$GITHUB_ENV" form silently reverts the migration (Trap 2).
+    // Every CARGO_TARGET_*MUSL*_LINKER occurrence must be (a) a READ ([ -z form) AND
+    // (b) lie inside the no-op detector step — not in "Build addon" or any other step.
+    // A READ guard outside the detector passes the form check but does not abort before
+    // the build, losing the migration's pre-build protection (Trap 2 from #339).
+    //
+    // PC12: step-scoping planted controls.
+    // (a) READ form inside "Build addon" step — form passes but scoping must FAIL.
+    const plantedReadInAddon = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: Verify no lingering musl linker export or wrapper (no-op detector)',
+      '        if: matrix.settings.use-zig',
+      '        run: |',
+      '          echo "no linker guard here"',
+      '      - name: Build addon',
+      '        working-directory: crates/mds-napi',
+      '        run: |',
+      '          [ -z "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-}" ] || exit 1',
+    ].join('\n');
+    const pc12aSteps = jobSteps(plantedReadInAddon);
+    const pc12aDetector = stepMatching(pc12aSteps, /Verify no lingering musl linker export/);
+    const pc12aStripped = stripCommentLines(plantedReadInAddon);
+    const pc12aMuslLines = pc12aStripped.split('\n').filter(l =>
+      /CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER/.test(l),
+    );
+    assert.ok(
+      pc12aMuslLines.length === 1,
+      'PC12a: planted section must have exactly one MUSL_LINKER line in Build addon',
+    );
+    assert.ok(
+      MUSL_LINKER_READ_RE.test(pc12aMuslLines[0]),
+      'PC12a: the planted MUSL_LINKER line must pass the READ form check ' +
+      '(proves form-pass alone is insufficient for the scoping gate to pass)',
+    );
+    assert.ok(
+      pc12aDetector !== null && !pc12aDetector.body.includes(pc12aMuslLines[0].trim()),
+      'PC12a: the detector step must NOT contain the planted READ line ' +
+      '(line is in "Build addon" — the scoping gate must reject a READ outside the detector)',
+    );
+    // (b) READ form inside the no-op detector step — scoping must PASS.
+    const plantedReadInDetector = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: Verify no lingering musl linker export or wrapper (no-op detector)',
+      '        if: matrix.settings.use-zig',
+      '        run: |',
+      '          [ -z "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-}" ] || exit 1',
+      '      - name: Build addon',
+      '        working-directory: crates/mds-napi',
+      '        run: |',
+      '          echo "build here"',
+    ].join('\n');
+    const pc12bSteps = jobSteps(plantedReadInDetector);
+    const pc12bDetector = stepMatching(pc12bSteps, /Verify no lingering musl linker export/);
+    const pc12bStripped = stripCommentLines(plantedReadInDetector);
+    const pc12bMuslLines = pc12bStripped.split('\n').filter(l =>
+      /CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER/.test(l),
+    );
+    assert.ok(
+      pc12bMuslLines.length === 1,
+      'PC12b: planted section must have exactly one MUSL_LINKER line in the detector step',
+    );
+    assert.ok(
+      pc12bDetector !== null && pc12bDetector.body.includes(pc12bMuslLines[0].trim()),
+      'PC12b: the detector step MUST contain the planted READ line ' +
+      '(line is in the detector — the scoping gate must accept a READ inside the detector)',
+    );
+
+    // Real-file check: form + step-scope enforcement.
     const muslLinkerLines = strippedSection.split('\n').filter(l =>
       /CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER/.test(l),
     );
+    const detectorStepByName = stepMatching(steps, /Verify no lingering musl linker export/);
     for (const line of muslLinkerLines) {
       assert.ok(
         MUSL_LINKER_READ_RE.test(line),
@@ -2368,6 +2436,13 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
         `any export or >> "$GITHUB_ENV" form silently reverts the cargo-zigbuild migration ` +
         `(cargo-zigbuild's add_env_if_missing yields to a pre-set linker env, Trap 2 from #339); ` +
         `got: "${line}"`,
+      );
+      assert.ok(
+        detectorStepByName !== null && detectorStepByName.body.includes(line.trim()),
+        `S22: every CARGO_TARGET_*MUSL*_LINKER READ line must lie inside the no-op detector ` +
+        `step ("Verify no lingering musl linker export or wrapper") — a READ guard in any ` +
+        `other step (e.g. "Build addon") does not abort before the build and loses the ` +
+        `migration's pre-build protection (Trap 2 from #339); got line: "${line.trim()}"`,
       );
     }
 
