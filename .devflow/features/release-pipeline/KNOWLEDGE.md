@@ -188,7 +188,7 @@ Steps (in order):
 1. Verify publish credentials (npm `whoami` + cargo token non-empty + PyPI OIDC mint-token exchange).
 2. Assert synchronized versions, no `file:` refs.
 3. Assert no hazardous codepoints in tracked source.
-4. Run `npm run test:gates` — all four spec files, 211 tests including pin-shape specs (S16), per-leg cache key spec (S20), and Alpine load test job spec (S21).
+4. Run `npm run test:gates` — all four spec files, 212 tests including pin-shape specs (S16), per-leg cache key spec (S20), Alpine load test job spec (S21), and the cargo-zigbuild musl-leg spec (S22).
 5. Assert tagged SHA has green CI history (step-skipped on `pull_request`).
 
 Because `npm run test:gates` runs inside `version-gate`, a malformed pin (e.g. a commit SHA
@@ -265,20 +265,36 @@ per PF-040) with `tool: cargo-zigbuild@0.23.0`, `fallback: none`, placed BEFORE
 | 3 | `Install cargo-zigbuild (pinned)` | SHA-pinned taiki-e/install-action, `fallback: none` |
 | 4 | `Swatinem/rust-cache` | `key: matrix.settings.target` (PF-041, S20) |
 | 5 | `Install zig` | SHA-pinned mlugg/setup-zig, version 0.16.0 |
-| 6 | `Assert cargo-zigbuild is the pinned version` | `cargo help zigbuild` + `cargo zigbuild --version` + 0.23.0 check |
-| 9 | `Verify no lingering musl linker export or wrapper (no-op detector)` | reads MUSL_LINKER env vars in `[ -z ]` guards; asserts `~/.cache/cargo-zigbuild` absent |
+| 6 | `Assert cargo-zigbuild is the pinned version` | `cargo help zigbuild` + `cargo-zigbuild --version` + 0.23.0 check |
+| 9 | `Verify no lingering musl linker export or wrapper (no-op detector)` | reads MUSL_LINKER env vars in `[ -z ]` guards; asserts the wrapper cache absent |
 | 10 | `Build addon` | `npx napi build … -x` |
-| 11 | `Assert cargo-zigbuild 0.23.0 wrappers were generated` | checks `~/.cache/cargo-zigbuild/0.23.0/` and `cargo zigbuild --version` |
+| 11 | `Assert cargo-zigbuild 0.23.0 wrappers were generated` | finds `zigcc-*` under the wrapper cache and re-asserts `cargo-zigbuild --version` |
 | 12 | `Assert musl artifact links musl, not glibc` | readelf + ALLOWED_NEEDED allowlist |
 
 cargo-zigbuild 0.23.0 owns the full linker-arg filter (`--fix-cortex-a53-843419`,
 `--no-undefined-version`, `-lgcc_s` to `-lunwind`, self-contained musl CRT skip, response
-files). Its CI tests zig 0.16.0; nothing in 0.23.2–0.23.4 touches x86_64/aarch64 musl.
-Bumping zig OR cargo-zigbuild is a deliberate, paired decision.
+files) — all of it in `src/zig.rs` (0.23.0 has no `src/zig/` directory; the filter lives
+around `run_filter_one`). Its CI tests zig 0.16.0; nothing in 0.23.2–0.23.4 touches
+x86_64/aarch64 musl. Bumping zig OR cargo-zigbuild is a deliberate, paired decision.
+
+Wrapper cache layout (verified against 0.23.0's `cache_dir()` in `src/zig.rs`):
+`${XDG_CACHE_HOME:-$HOME/.cache}/cargo-zigbuild/0.23.0/wrappers/<exe-hash>/zigcc-<target>-<hash>.sh`
+(plus `zigcxx-…`, `zigranlib.sh`, and `ar`/`lib` symlinks). Both the pre-build absence
+check and the post-build presence check resolve the root with `${XDG_CACHE_HOME:-$HOME/.cache}`
+so they name the directory cargo-zigbuild actually writes; the post-build `find` is
+recursive because of the `wrappers/<exe-hash>/` level. Spec S22 pins the XDG-aware form
+(a hard-coded `$HOME/.cache` path is rejected, with a planted control).
 
 The readelf gate uses `ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'` with a planted
 `libunwind.so.1` positive control (spec S22, PF-013, PF-038). Spec S22 asserts the
 ALLOWED_NEEDED assignment literal (not a comment) contains both patterns.
+The expected DT_NEEDED set for a dynamic musl cdylib is just `libc.so`; `libgcc_s.so.1`
+is tolerated because `node:22-alpine` ships it. `libunwind.so.1` is the control precisely
+because cargo-zigbuild rewrites `-lgcc_s` to `-lunwind` and zig links its own libunwind
+into the artifact — a `libunwind.so.1` DT_NEEDED would mean a shared object Alpine does
+not ship, invisible to readelf and fatal at dlopen. The allowlist has not yet been observed
+against a real cargo-zigbuild-linked artifact; the first dry run is where it earns its keep,
+and the Alpine load tests (#340) are the acceptance instrument for any linkage delta.
 
 ### GitHub expression preprocessor trap
 
@@ -362,8 +378,17 @@ such a file. Never write `${{` in comments; describe it in words.
 - **napi's cargo-zigbuild detector is presence-only**: `@napi-rs/cli` checks for zigbuild with
   `cargo help zigbuild`; if absent it runs an UNPINNED `cargo install cargo-zigbuild` mid-build,
   silently replacing the pinned version. Pre-install with `taiki-e/install-action` and `fallback:
-  none` (never `fallback: cargo-binstall`), then assert with `cargo zigbuild --version | grep
-  0.23.0` AFTER rust-cache and AGAIN after the build.
+  none` (never `fallback: cargo-binstall`), then assert with `cargo-zigbuild --version` AFTER
+  rust-cache and AGAIN after the build. `cargo help zigbuild` is itself non-vacuous — it exits
+  101 when the binary is absent and 0 when it is present (verified locally).
+- **`cargo zigbuild --version` is NOT a version probe — it exits 2**: cargo-zigbuild's clap enum
+  (`src/bin/cargo-zigbuild.rs`) puts `version` on the top-level command and never sets
+  `propagate_version`, and neither `cargo_options::Build` nor `CommonOptions` defines a
+  `--version` arg, so `cargo zigbuild --version` (and `-V`) fail with `error: unexpected
+  argument '--version' found`. Under `set -euo pipefail` that aborts the asserting step and
+  fails BOTH musl legs on every tag push, dispatch and release-surface PR. Always probe the
+  binary: `cargo-zigbuild --version` prints exactly `cargo-zigbuild 0.23.0`. S22 asserts the
+  binary form and rejects the substring `cargo zigbuild --version` anywhere in `build-napi`.
 - **`-x` cannot be combined with `--use-napi-cross`**: they are mutually exclusive flags in
   `@napi-rs/cli`; combining them is a build error.
 - **`add_env_if_missing` in cargo-zigbuild yields to a pre-set `CARGO_TARGET_*_LINKER`**:

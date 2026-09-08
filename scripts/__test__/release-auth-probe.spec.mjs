@@ -1920,17 +1920,22 @@ describe('B3a: Alpine musl load tests (#340)', () => {
 // ---------------------------------------------------------------------------
 // B3b helpers and S22 spec — cargo-zigbuild musl legs (#339)
 //
-// Phase B2 replaces the hand-written /tmp/zig-cc-* wrapper scripts with
-// `napi build … -x` (cargo-zigbuild 0.23.0). This spec describes the REQUIRED
-// shape of build-napi after that migration. It is RED until Phase B2 lands.
+// Both musl legs of build-napi cross-compile with `napi build … -x`
+// (cargo-zigbuild 0.23.0) instead of the hand-written /tmp/zig-cc-* wrapper
+// scripts. This spec pins that shape so it cannot silently regress.
 //
-// Two migration traps drive the checks:
+// Three traps drive the checks:
 //   Trap 1: napi's cargo-zigbuild detector is presence-only (`cargo help zigbuild`);
 //     on failure it runs an UNPINNED `cargo install cargo-zigbuild` mid-build.
 //     Pre-install via install-action with fallback:none prevents the fallback.
 //   Trap 2: cargo-zigbuild's add_env_if_missing yields to a pre-set
 //     CARGO_TARGET_*_LINKER, so any leftover musl linker export silently reverts
 //     the migration while every gate stays green.
+//   Trap 3: `cargo zigbuild --version` is NOT a version probe. cargo-zigbuild's
+//     clap enum sets version on the top-level command only and never sets
+//     propagate_version, so the subcommand form exits 2 with "unexpected argument
+//     '--version' found" and fails the asserting step on every musl leg. The
+//     binary form `cargo-zigbuild --version` prints "cargo-zigbuild 0.23.0".
 // ---------------------------------------------------------------------------
 
 /**
@@ -1998,6 +2003,13 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
     const INSTALL_ACTION_SHA_RE = /uses:\s*taiki-e\/install-action@[0-9a-f]{40}\b/;
     // READ form for a musl linker env name: [ -z "${NAME...}" ].
     const MUSL_LINKER_READ_RE = /\[\s*-z\s+"\$\{CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER[^}]*\}"/;
+    // The BROKEN version probe: `cargo zigbuild --version` is a clap parse error
+    // (exit 2), not a version string. Note the space — `cargo-zigbuild --version`
+    // (the binary form, which works) does not contain this substring (Trap 3).
+    const BROKEN_VERSION_PROBE = 'cargo zigbuild --version';
+    // Cache path must be resolved the way cargo-zigbuild's cache_dir() does:
+    // $XDG_CACHE_HOME when set, else $HOME/.cache (src/zig.rs).
+    const CZB_CACHE_RE = /\$\{XDG_CACHE_HOME:-\$HOME\/\.cache\}\/cargo-zigbuild\/0\.23\.0/;
 
     // -----------------------------------------------------------------------
     // Parser positive controls (PF-013) — all operate on planted YAML strings.
@@ -2043,7 +2055,7 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       '        if: matrix.settings.use-zig',
       '        run: |',
       '          cargo help zigbuild',
-      '          cargo zigbuild --version | grep 0.23.0 # positive control: must match',
+      '          cargo-zigbuild --version | grep 0.23.0 # positive control: must match',
       '      - uses: Swatinem/rust-cache@v2',
       '        with:',
       '          key: ${{ matrix.settings.target }}',
@@ -2148,9 +2160,70 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       'assertion — proves the regex cannot be satisfied by an inline comment alone',
     );
 
+    // PC9 (Trap 3): the subcommand form of the version probe must be detectable, and
+    // the working binary form must NOT trip the detector. `cargo zigbuild --version`
+    // exits 2 with "unexpected argument '--version' found" — a step that runs it under
+    // `set -e` fails on every musl leg, so it must never appear in the workflow.
+    const plantedBrokenProbe = 'ACTUAL=$(cargo zigbuild --version); echo "${ACTUAL}"';
+    const plantedWorkingProbe = 'ACTUAL=$(cargo-zigbuild --version); echo "${ACTUAL}"';
+    assert.ok(
+      plantedBrokenProbe.includes(BROKEN_VERSION_PROBE),
+      'PC9: the subcommand form "cargo zigbuild --version" must be detectable (PF-013)',
+    );
+    assert.ok(
+      !plantedWorkingProbe.includes(BROKEN_VERSION_PROBE),
+      'PC9: "cargo-zigbuild --version" (the binary form that actually prints a version) ' +
+      'must NOT match the broken-probe needle — the hyphen is what distinguishes them',
+    );
+    assert.ok(
+      plantedWorkingProbe.includes('cargo-zigbuild --version'),
+      'PC9: the binary form needle must match the planted working probe',
+    );
+    // `cargo help zigbuild` (napi's own presence predicate) must not be confused with
+    // the broken version probe — it is a different command and stays required.
+    assert.ok(
+      !'cargo help zigbuild'.includes(BROKEN_VERSION_PROBE),
+      'PC9: "cargo help zigbuild" must not match the broken-probe needle',
+    );
+
+    // PC10 (Trap 2): every SET form of a musl linker env must fail MUSL_LINKER_READ_RE,
+    // not just the `export NAME=` form covered by PC7. A bare assignment, a
+    // $GITHUB_ENV append, and a YAML `env:` mapping key are all SETs.
+    for (const [label, plantedSet] of [
+      ['bare assignment', 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/zig-cc-aarch64-musl'],
+      ['GITHUB_ENV append',
+        'echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/tmp/x" >> "$GITHUB_ENV"'],
+      ['YAML env: mapping key',
+        '          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: /tmp/zig-cc-x86_64-musl'],
+    ]) {
+      assert.ok(
+        /CARGO_TARGET_[A-Z0-9_]*MUSL[A-Z0-9_]*_LINKER/.test(plantedSet),
+        `PC10: the planted ${label} must be collected by the musl-linker line filter ` +
+        '(otherwise the READ assertion below never sees it — vacuous, PF-013)',
+      );
+      assert.ok(
+        !MUSL_LINKER_READ_RE.test(plantedSet),
+        `PC10: a ${label} SET form must NOT satisfy MUSL_LINKER_READ_RE — ` +
+        "cargo-zigbuild's add_env_if_missing yields to any pre-set linker env (Trap 2)",
+      );
+    }
+
+    // PC11: the wrapper-cache path must be XDG-aware. A hard-coded $HOME/.cache form
+    // checks a directory cargo-zigbuild may never touch, which would make the
+    // pre-build absence assertion vacuous (PF-013).
+    assert.ok(
+      CZB_CACHE_RE.test('CZB_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/cargo-zigbuild/0.23.0"'),
+      'PC11: the XDG-aware cache expression must match CZB_CACHE_RE',
+    );
+    assert.ok(
+      !CZB_CACHE_RE.test('CZB_CACHE="$HOME/.cache/cargo-zigbuild/0.23.0"'),
+      'PC11: a hard-coded $HOME/.cache path must NOT match CZB_CACHE_RE — ' +
+      "cargo-zigbuild's cache_dir() honours $XDG_CACHE_HOME first (src/zig.rs)",
+    );
+
     // -----------------------------------------------------------------------
-    // Real-file assertions — RED on current release.yml, GREEN after Phase B2.
-    // The FIRST failure below is the -x check on musl build lines.
+    // Real-file assertions — these pin the end state of the cargo-zigbuild migration.
+    // The first of them is the -x check on the musl build lines.
     // -----------------------------------------------------------------------
 
     const buildNapiSection = extractJobSection(yml, 'build-napi');
@@ -2190,7 +2263,7 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       assert.ok(
         CROSS_RE.test(line),
         `S22: musl build line must include -x or --cross-compile (cargo-zigbuild flag, #339); ` +
-        `got: "${line}" — Phase B2 appends " -x" to each musl napi build command`,
+        `got: "${line}" — each musl napi build command ends with " -x"`,
       );
     }
 
@@ -2230,7 +2303,7 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       );
       assert.ok(
         !entry.includes('setup:'),
-        `S22: musl matrix entries must NOT have a "setup:" key — Phase B2 removes the ` +
+        `S22: musl matrix entries must NOT have a "setup:" key — the migration removed the ` +
         `hand-written zig-cc wrapper scripts and the setup: block that created them; ` +
         `got entry:\n${entry}`,
       );
@@ -2251,14 +2324,14 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
 
     assert.ok(
       !strippedSection.includes('exec zig cc'),
-      'S22: "exec zig cc" must not appear in build-napi after Phase B2 — ' +
+      'S22: "exec zig cc" must not appear in build-napi — ' +
       'the hand-written zig-cc wrapper scripts (x86_64-musl and aarch64-musl) are ' +
       'replaced by cargo-zigbuild (#339)',
     );
 
     assert.ok(
       !strippedSection.includes('ZIGCC'),
-      'S22: "ZIGCC" heredoc marker must not appear in build-napi after Phase B2 (#339)',
+      'S22: "ZIGCC" heredoc marker must not appear in build-napi (#339)',
     );
 
     // zig-cc- may appear only in the no-op detector step's /tmp/zig-cc- absence assertion.
@@ -2273,13 +2346,13 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
     assert.ok(
       !strippedSection.includes('fakezig'),
       'S22: "fakezig" (the aarch64 wrapper self-check helper) must not appear in ' +
-      'build-napi after Phase B2 (#339)',
+      'build-napi (#339)',
     );
 
     assert.ok(
       !strippedSection.includes('843419'),
-      'S22: "843419" (--fix-cortex-a53-843419) must not appear in build-napi after Phase B2 — ' +
-      'cargo-zigbuild filters this flag internally in its linker_args.rs; the wrapper ' +
+      'S22: "843419" (--fix-cortex-a53-843419) must not appear in build-napi — ' +
+      'cargo-zigbuild filters this flag internally in src/zig.rs; the wrapper ' +
       'loop that stripped it is removed (#339)',
     );
 
@@ -2387,8 +2460,9 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       'presence detector; without it napi falls back to UNPINNED cargo install (Trap 1)',
     );
     assert.ok(
-      versionAssertStep.body.includes('cargo zigbuild --version'),
-      'S22: version-assert step must call "cargo zigbuild --version" to log the version',
+      versionAssertStep.body.includes('cargo-zigbuild --version'),
+      'S22: version-assert step must call "cargo-zigbuild --version" (the BINARY form) ' +
+      'to read the version',
     );
     assert.ok(
       versionAssertStep.body.includes('0.23.0'),
@@ -2443,12 +2517,12 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       );
     }
 
-    // Absence assertion: .cache/cargo-zigbuild must not exist before the build.
+    // Absence assertion: the cargo-zigbuild wrapper cache must not exist before the build.
     assert.ok(
-      nopDetectorStep.body.includes('.cache/cargo-zigbuild') &&
+      nopDetectorStep.body.includes('cargo-zigbuild/0.23.0') &&
         (nopDetectorStep.body.includes('! -d') || nopDetectorStep.body.includes('! -e')),
-      'S22: no-op detector must assert absence of .cache/cargo-zigbuild (! -d or ! -e) ' +
-      'before "Build addon" — proves cargo-zigbuild has not yet run at this point',
+      'S22: no-op detector must assert absence of the cargo-zigbuild/0.23.0 wrapper cache ' +
+      '(! -d or ! -e) before "Build addon" — proves cargo-zigbuild has not yet run at this point',
     );
 
     // Absence assertion: /tmp/zig-cc-* wrapper scripts must not exist.
@@ -2463,20 +2537,47 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
     const postBuildStep =
       steps.find(s =>
         s.index > buildAddonStep.index &&
-        s.body.includes('.cache/cargo-zigbuild/0.23.0'),
+        s.body.includes('cargo-zigbuild/0.23.0'),
       ) ?? null;
 
     assert.ok(
       postBuildStep !== null,
       'S22: build-napi must contain a post-build step (after "Build addon") that asserts ' +
-      '.cache/cargo-zigbuild/0.23.0 is present — proves cargo-zigbuild 0.23.0 (not another ' +
-      'version) ran in this specific job (#339)',
+      'the cargo-zigbuild/0.23.0 wrapper cache is present — proves cargo-zigbuild 0.23.0 ' +
+      '(not another version) ran in this specific job (#339)',
     );
 
     assert.ok(
-      postBuildStep.body.includes('cargo zigbuild --version'),
-      'S22: post-build step must call "cargo zigbuild --version" to record the version in logs',
+      postBuildStep.body.includes('cargo-zigbuild --version'),
+      'S22: post-build step must call "cargo-zigbuild --version" (the BINARY form) to ' +
+      're-assert the version after the build',
     );
+
+    // Trap 3: neither asserting step may use the subcommand form anywhere in build-napi.
+    // `cargo zigbuild --version` exits 2 ("unexpected argument '--version' found") because
+    // cargo-zigbuild's clap enum never sets propagate_version, so under `set -e` it fails
+    // BOTH musl legs of build-napi on every tag push, dispatch and release-surface PR.
+    assert.ok(
+      !strippedSection.includes(BROKEN_VERSION_PROBE),
+      `S22: "${BROKEN_VERSION_PROBE}" must not appear in build-napi — the cargo subcommand ` +
+      `form is a clap parse error (exit 2), not a version probe; use the binary form ` +
+      `"cargo-zigbuild --version", which prints "cargo-zigbuild 0.23.0" (Trap 3, #339)`,
+    );
+
+    // Both cache-path steps must resolve the wrapper cache the way cargo-zigbuild does.
+    for (const [label, step] of [
+      ['no-op detector', nopDetectorStep],
+      ['post-build wrapper assert', postBuildStep],
+    ]) {
+      assert.match(
+        step.body,
+        CZB_CACHE_RE,
+        `S22: the ${label} step must resolve the wrapper cache as ` +
+        '"${XDG_CACHE_HOME:-$HOME/.cache}/cargo-zigbuild/0.23.0" — cargo-zigbuild\'s ' +
+        'cache_dir() (src/zig.rs) honours $XDG_CACHE_HOME first, and a hard-coded ' +
+        '$HOME/.cache path would check a directory cargo-zigbuild never writes (PF-013)',
+      );
+    }
 
     // --- readelf gate (name contains "links musl, not glibc") ---
 
