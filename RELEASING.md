@@ -210,7 +210,7 @@ cases (the six release-surface paths are `.github/workflows/release.yml`,
    because `github.sha` is the ephemeral merge commit, not the branch head; a
    `::notice::` makes the skip visible. It runs only on tag push and dispatch.
 2. **Changes outside the release surface** — dependency sweeps,
-   `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the five
+   `crates/mds-core/**`, `Cargo.toml`, and `package.json` are not in the six
    paths above and do not trigger a `pull_request` run on `release.yml`.
 3. **Dependabot and fork PRs** — no repository secrets and no `id-token: write`;
    `Version gate` fails closed with the "No Actions secrets on this run" error.

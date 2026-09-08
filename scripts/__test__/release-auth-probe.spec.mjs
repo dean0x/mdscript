@@ -1346,6 +1346,17 @@ function runsOnOf(section) {
  * (comment-stripped, `/^      - /` boundaries), finds the load-test step, and
  * returns the lines after `run: |` that are indented deeper than the `run:`
  * key, joined with '\n'. Returns null when no such step or run block is found.
+ *
+ * Trailing blank lines are dropped before joining. When the load-test step is
+ * the LAST step of its job, the scan runs to the end of the job section, so the
+ * blank separator lines between that step and the next job's comment banner
+ * (the banner itself is removed by stripCommentLines) would otherwise land
+ * inside the returned block. That would make the byte-equality assertion below
+ * sensitive to blank lines OUTSIDE either run block — a purely cosmetic edit to
+ * one job's spacing would fail S21 with "must be BYTE-EQUAL", a true verdict for
+ * a false reason. Blank lines are not shell code; only the script text is
+ * compared. Control PC-I pins both halves: trailing blanks are ignored, and a
+ * real trailing command difference is still detected.
  */
 function loadTestRunBlock(section) {
   const lines = stripCommentLines(section).split('\n');
@@ -1367,6 +1378,7 @@ function loadTestRunBlock(section) {
       if (lineIndent <= runLineIndent) break;
       runLines.push(line);
     }
+    while (runLines.length > 0 && runLines[runLines.length - 1].trim() === '') runLines.pop();
     return runLines.join('\n');
   }
   return null;
@@ -1526,6 +1538,34 @@ describe('B3a: Alpine musl load tests (#340)', () => {
       extractNeeds(commentedNeedsSection), ['real-dep'],
       'S21/PC-H: extractNeeds must strip comment lines; # needs: [bogus] above ' +
       'needs: [real-dep] must yield [\'real-dep\'] (PF-013)',
+    );
+
+    // S21/PC-I: the byte-equality comparison below must ignore blank lines that
+    // sit OUTSIDE the run block — when the load-test step is the last step of a
+    // job, the scan reaches the end of the section and would otherwise absorb
+    // the blank separator before the next job's (comment-stripped) banner. Both
+    // halves are pinned so the trim cannot silently swallow a divergent script.
+    const plantLoadTestStep = (tail) => [
+      '  fake-job:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-x64-musl)"',
+      '        run: |',
+      '          set -euo pipefail',
+      '          docker run --network none :/w:ro',
+      ...tail,
+    ].join('\n');
+    assert.equal(
+      loadTestRunBlock(plantLoadTestStep([])),
+      loadTestRunBlock(plantLoadTestStep(['', '', ''])),
+      'S21/PC-I: two run blocks differing ONLY in trailing blank lines must compare ' +
+      'EQUAL — a blank separator outside the block is not shell code, and letting it ' +
+      'in makes S21 fail for a cosmetic edit to an unrelated job (PF-013)',
+    );
+    assert.notEqual(
+      loadTestRunBlock(plantLoadTestStep([])),
+      loadTestRunBlock(plantLoadTestStep(['          echo extra', ''])),
+      'S21/PC-I: a run block carrying a real extra trailing COMMAND must still compare ' +
+      'UNEQUAL — the trailing-blank trim must not swallow a divergent script (PF-013)',
     );
 
     // -----------------------------------------------------------------------

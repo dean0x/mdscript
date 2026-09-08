@@ -305,8 +305,8 @@ such a file. Never write `${{` in comments; describe it in words.
 - **Counting `positive control` occurrences without `stripCommentLines` first**: the
   `build-python` banner comment contains the phrase `positive control`; stripping comment
   lines before counting is required to get the correct count.
-- **Building a load-test fixture from the crate directory or the artifact root**: `napi build
-  --output-dir .` writes every `.node` into the crate root; the artifact also carries
+- **Building a load-test fixture from the crate directory or the artifact root**: `napi
+  artifacts --output-dir .` writes every `.node` into the crate root; the artifact also carries
   root-level `*.node` files — either source activates candidate 2 of the loader (`.node`
   beside `index.js`) and short-circuits the fixture, making the test vacuous.
 - **Testing the musl addon through `@mdscript/mds`**: its WASM fallback makes the test
