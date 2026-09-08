@@ -11,7 +11,7 @@ name: Release
 # scripts/verify-pr-checks.mjs for exactly the five enumerated job names in
 # TIER_B_EXPECTED_SKIPPED). crates/mds-core/**, Cargo.toml, and package.json
 # are excluded on purpose: they change on most PRs and ci.yml already covers
-# them; a dependency sweep that does not touch the five paths below still needs
+# them; a dependency sweep that does not touch the six paths below still needs
 # the manual workflow_dispatch dry-run.
 on:
   push:
@@ -496,7 +496,8 @@ jobs:
           docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
           # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
           # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
-          if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
+          if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
+            -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
             echo "::error::positive control FAILED - the probe passed WITHOUT the ${PLATFORM} package, so a green run proves nothing (PF-013)"
             printf '%s\n' "${CTRL_LOG}"; exit 1
           fi
@@ -593,7 +594,8 @@ jobs:
           docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
           # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
           # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
-          if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
+          if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
+            -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
             echo "::error::positive control FAILED - the probe passed WITHOUT the ${PLATFORM} package, so a green run proves nothing (PF-013)"
             printf '%s\n' "${CTRL_LOG}"; exit 1
           fi

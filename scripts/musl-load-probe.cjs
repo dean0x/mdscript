@@ -104,7 +104,13 @@ if (actualExports !== EXPECTED_EXPORTS) {
 // Step 6: Compile smoke test. dlopen binds lazily so symbols resolve at CALL
 // time — one export's type is not proof; we must call an exported function.
 // Expected: { kind: 'markdown', output: 'Hello alpine!\n', ... }
-const r = b.compile('Hello {{n}}!', { vars: { n: 'alpine' } });
+let r;
+try {
+  r = b.compile('Hello {{n}}!', { vars: { n: 'alpine' } });
+} catch (e) {
+  process.stderr.write('::error::compile() threw: ' + e.message + '\n');
+  process.exit(1);
+}
 if (r.kind !== 'markdown') {
   process.stderr.write(
     '::error::compile() returned kind=' + JSON.stringify(r.kind) + ', expected "markdown"\n',

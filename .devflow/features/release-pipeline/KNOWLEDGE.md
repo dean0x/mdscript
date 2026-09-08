@@ -82,8 +82,9 @@ Job details:
 `load-test-musl-arm64` proves the `linux-arm64-musl` addon dlopens on `node:22-alpine`
 (the readelf gate proves ELF metadata but not runtime loadability — a missing NEEDED
 entry like `libunwind.so.1` is invisible to readelf; PF-038 shape). The x64 equivalent
-runs as the last step of `stage-and-verify-napi` after the staged artifact upload (two
-independent verdicts; x64 failure never suppresses the artifact the arm64 job needs).
+runs as the last step of `stage-and-verify-napi` after the staged artifact upload, so
+an x64 failure never suppresses the artifact; `load-test-musl-arm64` is skipped when
+x64 fails (both are re-run together after the fix).
 
 Key ordering constraints:
 - `publish-crates` blocks on `rehearse-publish-python`: a failed OIDC exchange aborts before the irreversible crates.io write (PF-039).

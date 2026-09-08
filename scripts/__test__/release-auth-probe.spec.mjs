@@ -1402,6 +1402,36 @@ function stepIndexOf(section, needle) {
   return -1;
 }
 
+/**
+ * Return the env: key-value lines for the Alpine load test step in the given
+ * section, comment-stripped, as "KEY: value" strings joined by '\n'.
+ * Returns null when the step or env block is absent.
+ */
+function loadTestEnvBlock(section) {
+  const lines = stripCommentLines(section).split('\n');
+  const starts = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^      - /.test(lines[i])) starts.push(i);
+  }
+  for (const [n, start] of starts.entries()) {
+    const body = lines.slice(start, starts[n + 1] ?? lines.length);
+    if (!body.some(l => l.includes('name: "Alpine load test ('))) continue;
+    const envIdx = body.findIndex(l => /^\s+env:\s*$/.test(l));
+    if (envIdx === -1) return null;
+    const envIndent = (body[envIdx].match(/^(\s*)/) ?? ['', ''])[1].length;
+    const envLines = [];
+    for (let i = envIdx + 1; i < body.length; i++) {
+      const line = body[i];
+      if (line.trim() === '') break;
+      const lineIndent = (line.match(/^(\s*)/) ?? ['', ''])[1].length;
+      if (lineIndent <= envIndent) break;
+      envLines.push(line.trim());
+    }
+    return envLines.join('\n');
+  }
+  return null;
+}
+
 describe('B3a: Alpine musl load tests (#340)', () => {
 
   // -------------------------------------------------------------------------
@@ -1518,11 +1548,16 @@ describe('B3a: Alpine musl load tests (#340)', () => {
     assert.notEqual(runBlockA, runBlockB,
       'S21/PC-F: run blocks differing by one character must be unequal');
 
-    // S21/PC-G: a step text missing --network none is detectable.
+    // S21/PC-G: a step text missing --network none is detectable; the same
+    // planted text also lacks timeout 600 docker run (pin E2, #340, PF-013).
     const missingNetwork = 'docker run --rm :/w:ro --pull=never alpine sh';
     assert.ok(
       !missingNetwork.includes('--network none'),
       'S21/PC-G: a step text missing --network none must be detectable (PF-013)',
+    );
+    assert.ok(
+      !missingNetwork.includes('timeout 600 docker run'),
+      'S21/PC-G: a step text missing timeout 600 docker run must be detectable (PF-013, #340)',
     );
 
     // S21/PC-H: extractNeeds strips comment lines before matching (hardening).
@@ -1566,6 +1601,58 @@ describe('B3a: Alpine musl load tests (#340)', () => {
       loadTestRunBlock(plantLoadTestStep(['          echo extra', ''])),
       'S21/PC-I: a run block carrying a real extra trailing COMMAND must still compare ' +
       'UNEQUAL — the trailing-blank trim must not swallow a divergent script (PF-013)',
+    );
+
+    // S21/PC-J: a section without 'Upload staged napi tree' yields stepIndexOf === -1,
+    // so the non-vacuity guard on the step-ordering check is demonstrably reachable —
+    // renaming that step cannot make the ordering check pass vacuously (PF-013, #340).
+    const sectionWithoutUpload = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-x64-musl)"',
+      '        run: |',
+      '          echo hi',
+    ].join('\n');
+    assert.strictEqual(
+      stepIndexOf(sectionWithoutUpload, 'name: Upload staged napi tree'),
+      -1,
+      'S21/PC-J: stepIndexOf must return -1 when "Upload staged napi tree" is absent (PF-013, #340)',
+    );
+
+    // S21/PC-K: a planted upload step without if-no-files-found: error is flagged by
+    // the pin-E1 assertion below (the staged upload must fail loudly on an empty tree; #340).
+    const uploadStepWithoutIfNoFiles = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: Upload staged napi tree',
+      '        uses: actions/upload-artifact@v7',
+      '        with:',
+      '          name: napi-staged',
+    ].join('\n');
+    assert.ok(
+      !uploadStepWithoutIfNoFiles.includes('if-no-files-found: error'),
+      'S21/PC-K: a planted upload step without if-no-files-found: error must not include it (PF-013, #340)',
+    );
+
+    // S21/PC-L: a planted arm64-shaped load-test step with PLATFORM: linux-x64-musl is
+    // detectable — an arch flip would only fail at runtime (#340, PF-013).
+    const plantedArmWithWrongPlatform = [
+      '  load-test-musl-arm64:',
+      '    steps:',
+      '      - name: "Alpine load test (linux-arm64-musl)"',
+      '        env:',
+      '          ALPINE_IMAGE: node:22-alpine',
+      '          PLATFORM: linux-x64-musl',
+      '          ARCHKEY: linux-arm64',
+      '          NPM_DIR: staged/npm',
+      '        run: |',
+      '          echo hi',
+    ].join('\n');
+    const plantedArmEnv = loadTestEnvBlock(plantedArmWithWrongPlatform);
+    assert.ok(
+      plantedArmEnv !== null && !plantedArmEnv.includes('PLATFORM: linux-arm64-musl'),
+      'S21/PC-L: a planted arm64 load-test step with PLATFORM: linux-x64-musl must not ' +
+      'contain PLATFORM: linux-arm64-musl — demonstrating the per-arch env check is reachable (#340, PF-013)',
     );
 
     // -----------------------------------------------------------------------
@@ -1694,6 +1781,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
       ':/w:ro',
       '--pull=never',
       'timeout 300',
+      'timeout 600 docker run',
       'probe.cjs',
       'NODE_PATH=',
     ];
@@ -1725,9 +1813,55 @@ describe('B3a: Alpine musl load tests (#340)', () => {
     assert.ok(arm64JobSection.includes('ALPINE_IMAGE: node:22-alpine'),
       'S21: load-test-musl-arm64 step env must include ALPINE_IMAGE: node:22-alpine');
 
+    // Pin E1: the staged upload must fail loudly on an empty tree (#340).
+    assert.ok(
+      stageSection.includes('if-no-files-found: error'),
+      'S21 Pin E1: stage-and-verify-napi must contain if-no-files-found: error — ' +
+      'the staged upload must fail loudly when the napi tree is empty (#340)',
+    );
+
+    // Per-arch env values — an arch flip would only fail at runtime (#340).
+    const stageEnv = loadTestEnvBlock(stageSection);
+    assert.ok(stageEnv !== null,
+      'S21: stage-and-verify-napi Alpine load test step must have an env: block');
+    assert.ok(stageEnv.includes('PLATFORM: linux-x64-musl'),
+      'S21: stage-and-verify-napi load-test env must set PLATFORM: linux-x64-musl (#340)');
+    assert.ok(stageEnv.includes('ARCHKEY: linux-x64'),
+      'S21: stage-and-verify-napi load-test env must set ARCHKEY: linux-x64 (#340)');
+    assert.ok(stageEnv.includes('NPM_DIR: crates/mds-napi/npm'),
+      'S21: stage-and-verify-napi load-test env must set NPM_DIR: crates/mds-napi/npm (#340)');
+
+    const arm64Env = loadTestEnvBlock(arm64JobSection);
+    assert.ok(arm64Env !== null,
+      'S21: load-test-musl-arm64 Alpine load test step must have an env: block');
+    assert.ok(arm64Env.includes('PLATFORM: linux-arm64-musl'),
+      'S21: load-test-musl-arm64 load-test env must set PLATFORM: linux-arm64-musl (#340)');
+    assert.ok(arm64Env.includes('ARCHKEY: linux-arm64'),
+      'S21: load-test-musl-arm64 load-test env must set ARCHKEY: linux-arm64 (#340)');
+    assert.ok(arm64Env.includes('NPM_DIR: staged/npm'),
+      'S21: load-test-musl-arm64 load-test env must set NPM_DIR: staged/npm (#340)');
+
     // In stage-and-verify-napi, the load-test step must come AFTER Upload staged napi tree.
     const uploadStepIdx = stepIndexOf(stageSection, 'name: Upload staged napi tree');
     const loadTestStepIdx = stepIndexOf(stageSection, 'name: "Alpine load test (');
+    // Non-vacuity: both steps must exist; -1 > -1 is false but N > -1 holds for any N >= 0,
+    // making the ordering check vacuous when the upload step is renamed (PF-013, #340).
+    assert.ok(
+      uploadStepIdx !== -1 && loadTestStepIdx !== -1,
+      'S21 non-vacuity: "Upload staged napi tree" and Alpine load test steps must both ' +
+      'exist in stage-and-verify-napi (stepIndexOf returns -1 when absent; a missing ' +
+      'upload step would let N > -1 pass vacuously; #340, PF-013)',
+    );
+    // Exact-name check: stepIndexOf uses substring matching, so a suffix like " (v2)"
+    // would still return a non-(-1) index — this end-of-line regex catches any suffix rename
+    // (#340, PF-013). The YAML step line is "      - name: Upload staged napi tree" so the
+    // regex anchors to EOL (no trailing chars after the name).
+    assert.ok(
+      /name: Upload staged napi tree\s*$/m.test(stageSection),
+      'S21 non-vacuity: stage-and-verify-napi must contain a step named exactly ' +
+      '"Upload staged napi tree" — a rename like (v2) bypasses the stepIndexOf check ' +
+      'via substring matching but is caught here (#340, PF-013)',
+    );
     assert.ok(
       loadTestStepIdx > uploadStepIdx,
       `S21: in stage-and-verify-napi the Alpine load test step (index ${loadTestStepIdx}) ` +

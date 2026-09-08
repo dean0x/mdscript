@@ -362,16 +362,18 @@ The `release.yml` workflow runs, in order:
    4. **stage-and-verify-napi** — `napi create-npm-dirs` + `artifacts`, copies
       LICENSE into each platform dir, runs the **A3 name-gate**. The last step
       runs the x64 Alpine load test (`linux-x64-musl`) inside `node:22-alpine`
-      after the staged artifact upload, so the artifact is never suppressed by
-      an x64 failure (two independent verdicts: x64 and arm64).
+      after the staged artifact upload, so the artifact is preserved even when
+      the x64 test fails; if x64 fails, the arm64 job is skipped and both are
+      re-run together after the fix.
    5. **load-test-musl-arm64** — unguarded job on a native `ubuntu-24.04-arm`
       runner (no QEMU); downloads the `napi-staged` artifact; asserts the arm64
       ELF shape with a positive control; runs the arm64 Alpine load test
       (`linux-arm64-musl`) on `node:22-alpine` with a run block byte-identical
-      to the x64 step. Provides an independent verdict on the arm64 musl addon
-      before any registry write (PF-038, #340). `publish-crates` needs this
-      job and requires `needs.load-test-musl-arm64.result == 'success'` in its
-      `if:` (PF-047).
+      to the x64 step. Skipped when x64 fails (`if: !cancelled() &&
+      needs.stage-and-verify-napi.result == 'success'`); both are re-run
+      together after a fix. `publish-crates` needs this job and requires
+      `needs.load-test-musl-arm64.result == 'success'` in its `if:` (PF-047,
+      PF-038, #340).
    6. **rehearse-publish-python** — pin shape, GHCR manifest, `docker pull` and
       `twine check` (each with a positive control); uploads nothing and holds no
       OIDC token. publish-crates blocks on this so a broken action pin aborts
