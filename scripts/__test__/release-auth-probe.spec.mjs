@@ -1634,6 +1634,28 @@ describe('B3a: Alpine musl load tests (#340)', () => {
       'S21/PC-K: a planted upload step without if-no-files-found: error must not include it (PF-013, #340)',
     );
 
+    // S21/PC-K (cont.): a planted step whose if-no-files-found line is COMMENTED OUT
+    // must be rejected by stripCommentLines — proving the strip is what makes Pin-E1
+    // non-bypassable by a commented-out line (#340, PF-013).
+    const commentedIfNoFiles = [
+      '  fake-job:',
+      '    steps:',
+      '      - name: Upload staged napi tree',
+      '        uses: actions/upload-artifact@v7',
+      '        with:',
+      '          name: napi-staged',
+      '          # if-no-files-found: error',
+    ].join('\n');
+    assert.ok(
+      commentedIfNoFiles.includes('if-no-files-found: error'),
+      'S21/PC-K: planted step with commented if-no-files-found must include the raw text (PF-013, #340)',
+    );
+    assert.ok(
+      !stripCommentLines(commentedIfNoFiles).includes('if-no-files-found: error'),
+      'S21/PC-K: stripCommentLines must strip the commented if-no-files-found line, ' +
+      'proving the pin is load-bearing (PF-013, #340)',
+    );
+
     // S21/PC-L: a planted arm64-shaped load-test step with PLATFORM: linux-x64-musl is
     // detectable — an arch flip would only fail at runtime (#340, PF-013).
     const plantedArmWithWrongPlatform = [
@@ -1757,6 +1779,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
 
     const stageSection = extractJobSection(yml, 'stage-and-verify-napi');
     assert.ok(stageSection !== null, 'S21 non-vacuity: stage-and-verify-napi must exist');
+    const stageStripped = stripCommentLines(stageSection);
 
     // The two job sections must be distinct strings (sanity check).
     assert.notEqual(stageSection, arm64JobSection,
@@ -1815,7 +1838,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
 
     // Pin E1: the staged upload must fail loudly on an empty tree (#340).
     assert.ok(
-      stageSection.includes('if-no-files-found: error'),
+      stageStripped.includes('if-no-files-found: error'),
       'S21 Pin E1: stage-and-verify-napi must contain if-no-files-found: error — ' +
       'the staged upload must fail loudly when the napi tree is empty (#340)',
     );
@@ -1857,7 +1880,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
     // (#340, PF-013). The YAML step line is "      - name: Upload staged napi tree" so the
     // regex anchors to EOL (no trailing chars after the name).
     assert.ok(
-      /name: Upload staged napi tree\s*$/m.test(stageSection),
+      /name: Upload staged napi tree\s*$/m.test(stageStripped),
       'S21 non-vacuity: stage-and-verify-napi must contain a step named exactly ' +
       '"Upload staged napi tree" — a rename like (v2) bypasses the stepIndexOf check ' +
       'via substring matching but is caught here (#340, PF-013)',

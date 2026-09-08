@@ -31,7 +31,7 @@ let lddContent;
 try {
   lddContent = readFileSync('/usr/bin/ldd', 'utf-8');
 } catch (e) {
-  process.stderr.write('::error::Cannot read /usr/bin/ldd: ' + e.message + '\n');
+  process.stderr.write('::error::Cannot read /usr/bin/ldd: ' + ((e && e.message) || String(e)) + '\n');
   process.exit(1);
 }
 if (!lddContent.includes('musl')) {
@@ -57,7 +57,7 @@ let b;
 try {
   b = require('/w/index.js');
 } catch (e) {
-  process.stderr.write('::error::require(\'/w/index.js\') failed: ' + e.message + '\n');
+  process.stderr.write('::error::require(\'/w/index.js\') failed: ' + ((e && e.message) || String(e)) + '\n');
   process.exit(1);
 }
 
@@ -69,7 +69,7 @@ let resolved;
 try {
   resolved = require.resolve(pkg);
 } catch (e) {
-  process.stderr.write('::error::require.resolve(\'' + pkg + '\') failed: ' + e.message + '\n');
+  process.stderr.write('::error::require.resolve(\'' + pkg + '\') failed: ' + ((e && e.message) || String(e)) + '\n');
   process.exit(1);
 }
 if (!resolved.startsWith('/w/node_modules/')) {
@@ -108,7 +108,7 @@ let r;
 try {
   r = b.compile('Hello {{n}}!', { vars: { n: 'alpine' } });
 } catch (e) {
-  process.stderr.write('::error::compile() threw: ' + e.message + '\n');
+  process.stderr.write('::error::compile() threw: ' + ((e && e.message) || String(e)) + '\n');
   process.exit(1);
 }
 if (r.kind !== 'markdown') {
