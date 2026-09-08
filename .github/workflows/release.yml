@@ -496,7 +496,7 @@ jobs:
           docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
           # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
           # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
-          if CTRL_LOG=$(docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
+          if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
             echo "::error::positive control FAILED - the probe passed WITHOUT the ${PLATFORM} package, so a green run proves nothing (PF-013)"
             printf '%s\n' "${CTRL_LOG}"; exit 1
           fi
@@ -508,7 +508,7 @@ jobs:
             echo "::error::the loader computed the gnu key on Alpine - isMusl() returned false"; exit 1
           fi
           echo "positive control OK: load failed without the musl package, on the musl key"
-          docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
+          timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
             -v "${FIX}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}"
 
   # ---------------------------------------------------------------------------
@@ -593,7 +593,7 @@ jobs:
           docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
           # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
           # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
-          if CTRL_LOG=$(docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
+          if CTRL_LOG=$(timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
             echo "::error::positive control FAILED - the probe passed WITHOUT the ${PLATFORM} package, so a green run proves nothing (PF-013)"
             printf '%s\n' "${CTRL_LOG}"; exit 1
           fi
@@ -605,7 +605,7 @@ jobs:
             echo "::error::the loader computed the gnu key on Alpine - isMusl() returned false"; exit 1
           fi
           echo "positive control OK: load failed without the musl package, on the musl key"
-          docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
+          timeout 600 docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
             -v "${FIX}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}"
 
   # ---------------------------------------------------------------------------
