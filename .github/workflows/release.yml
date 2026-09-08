@@ -24,6 +24,7 @@ on:
       - 'crates/mds-napi/**'
       - 'crates/mds-python/**'
       - 'scripts/verify-napi-names.mjs'
+      - 'scripts/musl-load-probe.cjs'
   workflow_dispatch:
     inputs:
       testpypi:
@@ -449,6 +450,163 @@ jobs:
           path: |
             crates/mds-napi/npm/**
             crates/mds-napi/*.node
+          if-no-files-found: error
+      # readelf proves ELF metadata, not dlopen, so it is insufficient to confirm
+      # the addon loads on Alpine musl (PF-038). The fixture shape IS the assertion
+      # (PF-013): index.js + probe + ONLY the musl platform package, no .node beside
+      # index.js (loader candidate 2 would short-circuit), gnu package absent — so
+      # a pass is only possible if the loader's isMusl() returned true. This step
+      # never runs from crates/mds-napi/ because napi artifacts writes every .node
+      # into the crate root; the staged npm/ tree is the fixture source.
+      # This step has no local counterpart (PF-036). publish-crates blocks on it.
+      - name: "Alpine load test (linux-x64-musl)"
+        shell: bash
+        env:
+          ALPINE_IMAGE: node:22-alpine
+          PLATFORM: linux-x64-musl
+          ARCHKEY: linux-x64
+          NPM_DIR: crates/mds-napi/npm
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FIX="${RUNNER_TEMP}/alpine-load-${PLATFORM}"; CTRL="${FIX}-control"
+          rm -rf "${FIX}" "${CTRL}"; mkdir -p "${FIX}/node_modules/@mdscript"
+          cp crates/mds-napi/index.js "${FIX}/index.js"
+          cp scripts/musl-load-probe.cjs "${FIX}/probe.cjs"
+          cp -R "${NPM_DIR}/${PLATFORM}" "${FIX}/node_modules/@mdscript/mds-napi-${PLATFORM}"
+          # Fixture shape IS the assertion (PF-013): index.js + probe + ONE platform package.
+          bin="${FIX}/node_modules/@mdscript/mds-napi-${PLATFORM}/mds-napi.${PLATFORM}.node"
+          [ -s "${bin}" ] || { echo "::error::staged package has no ${bin##*/} (did napi artifacts skip this leg?)"; exit 1; }
+          stray=("${FIX}"/*.node)
+          [ "${#stray[@]}" -eq 0 ] || { echo "::error::.node beside index.js: ${stray[*]} (loader candidate 2 would short-circuit the package path)"; exit 1; }
+          [ ! -e "${FIX}/node_modules/@mdscript/mds-napi-${ARCHKEY}-gnu" ] || { echo "::error::gnu package present in the fixture; a false isMusl() could pass"; exit 1; }
+          scopes=("${FIX}"/node_modules/*); pkgs=("${FIX}"/node_modules/@mdscript/*)
+          { [ "${#scopes[@]}" -eq 1 ] && [ "${#pkgs[@]}" -eq 1 ]; } || { echo "::error::fixture must hold exactly one package (scopes=${#scopes[@]} packages=${#pkgs[@]})"; exit 1; }
+          cp -R "${FIX}" "${CTRL}"; rm -rf "${CTRL}/node_modules"
+          # GitHub-hosted runners are exempt from Docker Hub's pull limit for public images; a mirror
+          # would trade a documented exemption for a tighter quota (#340). Bounded retry (PF-013 shape).
+          PULLED=0
+          for i in 1 2 3; do
+            if timeout 300 docker pull --quiet "${ALPINE_IMAGE}"; then PULLED=1; break; fi
+            echo "::notice::docker pull attempt ${i}/3 failed for ${ALPINE_IMAGE}; retrying in 10 s"; sleep 10
+          done
+          [ "${PULLED}" -eq 1 ] || { echo "::error::docker pull failed for ${ALPINE_IMAGE} after 3 attempts"; exit 1; }
+          # Go template braces on the next line, not an Actions expression (Actions interpolates only
+          # the dollar form), same as the rehearsal job's digest print.
+          docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
+          # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
+          # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
+          if CTRL_LOG=$(docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
+            echo "::error::positive control FAILED - the probe passed WITHOUT the ${PLATFORM} package, so a green run proves nothing (PF-013)"
+            printf '%s\n' "${CTRL_LOG}"; exit 1
+          fi
+          printf '%s\n' "${CTRL_LOG}"
+          for needle in 'Failed to load mds-napi native binding for' "mds-napi.${PLATFORM}.node" "@mdscript/mds-napi-${PLATFORM}"; do
+            printf '%s\n' "${CTRL_LOG}" | grep -qF -- "${needle}" || { echo "::error::control failed for the wrong reason: missing '${needle}'"; exit 1; }
+          done
+          if printf '%s\n' "${CTRL_LOG}" | grep -q -- "${ARCHKEY}-gnu"; then
+            echo "::error::the loader computed the gnu key on Alpine - isMusl() returned false"; exit 1
+          fi
+          echo "positive control OK: load failed without the musl package, on the musl key"
+          docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
+            -v "${FIX}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}"
+
+  # ---------------------------------------------------------------------------
+  # Alpine musl load test on native arm64 — docker run from host job (ADR-013).
+  # Public repos get free native ubuntu-24.04-arm runners (no ubuntu-latest-arm
+  # label). Job-level container: is rejected by the runner on arm64: "JavaScript
+  # Actions in Alpine containers are only supported on x64 Linux runners". QEMU
+  # emulation is disqualified on reliability: Node segfaults under arm64 QEMU
+  # emulation (actions/runner-images#11471). Test is docker run from the host.
+  # This job is unguarded BY DESIGN (ADR-013): it reaches success on every PR and
+  # dispatch run, so it is NOT in TIER_B_EXPECTED_SKIPPED (M10c keeps 5 guarded
+  # jobs) and deliberately NOT in RELEASE_SURFACE_CONTEXTS. Spec S21 pins it.
+  # publish-crates lists this job in both its needs and its if-conjuncts (PF-047).
+  # ---------------------------------------------------------------------------
+  load-test-musl-arm64:
+    name: Alpine load test (linux-arm64-musl)
+    needs: [stage-and-verify-napi]
+    if: ${{ !cancelled() && needs.stage-and-verify-napi.result == 'success' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Assert native arm64 runner
+        run: |
+          [ "$(uname -m)" = aarch64 ] || { echo "::error::expected an aarch64 runner (label ubuntu-24.04-arm), got $(uname -m)"; exit 1; }
+          docker version --format 'docker server {{.Server.Version}}'
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+      - name: Restore staged napi tree
+        uses: actions/download-artifact@v8
+        with:
+          name: napi-staged
+          path: staged
+      - name: Assert the staged tree is complete and the arm64 binary is AArch64
+        run: |
+          set -euo pipefail
+          n=$(find staged/npm -mindepth 1 -maxdepth 1 -type d | wc -l)
+          [ "$n" -eq 7 ] || { echo "::error::expected 7 platform dirs in staged/npm, found $n"; exit 1; }
+          arm=staged/npm/linux-arm64-musl/mds-napi.linux-arm64-musl.node
+          x64=staged/npm/linux-x64-musl/mds-napi.linux-x64-musl.node
+          { [ -s "$arm" ] && [ -s "$x64" ]; } || { echo "::error::musl binaries missing from the staged tree"; exit 1; }
+          # Positive control (PF-013): the x86_64 sibling must NOT read as AArch64.
+          if readelf -h "$x64" | grep -q 'Machine:.*AArch64'; then echo "::error::positive control FAILED - x86_64 binary read as AArch64"; exit 1; fi
+          echo "positive control OK: the x86_64 sibling is not AArch64"
+          readelf -h "$arm" | grep -q 'Machine:.*AArch64' || { echo "::error::$arm is not an AArch64 ELF"; readelf -h "$arm"; exit 1; }
+      - name: "Alpine load test (linux-arm64-musl)"
+        shell: bash
+        env:
+          ALPINE_IMAGE: node:22-alpine
+          PLATFORM: linux-arm64-musl
+          ARCHKEY: linux-arm64
+          NPM_DIR: staged/npm
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          FIX="${RUNNER_TEMP}/alpine-load-${PLATFORM}"; CTRL="${FIX}-control"
+          rm -rf "${FIX}" "${CTRL}"; mkdir -p "${FIX}/node_modules/@mdscript"
+          cp crates/mds-napi/index.js "${FIX}/index.js"
+          cp scripts/musl-load-probe.cjs "${FIX}/probe.cjs"
+          cp -R "${NPM_DIR}/${PLATFORM}" "${FIX}/node_modules/@mdscript/mds-napi-${PLATFORM}"
+          # Fixture shape IS the assertion (PF-013): index.js + probe + ONE platform package.
+          bin="${FIX}/node_modules/@mdscript/mds-napi-${PLATFORM}/mds-napi.${PLATFORM}.node"
+          [ -s "${bin}" ] || { echo "::error::staged package has no ${bin##*/} (did napi artifacts skip this leg?)"; exit 1; }
+          stray=("${FIX}"/*.node)
+          [ "${#stray[@]}" -eq 0 ] || { echo "::error::.node beside index.js: ${stray[*]} (loader candidate 2 would short-circuit the package path)"; exit 1; }
+          [ ! -e "${FIX}/node_modules/@mdscript/mds-napi-${ARCHKEY}-gnu" ] || { echo "::error::gnu package present in the fixture; a false isMusl() could pass"; exit 1; }
+          scopes=("${FIX}"/node_modules/*); pkgs=("${FIX}"/node_modules/@mdscript/*)
+          { [ "${#scopes[@]}" -eq 1 ] && [ "${#pkgs[@]}" -eq 1 ]; } || { echo "::error::fixture must hold exactly one package (scopes=${#scopes[@]} packages=${#pkgs[@]})"; exit 1; }
+          cp -R "${FIX}" "${CTRL}"; rm -rf "${CTRL}/node_modules"
+          # GitHub-hosted runners are exempt from Docker Hub's pull limit for public images; a mirror
+          # would trade a documented exemption for a tighter quota (#340). Bounded retry (PF-013 shape).
+          PULLED=0
+          for i in 1 2 3; do
+            if timeout 300 docker pull --quiet "${ALPINE_IMAGE}"; then PULLED=1; break; fi
+            echo "::notice::docker pull attempt ${i}/3 failed for ${ALPINE_IMAGE}; retrying in 10 s"; sleep 10
+          done
+          [ "${PULLED}" -eq 1 ] || { echo "::error::docker pull failed for ${ALPINE_IMAGE} after 3 attempts"; exit 1; }
+          # Go template braces on the next line, not an Actions expression (Actions interpolates only
+          # the dollar form), same as the rehearsal job's digest print.
+          docker image inspect "${ALPINE_IMAGE}" --format 'pulled digests: {{json .RepoDigests}}'
+          # Positive control FIRST (PF-013): without the package the SAME probe must FAIL, and it must
+          # fail on loader candidate 3 for the MUSL KEY - that failure is also the isMusl() proof.
+          if CTRL_LOG=$(docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS=                         -v "${CTRL}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}" 2>&1); then
+            echo "::error::positive control FAILED - the probe passed WITHOUT the ${PLATFORM} package, so a green run proves nothing (PF-013)"
+            printf '%s\n' "${CTRL_LOG}"; exit 1
+          fi
+          printf '%s\n' "${CTRL_LOG}"
+          for needle in 'Failed to load mds-napi native binding for' "mds-napi.${PLATFORM}.node" "@mdscript/mds-napi-${PLATFORM}"; do
+            printf '%s\n' "${CTRL_LOG}" | grep -qF -- "${needle}" || { echo "::error::control failed for the wrong reason: missing '${needle}'"; exit 1; }
+          done
+          if printf '%s\n' "${CTRL_LOG}" | grep -q -- "${ARCHKEY}-gnu"; then
+            echo "::error::the loader computed the gnu key on Alpine - isMusl() returned false"; exit 1
+          fi
+          echo "positive control OK: load failed without the musl package, on the musl key"
+          docker run --rm --network none --pull=never -e NODE_PATH= -e NODE_OPTIONS= \
+            -v "${FIX}:/w:ro" "${ALPINE_IMAGE}" node /w/probe.cjs "${PLATFORM}"
 
   # ---------------------------------------------------------------------------
   # Python wheels + sdist — cp311-abi3, 7 platforms + sdist.
@@ -991,8 +1149,15 @@ jobs:
     # rehearse-publish-python is listed here so a failed OIDC exchange aborts
     # before the irreversible crates.io write (if PyPI will fail, we learn before
     # crates.io is already live at the new version).
-    needs: [version-gate, stage-and-verify-napi, build-python, rehearse-publish-python]
-    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && needs.build-python.result == 'success' && needs.rehearse-publish-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+    # load-test-musl-arm64 is listed here so the Alpine dlopen test on the
+    # native arm64 runner must pass before the irreversible crates.io publish.
+    # Because the condition starts with !cancelled(), the implicit
+    # success-of-dependencies gate is gone and the needs list is ordering-only;
+    # every dependency's result must be enumerated as an if-conjunct. A needs
+    # entry without its conjunct would let a failed load test reach cargo publish,
+    # which is irreversible (PF-023, PF-047).
+    needs: [version-gate, stage-and-verify-napi, load-test-musl-arm64, build-python, rehearse-publish-python]
+    if: ${{ !cancelled() && needs.version-gate.result == 'success' && needs.stage-and-verify-napi.result == 'success' && needs.load-test-musl-arm64.result == 'success' && needs.build-python.result == 'success' && needs.rehearse-publish-python.result == 'success' && startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
