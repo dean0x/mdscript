@@ -248,6 +248,38 @@ success). `npm publish` calls in `publish-npm` have NO such guard — a partial 
 unrecoverable by re-run. This makes `publish-crates` the single irreversible point of no
 return; all correctness gates run before it.
 
+### build-napi — musl legs with cargo-zigbuild (#339)
+
+Both musl matrix entries (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`) use
+`napi build --platform --release --target <triple> --no-js -x`. The `-x` flag instructs
+`@napi-rs/cli` 3.8.6 to run `cargo zigbuild` instead of `cargo build` for non-Windows targets;
+it cannot be combined with `--use-napi-cross`.
+
+**cargo-zigbuild 0.23.0** is pinned via `taiki-e/install-action` at SHA
+`6c6fd71fe4fb72c3697d269963d0e15df8adedad` (= v2.85.10, composite action; SHA pin is correct
+per PF-040) with `tool: cargo-zigbuild@0.23.0`, `fallback: none`, placed BEFORE
+`Swatinem/rust-cache`. Step ordering in `build-napi` (musl legs):
+
+| Index | Step | Purpose |
+|---|---|---|
+| 3 | `Install cargo-zigbuild (pinned)` | SHA-pinned taiki-e/install-action, `fallback: none` |
+| 4 | `Swatinem/rust-cache` | `key: matrix.settings.target` (PF-041, S20) |
+| 5 | `Install zig` | SHA-pinned mlugg/setup-zig, version 0.16.0 |
+| 6 | `Assert cargo-zigbuild is the pinned version` | `cargo help zigbuild` + `cargo zigbuild --version` + 0.23.0 check |
+| 9 | `Verify no lingering musl linker export or wrapper (no-op detector)` | reads MUSL_LINKER env vars in `[ -z ]` guards; asserts `~/.cache/cargo-zigbuild` absent |
+| 10 | `Build addon` | `npx napi build … -x` |
+| 11 | `Assert cargo-zigbuild 0.23.0 wrappers were generated` | checks `~/.cache/cargo-zigbuild/0.23.0/` and `cargo zigbuild --version` |
+| 12 | `Assert musl artifact links musl, not glibc` | readelf + ALLOWED_NEEDED allowlist |
+
+cargo-zigbuild 0.23.0 owns the full linker-arg filter (`--fix-cortex-a53-843419`,
+`--no-undefined-version`, `-lgcc_s` to `-lunwind`, self-contained musl CRT skip, response
+files). Its CI tests zig 0.16.0; nothing in 0.23.2–0.23.4 touches x86_64/aarch64 musl.
+Bumping zig OR cargo-zigbuild is a deliberate, paired decision.
+
+The readelf gate uses `ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'` with a planted
+`libunwind.so.1` positive control (spec S22, PF-013, PF-038). Spec S22 asserts the
+ALLOWED_NEEDED assignment literal (not a comment) contains both patterns.
+
 ### GitHub expression preprocessor trap
 
 GitHub's expression preprocessor scans `run:` block text **including shell comments** without
@@ -312,9 +344,36 @@ such a file. Never write `${{` in comments; describe it in words.
   beside `index.js`) and short-circuits the fixture, making the test vacuous.
 - **Testing the musl addon through `@mdscript/mds`**: its WASM fallback makes the test
   vacuous — a successful load does not prove the native addon was reached.
+- **Installing a pinned cargo binary (e.g. cargo-zigbuild) AFTER `Swatinem/rust-cache`**:
+  rust-cache deletes every pre-existing `~/.cargo/bin` binary before saving; on a warm cache
+  hit it restores nothing to `~/.cargo/bin`, so a binary installed after the step is wiped.
+  Place `taiki-e/install-action` with `fallback: none` BEFORE `Swatinem/rust-cache`.
+- **Setting any musl linker export (`CARGO_TARGET_*_MUSL_LINKER`)**: cargo-zigbuild's
+  `add_env_if_missing` yields to a pre-set `CARGO_TARGET_*_LINKER` value; a leftover export
+  from an old wrapper step silently reverts the migration with every gate green. The no-op
+  detector step reads both musl linker vars inside `[ -z "${...:-}" ]` guards before the build.
+- **Caching `~/.cache/cargo-zigbuild`**: the wrapper cache is version-keyed
+  (`~/.cache/cargo-zigbuild/<version>/…`); presence after the build proves cargo-zigbuild
+  0.23.0 ran in THAT job. Caching it would allow a prior version's wrappers to persist through
+  an upgrade, defeating the version assertion.
 
 ## Gotchas
 
+- **napi's cargo-zigbuild detector is presence-only**: `@napi-rs/cli` checks for zigbuild with
+  `cargo help zigbuild`; if absent it runs an UNPINNED `cargo install cargo-zigbuild` mid-build,
+  silently replacing the pinned version. Pre-install with `taiki-e/install-action` and `fallback:
+  none` (never `fallback: cargo-binstall`), then assert with `cargo zigbuild --version | grep
+  0.23.0` AFTER rust-cache and AGAIN after the build.
+- **`-x` cannot be combined with `--use-napi-cross`**: they are mutually exclusive flags in
+  `@napi-rs/cli`; combining them is a build error.
+- **`add_env_if_missing` in cargo-zigbuild yields to a pre-set `CARGO_TARGET_*_LINKER`**:
+  any lingering musl linker export (from a prior step or a cached `$GITHUB_ENV` restore)
+  silently overrides zigbuild's own linker selection. The no-op detector asserts both musl
+  linker vars are unset before the build, and S22 rejects any SET form anywhere in the file.
+- **Version-keyed wrapper cache (`~/.cache/cargo-zigbuild/0.23.0/…`) is fresh per upgrade**:
+  the path includes the version; an upgrade to 0.23.1 gets a new empty directory. The post-build
+  step checks `~/.cache/cargo-zigbuild/0.23.0/` to prove the CURRENT version ran (not a cached
+  older one). Never include `~/.cache/cargo-zigbuild` in `Swatinem/rust-cache`'s `cache-directories`.
 - **RELEASE_SURFACE set-equality is spec-enforced**: `RELEASE_SURFACE` in
   `verify-pr-checks.mjs` and `on.pull_request.paths:` in `release.yml` must be identical sets.
   Spec S10 in `release-auth-probe.spec.mjs` asserts this. If you add a path to one, add it
@@ -389,7 +448,9 @@ such a file. Never write `${{` in comments; describe it in words.
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape
   (S16), set equality S10, guard detection, no `${{ }}` literal (S19), `uses:` count
   (S14), per-leg cache key (S20), cargo token -z guard (S3 extension), Alpine load test
-  job structure and wiring (S21).
+  job structure and wiring (S21), cargo-zigbuild musl build: `-x` flag, install-before-cache
+  ordering, `fallback: none`, no musl linker exports, no-op detector, post-build wrapper
+  assert, readelf ALLOWED_NEEDED literal, setup-zig SHA pin (S22).
 - `scripts/__test__/fixtures/protection-main.json` — 6-context branch protection (historical,
   2026-08 baseline; kept byte-identical).
 - `scripts/__test__/fixtures/protection-main-2026-09.json` — 15-context branch protection

@@ -2139,6 +2139,15 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       '(proves the assertion cannot pass vacuously)',
     );
 
+    // PC(B3a): ALLOWED_NEEDED with only libc.so (no libgcc_s.so.1) must be detectable —
+    // proves the libgcc_s regex pins to the variable value, not an inline comment.
+    const plantedReadelfLibcOnly = "ALLOWED_NEEDED='libc\\.so'";
+    assert.ok(
+      !/ALLOWED_NEEDED='[^']*libgcc_s\\\.so\\\.1[^']*'/.test(plantedReadelfLibcOnly),
+      "PC(B3a): ALLOWED_NEEDED='libc\\.so' (no libgcc_s.so.1) must not pass the libgcc_s " +
+      'assertion — proves the regex cannot be satisfied by an inline comment alone',
+    );
+
     // -----------------------------------------------------------------------
     // Real-file assertions — RED on current release.yml, GREEN after Phase B2.
     // The FIRST failure below is the -x check on musl build lines.
@@ -2484,9 +2493,18 @@ describe('B3b: musl legs build with cargo-zigbuild (#339)', () => {
       'is not sufficient; the allowlist enumerates expected NEEDED entries (PF-038)',
     );
 
-    assert.ok(
-      readelfStep.body.includes('libgcc_s.so.1'),
-      'S22: readelf gate ALLOWED_NEEDED must list libgcc_s.so.1 (PF-038)',
+    assert.match(
+      readelfStep.body,
+      /ALLOWED_NEEDED='[^']*libgcc_s\\\.so\\\.1[^']*'/,
+      'S22: readelf gate ALLOWED_NEEDED must contain the escaped pattern libgcc_s\\.so\\.1 ' +
+      'in the variable assignment literal (PF-038)',
+    );
+
+    assert.match(
+      readelfStep.body,
+      /ALLOWED_NEEDED='[^']*libc\\\.so[^']*'/,
+      'S22: readelf gate ALLOWED_NEEDED must contain the escaped pattern libc\\.so ' +
+      'in the variable assignment literal (PF-038)',
     );
 
     assert.ok(

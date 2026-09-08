@@ -407,7 +407,7 @@ jobs:
           # exception-unwind ABI; earlier zig versions used libunwind.so.1 instead.
           # Any unlisted soname would silently fail at runtime on node:22-alpine if
           # Alpine does not ship it (PF-038, PF-013).
-          ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'  # sonames: libc.so, libgcc_s.so.1
+          ALLOWED_NEEDED='libc\.so|libgcc_s\.so\.1'
           # Positive control (PF-013): the allowlist must REJECT libunwind.so.1.
           if ! printf ' 0x0000000000000001 (NEEDED)             Shared library: [libunwind.so.1]\n' \
               | grep '(NEEDED)' | grep -vqE "\[(${ALLOWED_NEEDED})\]"; then
