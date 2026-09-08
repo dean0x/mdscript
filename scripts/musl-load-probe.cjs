@@ -2,8 +2,11 @@
 // #340, PF-013: the fixture shape IS the assertion; a pass is only possible if
 // the correct musl platform package is mounted under /w/node_modules/ AND the
 // loader's isMusl() returned true. Run inside `node:22-alpine` via:
-//   docker run --rm --network none -v <staged-dir>:/w:ro <image> \
+//   docker run --rm --network none --pull=never -w /w -v <staged-dir>:/w:ro <image> \
 //     node /w/probe.cjs <platform>
+//
+// Steps: 1 argv, 2 cwd, 3 ldd/musl, 4 loader require, 5 path resolution,
+//        6 exports, 7 compile smoke test.
 //
 // Fixture at /w: index.js (real loader), probe.cjs (this file),
 //               node_modules/@mdscript/mds-napi-<platform>/ (musl pkg only).
@@ -22,7 +25,18 @@ if (process.argv.length !== 3 || !VALID_PLATFORMS.includes(platform)) {
   process.exit(2);
 }
 
-// Step 2: Verify musl via /usr/bin/ldd — re-implements isMusl() from index.js
+// Step 2: Assert cwd is /w — node:22-alpine sets no WORKDIR so the default cwd is /;
+// mds-core rejects a filesystem-root base directory (#371, found by this gate's first
+// run); the docker run must pass -w /w so this probe runs from the fixture dir.
+if (process.cwd() !== '/w') {
+  process.stderr.write(
+    '::error::probe must run with cwd /w (docker run -w /w); got ' +
+    process.cwd() + ' — a root cwd trips the mds-core base-directory defect (#371)\n',
+  );
+  process.exit(1);
+}
+
+// Step 3: Verify musl via /usr/bin/ldd — re-implements isMusl() from index.js
 // verbatim (readFileSync('/usr/bin/ldd','utf-8').includes('musl') inside try/catch).
 // This check stays even though require() below also proves it — it makes the
 // isMusl() predicate visible in the log (PF-013: absence-only check is vacuous).
@@ -48,7 +62,7 @@ process.stdout.write(
   'platform=' + process.platform + ' arch=' + process.arch + '\n',
 );
 
-// Step 3: Load the real loader — never require the .node directly and never
+// Step 4: Load the real loader — never require the .node directly and never
 // @mdscript/mds (its WASM fallback would make the test vacuous).
 // Wrapped in try/catch so a load failure prints the full loader error message
 // (including per-candidate details) via ::error:: before exiting, giving the
@@ -61,7 +75,7 @@ try {
   process.exit(1);
 }
 
-// Step 4: Verify require.resolve path for the musl platform package.
+// Step 5: Verify require.resolve path for the musl platform package.
 // Must start with /w/node_modules/ and end with mds-napi.<platform>.node,
 // proving the loader used the fixture package, not a stale path or fallback.
 const pkg = '@mdscript/mds-napi-' + platform;
@@ -89,7 +103,7 @@ if (!resolved.endsWith(expectedSuffix)) {
 }
 process.stdout.write('resolved ' + pkg + ' -> ' + resolved + '\n');
 
-// Step 5: Verify exports are exactly the 7 required keys.
+// Step 6: Verify exports are exactly the 7 required keys.
 const EXPECTED_EXPORTS = 'check,checkFile,compile,compileFile,lint,lintFile,lintVirtual';
 const actualExports = Object.keys(b).sort().join(',');
 if (actualExports !== EXPECTED_EXPORTS) {
@@ -101,7 +115,7 @@ if (actualExports !== EXPECTED_EXPORTS) {
   process.exit(1);
 }
 
-// Step 6: Compile smoke test. dlopen binds lazily so symbols resolve at CALL
+// Step 7: Compile smoke test. dlopen binds lazily so symbols resolve at CALL
 // time — one export's type is not proof; we must call an exported function.
 // Expected: { kind: 'markdown', output: 'Hello alpine!\n', ... }
 let r;

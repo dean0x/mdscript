@@ -367,6 +367,13 @@ such a file. Never write `${{` in comments; describe it in words.
   from Docker Hub's anonymous pull limit for public images (documented at
   docs.github.com/en/actions/reference/limits). A mirror (`public.ecr.aws`) would operate
   under a tighter tier. The gate uses Docker Hub directly and is blocking.
+- **Alpine container must run with `-w /w`**: `node:22-alpine` sets no `WORKDIR`; the default
+  container cwd is `/`; mds-core rejects a filesystem-root base directory with "cannot resolve
+  path /: file not found: /" (#371, surfaced by this gate's first run on PR #370). All four
+  `docker run` invocations in the Alpine load-test steps pass `-w /w` so the probe executes
+  from the fixture directory — the shape any real non-root cwd has. `musl-load-probe.cjs`
+  asserts `process.cwd() === '/w'` so a dropped flag fails loudly rather than silently
+  returning a spurious "file not found" error. S21 pins `-w /w` in the needle list.
 
 ## Key Files
 
@@ -376,7 +383,7 @@ such a file. Never write `${{` in comments; describe it in words.
   `TIER_B_EXPECTED_SKIPPED`, `RELEASE_SURFACE`, `RELEASE_SURFACE_CONTEXTS`.
 - `scripts/musl-load-probe.cjs` — Alpine container smoke-test for musl napi addons; accepts
   `linux-x64-musl` or `linux-arm64-musl` as argv[2]; run inside `node:22-alpine` via
-  `docker run --rm --network none -v <staged-dir>:/w:ro <image> node /w/probe.cjs <platform>`.
+  `docker run --rm --network none --pull=never -w /w -v <staged-dir>:/w:ro <image> node /w/probe.cjs <platform>`.
 - `scripts/__test__/verify-pr-checks.spec.mjs` — specs for the verifier (M10c, S13, S18 rules;
   length assertion for `EXPECTED_CONTEXTS`).
 - `scripts/__test__/release-auth-probe.spec.mjs` — specs for release.yml structure: pin shape

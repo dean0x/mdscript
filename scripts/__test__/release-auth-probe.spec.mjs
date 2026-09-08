@@ -1549,7 +1549,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
       'S21/PC-F: run blocks differing by one character must be unequal');
 
     // S21/PC-G: a step text missing --network none is detectable; the same
-    // planted text also lacks timeout 600 docker run (pin E2, #340, PF-013).
+    // planted text also lacks timeout 600 docker run and -w /w (pin E2, #340, PF-013).
     const missingNetwork = 'docker run --rm :/w:ro --pull=never alpine sh';
     assert.ok(
       !missingNetwork.includes('--network none'),
@@ -1558,6 +1558,11 @@ describe('B3a: Alpine musl load tests (#340)', () => {
     assert.ok(
       !missingNetwork.includes('timeout 600 docker run'),
       'S21/PC-G: a step text missing timeout 600 docker run must be detectable (PF-013, #340)',
+    );
+    assert.ok(
+      !missingNetwork.includes('-w /w'),
+      'S21/PC-G: a step text missing -w /w must be detectable — a root cwd trips the ' +
+      'mds-core base-directory defect (#371, PF-013, #340)',
     );
 
     // S21/PC-H: extractNeeds strips comment lines before matching (hardening).
@@ -1803,6 +1808,7 @@ describe('B3a: Alpine musl load tests (#340)', () => {
       '--network none',
       ':/w:ro',
       '--pull=never',
+      '-w /w',
       'timeout 300',
       'timeout 600 docker run',
       'probe.cjs',
