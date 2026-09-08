@@ -50,7 +50,16 @@ process.stdout.write(
 
 // Step 3: Load the real loader — never require the .node directly and never
 // @mdscript/mds (its WASM fallback would make the test vacuous).
-const b = require('/w/index.js');
+// Wrapped in try/catch so a load failure prints the full loader error message
+// (including per-candidate details) via ::error:: before exiting, giving the
+// three workflow needles their signal.
+let b;
+try {
+  b = require('/w/index.js');
+} catch (e) {
+  process.stderr.write('::error::require(\'/w/index.js\') failed: ' + e.message + '\n');
+  process.exit(1);
+}
 
 // Step 4: Verify require.resolve path for the musl platform package.
 // Must start with /w/node_modules/ and end with mds-napi.<platform>.node,
