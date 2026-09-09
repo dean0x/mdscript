@@ -1,0 +1,194 @@
+name: Watch soak (manual)
+
+# MANUAL reproduction instrument for the cli_watch flake family (#129 / #318 / #320).
+#
+# NOT a gate. `workflow_dispatch` is the only trigger, so this workflow publishes
+# zero check-runs on any pull-request head: it cannot enter branch protection and
+# cannot appear in scripts/verify-pr-checks.mjs's tally. It touches none of the six
+# release-surface paths and does not modify release.yml.
+#
+# It runs CI's exact command -- `cargo test`, deliberately NOT nextest, because the
+# process-per-test model nextest uses is a different execution environment and this
+# suite's failures are environment-sensitive. ubuntu-latest only: macOS FSEvents
+# cannot reproduce this bug class at all (see .devflow/learning/pitfalls.md PF-026
+# and the project-watch-tests-flaky memory -- a green macOS run proves nothing).
+#
+# Runs every iteration and tallies, rather than aborting on the first red, because
+# the quantity of interest is a RATE. "Failed at iteration 3" cannot distinguish
+# 1/20 from 20/20, and the before/after control this instrument exists to serve
+# (PF-027 resolution 6) needs both numbers.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'How many times to run the cli_watch suite (1-200)'
+        type: string
+        default: '20'
+      filter:
+        description: 'Optional cargo-test name filter (empty = the whole suite)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# cancel-in-progress: false is load-bearing. A soak run is a MEASUREMENT; cancelling
+# one halfway leaves a partial tally indistinguishable from a clean run with fewer
+# iterations. run_id is in the group key so two deliberate dispatches on the same
+# ref never evict each other.
+concurrency:
+  group: watch-soak-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  soak:
+    name: Watch soak (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    # The loop is bounded by `iterations`, but a hung child inside cargo test is not.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Default features: the same build CI's `rust` job runs.
+          - label: default
+            feature: ''
+          # The #317 probe widens the publish->arm window to 200ms; N iterations turn
+          # "6/6 green with the probe on" into a rate.
+          - label: startup-race-probe
+            feature: 'startup-race-probe'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-leg key (PF-041): the two legs build different feature sets.
+          key: watch-soak-${{ matrix.label }}
+
+      - name: Validate the iterations input
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+        run: |
+          set -euo pipefail
+          case "$ITERATIONS" in
+            ''|*[!0-9]*)
+              echo "::error::iterations must be a positive integer; got '$ITERATIONS'"
+              exit 1
+              ;;
+          esac
+          if [ "$ITERATIONS" -lt 1 ] || [ "$ITERATIONS" -gt 200 ]; then
+            echo "::error::iterations must be between 1 and 200; got $ITERATIONS"
+            exit 1
+          fi
+          echo "iterations validated: $ITERATIONS"
+
+      # Compile once so the loop measures the SUITE and not rustc.
+      - name: Build the test binary once
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          set -euo pipefail
+          args=(build -p mds-cli --tests)
+          if [ -n "$FEATURE" ]; then
+            args+=(--features "$FEATURE")
+          fi
+          echo "cargo ${args[*]}"
+          cargo "${args[@]}"
+
+      - name: Soak
+        id: soak
+        env:
+          ITERATIONS: ${{ inputs.iterations }}
+          FILTER: ${{ inputs.filter }}
+          FEATURE: ${{ matrix.feature }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          # -e is DELIBERATELY omitted: a non-zero `cargo test` is the DATA this
+          # step collects, not an error that should abort it. -u and pipefail stay.
+          set -uo pipefail
+
+          mkdir -p soak
+
+          args=(test -p mds-cli --test cli_watch)
+          if [ -n "$FEATURE" ]; then
+            args+=(--features "$FEATURE")
+          fi
+          if [ -n "$FILTER" ]; then
+            args+=(-- "$FILTER")
+          fi
+          echo "command: cargo ${args[*]}"
+
+          pass=0
+          fail=0
+          failed_iters=""
+          i=1
+          while [ "$i" -le "$ITERATIONS" ]; do
+            log="soak/iter-$(printf '%03d' "$i").log"
+            if cargo "${args[@]}" > "$log" 2>&1; then
+              pass=$((pass + 1))
+              rm -f "$log"
+              printf 'iter %3d PASS\n' "$i"
+            else
+              fail=$((fail + 1))
+              failed_iters="$failed_iters $i"
+              printf 'iter %3d FAIL\n' "$i"
+              echo "::warning title=watch-soak::iteration $i failed on leg $LABEL"
+              # Surface the discriminator inline (PF-026: the panic's file:line, not
+              # the test's name, is the diagnosis).
+              grep -E 'panicked at|\.\.\. FAILED|test result: FAILED' "$log" || true
+            fi
+            i=$((i + 1))
+          done
+
+          # The summary file is ALWAYS written, so the artifact is never empty (PF-016).
+          {
+            echo "leg:        $LABEL"
+            echo "ref:        $GITHUB_REF"
+            echo "sha:        $GITHUB_SHA"
+            echo "command:    cargo ${args[*]}"
+            echo "iterations: $ITERATIONS"
+            echo "passed:     $pass"
+            echo "failed:     $fail"
+            echo "failed at: $failed_iters"
+          } > soak/summary.txt
+          cat soak/summary.txt
+
+          {
+            echo "### Watch soak - $LABEL"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| ref | \`$GITHUB_REF\` |"
+            echo "| sha | \`$GITHUB_SHA\` |"
+            echo "| command | \`cargo ${args[*]}\` |"
+            echo "| iterations | $ITERATIONS |"
+            echo "| passed | $pass |"
+            echo "| **failed** | **$fail** |"
+            if [ "$fail" -gt 0 ]; then
+              echo "| failing iterations |$failed_iters |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::$fail of $ITERATIONS iterations failed on leg $LABEL"
+            exit 1
+          fi
+          echo "clean soak: $pass/$ITERATIONS passed on leg $LABEL"
+
+      - name: Upload failing logs and the tally
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: watch-soak-${{ matrix.label }}-${{ github.run_id }}
+          path: soak/
+          # `error`, not `ignore`: summary.txt is always written, so an empty upload
+          # means the glob is wrong, not that the soak was clean (PF-016).
+          if-no-files-found: error
+          retention-days: 14
