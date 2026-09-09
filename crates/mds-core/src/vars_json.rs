@@ -28,7 +28,12 @@
 //! A reported path names a JSON key by walking from the document root:
 //! - Object nesting is dotted: `x.a`.
 //! - Array-element nesting uses a 0-based bracket index: `x[2].a`, and an array at
-//!   the document root renders as `[0].a`.
+//!   the document root renders as `[0].a`. This scanner produces that array-root
+//!   form on any JSON text (see the `T15` test below); in practice, though, the
+//!   public `load_vars_file`/`load_vars_str` (and their `_reporting_duplicates`
+//!   variants, in `lib.rs`) reject a non-object top-level value before this scan
+//!   ever runs, so a caller of those functions never observes it — only paths
+//!   starting with a key are reachable through the public API.
 //! - A literal key containing `.`, `[`, or `]` is **not** escaped — it renders
 //!   ambiguously with an actual nesting separator, and an empty-string key
 //!   renders as an empty segment. This is a documented, accepted limitation

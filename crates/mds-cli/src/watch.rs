@@ -951,7 +951,7 @@ fn rebuild_file(
     // emitted below, gated on `content_changed` — the same signal that gates
     // the "Recompiled" line — so the vars-file duplicate is re-reported exactly
     // once per OBSERVABLE rebuild (tests I16, I18, I20).
-    let resolved = match build_runtime_vars(RuntimeVarArgs {
+    let mut resolved = match build_runtime_vars(RuntimeVarArgs {
         vars: ctx.vars_path_raw.clone(),
         set_vars: ctx.static_set_vars.clone(),
         set_string_vars: ctx.static_set_string_vars.clone(),
@@ -963,7 +963,11 @@ fn rebuild_file(
             return;
         }
     };
-    let runtime_vars = resolved.vars.clone();
+    // Move the map out instead of cloning it: `compile_to_content` takes
+    // `runtime_vars` by value, and the emitter below only ever reads
+    // `resolved.vars_file` / `duplicate_vars_file_keys` /
+    // `duplicate_vars_file_keys_omitted` — none of which need `.vars`.
+    let runtime_vars = resolved.vars.take();
 
     let t0 = Instant::now();
     match compile_to_content(

@@ -1402,7 +1402,10 @@ pub fn scan_imports(source: &str) -> Result<Vec<String>, MdsError> {
 /// `duplicate_keys` lists the path of each key that repeated within its
 /// enclosing object, at any nesting depth, in encounter order: dotted for
 /// object nesting (`x.a`), 0-based bracketed for array-element nesting
-/// (`x[2].a`, or `[0].a` for an array at the document root). A literal key
+/// (`x[2].a`). Both loading functions above reject a non-object top-level
+/// value before the duplicate scan runs, so a caller only ever observes
+/// paths that start with a key — never the array-root form (`[0].a`) the
+/// internal scanner can otherwise produce. A literal key
 /// containing `.`, `[`, or `]` renders ambiguously with a nesting separator,
 /// and an empty-string key renders as an empty segment — a documented,
 /// accepted limitation. **These paths are structured, untrusted

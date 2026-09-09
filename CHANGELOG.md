@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Warn on duplicate keys in `--vars` JSON files, at every depth, on every `mds watch` rebuild (#326).**
+- **Warn on duplicate keys in `--vars` JSON files, at every depth, on every `mds watch` rebuild that writes output (#326).**
   `mds build|check|lint|watch --vars f.json` with a repeated JSON object key (e.g.
   `{"x": 1, "x": 2}`) previously compiled silently with the last value winning —
   `serde_json`'s map deserializer discards the earlier value with no signal. Now every
@@ -17,15 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the last value wins` for each duplicate, exit 0, suppressed by `--quiet` (parity with
   the existing `--set`/`--set-string` duplicate-key warning, #200). Duplicates are
   detected at **every depth** and reported with a dotted/bracketed key path mirroring
-  `{{a.b}}` interpolation syntax — `x`, `x.a`, `x[2].a`, `[0].a` for an array root
-  (0-based, display-only; a key that itself contains `.`/`[`/`]` renders ambiguously,
-  a known and documented limitation). At most 1 000 distinct duplicate key paths are
-  listed; beyond that a single tail line reports how many more were omitted:
-  `warning: {n} more duplicate keys in vars file <file> are not listed`. `mds watch`
-  reloads the vars file from disk on every rebuild (ADR-016), so its duplicate keys are
-  re-reported on every rebuild too — including a duplicate introduced mid-session by
-  editing the vars file — while `--set`/`--set-string` duplicate warnings keep their
-  existing once-at-startup behaviour. New public `mds-core` API:
+  `{{a.b}}` interpolation syntax — `x`, `x.a`, `x[2].a` (the array-root form `[0].a`
+  is produced only by the internal scanner and pinned by a unit test; both load
+  functions reject a non-object root before the scan runs, so a caller of
+  `mds::load_vars_file`/`load_vars_str` never sees it). At most 1 000 distinct
+  duplicate key paths are listed; beyond that a single tail line reports how many
+  more were omitted: `warning: {n} more duplicate keys in vars file <file> are not
+  listed`. `mds watch` reloads the vars file from disk on every rebuild (ADR-016),
+  so its duplicate keys are re-reported on every rebuild that writes output too —
+  including a duplicate introduced mid-session by editing the vars file — while
+  `--set`/`--set-string` duplicate warnings keep their existing once-at-startup
+  behaviour. New public `mds-core` API:
   `mds::VarsLoad { vars, duplicate_keys, duplicate_keys_omitted }` (`#[non_exhaustive]`)
   and `mds::load_vars_file_reporting_duplicates` /
   `mds::load_vars_str_reporting_duplicates`, implemented as a second, value-free parse
